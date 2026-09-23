@@ -73,8 +73,28 @@ function isMessage(e: TimelineEvent) {
   return e.kind === "note" || e.kind === "prompt" || e.kind === "agent_post";
 }
 
+/**
+ * Prompts still waiting in a session's queue: the newest `queued` queued-prompt events per
+ * target session. Older ones were delivered long ago even though their event says "queued".
+ */
+function stillQueued(events: TimelineEvent[]): Set<number> {
+  const left = new Map<number, number>();
+  const out = new Set<number>();
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.kind !== "prompt" || !e.data?.queued) continue;
+    const sid = e.data?.session_id ?? e.session_id;
+    if (sid === null || sid === undefined) continue;
+    const n = left.has(sid) ? left.get(sid)! : sessions.value.get(sid)?.queued ?? 0;
+    if (n > 0) out.add(e.id);
+    left.set(sid, Math.max(0, n - 1));
+  }
+  return out;
+}
+
 function build(events: TimelineEvent[]): Item[] {
   const out: Item[] = [];
+  const queued = stillQueued(events);
   let lastDay = "";
   for (const e of events) {
     if (e.kind === "hook") continue; // raw hooks are noise in the feed
@@ -111,7 +131,7 @@ function build(events: TimelineEvent[]): Item[] {
         prev && prev.type === "msg" && prev.author === author && prev.to === to &&
         e.ts - prev.ts < 5 * 60_000
       ) {
-        prev.parts.push({ id: e.id, text, queued: !!e.data?.queued });
+        prev.parts.push({ id: e.id, text, queued: queued.has(e.id) });
         prev.ts = e.ts;
       } else {
         out.push({
@@ -122,7 +142,7 @@ function build(events: TimelineEvent[]): Item[] {
           sid,
           to,
           ts: e.ts,
-          parts: [{ id: e.id, text, queued: !!e.data?.queued }],
+          parts: [{ id: e.id, text, queued: queued.has(e.id) }],
         });
       }
     } else {

@@ -7,12 +7,15 @@ import {
   emptyLayout,
   equalize,
   focusDirection,
+  isNoopMove,
   type LayoutState,
+  MIN_SPLIT,
   moveTab,
   neighbour,
   normalize,
   pane,
   paneOfSession,
+  panePx,
   paneRects,
   parseLayout,
   reconcile,
@@ -20,6 +23,7 @@ import {
   reorderTab,
   resizeFocused,
   sig,
+  splitFits,
   splitPane,
   toggleZoom,
 } from "./tree.ts";
@@ -287,4 +291,44 @@ Deno.test("activateTab in another pane clears zoom", () => {
   s = activateTab(s, 1);
   assertEquals(s.zoom, null);
   assertEquals(s.focus, paneOfSession(s.root, 1)!.id);
+});
+
+Deno.test("panePx scales unit rects to the box", () => {
+  let s = emptyLayout([1]);
+  s = splitPane(s, "right", 2);
+  const p2 = paneOfSession(s.root, 2)!.id;
+  assertEquals(panePx(s.root, p2, { w: 1000, h: 600 }), { w: 500, h: 600 });
+  assertEquals(panePx(s.root, "nope", { w: 1000, h: 600 }), null);
+});
+
+Deno.test("splitFits checks the halved size against the minimum", () => {
+  let s = emptyLayout([1]);
+  const box = { w: 1000, h: 600 };
+  const p1 = s.focus;
+  assert(splitFits(s.root, p1, "right", box), "1000px wide pane splits right");
+  assert(splitFits(s.root, p1, "bottom", box), "600px tall pane splits down");
+  assert(!splitFits(s.root, p1, "right", { w: 400, h: 600 }), "400px can't halve to 240");
+  assert(!splitFits(s.root, p1, "bottom", { w: 1000, h: 200 }), "200px can't halve to 120");
+  assert(splitFits(s.root, p1, "right", { w: 2 * MIN_SPLIT.w, h: MIN_SPLIT.h }), "exact minimum fits");
+  // Repeated right splits of the focused pane stop once halves would be too narrow.
+  let n = 1;
+  while (splitFits(s.root, s.focus, "right", box)) s = splitPane(s, "right", ++n);
+  assertEquals(allPanes(s.root).length, 3); // 1000 -> 500 -> 250; 250/2 < 240
+});
+
+Deno.test("isNoopMove recognises drops that change nothing", () => {
+  let s = emptyLayout([1]);
+  const p1 = s.focus;
+  assert(isNoopMove(s, 1, p1, "right"), "only tab onto own edge");
+  assert(isNoopMove(s, 1, p1, "center"), "own body");
+  s = addTab(s, 2, p1);
+  assert(!isNoopMove(s, 1, p1, "right"), "pane with two tabs can split off one");
+  assert(isNoopMove(s, 1, p1, "center", 0), "same slot (before itself)");
+  assert(isNoopMove(s, 1, p1, "center", 1), "same slot (after itself)");
+  assert(!isNoopMove(s, 1, p1, "center", 2), "moving to the end is a change");
+  s = splitPane(s, "right", 3);
+  const p3 = paneOfSession(s.root, 3)!.id;
+  assert(!isNoopMove(s, 1, p3, "center"), "other pane");
+  assert(!isNoopMove(s, 3, p1, "left"), "other pane edge");
+  assert(isNoopMove(s, 99, p1, "center"), "unknown session");
 });

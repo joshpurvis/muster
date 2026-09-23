@@ -7,7 +7,7 @@ import * as A from "../actions.ts";
 import * as terms from "../terms.ts";
 import { StateDot } from "./common.tsx";
 import { type MenuItem, openMenuAt } from "./Menu.tsx";
-import { IconChevronDown, IconSend, IconX, KindIcon } from "../icons.tsx";
+import { IconChevronDown, IconRestart, IconSend, IconX, KindIcon } from "../icons.tsx";
 import { findPane } from "../layout/tree.ts";
 import { STATE_LABEL } from "../types.ts";
 import { cx, load, save } from "../util.ts";
@@ -25,21 +25,38 @@ function pushHistory(ch: number, text: string) {
   save("history", Object.fromEntries(history));
 }
 
+function focusedIn(ch: number): SessionInfo | undefined {
+  const l = layouts.value.get(ch);
+  const focused = l ? findPane(l.root, l.focus)?.active ?? null : null;
+  return focused !== null ? sessions.value.get(focused) : undefined;
+}
+
+/**
+ * Who the composer sends to: the explicit pick, else the focused pane's agent, else any agent,
+ * else the focused shell, else any session. Exited sessions can't receive, so they're skipped.
+ */
 export function composerTarget(ch: number): SessionInfo | null {
-  const list = sessionsByChannel.value.get(ch) ?? [];
+  const list = (sessionsByChannel.value.get(ch) ?? []).filter((s) => s.state !== "exited");
   const o = targetOverride.value.get(ch);
   if (o !== undefined) {
     const s = sessions.value.get(o);
-    if (s && s.channel_id === ch) return s;
+    if (s && s.channel_id === ch && s.state !== "exited") return s;
   }
-  const l = layouts.value.get(ch);
-  const focused = l ? findPane(l.root, l.focus)?.active ?? null : null;
-  const fs = focused !== null ? sessions.value.get(focused) : undefined;
-  if (fs && fs.kind !== "shell" && fs.state !== "exited") return fs;
-  const agent = list.find((s) => s.kind !== "shell" && s.state !== "exited");
+  const fs = focusedIn(ch);
+  const live = fs && fs.state !== "exited" ? fs : undefined;
+  if (live && live.kind !== "shell") return live;
+  const agent = list.find((s) => s.kind !== "shell");
   if (agent) return agent;
-  if (fs) return fs;
-  return list[0] ?? null;
+  return live ?? list[0] ?? null;
+}
+
+/** When every session has exited: the one to offer a restart for (picked, focused, or first). */
+function restartCandidate(ch: number): SessionInfo | null {
+  const all = sessionsByChannel.value.get(ch) ?? [];
+  if (!all.length || all.some((s) => s.state !== "exited")) return null;
+  const o = targetOverride.value.get(ch);
+  const picked = o !== undefined ? all.find((s) => s.id === o) : undefined;
+  return picked ?? focusedIn(ch) ?? all.find((s) => s.kind !== "shell") ?? all[0];
 }
 
 export function Composer({ c }: { c: Channel }) {
@@ -49,7 +66,23 @@ export function Composer({ c }: { c: Channel }) {
   const [flash, setFlash] = useState<string | null>(null);
   const [sending, setSending] = useState(0);
   const target = composerTarget(c.id);
+  const dead = target ? null : restartCandidate(c.id);
   const list = sessionsByChannel.value.get(c.id) ?? [];
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Toasts sit above the composer; they read its height from this variable.
+  useLayoutEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const set = () => document.documentElement.style.setProperty("--composer-h", el.offsetHeight + "px");
+    set();
+    const ro = new ResizeObserver(set);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      document.documentElement.style.removeProperty("--composer-h");
+    };
+  }, []);
   const chipRef = useRef<HTMLButtonElement>(null);
 
   // Per-channel drafts.
@@ -110,7 +143,12 @@ export function Composer({ c }: { c: Channel }) {
       return;
     }
     if (!target) {
-      toast("warn", "No session to send to. Start one first, or use /note.");
+      toast(
+        "warn",
+        dead
+          ? `${dead.name} has exited. Restart it to send.`
+          : "No session to send to. Start one first, or use /note.",
+      );
       return;
     }
     const to = target;
@@ -138,7 +176,8 @@ export function Composer({ c }: { c: Channel }) {
     }
     if (e.key === "Escape") {
       e.preventDefault();
-      if (target) terms.focusTerminal(target.id) || A.focusActiveTerminalSoon();
+      const back = target ?? dead;
+      if (back) terms.focusTerminal(back.id) || A.focusActiveTerminalSoon();
       else A.focusActiveTerminalSoon();
       return;
     }
@@ -192,13 +231,15 @@ export function Composer({ c }: { c: Channel }) {
   const isNote = text.startsWith("/note");
   const busy = target && ["working", "starting"].includes(target.state);
   const placeholder = !target
-    ? "No sessions yet. Type /note to post to the timeline"
+    ? dead
+      ? `Restart ${dead.name} to send (or /note to post to the timeline)`
+      : "No sessions yet. Type /note to post to the timeline"
     : busy
     ? `Message ${target.name} (busy: will queue)…`
     : `Message ${target.name}…`;
 
   return (
-    <div class={cx("composer", isNote && "note-mode")}>
+    <div class={cx("composer", isNote && "note-mode")} ref={rootRef}>
       <div class="composer-box">
         <button
           type="button"
@@ -208,12 +249,12 @@ export function Composer({ c }: { c: Channel }) {
           disabled={!list.length}
           data-tip="Choose who receives the message"
         >
-          {isNote ? <span class="note-tag">note</span> : target
+          {isNote ? <span class="note-tag">note</span> : target || dead
             ? (
               <>
-                <StateDot state={target.state} />
-                <KindIcon kind={target.kind} size={13} />
-                <span class="target-name">{target.name}</span>
+                <StateDot state={(target ?? dead)!.state} />
+                <KindIcon kind={(target ?? dead)!.kind} size={13} />
+                <span class={cx("target-name", !target && "muted")}>{(target ?? dead)!.name}</span>
               </>
             )
             : <span class="target-name muted">no target</span>}
@@ -244,6 +285,19 @@ export function Composer({ c }: { c: Channel }) {
                 <IconX size={11} />
               </button>
             </span>
+          )}
+          {dead && !isNote && (
+            <button
+              type="button"
+              class="btn btn-sm restart-chip"
+              data-tip={`Restart ${dead.name}`}
+              onClick={() => {
+                A.restartSession(dead.id, false);
+                ref.current?.focus();
+              }}
+            >
+              <IconRestart size={12} /> Restart {dead.name}
+            </button>
           )}
           {sending > 0 && !flash && <span class="composer-flash">Sending…</span>}
           {flash && <span class="composer-flash">{flash}</span>}

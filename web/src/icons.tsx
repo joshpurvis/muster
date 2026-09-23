@@ -164,6 +164,13 @@ export const IconMonitor = (p: P) => (
     <path d="M8 21h8M12 17v4" />
   </Svg>
 );
+/** Half-filled circle: "follow the system" theme. */
+export const IconContrast = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none" />
+  </Svg>
+);
 export const IconCopy = (p: P) => (
   <Svg {...p}>
     <rect x="9" y="9" width="12" height="12" rx="2" />

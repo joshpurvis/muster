@@ -557,6 +557,51 @@ export function toggleZoom(s: LayoutState, paneId?: string): LayoutState {
   return { ...s, zoom: id, focus: id };
 }
 
+export interface Size {
+  w: number;
+  h: number;
+}
+
+/** Smallest pane a split may create (px, tab strip included). */
+export const MIN_SPLIT: Size = { w: 240, h: 120 };
+
+/** Pixel size of pane `id` when the whole tree is laid out in `box` (gutters ignored). */
+export function panePx(root: Layout, id: string, box: Size): Size | null {
+  const r = paneRects(root).get(id);
+  return r ? { w: r.w * box.w, h: r.h * box.h } : null;
+}
+
+/** Whether splitting pane `id` on `side` leaves both halves at least `min`. */
+export function splitFits(root: Layout, id: string, side: Side, box: Size, min: Size = MIN_SPLIT): boolean {
+  const r = panePx(root, id, box);
+  if (!r) return false;
+  const across = side === "left" || side === "right";
+  const w = across ? r.w / 2 : r.w;
+  const h = across ? r.h : r.h / 2;
+  return w >= min.w && h >= min.h;
+}
+
+/**
+ * Whether dropping tab `sid` on pane `paneId` / `zone` (at tab `index` for strips) would
+ * leave the layout as it is: a pane's only tab onto its own edge, its own body, or the slot
+ * it already occupies in its own strip.
+ */
+export function isNoopMove(
+  s: LayoutState,
+  sid: number,
+  paneId: string,
+  zone: DropZone,
+  index?: number,
+): boolean {
+  const from = paneOfSession(s.root, sid);
+  if (!from) return true;
+  if (from.id !== paneId) return false;
+  if (zone !== "center") return from.tabs.length === 1;
+  if (index === undefined) return true;
+  const old = from.tabs.indexOf(sid);
+  return index === old || index === old + 1;
+}
+
 /** Compact structural signature (for tests / debugging). */
 export function sig(n: Layout): string {
   if (n.type === "pane") return `[${n.tabs.join(",")}]`;

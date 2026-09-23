@@ -4,7 +4,8 @@ import type { PaneNode } from "./tree.ts";
 import { moveTab } from "./tree.ts";
 import { channelById, confirmClose, layouts, prefs, renaming, sessions, updateLayout } from "../state.ts";
 import type { SessionInfo, SessionKind } from "../types.ts";
-import { KIND_LABEL } from "../types.ts";
+import { KIND_LABEL, STATE_LABEL } from "../types.ts";
+import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import * as terms from "../terms.ts";
 import { drag, startTabDrag } from "./dnd.tsx";
@@ -78,6 +79,13 @@ export function Pane(
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active ? <TermHost sid={active.id} /> : <Launcher ch={ch} paneId={pane.id} focused={focused} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
+        {active && connStatus.value !== "open" && (
+          <div class="term-veil" role="status">
+            <span>
+              <span class="conn-dot" /> Disconnected · reconnecting. Typing is paused.
+            </span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -104,6 +112,62 @@ function TabStrip(
   },
 ) {
   const plusRef = useRef<HTMLButtonElement>(null);
+  const tabsRef = useRef<HTMLDivElement>(null);
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const [overflow, setOverflow] = useState(false);
+
+  // Overflow detection: re-measure on every render (tabs added/renamed) and on resize.
+  const measure = () => {
+    const el = tabsRef.current;
+    if (el) setOverflow(el.scrollWidth > el.clientWidth + 1 && el.childElementCount > 1);
+  };
+  useLayoutEffect(measure);
+  useEffect(() => {
+    const el = tabsRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Keep the active tab visible when it changes (keyboard cycling, reveal, new tab).
+  useLayoutEffect(() => {
+    const el = tabsRef.current;
+    const t = el?.querySelector<HTMLElement>(".tab.active");
+    if (!el || !t) return;
+    const r = t.getBoundingClientRect();
+    const box = el.getBoundingClientRect();
+    if (r.left < box.left) el.scrollLeft -= box.left - r.left + 8;
+    else if (r.right > box.right) el.scrollLeft += r.right - box.right + 8;
+  }, [pane.active, tabs.length, overflow]);
+
+  const onWheel = (e: WheelEvent) => {
+    const el = tabsRef.current;
+    if (!el || el.scrollWidth <= el.clientWidth) return;
+    // Vertical wheels scroll the strip sideways.
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      e.preventDefault();
+      el.scrollLeft += e.deltaY;
+    }
+  };
+
+  const openAll = () => {
+    openMenuAt(
+      moreRef.current!,
+      [
+        { header: `${tabs.length} tabs in this pane` },
+        ...tabs.map((s): MenuItem => ({
+          label: s.name,
+          icon: <KindIcon kind={s.kind} size={13} />,
+          hint: STATE_LABEL[s.state],
+          checked: s.id === pane.active,
+          run: () => A.activateSessionTab(ch, s.id),
+        })),
+      ],
+      { alignRight: false, minWidth: 220 },
+    );
+  };
+
   const openPlus = () => {
     openMenuAt(
       plusRef.current!,
@@ -115,8 +179,8 @@ function TabStrip(
     );
   };
   return (
-    <div class={cx("tabstrip", focused && "focused")} data-tabstrip={pane.id}>
-      <div class="tabs" role="tablist">
+    <div class={cx("tabstrip", focused && "focused", overflow && "overflowing")} data-tabstrip={pane.id}>
+      <div class="tabs" role="tablist" ref={tabsRef} onWheel={onWheel}>
         {tabs.map((s) => (
           <Tab
             key={s.id}
@@ -125,20 +189,35 @@ function TabStrip(
             s={s}
             active={s.id === pane.active}
             paneFocused={focused}
+            single={tabs.length === 1}
           />
         ))}
-        <button
-          ref={plusRef}
-          type="button"
-          class="tab-add"
-          data-tip="New session"
-          data-keys="Alt+N"
-          aria-label="New session"
-          onClick={openPlus}
-        >
-          <IconPlus size={14} />
-        </button>
       </div>
+      {overflow && tabs.length > 1 && (
+        <button
+          ref={moreRef}
+          type="button"
+          class="tab-more"
+          data-tip="All tabs"
+          aria-label="All tabs"
+          onClick={openAll}
+        >
+          <span class="tab-more-count">{tabs.length}</span>
+          <IconChevronDown size={12} />
+        </button>
+      )}
+      <button
+        ref={plusRef}
+        type="button"
+        class="tab-add"
+        data-tip="New session"
+        data-keys="Alt+N"
+        aria-label="New session"
+        onClick={openPlus}
+      >
+        <IconPlus size={14} />
+      </button>
+      <div class="strip-spacer" />
       <div class="tabstrip-actions">
         {zoomed && (
           <span class="zoom-badge" data-tip="Pane is zoomed" data-keys="Alt+Z">
@@ -152,6 +231,7 @@ function TabStrip(
           data-keys="Alt+D"
           aria-label="Split right"
           onClick={() => A.spawn(ch, "shell", { type: "split", side: "right", paneId: pane.id })}
+          onPointerDown={() => A.focusPane(ch, pane.id)}
         >
           <IconSplitRight size={14} />
         </button>
@@ -162,6 +242,7 @@ function TabStrip(
           data-keys="Alt+Shift+D"
           aria-label="Split down"
           onClick={() => A.spawn(ch, "shell", { type: "split", side: "bottom", paneId: pane.id })}
+          onPointerDown={() => A.focusPane(ch, pane.id)}
         >
           <IconSplitDown size={14} />
         </button>
@@ -186,12 +267,14 @@ function TabStrip(
 }
 
 function Tab(
-  { ch, paneId, s, active, paneFocused }: {
+  { ch, paneId, s, active, paneFocused, single }: {
     ch: number;
     paneId: string;
     s: SessionInfo;
     active: boolean;
     paneFocused: boolean;
+    /** The pane's only tab (can't be split off its own pane). */
+    single: boolean;
   },
 ) {
   const r = renaming.value;
@@ -210,12 +293,16 @@ function Tab(
     {
       label: "Move to split right",
       icon: <IconSplitRight size={14} />,
-      run: () => updateLayout(ch, (l) => moveTab(l, s.id, paneId, "right")),
+      disabled: single,
+      run: () =>
+        A.canSplit(ch, "right", paneId) && updateLayout(ch, (l) => moveTab(l, s.id, paneId, "right")),
     },
     {
       label: "Move to split down",
       icon: <IconSplitDown size={14} />,
-      run: () => updateLayout(ch, (l) => moveTab(l, s.id, paneId, "bottom")),
+      disabled: single,
+      run: () =>
+        A.canSplit(ch, "bottom", paneId) && updateLayout(ch, (l) => moveTab(l, s.id, paneId, "bottom")),
     },
     "sep",
     { label: "Copy working directory", run: () => A.copy(s.cwd, "Path copied") },
@@ -433,7 +520,7 @@ function Launcher({ ch, paneId, focused }: { ch: number; paneId: string; focused
         Start a session{c
           ? (
             <>
-              in <b>#{c.name}</b>
+              {" "}in <b>#{c.name}</b>
             </>
           )
           : null}

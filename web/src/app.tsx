@@ -2,7 +2,7 @@
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 import { render } from "preact";
-import { effect } from "@preact/signals";
+import { effect, signal } from "@preact/signals";
 import { useRef } from "preact/hooks";
 import { connStatus, rpc } from "./rpc.ts";
 import {
@@ -16,6 +16,8 @@ import {
   overlay,
   prefs,
   removedSessionListeners,
+  rightSuppressed,
+  rightVisible,
   sessions,
   setPref,
   updateLayout,
@@ -99,6 +101,39 @@ rpc.start();
   },
 };
 
+// ---------- window width: side panels yield to the center ----------
+
+/** The center (terminals) keeps at least this much width; side panels shrink first. */
+const CENTER_MIN = 480;
+/** Below this viewport width the right panel closes itself. */
+const RIGHT_AUTO_CLOSE = 1100;
+const SIDEBAR_MIN = 180;
+const RIGHT_MIN = 260;
+
+const winW = signal(innerWidth);
+let lastW = 0; // 0 = first run: a narrow window at startup also closes the panel
+function onWinResize() {
+  const w = innerWidth;
+  winW.value = w;
+  // Crossing the threshold hides/restores the panel without touching the saved preference.
+  if (w < RIGHT_AUTO_CLOSE && (lastW === 0 || lastW >= RIGHT_AUTO_CLOSE)) rightSuppressed.value = true;
+  if (w >= RIGHT_AUTO_CLOSE && (lastW === 0 || lastW < RIGHT_AUTO_CLOSE)) rightSuppressed.value = false;
+  lastW = w;
+}
+addEventListener("resize", onWinResize);
+onWinResize();
+
+/** Effective side panel widths for the current window (prefs are the user's wish). */
+function panelWidths(showSidebar: boolean, showRight: boolean) {
+  const p = prefs.value;
+  const room = winW.value - CENTER_MIN - 2; // 2 = the two 1px handles
+  let sw = showSidebar ? p.sidebarWidth : 0;
+  let rw = showRight ? p.rightWidth : 0;
+  if (sw + rw > room && showRight) rw = Math.max(RIGHT_MIN, room - sw);
+  if (sw + rw > room && showSidebar) sw = Math.max(SIDEBAR_MIN, room - rw);
+  return { sw, rw, room };
+}
+
 // ---------- components ----------
 
 function ResizeHandle(
@@ -119,12 +154,16 @@ function ResizeHandle(
         const up = () => {
           el.removeEventListener("pointermove", move);
           el.removeEventListener("pointerup", up);
+          el.removeEventListener("pointercancel", up);
+          el.removeEventListener("lostpointercapture", up);
           el.classList.remove("dragging");
           document.body.classList.remove("resizing-col");
           onDone?.();
         };
         el.addEventListener("pointermove", move);
         el.addEventListener("pointerup", up);
+        el.addEventListener("pointercancel", up);
+        el.addEventListener("lostpointercapture", up);
       }}
     />
   );
@@ -234,21 +273,23 @@ function App() {
     );
   }
   const c = activeChannel.value;
-  const showRight = p.rightOpen && view.value === "channel" && !!c;
+  const showRight = rightVisible.value && view.value === "channel" && !!c;
+  const { sw, rw, room } = panelWidths(!p.sidebarCollapsed, showRight);
   return (
     <div class="app">
       <Topbar />
       <div class="main">
         {!p.sidebarCollapsed && (
           <>
-            <div class="sidebar-wrap" style={{ width: p.sidebarWidth + "px" }}>
+            <div class="sidebar-wrap" style={{ width: sw + "px" }}>
               <Sidebar />
             </div>
             <ResizeHandle
               side="left"
               onDrag={(dx) => {
-                if (!startW.current) startW.current = p.sidebarWidth;
-                setPref("sidebarWidth", clamp(startW.current + dx, 180, 420));
+                if (!startW.current) startW.current = sw;
+                const max = Math.max(SIDEBAR_MIN, Math.min(420, room - rw));
+                setPref("sidebarWidth", clamp(startW.current + dx, SIDEBAR_MIN, max));
               }}
               onDone={() => (startW.current = 0)}
             />
@@ -262,12 +303,13 @@ function App() {
             <ResizeHandle
               side="right"
               onDrag={(dx) => {
-                if (!startW.current) startW.current = p.rightWidth;
-                setPref("rightWidth", clamp(startW.current - dx, 260, Math.min(720, innerWidth * 0.5)));
+                if (!startW.current) startW.current = rw;
+                const max = Math.max(RIGHT_MIN, Math.min(720, innerWidth * 0.5, room - sw));
+                setPref("rightWidth", clamp(startW.current - dx, RIGHT_MIN, max));
               }}
               onDone={() => (startW.current = 0)}
             />
-            <div class="right-wrap" style={{ width: p.rightWidth + "px" }}>
+            <div class="right-wrap" style={{ width: rw + "px" }}>
               <RightPanel c={c} />
             </div>
           </>

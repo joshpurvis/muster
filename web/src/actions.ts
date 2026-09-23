@@ -5,16 +5,22 @@ import { signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
 import {
   activeChannelId,
+  BUSY_STATES,
   channelById,
   channelOrder,
   channels,
   channelsByWorkspace,
   confirmClose,
+  holdNewSessions,
+  knowSession,
   layoutOf,
   layouts,
   overlay,
   prefs,
   pushRecent,
+  releaseNewSessions,
+  rightSuppressed,
+  rightVisible,
   sessions,
   sessionsByChannel,
   setPref,
@@ -41,9 +47,13 @@ import {
   findPane,
   focusDirection,
   focusPane as focusPaneTree,
+  type LayoutState,
+  panePx,
   pathOfPane,
   resizeFocused,
   type Side,
+  type Size,
+  splitFits,
   splitPane,
   toggleZoom,
 } from "./layout/tree.ts";
@@ -155,20 +165,67 @@ export type Placement =
   | { type: "tab"; paneId?: string }
   | { type: "split"; side: Side; paneId?: string };
 
+/** Size of the split area of the channel view (the box the layout tree is laid out in). */
+function splitBox(): Size | null {
+  const el = document.querySelector(".panes");
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0 ? { w: r.width, h: r.height } : null;
+}
+
+/** The layout as it is on screen (zoom only changes what's drawn, splits unzoom). */
+function visibleLayout(ch: ChannelId): LayoutState | null {
+  return channelById.value.has(ch) ? layoutOf(ch) : null;
+}
+
+/** Whether pane `paneId` (default focused) has room to split on `side`. Toasts when not. */
+export function canSplit(ch: ChannelId, side: Side, paneId?: string, quiet = false): boolean {
+  const l = visibleLayout(ch);
+  const box = splitBox();
+  if (!l || !box || ch !== activeChannelId.value) return true; // not on screen: can't measure
+  const id = paneId && findPane(l.root, paneId) ? paneId : l.focus;
+  if (splitFits(l.root, id, side, box)) return true;
+  if (!quiet) toast("warn", "Not enough room — zoom or close a pane");
+  return false;
+}
+
+/** Terminal grid (cols/rows) a session will get in `placement`, so it starts at the right size. */
+function gridFor(ch: ChannelId, placement: Placement): { cols: number; rows: number } | undefined {
+  const l = visibleLayout(ch);
+  const box = splitBox();
+  if (!l || !box || ch !== activeChannelId.value) return undefined;
+  const id = placement.paneId && findPane(l.root, placement.paneId) ? placement.paneId : l.focus;
+  // A zoomed pane fills the whole box; a split unzooms first.
+  const px = l.zoom === id && placement.type === "tab" ? box : panePx(l.root, id, box);
+  if (!px) return undefined;
+  let { w, h } = px;
+  if (placement.type === "split") {
+    if (placement.side === "left" || placement.side === "right") w = w / 2 - 1;
+    else h = h / 2 - 1;
+  }
+  return terms.estimateGrid(w, h - terms.TAB_STRIP_PX);
+}
+
 export async function spawn(
   ch: ChannelId,
   kind: SessionKind,
   placement: Placement = { type: "tab" },
   prompt?: string,
 ): Promise<SessionInfo | undefined> {
+  if (placement.type === "split" && !canSplit(ch, placement.side, placement.paneId)) return undefined;
+  const grid = gridFor(ch, placement);
+  holdNewSessions(ch);
+  let placed: SessionId | undefined;
   try {
     const s = await rpc.call<SessionInfo>("session.spawn", {
       channel_id: ch,
       kind,
       prompt: prompt || undefined,
+      ...grid,
     });
+    placed = s.id;
+    knowSession(s);
     if (kind !== "shell") setPref("lastAgent", kind);
-    // The session_upserted event may already have appended it to the focused pane; move it.
     updateLayout(
       ch,
       (l) =>
@@ -180,6 +237,8 @@ export async function spawn(
     return s;
   } catch (e) {
     toast("error", `Couldn't start ${kind}: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    releaseNewSessions(ch, placed);
   }
 }
 
@@ -218,13 +277,11 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
   spawn(ch, kind, { type: "split", side });
 }
 
-const BUSY = new Set(["working", "starting", "needs_approval", "asking_question"]);
-
 /** Close a tab. Busy sessions get an inline confirm first (tab turns into "Kill? ⏎ / Esc"). */
 export function closeSession(sid: SessionId, force = false) {
   const s = sessions.value.get(sid);
   if (!s) return;
-  if (!force && BUSY.has(s.state)) {
+  if (!force && BUSY_STATES.has(s.state)) {
     confirmClose.value = sid;
     return;
   }
@@ -242,10 +299,10 @@ export function closeFocused() {
   if (s) closeSession(s.id);
 }
 
-export function restartSession(sid: SessionId) {
+export function restartSession(sid: SessionId, focus = true) {
   rpc.call("session.restart", { id: sid }).then(() => {
     const s = sessions.value.get(sid);
-    if (s && s.channel_id === activeChannelId.value) focusActiveTerminalSoon();
+    if (focus && s && s.channel_id === activeChannelId.value) focusActiveTerminalSoon();
   }).catch(fail("Restart failed")).catch(() => {});
 }
 
@@ -298,6 +355,10 @@ export interface NewChannelReq {
 }
 
 export async function createChannel(req: NewChannelReq): Promise<Channel> {
+  // A new channel shows one pane filling the split area; size its first session for that.
+  // (Ignored by daemons that don't take cols/rows here; the first resize on attach fixes it.)
+  const box = splitBox() ?? estimatedChannelBox();
+  const grid = box ? terms.estimateGrid(box.w, box.h - terms.TAB_STRIP_PX) : undefined;
   const c = await rpc.call<Channel>("channel.create", {
     workspace_id: req.workspace_id,
     name: req.name,
@@ -305,12 +366,21 @@ export async function createChannel(req: NewChannelReq): Promise<Channel> {
     base: req.base || undefined,
     agent: req.agent ?? undefined,
     prompt: req.prompt || undefined,
+    ...grid,
   });
   setPref("lastAgent", req.agent ?? "none");
   // The channel_upserted event may lag the response.
   if (!channels.value.some((x) => x.id === c.id)) channels.value = [...channels.value, c];
   selectChannel(c.id);
   return c;
+}
+
+/** Split area size when no channel is open (welcome screen): center minus header and composer. */
+function estimatedChannelBox(): Size | null {
+  const el = document.querySelector(".center");
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { w: r.width, h: r.height - 44 - 64 };
 }
 
 export function renameChannel(id: ChannelId, name: string) {
@@ -363,12 +433,15 @@ export function toggleSidebar() {
 
 export function toggleRight(tab?: "timeline" | "diff") {
   const p = prefs.value;
-  if (tab && p.rightOpen && p.rightTab !== tab) {
+  const open = rightVisible.value;
+  if (tab && open && p.rightTab !== tab) {
     setPref("rightTab", tab);
     return;
   }
   if (tab) setPref("rightTab", tab);
-  setPref("rightOpen", !p.rightOpen);
+  // Asking for the panel always wins over a narrow window's auto-close.
+  rightSuppressed.value = false;
+  setPref("rightOpen", !open);
 }
 
 export function setFontSize(px: number) {

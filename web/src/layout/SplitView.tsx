@@ -119,12 +119,21 @@ function Gutter(
       el.removeEventListener("pointermove", move);
       el.removeEventListener("pointerup", up);
       el.removeEventListener("pointercancel", up);
+      el.removeEventListener("lostpointercapture", up);
+      if (raf) {
+        // Apply the last position the pending frame would have drawn.
+        cancelAnimationFrame(raf);
+        raf = 0;
+        const next = dragGutter(startSizes, index, last / total, minFrac);
+        updateLayout(ch, (l) => setSizes(l, path, next));
+      }
       el.classList.remove("dragging");
       document.body.classList.remove("resizing-col", "resizing-row");
     };
     el.addEventListener("pointermove", move);
     el.addEventListener("pointerup", up);
     el.addEventListener("pointercancel", up);
+    el.addEventListener("lostpointercapture", up);
   };
   return (
     <div

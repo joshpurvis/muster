@@ -105,14 +105,30 @@ export async function loadTimeline(ch: ChannelId, older = false) {
   const t = timelineOf(ch);
   if (t.value.loading) return;
   if (older && !t.value.hasMore) return;
+  const lastBefore = t.value.events[t.value.events.length - 1]?.id;
   t.value = { ...t.value, loading: true };
   try {
     const before = older && t.value.events.length ? t.value.events[0].id : undefined;
     const limit = 150;
     const evs = await rpc.call<TimelineEvent[]>("channel.timeline", { id: ch, before, limit });
     const cur = t.value;
-    const merged = older ? [...evs, ...cur.events] : mergeEvents(cur.events, evs);
-    t.value = { events: merged, loaded: true, loading: false, hasMore: evs.length >= limit };
+    const full = evs.length >= limit;
+    // A refresh after a long disconnect can return a full page that doesn't reach back to what
+    // we already have. Merging would hide the hole, so start over from the fresh page instead;
+    // scrolling up loads the rest in order.
+    // Compare with what we had before the call: live events appended meanwhile would hide it.
+    const gap = !older && full && lastBefore !== undefined && evs.length > 0 && evs[0].id > lastBefore;
+    const merged = older
+      ? [...evs, ...cur.events]
+      : gap
+      ? mergeEvents(evs, cur.events.filter((e) => e.id > evs[evs.length - 1].id))
+      : mergeEvents(cur.events, evs);
+    t.value = {
+      events: merged,
+      loaded: true,
+      loading: false,
+      hasMore: older || gap || !cur.loaded ? full : cur.hasMore,
+    };
   } catch {
     t.value = { ...t.value, loading: false };
   }
@@ -189,6 +205,8 @@ export interface Prefs {
   lastAgent: "claude" | "codex" | "shell" | "none";
   collapsedWorkspaces: number[];
   recent: string[];
+  /** Pass Alt shortcuts (except Alt+Shift+…) through to a focused terminal. */
+  altToTerminal: boolean;
 }
 
 const defaultPrefs: Prefs = {
@@ -202,6 +220,7 @@ const defaultPrefs: Prefs = {
   lastAgent: "claude",
   collapsedWorkspaces: [],
   recent: [],
+  altToTerminal: false,
 };
 
 export const prefs = signal<Prefs>({ ...defaultPrefs, ...load<Partial<Prefs>>("prefs", {}) });
@@ -255,6 +274,22 @@ export function dismissToast(id: number) {
 
 /** Session whose tab close is awaiting inline confirmation. */
 export const confirmClose = signal<SessionId | null>(null);
+// A pending "Kill?" never survives a channel switch.
+effect(() => {
+  void activeChannelId.value;
+  void view.value;
+  confirmClose.value = null;
+});
+
+/** States in which closing a tab asks first. */
+export const BUSY_STATES = new Set<AgentState>(["working", "starting", "needs_approval", "asking_question"]);
+
+/** The right panel was closed by a narrow window (not by the user; prefs keep their wish). */
+export const rightSuppressed = signal(false);
+export const rightVisible = computed(() => prefs.value.rightOpen && !rightSuppressed.value);
+
+/** Alt has been held on its own for a moment (sidebar shows Alt+1..9 numbers). */
+export const altHeld = signal(false);
 
 /** Session ids being renamed inline (tab or sidebar). */
 export const renaming = signal<{ kind: "channel" | "session"; id: number; where: string } | null>(
@@ -284,8 +319,43 @@ function scheduleSave(ch: ChannelId) {
   );
 }
 
+// Sessions we spawned are placed by the spawn call itself (a tab in a given pane, or a new
+// split). While a spawn is in flight, new sessions in that channel are held out of the layout so
+// they don't first land in the focused pane, attach there and size the PTY for the wrong pane.
+const spawnHolds = new Map<ChannelId, number>();
+const held = new Set<SessionId>();
+
+export function holdNewSessions(ch: ChannelId) {
+  spawnHolds.set(ch, (spawnHolds.get(ch) ?? 0) + 1);
+}
+
+/**
+ * Record a session we learned about from an RPC reply. The daemon sends queued events before
+ * each reply today, so session_upserted normally arrives first; this keeps placement correct
+ * if that ever changes (reconcile drops ids it doesn't know).
+ */
+export function knowSession(s: SessionInfo) {
+  if (sessions.value.has(s.id)) return;
+  const m = new Map(sessions.value);
+  m.set(s.id, s);
+  sessions.value = m;
+}
+
+/** Release one hold; once none remain, anything still held is placed normally. */
+export function releaseNewSessions(ch: ChannelId, placed?: SessionId) {
+  if (placed !== undefined) held.delete(placed);
+  const n = (spawnHolds.get(ch) ?? 1) - 1;
+  if (n > 0) {
+    spawnHolds.set(ch, n);
+    return;
+  }
+  spawnHolds.delete(ch);
+  for (const id of [...held]) if (sessions.value.get(id)?.channel_id === ch) held.delete(id);
+  reconcileChannel(ch);
+}
+
 export function liveIds(ch: ChannelId): number[] {
-  return (sessionsByChannel.value.get(ch) ?? []).map((s) => s.id);
+  return (sessionsByChannel.value.get(ch) ?? []).filter((s) => !held.has(s.id)).map((s) => s.id);
 }
 
 export function layoutOf(ch: ChannelId): LayoutState {
@@ -343,6 +413,9 @@ export function applyHello(h: HelloResult) {
     channels.value = h.channels.filter((c) => !c.archived);
     const prev = sessions.value;
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
+    for (const s of h.sessions) {
+      if (!prev.has(s.id) && spawnHolds.has(s.channel_id)) held.add(s.id);
+    }
     for (const s of h.sessions) for (const f of sessionListeners) f(s, prev.get(s.id));
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
@@ -395,7 +468,9 @@ export function applyEvent(ev: ServerEvent) {
       m.set(ev.data.id, ev.data);
       sessions.value = m;
       for (const f of sessionListeners) f(ev.data, prev);
+      if (!prev && spawnHolds.has(ev.data.channel_id)) held.add(ev.data.id);
       if (!prev) reconcileChannel(ev.data.channel_id);
+      if (confirmClose.value === ev.data.id && !BUSY_STATES.has(ev.data.state)) confirmClose.value = null;
       break;
     }
     case "session_removed": {
@@ -404,6 +479,7 @@ export function applyEvent(ev: ServerEvent) {
       const m = new Map(sessions.value);
       m.delete(ev.data.id);
       sessions.value = m;
+      held.delete(ev.data.id);
       for (const f of removedSessionListeners) f(ev.data.id);
       reconcileChannel(prev.channel_id);
       if (confirmClose.value === ev.data.id) confirmClose.value = null;
@@ -441,13 +517,24 @@ function removeChannel(id: ChannelId) {
 
 // ---------------- read tracking ----------------
 
-const markReadSoon = debounce((ch: ChannelId) => {
-  const c = channelById.value.get(ch);
-  if (!c) return;
-  const now = Date.now();
-  channels.value = upsertBy(channels.value, { ...c, last_read_at: now });
-  rpc.call("channel.mark_read", { id: ch }).catch(() => {});
-}, 600);
+// One pending mark per channel: switching channels quickly must not drop the first one.
+const readTimers = new Map<ChannelId, number>();
+function markReadSoon(ch: ChannelId) {
+  if (readTimers.has(ch)) return;
+  // What was on screen when we looked counts as read; events after that (e.g. after leaving
+  // the channel within the delay) stay unread.
+  const seenAt = Date.now();
+  readTimers.set(
+    ch,
+    setTimeout(() => {
+      readTimers.delete(ch);
+      const c = channelById.value.get(ch);
+      if (!c || c.last_read_at >= seenAt) return;
+      channels.value = upsertBy(channels.value, { ...c, last_read_at: seenAt });
+      rpc.call("channel.mark_read", { id: ch }).catch(() => {});
+    }, 600),
+  );
+}
 
 export function markRead(ch: ChannelId) {
   if (unread.value.has(ch)) markReadSoon(ch);

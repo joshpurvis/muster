@@ -35,6 +35,9 @@ import type { SessionKind } from "../types.ts";
 import { STATE_LABEL } from "../types.ts";
 import { cx, fuzzy, slugify, tildify } from "../util.ts";
 
+const FOCUSABLE =
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
+
 function close() {
   overlay.value = null;
   A.focusActiveTerminalSoon();
@@ -51,16 +54,47 @@ function Modal(
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
+    const focusables = () =>
+      [...(ref.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].filter((el) =>
+        el.offsetParent !== null || el === document.activeElement
+      );
     const key = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !e.defaultPrevented) {
         e.preventDefault();
         e.stopPropagation();
         onClose();
+        return;
+      }
+      // Trap Tab inside the dialog (fields that use Tab themselves prevent it first).
+      if (e.key === "Tab" && !e.defaultPrevented && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        const list = focusables();
+        if (!list.length) {
+          e.preventDefault();
+          ref.current?.focus();
+          return;
+        }
+        const i = list.indexOf(document.activeElement as HTMLElement);
+        const next = e.shiftKey
+          ? (i <= 0 ? list.length - 1 : i - 1)
+          : (i < 0 || i === list.length - 1 ? 0 : i + 1);
+        e.preventDefault();
+        list[next].focus();
       }
     };
+    // Focus can't leave the dialog for the terminal (or anything else) behind it; menus opened
+    // from the dialog are fine.
+    const focusIn = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!ref.current || !t || ref.current.contains(t) || t.closest?.(".menu")) return;
+      (focusables()[0] ?? ref.current).focus();
+    };
     addEventListener("keydown", key);
+    document.addEventListener("focusin", focusIn);
+    // Dialogs without an autofocused field still take focus off the terminal behind them.
+    if (ref.current && !ref.current.contains(document.activeElement)) ref.current.focus();
     return () => {
       removeEventListener("keydown", key);
+      document.removeEventListener("focusin", focusIn);
       if (document.activeElement === document.body && prev?.isConnected && !overlay.value) prev.focus();
     };
   }, []);
@@ -71,7 +105,7 @@ function Modal(
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div ref={ref} class={cx("modal", c)} role="dialog" aria-modal="true" aria-label={label}>
+      <div ref={ref} class={cx("modal", c)} role="dialog" aria-modal="true" aria-label={label} tabIndex={-1}>
         {children}
       </div>
     </div>
@@ -711,7 +745,7 @@ function AddWorkspace() {
 // ---------------- shortcuts ----------------
 
 const EXTRA: { title: string; keys: string[]; group: string }[] = [
-  { title: "Focus pane in direction", keys: ["Alt+←↑→↓"], group: "Panes" },
+  { title: "Focus pane in direction (not in text fields)", keys: ["Alt+←↑→↓"], group: "Panes" },
   { title: "Resize focused pane", keys: ["Alt+Shift+←↑→↓"], group: "Panes" },
   { title: "Jump to channel N", keys: ["Alt+1", "Alt+9"], group: "Navigate" },
   { title: "Copy / paste in terminal", keys: ["Ctrl+Shift+C", "Ctrl+Shift+V"], group: "View" },
@@ -721,6 +755,23 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Move tab / new split", keys: ["Drag tab"], group: "Panes" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Panes" },
 ];
+
+type ScGroup = [string, { title: string; keys: string[] }[]];
+
+/** Split groups into two columns of about the same height (rows + a header each). */
+function balance(groups: ScGroup[]): [ScGroup[], ScGroup[]] {
+  const weight = (g: ScGroup) => g[1].length + 1.5;
+  const cols: [ScGroup[], ScGroup[]] = [[], []];
+  const h = [0, 0];
+  // Biggest groups first into the shorter column, then restore sheet order in each column.
+  for (const g of [...groups].sort((a, b) => weight(b) - weight(a))) {
+    const i = h[0] <= h[1] ? 0 : 1;
+    cols[i].push(g);
+    h[i] += weight(g);
+  }
+  const order = (c: ScGroup[]) => c.sort((a, b) => groups.indexOf(a) - groups.indexOf(b));
+  return [order(cols[0]), order(cols[1])];
+}
 
 function Shortcuts() {
   const groups = new Map<string, { title: string; keys: string[] }[]>();
@@ -735,31 +786,48 @@ function Shortcuts() {
     g.push(e);
     groups.set(e.group, g);
   }
+  const altTerm = prefs.value.altToTerminal;
+  const cols = balance([...groups]);
   return (
     <Modal class="shortcuts" label="Keyboard shortcuts">
       <div class="dlg-head">
         <h2>Keyboard shortcuts</h2>
-        <span class="muted">App shortcuts work even while a terminal has focus.</span>
+        <span class="muted">
+          {altTerm
+            ? "Terminal gets Alt keys is on: in a terminal only Alt+Shift+… and Ctrl+Shift+… shortcuts apply."
+            : "App shortcuts work even while a terminal has focus. Text fields keep Alt+letters and Alt+arrows."}
+        </span>
       </div>
       <div class="sc-grid">
-        {[...groups].map(([g, list]) => (
-          <section class="sc-group">
-            <h3>{g}</h3>
-            {list.map((it) => (
-              <div class="sc-row">
-                <span>{it.title}</span>
-                <span class="sc-keys">
-                  {it.keys.map((k, i) => (
-                    <>
-                      {i > 0 && <span class="sc-or">{it.title === "Jump to channel N" ? "…" : "or"}</span>}
-                      <Kbd k={k} />
-                    </>
-                  ))}
-                </span>
-              </div>
+        {cols.map((col, ci) => (
+          <div class="sc-col" key={ci}>
+            {col.map(([g, list]) => (
+              <section class="sc-group" key={g}>
+                <h3>{g}</h3>
+                {list.map((it) => (
+                  <div class="sc-row" key={it.title}>
+                    <span>{it.title}</span>
+                    <span class="sc-keys">
+                      {it.keys.map((k, i) => (
+                        <>
+                          {i > 0 && <span class="sc-or">{it.title === "Jump to channel N" ? "…" : "or"}
+                          </span>}
+                          <Kbd k={k} />
+                        </>
+                      ))}
+                    </span>
+                  </div>
+                ))}
+              </section>
             ))}
-          </section>
+          </div>
         ))}
+      </div>
+      <div class="sc-foot">
+        <span>
+          Shells and agents use Alt for word motion. Command palette → <b>Terminal gets Alt keys</b>{" "}
+          hands them over ({altTerm ? "on" : "off"}).
+        </span>
       </div>
     </Modal>
   );
@@ -770,8 +838,10 @@ function Shortcuts() {
 function Confirm(
   props: { title: string; body: string; confirmLabel: string; danger?: boolean; run: () => void },
 ) {
-  const ref = useRef<HTMLButtonElement>(null);
-  useLayoutEffect(() => ref.current?.focus(), []);
+  const ok = useRef<HTMLButtonElement>(null);
+  const cancel = useRef<HTMLButtonElement>(null);
+  // A stray Enter must not destroy anything: destructive confirms start on Cancel.
+  useLayoutEffect(() => (props.danger ? cancel : ok).current?.focus(), []);
   return (
     <Modal class="dialog confirm-dlg" label={props.title}>
       <div class="dlg-head">
@@ -781,9 +851,9 @@ function Confirm(
         <p>{props.body}</p>
       </div>
       <div class="dlg-foot">
-        <button type="button" class="btn" onClick={close}>Cancel</button>
+        <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
         <button
-          ref={ref}
+          ref={ok}
           type="button"
           class={cx("btn", props.danger ? "btn-danger" : "btn-primary")}
           onClick={() => {

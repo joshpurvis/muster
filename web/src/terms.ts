@@ -7,7 +7,8 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
-import { FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
+import { effect } from "@preact/signals";
+import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
 
 const MAX_WEBGL = 10;
 const FONT_FAMILY =
@@ -129,6 +130,7 @@ function create(sid: number): Entry {
     macOptionIsMeta: true,
     rightClickSelectsWord: false,
     theme: themeFromCss(),
+    disableStdin: connStatus.peek() !== "open",
     // App shortcuts use Alt; don't let xterm swallow Alt+letters on macOS.
     macOptionClickForcesSelection: true,
   });
@@ -148,14 +150,21 @@ function create(sid: number): Entry {
   term.open(el);
 
   term.attachCustomKeyEventHandler((ev) => {
-    if (ev.type !== "keydown") return !shortcutMatcher(ev);
-    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && ev.code === "KeyC") {
-      const sel = term.getSelection();
-      if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+    const plainCtrlShift = ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey;
+    if (plainCtrlShift && ev.code === "KeyC") {
+      // Returning false only stops xterm; without preventDefault Chromium opens the inspector.
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ev.type === "keydown") {
+        const sel = term.getSelection();
+        if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+      }
       return false;
     }
-    if (ev.ctrlKey && ev.shiftKey && !ev.altKey && ev.code === "KeyV") {
-      navigator.clipboard?.readText().then((t) => t && term.paste(t)).catch(() => {});
+    if (plainCtrlShift && ev.code === "KeyV") {
+      // The browser's own paste event (Ctrl+Shift+V = paste as plain text) reaches xterm's
+      // textarea and pastes once; no clipboard permission needed. Just keep xterm from also
+      // sending ^V.
       return false;
     }
     return !shortcutMatcher(ev);
@@ -431,6 +440,46 @@ export function onSearchResults(sid: number, f: (idx: number, count: number) => 
 export function scrollToBottom(sid: number) {
   entries.get(sid)?.term.scrollToBottom();
 }
+
+/** Tab strip height (px) above each terminal. */
+export const TAB_STRIP_PX = 31;
+// .term-host padding plus xterm's scrollbar gutter (FitAddon's DEFAULT_SCROLL_BAR_WIDTH).
+const HOST_PAD_X = 14 + 14;
+const HOST_PAD_Y = 10;
+
+/** Cell size in CSS px, from a live terminal when there is one. */
+function cellSize(): { w: number; h: number } {
+  for (const e of entries.values()) {
+    // Same private field FitAddon reads.
+    const c = (e.term as any)._core?._renderService?.dimensions?.css?.cell;
+    if (c?.width > 0 && c?.height > 0 && e.term.options.fontSize === fontSize) {
+      return { w: c.width, h: c.height };
+    }
+  }
+  const ctx = document.createElement("canvas").getContext("2d");
+  let w = fontSize * 0.6;
+  if (ctx) {
+    ctx.font = `${fontSize}px ${FONT_FAMILY}`;
+    w = ctx.measureText("W").width || w;
+  }
+  return { w, h: Math.ceil(fontSize * 1.2) * 1.15 };
+}
+
+/** Terminal grid that fits a terminal host of `w`×`h` px (what fit() will pick there). */
+export function estimateGrid(w: number, h: number): { cols: number; rows: number } {
+  const c = cellSize();
+  return {
+    cols: Math.max(20, Math.min(500, Math.floor((w - HOST_PAD_X) / c.w))),
+    rows: Math.max(5, Math.min(300, Math.floor((h - HOST_PAD_Y) / c.h))),
+  };
+}
+
+// Input typed while the socket is down would be dropped silently: refuse it instead (the panes
+// show a veil saying so) and take it again once reconnected.
+effect(() => {
+  const down = connStatus.value !== "open";
+  for (const e of entries.values()) e.term.options.disableStdin = down;
+});
 
 export function refitAll() {
   for (const e of entries.values()) if (e.host) scheduleFit(e);

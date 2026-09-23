@@ -68,13 +68,24 @@ New session (split-button with Claude/Codex/Shell), Split right, Split down, Tim
   On load, reconcile with live sessions: drop unknown ids, append sessions not in any pane to the
   focused/first pane. Collapse empty panes (except the last) and single-child splits.
 - Tab strip (30px): tabs show kind icon, name, state dot; close `×` on hover; middle-click closes;
-  double-click renames; `+` at the end opens a small menu (Claude / Codex / Shell, keys 1/2/3).
-  Active tab of the focused pane gets an accent underline; others muted.
+  double-click renames; `+` after the tabs opens a small menu (Claude / Codex / Shell, keys 1/2/3).
+  Active tab of the focused pane gets an accent underline; others muted. Tabs keep a 96px
+  minimum; past that the strip scrolls (vertical wheel scrolls it sideways, the active tab is
+  kept in view) and a `N ▾` button lists every tab. Split/zoom buttons appear on hover
+  (not clickable while hidden) and drop out in panes narrower than 260px.
+- Focus: with several panes, the focused one has a faint accent ring and a brighter tab strip;
+  the others sit under a light dim veil (text stays readable).
+- Splits never create a pane smaller than ~240×120px (checked before splitting, by keyboard,
+  buttons, menus or drag; drag degrades to "join tabs"). No room → toast "Not enough room — zoom
+  or close a pane". When the window shrinks, panes keep a 96×64px floor. New sessions are
+  spawned with the cols/rows of the pane they will land in, so the PTY starts at the right size.
 - Gutters: 5px hit area, 1px visible line, accent on hover/drag, `col-resize`/`row-resize` cursor.
   Drag to resize with min pane size ~120px. Double-click gutter equalizes siblings.
 - Drag & drop tabs (Obsidian-style): dragging a tab over a pane shows a translucent overlay for
   the drop zone: left/right/top/bottom half-edges create a split, center moves into that pane's
   tabs. Dropping within a tab strip reorders. Use pointer events (not HTML5 DnD) for smoothness.
+  Drops that would change nothing (a pane's only tab onto itself, a tab onto its own slot) show
+  no overlay. Esc, window blur or pointercancel abort a drag.
 - Zoom: maximize the focused pane (others hidden, not destroyed); indicator in the tab strip.
 - Terminals: one `xterm.js` instance per session, created once and cached in a registry keyed by
   session id. Its DOM element is **reparented** when layout changes — never disposed on
@@ -93,7 +104,9 @@ New session (split-button with Claude/Codex/Shell), Split right, Split down, Tim
 - Auto-growing textarea (max ~40% height). Enter = send (queues if agent busy),
   Shift+Enter = newline, Ctrl+Enter = send & interrupt. Up-arrow in empty box recalls last message.
 - Shows "queued N" chip (from `SessionInfo.queued`) with a clear (×) action.
-- Esc returns focus to the target's terminal. Alt+M focuses the composer.
+- Esc returns focus to the target's terminal. Alt+C focuses the composer.
+- Exited sessions are never the target. If every session has exited, the composer says
+  "Restart <name> to send" and shows a Restart button.
 - `/note text` posts a human note to the timeline instead of sending to the agent.
 
 ### Right panel (resizable, toggle)
@@ -120,14 +133,31 @@ New session (split-button with Claude/Codex/Shell), Split right, Split down, Tim
 - **Add workspace**: path input with `fs.complete` suggestions (Tab completes), optional name.
 - **Shortcuts sheet** (Alt+/ or F1).
 - Context menus: custom (not native), keyboard navigable.
-- Toasts bottom-right for `notice` events and RPC errors; auto-dismiss 4s, errors sticky-ish 8s.
+- Toasts bottom-right (above the composer) for `notice` events and RPC errors; auto-dismiss 4s,
+  errors sticky-ish 8s.
+- Modals trap Tab and keep focus away from the terminal behind them. Destructive confirm
+  dialogs open with Cancel focused.
+- Window width: the center keeps ≥480px; the sidebar and right panel shrink first. Below 1100px
+  viewport width the right panel closes itself (it can still be reopened).
 - Confirm destructive actions inline (e.g. closing a working agent's tab turns the tab into
   "Kill? ⏎ / Esc") rather than modal dialogs where possible. Never use `alert/confirm/prompt`.
+  The inline confirm takes Enter/Esc even from a focused terminal, and clears itself when the
+  session stops being busy, on a click elsewhere, or on a channel switch.
 
 ## Keyboard map
 
 App shortcuts use Alt (Zellij/iTerm-style) and Ctrl+Shift; all are intercepted in the capture
 phase before xterm sees them. Avoid browser-reserved combos (Ctrl+N/T/W, Ctrl+Shift+N/T/W/I/J).
+
+Conflicts with shells and agents, and how they're handled:
+- Keys agents and shells rely on are not app shortcuts: Alt+M (Claude Code permission mode),
+  Alt+B / Alt+F (readline and fish word motion).
+- In the composer and every other text field, Alt+letters and Alt+←↑→↓ are left alone (word
+  motion and editing); only Alt+Shift+…, Alt+digits, Alt+[ ] / and Ctrl+Shift+… act there.
+- Alt+←↑→↓ move pane focus when a terminal or the app itself has focus.
+- Setting **Terminal gets Alt keys** (command palette; stored in localStorage prefs): while a
+  terminal has focus, every Alt shortcut except Alt+Shift+… goes to the terminal instead.
+  Ctrl+Shift+… shortcuts keep working.
 
 | Keys | Action |
 |---|---|
@@ -141,12 +171,12 @@ phase before xterm sees them. Avoid browser-reserved combos (Ctrl+N/T/W, Ctrl+Sh
 | Alt+Shift+←↑→↓ | Resize focused pane |
 | Alt+Z | Zoom (maximize) focused pane |
 | Alt+[ / Alt+] | Previous / next tab in pane |
-| Alt+1…9 | Jump to channel N (sidebar order) |
+| Alt+1…9 | Jump to channel N (sidebar order; hold Alt to see the numbers) |
 | Ctrl+Alt+↑ / ↓ | Previous / next channel |
 | Alt+I | Inbox |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
-| Alt+M | Focus composer |
-| Alt+B | Toggle sidebar |
+| Alt+C | Focus composer |
+| Ctrl+Shift+B | Toggle sidebar |
 | Alt+L | Toggle right panel (timeline) · Alt+G diff |
 | Ctrl+Shift+F | Find in terminal |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
@@ -156,8 +186,12 @@ phase before xterm sees them. Avoid browser-reserved combos (Ctrl+N/T/W, Ctrl+Sh
 ## Behavior details
 - Reconnect: on WS close show an unobtrusive "Reconnecting…" pill; exponential backoff to 5s;
   on reconnect call `hello` and re-attach every cached terminal (replay frame resets it).
+- While disconnected, terminals refuse input (xterm `disableStdin`) under a "Disconnected ·
+  reconnecting" veil, instead of dropping keystrokes silently.
+- After a reconnect, open timelines refetch; if more than a page was missed, the timeline restarts
+  from the fresh page (older events load on scroll) rather than showing a silent gap.
 - `document.title` = `(N) Muster` when N items need the human.
 - Per-viewer prefs in `localStorage` (try/catch): sidebar width/collapsed, right panel width/tab/open,
-  font size, theme, last agent kind, collapsed workspaces.
+  font size, theme, last agent kind, collapsed workspaces, "Terminal gets Alt keys".
 - Performance: batch incoming output per animation frame per terminal; never re-render the Preact
   tree on output bytes (terminals live outside the VDOM).

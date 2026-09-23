@@ -131,7 +131,22 @@ function MenuList(
   };
 
   const onKey = (e: KeyboardEvent) => {
-    if (sub) return; // submenu handles keys
+    // Keys reach this list only while it has focus, so an open submenu here was opened by
+    // hover and isn't focused. Enter / → move into it; anything else closes it and is handled.
+    if (sub) {
+      if (e.key === "ArrowRight" || e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        e.stopPropagation();
+        openSub(sub.index, true);
+        return;
+      }
+      setSub(null);
+      if (e.key === "ArrowLeft" || e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === "ArrowLeft" || depth > 0) return;
+      }
+    }
     const pos = actionable.indexOf(sel);
     if (e.key === "ArrowDown") {
       setSel(actionable[(pos + 1) % actionable.length]);
@@ -203,6 +218,8 @@ function MenuList(
                 sub?.index === i && "open",
               )}
               onMouseEnter={() => {
+                // Keyboard follows the pointer: the list under the mouse takes focus.
+                if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
                 setSel(i);
                 if (it.submenu) openSub(i);
                 else setSub(null);
@@ -235,6 +252,7 @@ function MenuList(
         if (!isAction(it) || !it.submenu) return null;
         return (
           <SubMenu
+            key={`${sub.index}:${sub.kb}`}
             items={it.submenu}
             x={sub.x}
             y={sub.y}

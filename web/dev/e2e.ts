@@ -167,7 +167,7 @@ try {
 
   // Composer
   sid = await b.eval(focusedSid);
-  await b.key("Alt+m");
+  await b.key("Alt+c");
   await b.wait(`document.activeElement?.tagName === 'TEXTAREA'`);
   await b.type("echo from-composer");
   await b.sleep(100);
@@ -183,9 +183,15 @@ try {
     });
 
   // Note + timeline
-  await b.key("Alt+m");
+  await b.key("Alt+c");
   await b.type("/note checked the redirect flow");
   await b.key("Enter");
+  // Alt+letters belong to the text field while the composer has focus; Esc goes back first.
+  await b.key("Alt+l");
+  if (await b.eval(`!!document.querySelector('.timeline')`)) {
+    throw new Error("Alt+L was intercepted inside the composer");
+  }
+  await b.key("Escape");
   await b.key("Alt+l");
   await b.wait(`!!document.querySelector('.timeline')`);
   await b.wait(`document.querySelector('.timeline').textContent.includes('checked the redirect flow')`, 4000);

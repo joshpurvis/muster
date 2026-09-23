@@ -2,7 +2,17 @@
 // App shortcuts are matched in the capture phase, before xterm or inputs see them.
 
 import * as A from "./actions.ts";
-import { activeChannel, activeChannelId, confirmClose, overlay, prefs, view } from "./state.ts";
+import {
+  activeChannel,
+  activeChannelId,
+  altHeld,
+  confirmClose,
+  overlay,
+  prefs,
+  setPref,
+  toast,
+  view,
+} from "./state.ts";
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { isMac } from "./util.ts";
 
@@ -148,10 +158,11 @@ export const commands: Command[] = [
     run: () => A.jumpChannel(i),
   })),
   {
+    // Not Alt+M: Claude Code uses it for its permission mode.
     id: "composer",
     title: "Focus composer",
     group: "Navigate",
-    keys: ["Alt+M"],
+    keys: ["Alt+C"],
     run: () => A.focusComposer(),
   },
 
@@ -280,7 +291,14 @@ export const commands: Command[] = [
   })),
 
   // View
-  { id: "sidebar", title: "Toggle sidebar", group: "View", keys: ["Alt+B"], run: () => A.toggleSidebar() },
+  // Not Alt+B: that's backward-word in readline and fish.
+  {
+    id: "sidebar",
+    title: "Toggle sidebar",
+    group: "View",
+    keys: ["Ctrl+Shift+B"],
+    run: () => A.toggleSidebar(),
+  },
   {
     id: "timeline",
     title: "Toggle timeline",
@@ -313,6 +331,23 @@ export const commands: Command[] = [
   },
   { id: "theme", title: "Cycle theme (system / dark / light)", group: "View", run: () => A.cycleTheme() },
   {
+    id: "alt-to-terminal",
+    get title() {
+      return `Terminal gets Alt keys: ${prefs.value.altToTerminal ? "on (turn off)" : "off (turn on)"}`;
+    },
+    group: "View",
+    run: () => {
+      const on = !prefs.value.altToTerminal;
+      setPref("altToTerminal", on);
+      toast(
+        "info",
+        on
+          ? "Alt keys now go to the terminal. App shortcuts: Alt+Shift+… and Ctrl+Shift+…"
+          : "Alt shortcuts work in terminals again",
+      );
+    },
+  },
+  {
     id: "shortcuts",
     title: "Keyboard shortcuts",
     group: "Help",
@@ -335,12 +370,18 @@ const bindings: Binding[] = commands.flatMap((cmd) =>
   (cmd.keys ?? []).map((key) => ({ key, spec: parseKey(key), cmd }))
 );
 
+/** Terminal focus counts as "not an input": xterm's helper textarea is an implementation detail. */
 function ctxOf(e: KeyboardEvent): KeyCtx {
   const t = e.target as HTMLElement | null;
   const inTerminal = hasTerminalFocus() !== null || !!t?.closest?.(".term-el");
   const inInput = !inTerminal && !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
-    t.isContentEditable);
+    t.tagName === "SELECT" || t.isContentEditable);
   return { inTerminal, inInput };
+}
+
+/** Alt+letter / Alt+arrow: word motion and editing keys in text fields, readline and fish. */
+function isTextEditingAlt(k: KeySpec): boolean {
+  return k.alt && !k.shift && !k.ctrl && !k.meta && /^(Key[A-Z]|Arrow)/.test(k.code);
 }
 
 export function findBinding(e: KeyboardEvent): Binding | null {
@@ -348,6 +389,10 @@ export function findBinding(e: KeyboardEvent): Binding | null {
   const ctx = ctxOf(e);
   for (const b of bindings) {
     if (!matches(b.spec, e)) continue;
+    // Let text fields keep Alt+letters and Alt+arrows (word motion, etc.).
+    if (ctx.inInput && isTextEditingAlt(b.spec)) continue;
+    // Opt-in: a focused terminal gets every Alt key except Alt+Shift+….
+    if (ctx.inTerminal && prefs.value.altToTerminal && b.spec.alt && !b.spec.shift) continue;
     const w = WHEN[b.cmd.id];
     if (w && !w(ctx, b.key)) continue;
     return b;
@@ -368,14 +413,33 @@ export function installKeys() {
     const b = findBinding(e);
     return !!b && overlayAllows(b);
   });
+  // Clicking anywhere but the "Kill?" tab itself cancels it.
+  addEventListener(
+    "pointerdown",
+    (e) => {
+      if (confirmClose.value === null) return;
+      if (!(e.target as HTMLElement)?.closest?.(".tab.confirm")) confirmClose.value = null;
+    },
+    { capture: true },
+  );
+  installAltHeld();
   addEventListener(
     "keydown",
     (e) => {
-      // Inline "Kill? ⏎ / Esc" confirmation for closing a busy tab.
+      // Inline "Kill? ⏎ / Esc" confirmation for closing a busy tab. Enter/Esc must not reach
+      // the terminal (Enter would submit the agent's prompt), so terminal focus counts here.
       const pendingClose = confirmClose.value !== null ? A.sessionInActiveChannel(confirmClose.value) : false;
       if (confirmClose.value !== null && !pendingClose) confirmClose.value = null;
-      if (pendingClose && !overlay.value && !(e.target as HTMLElement)?.closest?.("input, textarea")) {
-        if (e.key === "Enter") {
+      if (
+        pendingClose && !overlay.value && !ctxOf(e).inInput && !e.isComposing &&
+        !document.querySelector(".menu")
+      ) {
+        const bare = !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+        const modifierOnly = ["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock"].includes(e.key);
+        // Anything but a bare Enter/Esc means the user moved on: drop the question, pass the key.
+        if (!modifierOnly && !(bare && (e.key === "Enter" || e.key === "Escape"))) {
+          confirmClose.value = null;
+        } else if (e.key === "Enter") {
           e.preventDefault();
           e.stopPropagation();
           A.closeSession(confirmClose.value!, true);
@@ -411,4 +475,25 @@ export function installKeys() {
     },
     { capture: true },
   );
+}
+
+/** Holding Alt alone for a moment shows the Alt+1..9 channel numbers in the sidebar. */
+function installAltHeld() {
+  let timer = 0;
+  const clear = () => {
+    clearTimeout(timer);
+    timer = 0;
+    if (altHeld.value) altHeld.value = false;
+  };
+  addEventListener("keydown", (e) => {
+    if (e.key === "Alt" && !e.ctrlKey && !e.shiftKey && !e.metaKey && !e.repeat) {
+      clearTimeout(timer);
+      timer = setTimeout(() => (altHeld.value = true), 350);
+    } else if (e.key !== "Alt") clear();
+  }, { capture: true });
+  addEventListener("keyup", (e) => {
+    if (e.key === "Alt" || !e.altKey) clear();
+  }, { capture: true });
+  addEventListener("blur", clear);
+  addEventListener("pointerdown", clear, { capture: true });
 }

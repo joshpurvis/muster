@@ -2,8 +2,9 @@
 // will land: edges split, center joins the pane's tabs, tab strips reorder.
 
 import { signal } from "@preact/signals";
-import { type DropZone, moveTab } from "./tree.ts";
-import { updateLayout } from "../state.ts";
+import { useLayoutEffect, useRef, useState } from "preact/hooks";
+import { type DropZone, isNoopMove, moveTab, splitFits } from "./tree.ts";
+import { layouts, updateLayout } from "../state.ts";
 import { focusActiveTerminalSoon } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
 import { KindIcon } from "../icons.tsx";
@@ -55,12 +56,13 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
       kind: s.kind,
       x: ev.clientX,
       y: ev.clientY,
-      target: computeTarget(ev.clientX, ev.clientY, s.id),
+      target: computeTarget(ev.clientX, ev.clientY, ch, s.id),
     };
   };
   const cleanup = () => {
     removeEventListener("pointermove", move, true);
     removeEventListener("pointerup", up, true);
+    removeEventListener("pointercancel", cancel, true);
     removeEventListener("keydown", key, true);
     removeEventListener("blur", cancel);
     document.body.classList.remove("dragging");
@@ -92,13 +94,16 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
   };
   addEventListener("pointermove", move, true);
   addEventListener("pointerup", up, true);
+  addEventListener("pointercancel", cancel, true);
   addEventListener("keydown", key, true);
   addEventListener("blur", cancel);
 }
 
-function computeTarget(x: number, y: number, sid: number): Target | null {
+function computeTarget(x: number, y: number, ch: number, sid: number): Target | null {
   const el = document.elementFromPoint(x, y) as HTMLElement | null;
   if (!el) return null;
+  const l = layouts.value.get(ch);
+  if (!l) return null;
   const strip = el.closest("[data-tabstrip]") as HTMLElement | null;
   if (strip) {
     const paneId = strip.dataset.tabstrip!;
@@ -116,8 +121,7 @@ function computeTarget(x: number, y: number, sid: number): Target | null {
     if (tabs.length === 0) lineX = sr.left + 4;
     else if (index < tabs.length) lineX = tabs[index].getBoundingClientRect().left;
     else lineX = tabs[tabs.length - 1].getBoundingClientRect().right;
-    // Dropping a tab right next to itself is a no-op; still show the marker.
-    void sid;
+    if (isNoopMove(l, sid, paneId, "center", index)) return null;
     return {
       paneId,
       zone: "center",
@@ -138,6 +142,12 @@ function computeTarget(x: number, y: number, sid: number): Target | null {
   const d = { left: rx, right: 1 - rx, top: ry, bottom: 1 - ry };
   const nearest = (Object.keys(d) as (keyof typeof d)[]).reduce((a, b) => (d[a] < d[b] ? a : b));
   if (d[nearest] < edge) zone = nearest;
+  // No room for another split there: joining the pane's tabs is the only option.
+  if (zone !== "center") {
+    const box = document.querySelector(".panes")?.getBoundingClientRect();
+    if (box && !splitFits(l.root, paneId, zone, { w: box.width, h: box.height })) zone = "center";
+  }
+  if (isNoopMove(l, sid, paneId, zone)) return null;
   let rect = { left: r.left, top: r.top, width: r.width, height: r.height };
   if (zone === "left") rect = { ...rect, width: r.width / 2 };
   if (zone === "right") rect = { ...rect, left: r.left + r.width / 2, width: r.width / 2 };
@@ -169,10 +179,29 @@ export function DragOverlay() {
           style={{ left: t.line.left + "px", top: t.line.top + "px", height: t.line.height + "px" }}
         />
       )}
-      <div class="drag-ghost" style={{ left: d.x + 12 + "px", top: d.y + 10 + "px" }}>
-        <KindIcon kind={d.kind} size={13} />
-        <span>{d.name}</span>
-      </div>
+      <Ghost x={d.x} y={d.y} kind={d.kind} name={d.name} />
     </>
+  );
+}
+
+/** The dragged tab's label, following the pointer but kept inside the window. */
+function Ghost({ x, y, kind, name }: { x: number; y: number; kind: SessionInfo["kind"]; name: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [size, setSize] = useState({ w: 160, h: 26 });
+  useLayoutEffect(() => {
+    const r = ref.current?.getBoundingClientRect();
+    if (r && (r.width !== size.w || r.height !== size.h)) setSize({ w: r.width, h: r.height });
+  }, [name]);
+  let left = x + 12;
+  let top = y + 10;
+  if (left + size.w > innerWidth - 4) left = x - size.w - 8;
+  if (top + size.h > innerHeight - 4) top = y - size.h - 6;
+  left = Math.max(4, Math.min(left, innerWidth - size.w - 4));
+  top = Math.max(4, Math.min(top, innerHeight - size.h - 4));
+  return (
+    <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
+      <KindIcon kind={kind} size={13} />
+      <span>{name}</span>
+    </div>
   );
 }

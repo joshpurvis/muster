@@ -3,6 +3,8 @@ import { useRef, useState } from "preact/hooks";
 import {
   activeChannelId,
   aggregateState,
+  altHeld,
+  channelOrder,
   channels,
   channelsByWorkspace,
   inboxItems,
@@ -79,9 +81,8 @@ function ConnDot() {
   const s = connStatus.value;
   const label = s === "open" ? "Connected" : s === "no_token" ? "No token" : "Reconnecting…";
   return (
-    <span class={cx("conn", "conn-" + s)} data-tip={label}>
+    <span class={cx("conn", "conn-" + s)} data-tip={label} role="status" aria-label={label}>
       <span class="conn-dot" />
-      {s !== "open" && <span class="conn-label">{label}</span>}
     </span>
   );
 }
@@ -218,11 +219,17 @@ function ChannelList(
         : rows[rows.length - 1].getBoundingClientRect().bottom;
       setDrag({ id: c.id, index, y: y - ref.current!.getBoundingClientRect().top });
     };
-    const up = () => {
+    const stop = () => {
       removeEventListener("pointermove", move, true);
       removeEventListener("pointerup", up, true);
+      removeEventListener("pointercancel", cancel, true);
+      removeEventListener("blur", cancel);
       document.body.classList.remove("dragging");
       setDrag(null);
+    };
+    const cancel = () => stop();
+    const up = () => {
+      stop();
       if (!started) return;
       // Suppress the click that follows a drag.
       const swallow = (ev: Event) => ev.stopPropagation();
@@ -247,6 +254,8 @@ function ChannelList(
     };
     addEventListener("pointermove", move, true);
     addEventListener("pointerup", up, true);
+    addEventListener("pointercancel", cancel, true);
+    addEventListener("blur", cancel);
   };
 
   return (
@@ -282,6 +291,7 @@ function ChannelRow(
   const working = agg === "working" || agg === "starting";
   const r = renaming.value;
   const isRenaming = r?.kind === "channel" && r.id === c.id && r.where === "sidebar";
+  const num = altHeld.value ? channelOrder.value.findIndex((x) => x.id === c.id) + 1 : 0;
 
   const items = (): MenuItem[] => [
     {
@@ -336,9 +346,13 @@ function ChannelRow(
           )
           : <span class="side-label">{c.name}</span>}
         <span class="ch-right">
-          {attn > 0 && <span class="badge badge-attn">{attn}</span>}
-          {attn === 0 && queued > 0 && <span class="badge" data-tip={`${queued} queued`}>{queued}</span>}
-          {attn === 0 && queued === 0 && working && <Spinner size={11} />}
+          {num > 0 && num <= 9 ? <kbd class="ch-num" aria-label={`Alt+${num}`}>{num}</kbd> : (
+            <>
+              {attn > 0 && <span class="badge badge-attn">{attn}</span>}
+              {attn === 0 && queued > 0 && <span class="badge" data-tip={`${queued} queued`}>{queued}</span>}
+              {attn === 0 && queued === 0 && working && <Spinner size={11} />}
+            </>
+          )}
         </span>
       </div>
       {active && list && list.length > 0 && <SessionRows ch={c.id} list={list} />}

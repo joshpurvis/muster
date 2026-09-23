@@ -3,15 +3,18 @@ import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { Kbd } from "./common.tsx";
 import {
+  IconContrast,
   IconInbox,
   IconKeyboard,
-  IconMonitor,
   IconMoon,
   IconSearch,
   IconSidebar,
   IconSun,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
+
+const THEME_NAME = { system: "match system", dark: "dark", light: "light" } as const;
+const NEXT_THEME = { system: "dark", dark: "light", light: "system" } as const;
 
 export function Topbar() {
   const n = inboxItems.value.length;
@@ -23,8 +26,8 @@ export function Topbar() {
         <button
           type="button"
           class={cx("icon-btn", !prefs.value.sidebarCollapsed && "active-soft")}
-          data-tip="Toggle sidebar"
-          data-keys="Alt+B"
+          data-tip={prefs.value.sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+          data-keys="Ctrl+Shift+B"
           aria-label="Toggle sidebar"
           onClick={A.toggleSidebar}
         >
@@ -61,15 +64,15 @@ export function Topbar() {
         <button
           type="button"
           class="icon-btn"
-          data-tip={`Theme: ${theme}`}
-          aria-label="Cycle theme"
+          data-tip={`Theme: ${THEME_NAME[theme]} · click for ${THEME_NAME[NEXT_THEME[theme]]}`}
+          aria-label={`Theme: ${THEME_NAME[theme]}. Switch to ${THEME_NAME[NEXT_THEME[theme]]}`}
           onClick={A.cycleTheme}
         >
           {theme === "light"
             ? <IconSun size={16} />
             : theme === "dark"
             ? <IconMoon size={16} />
-            : <IconMonitor size={16} />}
+            : <IconContrast size={15} />}
         </button>
         <button
           type="button"

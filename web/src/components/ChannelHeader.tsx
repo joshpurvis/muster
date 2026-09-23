@@ -1,6 +1,6 @@
 import { useRef } from "preact/hooks";
 import type { Channel } from "../types.ts";
-import { layouts, meta, prefs, renaming, sessionsByChannel, workspaceById } from "../state.ts";
+import { layouts, meta, prefs, renaming, rightVisible, sessionsByChannel, workspaceById } from "../state.ts";
 import * as A from "../actions.ts";
 import { IconButton, InlineEdit } from "./common.tsx";
 import { type MenuItem, openMenuAt } from "./Menu.tsx";
@@ -179,14 +179,14 @@ export function ChannelHeader({ c }: { c: Channel }) {
           icon={<IconTimeline size={16} />}
           tip="Timeline"
           keys="Alt+L"
-          active={p.rightOpen && p.rightTab === "timeline"}
+          active={rightVisible.value && p.rightTab === "timeline"}
           onClick={() => A.toggleRight("timeline")}
         />
         <IconButton
           icon={<IconDiff size={16} />}
           tip="Diff"
           keys="Alt+G"
-          active={p.rightOpen && p.rightTab === "diff"}
+          active={rightVisible.value && p.rightTab === "diff"}
           onClick={() => A.toggleRight("diff")}
         />
         <button

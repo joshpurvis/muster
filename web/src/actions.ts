@@ -226,13 +226,25 @@ export function reorderTabs(ids: ChannelId[]) {
   if (w) {
     knowWindow({ ...w, channel_ids: ids });
     rpc.call<Win>("window.reorder_tabs", { id: w.id, channel_ids: ids })
-      .catch(fail("Reorder failed")).catch(() => {});
+      .then(knowWindow)
+      .catch((e) => {
+        // Roll back the optimistic order unless something newer replaced it meanwhile.
+        const cur = windows.value.find((x) => x.id === w.id);
+        if (cur && cur.channel_ids.join() === ids.join()) knowWindow({ ...cur, channel_ids: w.channel_ids });
+        toast("error", `Reorder failed: ${errText(e)}`);
+      });
     return;
   }
   // No windows: the daemon's global channel order is the tab order.
+  const before = new Map(channels.value.map((c) => [c.id, c.sort_order]));
   const pos = new Map(ids.map((id, i) => [id, i]));
   channels.value = channels.value.map((c) => (pos.has(c.id) ? { ...c, sort_order: pos.get(c.id)! } : c));
-  rpc.call("channel.reorder", { ids }).catch(fail("Reorder failed")).catch(() => {});
+  rpc.call("channel.reorder", { ids }).catch((e) => {
+    channels.value = channels.value.map((
+      c,
+    ) => (before.has(c.id) ? { ...c, sort_order: before.get(c.id)! } : c));
+    toast("error", `Reorder failed: ${errText(e)}`);
+  });
 }
 
 export function dropTabAt(id: ChannelId, slot: number) {
@@ -272,12 +284,20 @@ export async function gotoChannel(id: ChannelId, sid?: SessionId) {
 }
 
 /** Alt+J: the next session that needs you, in any window. */
+let lastNeedsYou: SessionId | null = null;
+
 export function nextNeedsYou() {
-  const next = nextInCycle(needsYou.value, focusedSession()?.id ?? null);
+  const list = needsYou.value;
+  // Cycle from the focused session when it needs you; else from the last one we went to (it may
+  // be in another window that was raised, so focus here didn't move).
+  const focused = focusedSession()?.id ?? null;
+  const from = focused !== null && list.some((s) => s.id === focused) ? focused : lastNeedsYou;
+  const next = nextInCycle(list, from);
   if (!next) {
     toast("info", "Nothing needs you", 1500);
     return;
   }
+  lastNeedsYou = next.id;
   gotoChannel(next.channel_id, next.id);
 }
 
@@ -625,9 +645,8 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
   setPref("lastAgent", req.agent ?? "none");
   pushRecentFolder(ws.path);
   knowChannel(here !== null ? { ...c, window_id: c.window_id ?? here } : c);
-  if (here !== null && !myWindow.value?.channel_ids.includes(c.id)) {
-    windows.value = moveChannelLocally(windows.value, c.id, here);
-  }
+  // Optimistic: the window_upserted that lists the new tab may lag the reply.
+  if (here !== null) windows.value = moveChannelLocally(windows.value, c.id, here);
   selectTab(c.id);
   return c;
 }

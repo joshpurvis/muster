@@ -413,7 +413,10 @@ function attach(e: Entry) {
   const go = () =>
     rpc.call("session.resize", { id: e.sid, cols: e.term.cols, rows: e.term.rows })
       .catch(() => {})
-      .then(() => rpc.call("session.attach", { id: e.sid }))
+      // Detached (tab moved away) or disposed while the resize was in flight: don't attach.
+      .then(() =>
+        e.attached && entries.get(e.sid) === e ? rpc.call("session.attach", { id: e.sid }) : undefined
+      )
       .catch(() => {
         // Keep `attached` (= wanted): a reconnect's reattachAll retries it. If the session is
         // gone, session_removed disposes the entry.

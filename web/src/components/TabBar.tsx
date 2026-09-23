@@ -352,7 +352,38 @@ export function TabBar() {
 
   return (
     <header class={cx("tabbar", d && "tab-dragging")}>
-      <div class="tb-tabs" role="tablist" aria-label="Tabs" ref={tabsRef} onWheel={onWheel}>
+      <div
+        class="tb-tabs"
+        role="tablist"
+        aria-label="Tabs"
+        ref={tabsRef}
+        onWheel={onWheel}
+        onKeyDown={(e) => {
+          // Roving focus: ←/→ (Home/End) select tabs, Enter goes to the terminal.
+          if (e.altKey || e.ctrlKey || e.metaKey || !(e.target as HTMLElement).matches?.(".ttab")) return;
+          const i = list.findIndex((c) => c.id === active?.id);
+          let next = -1;
+          if (e.key === "ArrowRight") next = (i + 1) % list.length;
+          else if (e.key === "ArrowLeft") next = (i - 1 + list.length) % list.length;
+          else if (e.key === "Home") next = 0;
+          else if (e.key === "End") next = list.length - 1;
+          else if (e.key === "Enter") {
+            e.preventDefault();
+            A.focusActiveTerminalSoon();
+            return;
+          } else if (e.key === "F2" && active) {
+            e.preventDefault();
+            renaming.value = { kind: "channel", id: active.id };
+            return;
+          }
+          if (next < 0 || !list[next]) return;
+          e.preventDefault();
+          A.selectTab(list[next].id, false);
+          requestAnimationFrame(() =>
+            tabsRef.current?.querySelector<HTMLElement>(`[data-tab-id="${list[next].id}"]`)?.focus()
+          );
+        }}
+      >
         {list.map((c, i) => <TopTab key={c.id} c={c} index={i} active={c.id === active?.id} />)}
       </div>
       {overflow && (
@@ -479,7 +510,8 @@ function TopTab({ c, index, active }: { c: Channel; index: number; active: boole
       class={cx("ttab", active && "active", isUnread && "unread", dragging && "dragging")}
       role="tab"
       aria-selected={active}
-      tabIndex={-1}
+      tabIndex={active ? 0 : -1}
+      aria-label={label.text}
       data-tab-id={c.id}
       data-tip={tip}
       onPointerDown={(e) => {

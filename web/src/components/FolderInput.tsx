@@ -28,9 +28,9 @@ export function FolderInput(
     }
   }, []);
 
-  // Suggest only once the user types (the prefilled folder needs none).
+  // Fetch completions for every value (the list only shows once the user types or presses Tab),
+  // so the first Tab already has something to complete.
   useEffect(() => {
-    if (!touched) return;
     const prefix = value || "~/";
     const my = ++seq.current;
     const t = setTimeout(() => {
@@ -43,7 +43,7 @@ export function FolderInput(
         .catch(() => my === seq.current && setSugg([]));
     }, 90);
     return () => clearTimeout(t);
-  }, [value, touched]);
+  }, [value]);
 
   const complete = (v: string) => {
     onChange(v.endsWith("/") ? v : v + "/");

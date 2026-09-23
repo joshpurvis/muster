@@ -9,11 +9,14 @@ import {
   myWindow,
   overlay,
   prefs,
+  sessions,
   sessionsByChannel,
   tabIdSet,
+  tabs,
   toasts,
   windowById,
   windowOf,
+  windows,
   workspaceById,
   workspaces,
 } from "../state.ts";
@@ -197,8 +200,12 @@ function jumpEntries(): Entry[] {
   };
   const live = channels.value.filter((c) => !c.archived);
   // This window's tabs first, in tab order, then other windows'.
+  // This window's tabs in tab order, then other windows' (by window, then age).
+  const tabPos = new Map(tabs.value.map((c, i) => [c.id, i]));
   const ordered = [...live].sort((a, b) =>
-    Number(here.has(b.id)) - Number(here.has(a.id)) || (windowOf(a) ?? 0) - (windowOf(b) ?? 0) || a.id - b.id
+    Number(here.has(b.id)) - Number(here.has(a.id)) ||
+    (tabPos.get(a.id) ?? 0) - (tabPos.get(b.id) ?? 0) ||
+    (windowOf(a) ?? 0) - (windowOf(b) ?? 0) || a.id - b.id
   );
   const tabOf = new Map<number, string>();
   for (const c of ordered) {
@@ -316,10 +323,13 @@ function Jump({ initial }: { initial: string }) {
     }
     const query = q.trim();
     const items = jumpEntries();
-    // Commands also match plain queries, after everything else.
-    if (query) { for (const c of commandEntries()) items.push({ ...c, boost: -4 }); }
-    return rankJump(items, query, prefs.value.recent).map((r) => ({ e: r.item, hits: r.hits }));
-  }, [q]);
+    const ranked = rankJump(items, query, prefs.value.recent).map((r) => ({ e: r.item, hits: r.hits }));
+    // Commands also match plain queries, always after everything else.
+    if (!query) return ranked;
+    const cmds = rankJump(commandEntries(), query, [], 10).map((r) => ({ e: r.item, hits: r.hits }));
+    return [...ranked, ...cmds];
+    // Live: states and tabs change while Jump is open.
+  }, [q, sessions.value, channels.value, windows.value]);
 
   useEffect(() => setSel(0), [q]);
   useEffect(() => {

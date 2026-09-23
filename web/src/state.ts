@@ -283,7 +283,8 @@ effect(() => {
 });
 effect(() => {
   const id = activeChannelId.value;
-  if (id !== null && helloDone.peek()) save(activeKey(), id);
+  // Only a tab of this window (a stale id from before a claim must not land under its key).
+  if (id !== null && helloDone.peek() && tabIdSet.value.has(id)) save(activeKey(), id);
 });
 
 // ---------------- layouts ----------------

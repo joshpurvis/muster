@@ -429,6 +429,7 @@ impl Store {
                     cols: r.get::<_, i64>(12)?.clamp(1, u16::MAX as i64) as u16,
                     rows: r.get::<_, i64>(13)?.clamp(1, u16::MAX as i64) as u16,
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
+                    subagents: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
                 },

@@ -231,7 +231,10 @@ struct Inner {
     /// A better source (agent title > first prompt > shell title) renames it again.
     branch_named_from: HashMap<ChannelId, NameSource>,
     /// Worktree directories being deleted right now: no process may start inside them.
-    removing_worktrees: HashSet<PathBuf>,
+    /// Windows a client window was just launched for (`window.show`), until one claims them.
+    launching: HashMap<WindowId, std::time::Instant>,
+    /// Counted: overlapping removals of one directory each hold it until they finish.
+    removing_worktrees: HashMap<PathBuf, u32>,
     sessions: BTreeMap<SessionId, SessEntry>,
     tokens: HashMap<String, SessionId>,
     /// One-time launch code -> expiry.
@@ -260,6 +263,23 @@ const REPLAY_CACHE_MAX: usize = 8;
 impl Hub {
     /// Load persisted state. Sessions that were running when the previous daemon died are
     /// marked Exited ("daemon restarted").
+    /// Record a client-window launch for `id`; false while an earlier launch (under 15 s ago)
+    /// hasn't been claimed yet, so repeated `window.show` calls don't open duplicates.
+    pub fn begin_window_launch(&self, id: WindowId) -> bool {
+        let mut g = self.inner.lock();
+        let now = std::time::Instant::now();
+        if g.launching.get(&id).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(15)) {
+            return false;
+        }
+        g.launching.insert(id, now);
+        true
+    }
+
+    /// A launch failed: allow the next `window.show` to try again.
+    pub fn end_window_launch(&self, id: WindowId) {
+        self.inner.lock().launching.remove(&id);
+    }
+
     /// The muster binary the daemon runs as (for launching client windows).
     pub fn muster_bin(&self) -> &Path {
         &self.cfg.muster_bin
@@ -1360,6 +1380,7 @@ impl Hub {
             if let Some(w) = g.windows.get_mut(&target) {
                 w.holder = Some(conn);
             }
+            g.launching.remove(&target);
             // Adopt orphans: live channels whose window is unset or gone.
             let mut orphans: Vec<(i64, ChannelId)> = g
                 .channels
@@ -1642,17 +1663,18 @@ impl Hub {
                 }
                 // Re-checked, and reserved until the delete is done: a session may have moved out
                 // (or be starting) since the check above.
-                if let Err(user) = self.reserve_worktree_removal(&ch) {
-                    self.notice(
+                // Reserved (checked and marked under one lock) until the delete ends; the guard
+                // also releases it when this future is dropped mid-way (the client went away).
+                match self.reserve_worktree_removal(&ch) {
+                    Err(user) => self.notice(
                         "warn",
                         format!("Kept worktree {}: session {user} in another tab still runs in it", ch.cwd),
-                    );
-                } else if let Err(e) = {
-                    let r = worktree::remove(&repo, Path::new(&ch.cwd)).await;
-                    self.release_worktree(&ch);
-                    r
-                } {
-                    self.notice("warn", format!("Could not remove worktree {}: {e:#}", ch.cwd));
+                    ),
+                    Ok(_reservation) => {
+                        if let Err(e) = worktree::remove(&repo, Path::new(&ch.cwd)).await {
+                            self.notice("warn", format!("Could not remove worktree {}: {e:#}", ch.cwd));
+                        }
+                    }
                 }
             }
         }
@@ -1668,17 +1690,14 @@ impl Hub {
     /// Mark `ch`'s worktree as being deleted, unless a session outside `ch` runs (or is
     /// starting) in it; checked and marked under one lock, and `start_process` refuses cwds
     /// inside a marked directory, so nothing can start there until `release_worktree`.
-    fn reserve_worktree_removal(&self, ch: &Channel) -> Result<(), SessionId> {
+    fn reserve_worktree_removal(&self, ch: &Channel) -> Result<WorktreeReservation<'_>, SessionId> {
         let mut g = self.inner.lock();
         if let Some(user) = dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy))) {
             return Err(user);
         }
-        g.removing_worktrees.insert(PathBuf::from(&ch.cwd));
-        Ok(())
-    }
-
-    fn release_worktree(&self, ch: &Channel) {
-        self.inner.lock().removing_worktrees.remove(Path::new(&ch.cwd));
+        let path = PathBuf::from(&ch.cwd);
+        *g.removing_worktrees.entry(path.clone()).or_insert(0) += 1;
+        Ok(WorktreeReservation { hub: self, path })
     }
 
     /// Archive `id` (keeping any worktree) only if it has no sessions left, checked and marked
@@ -1820,6 +1839,7 @@ impl Hub {
                 cols,
                 rows,
                 queued: 0,
+                subagents: 0,
                 created_at: now,
                 window_id: Some(window_id),
             };
@@ -1963,13 +1983,15 @@ impl Hub {
                     .info
                     .cwd,
             );
-            if g.removing_worktrees.iter().any(|w| cwd.starts_with(w)) {
+            if g.removing_worktrees.keys().any(|w| cwd.starts_with(w)) {
                 anyhow::bail!("session {id}'s folder is a worktree being removed");
             }
             let e = g.sessions.get_mut(&id).expect("looked up above");
             e.generation = generation;
             e.early_exit = None;
             let (info, extra) = (e.info.clone(), e.extra_args.clone());
+            // Also on restarts: args stored before the allowlist existed are replayed here.
+            crate::agents::check_extra_args(info.kind, &extra)?;
             let ch = g.channels.get(&info.channel_id);
             let port_base = ch.map(|c| c.port_base).unwrap_or(20000);
             let permissions = ch.map(|c| c.permissions).unwrap_or_default();
@@ -2546,7 +2568,28 @@ impl Hub {
         if let Some(u) = update {
             self.set_state(id, u, StateSource::Hook);
         }
+        if let Some(delta) = subagent_delta(event, &payload) {
+            self.adjust_subagents(id, delta);
+        }
         Ok(())
+    }
+
+    /// Change the running-subagent count (runtime only; emits on change). `None`: reset to 0.
+    fn adjust_subagents(&self, id: SessionId, delta: Option<i32>) {
+        let info = {
+            let mut g = self.inner.lock();
+            let Some(e) = g.sessions.get_mut(&id) else { return };
+            let next = match delta {
+                Some(d) => (e.info.subagents as i64 + d as i64).max(0) as u32,
+                None => 0,
+            };
+            if next == e.info.subagents {
+                return;
+            }
+            e.info.subagents = next;
+            e.info.clone()
+        };
+        self.emit(ServerEvent::SessionUpserted(info));
     }
 
     // ----- daemon lifecycle -----
@@ -2805,6 +2848,25 @@ pub fn prompt_name(text: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// A worktree directory marked as being deleted; unmarked when dropped, however the delete
+/// ends (done, failed, or its future dropped).
+struct WorktreeReservation<'a> {
+    hub: &'a Hub,
+    path: PathBuf,
+}
+
+impl Drop for WorktreeReservation<'_> {
+    fn drop(&mut self) {
+        let mut g = self.hub.inner.lock();
+        if let Some(n) = g.removing_worktrees.get_mut(&self.path) {
+            *n -= 1;
+            if *n == 0 {
+                g.removing_worktrees.remove(&self.path);
+            }
+        }
+    }
+}
+
 /// The first running session (`(info, running)`) outside `ch` whose cwd is inside `ch.cwd`.
 fn dir_user<'a>(ch: &Channel, sessions: impl Iterator<Item = (&'a SessionInfo, bool)>) -> Option<SessionId> {
     let root = Path::new(&ch.cwd);
@@ -2812,6 +2874,20 @@ fn dir_user<'a>(ch: &Channel, sessions: impl Iterator<Item = (&'a SessionInfo, b
         .filter(|(i, running)| *running && i.channel_id != ch.id && Path::new(&i.cwd).starts_with(root))
         .map(|(i, _)| i.id)
         .next()
+}
+
+/// How a hook changes the count of built-in subagents: +1 when the Agent/Task tool starts, -1
+/// when it returns (or fails), reset (`Some(None)`) when a session starts or ends. `None`: no
+/// change. Background subagents return at launch, so only foreground ones are counted.
+fn subagent_delta(event: &str, payload: &serde_json::Value) -> Option<Option<i32>> {
+    let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    let agent_tool = matches!(tool, "Agent" | "Task");
+    match event {
+        "PreToolUse" if agent_tool => Some(Some(1)),
+        "PostToolUse" | "PostToolUseFailure" if agent_tool => Some(Some(-1)),
+        "SessionStart" | "SessionEnd" => Some(None),
+        _ => None,
+    }
 }
 
 /// Where an auto-named channel's name came from, worst to best.
@@ -3252,6 +3328,37 @@ mod tests {
         let mut pick = |req, parent, cid| hub.session_window_locked(&mut g, req, parent, cid, &mut ev);
         assert_eq!(pick(None, None, 1).unwrap(), 1);
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn worktree_reservations_are_counted_and_released_on_drop() {
+        let hub = move_fixture();
+        let ch = hub.channel(1).unwrap();
+        let reserved = |h: &Hub| h.inner.lock().removing_worktrees.contains_key(Path::new(&ch.cwd));
+        let a = hub.reserve_worktree_removal(&ch).ok().unwrap();
+        let b = hub.reserve_worktree_removal(&ch).ok().unwrap();
+        drop(a);
+        assert!(reserved(&hub), "the overlapping removal still holds it");
+        drop(b);
+        assert!(!reserved(&hub));
+        // A dropped (cancelled) delete releases it too.
+        {
+            let _r = hub.reserve_worktree_removal(&ch).ok().unwrap();
+            assert!(reserved(&hub));
+        }
+        assert!(!reserved(&hub));
+    }
+
+    #[test]
+    fn window_launches_are_deduplicated_until_failed_or_claimed() {
+        let hub = move_fixture();
+        assert!(hub.begin_window_launch(1));
+        assert!(!hub.begin_window_launch(1), "a launch is already on its way");
+        assert!(hub.begin_window_launch(2), "other windows are independent");
+        hub.end_window_launch(1);
+        assert!(hub.begin_window_launch(1), "a failed launch can be retried");
+        hub.claim_window(7, Some(1)).unwrap();
+        assert!(!hub.inner.lock().launching.contains_key(&1), "claimed: launch done");
     }
 
     #[test]

@@ -267,6 +267,10 @@ pub struct SessionInfo {
     pub rows: u16,
     /// Messages waiting in the injection queue.
     pub queued: u32,
+    /// Built-in subagents (Claude Code's Agent/Task tool) the agent is running right now, from
+    /// its hooks. Runtime only: not persisted, 0 after a restart.
+    #[serde(default)]
+    pub subagents: u32,
     pub created_at: i64,
     /// Client window this session is a tab in (None: adopted by the next `window.claim`).
     #[serde(default)]

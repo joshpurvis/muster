@@ -192,6 +192,7 @@ mod tests {
             cols: 120,
             rows: 32,
             queued: 0,
+            subagents: 0,
             created_at: 0,
             window_id: None,
         }

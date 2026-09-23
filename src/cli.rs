@@ -1042,6 +1042,8 @@ impl EventTracker {
     pub fn resync(&mut self, snap: &Snapshot) {
         self.sessions = snap.sessions.iter().map(|s| (s.id, s.clone())).collect();
         self.note_session_tab();
+        // Rebuilt from the snapshot: a tab may have changed windows while events were missed.
+        self.windows.clear();
         for c in &snap.channels {
             if let Some(w) = c.window_id {
                 let tabs = self.windows.entry(w).or_default();
@@ -1146,7 +1148,11 @@ impl EventTracker {
                 let pass = self.unfiltered()
                     || self.focus_tab().is_some_and(|c| tabs.contains(&c))
                     || self.session_window().is_some_and(|w| Some(w) == id);
-                if let Some(id) = id {
+                // A window whose last tab just closed keeps its remembered tabs, so its coming
+                // `window_removed` still matches the filter.
+                if let Some(id) = id
+                    && !tabs.is_empty()
+                {
                     self.windows.insert(id, tabs);
                 }
                 pass
@@ -1355,6 +1361,17 @@ mod tests {
         assert!(t.apply(&ev("channel_removed", json!({"id": 6}))).pass);
         assert!(!t.apply(&ev("channel_removed", json!({"id": 2}))).pass);
         assert!(t.apply(&ev("session_removed", json!({"id": 62}))).pass);
+    }
+
+    #[test]
+    fn events_window_removed_after_its_last_tab_closed() {
+        let by_tab = EventFilter { session: None, channel: Some(6) };
+        let mut t = EventTracker::new(&snap(), by_tab);
+        assert!(t.apply(&ev("window_upserted", json!({"id": 3, "channel_ids": [6]}))).pass);
+        // The tab closes: the window is upserted without it, then removed.
+        t.apply(&ev("channel_removed", json!({"id": 6})));
+        t.apply(&ev("window_upserted", json!({"id": 3, "channel_ids": []})));
+        assert!(t.apply(&ev("window_removed", json!({"id": 3}))).pass);
     }
 
     #[test]

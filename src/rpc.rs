@@ -373,9 +373,15 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             let w = hub
                 .window(p.id)
                 .ok_or_else(|| RpcError(format!("no such window: {}", p.id)))?;
-            // Already on screen somewhere: bring it forward instead of opening a second one.
-            if w.open && crate::wm::raise(&crate::wm::window_title(&w.name)).await {
-                return Ok(json!({ "shown": "raised" }));
+            // Already on screen: bring it forward (best effort; without a WM helper it just
+            // stays where it is). Never a second client for a held window.
+            if w.open {
+                let raised = crate::wm::raise(&crate::wm::window_title(&w.name)).await;
+                return Ok(json!({ "shown": if raised { "raised" } else { "open" } }));
+            }
+            // Launched moments ago and not claimed yet: don't open a duplicate.
+            if !hub.begin_window_launch(p.id) {
+                return Ok(json!({ "shown": "launching" }));
             }
             // A client can't open another native window itself: launch one, like
             // `muster open --window N` from a terminal (the daemon's environment has the display).
@@ -392,10 +398,23 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
                     Ok(())
                 });
             }
-            let mut child = cmd.spawn().map_err(|e| RpcError(format!("launching a window: {e}")))?;
-            // `open` hands off to a detached window process and exits; reap it.
-            tokio::task::spawn_blocking(move || child.wait());
-            Ok(json!({ "shown": "launched" }))
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    hub.end_window_launch(p.id);
+                    return Err(RpcError(format!("launching a window: {e}")));
+                }
+            };
+            // `open` hands off to a detached window process and exits: a quick non-zero exit
+            // means the launch failed (the UI then falls back). Reaped either way.
+            let wait = tokio::task::spawn_blocking(move || child.wait());
+            match tokio::time::timeout(Duration::from_secs(3), wait).await {
+                Ok(Ok(Ok(status))) if !status.success() => {
+                    hub.end_window_launch(p.id);
+                    Err(RpcError(format!("launching a window failed ({status})")))
+                }
+                _ => Ok(json!({ "shown": "launched" })),
+            }
         }
         "window.raise" => {
             let p: IdParam<WindowId> = parse(params)?;

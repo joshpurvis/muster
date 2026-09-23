@@ -104,6 +104,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "kind": {"type": "string", "enum": ["claude", "codex", "shell"], "description": "What to run."},
                     "prompt": {"type": "string", "description": "Initial task for the agent (or command for a shell)."},
                     "name": {"type": "string", "description": "Display name for the session."},
+                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6-sol' (codex). Default: the CLI's own default."},
+                    "effort": {"type": "string", "description": "Reasoning effort, e.g. 'low', 'medium', 'high' (claude --effort), 'xhigh' (codex model_reasoning_effort)."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra CLI arguments for the agent. Only an allowlist is accepted (claude: --model, --effort, --fallback-model, --append-system-prompt, --continue, --resume, --verbose, --debug; codex: -m, -c with model/model_reasoning_* keys, -i, --no-alt-screen); permissions always come from the channel's profile."},
                     "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},
                     "new_channel": {
                         "type": "object",
@@ -611,6 +614,45 @@ fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
     Ok(pretty(&Value::Array(out)))
 }
 
+/// `spawn_agent`'s `model`, `effort` and `args` as CLI arguments, checked against the agent
+/// argument allowlist (so they can't widen the channel's permission profile).
+fn agent_args(kind: SessionKind, a: &Args<'_>) -> Result<Vec<String>, String> {
+    let model = a.str("model")?.map(str::trim).filter(|m| !m.is_empty());
+    let effort = a.str("effort")?.map(str::trim).filter(|e| !e.is_empty());
+    let mut out = Vec::new();
+    match (kind, model, effort) {
+        (SessionKind::Shell, None, None) => {}
+        (SessionKind::Shell, _, _) => return Err("model and effort are for claude and codex agents".into()),
+        (SessionKind::Claude, m, e) => {
+            if let Some(m) = m {
+                out.extend(["--model".to_string(), m.to_string()]);
+            }
+            if let Some(e) = e {
+                out.extend(["--effort".to_string(), e.to_string()]);
+            }
+        }
+        (SessionKind::Codex, m, e) => {
+            if let Some(m) = m {
+                out.extend(["-m".to_string(), m.to_string()]);
+            }
+            if let Some(e) = e {
+                out.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
+            }
+        }
+    }
+    match a.get("args") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(v)) => {
+            for x in v {
+                out.push(x.as_str().ok_or("`args` must be an array of strings")?.to_string());
+            }
+        }
+        Some(_) => return Err("`args` must be an array of strings".into()),
+    }
+    crate::agents::check_extra_args(kind, &out).map_err(|e| format!("{e:#}"))?;
+    Ok(out)
+}
+
 async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let kind_s = a.req_str("kind")?;
     let kind = SessionKind::parse(kind_s)
@@ -623,6 +665,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         .str("name")?
         .filter(|n| !n.trim().is_empty())
         .map(str::to_string);
+    let extra_args = agent_args(kind, a)?;
     let channel_id = a.int("channel_id")?;
     let new_channel = match a.get("new_channel") {
         None => None,
@@ -730,7 +773,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         name,
         cwd: None,
         prompt,
-        extra_args: Vec::new(),
+        extra_args,
         cols: 120,
         rows: 32,
         parent_id: Some(caller),

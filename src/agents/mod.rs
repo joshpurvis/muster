@@ -33,44 +33,118 @@ pub struct SpawnCtx {
     pub permissions: Permissions,
 }
 
-/// Refuse extra args that would change what an agent may do: the channel's permission profile
-/// (set by the human, applied as flags before the extra args) must stay what decides it, and the
-/// CLIs let a later flag win. Shells take anything.
+/// How an allowed extra-arg flag takes its value.
+#[derive(Clone, Copy, PartialEq)]
+enum Val {
+    /// No value.
+    None,
+    /// Exactly one (`--flag v`, `--flag=v`, `-fv`).
+    One,
+    /// An optional one (`--flag`, `--flag=v`, or `--flag v` when `v` doesn't start with `-`).
+    Opt,
+    /// One or more (`-i a.png b.png`).
+    Many,
+}
+
+/// Extra args users may pass to agent CLIs. An allowlist: the channel's permission profile (set
+/// by the human, applied as flags before the extra args) must stay what decides what an agent
+/// may do, and the CLIs let a later flag win, so anything that could widen it (sandbox,
+/// approval policy, allowed tools, extra dirs, settings, config profiles) is refused. Shells
+/// take anything.
+const CLAUDE_ARGS: &[(&str, Option<char>, Val)] = &[
+    ("--model", None, Val::One),
+    ("--effort", None, Val::One),
+    ("--fallback-model", None, Val::One),
+    ("--append-system-prompt", None, Val::One),
+    ("--continue", Some('c'), Val::None),
+    ("--resume", Some('r'), Val::Opt),
+    ("--verbose", None, Val::None),
+    ("--debug", Some('d'), Val::Opt),
+];
+const CODEX_ARGS: &[(&str, Option<char>, Val)] = &[
+    ("--model", Some('m'), Val::One),
+    ("--config", Some('c'), Val::One),
+    ("--image", Some('i'), Val::Many),
+    ("--no-alt-screen", None, Val::None),
+];
+/// `codex -c key=value` keys that don't touch permissions.
+const CODEX_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_verbosity",
+    "hide_agent_reasoning",
+    "show_raw_agent_reasoning",
+];
+
 pub fn check_extra_args(kind: SessionKind, args: &[String]) -> anyhow::Result<()> {
-    let (flags, config_flags): (&[&str], &[&str]) = match kind {
-        SessionKind::Claude => (
-            &["--permission-mode", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"],
-            &[],
-        ),
-        SessionKind::Codex => (
-            &[
-                "--sandbox",
-                "-s",
-                "--full-auto",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--yolo",
-                "--profile",
-                "-p",
-            ],
-            &["-c", "--config"],
-        ),
+    let table = match kind {
+        SessionKind::Claude => CLAUDE_ARGS,
+        SessionKind::Codex => CODEX_ARGS,
         SessionKind::Shell => return Ok(()),
     };
-    let name = |a: &str| a.split_once('=').map_or(a, |(n, _)| n).to_string();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        let n = name(a);
-        if flags.contains(&n.as_str()) {
-            anyhow::bail!("{n} changes the agent's permissions; set the tab's permissions instead");
+    let allowed = || {
+        table
+            .iter()
+            .map(|(l, s, _)| s.map_or(l.to_string(), |c| format!("-{c}/{l}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let refuse = |a: &str| {
+        anyhow::anyhow!(
+            "{a} is not allowed as an agent argument (allowed: {}). Permissions come from the tab's permission profile",
+            allowed()
+        )
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        // Which flag, and a value attached to it (`--flag=v`, `-fv`).
+        let (entry, attached) = if let Some(long) = a.strip_prefix("--") {
+            let (name, v) = long.split_once('=').map_or((long, None), |(n, v)| (n, Some(v)));
+            (table.iter().find(|(l, _, _)| l[2..] == *name), v)
+        } else if let Some(short) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
+            let c = short.chars().next().unwrap();
+            let rest = &short[c.len_utf8()..];
+            (table.iter().find(|(_, s, _)| *s == Some(c)), (!rest.is_empty()).then_some(rest))
+        } else {
+            (None, None)
+        };
+        let Some(&(long, _, val)) = entry else {
+            return Err(refuse(a));
+        };
+        let mut values: Vec<&str> = attached.into_iter().collect();
+        match val {
+            Val::None if !values.is_empty() => return Err(refuse(a)),
+            Val::None => {}
+            Val::One if values.is_empty() => {
+                let v = args.get(i).ok_or_else(|| anyhow::anyhow!("{a} needs a value"))?;
+                values.push(v);
+                i += 1;
+            }
+            Val::One => {}
+            Val::Opt | Val::Many => {
+                while (values.is_empty() || val == Val::Many)
+                    && let Some(v) = args.get(i).filter(|v| !v.starts_with('-'))
+                {
+                    values.push(v);
+                    i += 1;
+                    if val == Val::Opt {
+                        break;
+                    }
+                }
+            }
         }
-        if config_flags.contains(&n.as_str()) {
-            // `-c key=value`, `--config key=value`, `--config=key=value`.
-            let kv = match a.split_once('=') {
-                Some((_, rest)) if n == "--config" || n == "-c" => Some(rest.to_string()),
-                _ => it.peek().map(|v| v.to_string()),
-            };
-            if kv.as_deref().is_some_and(|kv| kv.trim_start().starts_with("sandbox")) {
-                anyhow::bail!("{n} sandbox settings change the agent's permissions; set the tab's permissions instead");
+        if kind == SessionKind::Codex && long == "--config" {
+            for kv in &values {
+                let key = kv.split_once('=').map_or(*kv, |(k, _)| k).trim();
+                if !CODEX_CONFIG_KEYS.contains(&key) {
+                    anyhow::bail!(
+                        "-c {key} is not allowed as an agent argument (allowed keys: {}). Permissions come from the tab's permission profile",
+                        CODEX_CONFIG_KEYS.join(", ")
+                    );
+                }
             }
         }
     }
@@ -185,19 +259,44 @@ mod tests {
     #[test]
     fn extra_args_cannot_change_permissions() {
         use SessionKind::*;
-        assert!(check(Codex, &["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]));
-        assert!(check(Claude, &["--model", "haiku"]));
+        for ok in [
+            &["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"][..],
+            &["--model=gpt-6-sol", "-cmodel_reasoning_effort=high", "--config", "model_verbosity=low"],
+            &["-mgpt-6-luna"],
+            &["-i", "a.png", "b.png", "--no-alt-screen"],
+        ] {
+            assert!(check(Codex, ok), "{ok:?}");
+        }
+        for ok in [
+            &["--model", "haiku"][..],
+            &["--model=sonnet", "--effort", "high", "--fallback-model", "haiku"],
+            &["-c"],
+            &["-r", "abc123", "--verbose"],
+            &["--resume"],
+            &["-d", "--append-system-prompt", "be brief"],
+        ] {
+            assert!(check(Claude, ok), "{ok:?}");
+        }
         for bad in [
             &["--sandbox", "danger-full-access"][..],
             &["-s", "read-only"],
+            &["-sdanger-full-access"],
             &["--sandbox=danger-full-access"],
             &["--full-auto"],
             &["--yolo"],
             &["--dangerously-bypass-approvals-and-sandbox"],
             &["--profile", "wide"],
+            &["-pwide"],
+            &["-a", "never"],
+            &["--ask-for-approval", "never"],
+            &["--add-dir", "/"],
             &["-c", "sandbox_workspace_write.network_access=true"],
-            &["--config", "sandbox_mode=danger-full-access"],
+            &["-csandbox_mode=danger-full-access"],
             &["--config=sandbox_mode=danger-full-access"],
+            &["-c", "approval_policy=never"],
+            &["-c", "profiles.loose.sandbox_mode=danger-full-access"],
+            &["--model"],
+            &["stray-positional"],
         ] {
             assert!(!check(Codex, bad), "{bad:?}");
         }
@@ -205,6 +304,12 @@ mod tests {
             &["--permission-mode", "bypassPermissions"][..],
             &["--permission-mode=acceptEdits"],
             &["--dangerously-skip-permissions"],
+            &["--allowedTools", "Bash"],
+            &["--allowed-tools", "Bash"],
+            &["--add-dir", "/"],
+            &["--settings", "/tmp/x.json"],
+            &["--mcp-config", "x.json"],
+            &["-cx"],
         ] {
             assert!(!check(Claude, bad), "{bad:?}");
         }

@@ -145,7 +145,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.focused` | `{id}` | `{}` (records `last_focused_at`; clients call it on window focus) |
 | `window.rename` | `{id, name}` | `Window` |
 | `window.reorder_tabs` | `{id, channel_ids: []}` | `Window` (ids not in the window are ignored; tabs left out keep their relative order after the listed ones) |
-| `window.show` | `{id}` | `{shown: "raised" \| "launched"}`. Puts window `id` on screen: raises it when a connection holds it (as `window.raise`), else the daemon launches `<muster binary> open --window <id>` detached (a native window can't open another one itself). Used by the UI when a tab moves to a window no client shows. |
+| `window.show` | `{id}` | `{shown: "raised" \| "open" \| "launching" \| "launched"}`. Puts window `id` on screen. When a connection holds it: raises it (`"raised"`, or `"open"` when no WM helper could), never a second client. Otherwise the daemon launches `<muster binary> open --window <id>` detached (a native window can't open another one itself); repeated calls within 15 s, before a client claims the window, return `"launching"` instead of launching again. A launcher that exits non-zero within 3 s is an error (the UI then falls back). |
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. |
@@ -224,6 +224,14 @@ result carries the new branch), the daemon renames the branch to `muster/<slug(n
 --abbrev-ref <branch>@{upstream}` fails). Failures are logged, never fatal. The worktree
 directory never moves.
 
+## Subagents
+
+`SessionInfo.subagents` (runtime only, 0 after a restart) counts the built-in subagents a
+Claude session is running right now (its Agent/Task tool): +1 on the tool's `PreToolUse`, -1
+on its `PostToolUse`/`PostToolUseFailure`, reset on `SessionStart`/`SessionEnd`. Background
+subagents return at launch, so only foreground ones are counted. Changes emit
+`session_upserted`.
+
 ## Groups layout (v2)
 
 The UI's structure is window → split groups → tabs, where a tab is one session. So a session
@@ -289,14 +297,24 @@ restart), for every agent in the channel, including agents spawned through MCP:
 | `plan` | `--permission-mode plan` |
 | `bypass` | `--permission-mode bypassPermissions` |
 
-The flags are always passed, so the channel profile (not a `sandbox_mode`, `network_access` or
-`defaultMode` in the user's own config) decides how a session starts. Approval policies are not
-touched. The user's `extra_args` for a session (`session.spawn`, or `channel.create` for its first
-agent) come after these flags, and since both CLIs let a later flag win, flags that change
-permissions are refused there (error: set the tab's permissions instead): Claude
-`--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`;
-Codex `--sandbox`/`-s`, `--full-auto`, `--dangerously-bypass-approvals-and-sandbox`, `--yolo`,
-`--profile`/`-p`, and `-c`/`--config` with a `sandbox…` key. Shells are not affected.
+Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
+`network_access` in the user's own config) decides how a Codex session starts. Claude's
+`default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
+there; the other Claude profiles pass `--permission-mode`. Approval policies are not touched.
+The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
+MCP `spawn_agent` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
+later flag win they are checked against an **allowlist** (also again on every restart):
+Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
+`-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
+with the keys `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
+`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. Values
+may be attached (`--model=x`, `-mx`, `-cmodel=x`). Anything else (sandbox, approval policy,
+allowed tools, extra dirs, settings, profiles, positional arguments) is refused. Shells are
+not affected.
+
+Claude sessions also get `permissions.allow: ["mcp__muster"]` in their per-session settings
+file, so calls to muster's own MCP tools skip Claude Code's `auto`-mode safety classifier
+(about 1.5-4 s per call otherwise). Muster's own guardrails still apply to those tools.
 Channels created before this existed have the defaults (store migration v3). `permissions` in
 `channel.create` and `channel.set_permissions` must name both fields (a partial profile is
 rejected, so it can't silently reset the other half).

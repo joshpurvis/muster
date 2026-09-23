@@ -87,8 +87,14 @@ pub fn settings_json(muster_bin: &Path) -> Value {
             }]}]),
         );
     }
-    json!({ "hooks": hooks })
+    // Muster's own MCP tools are allowed for this session: under `auto` mode every call would
+    // otherwise wait on Claude Code's safety classifier (1.5-4 s each). Muster's guardrails
+    // (spawn limits, no approving prompts) still apply on the daemon side.
+    json!({ "hooks": hooks, "permissions": { "allow": [MUSTER_TOOLS_RULE] } })
 }
+
+/// Permission rule matching every tool of the `muster` MCP server.
+pub const MUSTER_TOOLS_RULE: &str = "mcp__muster";
 
 /// `--permission-mode` value for the channel's profile. Always passed explicitly, so the channel
 /// profile (not a `defaultMode` in the user's settings) decides how the session starts.

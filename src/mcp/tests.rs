@@ -29,6 +29,8 @@ struct Data {
     diff: String,
     fail_spawn: bool,
     fail_send: bool,
+    /// extra_args of the last spawn_session call.
+    last_args: Vec<String>,
     /// What the mock's send reports: (delivered, queued).
     send_outcome: Option<(bool, u32)>,
 }
@@ -178,6 +180,7 @@ impl Backend for Arc<Mock> {
             anyhow::bail!("claude: command not found");
         }
         d.next_session += 1;
+        d.last_args = req.extra_args.clone();
         let mut s = session(d.next_session, req.channel_id, req.kind, req.parent_id);
         s.state = AgentState::Starting;
         if let Some(n) = req.name {
@@ -637,6 +640,32 @@ async fn send_rate_limit() {
     )
     .await;
     assert!(!err);
+}
+
+#[tokio::test]
+async fn spawn_agent_model_effort_and_args() {
+    let (m, st) = state();
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "claude", "model": "sonnet", "effort": "high"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().last_args, ["--model", "sonnet", "--effort", "high"]);
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "model": "gpt-6-sol", "effort": "xhigh", "args": ["--no-alt-screen"]}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().last_args, ["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh", "--no-alt-screen"]);
+    // Nothing that widens permissions, and no model for shells.
+    for bad in [
+        json!({"kind": "codex", "args": ["--sandbox", "danger-full-access"]}),
+        json!({"kind": "claude", "args": ["--dangerously-skip-permissions"]}),
+        json!({"kind": "claude", "args": "--model x"}),
+        json!({"kind": "shell", "model": "sonnet"}),
+    ] {
+        let (t, err) = call(&st, "spawn_agent", bad.clone()).await;
+        assert!(err, "{bad}: {t}");
+    }
 }
 
 #[tokio::test]

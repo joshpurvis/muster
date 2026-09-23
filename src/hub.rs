@@ -188,6 +188,9 @@ struct SessEntry {
     busy: bool,
     /// `kill_session` arrived while a process was being started.
     kill_requested: bool,
+    /// The last title this session set that was usable as a channel name (`clean_title`).
+    /// Later unusable titles (a shell prompt, the program name) don't clear it.
+    usable_title: Option<String>,
 }
 
 struct WinEntry {
@@ -211,8 +214,9 @@ struct Inner {
     channels: BTreeMap<ChannelId, Channel>,
     windows: BTreeMap<WindowId, WinEntry>,
     titles: HashMap<ChannelId, Titles>,
-    /// Channels whose branch got its one derived-name rename attempt this run.
-    branch_renamed: HashSet<ChannelId>,
+    /// Per channel, the source of the derived name its branch was last renamed after this run.
+    /// A better source (agent title > first prompt > shell title) renames it again.
+    branch_named_from: HashMap<ChannelId, NameSource>,
     sessions: BTreeMap<SessionId, SessEntry>,
     tokens: HashMap<String, SessionId>,
     /// One-time launch code -> expiry.
@@ -306,6 +310,7 @@ impl Hub {
         }
         for s in store.load_sessions()? {
             let StoredSession { info, extra_args } = s;
+            let usable_title = info.title.as_deref().and_then(|t| clean_title(t, info.kind));
             inner.sessions.insert(
                 info.id,
                 SessEntry {
@@ -319,6 +324,7 @@ impl Hub {
                     last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
+                    usable_title,
                 },
             );
         }
@@ -503,6 +509,11 @@ impl Hub {
             None if self.session(id).is_some() => anyhow::bail!("session {id} is not running"),
             None => anyhow::bail!("no such session: {id}"),
         }
+    }
+
+    /// Is the session's terminal in application cursor mode (DECCKM)?
+    pub fn application_cursor(&self, id: SessionId) -> bool {
+        self.pty(id).is_some_and(|p| p.application_cursor())
     }
 
     /// Generation of the session's current process (changes on every restart), if it has one
@@ -740,6 +751,9 @@ impl Hub {
         };
         {
             let mut g = self.inner.lock();
+            if let Some(e) = g.sessions.get_mut(&id) {
+                e.usable_title = Some(clean.clone());
+            }
             let t = g.titles.entry(info.channel_id).or_default();
             let slot = match info.kind {
                 SessionKind::Shell => &mut t.shell,
@@ -934,7 +948,7 @@ impl Hub {
             None => prompt.as_deref().and_then(prompt_name),
         };
         let (name, derived) = match &explicit {
-            Some(n) => (n.clone(), false),
+            Some(n) => (n.clone(), NameSource::Folder),
             None => derive_name(None, first_prompt.as_deref(), None, &folder_name(&ws)),
         };
         let repo = PathBuf::from(&ws.path);
@@ -971,7 +985,7 @@ impl Hub {
                     // Named up front (explicitly, or from the prompt): the branch gets that name
                     // right away, which counts as its one derived-name rename.
                     let mut branch = wt.branch;
-                    if explicit.is_some() || derived {
+                    if explicit.is_some() || derived != NameSource::Folder {
                         match worktree::rename_branch(&wt.path, &branch, &worktree::slugify(&ch.name)).await {
                             Ok(Some(n)) => branch = n,
                             Ok(None) => {}
@@ -1013,8 +1027,8 @@ impl Hub {
                 .unwrap_or(pref);
             self.store.update_channel(&ch)?;
             g.channels.insert(ch.id, ch.clone());
-            if derived {
-                g.branch_renamed.insert(ch.id);
+            if derived != NameSource::Folder {
+                g.branch_named_from.insert(ch.id, derived);
             }
             events.push(ServerEvent::ChannelUpserted(ch.clone()));
             if let Some(w) = window_view(&g, wid) {
@@ -1138,21 +1152,30 @@ impl Hub {
             self.emit(ServerEvent::ChannelUpserted(ch.clone()));
         }
         // Also when the derived name equals the folder name: the branch still gets named.
-        if derived {
-            self.after_derived_name(&ch);
+        if derived != NameSource::Folder {
+            self.after_derived_name(&ch, derived);
         }
     }
 
-    /// The first derived name renames the worktree's initial `muster/<id>` branch (once).
-    fn after_derived_name(&self, ch: &Channel) {
-        if !ch.owns_worktree
-            || !ch
-                .branch
-                .as_deref()
-                .is_some_and(|b| is_initial_branch(b, ch.id))
-            || !self.inner.lock().branch_renamed.insert(ch.id)
-        {
+    /// A derived name renames the worktree's branch: the initial `muster/<id>` one, and again
+    /// when a better source takes over (a shell title first, then the agent's own title), so
+    /// the branch ends up named after what the tab is about. Same-source updates (an agent
+    /// retitling itself) don't rename it. The upstream check is `worktree::rename_branch`'s.
+    fn after_derived_name(&self, ch: &Channel, source: NameSource) {
+        if !ch.owns_worktree || ch.branch.is_none() {
             return;
+        }
+        {
+            let mut g = self.inner.lock();
+            let initial = ch.branch.as_deref().is_some_and(|b| is_initial_branch(b, ch.id));
+            let better = match g.branch_named_from.get(&ch.id) {
+                Some(prev) => source > *prev,
+                None => initial,
+            };
+            if !better {
+                return;
+            }
+            g.branch_named_from.insert(ch.id, source);
         }
         let (Some(hub), Some(rt)) = (
             self.weak.upgrade(),
@@ -1650,6 +1673,7 @@ impl Hub {
                     last_dequeue_at: 0,
                     busy: true,
                     kill_requested: false,
+                    usable_title: None,
                 },
             );
             id
@@ -2051,7 +2075,7 @@ impl Hub {
             let mut g = self.inner.lock();
             let mut t = Titles::default();
             for e in g.sessions.values().filter(|e| e.info.channel_id == cid) {
-                if let Some(clean) = e.info.title.as_deref().and_then(|x| clean_title(x, e.info.kind)) {
+                if let Some(clean) = e.usable_title.clone() {
                     match e.info.kind {
                         SessionKind::Shell => t.shell = Some(clean),
                         SessionKind::Claude | SessionKind::Codex => t.agent = Some(clean),
@@ -2367,18 +2391,30 @@ pub fn prompt_name(text: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Where an auto-named channel's name came from, worst to best.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NameSource {
+    Folder,
+    ShellTitle,
+    FirstPrompt,
+    AgentTitle,
+}
+
 /// An auto-named channel's name: agent title > first prompt > shell title > folder (inputs
-/// already cleaned). Returns (name, derived), `derived` false for the folder fallback.
+/// already cleaned), and where it came from.
 pub fn derive_name(
     agent_title: Option<&str>,
     first_prompt: Option<&str>,
     shell_title: Option<&str>,
     folder: &str,
-) -> (String, bool) {
-    match agent_title.or(first_prompt).or(shell_title) {
-        Some(n) => (cap_chars(n, NAME_MAX), true),
-        None => (cap_chars(folder, NAME_MAX), false),
-    }
+) -> (String, NameSource) {
+    let (n, src) = match (agent_title, first_prompt, shell_title) {
+        (Some(n), _, _) => (n, NameSource::AgentTitle),
+        (None, Some(n), _) => (n, NameSource::FirstPrompt),
+        (None, None, Some(n)) => (n, NameSource::ShellTitle),
+        (None, None, None) => (folder, NameSource::Folder),
+    };
+    (cap_chars(n, NAME_MAX), src)
 }
 
 #[cfg(test)]
@@ -2423,10 +2459,12 @@ mod tests {
 
     #[test]
     fn name_priority() {
-        assert_eq!(derive_name(Some("Agent"), Some("prompt"), Some("sh"), "repo"), ("Agent".into(), true));
-        assert_eq!(derive_name(None, Some("prompt"), Some("sh"), "repo"), ("prompt".into(), true));
-        assert_eq!(derive_name(None, None, Some("cargo test"), "repo"), ("cargo test".into(), true));
-        assert_eq!(derive_name(None, None, None, "repo"), ("repo".into(), false));
+        use NameSource::*;
+        assert_eq!(derive_name(Some("Agent"), Some("prompt"), Some("sh"), "repo"), ("Agent".into(), AgentTitle));
+        assert_eq!(derive_name(None, Some("prompt"), Some("sh"), "repo"), ("prompt".into(), FirstPrompt));
+        assert_eq!(derive_name(None, None, Some("cargo test"), "repo"), ("cargo test".into(), ShellTitle));
+        assert_eq!(derive_name(None, None, None, "repo"), ("repo".into(), Folder));
+        assert!(AgentTitle > FirstPrompt && FirstPrompt > ShellTitle && ShellTitle > Folder);
     }
 
     #[test]

@@ -478,6 +478,11 @@ impl PtySession {
         self.master.lock().as_ref()?.process_group_leader()
     }
 
+    /// Application cursor mode (DECCKM) is on.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.lock().screen().application_cursor()
+    }
+
     pub fn screen(&self) -> ScreenSnapshot {
         let foreground_busy = self.is_alive()
             && match (self.foreground_pgrp(), self.pid) {
@@ -1047,9 +1052,26 @@ pub fn log_screen(path: &Path, cols: u16, rows: u16) -> Option<ScreenSnapshot> {
     })
 }
 
+/// Unmodified cursor keys (`CSI A`..`CSI D`, `CSI H`, `CSI F`) as a keyboard sends them in
+/// application cursor mode (`SS3 A`...). Modified keys (`CSI 1;5A`) are left alone.
+pub fn to_application_cursor(data: &str) -> String {
+    let mut out = data.to_string();
+    for k in ['A', 'B', 'C', 'D', 'H', 'F'] {
+        out = out.replace(&format!("\x1b[{k}"), &format!("\x1bO{k}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_keys_in_application_mode() {
+        assert_eq!(to_application_cursor("\x1b[A\x1b[D\x1b[H"), "\x1bOA\x1bOD\x1bOH");
+        assert_eq!(to_application_cursor("\x1b[1;5A\r"), "\x1b[1;5A\r", "modified keys stay CSI");
+        assert_eq!(to_application_cursor("plain"), "plain");
+    }
 
     fn parser_with(data: &[u8], rows: u16) -> vt100::Parser<TitleCb> {
         let mut p = vt100::Parser::new_with_callbacks(rows, 40, SCROLLBACK_LINES, TitleCb::default());

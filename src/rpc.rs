@@ -351,9 +351,18 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             struct P {
                 id: SessionId,
                 data: String,
+                /// Typed keys: unmodified cursor keys are sent in the terminal's current
+                /// cursor mode (SS3 in application mode), as a keyboard would.
+                #[serde(default)]
+                keys: bool,
             }
             let p: P = parse(params)?;
-            hub.write_input(p.id, p.data.as_bytes())?;
+            let data = if p.keys && hub.application_cursor(p.id) {
+                crate::pty::to_application_cursor(&p.data)
+            } else {
+                p.data
+            };
+            hub.write_input(p.id, data.as_bytes())?;
             Ok(json!({}))
         }
         "session.output" => {

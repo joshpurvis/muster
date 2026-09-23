@@ -189,9 +189,12 @@ pub fn resolve(snap: &Snapshot, target: &str, env_session: Option<&str>) -> anyh
             .cloned()
             .ok_or_else(|| exit(2, format!("no such session: {id}")));
     }
+    // `tab/name`, unless the whole string is exactly a session or tab name ("fix src/main.rs").
+    let exact_whole = !exact_names(snap.visible(), target).is_empty()
+        || snap.channels.iter().any(|c| eq_ci(&c.name, target));
     let found = match target.split_once('/') {
-        Some((tab, name)) => resolve_tab_name(snap, tab, name),
-        None => resolve_word(snap, target),
+        Some((tab, name)) if !exact_whole => resolve_tab_name(snap, tab, name),
+        _ => resolve_word(snap, target),
     };
     match found {
         Found::One(s) => Ok(s.clone()),
@@ -609,7 +612,10 @@ pub fn send(d: &Discovery, t: &str, words: &[String], o: SendOpts) -> anyhow::Re
         }
         return Ok(());
     }
-    if !wait_started(d, s.id, sent_at, queued > 0 || r["delivered"] != true, deadline)? {
+    // Shells go busy only while a foreground job runs, sampled every 250 ms: a quick command
+    // (`echo`) never shows as working, so don't wait long for it to.
+    let grace = if s.is_agent() { Duration::from_secs(10) } else { Duration::from_millis(1500) };
+    if !wait_started(d, s.id, sent_at, queued > 0 || r["delivered"] != true, grace, deadline)? {
         // Timed out before the prompt even started: report the state as it is now.
         let r = session_wait(d, s.id, &[], Duration::ZERO)?;
         return finish_wait(&snap, &json!({ "session": r["session"], "matched": false }), o.timeout);
@@ -624,10 +630,16 @@ pub fn send(d: &Discovery, t: &str, words: &[String], o: SendOpts) -> anyhow::Re
 /// quick answer). Queued behind earlier work: the earlier work ending (idle) also changes the
 /// state, and the queue empties before our prompt is typed, so only a non-idle state that
 /// began after the queue was last seen non-empty counts. A session that never visibly reacts
-/// is let through after a grace period, so the settled wait that follows can't hang on it.
+/// is let through after `grace`, so the settled wait that follows can't hang on it.
 /// `false`: the deadline passed first.
-fn wait_started(d: &Discovery, id: u32, sent_at: i64, queued: bool, deadline: Instant) -> anyhow::Result<bool> {
-    const GRACE: Duration = Duration::from_secs(10);
+fn wait_started(
+    d: &Discovery,
+    id: u32,
+    sent_at: i64,
+    queued: bool,
+    grace: Duration,
+    deadline: Instant,
+) -> anyhow::Result<bool> {
     let mut delivered_at: Option<Instant> = None;
     // Unix ms when the queue was last seen non-empty.
     let mut last_queued = sent_at;
@@ -636,8 +648,10 @@ fn wait_started(d: &Discovery, id: u32, sent_at: i64, queued: bool, deadline: In
         if left.is_zero() {
             return Ok(false);
         }
-        let chunk = left.min(Duration::from_secs(1));
+        // Short polls, so the grace period is measured closely.
+        let chunk = left.min(Duration::from_secs(1)).min(grace / 3);
         let asked_at = now_ms();
+        let asked = Instant::now();
         let r = session_wait(d, id, &["working", "exited"], chunk)?;
         let Some(s) = Sess::from_value(r["session"].clone()) else {
             anyhow::bail!("unexpected session.wait reply: {r}");
@@ -657,8 +671,8 @@ fn wait_started(d: &Discovery, id: u32, sent_at: i64, queued: bool, deadline: In
             if reacted {
                 return Ok(true);
             }
-            let at = *delivered_at.get_or_insert_with(Instant::now);
-            if at.elapsed() >= GRACE {
+            let at = *delivered_at.get_or_insert(asked);
+            if at.elapsed() >= grace {
                 return Ok(true);
             }
         }
@@ -680,24 +694,39 @@ fn session_wait(d: &Discovery, id: u32, until: &[&str], timeout: Duration) -> an
 }
 
 /// `session.wait` until `until` or `deadline`, in chunks the daemon accepts. Returns the last
-/// reply (`{session, matched, timed_out}`).
+/// reply (`{session, matched, timed_out}`). Stops early when the daemon says the wait can
+/// never match (`timed_out: false` without a match: the session exited).
 fn wait_until(d: &Discovery, id: u32, until: &[String], deadline: Instant) -> anyhow::Result<Value> {
     let until: Vec<&str> = until.iter().map(String::as_str).collect();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let r = session_wait(d, id, &until, left.min(MAX_WAIT_CHUNK))?;
-        if r["matched"] == true || left <= MAX_WAIT_CHUNK {
+        if r["matched"] == true || never_matches(&r) || left <= MAX_WAIT_CHUNK {
             return Ok(r);
         }
     }
 }
 
-/// Print the final state line; exit 124 when the wait timed out.
+/// The daemon ended the wait without a match and without timing out: the session exited.
+fn never_matches(r: &Value) -> bool {
+    r["matched"] != true && r["timed_out"] == false
+}
+
+/// The error for an unmatched wait: exit 1 when the session exited first, 124 on timeout.
+fn unmatched(r: &Value, s: &Sess, timeout: u64) -> anyhow::Error {
+    if never_matches(r) {
+        exit(1, format!("session {} exited before reaching the state", s.id))
+    } else {
+        exit(124, format!("timed out after {timeout}s (session {} is {})", s.id, s.state))
+    }
+}
+
+/// Print the final state line; exit 124 when the wait timed out, 1 when the session exited.
 fn finish_wait(snap: &Snapshot, r: &Value, timeout: u64) -> anyhow::Result<()> {
     let s = Sess::from_value(r["session"].clone()).with_context(|| format!("unexpected session.wait reply: {r}"))?;
     println!("{}", state_line(snap, &s));
     if r["matched"] != true {
-        return Err(exit(124, format!("timed out after {timeout}s (session {} is {})", s.id, s.state)));
+        return Err(unmatched(r, &s, timeout));
     }
     Ok(())
 }
@@ -710,7 +739,8 @@ pub fn wait(d: &Discovery, t: &str, until: Vec<String>, timeout: u64, as_json: b
     if as_json {
         print_json(&r)?;
         if r["matched"] != true {
-            return Err(exit(124, format!("timed out after {timeout}s")));
+            let s = Sess::from_value(r["session"].clone()).with_context(|| format!("unexpected session.wait reply: {r}"))?;
+            return Err(unmatched(&r, &s, timeout));
         }
         return Ok(());
     }
@@ -819,7 +849,8 @@ fn named_key(k: &str) -> Option<&'static str> {
 pub fn keys(d: &Discovery, t: &str, keys: &[String]) -> anyhow::Result<()> {
     let data = keys.iter().map(|k| parse_key(k)).collect::<anyhow::Result<String>>()?;
     let (_, s) = target(d, t)?;
-    client::rpc(d, "session.input", json!({ "id": s.id, "data": data }))?;
+    // `keys`: cursor keys follow the terminal's cursor mode, as a keyboard's would.
+    client::rpc(d, "session.input", json!({ "id": s.id, "data": data, "keys": true }))?;
     Ok(())
 }
 
@@ -934,6 +965,7 @@ mod tests {
                 {"id": 4, "name": "old", "archived": true},
                 {"id": 5, "name": "pair"},
                 {"id": 6, "name": "shells"},
+                {"id": 7, "name": "Fix src/main.rs"},
             ],
             "sessions": [
                 {"id": 10, "channel_id": 1, "kind": "claude", "name": "claude", "state": "working", "state_since": 0},
@@ -947,6 +979,7 @@ mod tests {
                 {"id": 60, "channel_id": 6, "kind": "shell", "name": "a", "state": "idle"},
                 {"id": 61, "channel_id": 6, "kind": "shell", "name": "b", "state": "idle"},
                 {"id": 62, "channel_id": 6, "kind": "shell", "name": "gone2", "state": "exited"},
+                {"id": 70, "channel_id": 7, "kind": "claude", "name": "claude", "state": "idle"},
             ]
         });
         Snapshot::from_hello(&h)
@@ -982,6 +1015,7 @@ mod tests {
         assert_eq!(ok("fix/serv"), 11, "both parts prefixes");
         assert_eq!(ok("docs/gone"), 21, "exited by exact tab/name");
         assert_eq!(ok("pair/left"), 50);
+        assert_eq!(ok("fix src/main.rs"), 70, "a whole tab name with a slash wins over tab/name");
     }
 
     #[test]

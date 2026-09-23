@@ -79,7 +79,8 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree,
   confirmed in a dialog).
 - "New window" creates a window (`window.create`), moves the tab there and opens it as a new
-  browser window (`#window=<id>`); when that is blocked, a toast says to run
+  client window: the daemon launches one (`window.show`, like `muster open --window N`); only
+  if that fails does the UI try a browser window (`#window=<id>`), then a toast saying to run
   `muster open --window N`. Moving a tab to a window no client shows opens it the same way.
 - `+` makes a new tab (same folder as the active tab, no worktree, last agent kind).
   Double-clicking the empty part of the bar does the same. `▾` next to it opens a menu: New

@@ -254,6 +254,11 @@ const REPLAY_CACHE_MAX: usize = 8;
 impl Hub {
     /// Load persisted state. Sessions that were running when the previous daemon died are
     /// marked Exited ("daemon restarted").
+    /// The muster binary the daemon runs as (for launching client windows).
+    pub fn muster_bin(&self) -> &Path {
+        &self.cfg.muster_bin
+    }
+
     pub fn new(cfg: HubConfig, store: Store) -> anyhow::Result<Arc<Hub>> {
         // Processes that outlived a crashed daemon (or ignored SIGHUP, or were left behind by
         // an exited shell) would otherwise keep running unmanaged next to a restarted copy.

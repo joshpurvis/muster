@@ -345,6 +345,35 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             let p: P = parse(params)?;
             to_value(hub.reorder_tabs(p.id, &p.channel_ids)?)
         }
+        "window.show" => {
+            let p: IdParam<WindowId> = parse(params)?;
+            let w = hub
+                .window(p.id)
+                .ok_or_else(|| RpcError(format!("no such window: {}", p.id)))?;
+            // Already on screen somewhere: bring it forward instead of opening a second one.
+            if w.open && crate::wm::raise(&crate::wm::window_title(&w.name)).await {
+                return Ok(json!({ "shown": "raised" }));
+            }
+            // A client can't open another native window itself: launch one, like
+            // `muster open --window N` from a terminal (the daemon's environment has the display).
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(hub.muster_bin());
+            cmd.args(["open", "--window", &p.id.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            // SAFETY: setsid is async-signal-safe; the window outlives this request.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().map_err(|e| RpcError(format!("launching a window: {e}")))?;
+            // `open` hands off to a detached window process and exits; reap it.
+            tokio::task::spawn_blocking(move || child.wait());
+            Ok(json!({ "shown": "launched" }))
+        }
         "window.raise" => {
             let p: IdParam<WindowId> = parse(params)?;
             let w = hub

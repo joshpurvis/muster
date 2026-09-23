@@ -156,8 +156,16 @@ export function renameWindow(name: string) {
     .catch(fail("Rename failed")).catch(() => {});
 }
 
-/** Open a client window for window `id` (a new browser tab or window). */
+/**
+ * Show window `id`: the daemon raises it if it's already open, else launches a client window for
+ * it (the native window can't open another itself). Falls back to a browser window, then to a
+ * hint.
+ */
 export function openClientWindow(id: WindowId) {
+  rpc.call("window.show", { id }).catch(() => openClientWindowHere(id));
+}
+
+function openClientWindowHere(id: WindowId) {
   const url = `${location.origin}${location.pathname}#window=${id}`;
   let w: Window | null = null;
   try {

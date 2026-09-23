@@ -440,7 +440,7 @@ async fn session_wait(
         let ctx = WaitCtx {
             after_ms: Some(after_ms.unwrap_or(0)),
             last_send_ms: None,
-            last_delivery_ms: None,
+            last_delivery_ms: hub.last_dequeue_at(id),
             settle_grace_ms: 15_000,
             now_ms: now_ms(),
         };

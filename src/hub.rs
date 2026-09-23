@@ -182,6 +182,8 @@ struct SessEntry {
     /// Exit reported before the PTY was installed (process died instantly).
     early_exit: Option<i32>,
     last_hook_at: i64,
+    /// Unix ms of the last delivery out of the injection queue (queue length shrank), or 0.
+    last_dequeue_at: i64,
     /// A spawn or restart is in progress (lifecycle ops on one session are serialized).
     busy: bool,
     /// `kill_session` arrived while a process was being started.
@@ -314,6 +316,7 @@ impl Hub {
                     generation: 0,
                     early_exit: None,
                     last_hook_at: 0,
+                    last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
                 },
@@ -647,6 +650,16 @@ impl Hub {
         true
     }
 
+    /// Unix ms of the last delivery out of a session's injection queue (for `session.wait`).
+    pub fn last_dequeue_at(&self, id: SessionId) -> Option<i64> {
+        self.inner
+            .lock()
+            .sessions
+            .get(&id)
+            .map(|e| e.last_dequeue_at)
+            .filter(|t| *t > 0)
+    }
+
     /// Update the injection-queue length shown in the UI.
     pub fn set_queued(&self, id: SessionId, queued: u32) {
         let info = {
@@ -656,6 +669,9 @@ impl Hub {
             };
             if e.info.queued == queued {
                 return;
+            }
+            if queued < e.info.queued {
+                e.last_dequeue_at = now_ms();
             }
             e.info.queued = queued;
             e.info.clone()
@@ -1088,8 +1104,9 @@ impl Hub {
 
     /// Recompute an auto-named channel's name from its inputs; emits only on change.
     fn rederive_name(&self, id: ChannelId) {
-        let (name, derived) = {
-            let g = self.inner.lock();
+        // Derived and applied under one lock, so a slower update can't overwrite a newer one.
+        let (ch, changed, derived) = {
+            let mut g = self.inner.lock();
             let Some(c) = g.channels.get(&id).filter(|c| c.auto_named && !c.archived) else {
                 return;
             };
@@ -1105,25 +1122,24 @@ impl Hub {
                 t.and_then(|t| t.shell.as_deref()),
                 &folder,
             );
-            if name == c.name {
-                (None, derived)
-            } else {
-                (Some(name), derived)
-            }
-        };
-        let ch = match name {
-            Some(n) => self.update_channel(id, false, |c| {
-                if c.auto_named {
-                    c.name = n;
+            let changed = name != c.name;
+            let mut next = c.clone();
+            if changed {
+                next.name = name;
+                if let Err(e) = self.store.update_channel(&next) {
+                    tracing::warn!(channel = id, "persisting derived name: {e}");
+                    return;
                 }
-            }),
-            None => return,
-        };
-        if let Ok(ch) = ch {
-            self.emit(ServerEvent::ChannelUpserted(ch.clone()));
-            if derived {
-                self.after_derived_name(&ch);
+                g.channels.insert(id, next.clone());
             }
+            (next, changed, derived)
+        };
+        if changed {
+            self.emit(ServerEvent::ChannelUpserted(ch.clone()));
+        }
+        // Also when the derived name equals the folder name: the branch still gets named.
+        if derived {
+            self.after_derived_name(&ch);
         }
     }
 
@@ -1631,6 +1647,7 @@ impl Hub {
                     generation: 0,
                     early_exit: None,
                     last_hook_at: 0,
+                    last_dequeue_at: 0,
                     busy: true,
                     kill_requested: false,
                 },
@@ -2028,6 +2045,22 @@ impl Hub {
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
         self.emit(ServerEvent::SessionRemoved { id });
+        // A removed session's title no longer names the channel: rebuild from the rest.
+        let cid = entry.info.channel_id;
+        {
+            let mut g = self.inner.lock();
+            let mut t = Titles::default();
+            for e in g.sessions.values().filter(|e| e.info.channel_id == cid) {
+                if let Some(clean) = e.info.title.as_deref().and_then(|x| clean_title(x, e.info.kind)) {
+                    match e.info.kind {
+                        SessionKind::Shell => t.shell = Some(clean),
+                        SessionKind::Claude | SessionKind::Codex => t.agent = Some(clean),
+                    }
+                }
+            }
+            g.titles.insert(cid, t);
+        }
+        self.rederive_name(cid);
         Ok(())
     }
 

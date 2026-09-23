@@ -757,6 +757,8 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         .lock()
         .spawned_depth
         .insert(info.id, b.caller_depth + 1);
+    // The spawn's prompt may have named an auto-named channel: report it as it is now.
+    let channel = st.backend.channel(channel.id).unwrap_or(channel);
     let ws = st.backend.workspace(channel.workspace_id);
     Ok(pretty(&json!({
         "session": session_json(&info, caller),

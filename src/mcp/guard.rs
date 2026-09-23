@@ -2,7 +2,12 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::{AgentState, SessionId, SessionInfo};
+use crate::model::{AgentState, ChannelId, SessionId, SessionInfo};
+
+/// Env var (on the daemon) that lets agents run shell commands through MCP.
+pub const ENV_ALLOW_SHELL: &str = "MUSTER_MCP_ALLOW_SHELL";
+/// Env var (on the daemon) that lets agents reach channels/sessions in other workspaces.
+pub const ENV_CROSS_WORKSPACE: &str = "MUSTER_MCP_CROSS_WORKSPACE";
 
 /// Tunable limits. `Default` holds the values documented in docs/MCP.md.
 #[derive(Debug, Clone)]
@@ -28,6 +33,35 @@ pub struct Limits {
     pub diff_max_bytes: usize,
     pub max_message_chars: usize,
     pub max_post_chars: usize,
+    /// spawn_agent calls allowed per caller per `spawn_window_ms`.
+    pub spawn_per_window: usize,
+    pub spawn_window_ms: i64,
+    /// Max non-archived channels created through spawn_agent's `new_channel`, daemon-wide.
+    pub max_mcp_channels: usize,
+    /// Allow shell spawns with a prompt and send_message to shell sessions
+    /// (`MUSTER_MCP_ALLOW_SHELL=1`). Off by default: that is arbitrary command execution.
+    pub allow_shell: bool,
+    /// Allow targets outside the caller's workspace (`MUSTER_MCP_CROSS_WORKSPACE=1`).
+    pub cross_workspace: bool,
+}
+
+impl Limits {
+    /// Defaults plus the human's opt-ins from the daemon's environment.
+    pub fn from_env() -> Self {
+        let on = |k: &str| {
+            std::env::var(k).is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        };
+        Self {
+            allow_shell: on(ENV_ALLOW_SHELL),
+            cross_workspace: on(ENV_CROSS_WORKSPACE),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for Limits {
@@ -48,6 +82,11 @@ impl Default for Limits {
             diff_max_bytes: 400_000,
             max_message_chars: 100_000,
             max_post_chars: 20_000,
+            spawn_per_window: 10,
+            spawn_window_ms: 10 * 60_000,
+            max_mcp_channels: 10,
+            allow_shell: false,
+            cross_workspace: false,
         }
     }
 }
@@ -196,6 +235,10 @@ impl RateLimiter {
 pub struct GuardState {
     pub sends: RateLimiter,
     pub posts: RateLimiter,
+    pub spawns: RateLimiter,
+    /// Channels created through spawn_agent's `new_channel` (in memory: after a daemon restart
+    /// earlier ones no longer count toward `max_mcp_channels`).
+    pub mcp_channels: HashSet<ChannelId>,
     /// Target session -> unix ms of the last MCP send_message to it (for wait_for_state).
     pub last_send: HashMap<SessionId, i64>,
     /// Session -> unix ms when its injection queue last shrank (a queued message was delivered).
@@ -225,6 +268,7 @@ impl GuardState {
     pub fn forget(&mut self, id: SessionId) {
         self.sends.forget(id);
         self.posts.forget(id);
+        self.spawns.forget(id);
         self.last_send.remove(&id);
         self.last_delivery.remove(&id);
         self.prev_queued.remove(&id);

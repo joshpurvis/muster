@@ -94,7 +94,10 @@ impl StateUpdate {
         Self { state, detail: None }
     }
     pub fn with(state: AgentState, detail: impl Into<String>) -> Self {
-        Self { state, detail: Some(detail.into()) }
+        Self {
+            state,
+            detail: Some(detail.into()),
+        }
     }
 }
 
@@ -168,7 +171,8 @@ pub enum EventKind {
     SessionStarted,
     /// data: {session_id, exit_code}
     SessionExited,
-    /// Raw hook callback. data: {session_id, event, payload}
+    /// Hook callback. data: {session_id, event, summary: {tool_name?, notification_type?, …}}
+    /// (identifying fields only, never the full payload)
     Hook,
     /// An agent called an MCP tool. data: {session_id, tool, args, ok}
     McpCall,
@@ -201,6 +205,7 @@ pub enum Decision {
 }
 
 /// One entry in the decision inbox. Derived from session state; not persisted separately.
+#[allow(dead_code)] // wire type documented for clients; not built by the daemon yet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxItem {
     pub session_id: SessionId,

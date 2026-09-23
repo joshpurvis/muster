@@ -26,20 +26,28 @@ fn supports_bracketed_paste(name: &str) -> bool {
     matches!(name, "bash" | "zsh" | "fish")
 }
 
+/// Sent before every delivered command: the shell's input line can't be read from the screen,
+/// so a half-typed human draft would otherwise be prepended to it. Ctrl-E (end of line) then
+/// Ctrl-U (kill to start of line) empties the line in bash, zsh and fish with emacs key
+/// bindings; for shells without a line editor, Ctrl-U is the terminal's kill-line character
+/// (and the Ctrl-E it follows is erased with it). In vi mode it may not clear the line.
+pub(crate) const LINE_CLEAR: &[u8] = b"\x05\x15";
+
 pub(crate) fn prompt_bytes_for(shell: &str, text: &str) -> Vec<u8> {
     let text = text.replace("\r\n", "\n");
     let text = text.trim_end_matches('\n');
+    let mut out = LINE_CLEAR.to_vec();
     // Bracketed paste keeps tabs/newlines literal (no completion, no early submit).
     if supports_bracketed_paste(&shell_name(shell)) {
-        let mut out = b"\x1b[200~".to_vec();
+        out.extend_from_slice(b"\x1b[200~");
         out.extend_from_slice(text.as_bytes());
         out.extend_from_slice(b"\x1b[201~");
-        out
     } else {
         // No bracketed paste: run the lines one after another; the last one is submitted by
         // submit_bytes. Tabs would trigger completion, so send them as spaces.
-        text.replace('\n', "\r").replace('\t', " ").into_bytes()
+        out.extend_from_slice(text.replace('\n', "\r").replace('\t', " ").as_bytes());
     }
+    out
 }
 
 impl Adapter for ShellAdapter {
@@ -99,14 +107,17 @@ mod tests {
     fn prompt_bytes_by_shell() {
         assert_eq!(
             prompt_bytes_for("/bin/bash", "ls -la\n"),
-            b"\x1b[200~ls -la\x1b[201~".to_vec()
+            b"\x05\x15\x1b[200~ls -la\x1b[201~".to_vec()
         );
-        assert_eq!(prompt_bytes_for("/bin/sh", "a\tb"), b"a b".to_vec());
+        assert_eq!(prompt_bytes_for("/bin/sh", "a\tb"), b"\x05\x15a b".to_vec());
         assert_eq!(
             prompt_bytes_for("/usr/bin/zsh", "a\nb"),
-            b"\x1b[200~a\nb\x1b[201~".to_vec()
+            b"\x05\x15\x1b[200~a\nb\x1b[201~".to_vec()
         );
-        assert_eq!(prompt_bytes_for("/bin/dash", "a\r\nb"), b"a\rb".to_vec());
+        assert_eq!(
+            prompt_bytes_for("/bin/dash", "a\r\nb"),
+            b"\x05\x15a\rb".to_vec()
+        );
     }
 
     #[test]

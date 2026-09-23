@@ -7,7 +7,10 @@
 //!
 //! Stuck (agents only, `StateSource::Timer`): Working with no meaningful screen change for 10
 //! minutes. "Meaningful" ignores digits and spinner glyphs, so animated timers and token
-//! counters don't count as progress. Any meaningful change moves Stuck back to Working.
+//! counters don't count as progress. Any meaningful change moves Stuck back to Working (or to
+//! what the screen shows). A Stuck session whose screen shows another state (idle, a prompt)
+//! moves there even without a further change, so an idle verdict that had to wait for the
+//! output to settle is applied on a later tick.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -131,6 +134,15 @@ fn evaluate_inner(
     let detected = adapter.detect_from_screen(screen, current);
 
     if current == Stuck {
+        // The screen shows something other than an agent at work (idle, a dialog): go there.
+        // This must not depend on `changed`: an idle screen first waits for its output to
+        // settle (`Verdict::Recheck`), and by the next tick the hash no longer changes.
+        if let Some(u) = detected
+            .clone()
+            .filter(|u| !matches!(u.state, Stuck | Working))
+        {
+            return Some((u, StateSource::Timer));
+        }
         if !changed {
             return None;
         }
@@ -253,6 +265,55 @@ mod tests {
         more.lines[3] = "● new output".into();
         let r = evaluate_inner(&s, &more, &mut t, 3_000 + STUCK_AFTER_MS).unwrap();
         assert_eq!((r.0.state, r.1), (AgentState::Working, StateSource::Timer));
+    }
+
+    #[test]
+    fn stuck_returns_to_idle_once_output_settles() {
+        let working = snap(include_str!("agents/fixtures/claude_running_tool.txt"));
+        let mut t = Track::default();
+        let w = info(SessionKind::Claude, AgentState::Working, 0);
+        assert!(matches!(
+            evaluate(&w, &working, &mut t, 1_000),
+            Verdict::Keep
+        ));
+        let at = 1_000 + STUCK_AFTER_MS;
+        let r = evaluate(&w, &working, &mut t, at);
+        assert!(
+            matches!(
+                r,
+                Verdict::Set(
+                    StateUpdate {
+                        state: AgentState::Stuck,
+                        ..
+                    },
+                    StateSource::Timer
+                )
+            ),
+            "{r:?}"
+        );
+        let s = info(SessionKind::Claude, AgentState::Stuck, at);
+        // The agent finishes: the screen turns idle with fresh output, which isn't trusted yet.
+        let mut idle = snap(include_str!("agents/fixtures/claude_idle_done.txt"));
+        idle.last_output_at = at + 1_000;
+        assert!(matches!(
+            evaluate(&s, &idle, &mut t, at + 1_100),
+            Verdict::Recheck
+        ));
+        // Next tick: same screen (hash unchanged), output has settled -> Idle.
+        let r = evaluate(&s, &idle, &mut t, at + 1_000 + IDLE_SETTLE_MS + 50);
+        assert!(
+            matches!(
+                r,
+                Verdict::Set(
+                    StateUpdate {
+                        state: AgentState::Idle,
+                        ..
+                    },
+                    StateSource::Timer
+                )
+            ),
+            "{r:?}"
+        );
     }
 
     #[test]

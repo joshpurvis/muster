@@ -76,7 +76,7 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let r = match cli.cmd {
-        None => ensure_daemon().and_then(|d| gui::open(&d.ui_url())),
+        None => ensure_daemon().and_then(|d| open_ui(&d)),
         Some(Cmd::Daemon { foreground: true }) => run_daemon(),
         Some(Cmd::Daemon { foreground: false }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
@@ -239,7 +239,23 @@ fn open(path: Option<PathBuf>) -> anyhow::Result<()> {
     let d = ensure_daemon()?;
     let ws = client::rpc(&d, "workspace.add", serde_json::json!({ "path": abs }))?;
     println!("workspace: {} ({})", ws["name"].as_str().unwrap_or("?"), abs.display());
-    gui::open(&d.ui_url())
+    open_ui(&d)
+}
+
+/// Open the UI with a single-use launch code, so the client token never appears on the
+/// browser's command line (/proc/<pid>/cmdline is world-readable).
+fn open_ui(d: &Discovery) -> anyhow::Result<()> {
+    match client::launch_code(d).context("getting a launch code from the daemon")? {
+        Some(code) => gui::open(&d.launch_url(&code)),
+        None => {
+            eprintln!(
+                "muster: the running daemon (version {}) has no launch codes; opening with the token URL. \
+                 Restart it (`muster stop`) to stop passing the token on the browser command line.",
+                d.version
+            );
+            gui::open(&d.ui_url())
+        }
+    }
 }
 
 // ----- daemon side -----
@@ -339,7 +355,22 @@ async fn daemon_main() -> anyhow::Result<()> {
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
 
+    // Event log retention (also applied at startup).
+    {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(3600));
+            t.tick().await;
+            loop {
+                t.tick().await;
+                let h = hub.clone();
+                let _ = tokio::task::spawn_blocking(move || h.prune_events()).await;
+            }
+        });
+    }
+
     // Periodically persist scrollback so a crash loses at most a few seconds.
+    // Appends only what's new since the last flush, without fsync.
     {
         let hub = hub.clone();
         tokio::spawn(async move {

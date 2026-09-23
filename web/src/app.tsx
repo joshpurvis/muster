@@ -240,10 +240,10 @@ function Splash() {
     return (
       <div class="splash">
         <div class="welcome-card">
-          <h1>Missing access token</h1>
+          <h1>Not signed in</h1>
           <p>
-            Open the link printed by <code>muster url</code> (it ends in <code>#token=…</code>), or run{" "}
-            <code>muster</code> to open the app. The token is kept for this tab only.
+            This launch link has expired or was already used. Run <code>muster</code> again, or open the
+            link printed by <code>muster url</code>. Access is kept for this tab only.
           </p>
         </div>
       </div>

@@ -82,6 +82,30 @@ pub fn healthy(port: u16) -> bool {
     )
 }
 
+/// Mint a single-use launch code (`POST /api/launch-code`). `None`: the daemon predates
+/// launch codes (404).
+pub fn launch_code(d: &Discovery) -> anyhow::Result<Option<String>> {
+    let (status, resp) = request(
+        d.port,
+        "POST",
+        "/api/launch-code",
+        Some(&d.token),
+        None,
+        Duration::from_secs(10),
+    )?;
+    if status == 404 {
+        return Ok(None);
+    }
+    if status != 200 {
+        anyhow::bail!("daemon returned HTTP {status} for a launch code");
+    }
+    let v: Value = serde_json::from_slice(&resp).context("invalid JSON from daemon")?;
+    v["code"]
+        .as_str()
+        .map(|c| Some(c.to_string()))
+        .context("no launch code in the daemon's reply")
+}
+
 /// Call a JSON method through `POST /api/rpc`.
 pub fn rpc(d: &Discovery, method: &str, params: Value) -> anyhow::Result<Value> {
     let body = serde_json::to_vec(&json!({ "id": 1, "method": method, "params": params }))?;

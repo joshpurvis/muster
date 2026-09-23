@@ -17,6 +17,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/rpc", post(rpc_http))
+        .route("/api/launch-code", post(launch_code))
+        .route("/api/exchange", post(exchange))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
         .with_state(hub.clone())
@@ -90,6 +92,46 @@ async fn rpc_http(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
         return unauthorized();
     }
     axum::Json(crate::rpc::http_call(&hub, &body).await).into_response()
+}
+
+fn forbidden(msg: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        axum::Json(json!({ "error": { "message": msg } })),
+    )
+        .into_response()
+}
+
+/// `POST /api/launch-code` (client token): mint a single-use code for opening the UI without
+/// putting the token on a browser command line.
+async fn launch_code(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    if !bearer(&headers).is_some_and(|t| hub.check_client_token(t)) {
+        return unauthorized();
+    }
+    if !origin_allowed(&headers, hub.port()) {
+        return forbidden("origin not allowed");
+    }
+    axum::Json(json!({ "code": hub.mint_launch_code() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ExchangeBody {
+    code: String,
+}
+
+/// `POST /api/exchange` `{"code"}` -> `{"token"}`; the code is consumed. 403 if it is unknown,
+/// used or expired.
+async fn exchange(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Response {
+    if !origin_allowed(&headers, hub.port()) {
+        return forbidden("origin not allowed");
+    }
+    let Ok(req) = serde_json::from_slice::<ExchangeBody>(&body) else {
+        return forbidden("invalid or expired launch code");
+    };
+    match hub.exchange_launch_code(req.code.trim()) {
+        Some(token) => axum::Json(json!({ "token": token })).into_response(),
+        None => forbidden("invalid or expired launch code"),
+    }
 }
 
 async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: HeaderMap, body: Bytes) -> Response {

@@ -97,7 +97,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_agent",
             "Spawn agent",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The prompt, if given, is delivered once the agent is ready. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -125,7 +125,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "send_message",
             "Send message",
-            "Send a prompt to another session. It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Cannot target yourself, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller. Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit).",
+            "Send a prompt to another agent session in your workspace. It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Cannot target yourself or (unless the human allowed it) shell sessions, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller. Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit).",
             json!({
                 "type": "object",
                 "properties": {
@@ -370,13 +370,13 @@ pub async fn call_tool<B: Backend>(
     let a = Args(map);
     let res = match name {
         "whoami" => whoami(st, caller),
-        "list_channels" => list_channels(st),
+        "list_channels" => list_channels(st, caller),
         "list_sessions" => list_sessions(st, caller, &a),
         "spawn_agent" => spawn_agent(st, caller, &a).await,
         "send_message" => send_message(st, caller, &a).await,
-        "read_screen" => read_screen(st, &a),
-        "get_recent_output" => get_recent_output(st, &a),
-        "wait_for_state" => wait_for_state(st, &a).await,
+        "read_screen" => read_screen(st, caller, &a),
+        "get_recent_output" => get_recent_output(st, caller, &a),
+        "wait_for_state" => wait_for_state(st, caller, &a).await,
         "post_to_channel" => post_to_channel(st, caller, &a),
         "get_diff" => get_diff(st, caller, &a).await,
         _ => return Err(()),
@@ -413,6 +413,93 @@ fn open_channel<B: Backend>(st: &McpState<B>, id: ChannelId) -> Result<Channel, 
     }
 }
 
+// ----- reach policy -----
+
+const HOW_SHELL: &str =
+    "The human can allow it by starting the muster daemon with MUSTER_MCP_ALLOW_SHELL=1.";
+const HOW_CROSS: &str =
+    "The human can allow it by starting the muster daemon with MUSTER_MCP_CROSS_WORKSPACE=1.";
+
+/// Text an agent sends to another session is typed into its terminal, so it must stay text:
+/// escape sequences could end the bracketed paste (`ESC [ 201 ~`) and turn the rest into raw
+/// keystrokes (answering a permission dialog, switching modes). Drops ESC and every other C0/C1
+/// control except newline and tab; CR and CRLF become newline.
+pub fn clean_text(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .map(|c| if c == '\r' { '\n' } else { c })
+        .filter(|&c| c == '\n' || c == '\t' || !(c.is_control()))
+        .collect()
+}
+
+/// Claude Code and Codex run a message that starts with `!` as a shell command.
+fn check_no_shell_escape<B: Backend>(
+    st: &McpState<B>,
+    kind: SessionKind,
+    text: &str,
+) -> Result<(), String> {
+    if kind != SessionKind::Shell && !st.limits.allow_shell && text.trim_start().starts_with('!') {
+        return Err(format!(
+            "a message starting with `!` runs as a shell command in {}, which agents may not do. Rephrase it. {HOW_SHELL}",
+            kind.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// The caller's workspace (None if its channel is gone).
+fn caller_workspace<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<WorkspaceId> {
+    let me = st.backend.session(caller)?;
+    st.backend.channel(me.channel_id).map(|c| c.workspace_id)
+}
+
+/// Is channel `ch` reachable for `caller`?
+fn in_reach<B: Backend>(st: &McpState<B>, caller: SessionId, ch: &Channel) -> bool {
+    st.limits.cross_workspace || caller_workspace(st, caller) == Some(ch.workspace_id)
+}
+
+fn check_channel_reach<B: Backend>(
+    st: &McpState<B>,
+    caller: SessionId,
+    ch: &Channel,
+) -> Result<(), String> {
+    if in_reach(st, caller, ch) {
+        return Ok(());
+    }
+    Err(format!(
+        "channel {} is in another workspace; agents can only reach their own workspace. {HOW_CROSS}",
+        ch.id
+    ))
+}
+
+fn check_session_reach<B: Backend>(
+    st: &McpState<B>,
+    caller: SessionId,
+    s: &SessionInfo,
+) -> Result<(), String> {
+    if st.limits.cross_workspace {
+        return Ok(());
+    }
+    match st.backend.channel(s.channel_id) {
+        Some(ch) if in_reach(st, caller, &ch) => Ok(()),
+        _ => Err(format!(
+            "session {} is in another workspace; agents can only reach their own workspace. {HOW_CROSS}",
+            s.id
+        )),
+    }
+}
+
+/// A session the caller may look at or message.
+fn reachable_session<B: Backend>(
+    st: &McpState<B>,
+    caller: SessionId,
+    id: SessionId,
+) -> Result<SessionInfo, String> {
+    let s = target_session(st, id)?;
+    check_session_reach(st, caller, &s)?;
+    Ok(s)
+}
+
 fn budget<B: Backend>(st: &McpState<B>, caller: SessionId) -> guard::SpawnBudget {
     let sessions = st.backend.sessions();
     let live: HashSet<SessionId> = st.backend.live_session_ids().into_iter().collect();
@@ -433,17 +520,21 @@ fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
         "workspace": ws.as_ref().map(|w| json!({"id": w.id, "name": w.name, "path": w.path, "is_git": w.is_git})),
         "spawn_budget": budget(st, caller),
         "agents_may_approve_prompts": guard::AGENTS_MAY_APPROVE,
+        "policy": {
+            "shell_commands": st.limits.allow_shell,
+            "other_workspaces": st.limits.cross_workspace,
+        },
     })))
 }
 
-fn list_channels<B: Backend>(st: &McpState<B>) -> TResult {
+fn list_channels<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
     let sessions = st.backend.sessions();
     let live: HashSet<SessionId> = st.backend.live_session_ids().into_iter().collect();
     let out: Vec<Value> = st
         .backend
         .channels()
         .into_iter()
-        .filter(|c| !c.archived)
+        .filter(|c| !c.archived && in_reach(st, caller, c))
         .map(|c| {
             let ws = st.backend.workspace(c.workspace_id);
             let mine: Vec<&SessionInfo> =
@@ -465,6 +556,7 @@ fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
         .sessions()
         .iter()
         .filter(|s| filter.is_none_or(|c| s.channel_id == c))
+        .filter(|s| check_session_reach(st, caller, s).is_ok())
         .map(|s| session_json(s, caller))
         .collect();
     Ok(pretty(&Value::Array(out)))
@@ -476,8 +568,8 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         .ok_or_else(|| format!("unknown kind `{kind_s}` (expected claude, codex or shell)"))?;
     let prompt = a
         .str("prompt")?
-        .filter(|p| !p.trim().is_empty())
-        .map(str::to_string);
+        .map(clean_text)
+        .filter(|p| !p.trim().is_empty());
     let name = a
         .str("name")?
         .filter(|n| !n.trim().is_empty())
@@ -491,40 +583,90 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
     if channel_id.is_some() && new_channel.is_some() {
         return Err("pass either channel_id or new_channel, not both".into());
     }
+    if kind == SessionKind::Shell && prompt.is_some() && !st.limits.allow_shell {
+        return Err(format!(
+            "agents can't start a shell with a command (prompt); spawn it without a prompt for the human to use, or spawn an agent instead. {HOW_SHELL}"
+        ));
+    }
+    if let Some(p) = &prompt {
+        check_no_shell_escape(st, kind, p)?;
+    }
     let me = caller_session(st, caller)?;
+    let target_channel = match new_channel {
+        Some(_) => None,
+        None => Some(open_channel(st, channel_id.unwrap_or(me.channel_id))?),
+    };
+    if let Some(ch) = &target_channel {
+        check_channel_reach(st, caller, ch)?;
+    }
 
     // Serialize spawns so concurrent calls can't overshoot the limits.
     let _lock = st.spawn_lock.lock().await;
     let b = budget(st, caller);
     check_spawn(&b)?;
+    let open_mcp_channels = {
+        let ids: Vec<ChannelId> = st.guard.lock().mcp_channels.iter().copied().collect();
+        ids.into_iter()
+            .filter(|id| st.backend.channel(*id).is_some_and(|c| !c.archived))
+            .count()
+    };
+    if new_channel.is_some() && open_mcp_channels >= st.limits.max_mcp_channels {
+        return Err(format!(
+            "{open_mcp_channels} agent-created channels are open (max {}). Reuse one with channel_id, or ask the human to archive some.",
+            st.limits.max_mcp_channels
+        ));
+    }
+    if let Err(wait_s) = st.guard.lock().spawns.check_and_record(
+        caller,
+        now_ms(),
+        st.limits.spawn_per_window,
+        st.limits.spawn_window_ms,
+    ) {
+        return Err(format!(
+            "rate limit: at most {} spawns per {} minutes. Try again in {wait_s}s.",
+            st.limits.spawn_per_window,
+            st.limits.spawn_window_ms / 60_000
+        ));
+    }
+    let refund = || st.guard.lock().spawns.refund(caller);
 
     let (channel, created) = if let Some(nc) = new_channel {
         let nc = Args(nc);
-        let ch_name = nc.req_str("name")?.trim().to_string();
+        let ch_name = match nc.req_str("name") {
+            Ok(n) => n.trim().to_string(),
+            Err(e) => {
+                refund();
+                return Err(e);
+            }
+        };
         if ch_name.is_empty() {
+            refund();
             return Err("new_channel.name must not be empty".into());
         }
-        let my_ch = st
-            .backend
-            .channel(me.channel_id)
-            .ok_or("your channel no longer exists")?;
-        let req = CreateChannel {
-            workspace_id: my_ch.workspace_id,
-            name: ch_name,
-            worktree: nc.bool("worktree")?.unwrap_or(true),
-            base: nc.str("base")?.map(str::to_string),
-            agent: None,
-            prompt: None,
-        };
-        let ch = st
-            .backend
-            .create_channel(req)
-            .await
-            .map_err(|e| format!("could not create channel: {e:#}"))?;
+        let parsed = (|| -> Result<CreateChannel, String> {
+            let my_ch = st
+                .backend
+                .channel(me.channel_id)
+                .ok_or("your channel no longer exists")?;
+            Ok(CreateChannel {
+                workspace_id: my_ch.workspace_id,
+                name: ch_name,
+                worktree: nc.bool("worktree")?.unwrap_or(true),
+                base: nc.str("base")?.map(str::to_string),
+                agent: None,
+                prompt: None,
+            })
+        })();
+        let req = parsed.inspect_err(|_| refund())?;
+        let ch = st.backend.create_channel(req).await.map_err(|e| {
+            refund();
+            format!("could not create channel: {e:#}")
+        })?;
+        st.guard.lock().mcp_channels.insert(ch.id);
         (ch, true)
     } else {
         (
-            open_channel(st, channel_id.unwrap_or(me.channel_id))?,
+            target_channel.expect("set when new_channel is absent"),
             false,
         )
     };
@@ -543,6 +685,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,
         Err(e) => {
+            refund();
             // Don't leave an empty channel/worktree behind for a failed spawn.
             let mut msg = format!("spawn failed: {e:#}");
             if created {
@@ -587,7 +730,17 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
             st.limits.max_message_chars
         ));
     }
-    let info = target_session(st, target)?;
+    let info = reachable_session(st, caller, target)?;
+    if info.kind == SessionKind::Shell && !st.limits.allow_shell {
+        return Err(format!(
+            "session {target} is a shell: a message would run as a shell command, which agents may not do. {HOW_SHELL}"
+        ));
+    }
+    let text = clean_text(text);
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    check_no_shell_escape(st, info.kind, &text)?;
     if info.state == AgentState::Exited {
         return Err(format!("session {target} has exited"));
     }
@@ -620,7 +773,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     };
     let out = match st
         .backend
-        .send(target, text.to_string(), mode, format!("session:{caller}"))
+        .send(target, text, mode, format!("session:{caller}"))
         .await
     {
         Ok(out) => out,
@@ -646,9 +799,9 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     })))
 }
 
-fn read_screen<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+fn read_screen<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let id = a.session_id("session_id")?;
-    let info = target_session(st, id)?;
+    let info = reachable_session(st, caller, id)?;
     let text = st
         .backend
         .screen_text(id)
@@ -661,9 +814,9 @@ fn read_screen<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
     ))
 }
 
-fn get_recent_output<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+fn get_recent_output<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let id = a.session_id("session_id")?;
-    target_session(st, id)?;
+    reachable_session(st, caller, id)?;
     let lines = a
         .int("lines")?
         .unwrap_or(st.limits.recent_default_lines as i64)
@@ -673,7 +826,7 @@ fn get_recent_output<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
         .ok_or_else(|| format!("no output available for session {id}"))
 }
 
-async fn wait_for_state<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let id = a.session_id("session_id")?;
     let states: Vec<AgentState> = match a.get("states") {
         None => wait::DEFAULT_STATES.to_vec(),
@@ -700,7 +853,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
         .unwrap_or(st.limits.wait_default_s as i64)
         .clamp(0, st.limits.wait_max_s as i64) as u64;
     let after_ms = a.int("after_ms")?;
-    target_session(st, id)?;
+    reachable_session(st, caller, id)?;
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_s);
@@ -765,6 +918,7 @@ fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         None => caller_session(st, caller)?.channel_id,
     };
     let ch = open_channel(st, ch_id)?;
+    check_channel_reach(st, caller, &ch)?;
     if let Err(wait_s) = st.guard.lock().posts.check_and_record(
         caller,
         now_ms(),
@@ -795,6 +949,7 @@ async fn get_diff<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>)
         .unwrap_or(st.limits.diff_default_bytes as i64)
         .clamp(1000, st.limits.diff_max_bytes as i64) as usize;
     let ch = open_channel(st, ch_id)?;
+    check_channel_reach(st, caller, &ch)?;
     let diff = st
         .backend
         .diff(ch.cwd.clone(), ch.base_branch.clone())
@@ -869,6 +1024,15 @@ mod tests {
         assert_eq!(t["n"], 1);
         let huge = json!({"a": vec!["y".repeat(400); 50]});
         assert!(truncate_args(&huge).get("_truncated").is_some());
+    }
+
+    #[test]
+    fn clean_text_keeps_text_only() {
+        assert_eq!(
+            clean_text("a\x1b[201~\r1\r\n\tb\u{9b}c\u{7f}"),
+            "a[201~\n1\n\tbc"
+        );
+        assert_eq!(clean_text("héllo\nwörld"), "héllo\nwörld");
     }
 
     #[test]

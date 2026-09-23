@@ -212,6 +212,27 @@ async function main() {
     `GET /ws?token=wrong HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`,
   );
   ok(badTok.startsWith("HTTP/1.1 401"), "ws with bad token -> 401");
+  // launch codes: minted with the client token, exchanged once for it
+  const base = `http://127.0.0.1:${PORT}`;
+  ok((await fetch(`${base}/api/launch-code`, { method: "POST" })).status === 401, "launch-code without token -> 401");
+  const lc = await (await fetch(`${base}/api/launch-code`, { method: "POST", headers: { Authorization: `Bearer ${d.token}` } })).json();
+  ok(typeof lc.code === "string" && lc.code.length >= 32 && lc.code !== d.token, "launch-code mints a code");
+  const exchange = (code: string) =>
+    fetch(`${base}/api/exchange`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+  const lcBody = JSON.stringify({ code: lc.code });
+  const evilExchange = await rawHttp(
+    `POST /api/exchange HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: ${lcBody.length}\r\nConnection: close\r\n\r\n${lcBody}`,
+  );
+  ok(evilExchange.startsWith("HTTP/1.1 403"), "exchange with foreign Origin -> 403");
+  const ex = await exchange(lc.code);
+  ok(ex.status === 200 && (await ex.json()).token === d.token, "exchange trades the code for the client token");
+  const reuse = await exchange(lc.code);
+  ok(reuse.status === 403, "launch code reuse -> 403");
+  await reuse.body?.cancel();
+  const bogus = await exchange("0".repeat(64));
+  ok(bogus.status === 403, "unknown launch code -> 403");
+  await bogus.body?.cancel();
+
   const index = await fetch(`http://127.0.0.1:${PORT}/some/spa/route`);
   ok(index.status === 200 && (await index.text()).includes("<html"), "SPA fallback serves HTML");
 
@@ -303,7 +324,10 @@ async function main() {
   const note = await c.call("channel.post", { id: ch.id, text: "hello timeline" });
   ok(note.kind === "note", "channel.post returns a note event");
   const tl = await c.call("channel.timeline", { id: ch.id });
-  ok(tl.some((e: Json) => e.kind === "session_started") && tl.at(-1).kind === "note", "timeline oldest-first with events");
+  // A shell state change may land after the note, so check order rather than the last entry.
+  const iStart = tl.findIndex((e: Json) => e.kind === "session_started");
+  const iNote = tl.findIndex((e: Json) => e.kind === "note" && e.id === note.id);
+  ok(iStart >= 0 && iNote > iStart, "timeline oldest-first with events");
 
   // diff
   await Deno.writeTextFile(`${ch.cwd}/README.md`, "smoke\nchanged\n");
@@ -329,7 +353,8 @@ async function main() {
   await c.call("session.attach", { id: sid });
   await c.waitFor("replay after restart", () => c.frames.some((f) => f.id === sid && f.type === 0x03));
   const replayed = c.terminal(sid);
-  ok(replayed.includes(marker) && replayed.length <= 2 * 1024 * 1024, "exited session replays persisted output.log (capped at 2 MiB)");
+  // 2 MiB of output plus a short terminal-mode prefix.
+  ok(replayed.includes(marker) && replayed.length <= 2 * 1024 * 1024 + 256, "exited session replays persisted output.log (capped at 2 MiB)");
 
   // restart the session: same id, new process, replay cleared
   const rs = await c.call("session.restart", { id: sid });
@@ -354,6 +379,20 @@ async function main() {
   await c.waitFor("exit", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === sid && e.data.state === "exited"));
   ok(true, "session.kill -> exited");
   await c.call("session.restart", { id: sid });
+
+  // leftovers: a background job (ignoring SIGHUP) of a shell that exited is reaped on kill
+  await sleep(800);
+  c.events = [];
+  c.input(sid, `(trap '' HUP; exec sleep 7771) & echo $! > ${BASE}/bgpid; exit\r`);
+  await c.waitFor("shell exit", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === sid && e.data.state === "exited"));
+  const bg = (await Deno.readTextFile(`${BASE}/bgpid`)).trim();
+  await c.call("session.kill", { id: sid });
+  await sleep(4000); // SIGHUP is ignored: SIGKILL follows after the 3 s grace
+  await c.call("session.restart", { id: sid });
+  await sleep(800);
+  c.input(sid, `kill -0 ${bg} 2>/dev/null && echo BG-ALIVE || echo BG-GONE$((1))\r`);
+  await c.waitFor("leftover check", () => c.terminal(sid).includes("BG-GONE1") || c.terminal(sid).includes("BG-ALIVE\r"));
+  ok(c.terminal(sid).includes("BG-GONE1"), "background job of an exited shell killed by session.kill");
 
   // --- clean shutdown
   c.close();

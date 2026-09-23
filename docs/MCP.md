@@ -79,15 +79,17 @@ curl -s -X POST "$MUSTER_URL/mcp" -H "Authorization: Bearer $MUSTER_TOKEN" \
 ## Tools
 
 All results are text. Structured results are pretty-printed JSON. "Caller" means the session
-whose token made the request.
+whose token made the request. By default every tool is limited to the caller's **workspace**
+(see [Reach](#reach-shell-commands-and-other-workspaces)): lists leave out other workspaces,
+and targets in them are refused.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd), workspace (id, name, path), spawn budget. |
+| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
 | `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `state` (aggregate), `sessions`, `live_sessions`. |
 | `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, parent_id, title, exit_code, is_me. |
-| `spawn_agent` | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `channel_id?` **or** `new_channel?: {name, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. `new_channel` is created in the caller's workspace. |
-| `send_message` | `session_id`, `text`, `interrupt? = false` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). |
+| `spawn_agent` | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `channel_id?` **or** `new_channel?: {name, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. `new_channel` is created in the caller's workspace. `kind: shell` with a `prompt` is refused unless shell commands are allowed. |
+| `send_message` | `session_id`, `text`, `interrupt? = false` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
 | `get_recent_output` | `session_id`, `lines? = 100` (max 2000) | Last N lines, ANSI stripped. |
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
@@ -130,11 +132,42 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Live children per caller | **8** (live sessions whose `parent_id` is the caller) |
 | Live MCP-spawned sessions, daemon-wide | **24** (live sessions with any `parent_id`) |
 | `send_message` rate | **20 per 60 s** sliding window, per caller. A send that fails (e.g. the PTY is gone) doesn't use up a slot. |
+| `spawn_agent` rate | **10 per 10 minutes** sliding window, per caller. Refused or failed spawns don't use up a slot. |
+| Agent-created channels | At most **10** non-archived channels created through `spawn_agent`'s `new_channel`, daemon-wide. Spawning into existing channels is not affected. (Tracked in memory: after a daemon restart, earlier channels no longer count.) |
+| Shell commands | Off by default, see below. |
+| Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
 | Self-messaging | Refused (`session_id` == caller) |
 | Message size | 100 000 chars (`send_message`), 20 000 chars (`post_to_channel`) |
 | Permission prompts | There is **no approve tool**. `send_message` with `interrupt: true` is refused while the target is `needs_approval`. Plain sends are queued and delivered only once the agent is ready. A marked extension point (`guard::AGENTS_MAY_APPROVE`, see `src/mcp/guard.rs`) exists for a future human-enabled setting. |
 | Audit | Every `tools/call` (including refused ones, unknown tools, and calls without a name) logs an `mcp_call` event in the caller's channel: `{session_id, tool, args, ok}`, plus `cancelled: true` if the client disconnected mid-call. Strings in args over 500 bytes are shortened; args over 4 KB total are replaced by a truncated string. Protocol-level rejections (bad auth, bad headers) are not tool calls and aren't logged. |
+
+### Reach: shell commands and other workspaces
+
+A message to a shell session, or a shell spawned with a prompt, runs an arbitrary command
+outside the agent CLI's own permission prompts. And one agent driving sessions in an unrelated
+workspace crosses a line the human drew by making separate workspaces. So by default the MCP
+server refuses:
+
+- `spawn_agent` with `kind: "shell"` and a `prompt` (a shell without a prompt is fine: it's for
+  the human), and `send_message` to a `shell` session. Error text: `… The human can allow it by
+  starting the muster daemon with MUSTER_MCP_ALLOW_SHELL=1.`
+- any target outside the caller's workspace: `send_message`, `read_screen`,
+  `get_recent_output`, `wait_for_state` (by session), `post_to_channel`, `get_diff`,
+  `spawn_agent` (by `channel_id`). `list_channels` and `list_sessions` only show the caller's
+  workspace. Error text: `… The human can allow it by starting the muster daemon with
+  MUSTER_MCP_CROSS_WORKSPACE=1.`
+
+Text from agents (`send_message` text, `spawn_agent` prompt) is typed into a terminal, so it
+is cleaned first: ESC and all other control characters except newline and tab are removed (CR
+becomes newline). Otherwise `ESC [ 201 ~` could end the bracketed paste and the rest would
+arrive as raw keystrokes, e.g. answering a permission dialog. And because Claude Code and Codex
+run input that starts with `!` as a shell command, such text is refused for them too unless
+shell commands are allowed.
+
+Only the human can turn these on, through the daemon's environment (`1`, `true`, `yes` or `on`),
+for example `MUSTER_MCP_ALLOW_SHELL=1 muster daemon`. The daemon logs a warning at startup when
+either is on. Agents can see the current setting in `whoami`'s `policy`.
 
 `spawn_agent` calls run one at a time, so parallel requests can't overshoot the limits.
 If `spawn_agent` created a new channel and the spawn then fails, the channel (and its

@@ -415,7 +415,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
             Message::Binary(data) => {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-                    if let Err(e) = hub.write_input(id, &data[5..]) {
+                    if let Err(e) = hub.write_client_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");
                     }
                 }
@@ -468,12 +468,12 @@ async fn handle_request(
                     let _ = out
                         .send(Message::Text(response(&req.id, Ok(json!({}))).to_string().into()))
                         .await;
-                    let (replay, rx, pid) = match att {
-                        Attach::Live(r, rx, pid) => (r, Some(rx), pid),
+                    let (replay, rx, generation) = match att {
+                        Attach::Live(r, rx, g) => (r, Some(rx), Some(g)),
                         Attach::Replay(r) => (r, None, None),
                     };
                     let _ = out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay))).await;
-                    let task = tokio::spawn(forward_output(hub.clone(), id, pid, rx, bus, out.clone()));
+                    let task = tokio::spawn(forward_output(hub.clone(), id, generation, rx, bus, out.clone()));
                     if let Some(other) = attachments.lock().insert(id, task) {
                         other.abort();
                     }
@@ -511,7 +511,7 @@ async fn handle_request(
 async fn forward_output(
     hub: Arc<Hub>,
     id: SessionId,
-    mut pid: Option<u32>,
+    mut generation: Option<u64>,
     mut rx: Option<broadcast::Receiver<Bytes>>,
     mut bus: broadcast::Receiver<ServerEvent>,
     out: Outbox,
@@ -531,16 +531,19 @@ async fn forward_output(
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Slow client: start over from a fresh replay.
-                    if !resend_replay(&hub, id, &mut pid, &mut rx, &out).await {
+                    if !resend_replay(&hub, id, &mut generation, &mut rx, &out).await {
                         return;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => rx = None,
             },
             ev = bus.recv() => match ev {
-                Ok(ServerEvent::SessionUpserted(info)) if info.id == id && info.pid.is_some() && info.pid != pid => {
-                    // Restarted: a new process with an empty replay buffer.
-                    if !resend_replay(&hub, id, &mut pid, &mut rx, &out).await {
+                // Restarted: a new process with an empty replay buffer. Compared by process
+                // generation, not pid (a pid can be reused).
+                Ok(ServerEvent::SessionUpserted(info))
+                    if info.id == id && hub.pty_generation(id).is_some_and(|g| Some(g) != generation) =>
+                {
+                    if !resend_replay(&hub, id, &mut generation, &mut rx, &out).await {
                         return;
                     }
                 }
@@ -555,16 +558,16 @@ async fn forward_output(
 async fn resend_replay(
     hub: &Arc<Hub>,
     id: SessionId,
-    pid: &mut Option<u32>,
+    generation: &mut Option<u64>,
     rx: &mut Option<broadcast::Receiver<Bytes>>,
     out: &Outbox,
 ) -> bool {
-    let (replay, new_rx, new_pid) = match hub.attach(id) {
-        Ok(Attach::Live(r, rx, p)) => (r, Some(rx), p),
+    let (replay, new_rx, new_gen) = match hub.attach(id) {
+        Ok(Attach::Live(r, rx, g)) => (r, Some(rx), Some(g)),
         Ok(Attach::Replay(r)) => (r, None, None),
         Err(_) => return false,
     };
-    *pid = new_pid;
+    *generation = new_gen;
     *rx = new_rx;
     out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay)))
         .await

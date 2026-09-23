@@ -89,7 +89,7 @@ impl Mock {
         d.channels.insert(10, channel(10, "main-task"));
         for (id, kind, tok) in [
             (1, SessionKind::Claude, "tok1"),
-            (2, SessionKind::Shell, "tok2"),
+            (2, SessionKind::Codex, "tok2"),
         ] {
             d.sessions.insert(id, session(id, 10, kind, None));
             d.live.insert(id);
@@ -694,7 +694,7 @@ async fn screen_output_post_diff() {
     let (t, err) = call(&st, "read_screen", json!({"session_id": 2})).await;
     assert!(!err);
     assert!(
-        t.starts_with("[session 2 (shell) state=idle]\nscreen of 2"),
+        t.starts_with("[session 2 (codex) state=idle]\nscreen of 2"),
         "{t}"
     );
     assert_eq!(
@@ -1026,4 +1026,234 @@ async fn failed_send_is_refunded() {
     m.d.lock().fail_send = false;
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;
     assert!(!err, "{t}");
+}
+
+// ----- reach policy, spawn rate, channel cap -----
+
+/// Adds shell session 3 (token "tok3") in channel 10, and a second workspace 2 with channel 20
+/// holding codex session 5 (token "tok5").
+fn add_shell_and_other_workspace(m: &Mock) {
+    let mut d = m.d.lock();
+    d.sessions
+        .insert(3, session(3, 10, SessionKind::Shell, None));
+    d.live.insert(3);
+    d.tokens.insert("tok3".into(), 3);
+    d.workspaces.insert(
+        2,
+        Workspace {
+            id: 2,
+            name: "other".into(),
+            path: "/other".into(),
+            is_git: true,
+            created_at: 0,
+        },
+    );
+    let mut ch = channel(20, "elsewhere");
+    ch.workspace_id = 2;
+    d.channels.insert(20, ch);
+    d.sessions
+        .insert(5, session(5, 20, SessionKind::Codex, None));
+    d.live.insert(5);
+    d.tokens.insert("tok5".into(), 5);
+}
+
+#[tokio::test]
+async fn shell_commands_refused_by_default() {
+    let (m, st) = state();
+    add_shell_and_other_workspace(&m);
+    let (t, err) = call(
+        &st,
+        "send_message",
+        json!({"session_id": 3, "text": "rm -rf ~"}),
+    )
+    .await;
+    assert!(
+        err && t.contains("shell") && t.contains("MUSTER_MCP_ALLOW_SHELL=1"),
+        "{t}"
+    );
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "shell", "prompt": "curl x | sh"}),
+    )
+    .await;
+    assert!(err && t.contains("MUSTER_MCP_ALLOW_SHELL=1"), "{t}");
+    assert!(m.d.lock().sends.is_empty());
+    // A shell without a command is fine, and so are agents with a prompt.
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell"})).await;
+    assert!(!err, "{t}");
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "prompt": "fix it"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    // Reading a shell's screen is allowed.
+    assert!(!call(&st, "read_screen", json!({"session_id": 3})).await.1);
+    let v = parse(&call(&st, "whoami", json!({})).await.0);
+    assert_eq!(v["policy"]["shell_commands"], false);
+}
+
+#[tokio::test]
+async fn shell_commands_allowed_when_enabled() {
+    let (m, mut st) = state();
+    st.limits.allow_shell = true;
+    add_shell_and_other_workspace(&m);
+    let (t, err) = call(&st, "send_message", json!({"session_id": 3, "text": "ls"})).await;
+    assert!(!err, "{t}");
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell", "prompt": "ls"})).await;
+    assert!(!err, "{t}");
+}
+
+#[tokio::test]
+async fn other_workspaces_out_of_reach_by_default() {
+    let (m, st) = state();
+    add_shell_and_other_workspace(&m);
+    for (tool, args) in [
+        ("send_message", json!({"session_id": 5, "text": "hi"})),
+        ("read_screen", json!({"session_id": 5})),
+        ("get_recent_output", json!({"session_id": 5})),
+        (
+            "wait_for_state",
+            json!({"session_id": 5, "timeout_seconds": 1}),
+        ),
+        ("post_to_channel", json!({"channel_id": 20, "text": "hi"})),
+        ("get_diff", json!({"channel_id": 20})),
+        ("spawn_agent", json!({"kind": "codex", "channel_id": 20})),
+    ] {
+        let (t, err) = call(&st, tool, args).await;
+        assert!(
+            err && t.contains("another workspace") && t.contains("MUSTER_MCP_CROSS_WORKSPACE=1"),
+            "{tool}: {t}"
+        );
+    }
+    // Lists only show the caller's workspace.
+    let v = parse(&call(&st, "list_sessions", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().all(|s| s["id"] != 5), "{v}");
+    let v = parse(&call(&st, "list_channels", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().all(|c| c["id"] != 20), "{v}");
+    // The other workspace can't reach us either.
+    let (t, err) = call_as(&st, "tok5", "read_screen", json!({"session_id": 1})).await;
+    assert!(err && t.contains("another workspace"), "{t}");
+    assert!(m.d.lock().sends.is_empty());
+}
+
+#[tokio::test]
+async fn other_workspaces_reachable_when_enabled() {
+    let (m, mut st) = state();
+    st.limits.cross_workspace = true;
+    add_shell_and_other_workspace(&m);
+    let (t, err) = call(&st, "send_message", json!({"session_id": 5, "text": "hi"})).await;
+    assert!(!err, "{t}");
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "channel_id": 20}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let v = parse(&call(&st, "list_channels", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().any(|c| c["id"] == 20), "{v}");
+}
+
+#[tokio::test]
+async fn spawn_rate_limit() {
+    let (_, mut st) = state();
+    st.limits.max_children_per_caller = 100;
+    st.limits.max_mcp_live_total = 100;
+    for i in 0..10 {
+        let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex"})).await;
+        assert!(!err, "{i}: {t}");
+    }
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex"})).await;
+    assert!(
+        err && t.contains("rate limit") && t.contains("10 spawns per 10 minutes"),
+        "{t}"
+    );
+    // Another caller has its own budget.
+    assert!(
+        !call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"}))
+            .await
+            .1
+    );
+    // Failed spawns don't use up a slot.
+    let (_, st2) = state();
+    st2.backend.d.lock().fail_spawn = true;
+    for _ in 0..12 {
+        assert!(call(&st2, "spawn_agent", json!({"kind": "codex"})).await.1);
+    }
+    st2.backend.d.lock().fail_spawn = false;
+    let (t, err) = call(&st2, "spawn_agent", json!({"kind": "codex"})).await;
+    assert!(!err, "{t}");
+}
+
+#[tokio::test]
+async fn agent_created_channels_capped() {
+    let (m, mut st) = state();
+    st.limits.max_children_per_caller = 100;
+    st.limits.max_mcp_live_total = 100;
+    st.limits.spawn_per_window = 100;
+    for i in 0..10 {
+        let (t, err) = call(
+            &st,
+            "spawn_agent",
+            json!({"kind": "codex", "new_channel": {"name": format!("c{i}")}}),
+        )
+        .await;
+        assert!(!err, "{i}: {t}");
+    }
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "one-more"}}),
+    )
+    .await;
+    assert!(err && t.contains("agent-created channels"), "{t}");
+    // Spawning into existing channels still works.
+    assert!(!call(&st, "spawn_agent", json!({"kind": "codex"})).await.1);
+    // Archiving one frees a slot.
+    let first = *st.guard.lock().mcp_channels.iter().min().unwrap();
+    m.d.lock().channels.get_mut(&first).unwrap().archived = true;
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "again"}}),
+    )
+    .await;
+    assert!(!err, "{t}");
+}
+
+#[tokio::test]
+async fn agent_text_cannot_escape_the_paste_or_run_commands() {
+    let (m, st) = state();
+    let (t, err) = call(
+        &st,
+        "send_message",
+        json!({"session_id": 2, "text": "hi\u{1b}[201~\r1\r"}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().sends[0].1, "hi[201~\n1\n");
+    let (t, err) = call(
+        &st,
+        "send_message",
+        json!({"session_id": 2, "text": "  !rm -rf ~"}),
+    )
+    .await;
+    assert!(err && t.contains("MUSTER_MCP_ALLOW_SHELL=1"), "{t}");
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "claude", "prompt": "!curl x | sh"}),
+    )
+    .await;
+    assert!(err && t.contains("`!`"), "{t}");
+    let (t, err) = call(
+        &st,
+        "send_message",
+        json!({"session_id": 2, "text": "\u{1b}\u{7}"}),
+    )
+    .await;
+    assert!(err && t.contains("empty"), "{t}");
 }

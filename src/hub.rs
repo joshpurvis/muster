@@ -112,9 +112,10 @@ pub struct HubConfig {
 
 /// What `attach` hands to a client connection.
 pub enum Attach {
-    /// Running (or exited-this-run) session: replay bytes + live output receiver + the pid
-    /// of the process they belong to (taken together, so a restart can't mismatch them).
-    Live(Vec<u8>, broadcast::Receiver<Bytes>, Option<u32>),
+    /// Running (or exited-this-run) session: replay bytes + live output receiver + the
+    /// generation of the process they belong to (taken together, so a restart can't
+    /// mismatch them; see `pty_generation`).
+    Live(Vec<u8>, broadcast::Receiver<Bytes>, u64),
     /// Session from a previous daemon run: replay only.
     Replay(Vec<u8>),
 }
@@ -142,8 +143,13 @@ struct Started {
 /// A Screen update can't override a Hook update younger than this.
 const HOOK_GRACE_MS: i64 = 1500;
 const EVENT_BUS_CAP: usize = 4096;
-/// Hook payloads larger than this are not stored verbatim in the event log.
-const MAX_HOOK_PAYLOAD: usize = 64 * 1024;
+/// Event log retention: rows older than this, or beyond the newest `EVENTS_PER_CHANNEL` of a
+/// channel, are pruned at startup and hourly.
+pub const EVENT_MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub const EVENTS_PER_CHANNEL: usize = 5000;
+/// Launch codes (`POST /api/launch-code`) are single use and expire after this.
+const LAUNCH_CODE_TTL: Duration = Duration::from_secs(60);
+const MAX_LAUNCH_CODES: usize = 64;
 
 struct SessEntry {
     info: SessionInfo,
@@ -167,6 +173,8 @@ struct Inner {
     channels: BTreeMap<ChannelId, Channel>,
     sessions: BTreeMap<SessionId, SessEntry>,
     tokens: HashMap<String, SessionId>,
+    /// One-time launch code -> expiry.
+    launch_codes: HashMap<String, std::time::Instant>,
 }
 
 pub struct Hub {
@@ -183,12 +191,32 @@ impl Hub {
     /// Load persisted state. Sessions that were running when the previous daemon died are
     /// marked Exited ("daemon restarted").
     pub fn new(cfg: HubConfig, store: Store) -> anyhow::Result<Arc<Hub>> {
-        // Processes that outlived a crashed daemon (e.g. ignoring SIGHUP) would otherwise keep
-        // running unmanaged next to a restarted copy.
-        for (id, pid) in store.running_pids().unwrap_or_default() {
-            pty::reap_orphan(pid, id);
-        }
+        // Processes that outlived a crashed daemon (or ignored SIGHUP, or were left behind by
+        // an exited shell) would otherwise keep running unmanaged next to a restarted copy.
+        let url = format!("MUSTER_URL=http://127.0.0.1:{}", cfg.port);
+        pty::reap_leftovers(
+            store
+                .session_sids()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, sid, marker)| {
+                    // The per-run token marks that run's processes (whatever port it used); rows
+                    // from before markers were stored fall back to this daemon's URL.
+                    (
+                        sid,
+                        id,
+                        vec![format!("MUSTER_SESSION_ID={id}"), marker.unwrap_or_else(|| url.clone())],
+                    )
+                })
+                .collect(),
+        );
+        let _ = store.clear_session_sids();
         store.mark_all_exited("daemon restarted", now_ms())?;
+        match store.prune_events(now_ms() - EVENT_MAX_AGE_MS, EVENTS_PER_CHANNEL) {
+            Ok(n) if n > 0 => tracing::info!("pruned {n} old events"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("pruning events: {e}"),
+        }
         let mut inner = Inner::default();
         for w in store.load_workspaces()? {
             inner.workspaces.insert(w.id, w);
@@ -236,6 +264,41 @@ impl Hub {
 
     pub fn check_client_token(&self, token: &str) -> bool {
         paths::token_eq(token, &self.cfg.client_token)
+    }
+
+    /// Mint a single-use launch code (60 s) the UI trades for the client token, so the token
+    /// never shows up on a browser command line.
+    pub fn mint_launch_code(&self) -> String {
+        let now = std::time::Instant::now();
+        let code = paths::random_token();
+        let mut g = self.inner.lock();
+        g.launch_codes.retain(|_, exp| *exp > now);
+        if g.launch_codes.len() >= MAX_LAUNCH_CODES
+            && let Some(oldest) = g.launch_codes.iter().min_by_key(|(_, e)| **e).map(|(c, _)| c.clone())
+        {
+            g.launch_codes.remove(&oldest);
+        }
+        g.launch_codes.insert(code.clone(), now + LAUNCH_CODE_TTL);
+        code
+    }
+
+    /// Consume a launch code; returns the client token if it was valid and unexpired.
+    pub fn exchange_launch_code(&self, code: &str) -> Option<String> {
+        let now = std::time::Instant::now();
+        let mut g = self.inner.lock();
+        g.launch_codes.retain(|_, exp| *exp > now);
+        let key = g.launch_codes.keys().find(|k| paths::token_eq(k, code)).cloned()?;
+        g.launch_codes.remove(&key);
+        Some(self.cfg.client_token.clone())
+    }
+
+    /// Apply event-log retention (see `EVENT_MAX_AGE_MS`, `EVENTS_PER_CHANNEL`).
+    pub fn prune_events(&self) {
+        match self.store.prune_events(now_ms() - EVENT_MAX_AGE_MS, EVENTS_PER_CHANNEL) {
+            Ok(n) if n > 0 => tracing::info!("pruned {n} old events"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("pruning events: {e}"),
+        }
     }
 
     // ----- event bus -----
@@ -358,6 +421,22 @@ impl Hub {
         }
     }
 
+    /// Keyboard input from an attached client's terminal (`0x02` frames). Answers to terminal
+    /// queries are dropped: the daemon answers those itself.
+    pub fn write_client_input(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
+        match self.pty(id) {
+            Some(p) => p.write_client(bytes),
+            None if self.session(id).is_some() => anyhow::bail!("session {id} is not running"),
+            None => anyhow::bail!("no such session: {id}"),
+        }
+    }
+
+    /// Generation of the session's current process (changes on every restart), if it has one
+    /// this daemon run.
+    pub fn pty_generation(&self, id: SessionId) -> Option<u64> {
+        self.pty(id).map(|p| p.generation)
+    }
+
     /// Current screen as text, from the headless VT.
     pub fn screen(&self, id: SessionId) -> Option<ScreenSnapshot> {
         if let Some(p) = self.pty(id) {
@@ -377,6 +456,7 @@ impl Hub {
     }
 
     /// Unix ms of the last PTY output for a session (0 if none).
+    #[allow(dead_code)] // part of the hub's public surface
     pub fn last_output_at(&self, id: SessionId) -> i64 {
         self.pty(id).map(|p| p.last_output_at()).unwrap_or(0)
     }
@@ -390,13 +470,15 @@ impl Hub {
     pub fn attach(&self, id: SessionId) -> anyhow::Result<Attach> {
         if let Some(p) = self.pty(id) {
             let (replay, rx) = p.attach();
-            return Ok(Attach::Live(replay, rx, p.pid));
+            return Ok(Attach::Live(replay, rx, p.generation));
         }
-        if self.session(id).is_none() {
-            anyhow::bail!("no such session: {id}");
-        }
-        Ok(Attach::Replay(pty::read_log(
+        let info = self
+            .session(id)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        Ok(Attach::Replay(pty::log_replay(
             &paths::session_dir(id).join("output.log"),
+            info.cols,
+            info.rows,
         )))
     }
 
@@ -546,7 +628,18 @@ impl Hub {
         let _ = self.update_session_info_checked(id, Some(generation), |i| i.title = title);
     }
 
+    /// Can an exited process's PTY be dropped from the hub? Only once output.log holds the
+    /// scrollback and nothing of its session is left running (the PTY is the handle used to
+    /// kill leftovers, including ones that closed the terminal, e.g. `nohup … &`). Walks /proc:
+    /// call without the hub lock.
+    fn releasable(p: &PtySession) -> bool {
+        !p.is_alive() && p.is_drained() && p.log_persisted() && !p.has_processes()
+    }
+
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
+        let release = self
+            .pty(id)
+            .is_some_and(|p| p.generation == generation && Self::releasable(&p));
         let channel_id = {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else {
@@ -562,9 +655,10 @@ impl Hub {
             e.info.exit_code = Some(code);
             e.info.pid = None;
             e.info.queued = 0;
-            // Release the PTY and its in-memory ring once output.log holds the scrollback;
+            // Release the PTY and its in-memory ring once output.log holds the scrollback and
+            // no leftover process holds the terminal (the PTY is needed to kill those);
             // replay/screen for exited sessions are served from the log.
-            if e.pty.as_ref().is_some_and(|p| p.log_persisted()) {
+            if release && e.pty.as_ref().is_some_and(|p| p.generation == generation) {
                 e.pty = None;
             }
             let token = e.token.take();
@@ -596,6 +690,27 @@ impl Hub {
             EventKind::SessionExited,
             serde_json::json!({ "session_id": id, "exit_code": code }),
         );
+    }
+
+    /// The reader of a PTY saw EOF (nothing holds the terminal any more). Releases the PTY
+    /// of an exited process.
+    pub(crate) fn pty_drained(&self, id: SessionId, generation: u64) {
+        if !self
+            .pty(id)
+            .is_some_and(|p| p.generation == generation && Self::releasable(&p))
+        {
+            return;
+        }
+        let mut g = self.inner.lock();
+        // Only after `pty_exited` recorded the exit: it treats a missing PTY as "not installed
+        // yet" and would otherwise drop the exit.
+        if let Some(e) = g.sessions.get_mut(&id)
+            && e.generation == generation
+            && e.info.exit_code.is_some()
+            && e.pty.as_ref().is_some_and(|p| p.generation == generation)
+        {
+            e.pty = None;
+        }
     }
 
     // ----- mutations -----
@@ -944,6 +1059,7 @@ impl Hub {
         let started = self.start_process(id, prompt.clone());
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
             e.busy = false;
+            e.kill_requested = false;
         }
         match started {
             Ok(Started {
@@ -1098,6 +1214,12 @@ impl Hub {
             e.info.exit_code = None;
             e.info.queued = 0;
             e.info.title = None;
+            if let Err(err) = self
+                .store
+                .set_session_sid(id, pty.pid, Some(&format!("MUSTER_TOKEN={token}")))
+            {
+                tracing::warn!(session = id, "persisting session id: {err}");
+            }
             let early = e.early_exit.take();
             let kill = std::mem::take(&mut e.kill_requested);
             let info = e.info.clone();
@@ -1141,15 +1263,21 @@ impl Hub {
         let r = self.restart_inner(id).await;
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
             e.busy = false;
+            // A kill that arrived while starting was applied to the new process, or the
+            // start failed; either way it must not hit the next process.
+            e.kill_requested = false;
         }
         r
     }
 
     async fn restart_inner(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
+        if let Some(p) = self.pty(id) {
+            // Also reaps leftovers (background jobs) of an already exited process.
+            p.kill();
+        }
         if let Some(p) = self.pty(id)
             && p.is_alive()
         {
-            p.kill();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
             while p.is_alive() || self.session(id).is_some_and(|s| s.state != AgentState::Exited) {
                 if tokio::time::Instant::now() > deadline {
@@ -1247,10 +1375,14 @@ impl Hub {
         };
         if let Some(p) = &entry.pty {
             p.discard();
+            // Also reaps leftovers (background jobs) of an already exited process.
             p.kill();
         }
         if let Err(e) = self.store.delete_session(id) {
             tracing::warn!(session = id, "deleting session: {e}");
+        }
+        if let Err(e) = self.store.delete_session_events(id) {
+            tracing::warn!(session = id, "deleting session events: {e}");
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.emit(ServerEvent::SessionRemoved { id });
@@ -1293,16 +1425,11 @@ impl Hub {
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         let update = adapter_for(info.kind).on_hook(event, &payload);
-        let stored_payload = if payload.to_string().len() > MAX_HOOK_PAYLOAD {
-            serde_json::json!({"truncated": true})
-        } else {
-            payload
-        };
         self.log_event(
             Some(info.channel_id),
             Some(id),
             EventKind::Hook,
-            serde_json::json!({"session_id": id, "event": event, "payload": stored_payload}),
+            serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}),
         );
         if let Some(u) = update {
             self.set_state(id, u, StateSource::Hook);
@@ -1312,41 +1439,49 @@ impl Hub {
 
     // ----- daemon lifecycle -----
 
-    /// Persist every live session's output buffer (called periodically).
-    pub fn flush_logs(&self) {
-        let ptys: Vec<Arc<PtySession>> = self
-            .inner
+    fn all_ptys(&self) -> Vec<Arc<PtySession>> {
+        self.inner
             .lock()
             .sessions
             .values()
             .filter_map(|e| e.pty.clone())
-            .collect();
-        for p in ptys {
+            .collect()
+    }
+
+    /// Append new output of every session to its output.log (called periodically; no fsync).
+    pub fn flush_logs(&self) {
+        for p in self.all_ptys() {
             p.flush_log();
         }
     }
 
-    /// Kill all sessions, wait briefly for them to exit, flush logs, mark the rest Exited.
+    /// Kill all sessions (and their leftover background processes), wait briefly for them to
+    /// exit, flush and fsync logs, mark the rest Exited.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         let ptys: Vec<Arc<PtySession>> = self
-            .inner
-            .lock()
-            .sessions
-            .values()
-            .filter_map(|e| e.pty.clone())
-            .filter(|p| p.is_alive())
+            .all_ptys()
+            .into_iter()
+            .filter(|p| p.is_alive() || !p.is_drained())
             .collect();
         for p in &ptys {
             p.kill();
         }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
-        while ptys.iter().any(|p| p.is_alive()) && tokio::time::Instant::now() < deadline {
+        while ptys.iter().any(|p| p.has_processes()) && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // The kill threads' SIGKILL escalation may not get to run before the process exits.
+        for p in &ptys {
+            if p.has_processes() {
+                p.kill_now();
+            }
         }
         // Give waiter threads a moment to report exits.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        self.flush_logs();
+        for p in self.all_ptys() {
+            p.flush_log_final();
+        }
         let ids: Vec<SessionId> = self
             .inner
             .lock()
@@ -1363,6 +1498,30 @@ impl Hub {
             );
         }
     }
+}
+
+/// What the event log keeps of a hook payload: the event's identifying fields only (the full
+/// payload can hold prompts, tool inputs and outputs).
+fn hook_summary(payload: &serde_json::Value) -> serde_json::Value {
+    const KEYS: &[&str] = &[
+        "hook_event_name",
+        "tool_name",
+        "notification_type",
+        "matcher",
+        "source",
+        "reason",
+        "type",
+    ];
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = payload.as_object() {
+        for k in KEYS {
+            if let Some(v) = obj.get(*k).and_then(|v| v.as_str()) {
+                let v: String = v.chars().take(120).collect();
+                out.insert((*k).to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Each channel gets a block of 10 ports.

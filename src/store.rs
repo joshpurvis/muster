@@ -76,6 +76,20 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX events_channel ON events(channel_id, id);
     "#,
+    // v2: session id of the last process (to reap leftovers after a restart), event retention
+    // (index on ts), hook events keep a summary only.
+    r#"
+    ALTER TABLE sessions ADD COLUMN sid INTEGER;
+    ALTER TABLE sessions ADD COLUMN run_marker TEXT;
+    UPDATE sessions SET sid = pid WHERE pid IS NOT NULL;
+    CREATE INDEX events_ts ON events(ts);
+    CREATE INDEX events_session ON events(session_id);
+    UPDATE events SET data = json_object(
+        'session_id', json_extract(data, '$.session_id'),
+        'event', json_extract(data, '$.event'),
+        'summary', json_object())
+    WHERE kind = 'hook' AND json_valid(data);
+    "#,
 ];
 
 fn enum_to_str<T: serde::Serialize>(v: &T) -> String {
@@ -103,6 +117,15 @@ impl Store {
             crate::paths::make_private_file(std::path::Path::new(&format!("{}{suffix}", path.display())));
         }
         let store = Store { conn: Mutex::new(conn) };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub fn open_memory() -> anyhow::Result<Self> {
+        let store = Store {
+            conn: Mutex::new(Connection::open_in_memory()?),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -342,14 +365,34 @@ impl Store {
         Ok(())
     }
 
-    /// Sessions that were running when the previous daemon stopped: (id, pid).
-    pub fn running_pids(&self) -> anyhow::Result<Vec<(SessionId, u32)>> {
+    /// Record the session id (= pid of the process muster started) of a session's current
+    /// process. Kept after the process exits, so leftovers can be reaped at the next start.
+    /// `marker` is a `KEY=value` from that process's environment unique to the run
+    /// (`MUSTER_TOKEN=…`), used to recognize its leftovers.
+    pub fn set_session_sid(&self, id: SessionId, sid: Option<u32>, marker: Option<&str>) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET sid = ?2, run_marker = ?3 WHERE id = ?1",
+            params![id, sid, marker],
+        )?;
+        Ok(())
+    }
+
+    /// Every session's last process session id: (id, sid, marker).
+    pub fn session_sids(&self) -> anyhow::Result<Vec<(SessionId, u32, Option<String>)>> {
         let conn = self.conn.lock();
-        let mut st = conn.prepare("SELECT id, pid FROM sessions WHERE state != 'exited' AND pid IS NOT NULL")?;
+        let mut st = conn.prepare("SELECT id, sid, run_marker FROM sessions WHERE sid IS NOT NULL")?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)? as SessionId, r.get::<_, i64>(1)? as u32))
+            Ok((r.get::<_, i64>(0)? as SessionId, r.get::<_, i64>(1)? as u32, r.get(2)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn clear_session_sids(&self) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET sid = NULL, run_marker = NULL WHERE sid IS NOT NULL",
+            [],
+        )?;
+        Ok(())
     }
 
     /// At daemon start: any session not Exited becomes Exited ("daemon restarted").
@@ -379,6 +422,32 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Retention: delete events older than `cutoff_ts`, and all but the newest `per_channel`
+    /// events of each channel. Returns the number of rows deleted.
+    pub fn prune_events(&self, cutoff_ts: i64, per_channel: usize) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let old = conn.execute("DELETE FROM events WHERE ts < ?1", [cutoff_ts])?;
+        let over = conn.execute(
+            "DELETE FROM events WHERE id IN (
+                SELECT id FROM (
+                    SELECT id, ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY id DESC) AS rn
+                    FROM events
+                ) WHERE rn > ?1
+            )",
+            [per_channel as i64],
+        )?;
+        Ok(old + over)
+    }
+
+    /// On session removal: drop its hook and state-change rows (the rest of the timeline,
+    /// prompts, posts and so on, stays).
+    pub fn delete_session_events(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().execute(
+            "DELETE FROM events WHERE session_id = ?1 AND kind IN ('hook', 'state_change')",
+            [session_id],
+        )?)
+    }
+
     pub fn timeline(&self, channel_id: ChannelId, before: Option<i64>, limit: usize) -> anyhow::Result<Vec<Event>> {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
@@ -400,5 +469,79 @@ impl Store {
         let mut out: Vec<Event> = rows.collect::<Result<_, _>>()?;
         out.reverse();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn count(s: &Store, sql: &str) -> i64 {
+        s.conn.lock().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn event_retention() {
+        let s = Store::open_memory().unwrap();
+        let v = serde_json::json!({"x": 1});
+        // Channel 1: 10 old + 20 new; channel 2: 3 new; no channel: 2 old.
+        for i in 0..10 {
+            s.insert_event(Some(1), None, EventKind::Note, &v, 100 + i).unwrap();
+        }
+        for i in 0..20 {
+            s.insert_event(Some(1), None, EventKind::Note, &v, 10_000 + i).unwrap();
+        }
+        for i in 0..3 {
+            s.insert_event(Some(2), None, EventKind::Note, &v, 10_000 + i).unwrap();
+        }
+        for i in 0..2 {
+            s.insert_event(None, None, EventKind::System, &v, 50 + i).unwrap();
+        }
+        let n = s.prune_events(5_000, 15).unwrap();
+        assert_eq!(n, 12 + 5);
+        assert_eq!(count(&s, "SELECT COUNT(*) FROM events WHERE channel_id = 1"), 15);
+        assert_eq!(count(&s, "SELECT COUNT(*) FROM events WHERE channel_id = 2"), 3);
+        // The newest ones of channel 1 are kept.
+        assert_eq!(count(&s, "SELECT MIN(ts) FROM events WHERE channel_id = 1"), 10_005);
+        assert_eq!(s.timeline(1, None, 100).unwrap().len(), 15);
+    }
+
+    #[test]
+    fn session_events_removed_with_session() {
+        let s = Store::open_memory().unwrap();
+        let v = serde_json::json!({});
+        s.insert_event(Some(1), Some(7), EventKind::Hook, &v, 1).unwrap();
+        s.insert_event(Some(1), Some(7), EventKind::StateChange, &v, 2).unwrap();
+        s.insert_event(Some(1), Some(7), EventKind::Prompt, &v, 3).unwrap();
+        s.insert_event(Some(1), Some(8), EventKind::Hook, &v, 4).unwrap();
+        assert_eq!(s.delete_session_events(7).unwrap(), 2);
+        let left: Vec<_> = s
+            .timeline(1, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.session_id, e.kind))
+            .collect();
+        assert_eq!(left, vec![(Some(7), EventKind::Prompt), (Some(8), EventKind::Hook)]);
+    }
+
+    #[test]
+    fn sids_roundtrip() {
+        let s = Store::open_memory().unwrap();
+        assert!(s.session_sids().unwrap().is_empty());
+        s.conn
+            .lock()
+            .execute(
+                "INSERT INTO sessions (id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
+                 VALUES (3, 1, 'shell', 's', '/', 'exited', 0, 80, 24, 0)",
+                [],
+            )
+            .unwrap();
+        s.set_session_sid(3, Some(4242), Some("MUSTER_TOKEN=ab")).unwrap();
+        assert_eq!(
+            s.session_sids().unwrap(),
+            vec![(3, 4242, Some("MUSTER_TOKEN=ab".to_string()))]
+        );
+        s.clear_session_sids().unwrap();
+        assert!(s.session_sids().unwrap().is_empty());
     }
 }

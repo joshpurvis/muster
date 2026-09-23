@@ -6,6 +6,13 @@
 //! `prompt_bytes`, wait, write `submit_bytes`, then verify the agent took it (state left Idle,
 //! or the input box no longer holds the text). If not, submit once more; if the text is still
 //! sitting there, clear it and requeue (at most 3 attempts), so no half-typed input remains.
+//! If a dialog (permission prompt, question) opens while the text is being typed, Enter is not
+//! pressed and the prompt goes back to the front of the queue; the typed text is cleared by the
+//! next attempt once the dialog is gone (keys sent now would answer the dialog).
+//!
+//! Shells: the adapter can't read the input line, so shell deliveries start with a line clear
+//! (Ctrl-E, Ctrl-U; see `agents/shell.rs`). A half-typed command of the human is discarded
+//! (bash and zsh keep it in the kill ring: Ctrl-Y brings it back).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock};
@@ -63,6 +70,11 @@ struct SessQ {
 }
 
 static QUEUES: LazyLock<Mutex<HashMap<SessionId, SessQ>>> = LazyLock::new(Default::default);
+
+/// Put an item back at the head of a session's queue.
+fn requeue_front(id: SessionId, item: Item) {
+    QUEUES.lock().entry(id).or_default().items.push_front(item);
+}
 
 fn queue_len(id: SessionId) -> u32 {
     QUEUES
@@ -273,29 +285,63 @@ fn box_holds(composer: &str, text: &str) -> bool {
     (!p.is_empty() && composer.contains(&p)) || composer.contains("[Pasted")
 }
 
-/// Why typing must stop right now, if it must.
+/// Why typing must stop right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unsafe {
+    /// The session was removed, exited or restarted.
+    Gone(&'static str),
+    /// A dialog (permission, question, folder trust) took over: keys would answer it.
+    Dialog,
+}
+
+impl std::fmt::Display for Unsafe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unsafe::Gone(why) => f.write_str(why),
+            Unsafe::Dialog => f.write_str("a dialog is open in the terminal"),
+        }
+    }
+}
+
+/// Why typing must stop right now, if it must. `generation` identifies the process the
+/// delivery started with (compared instead of the pid, which can be reused).
 fn unsafe_to_type(
     hub: &Hub,
     id: SessionId,
     adapter: &dyn Adapter,
-    pid: Option<u32>,
-) -> Option<String> {
+    generation: Option<u64>,
+) -> Option<Unsafe> {
     let Some(info) = hub.session(id) else {
-        return Some("the session was removed".into());
+        return Some(Unsafe::Gone("the session was removed"));
     };
-    if info.state == AgentState::Exited || info.pid != pid {
-        return Some("the process exited or was restarted".into());
+    if info.state == AgentState::Exited || hub.pty_generation(id) != generation {
+        return Some(Unsafe::Gone("the process exited or was restarted"));
     }
     let screen = hub.screen(id)?;
-    // A dialog (permission, question, folder trust) took over: keys would answer it.
     match adapter
         .detect_from_screen(&screen, info.state)
         .map(|u| u.state)
     {
-        Some(AgentState::NeedsApproval | AgentState::AskingQuestion) => {
-            Some("a dialog is open in the terminal".into())
-        }
+        Some(AgentState::NeedsApproval | AgentState::AskingQuestion) => Some(Unsafe::Dialog),
         _ => None,
+    }
+}
+
+/// What to do after typing a prompt, before pressing Enter.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterTyping {
+    Submit,
+    /// A dialog opened: don't submit; put the prompt back at the front of the queue. Its text
+    /// stays in the input box until the next attempt clears it (it matches `last_sent`).
+    Requeue,
+    Fail(String),
+}
+
+fn after_typing(state: Option<Unsafe>, attempts: u8) -> AfterTyping {
+    match state {
+        None => AfterTyping::Submit,
+        Some(Unsafe::Dialog) if attempts < MAX_ATTEMPTS => AfterTyping::Requeue,
+        Some(why) => AfterTyping::Fail(format!("prompt typed but not submitted: {why}")),
     }
 }
 
@@ -305,12 +351,12 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
     let adapter = adapter_for(info.kind);
-    let pid = info.pid;
+    let generation = hub.pty_generation(id);
     let requeue = |item: Item| {
-        QUEUES.lock().entry(id).or_default().items.push_front(item);
+        requeue_front(id, item);
         Ok(false)
     };
-    if let Some(why) = unsafe_to_type(hub, id, adapter, pid) {
+    if let Some(why) = unsafe_to_type(hub, id, adapter, generation) {
         tracing::debug!(session = id, "not typing: {why}");
         return requeue(item);
     }
@@ -349,9 +395,14 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     QUEUES.lock().entry(id).or_default().last_sent = Some(item.text.clone());
     let extra = Duration::from_millis((bytes.len() as u64 / 50).min(900));
     tokio::time::sleep(SUBMIT_DELAY_MIN + extra).await;
-    if let Some(why) = unsafe_to_type(hub, id, adapter, pid) {
-        // Something took over while we typed; don't press Enter into it.
-        anyhow::bail!("prompt typed but not submitted: {why}");
+    // Something took over while we typed; don't press Enter into it.
+    match after_typing(unsafe_to_type(hub, id, adapter, generation), item.attempts) {
+        AfterTyping::Submit => {}
+        AfterTyping::Requeue => {
+            tracing::debug!(session = id, "dialog opened while typing; prompt requeued");
+            return requeue(item);
+        }
+        AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
     let seq_before = hub.output_seq(id);
     hub.write_input(id, &adapter.submit_bytes())?;
@@ -363,7 +414,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         Outcome::Gone => anyhow::bail!("the session exited"),
         Outcome::Pending => {}
     }
-    if unsafe_to_type(hub, id, adapter, pid).is_some() {
+    if unsafe_to_type(hub, id, adapter, generation).is_some() {
         return Ok(true);
     }
     tracing::debug!(session = id, "prompt not accepted yet; submitting again");
@@ -377,7 +428,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
 
     // 4. Still sitting in the box: take it back out and retry later.
     let still_there = composer(hub, id, adapter).is_some_and(|c| box_holds(&c, &item.text));
-    if still_there && unsafe_to_type(hub, id, adapter, pid).is_none() {
+    if still_there && unsafe_to_type(hub, id, adapter, generation).is_none() {
         if let Some(clear) = adapter.clear_input_bytes() {
             hub.write_input(id, &clear)?;
         }
@@ -523,6 +574,48 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_while_typing_requeues_at_front() {
+        // Decision: a dialog means "requeue" (until attempts run out), a dead process fails.
+        assert_eq!(after_typing(None, 1), AfterTyping::Submit);
+        assert_eq!(after_typing(Some(Unsafe::Dialog), 1), AfterTyping::Requeue);
+        assert_eq!(after_typing(Some(Unsafe::Dialog), 2), AfterTyping::Requeue);
+        assert!(matches!(
+            after_typing(Some(Unsafe::Dialog), MAX_ATTEMPTS),
+            AfterTyping::Fail(_)
+        ));
+        assert!(matches!(
+            after_typing(Some(Unsafe::Gone("the session was removed")), 1),
+            AfterTyping::Fail(m) if m.contains("removed")
+        ));
+        // Requeue puts it ahead of what was queued meanwhile.
+        let id = 4_000_000_001;
+        let item = |t: &str| Item {
+            text: t.into(),
+            clear_first: false,
+            attempts: 1,
+            draft_noticed: false,
+        };
+        QUEUES
+            .lock()
+            .entry(id)
+            .or_default()
+            .items
+            .push_back(item("later"));
+        requeue_front(id, item("interrupted"));
+        let texts: Vec<String> = QUEUES
+            .lock()
+            .remove(&id)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.text)
+            .collect();
+        assert_eq!(texts, ["interrupted", "later"]);
+        // The next attempt recognizes the leftover text as ours (so it clears it first).
+        assert!(box_holds("interrupted", "interrupted"));
+    }
 
     #[test]
     fn box_matching() {

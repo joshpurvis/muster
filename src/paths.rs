@@ -125,8 +125,13 @@ impl Discovery {
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+    /// UI URL carrying the client token itself (`muster url`: the user asked for it).
     pub fn ui_url(&self) -> String {
         format!("{}/#token={}", self.base_url(), self.token)
+    }
+    /// UI URL carrying a single-use launch code (safe to put on a browser command line).
+    pub fn launch_url(&self, code: &str) -> String {
+        format!("{}/#code={}", self.base_url(), code)
     }
 }
 

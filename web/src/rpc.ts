@@ -32,17 +32,37 @@ type HelloHandler = (h: HelloResult, reconnect: boolean) => void;
 
 const TOKEN_KEY = "muster.token";
 
-function readToken(): string | null {
+function storeToken(tok: string) {
+  try {
+    sessionStorage.setItem(TOKEN_KEY, tok);
+  } catch { /* ignore */ }
+}
+
+/** Read the client token. `muster` opens `#code=<one-time code>`, which is exchanged for the
+ * token (so the token never appears on a process command line); `muster url` links carry
+ * `#token=` directly. Either way the hash is stripped and the token kept for this tab. */
+async function readToken(): Promise<string | null> {
   const params = new URLSearchParams(location.hash.slice(1));
-  const tok = params.get("token");
-  if (tok) {
-    try {
-      sessionStorage.setItem(TOKEN_KEY, tok);
-    } catch { /* ignore */ }
-    // Strip the token from the visible URL / history.
+  const code = params.get("code");
+  let tok = params.get("token");
+  if (code || tok) {
+    params.delete("code");
     params.delete("token");
     const rest = params.toString();
     history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+  }
+  if (!tok && code) {
+    try {
+      const r = await fetch("/api/exchange", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      if (r.ok) tok = ((await r.json()) as { token?: string }).token ?? null;
+    } catch { /* fall back to a stored token */ }
+  }
+  if (tok) {
+    storeToken(tok);
     return tok;
   }
   try {
@@ -68,8 +88,8 @@ class Rpc {
   onBinary: BinaryHandler = () => {};
   onHello: HelloHandler = () => {};
 
-  start() {
-    this.token = readToken();
+  async start() {
+    this.token = await readToken();
     if (!this.token) {
       connStatus.value = "no_token";
       return;

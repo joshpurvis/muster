@@ -41,10 +41,16 @@ pub struct McpState<B> {
 }
 
 impl<B: Backend> McpState<B> {
+    /// Default limits (shell commands and other workspaces off).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(backend: B) -> Self {
+        Self::with_limits(backend, guard::Limits::default())
+    }
+
+    pub fn with_limits(backend: B, limits: guard::Limits) -> Self {
         Self {
             backend,
-            limits: guard::Limits::default(),
+            limits,
             guard: Default::default(),
             spawn_lock: Default::default(),
         }
@@ -82,7 +88,20 @@ pub fn spawn_tracker<B: Backend>(st: &Arc<McpState<B>>) {
 }
 
 pub fn router(hub: Arc<Hub>) -> Router {
-    let st = Arc::new(McpState::new(HubBackend(hub)));
+    let limits = guard::Limits::from_env();
+    if limits.allow_shell {
+        tracing::warn!(
+            "{}=1: agents may run shell commands through MCP",
+            guard::ENV_ALLOW_SHELL
+        );
+    }
+    if limits.cross_workspace {
+        tracing::warn!(
+            "{}=1: agents may reach other workspaces through MCP",
+            guard::ENV_CROSS_WORKSPACE
+        );
+    }
+    let st = Arc::new(McpState::with_limits(HubBackend(hub), limits));
     spawn_tracker(&st);
     Router::new()
         .route("/", post(handle_post).get(not_allowed).delete(not_allowed))

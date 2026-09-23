@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+#[cfg(test)]
+use clap::CommandFactory;
 
 use crate::paths::Discovery;
 
@@ -157,6 +159,9 @@ Example: muster keys 12 esc text:/compact enter")]
         target: String,
     },
     /// Open a new tab and start an agent in it; prints the new session id.
+    #[command(after_help = "Arguments after `--` go to the agent CLI, after muster's permission flags:\n  \
+muster new . --agent codex --prompt \"hi\" -- -m gpt-6-sol -c model_reasoning_effort=xhigh\n  \
+muster new --agent claude -- --model haiku")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,
@@ -181,6 +186,9 @@ Example: muster keys 12 esc text:/compact enter")]
         /// Print {channel, session} as JSON.
         #[arg(long)]
         json: bool,
+        /// Extra arguments for the agent CLI (not with --agent none).
+        #[arg(last = true, value_name = "AGENT_ARGS")]
+        agent_args: Vec<String>,
     },
     /// Rename a session, or its tab.
     Rename {
@@ -201,6 +209,21 @@ Example: muster keys 12 esc text:/compact enter")]
     Restart {
         #[arg(help = TARGET_HELP)]
         target: String,
+    },
+    /// Stream daemon events: one line per session state change, or every event as JSON.
+    #[command(after_help = "Human lines: HH:MM:SS  ID  TAB/NAME  FROM -> TO  DETAIL\n\
+--json prints the session_*, channel_* and window_* events as the daemon sends them, one per line.\n\
+Runs until Ctrl-C or the daemon stops (exit 0). Never starts the daemon (exit 1 when none runs).")]
+    Events {
+        /// Print every event as one JSON object per line.
+        #[arg(long)]
+        json: bool,
+        /// Only this session's events.
+        #[arg(long, value_name = "TARGET")]
+        session: Option<String>,
+        /// Only this tab's events (exact name, else unique prefix).
+        #[arg(long, value_name = "NAME")]
+        tab: Option<String>,
     },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
@@ -239,6 +262,9 @@ fn main() -> ExitCode {
             ensure_daemon().and_then(|d| gui::run_window(&d, window, || browser_url(&d, window)))
         }
         Some(Cmd::Ls { all, json }) => cli::ls(find_daemon().as_ref(), all, json),
+        Some(Cmd::Events { json, session, tab }) => {
+            running().and_then(|d| cli::events(&d, json, session.as_deref(), tab.as_deref()))
+        }
         Some(cmd) => ensure_daemon().and_then(|d| agent_cmd(&d, cmd)),
     };
     match r {
@@ -298,6 +324,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             window,
             prompt,
             json,
+            agent_args,
         } => cli::new(
             d,
             cli::NewOpts {
@@ -309,6 +336,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 window,
                 prompt,
                 json,
+                agent_args,
             },
         ),
         _ => unreachable!("dispatched in main"),
@@ -678,4 +706,68 @@ async fn daemon_main() -> anyhow::Result<()> {
 async fn shutdown(hub: &Arc<hub::Hub>) {
     hub.shutdown().await;
     tracing::info!("muster daemon stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cmd, clap::Error> {
+        Cli::try_parse_from(std::iter::once("muster").chain(args.iter().copied())).map(|c| c.cmd.expect("a command"))
+    }
+
+    fn agent_args(args: &[&str]) -> (Option<PathBuf>, Option<String>, Vec<String>) {
+        match parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}")) {
+            Cmd::New {
+                path,
+                prompt,
+                agent_args,
+                ..
+            } => (path, prompt, agent_args),
+            _ => panic!("not `new`"),
+        }
+    }
+
+    #[test]
+    fn new_passes_args_after_double_dash() {
+        let (path, prompt, args) = agent_args(&[
+            "new", ".", "--agent", "codex", "--prompt", "hi", "--", "-m", "gpt-6-sol", "-c",
+            "model_reasoning_effort=xhigh",
+        ]);
+        assert_eq!(path, Some(PathBuf::from(".")));
+        assert_eq!(prompt.as_deref(), Some("hi"));
+        assert_eq!(args, ["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]);
+        // Without a path, and flags after `--` are never muster's own.
+        let (path, _, args) = agent_args(&["new", "--agent", "shell", "--", "--json", "-c", "echo hi"]);
+        assert_eq!(path, None);
+        assert_eq!(args, ["--json", "-c", "echo hi"]);
+        let (_, _, args) = agent_args(&["new"]);
+        assert!(args.is_empty());
+        // Extra words without `--` are still an error, not agent arguments.
+        assert!(parse(&["new", ".", "-m"]).is_err());
+        assert!(parse(&["new", ".", "extra"]).is_err());
+    }
+
+    #[test]
+    fn new_help_shows_agent_args() {
+        let help = Cli::command().find_subcommand_mut("new").unwrap().render_help().to_string();
+        assert!(help.contains("[-- <AGENT_ARGS>...]"), "{help}");
+        assert!(help.contains("gpt-6-sol"), "{help}");
+    }
+
+    #[test]
+    fn events_flags() {
+        match parse(&["events", "--json", "--session", "12", "--tab", "fix"]).unwrap() {
+            Cmd::Events { json, session, tab } => {
+                assert!(json);
+                assert_eq!(session.as_deref(), Some("12"));
+                assert_eq!(tab.as_deref(), Some("fix"));
+            }
+            _ => panic!("not `events`"),
+        }
+        assert!(matches!(
+            parse(&["events"]).unwrap(),
+            Cmd::Events { json: false, session: None, tab: None }
+        ));
+    }
 }

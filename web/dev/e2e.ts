@@ -54,6 +54,7 @@ try {
   let n0 = (await a.eval(tabIds)).length;
   if (n0 === 0) {
     await a.wait(`!!document.querySelector('.empty-window')`);
+    check(await a.eval(`!document.querySelector('.tb-split')`), "no split buttons without tabs");
     await shot(a, "01-empty-window");
     await a.eval(`(() => { const i = document.querySelector('.empty-window input');
       const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -69,6 +70,12 @@ try {
     "lone pane has no chrome",
   );
   ok("a lone pane with one session has no chrome");
+
+  // ---- the tab bar's "Split right" button splits a lone pane (like Alt+D)
+  const panes0: number = await a.eval(`document.querySelectorAll('.pane').length`);
+  await a.click(`.tb-split-btn[aria-label="Split right"]`);
+  await a.wait(`document.querySelectorAll('.pane').length === ${panes0 + 1}`, 6000);
+  ok("the tab bar's Split right button split the lone pane");
 
   // ---- new tab (Alt+T), split (Alt+D), pane-tab (Alt+N)
   await a.key("Alt+T");

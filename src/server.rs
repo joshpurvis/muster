@@ -12,12 +12,15 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::hub::Hub;
+use tokio::sync::broadcast;
+
+use crate::hub::{Hub, ServerEvent};
 
 pub fn router(hub: Arc<Hub>) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/rpc", post(rpc_http))
+        .route("/api/events", get(events_stream))
         .route("/api/launch-code", post(launch_code))
         .route("/api/exchange", post(exchange))
         .route("/ws", get(ws_upgrade))
@@ -93,6 +96,59 @@ async fn rpc_http(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) 
         return unauthorized();
     }
     axum::Json(crate::rpc::http_call(&hub, &body).await).into_response()
+}
+
+/// Whether `GET /api/events` streams this event: tab, session and window changes only (no
+/// event-log entries, notices or workspaces, and never terminal output).
+fn streamed(ev: &ServerEvent) -> bool {
+    matches!(
+        ev,
+        ServerEvent::SessionUpserted(_)
+            | ServerEvent::SessionRemoved { .. }
+            | ServerEvent::ChannelUpserted(_)
+            | ServerEvent::ChannelRemoved { .. }
+            | ServerEvent::WindowUpserted(_)
+            | ServerEvent::WindowRemoved { .. }
+    )
+}
+
+/// `GET /api/events` (client token): the event bus as NDJSON, one `{"event", "data"}` object
+/// per line, as the WebSocket sends them. A reader that falls behind the bus gets
+/// `{"event":"lagged","data":{"missed":n}}` and the stream goes on (re-sync with `hello`).
+async fn events_stream(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    if !bearer(&headers).is_some_and(|t| hub.check_client_token(t)) {
+        return unauthorized();
+    }
+    if !origin_allowed(&headers, hub.port()) {
+        return forbidden("origin not allowed");
+    }
+    // Subscribed before the response starts, so a client that sees the headers and then calls
+    // `hello` misses nothing in between.
+    let rx = hub.subscribe();
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            let line = match rx.recv().await {
+                Ok(ev) if streamed(&ev) => serde_json::to_string(&ev).ok(),
+                Ok(_) => None,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    Some(json!({ "event": "lagged", "data": { "missed": n } }).to_string())
+                }
+                Err(broadcast::error::RecvError::Closed) => return None,
+            };
+            if let Some(mut line) = line {
+                line.push('\n');
+                return Some((Ok::<_, std::convert::Infallible>(Bytes::from(line)), rx));
+            }
+        }
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 fn forbidden(msg: &str) -> Response {
@@ -237,6 +293,18 @@ fn parse_proc_addr(s: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_route_streams_state_events_only() {
+        assert!(streamed(&ServerEvent::SessionRemoved { id: 1 }));
+        assert!(streamed(&ServerEvent::ChannelRemoved { id: 1 }));
+        assert!(streamed(&ServerEvent::WindowRemoved { id: 1 }));
+        assert!(!streamed(&ServerEvent::WorkspaceRemoved { id: 1 }));
+        assert!(!streamed(&ServerEvent::Notice {
+            level: "info".into(),
+            text: "x".into()
+        }));
+    }
 
     #[test]
     fn proc_addr_parsing() {

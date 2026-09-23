@@ -34,6 +34,8 @@ import {
   IconSearch,
   IconShield,
   IconSpark,
+  IconSplitDown,
+  IconSplitRight,
   IconTerminal,
   IconX,
 } from "../icons.tsx";
@@ -469,6 +471,31 @@ export function TabBar() {
         >
           {windowLabel(me)}
         </button>
+      )}
+      {list.length > 0 && (
+        // A lone pane has no chrome, so these are the visible way to split it (same as Alt+D).
+        <div class="tb-split" role="group" aria-label="Split the focused pane">
+          <button
+            type="button"
+            class="tb-btn tb-split-btn"
+            data-tip="Split right"
+            data-keys="Alt+D"
+            aria-label="Split right"
+            onClick={() => A.splitFocused("right")}
+          >
+            <IconSplitRight size={14} />
+          </button>
+          <button
+            type="button"
+            class="tb-btn tb-split-btn"
+            data-tip="Split down"
+            data-keys="Alt+Shift+D"
+            aria-label="Split down"
+            onClick={() => A.splitFocused("bottom")}
+          >
+            <IconSplitDown size={14} />
+          </button>
+        </div>
       )}
       <button
         type="button"

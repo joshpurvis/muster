@@ -341,6 +341,81 @@ async function main() {
   await c.waitFor("echo output", () => c.terminal(sid).includes(expect));
   ok(true, `live 0x01 output contains ${expect}`);
 
+  // GET /api/events: NDJSON, client token only, JSON events without terminal output. The CLI
+  // (`muster events --json`) reads the same stream; it keeps running until the SIGKILL below.
+  const eventsUrl = `http://127.0.0.1:${PORT}/api/events`;
+  const noAuth = await fetch(eventsUrl);
+  await noAuth.body?.cancel();
+  ok(noAuth.status === 401, "/api/events needs the client token");
+  const foreign = await fetch(eventsUrl, { headers: { Authorization: `Bearer ${d.token}`, Origin: "http://evil.test" } });
+  await foreign.body?.cancel();
+  ok(foreign.status === 403, "/api/events refuses a foreign Origin");
+  const evAbort = new AbortController();
+  const evResp = await fetch(eventsUrl, { headers: { Authorization: `Bearer ${d.token}` }, signal: evAbort.signal });
+  ok(evResp.status === 200 && evResp.headers.get("content-type") === "application/x-ndjson", "/api/events streams NDJSON");
+  const cliEnv = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
+  const evCli = new Deno.Command(BIN, { args: ["events", "--json"], env: cliEnv, stdout: "piped", stderr: "piped" }).spawn();
+  const routeLines: string[] = [];
+  const cliLines: string[] = [];
+  const cliErr: string[] = [];
+  const collect = async (s: ReadableStream<Uint8Array>, into: string[]) => {
+    let buf = "";
+    try {
+      for await (const chunk of s.pipeThrough(new TextDecoderStream())) {
+        buf += chunk;
+        const parts = buf.split("\n");
+        buf = parts.pop()!;
+        into.push(...parts);
+      }
+    } catch {
+      // aborted
+    }
+  };
+  collect(evResp.body!, routeLines);
+  collect(evCli.stdout, cliLines);
+  collect(evCli.stderr, cliErr);
+  const evCliDone = evCli.status;
+  await sleep(1000); // let the CLI connect
+  c.input(sid, "echo while-streaming\r");
+  await c.call("session.rename", { id: sid, name: "evt-smoke" });
+  const sawRename = (lines: string[]) =>
+    lines.some((l) => {
+      const e = JSON.parse(l);
+      return e.event === "session_upserted" && e.data.id === sid && e.data.name === "evt-smoke";
+    });
+  await c.waitFor("rename event on /api/events", () => sawRename(routeLines));
+  await c.waitFor("rename event from `muster events --json`", () => sawRename(cliLines));
+  ok(true, "a state change arrives on /api/events and from `muster events --json`");
+  ok(
+    [...routeLines, ...cliLines].every((l) => /^\{"event":"(session|channel|window)_[a-z]+","data":/.test(l)),
+    "the event stream carries only session/channel/window events (no output, notices or log entries)",
+  );
+  evAbort.abort();
+  // `muster new -- ARGS`: arguments go to the agent (here the shell, after its -l).
+  const newOut = await new Deno.Command(BIN, {
+    args: ["new", REPO, "--agent", "shell", "--name", "extra", "--", "-c", "echo extra-$((40+2)); sleep 30"],
+    env: cliEnv,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const extraSid = Number(dec.decode(newOut.stdout).trim());
+  ok(newOut.success && extraSid > 0, "muster new ... -- ARGS prints the new session id");
+  let extraRan = false;
+  for (let i = 0; i < 100 && !extraRan; i++, await sleep(100)) {
+    const out = await c.call("session.output", { id: extraSid, lines: 20 });
+    extraRan = (out.lines as string[]).some((l) => l.includes("extra-42"));
+  }
+  ok(extraRan, "the arguments after -- reached the agent command");
+  const extraCh = (await c.call("hello")).sessions.find((x: Json) => x.id === extraSid).channel_id;
+  const noneOut = await new Deno.Command(BIN, {
+    args: ["new", REPO, "--agent", "none", "--", "-x"],
+    env: cliEnv,
+    stdout: "null",
+    stderr: "piped",
+  }).output();
+  ok(!noneOut.success && dec.decode(noneOut.stderr).includes("need an agent"), "muster new --agent none -- ARGS is refused");
+  await c.call("channel.archive", { id: extraCh, remove_worktree: false });
+
   // session.output / session.input / session.wait (the CLI's primitives)
   const out = await c.call("session.output", { id: sid, lines: 20 });
   ok(out.lines.length <= 20 && out.lines.some((l: string) => l.includes(expect)), "session.output returns the tail as plain text");
@@ -513,6 +588,9 @@ async function main() {
   console.log("SIGKILL daemon, restart");
   await sleep(3500); // let the periodic flush persist output.log
   await stopDaemon(d, "SIGKILL");
+  const evStatus = await evCliDone;
+  await sleep(100);
+  ok(evStatus.code === 0 && cliErr.join("").includes("daemon stopped"), "`muster events` exits 0 when the daemon goes away");
   d = await startDaemon();
   c = new Client(d.token);
   await c.open();

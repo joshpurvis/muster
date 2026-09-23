@@ -54,6 +54,9 @@ fn channel(id: ChannelId, name: &str) -> Channel {
         last_read_at: 0,
         sort_order: 0,
         permissions: Permissions::default(),
+        window_id: Some(1),
+        auto_named: false,
+        first_prompt: None,
     }
 }
 
@@ -158,7 +161,9 @@ impl Backend for Arc<Mock> {
     async fn create_channel(&self, req: CreateChannel) -> anyhow::Result<Channel> {
         let mut d = self.d.lock();
         d.next_channel += 1;
-        let mut c = channel(d.next_channel, &req.name);
+        let mut c = channel(d.next_channel, req.name.as_deref().unwrap_or("auto"));
+        c.auto_named = req.name.is_none();
+        c.window_id = req.prefer_window;
         c.workspace_id = req.workspace_id;
         c.permissions = req.permissions.unwrap_or_default();
         if !req.worktree {
@@ -1060,6 +1065,35 @@ async fn audit_covers_missing_name_and_cancellation() {
     let last = &d.events.last().unwrap().3;
     assert_eq!(last["tool"], "wait_for_state");
     assert_eq!(last["cancelled"], true);
+}
+
+#[tokio::test]
+async fn new_channel_is_a_tab_next_to_the_caller_and_may_be_unnamed() {
+    let (m, st) = state();
+    m.d.lock().channels.get_mut(&10).unwrap().window_id = Some(4);
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "prompt": "fix it", "new_channel": {}}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!(v["channel_created"], true);
+    let id = v["channel"]["id"].as_i64().unwrap();
+    let ch = m.d.lock().channels.get(&id).cloned().unwrap();
+    assert!(ch.auto_named);
+    assert_eq!(ch.window_id, Some(4));
+    // A blank name is the same as none.
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "  "}}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let id = parse(&t)["channel"]["id"].as_i64().unwrap();
+    assert!(m.d.lock().channels.get(&id).unwrap().auto_named);
 }
 
 #[tokio::test]

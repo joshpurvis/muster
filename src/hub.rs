@@ -9,7 +9,7 @@
 //! Locking rule: never hold a Hub lock across an `.await` or while calling into another
 //! module's code.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -40,6 +40,11 @@ pub enum ServerEvent {
     ChannelRemoved {
         id: ChannelId,
     },
+    /// A window was created or changed (tabs, order, name, open, focus time).
+    WindowUpserted(Window),
+    WindowRemoved {
+        id: WindowId,
+    },
     /// Sent on create and on ANY change (state, title, queued count, exit, resize).
     SessionUpserted(SessionInfo),
     SessionRemoved {
@@ -57,10 +62,12 @@ pub enum ServerEvent {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateChannel {
     pub workspace_id: WorkspaceId,
-    pub name: String,
-    /// Create a git worktree + branch `muster/<slug>` for this channel. Ignored for non-git
-    /// workspaces (cwd is then the workspace path).
-    #[serde(default = "yes")]
+    /// None or blank: auto-named (see `derive_name`).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Create a git worktree at `<root>/<channel id>` on branch `muster/<channel id>` for this
+    /// channel. Ignored for non-git workspaces (cwd is then the workspace path).
+    #[serde(default)]
     pub worktree: bool,
     /// Branch/commit to base the worktree on. Default: the workspace's current HEAD.
     pub base: Option<String>,
@@ -71,6 +78,12 @@ pub struct CreateChannel {
     /// Agent permission profile. Default: the CLIs' own defaults (see `Permissions`).
     #[serde(default, deserialize_with = "de_permissions")]
     pub permissions: Option<Permissions>,
+    /// Window to put the tab in (must exist). Default: see `place_locked`.
+    #[serde(default)]
+    pub window_id: Option<WindowId>,
+    /// Used when it exists, else the default placement (MCP: the caller's channel's window).
+    #[serde(skip)]
+    pub prefer_window: Option<WindowId>,
     /// Terminal size for that first agent (what the client will show it at).
     #[serde(default = "default_cols")]
     pub cols: u16,
@@ -80,10 +93,6 @@ pub struct CreateChannel {
 
 fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permissions>, D::Error> {
     Ok(Option::<PermissionsInput>::deserialize(d)?.map(Into::into))
-}
-
-fn yes() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,10 +188,29 @@ struct SessEntry {
     kill_requested: bool,
 }
 
+struct WinEntry {
+    name: String,
+    last_focused_at: i64,
+    created_at: i64,
+    /// Client connection showing this window (`window.claim`).
+    holder: Option<u64>,
+}
+
+/// Latest usable (cleaned) terminal titles of a channel's sessions: auto-naming inputs.
+#[derive(Default)]
+struct Titles {
+    agent: Option<String>,
+    shell: Option<String>,
+}
+
 #[derive(Default)]
 struct Inner {
     workspaces: BTreeMap<WorkspaceId, Workspace>,
     channels: BTreeMap<ChannelId, Channel>,
+    windows: BTreeMap<WindowId, WinEntry>,
+    titles: HashMap<ChannelId, Titles>,
+    /// Channels whose branch got its one derived-name rename attempt this run.
+    branch_renamed: HashSet<ChannelId>,
     sessions: BTreeMap<SessionId, SessEntry>,
     tokens: HashMap<String, SessionId>,
     /// One-time launch code -> expiry.
@@ -199,6 +227,10 @@ pub struct Hub {
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
+    /// Serializes branch renames (git calls) so they see each other's results.
+    branch_lock: tokio::sync::Mutex<()>,
+    /// For work started from PTY threads (outside the runtime).
+    rt: Option<tokio::runtime::Handle>,
     weak: Weak<Hub>,
 }
 
@@ -248,6 +280,28 @@ impl Hub {
         for c in store.load_channels()? {
             inner.channels.insert(c.id, c);
         }
+        for (id, name, last_focused_at, created_at) in store.load_windows()? {
+            // Nothing holds a window at startup: empty ones are gone for good.
+            let empty = !inner
+                .channels
+                .values()
+                .any(|c| !c.archived && c.window_id == Some(id));
+            if empty {
+                if let Err(e) = store.delete_window(id) {
+                    tracing::warn!(window = id, "deleting empty window: {e}");
+                }
+                continue;
+            }
+            inner.windows.insert(
+                id,
+                WinEntry {
+                    name,
+                    last_focused_at,
+                    created_at,
+                    holder: None,
+                },
+            );
+        }
         for s in store.load_sessions()? {
             let StoredSession { info, extra_args } = s;
             inner.sessions.insert(
@@ -274,6 +328,8 @@ impl Hub {
             generation: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
+            branch_lock: tokio::sync::Mutex::new(()),
+            rt: tokio::runtime::Handle::try_current().ok(),
             weak: weak.clone(),
         }))
     }
@@ -660,7 +716,25 @@ impl Hub {
     // ----- PTY callbacks -----
 
     pub(crate) fn pty_title_changed(&self, id: SessionId, generation: u64, title: Option<String>) {
-        let _ = self.update_session_info_checked(id, Some(generation), |i| i.title = title);
+        let Ok(info) = self.update_session_info_checked(id, Some(generation), |i| i.title = title) else {
+            return;
+        };
+        let Some(clean) = info.title.as_deref().and_then(|t| clean_title(t, info.kind)) else {
+            return;
+        };
+        {
+            let mut g = self.inner.lock();
+            let t = g.titles.entry(info.channel_id).or_default();
+            let slot = match info.kind {
+                SessionKind::Shell => &mut t.shell,
+                SessionKind::Claude | SessionKind::Codex => &mut t.agent,
+            };
+            if slot.as_deref() == Some(clean.as_str()) {
+                return;
+            }
+            *slot = Some(clean);
+        }
+        self.rederive_name(info.channel_id);
     }
 
     /// Can an exited process's PTY be dropped from the hub? Only once output.log holds the
@@ -827,62 +901,90 @@ impl Hub {
         let ws = self
             .workspace(req.workspace_id)
             .ok_or_else(|| anyhow::anyhow!("no such workspace: {}", req.workspace_id))?;
-        let name = req.name.trim().to_string();
-        if name.is_empty() {
-            anyhow::bail!("channel name is empty");
+        if let Some(w) = req.window_id
+            && !self.inner.lock().windows.contains_key(&w)
+        {
+            anyhow::bail!("no such window: {w}");
         }
-        let repo = PathBuf::from(&ws.path);
-        let slug = worktree::slugify(&name);
-        let (cwd, branch, base_branch, owns) = if ws.is_git && req.worktree {
-            let root = paths::worktrees_dir().join(format!("{}-{}", worktree::slugify(&ws.name), ws.id));
-            let wt = worktree::create(&repo, &root, &slug, req.base.as_deref()).await?;
-            (
-                wt.path.to_string_lossy().to_string(),
-                Some(wt.branch),
-                Some(wt.base),
-                true,
-            )
-        } else {
-            let branch = if ws.is_git {
-                worktree::current_head(&repo).await.ok()
-            } else {
-                None
-            };
-            (ws.path.clone(), branch, None, false)
+        let explicit = req
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
+        let first_prompt = match explicit {
+            Some(_) => None,
+            None => prompt.as_deref().and_then(prompt_name),
         };
+        let (name, derived) = match &explicit {
+            Some(n) => (n.clone(), false),
+            None => derive_name(None, first_prompt.as_deref(), None, &folder_name(&ws)),
+        };
+        let repo = PathBuf::from(&ws.path);
         let now = now_ms();
-        let insert = || -> anyhow::Result<Channel> {
+        // The row goes in first (archived until it's ready) because the worktree is keyed by
+        // the channel id.
+        let mut ch = Channel {
+            id: 0,
+            workspace_id: ws.id,
+            name,
+            cwd: ws.path.clone(),
+            branch: None,
+            base_branch: None,
+            owns_worktree: false,
+            port_base: 0,
+            archived: true,
+            layout: None,
+            created_at: now,
+            last_read_at: now,
+            sort_order: 0,
+            permissions: req.permissions.unwrap_or_default(),
+            window_id: None,
+            auto_named: explicit.is_none(),
+            first_prompt,
+        };
+        ch.id = self.store.insert_channel(&ch)?;
+        if ws.is_git && req.worktree {
+            let root = paths::worktrees_dir().join(format!("{}-{}", worktree::slugify(&ws.name), ws.id));
+            match worktree::create(&repo, &root, &ch.id.to_string(), req.base.as_deref()).await {
+                Ok(wt) => {
+                    ch.cwd = wt.path.to_string_lossy().to_string();
+                    ch.base_branch = Some(wt.base);
+                    ch.owns_worktree = true;
+                    // Named up front (explicitly, or from the prompt): the branch gets that name
+                    // right away, which counts as its one derived-name rename.
+                    let mut branch = wt.branch;
+                    if explicit.is_some() || derived {
+                        match worktree::rename_branch(&wt.path, &branch, &worktree::slugify(&ch.name)).await {
+                            Ok(Some(n)) => branch = n,
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(channel = ch.id, "renaming branch {branch}: {e:#}"),
+                        }
+                    }
+                    ch.branch = Some(branch);
+                }
+                Err(e) => {
+                    let _ = self.store.delete_channel(ch.id);
+                    return Err(e);
+                }
+            }
+        } else if ws.is_git {
+            ch.branch = worktree::current_head(&repo).await.ok();
+        }
+        let mut events = Vec::new();
+        let inserted = (|| -> anyhow::Result<Channel> {
             let mut g = self.inner.lock();
             if !g.workspaces.contains_key(&ws.id) {
                 anyhow::bail!("workspace {} was removed", ws.id);
             }
-            let sort_order = g
-                .channels
-                .values()
-                .filter(|c| c.workspace_id == ws.id)
-                .map(|c| c.sort_order + 1)
-                .max()
-                .unwrap_or(0);
-            let mut ch = Channel {
-                id: 0,
-                workspace_id: ws.id,
-                name: name.clone(),
-                cwd: cwd.clone(),
-                branch: branch.clone(),
-                base_branch: base_branch.clone(),
-                owns_worktree: owns,
-                port_base: 0,
-                archived: false,
-                layout: None,
-                created_at: now,
-                last_read_at: now,
-                sort_order,
-                permissions: req.permissions.unwrap_or_default(),
-            };
-            ch.id = self.store.insert_channel(&ch)?;
+            let wid = self.place_locked(&mut g, req.window_id, req.prefer_window, &mut events)?;
+            ch.window_id = Some(wid);
+            ch.sort_order = next_tab_order(&g, wid);
+            ch.archived = false;
             // Preferred block derives from the id; if an active channel already uses it
             // (ids 1000 apart), take the next free block.
-            let used: std::collections::HashSet<u16> = g
+            let used: HashSet<u16> = g
                 .channels
                 .values()
                 .filter(|c| !c.archived)
@@ -895,25 +997,35 @@ impl Hub {
                 .unwrap_or(pref);
             self.store.update_channel(&ch)?;
             g.channels.insert(ch.id, ch.clone());
-            Ok(ch)
-        };
-        let ch = match insert() {
+            if derived {
+                g.branch_renamed.insert(ch.id);
+            }
+            events.push(ServerEvent::ChannelUpserted(ch.clone()));
+            if let Some(w) = window_view(&g, wid) {
+                events.push(ServerEvent::WindowUpserted(w));
+            }
+            Ok(ch.clone())
+        })();
+        let ch = match inserted {
             Ok(ch) => ch,
             Err(e) => {
-                if owns {
-                    let _ = worktree::remove(&repo, Path::new(&cwd)).await;
+                let _ = self.store.delete_channel(ch.id);
+                if ch.owns_worktree {
+                    let _ = worktree::remove(&repo, Path::new(&ch.cwd)).await;
                 }
                 return Err(e);
             }
         };
-        self.emit(ServerEvent::ChannelUpserted(ch.clone()));
+        for ev in events {
+            self.emit(ev);
+        }
         if let Some(kind) = req.agent {
             let spawn = SpawnSession {
                 channel_id: ch.id,
                 kind,
                 name: None,
                 cwd: None,
-                prompt: req.prompt.clone().filter(|p| !p.trim().is_empty()),
+                prompt,
                 extra_args: Vec::new(),
                 cols: req.cols,
                 rows: req.rows,
@@ -933,12 +1045,423 @@ impl Hub {
         Ok(ch)
     }
 
-    pub fn rename_channel(&self, id: ChannelId, name: String) -> anyhow::Result<Channel> {
+    /// Explicit rename: ends auto naming, and renames a muster-owned worktree branch without
+    /// upstream to `muster/<slug>` (never fatal).
+    pub async fn rename_channel(self: &Arc<Self>, id: ChannelId, name: String) -> anyhow::Result<Channel> {
         let name = name.trim().to_string();
         if name.is_empty() {
             anyhow::bail!("channel name is empty");
         }
-        self.update_channel(id, true, |c| c.name = name)
+        let ch = self.update_channel(id, true, |c| {
+            c.name = name;
+            c.auto_named = false;
+        })?;
+        if ch.owns_worktree && !ch.archived {
+            self.rename_branch_now(id).await;
+        }
+        Ok(self.channel(id).unwrap_or(ch))
+    }
+
+    // ----- auto naming -----
+
+    /// The first prompt sent to a session of an auto-named channel names it (priority 2).
+    pub fn note_prompt(&self, session_id: SessionId, text: &str) {
+        let Some(cid) = self.session(session_id).map(|s| s.channel_id) else {
+            return;
+        };
+        if !self
+            .channel(cid)
+            .is_some_and(|c| c.auto_named && !c.archived && c.first_prompt.is_none())
+        {
+            return;
+        }
+        let Some(p) = prompt_name(text) else {
+            return;
+        };
+        let _ = self.update_channel(cid, false, |c| {
+            if c.first_prompt.is_none() {
+                c.first_prompt = Some(p);
+            }
+        });
+        self.rederive_name(cid);
+    }
+
+    /// Recompute an auto-named channel's name from its inputs; emits only on change.
+    fn rederive_name(&self, id: ChannelId) {
+        let (name, derived) = {
+            let g = self.inner.lock();
+            let Some(c) = g.channels.get(&id).filter(|c| c.auto_named && !c.archived) else {
+                return;
+            };
+            let t = g.titles.get(&id);
+            let folder = g
+                .workspaces
+                .get(&c.workspace_id)
+                .map(folder_name)
+                .unwrap_or_else(|| c.name.clone());
+            let (name, derived) = derive_name(
+                t.and_then(|t| t.agent.as_deref()),
+                c.first_prompt.as_deref(),
+                t.and_then(|t| t.shell.as_deref()),
+                &folder,
+            );
+            if name == c.name {
+                (None, derived)
+            } else {
+                (Some(name), derived)
+            }
+        };
+        let ch = match name {
+            Some(n) => self.update_channel(id, false, |c| {
+                if c.auto_named {
+                    c.name = n;
+                }
+            }),
+            None => return,
+        };
+        if let Ok(ch) = ch {
+            self.emit(ServerEvent::ChannelUpserted(ch.clone()));
+            if derived {
+                self.after_derived_name(&ch);
+            }
+        }
+    }
+
+    /// The first derived name renames the worktree's initial `muster/<id>` branch (once).
+    fn after_derived_name(&self, ch: &Channel) {
+        if !ch.owns_worktree
+            || !ch
+                .branch
+                .as_deref()
+                .is_some_and(|b| is_initial_branch(b, ch.id))
+            || !self.inner.lock().branch_renamed.insert(ch.id)
+        {
+            return;
+        }
+        let (Some(hub), Some(rt)) = (
+            self.weak.upgrade(),
+            tokio::runtime::Handle::try_current().ok().or_else(|| self.rt.clone()),
+        ) else {
+            return;
+        };
+        let id = ch.id;
+        rt.spawn(async move { hub.rename_branch_now(id).await });
+    }
+
+    /// Rename the channel's branch after its current name, if muster owns the worktree and the
+    /// branch has no upstream. Failures are logged.
+    async fn rename_branch_now(&self, id: ChannelId) {
+        let _serial = self.branch_lock.lock().await;
+        let Some(ch) = self.channel(id).filter(|c| c.owns_worktree && !c.archived) else {
+            return;
+        };
+        let Some(old) = ch.branch.clone() else {
+            return;
+        };
+        let slug = worktree::slugify(&ch.name);
+        match worktree::rename_branch(Path::new(&ch.cwd), &old, &slug).await {
+            Ok(Some(new)) => {
+                let _ = self.update_channel(id, true, |c| {
+                    if c.branch.as_deref() == Some(old.as_str()) {
+                        c.branch = Some(new);
+                    }
+                });
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(channel = id, "renaming branch {old}: {e:#}"),
+        }
+    }
+
+    // ----- windows -----
+
+    pub fn windows(&self) -> Vec<Window> {
+        let g = self.inner.lock();
+        g.windows.keys().filter_map(|id| window_view(&g, *id)).collect()
+    }
+
+    pub fn window(&self, id: WindowId) -> Option<Window> {
+        window_view(&self.inner.lock(), id)
+    }
+
+    /// Add a window row (not held). `id` must be free.
+    fn add_window_locked(&self, g: &mut Inner, id: WindowId, name: Option<String>) -> anyhow::Result<()> {
+        let now = now_ms();
+        let name = clean_window_name(name).unwrap_or_else(|| id.to_string());
+        self.store.upsert_window(id, &name, 0, now)?;
+        g.windows.insert(
+            id,
+            WinEntry {
+                name,
+                last_focused_at: 0,
+                created_at: now,
+                holder: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Where a new channel goes: `requested` (must exist); else `prefer` if it exists; else the
+    /// open window focused last; else the lowest-id window; else a new window.
+    fn place_locked(
+        &self,
+        g: &mut Inner,
+        requested: Option<WindowId>,
+        prefer: Option<WindowId>,
+        events: &mut Vec<ServerEvent>,
+    ) -> anyhow::Result<WindowId> {
+        if let Some(id) = requested {
+            if g.windows.contains_key(&id) {
+                return Ok(id);
+            }
+            anyhow::bail!("no such window: {id}");
+        }
+        if let Some(id) = prefer.filter(|id| g.windows.contains_key(id)) {
+            return Ok(id);
+        }
+        let focused = g
+            .windows
+            .iter()
+            .filter(|(_, w)| w.holder.is_some())
+            .max_by_key(|(id, w)| (w.last_focused_at, std::cmp::Reverse(**id)))
+            .map(|(id, _)| *id);
+        if let Some(id) = focused.or_else(|| g.windows.keys().next().copied()) {
+            return Ok(id);
+        }
+        let id = free_window_id(g);
+        self.add_window_locked(g, id, None)?;
+        if let Some(w) = window_view(g, id) {
+            events.push(ServerEvent::WindowUpserted(w));
+        }
+        Ok(id)
+    }
+
+    /// `window.create`: a new window nobody holds yet.
+    pub fn create_window(&self, name: Option<String>) -> anyhow::Result<Window> {
+        let w = {
+            let mut g = self.inner.lock();
+            let id = free_window_id(&g);
+            self.add_window_locked(&mut g, id, name)?;
+            window_view(&g, id).ok_or_else(|| anyhow::anyhow!("window {id} vanished"))?
+        };
+        self.emit(ServerEvent::WindowUpserted(w.clone()));
+        Ok(w)
+    }
+
+    /// `window.claim` for connection `conn`: with `id`, that window (created if missing);
+    /// else the lowest-id window with tabs that nobody holds, else a new one. Releases the
+    /// connection's previous window and adopts channels without a (live) window.
+    pub fn claim_window(&self, conn: u64, id: Option<WindowId>) -> anyhow::Result<Window> {
+        let mut events = Vec::new();
+        let w = {
+            let mut g = self.inner.lock();
+            let target = match id {
+                Some(id) if id < 1 => anyhow::bail!("invalid window id: {id}"),
+                Some(id) => {
+                    if !g.windows.contains_key(&id) {
+                        self.add_window_locked(&mut g, id, None)?;
+                    }
+                    id
+                }
+                None => {
+                    let free = g
+                        .windows
+                        .iter()
+                        .find(|(wid, w)| w.holder.is_none() && !tab_ids(&g, **wid).is_empty())
+                        .map(|(wid, _)| *wid);
+                    match free {
+                        Some(wid) => wid,
+                        None => {
+                            let wid = free_window_id(&g);
+                            self.add_window_locked(&mut g, wid, None)?;
+                            wid
+                        }
+                    }
+                }
+            };
+            let prev: Vec<WindowId> = g
+                .windows
+                .iter()
+                .filter(|(wid, w)| w.holder == Some(conn) && **wid != target)
+                .map(|(wid, _)| *wid)
+                .collect();
+            if let Some(w) = g.windows.get_mut(&target) {
+                w.holder = Some(conn);
+            }
+            // Adopt orphans: live channels whose window is unset or gone.
+            let mut orphans: Vec<(i64, ChannelId)> = g
+                .channels
+                .values()
+                .filter(|c| !c.archived && c.window_id.is_none_or(|w| !g.windows.contains_key(&w)))
+                .map(|c| (c.sort_order, c.id))
+                .collect();
+            orphans.sort();
+            let mut order = next_tab_order(&g, target);
+            for (_, cid) in orphans {
+                let Some(c) = g.channels.get(&cid) else { continue };
+                let mut next = c.clone();
+                next.window_id = Some(target);
+                next.sort_order = order;
+                order += 1;
+                if let Err(e) = self.store.update_channel(&next) {
+                    tracing::warn!(channel = cid, "adopting into window {target}: {e}");
+                    continue;
+                }
+                g.channels.insert(cid, next.clone());
+                events.push(ServerEvent::ChannelUpserted(next));
+            }
+            for p in prev {
+                self.release_locked(&mut g, p, &mut events);
+            }
+            window_view(&g, target).ok_or_else(|| anyhow::anyhow!("window {target} vanished"))?
+        };
+        events.push(ServerEvent::WindowUpserted(w.clone()));
+        for ev in events {
+            self.emit(ev);
+        }
+        Ok(w)
+    }
+
+    /// A connection closed: release its window (deleted when it has no tabs).
+    pub fn release_windows(&self, conn: u64) {
+        let mut events = Vec::new();
+        {
+            let mut g = self.inner.lock();
+            let held: Vec<WindowId> = g
+                .windows
+                .iter()
+                .filter(|(_, w)| w.holder == Some(conn))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in held {
+                self.release_locked(&mut g, id, &mut events);
+            }
+        }
+        for ev in events {
+            self.emit(ev);
+        }
+    }
+
+    fn release_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) {
+        if let Some(w) = g.windows.get_mut(&id) {
+            w.holder = None;
+        }
+        self.gc_window_locked(g, id, events);
+    }
+
+    /// After a window lost a tab or its holder: delete it if nobody holds it and it has no
+    /// tabs, else report its new state.
+    fn gc_window_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) {
+        let Some(w) = g.windows.get(&id) else {
+            return;
+        };
+        if w.holder.is_none() && tab_ids(g, id).is_empty() {
+            if let Err(e) = self.store.delete_window(id) {
+                tracing::warn!(window = id, "deleting window: {e}");
+            }
+            g.windows.remove(&id);
+            events.push(ServerEvent::WindowRemoved { id });
+        } else if let Some(v) = window_view(g, id) {
+            events.push(ServerEvent::WindowUpserted(v));
+        }
+    }
+
+    /// Mutate a window under the lock, persist, broadcast.
+    fn update_window(&self, id: WindowId, f: impl FnOnce(&mut WinEntry)) -> anyhow::Result<Window> {
+        let w = {
+            let mut g = self.inner.lock();
+            let e = g
+                .windows
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such window: {id}"))?;
+            f(e);
+            self.store.upsert_window(id, &e.name, e.last_focused_at, e.created_at)?;
+            window_view(&g, id).ok_or_else(|| anyhow::anyhow!("no such window: {id}"))?
+        };
+        self.emit(ServerEvent::WindowUpserted(w.clone()));
+        Ok(w)
+    }
+
+    pub fn window_focused(&self, id: WindowId) -> anyhow::Result<Window> {
+        let now = now_ms();
+        self.update_window(id, |w| w.last_focused_at = w.last_focused_at.max(now))
+    }
+
+    pub fn rename_window(&self, id: WindowId, name: String) -> anyhow::Result<Window> {
+        let name = clean_window_name(Some(name)).ok_or_else(|| anyhow::anyhow!("window name is empty"))?;
+        self.update_window(id, |w| w.name = name)
+    }
+
+    /// Set a window's tab order. Ids not in the window are ignored; tabs left out keep their
+    /// relative order after the listed ones.
+    pub fn reorder_tabs(&self, id: WindowId, ids: &[ChannelId]) -> anyhow::Result<Window> {
+        let w = {
+            let mut g = self.inner.lock();
+            if !g.windows.contains_key(&id) {
+                anyhow::bail!("no such window: {id}");
+            }
+            let current = tab_ids(&g, id);
+            let mut order: Vec<ChannelId> = Vec::with_capacity(current.len());
+            for c in ids.iter().chain(current.iter()) {
+                if current.contains(c) && !order.contains(c) {
+                    order.push(*c);
+                }
+            }
+            self.renumber_locked(&mut g, &order)?;
+            window_view(&g, id).ok_or_else(|| anyhow::anyhow!("no such window: {id}"))?
+        };
+        self.emit(ServerEvent::WindowUpserted(w.clone()));
+        Ok(w)
+    }
+
+    /// Give `order`'s channels sort_order 0, 1, ... (persisting only changes).
+    fn renumber_locked(&self, g: &mut Inner, order: &[ChannelId]) -> anyhow::Result<()> {
+        for (i, cid) in order.iter().enumerate() {
+            let Some(c) = g.channels.get_mut(cid) else { continue };
+            if c.sort_order != i as i64 {
+                let mut next = c.clone();
+                next.sort_order = i as i64;
+                self.store.update_channel(&next)?;
+                *c = next;
+            }
+        }
+        Ok(())
+    }
+
+    /// Move a tab to another window, at `index` (default: the end).
+    pub fn move_channel(&self, id: ChannelId, window_id: WindowId, index: Option<usize>) -> anyhow::Result<Channel> {
+        let mut events = Vec::new();
+        let ch = {
+            let mut g = self.inner.lock();
+            let c = g
+                .channels
+                .get(&id)
+                .filter(|c| !c.archived)
+                .ok_or_else(|| anyhow::anyhow!("no such channel: {id}"))?;
+            if !g.windows.contains_key(&window_id) {
+                anyhow::bail!("no such window: {window_id}");
+            }
+            let old = c.window_id;
+            let mut next = c.clone();
+            next.window_id = Some(window_id);
+            self.store.update_channel(&next)?;
+            g.channels.insert(id, next);
+            let mut order: Vec<ChannelId> = tab_ids(&g, window_id).into_iter().filter(|c| *c != id).collect();
+            order.insert(index.unwrap_or(order.len()).min(order.len()), id);
+            self.renumber_locked(&mut g, &order)?;
+            let ch = g.channels.get(&id).cloned().ok_or_else(|| anyhow::anyhow!("no such channel: {id}"))?;
+            events.push(ServerEvent::ChannelUpserted(ch.clone()));
+            if let Some(o) = old.filter(|o| *o != window_id) {
+                self.gc_window_locked(&mut g, o, &mut events);
+            }
+            if let Some(w) = window_view(&g, window_id) {
+                events.push(ServerEvent::WindowUpserted(w));
+            }
+            ch
+        };
+        for ev in events {
+            self.emit(ev);
+        }
+        Ok(ch)
     }
 
     /// Kills and removes the channel's sessions, marks it archived, optionally removes the
@@ -957,6 +1480,17 @@ impl Hub {
             let _ = self.remove_session(*sid);
         }
         self.emit(ServerEvent::ChannelRemoved { id });
+        if let Some(wid) = ch.window_id {
+            let mut events = Vec::new();
+            {
+                let mut g = self.inner.lock();
+                g.titles.remove(&id);
+                self.gc_window_locked(&mut g, wid, &mut events);
+            }
+            for ev in events {
+                self.emit(ev);
+            }
+        }
         if remove_worktree && ch.owns_worktree {
             let repo = self.workspace(ch.workspace_id).map(|w| PathBuf::from(w.path));
             if let Some(repo) = repo {
@@ -1131,6 +1665,7 @@ impl Hub {
                 if let Some(code) = early_exit {
                     self.pty_exited(id, generation, code);
                 } else if let Some(text) = prompt {
+                    self.note_prompt(id, &text);
                     self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id);
                 }
                 Ok(self.session(id).unwrap_or(info))
@@ -1311,14 +1846,21 @@ impl Hub {
             }
             e.busy = true;
         }
-        let r = self.restart_inner(id).await;
-        if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
-            e.busy = false;
-            // A kill that arrived while starting was applied to the new process, or the
-            // start failed; either way it must not hit the next process.
-            e.kill_requested = false;
+        // Cleared on every exit, also when the request is dropped midway (an HTTP client that
+        // went away), so the session can't stay "already restarting".
+        struct Done<'a>(&'a Hub, SessionId);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                if let Some(e) = self.0.inner.lock().sessions.get_mut(&self.1) {
+                    e.busy = false;
+                    // A kill that arrived while starting was applied to the new process, or the
+                    // start failed; either way it must not hit the next process.
+                    e.kill_requested = false;
+                }
+            }
         }
-        r
+        let _done = Done(self, id);
+        self.restart_inner(id).await
     }
 
     async fn restart_inner(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
@@ -1656,4 +2198,259 @@ fn hook_summary(payload: &serde_json::Value) -> serde_json::Value {
 /// Each channel gets a block of 10 ports.
 pub fn port_base_for(id: ChannelId) -> u16 {
     (20000 + (id.rem_euclid(1000)) * 10) as u16
+}
+
+// ----- windows (pure helpers, called under the hub lock) -----
+
+/// A window's tabs: its live channels in sort order.
+fn tab_ids(g: &Inner, id: WindowId) -> Vec<ChannelId> {
+    let mut v: Vec<(i64, ChannelId)> = g
+        .channels
+        .values()
+        .filter(|c| !c.archived && c.window_id == Some(id))
+        .map(|c| (c.sort_order, c.id))
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, id)| id).collect()
+}
+
+fn window_view(g: &Inner, id: WindowId) -> Option<Window> {
+    let w = g.windows.get(&id)?;
+    Some(Window {
+        id,
+        name: w.name.clone(),
+        channel_ids: tab_ids(g, id),
+        open: w.holder.is_some(),
+        last_focused_at: w.last_focused_at,
+        created_at: w.created_at,
+    })
+}
+
+/// sort_order for a tab appended to window `id`.
+fn next_tab_order(g: &Inner, id: WindowId) -> i64 {
+    g.channels
+        .values()
+        .filter(|c| !c.archived && c.window_id == Some(id))
+        .map(|c| c.sort_order + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Windows are numbered 1, 2, 3...: the lowest free number.
+fn free_window_id(g: &Inner) -> WindowId {
+    (1..).find(|i| !g.windows.contains_key(i)).unwrap_or(1)
+}
+
+fn clean_window_name(name: Option<String>) -> Option<String> {
+    let n: String = name?.chars().filter(|c| !c.is_control()).collect();
+    let n = cap_chars(n.trim(), NAME_MAX);
+    (!n.is_empty()).then_some(n)
+}
+
+// ----- auto naming (pure) -----
+
+/// Channel names derived by the daemon are capped at this many chars.
+pub const NAME_MAX: usize = 60;
+
+fn cap_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect::<String>().trim_end().to_string()
+}
+
+/// The folder a channel is named after until something better shows up.
+fn folder_name(ws: &Workspace) -> String {
+    Path::new(&ws.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| ws.name.clone())
+}
+
+/// `muster/<id>` or a deduplicated `muster/<id>-<n>`: the branch a worktree starts on.
+fn is_initial_branch(branch: &str, id: ChannelId) -> bool {
+    let Some(rest) = branch.strip_prefix(&format!("muster/{id}")) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest
+            .strip_prefix('-')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A terminal title usable as a channel name, or None. Leading spinner/status glyphs and
+/// surrounding whitespace are stripped; program names (`claude`, `codex cli`, the kind, a
+/// shell's name), paths and `user@host` prompts are rejected.
+pub fn clean_title(title: &str, kind: SessionKind) -> Option<String> {
+    let t = title.trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '/' || c == '~'));
+    let t: String = t
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_lowercase();
+    const PROGRAMS: &[&str] = &["claude", "claude code", "codex", "codex cli"];
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "tcsh"];
+    if PROGRAMS.contains(&lower.as_str())
+        || lower == kind.as_str()
+        || (kind == SessionKind::Shell && SHELLS.contains(&lower.as_str()))
+    {
+        return None;
+    }
+    if t.starts_with('/') || t.starts_with('~') || looks_like_user_host(&t) {
+        return None;
+    }
+    Some(cap_chars(&t, NAME_MAX))
+}
+
+/// `user@host`, `user@host:~/dir ...`: a shell prompt title.
+fn looks_like_user_host(t: &str) -> bool {
+    let first = t.split_whitespace().next().unwrap_or("");
+    let Some((user, rest)) = first.split_once('@') else {
+        return false;
+    };
+    let host = rest.split(':').next().unwrap_or("");
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    ok(user) && ok(host)
+}
+
+/// Name from a prompt: its first non-empty line, first 6 words, at most 40 chars.
+pub fn prompt_name(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .take(6)
+        .collect();
+    let s = cap_chars(&words.join(" "), 40);
+    (!s.is_empty()).then_some(s)
+}
+
+/// An auto-named channel's name: agent title > first prompt > shell title > folder (inputs
+/// already cleaned). Returns (name, derived), `derived` false for the folder fallback.
+pub fn derive_name(
+    agent_title: Option<&str>,
+    first_prompt: Option<&str>,
+    shell_title: Option<&str>,
+    folder: &str,
+) -> (String, bool) {
+    match agent_title.or(first_prompt).or(shell_title) {
+        Some(n) => (cap_chars(n, NAME_MAX), true),
+        None => (cap_chars(folder, NAME_MAX), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titles_are_cleaned() {
+        let c = SessionKind::Claude;
+        assert_eq!(clean_title("✳ Fix the auth bug", c).as_deref(), Some("Fix the auth bug"));
+        assert_eq!(clean_title("⠂ Fix the auth bug ", c).as_deref(), Some("Fix the auth bug"));
+        assert_eq!(clean_title("⠐  Refactor   parser", c).as_deref(), Some("Refactor parser"));
+        assert_eq!(clean_title("· Running tests", c).as_deref(), Some("Running tests"));
+        // Program names, blank, glyph-only.
+        for t in ["✳ Claude Code", "claude", "CODEX", "Codex CLI", "  ", "✳", "⠂ ·"] {
+            assert_eq!(clean_title(t, c), None, "{t}");
+        }
+        // The kind name and shell names, for shells.
+        assert_eq!(clean_title("shell", SessionKind::Shell), None);
+        assert_eq!(clean_title("fish", SessionKind::Shell), None);
+        assert_eq!(clean_title("bash", SessionKind::Shell), None);
+        assert_eq!(clean_title("cargo test", SessionKind::Shell).as_deref(), Some("cargo test"));
+        // Paths and user@host prompts.
+        for t in ["/home/josh/p/muster", "~/p/muster", "~", "josh@arch: ~/p", "josh@arch:~/p/muster", "root@box"] {
+            assert_eq!(clean_title(t, SessionKind::Shell), None, "{t}");
+        }
+        // Mail-like words elsewhere are fine; long titles are capped.
+        assert_eq!(clean_title("ask bob@example.com", c).as_deref(), Some("ask bob@example.com"));
+        let long = "word ".repeat(30);
+        assert_eq!(clean_title(&long, c).unwrap().chars().count(), NAME_MAX - 1);
+        assert!(clean_title("x\u{7}y", c).is_some_and(|t| t == "xy"));
+    }
+
+    #[test]
+    fn prompt_names() {
+        assert_eq!(prompt_name("fix the flaky login test please now and more").as_deref(), Some("fix the flaky login test please"));
+        assert_eq!(prompt_name("\n\n  hello world\nsecond line").as_deref(), Some("hello world"));
+        assert_eq!(prompt_name("   \n "), None);
+        let n = prompt_name("supercalifragilisticexpialidocious-and-more-words-here x").unwrap();
+        assert!(n.chars().count() <= 40, "{n}");
+    }
+
+    #[test]
+    fn name_priority() {
+        assert_eq!(derive_name(Some("Agent"), Some("prompt"), Some("sh"), "repo"), ("Agent".into(), true));
+        assert_eq!(derive_name(None, Some("prompt"), Some("sh"), "repo"), ("prompt".into(), true));
+        assert_eq!(derive_name(None, None, Some("cargo test"), "repo"), ("cargo test".into(), true));
+        assert_eq!(derive_name(None, None, None, "repo"), ("repo".into(), false));
+    }
+
+    #[test]
+    fn initial_branches() {
+        assert!(is_initial_branch("muster/7", 7));
+        assert!(is_initial_branch("muster/7-2", 7));
+        assert!(!is_initial_branch("muster/70", 7));
+        assert!(!is_initial_branch("muster/7-x", 7));
+        assert!(!is_initial_branch("muster/7-", 7));
+        assert!(!is_initial_branch("muster/fix-auth", 7));
+    }
+
+    #[test]
+    fn window_placement_helpers() {
+        let mut g = Inner::default();
+        assert_eq!(free_window_id(&g), 1);
+        for id in [1, 2, 4] {
+            g.windows.insert(
+                id,
+                WinEntry {
+                    name: id.to_string(),
+                    last_focused_at: 0,
+                    created_at: 0,
+                    holder: None,
+                },
+            );
+        }
+        assert_eq!(free_window_id(&g), 3);
+        let mk = |id, win, order, archived| Channel {
+            id,
+            workspace_id: 1,
+            name: "c".into(),
+            cwd: "/".into(),
+            branch: None,
+            base_branch: None,
+            owns_worktree: false,
+            port_base: 20000,
+            archived,
+            layout: None,
+            created_at: 0,
+            last_read_at: 0,
+            sort_order: order,
+            permissions: Permissions::default(),
+            window_id: Some(win),
+            auto_named: false,
+            first_prompt: None,
+        };
+        g.channels.insert(10, mk(10, 1, 3, false));
+        g.channels.insert(11, mk(11, 1, 0, false));
+        g.channels.insert(12, mk(12, 1, 1, true));
+        g.channels.insert(13, mk(13, 2, 0, false));
+        assert_eq!(tab_ids(&g, 1), vec![11, 10]);
+        assert_eq!(next_tab_order(&g, 1), 4);
+        assert_eq!(next_tab_order(&g, 4), 0);
+        let v = window_view(&g, 2).unwrap();
+        assert_eq!((v.channel_ids, v.open, v.name.as_str()), (vec![13], false, "2"));
+        assert_eq!(clean_window_name(Some("  a\u{1b}b ".into())).as_deref(), Some("ab"));
+        assert_eq!(clean_window_name(Some(" ".into())), None);
+    }
 }

@@ -98,7 +98,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell}` |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `window_id` defaults to the most recently focused window. `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`) |
 | `channel.set_permissions` | `{id, permissions: {codex_sandbox, claude_mode}}` (both required) | `Channel` (emits `channel_upserted`). Human only: the MCP server has no way to call it. Applies to sessions started or restarted afterwards; running sessions keep the permissions they started with. |
@@ -122,16 +122,16 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.clear_queue` | `{id}` | `{}` |
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
 | `fs.complete` | `{prefix}` | `{entries: string[]}` directory completions for the "add workspace" path box |
-| `channel.move` | `{id, window_id, index?}` | `Channel` (moves the tab to another window, at `index` or the end; emits `channel_upserted` and `window_upserted` for both windows) |
-| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window that has tabs and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. |
-| `window.create` | `{name?}` | `Window` (a new window, not held; used by `muster open` to put a tab in it before the UI claims it) |
+| `channel.move` | `{id, window_id, index?}` | `Channel` (moves the tab to another window, at `index` or the end; emits `channel_upserted` and `window_upserted` for both windows, or `window_removed` for the old one when nobody holds it and it has no tabs left) |
+| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window that has tabs and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. Claiming a window another connection holds takes it over (a reload's new connection may arrive before the old one closes). Also adopts orphaned channels (below). |
+| `window.create` | `{name?}` | `Window` (a new window, not held; used by `muster open` to put a tab in it before the UI claims it). New windows get the lowest free id (1, 2, 3...). |
 | `window.focused` | `{id}` | `{}` (records `last_focused_at`; clients call it on window focus) |
 | `window.rename` | `{id, name}` | `Window` |
-| `window.reorder_tabs` | `{id, channel_ids: []}` | `Window` |
+| `window.reorder_tabs` | `{id, channel_ids: []}` | `Window` (ids not in the window are ignored; tabs left out keep their relative order after the listed ones) |
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
-| `session.wait` | `{id, until?: string[], timeout_ms? = 600000}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state). Returns immediately when already matching. Max timeout 1 h. |
+| `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. |
-| `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first. Max 10000. |
+| `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 Exited sessions keep their scrollback (persisted under `$XDG_DATA_HOME/muster/sessions/<id>/output.log`)
 so they can be attached (replay only) and restarted after a daemon restart. The file is
@@ -180,18 +180,23 @@ base name. While `auto_named`, the daemon re-derives `name` (emitting `channel_u
 change), in priority order: (1) the latest OSC title of an agent (claude/codex) session in the
 channel, cleaned: leading non-alphanumeric glyphs (spinners like `✳ ⠂ ⠐ ·`) and surrounding
 whitespace stripped, ignored when empty, when it equals (case-insensitively) `claude`,
-`claude code`, `codex`, `codex cli`, or the kind name, when it looks like a path (starts with
+`claude code`, `codex`, `codex cli`, or the kind name (for shells also a shell's name: `sh`,
+`bash`, `zsh`, `fish`, `dash`, `ksh`, `nu`, `tcsh`), when it looks like a path (starts with
 `/` or `~`) or a `user@host` prompt; (2) the first prompt sent to the channel (`channel.create`
 `prompt` or `session.send`/MCP `send_message` to one of its sessions): its first line, first 6
 words, at most 40 chars; (3) the latest title of a shell session, with the same filters; (4) the
-folder base name. Names are capped at 60 chars. `channel.rename` ends auto naming.
+folder base name. Names are capped at 60 chars. `channel.rename` ends auto naming. A title
+that is filtered out is ignored (the previous usable title stays). Titles are kept in memory;
+the first prompt is stored with the channel.
 
 **Opening a specific window.** The launcher passes the window id to the page: the native window's init script sets `sessionStorage["muster.window"]`, and browser URLs carry `&window=<id>` in the hash (`#code=...&window=3`). The frontend claims that id, keeps it in `sessionStorage`, and strips it from the URL.
 
 **Worktrees.** `worktree` now defaults to `false`. A worktree is created at
-`<data>/worktrees/<workspace slug>/<channel id>` on branch `muster/<channel id>` (deduplicated).
-The first time an auto-named channel gets a derived name (priority 1–3), and on every
-`channel.rename`, the daemon renames the branch to `muster/<slug(name)>` (deduplicated with
+`<data>/worktrees/<workspace slug>-<workspace id>/<channel id>` on branch `muster/<channel id>`
+(deduplicated). When `channel.create` already has a name (given, or derived from its `prompt`),
+the branch is renamed right away, so the result carries it. Otherwise the first time an
+auto-named channel gets a derived name (priority 1–3), and on every `channel.rename` (whose
+result carries the new branch), the daemon renames the branch to `muster/<slug(name)>` (deduplicated with
 `-2`, `-3`...) if `owns_worktree` and the branch has no upstream (`git rev-parse
 --abbrev-ref <branch>@{upstream}` fails). Failures are logged, never fatal. The worktree
 directory never moves.

@@ -241,6 +241,45 @@ pub async fn create(repo: &Path, root: &Path, slug: &str, base: Option<&str>) ->
     anyhow::bail!("could not find a free worktree name for {slug}")
 }
 
+/// True when `branch` has an upstream configured (it was pushed or tracks a remote branch).
+pub async fn has_upstream(cwd: &Path, branch: &str) -> bool {
+    succeeds(cwd, &["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")]).await
+}
+
+/// Rename branch `old` to `muster/<slug>` (deduplicated with -2, -3, ...), unless it has an
+/// upstream. Runs in `cwd` (the channel's worktree). Returns the new name, or None when it was
+/// left alone (upstream, already named so, or `old` doesn't exist).
+pub async fn rename_branch(cwd: &Path, old: &str, slug: &str) -> anyhow::Result<Option<String>> {
+    if old.starts_with('-')
+        || !succeeds(cwd, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{old}")]).await
+    {
+        return Ok(None);
+    }
+    if has_upstream(cwd, old).await {
+        return Ok(None);
+    }
+    for n in 1..1000 {
+        let name = if n == 1 {
+            format!("muster/{slug}")
+        } else {
+            format!("muster/{slug}-{n}")
+        };
+        if name == old {
+            return Ok(None);
+        }
+        if succeeds(cwd, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{name}")]).await {
+            continue;
+        }
+        match run(cwd, &["branch", "-m", old, &name]).await {
+            Ok(_) => return Ok(Some(name)),
+            // Lost a race with another branch of that name: try the next suffix.
+            Err(e) if e.to_string().contains("already exists") => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    anyhow::bail!("could not find a free branch name for muster/{slug}")
+}
+
 /// Remove a worktree (keeps the branch). Falls back to deleting the directory + prune.
 pub async fn remove(repo: &Path, path: &Path) -> anyhow::Result<()> {
     let path_s = path.to_string_lossy().to_string();
@@ -357,6 +396,49 @@ mod tests {
             .filter(|n| n.starts_with("pwned"))
             .collect();
         assert!(hits.is_empty(), "repo config ran commands: {hits:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn branch_rename_dedups_and_respects_upstream() {
+        let base = std::env::temp_dir().join(format!("muster-wt-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(
+            &repo,
+            "git init -q -b main && git config user.name t && git config user.email t@t && \
+             printf 'a\\n' > f.txt && git add f.txt && git commit -qm init && git branch muster/taken",
+        );
+        // Keyed by channel id: path <root>/7, branch muster/7.
+        let wt = create(&repo, &base.join("wts"), "7", None).await.unwrap();
+        assert_eq!(wt.branch, "muster/7");
+        assert!(wt.path.ends_with("wts/7"));
+        let head = |p: &Path| {
+            let o = std::process::Command::new("git")
+                .args(["-C", &p.display().to_string(), "rev-parse", "--abbrev-ref", "HEAD"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        // Renamed in place: the worktree follows, the directory doesn't move.
+        let n = rename_branch(&wt.path, "muster/7", "fix-auth").await.unwrap();
+        assert_eq!(n.as_deref(), Some("muster/fix-auth"));
+        assert_eq!(head(&wt.path), "muster/fix-auth");
+        assert!(wt.path.exists());
+        // Same name again: no-op. A taken name: deduplicated.
+        assert_eq!(rename_branch(&wt.path, "muster/fix-auth", "fix-auth").await.unwrap(), None);
+        let n = rename_branch(&wt.path, "muster/fix-auth", "taken").await.unwrap();
+        assert_eq!(n.as_deref(), Some("muster/taken-2"));
+        assert_eq!(head(&wt.path), "muster/taken-2");
+        // A missing branch is left alone.
+        assert_eq!(rename_branch(&wt.path, "muster/nope", "x").await.unwrap(), None);
+        // With an upstream it is never renamed.
+        sh(&repo, "git branch -q --set-upstream-to=main muster/taken-2");
+        assert!(has_upstream(&wt.path, "muster/taken-2").await);
+        assert_eq!(rename_branch(&wt.path, "muster/taken-2", "other").await.unwrap(), None);
+        assert_eq!(head(&wt.path), "muster/taken-2");
         let _ = std::fs::remove_dir_all(&base);
     }
 

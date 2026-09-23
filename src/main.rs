@@ -14,6 +14,7 @@ mod pty;
 mod rpc;
 mod server;
 mod store;
+mod wm;
 mod worktree;
 
 

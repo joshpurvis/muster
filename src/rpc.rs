@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
@@ -24,6 +26,16 @@ pub const FRAME_REPLAY: u8 = 0x03;
 
 /// Outgoing messages buffered per connection before output forwarding applies backpressure.
 const OUTBOX_CAP: usize = 256;
+
+/// `session.wait` limits.
+const WAIT_DEFAULT_MS: u64 = 600_000;
+const WAIT_MAX_MS: u64 = 3_600_000;
+/// `session.output` limits.
+const OUTPUT_DEFAULT_LINES: usize = 200;
+const OUTPUT_MAX_LINES: usize = 10_000;
+
+/// Identifies a WebSocket connection (the holder of a claimed window).
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 pub fn frame(ty: u8, id: SessionId, payload: &[u8]) -> Bytes {
     let mut v = Vec::with_capacity(5 + payload.len());
@@ -76,6 +88,7 @@ pub fn hello(hub: &Hub) -> Value {
         "workspaces": hub.workspaces(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
+        "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": default_shell(),
     })
@@ -107,7 +120,7 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
         }
         "channel.rename" => {
             let p: Rename<ChannelId> = parse(params)?;
-            to_value(hub.rename_channel(p.id, p.name)?)
+            to_value(hub.rename_channel(p.id, p.name).await?)
         }
         "channel.archive" => {
             #[derive(Deserialize)]
@@ -266,6 +279,103 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             Ok(json!({ "lines": lines }))
         }
 
+        "channel.move" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: ChannelId,
+                window_id: WindowId,
+                #[serde(default)]
+                index: Option<usize>,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.move_channel(p.id, p.window_id, p.index)?)
+        }
+
+        "window.create" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                name: Option<String>,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.create_window(p.name)?)
+        }
+        "window.focused" => {
+            let p: IdParam<WindowId> = parse(params)?;
+            hub.window_focused(p.id)?;
+            Ok(json!({}))
+        }
+        "window.rename" => {
+            let p: Rename<WindowId> = parse(params)?;
+            to_value(hub.rename_window(p.id, p.name)?)
+        }
+        "window.reorder_tabs" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: WindowId,
+                channel_ids: Vec<ChannelId>,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.reorder_tabs(p.id, &p.channel_ids)?)
+        }
+        "window.raise" => {
+            let p: IdParam<WindowId> = parse(params)?;
+            let w = hub
+                .window(p.id)
+                .ok_or_else(|| RpcError(format!("no such window: {}", p.id)))?;
+            let raised = w.open && crate::wm::raise(&crate::wm::window_title(&w.name)).await;
+            Ok(json!({ "raised": raised }))
+        }
+
+        "session.wait" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                #[serde(default)]
+                until: Option<Vec<String>>,
+                #[serde(default)]
+                timeout_ms: Option<u64>,
+                #[serde(default)]
+                after_ms: Option<i64>,
+            }
+            let p: P = parse(params)?;
+            let states = match p.until {
+                Some(u) if !u.is_empty() => parse_states(&u)?,
+                _ => crate::mcp::wait::DEFAULT_STATES.to_vec(),
+            };
+            let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MAX_MS));
+            session_wait(hub, p.id, &states, p.after_ms, timeout).await
+        }
+        "session.input" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                data: String,
+            }
+            let p: P = parse(params)?;
+            hub.write_input(p.id, p.data.as_bytes())?;
+            Ok(json!({}))
+        }
+        "session.output" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                #[serde(default)]
+                lines: Option<usize>,
+            }
+            let p: P = parse(params)?;
+            let n = p.lines.unwrap_or(OUTPUT_DEFAULT_LINES).clamp(1, OUTPUT_MAX_LINES);
+            let h = hub.clone();
+            let text = tokio::task::spawn_blocking(move || h.recent_output_text(p.id, n))
+                .await?
+                .ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
+            let mut lines: Vec<&str> = text.lines().collect();
+            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.pop();
+            }
+            Ok(json!({ "lines": lines }))
+        }
+
         "fs.complete" => {
             #[derive(Deserialize)]
             struct P {
@@ -276,8 +386,74 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             Ok(json!({ "entries": entries }))
         }
 
-        "session.attach" | "session.detach" => Err(RpcError(format!("{method} is only available over the WebSocket"))),
+        "session.attach" | "session.detach" | "window.claim" => {
+            Err(RpcError(format!("{method} is only available over the WebSocket")))
+        }
         _ => Err(RpcError(format!("unknown method: {method}"))),
+    }
+}
+
+/// `until` names -> states. `needs_human` is every state that needs the human; `done` is an
+/// alias for `idle`.
+fn parse_states(names: &[String]) -> Result<Vec<AgentState>, RpcError> {
+    let mut out: Vec<AgentState> = Vec::new();
+    for n in names {
+        let add: Vec<AgentState> = match n.trim() {
+            "needs_human" => vec![
+                AgentState::NeedsApproval,
+                AgentState::AskingQuestion,
+                AgentState::Error,
+                AgentState::Stuck,
+            ],
+            "done" => vec![AgentState::Idle],
+            other => vec![
+                serde_json::from_value(Value::String(other.to_string()))
+                    .map_err(|_| RpcError(format!("unknown state: {other}")))?,
+            ],
+        };
+        for s in add {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `session.wait`: block until the session is in one of `states` (or exits, or `timeout`).
+/// Without `after_ms` any matching state counts at once; with it, the MCP `wait_for_state`
+/// staleness rules apply (a state entered before `after_ms` doesn't count, see mcp::wait).
+async fn session_wait(
+    hub: &Arc<Hub>,
+    id: SessionId,
+    states: &[AgentState],
+    after_ms: Option<i64>,
+    timeout: Duration,
+) -> RpcResult {
+    use crate::mcp::wait::{Verdict, WaitCtx, evaluate, next_change};
+    let mut rx = hub.subscribe();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let info = hub
+            .session(id)
+            .ok_or_else(|| RpcError(format!("no such session: {id}")))?;
+        let ctx = WaitCtx {
+            after_ms: Some(after_ms.unwrap_or(0)),
+            last_send_ms: None,
+            last_delivery_ms: None,
+            settle_grace_ms: 15_000,
+            now_ms: now_ms(),
+        };
+        let verdict = evaluate(&info, states, &ctx);
+        let now = tokio::time::Instant::now();
+        if verdict != Verdict::Wait || now >= deadline {
+            return Ok(json!({
+                "session": info,
+                "matched": verdict == Verdict::Reached,
+                "timed_out": verdict == Verdict::Wait,
+            }));
+        }
+        next_change(&mut rx, id, (deadline - now).min(Duration::from_secs(1))).await;
     }
 }
 
@@ -344,6 +520,7 @@ type Outbox = mpsc::Sender<Message>;
 
 /// One WebSocket client connection.
 pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
+    let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
 
@@ -425,7 +602,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         continue;
                     }
                 };
-                handle_request(&hub, req, &out_tx, &resp_tx, &attachments).await;
+                handle_request(&hub, conn, req, &out_tx, &resp_tx, &attachments).await;
             }
             Message::Binary(data) => {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
@@ -443,6 +620,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     for (_, h) in attachments.lock().drain() {
         h.abort();
     }
+    hub.release_windows(conn);
     drop(resp_tx);
     events.abort();
     drop(out_tx);
@@ -451,6 +629,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
 
 async fn handle_request(
     hub: &Arc<Hub>,
+    conn: u64,
     req: Request,
     out: &Outbox,
     resp: &Outbox,
@@ -500,6 +679,16 @@ async fn handle_request(
                 }
             }
         }
+        "window.claim" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                id: Option<WindowId>,
+            }
+            // Through the response queue, after the events it emits.
+            let r = parse::<P>(req.params).and_then(|p| to_value(hub.claim_window(conn, p.id)?));
+            let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+        }
         "session.detach" => {
             let r = parse::<IdParam<SessionId>>(req.params).map(|p| {
                 if let Some(h) = attachments.lock().remove(&p.id) {
@@ -514,7 +703,16 @@ async fn handle_request(
             let hub = hub.clone();
             let resp = resp.clone();
             tokio::spawn(async move {
-                let r = dispatch(&hub, &req.method, req.params).await;
+                // A `session.wait` stops once the connection is gone. Other methods run to
+                // completion (cancelling one halfway could leave state behind).
+                let r = if req.method == "session.wait" {
+                    tokio::select! {
+                        r = dispatch(&hub, &req.method, req.params) => r,
+                        _ = resp.closed() => return,
+                    }
+                } else {
+                    dispatch(&hub, &req.method, req.params).await
+                };
                 let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
         }

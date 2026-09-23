@@ -126,6 +126,8 @@ pub async fn send(
     if text.trim().is_empty() {
         anyhow::bail!("empty prompt");
     }
+    // The first prompt to an auto-named channel names it.
+    hub.note_prompt(id, &text);
     let adapter = adapter_for(info.kind);
     let item = Item {
         text: text.clone(),

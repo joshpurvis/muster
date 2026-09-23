@@ -100,6 +100,26 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (session_id, sid)
     );
     "#,
+    // v4: client windows (a channel is a tab in one window), auto-named channels. Existing
+    // live channels go into window 1 in their sort order (renumbered 0..), keeping their names.
+    r#"
+    CREATE TABLE windows (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        last_focused_at INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE channels ADD COLUMN window_id INTEGER;
+    ALTER TABLE channels ADD COLUMN auto_named INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE channels ADD COLUMN first_prompt TEXT;
+    INSERT INTO windows (id, name, last_focused_at, created_at)
+        VALUES (1, '1', 0, CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+    UPDATE channels SET window_id = 1,
+        sort_order = (SELECT r.rn FROM (
+            SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order, id) - 1 AS rn
+            FROM channels WHERE archived = 0) r WHERE r.id = channels.id)
+    WHERE archived = 0;
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -238,6 +258,9 @@ impl Store {
                 .get::<_, Option<String>>(13)?
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default(),
+            window_id: r.get(14)?,
+            auto_named: r.get::<_, i64>(15)? != 0,
+            first_prompt: r.get(16)?,
         })
     }
 
@@ -245,7 +268,8 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base, archived,
-                    layout, created_at, last_read_at, sort_order, permissions FROM channels ORDER BY id",
+                    layout, created_at, last_read_at, sort_order, permissions, window_id, auto_named, first_prompt
+             FROM channels ORDER BY id",
         )?;
         let rows = st.query_map([], Self::row_channel)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -256,8 +280,9 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO channels (workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base,
-                                   archived, layout, created_at, last_read_at, sort_order, permissions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                   archived, layout, created_at, last_read_at, sort_order, permissions,
+                                   window_id, auto_named, first_prompt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 c.workspace_id,
                 c.name,
@@ -271,7 +296,10 @@ impl Store {
                 c.created_at,
                 c.last_read_at,
                 c.sort_order,
-                perms_json(&c.permissions)
+                perms_json(&c.permissions),
+                c.window_id,
+                c.auto_named as i64,
+                c.first_prompt
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -281,7 +309,7 @@ impl Store {
         self.conn.lock().execute(
             "UPDATE channels SET workspace_id=?2, name=?3, cwd=?4, branch=?5, base_branch=?6, owns_worktree=?7,
                     port_base=?8, archived=?9, layout=?10, created_at=?11, last_read_at=?12, sort_order=?13,
-                    permissions=?14
+                    permissions=?14, window_id=?15, auto_named=?16, first_prompt=?17
              WHERE id=?1",
             params![
                 c.id,
@@ -297,9 +325,43 @@ impl Store {
                 c.created_at,
                 c.last_read_at,
                 c.sort_order,
-                perms_json(&c.permissions)
+                perms_json(&c.permissions),
+                c.window_id,
+                c.auto_named as i64,
+                c.first_prompt
             ],
         )?;
+        Ok(())
+    }
+
+    /// Forget a channel row (only for one that never went live: a failed create).
+    pub fn delete_channel(&self, id: ChannelId) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM channels WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    // ----- windows -----
+
+    /// (id, name, last_focused_at, created_at) of every window.
+    pub fn load_windows(&self) -> anyhow::Result<Vec<(WindowId, String, i64, i64)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT id, name, last_focused_at, created_at FROM windows ORDER BY id")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Insert or update a window row.
+    pub fn upsert_window(&self, id: WindowId, name: &str, last_focused_at: i64, created_at: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO windows (id, name, last_focused_at, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, last_focused_at = excluded.last_focused_at",
+            params![id, name, last_focused_at, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_window(&self, id: WindowId) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM windows WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -562,6 +624,59 @@ mod tests {
 
     fn count(s: &Store, sql: &str) -> i64 {
         s.conn.lock().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn migration_v4_puts_live_channels_in_window_1() {
+        let conn = Connection::open_in_memory().unwrap();
+        let s = Store { conn: Mutex::new(conn) };
+        // Apply v1..v3 only, add channels the old way, then run the rest.
+        {
+            let c = s.conn.lock();
+            for sql in &MIGRATIONS[..3] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 3).unwrap();
+            for (id, ws, order, archived) in [(1, 1, 5, 0), (2, 2, 0, 0), (3, 1, 1, 1), (4, 1, 2, 0)] {
+                c.execute(
+                    "INSERT INTO channels (id, workspace_id, name, cwd, owns_worktree, port_base, archived,
+                                           created_at, last_read_at, sort_order)
+                     VALUES (?1, ?2, 'n', '/', 0, 20000, ?4, 0, 0, ?3)",
+                    params![id, ws, order, archived],
+                )
+                .unwrap();
+            }
+        }
+        s.migrate().unwrap();
+        let wins = s.load_windows().unwrap();
+        assert_eq!(wins.len(), 1);
+        assert_eq!((wins[0].0, wins[0].1.as_str()), (1, "1"));
+        let chans = s.load_channels().unwrap();
+        let live: Vec<(ChannelId, Option<WindowId>, i64, bool)> = chans
+            .iter()
+            .filter(|c| !c.archived)
+            .map(|c| (c.id, c.window_id, c.sort_order, c.auto_named))
+            .collect();
+        assert_eq!(
+            live,
+            vec![(1, Some(1), 2, false), (2, Some(1), 0, false), (4, Some(1), 1, false)]
+        );
+        assert_eq!(chans.iter().find(|c| c.id == 3).unwrap().window_id, None);
+        // Round trip of the new columns.
+        let mut c = chans[0].clone();
+        c.auto_named = true;
+        c.first_prompt = Some("fix it".into());
+        c.window_id = Some(7);
+        s.update_channel(&c).unwrap();
+        let back = s.load_channels().unwrap().into_iter().find(|x| x.id == c.id).unwrap();
+        assert!(back.auto_named);
+        assert_eq!(back.first_prompt.as_deref(), Some("fix it"));
+        assert_eq!(back.window_id, Some(7));
+        s.upsert_window(2, "two", 5, 6).unwrap();
+        s.upsert_window(2, "zwei", 9, 0).unwrap();
+        assert_eq!(s.load_windows().unwrap()[1], (2, "zwei".to_string(), 9, 6));
+        s.delete_window(2).unwrap();
+        assert_eq!(s.load_windows().unwrap().len(), 1);
     }
 
     #[test]

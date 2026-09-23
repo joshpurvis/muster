@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub type WorkspaceId = i64;
 pub type ChannelId = i64;
 pub type SessionId = u32;
+pub type WindowId = i64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +136,31 @@ pub struct Channel {
     /// when a session's process starts.
     #[serde(default)]
     pub permissions: Permissions,
+    /// Client window this channel is a tab in (None: adopted by the next `window.claim`).
+    #[serde(default)]
+    pub window_id: Option<WindowId>,
+    /// Created without a name: the daemon derives `name` until the human renames it.
+    #[serde(default)]
+    pub auto_named: bool,
+    /// Name derived from the first prompt sent to the channel (auto naming input). Internal.
+    #[serde(skip)]
+    pub first_prompt: Option<String>,
+}
+
+/// A client window. Its tabs are the non-archived channels with this `window_id`, in
+/// `sort_order`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Window {
+    pub id: WindowId,
+    /// Default: the id as a string.
+    pub name: String,
+    /// Tab order.
+    pub channel_ids: Vec<ChannelId>,
+    /// A client connection holds (shows) this window.
+    pub open: bool,
+    /// Unix ms of the last `window.focused`.
+    pub last_focused_at: i64,
+    pub created_at: i64,
 }
 
 /// Codex `--sandbox` policy for a channel's Codex sessions. Ordered least to most permissive.

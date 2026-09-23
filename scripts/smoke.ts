@@ -275,8 +275,14 @@ async function main() {
   const ws2 = await c.call("workspace.add", { path: REPO + "/" });
   ok(ws2.id === ws.id, "workspace.add is idempotent");
 
-  const ch = await c.call("channel.create", { workspace_id: ws.id, name: "Smoke Test!", agent: "shell" });
+  const plain = await c.call("channel.create", { workspace_id: ws.id, name: "no tree" });
+  ok(!plain.owns_worktree && plain.cwd === ws.path && plain.branch === "main", "worktree is off by default");
+  await c.call("channel.archive", { id: plain.id, remove_worktree: false });
+  const ch = await c.call("channel.create", { workspace_id: ws.id, name: "Smoke Test!", agent: "shell", worktree: true });
   ok(ch.branch === "muster/smoke-test" && ch.owns_worktree, "channel.create made branch muster/smoke-test");
+  ok(ch.cwd.endsWith(`/${ch.id}`), "worktree directory is keyed by the channel id");
+  ok(ch.auto_named === false && ch.window_id === 1, "named channel, placed in a new window 1");
+  ok(c.events.some((e) => e.event === "window_upserted" && e.data.id === 1 && e.data.channel_ids.includes(ch.id)), "window_upserted with the new tab");
   ok(c.events.some((e) => e.event === "channel_upserted" && e.data.id === ch.id), "channel_upserted arrives before the result");
   ok(await exists(`${ch.cwd}/README.md`), "worktree checked out");
   ok(ch.port_base === 20000 + (ch.id % 1000) * 10, "port_base from channel id");
@@ -335,6 +341,23 @@ async function main() {
   await c.waitFor("echo output", () => c.terminal(sid).includes(expect));
   ok(true, `live 0x01 output contains ${expect}`);
 
+  // session.output / session.input / session.wait (the CLI's primitives)
+  const out = await c.call("session.output", { id: sid, lines: 20 });
+  ok(out.lines.length <= 20 && out.lines.some((l: string) => l.includes(expect)), "session.output returns the tail as plain text");
+  ok(!out.lines.join("\n").includes("\x1b["), "session.output has no ANSI escapes");
+  await c.call("session.input", { id: sid, data: "echo in$((3*3))put\r" });
+  await c.waitFor("session.input output", () => c.terminal(sid).includes("in9put"));
+  ok(true, "session.input writes raw bytes");
+  const wIdle = await c.call("session.wait", { id: sid, until: ["idle", "working"], timeout_ms: 5000 });
+  ok(wIdle.matched && !wIdle.timed_out && wIdle.session.id === sid, "session.wait returns at once when already matching");
+  const t0 = Date.now();
+  const wNo = await c.call("session.wait", { id: sid, until: ["needs_human"], timeout_ms: 400 });
+  ok(!wNo.matched && wNo.timed_out && Date.now() - t0 >= 350, "session.wait times out (needs_human group)");
+  await c.call("session.wait", { id: sid, until: ["bogus"] }).then(
+    () => ok(false, "session.wait rejects unknown states"),
+    (e) => ok(String(e).includes("unknown state"), "session.wait rejects unknown states"),
+  );
+
   const screen = await c.call("session.screen", { id: sid });
   ok(screen.lines.some((l: string) => l.includes(expect)), "session.screen shows the output");
   ok(c.events.some((e) => e.event === "session_upserted" && e.data.id === sid && e.data.cols === 100), "resize broadcast");
@@ -350,6 +373,87 @@ async function main() {
   ok(true, "both clients receive live output");
   await c2.call("session.detach", { id: sid });
   c2.close();
+
+  // ----- windows, tabs, auto naming -----
+  const httpRpc = async (method: string, params: Json = {}) =>
+    await (
+      await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${d.token}` },
+        body: JSON.stringify({ id: 9, method, params }),
+      })
+    ).json();
+  ok((await httpRpc("window.claim")).error?.message.includes("WebSocket"), "window.claim is WebSocket only");
+  const w1 = await c.call("window.claim", {});
+  ok(w1.id === 1 && w1.open && w1.channel_ids.includes(ch.id), "window.claim takes the lowest window with tabs");
+  ok((await c.call("hello")).windows.some((w: Json) => w.id === 1 && w.open), "hello lists windows");
+  await c.call("window.focused", { id: 1 });
+  const c3 = new Client(d.token);
+  await c3.open();
+  const w2 = await c3.call("window.claim", {});
+  ok(w2.id === 2 && w2.channel_ids.length === 0 && w2.name === "2", "second window.claim gets a new empty window 2");
+  // New channels go to the focused open window unless told otherwise.
+  const auto = await c.call("channel.create", { workspace_id: ws.id, agent: "shell", prompt: "echo fix the flaky login test now please" });
+  ok(auto.auto_named && auto.name === "echo fix the flaky login test", "unnamed channel is named from its first prompt");
+  ok(auto.window_id === 1, "new channel goes to the last focused window");
+  const bare = await c.call("channel.create", { workspace_id: ws.id, worktree: true, window_id: 2 });
+  ok(bare.auto_named && bare.name === "repo" && bare.window_id === 2, "no name, no prompt: folder name, in the requested window");
+  ok(bare.branch === `muster/${bare.id}` && bare.cwd.endsWith(`/${bare.id}`), "worktree starts on muster/<id>");
+  await c.call("channel.create", { workspace_id: ws.id, window_id: 99 }).then(
+    () => ok(false, "channel.create rejects an unknown window"),
+    (e) => ok(String(e).includes("no such window"), "channel.create rejects an unknown window"),
+  );
+  // A shell's OSC title names a channel that has no prompt (priority 3), spinner glyph stripped.
+  const bs = await c.call("session.spawn", { channel_id: bare.id, kind: "shell" });
+  await sleep(800);
+  await c.call("session.input", { id: bs.id, data: "printf '\\033]0;\\342\\234\\263 build the widget\\007'\r" });
+  await c.waitFor("title-derived name", () =>
+    c.events.some((e) => e.event === "channel_upserted" && e.data.id === bare.id && e.data.name === "build the widget"));
+  ok(true, "shell title names the channel (glyph stripped)");
+  await c.waitFor("branch renamed after the first derived name", () =>
+    c.events.some((e) => e.event === "channel_upserted" && e.data.id === bare.id && e.data.branch === "muster/build-the-widget"));
+  ok((await git(REPO, "branch", "--list", "muster/build-the-widget")).includes("muster/build-the-widget"), "git branch renamed to muster/<slug>");
+  ok(await exists(bare.cwd), "worktree directory did not move");
+  // A prompt outranks a shell title.
+  await c.call("session.send", { id: bs.id, text: "echo second opinion" });
+  await c.waitFor("prompt-derived name", () =>
+    c.events.some((e) => e.event === "channel_upserted" && e.data.id === bare.id && e.data.name === "echo second opinion"));
+  ok(true, "first prompt outranks the shell title");
+  const renamed = await c.call("channel.rename", { id: bare.id, name: "My Feature" });
+  ok(!renamed.auto_named && renamed.name === "My Feature" && renamed.branch === "muster/my-feature", "channel.rename ends auto naming and renames the branch");
+  await c.call("session.input", { id: bs.id, data: "printf '\\033]0;other title\\007'\r" });
+  await sleep(500);
+  ok((await c.call("hello")).channels.find((x: Json) => x.id === bare.id).name === "My Feature", "no auto naming after a rename");
+  // Tabs: move, reorder, rename, raise.
+  const mv = await c.call("channel.move", { id: auto.id, window_id: 2, index: 0 });
+  ok(mv.window_id === 2, "channel.move");
+  let wins = (await c.call("hello")).windows;
+  ok(JSON.stringify(wins.find((w: Json) => w.id === 2).channel_ids) === JSON.stringify([auto.id, bare.id]), "moved tab inserted at index");
+  ok(!wins.find((w: Json) => w.id === 1).channel_ids.includes(auto.id), "moved tab left its old window");
+  const ro = await c.call("window.reorder_tabs", { id: 2, channel_ids: [bare.id, auto.id] });
+  ok(JSON.stringify(ro.channel_ids) === JSON.stringify([bare.id, auto.id]), "window.reorder_tabs");
+  ok((await c.call("window.rename", { id: 2, name: "  side  " })).name === "side", "window.rename");
+  const w3 = await c.call("window.create", {});
+  ok(w3.id === 3 && !w3.open, "window.create makes an unheld window");
+  ok((await c.call("window.raise", { id: 3 })).raised === false, "window.raise is false when no client holds the window");
+  // Closing a client releases its window; an empty released window is deleted.
+  c.events = [];
+  c3.close();
+  await c.waitFor("window 2 released", () => c.events.some((e) => e.event === "window_upserted" && e.data.id === 2 && !e.data.open));
+  ok(true, "closing a client releases its window (tabs kept)");
+  await c.call("channel.move", { id: auto.id, window_id: 1 });
+  await c.call("channel.move", { id: bare.id, window_id: 1 });
+  await c.waitFor("window 2 removed", () => c.events.some((e) => e.event === "window_removed" && e.data.id === 2));
+  ok(true, "a released window without tabs is deleted");
+  await c.call("channel.archive", { id: auto.id, remove_worktree: false });
+  await c.call("channel.archive", { id: bare.id, remove_worktree: true });
+  const c4 = new Client(d.token);
+  await c4.open();
+  const w4 = await c4.call("window.claim", { id: 3 });
+  ok(w4.id === 3 && w4.open, "window.claim with an id takes that window");
+  c4.close();
+  await c.waitFor("window 3 removed", () => c.events.some((e) => e.event === "window_removed" && e.data.id === 3));
+  ok(true, "empty window deleted when its client leaves");
 
   // flood: 20 MB of output must not wedge the daemon or lose the tail
   c.input(sid, "head -c 20000000 /dev/zero | tr '\\0' x; echo; echo FLOOD$((40+2))\r");
@@ -392,6 +496,7 @@ async function main() {
   let h = await c.call("hello");
   let s = h.sessions.find((x: Json) => x.id === sid);
   ok(s.state === "exited" && s.state_detail === "daemon restarted", "after crash: session exited (daemon restarted)");
+  ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
   await c.call("session.attach", { id: sid });
   await c.waitFor("replay after restart", () => c.frames.some((f) => f.id === sid && f.type === 0x03));
   const replayed = c.terminal(sid);

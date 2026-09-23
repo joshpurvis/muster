@@ -97,7 +97,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_agent",
             "Spawn agent",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -109,11 +109,10 @@ pub fn tool_definitions() -> Vec<Value> {
                         "type": "object",
                         "description": "Create a new channel in your workspace and spawn there.",
                         "properties": {
-                            "name": {"type": "string", "description": "Channel name, e.g. 'fix-login-bug'."},
-                            "worktree": {"type": "boolean", "default": true, "description": "Create a git worktree + branch muster/<slug> (ignored for non-git workspaces)."},
+                            "name": {"type": "string", "description": "Channel name, e.g. 'fix-login-bug'. Omit to let muster name it from the agent's task."},
+                            "worktree": {"type": "boolean", "default": true, "description": "Create a git worktree + branch muster/<channel id>, renamed after the channel name (ignored for non-git workspaces)."},
                             "base": {"type": "string", "description": "Branch or commit to base the worktree on. Default: workspace HEAD."}
                         },
-                        "required": ["name"],
                         "additionalProperties": false
                     }
                 },
@@ -683,18 +682,13 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
 
     let (channel, created) = if let Some(nc) = new_channel {
         let nc = Args(nc);
-        let ch_name = match nc.req_str("name") {
-            Ok(n) => n.trim().to_string(),
-            Err(e) => {
-                refund();
-                return Err(e);
-            }
-        };
-        if ch_name.is_empty() {
-            refund();
-            return Err("new_channel.name must not be empty".into());
-        }
         let parsed = (|| -> Result<CreateChannel, String> {
+            // Blank or missing: auto-named from the agent's title / prompt.
+            let ch_name = nc
+                .str("name")?
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string);
             let my_ch = st
                 .backend
                 .channel(me.channel_id)
@@ -708,6 +702,9 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
                 prompt: None,
                 // Never more than the caller has: the new channel gets the caller's profile.
                 permissions: Some(my_ch.permissions),
+                window_id: None,
+                // A new tab next to the caller's.
+                prefer_window: my_ch.window_id,
                 cols: crate::hub::default_cols(),
                 rows: crate::hub::default_rows(),
             })

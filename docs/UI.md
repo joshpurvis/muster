@@ -59,7 +59,14 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   renames.
 - Double-click renames inline. Middle-click closes. Drag reorders (`window.reorder_tabs`). While
   a tab is dragged, "→ Window N" and "→ New window" targets appear in the bar; dropping on one
-  moves the tab there, and dropping on the Jump button opens a "Move tab to" menu. The
+  moves the tab there, and dropping on the Jump button opens a "Move tab to" menu. Dragging a
+  tab (not the active one) off the bar onto the active tab's panes shows the same drop-zone
+  overlay as a pane drag (edge halves split that side, the center or a header joins that pane,
+  a tab strip inserts at the marker); dropping merges the tab there: all its sessions, live and
+  exited, move over (`session.move`) into one pane, in their pane order with its focused session
+  active, and the emptied tab closes (`channel.archive`, worktree kept). If a move fails, a
+  toast says so and what moved stays placed; the rest stays in the (still open) dragged tab.
+  Esc, window blur or a cancelled pointer abort any tab drag. The
   context menu has Rename, Permissions…, Copy path, Copy branch, Move to window ▸ (existing
   windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree,
   confirmed in a dialog).
@@ -91,6 +98,13 @@ bar. Differences:
   buttons on hover, `×`) only when the tab has 2 or more panes. With one pane there is no
   chrome at all. Dragging the header works like dragging a v0 pane-tab, and dropping a session
   on a header joins that pane. Double-click renames the session.
+- Dropping a pane header or pane-tab on the empty part of the tab bar (a marker shows at the
+  end of the strip) moves that session into a new tab: `channel.create` without an agent, same
+  folder and window, then `session.move`; the new tab becomes active. A moved session keeps its
+  process, cwd and permissions (`MUSTER_CHANNEL_ID` in its environment stays stale until it
+  restarts, and a restart applies the new tab's permission profile).
+- The panes also take a whole tab dragged from the tab bar (see Tab bar): it lands as a split
+  on the edge it is dropped on, or as pane-tabs of the pane under the pointer.
 - The pane tab strip only appears when the pane holds 2+ sessions; it replaces the header.
 - Right-click in a pane opens the pane menu: Copy, Paste, Find…, New session here ▸, Split
   right ▸, Split down ▸, Zoom, Rename session, Restart, Interrupt, Kill process, Close pane.

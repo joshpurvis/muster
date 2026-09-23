@@ -1,5 +1,6 @@
 // Top tab bar: one tab per channel in this window. Drag reorders (window.reorder_tabs); drag
-// onto a "→ Window N" target or the Jump button moves a tab to another window.
+// onto a "→ Window N" target or the Jump button moves a tab to another window; drag onto the
+// active tab's panes merges it there as a split (or pane-tabs).
 import { signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { Channel } from "../types.ts";
@@ -38,6 +39,7 @@ import {
 } from "../icons.tsx";
 import { aggregateState, isNoopSlot, tabLabel, windowLabel } from "../model.ts";
 import { cx } from "../util.ts";
+import { computeTarget, DropMarker, type Target } from "../layout/dnd.tsx";
 
 // ---------------- drag ----------------
 
@@ -52,6 +54,8 @@ interface TabDrag {
   slot: number | null;
   line: { left: number; top: number; height: number } | null;
   target: TabDropTarget | null;
+  /** Over the active tab's panes: where the dragged tab's sessions would land. */
+  pane: Target | null;
 }
 
 export const tabDrag = signal<TabDrag | null>(null);
@@ -95,7 +99,10 @@ function startTabDrag(e: PointerEvent, c: Channel, label: string, onClick: () =>
       return;
     }
     if (!d) return;
-    if (d.target?.kind === "window") A.moveTabToWindow(c.id, d.target.id);
+    const into = activeChannel.value?.id;
+    if (d.pane && into !== undefined && into !== c.id) {
+      A.mergeTab(c.id, into, d.pane.paneId, d.pane.zone, d.pane.index);
+    } else if (d.target?.kind === "window") A.moveTabToWindow(c.id, d.target.id);
     else if (d.target?.kind === "new") A.moveTabToWindow(c.id, "new");
     else if (d.target?.kind === "jump") {
       const btn = document.querySelector(".jump-btn");
@@ -120,10 +127,16 @@ function startTabDrag(e: PointerEvent, c: Channel, label: string, onClick: () =>
   addEventListener("blur", cancel);
 }
 
-function dropAt(x: number, y: number, id: number): Pick<TabDrag, "slot" | "line" | "target"> {
-  const none = { slot: null, line: null, target: null };
+function dropAt(x: number, y: number, id: number): Pick<TabDrag, "slot" | "line" | "target" | "pane"> {
+  const none = { slot: null, line: null, target: null, pane: null };
   const el = document.elementFromPoint(x, y) as HTMLElement | null;
   if (!el) return none;
+  // Off the bar, over the active tab's panes (not the dragged tab's own): merge there.
+  const into = activeChannel.value;
+  if (!el.closest(".tabbar") && el.closest(".panes") && into && into.id !== id) {
+    if (!sessionsByChannel.value.get(id)?.length) return none;
+    return { ...none, pane: computeTarget(x, y, into.id, null) };
+  }
   const mv = el.closest("[data-move-to]") as HTMLElement | null;
   if (mv) {
     const v = mv.dataset.moveTo!;
@@ -151,7 +164,7 @@ function dropAt(x: number, y: number, id: number): Pick<TabDrag, "slot" | "line"
   else if (slot < els.length) lx = els[slot].getBoundingClientRect().left;
   else lx = els[els.length - 1].getBoundingClientRect().right;
   lx = Math.max(sr.left + 1, Math.min(sr.right - 1, lx));
-  return { slot, line: { left: lx - 1, top: sr.top + 5, height: sr.height - 10 }, target: null };
+  return { slot, line: { left: lx - 1, top: sr.top + 5, height: sr.height - 10 }, target: null, pane: null };
 }
 
 export function TabDragOverlay() {
@@ -159,6 +172,7 @@ export function TabDragOverlay() {
   if (!d) return null;
   return (
     <>
+      <DropMarker t={d.pane} />
       {d.line && (
         <div
           class="drop-line"

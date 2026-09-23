@@ -424,6 +424,29 @@ async function main() {
   await c.call("session.input", { id: bs.id, data: "printf '\\033]0;other title\\007'\r" });
   await sleep(500);
   ok((await c.call("hello")).channels.find((x: Json) => x.id === bare.id).name === "My Feature", "no auto naming after a rename");
+  // session.move: the shell leaves "My Feature" for a fresh auto-named tab, whose name then
+  // comes from the shell's title. Same channel is a no-op; archived/unknown channels are refused.
+  const dst = await c.call("channel.create", { workspace_id: ws.id, window_id: 1 });
+  ok(dst.auto_named && dst.name === "repo", "empty auto-named tab for session.move");
+  c.events = [];
+  const moved = await c.call("session.move", { id: bs.id, channel_id: dst.id });
+  ok(moved.id === bs.id && moved.channel_id === dst.id && moved.pid === bs.pid, "session.move keeps the process");
+  ok(c.events.some((e) => e.event === "session_upserted" && e.data.id === bs.id && e.data.channel_id === dst.id), "session_upserted with the new channel_id");
+  await c.waitFor("moved title names the tab", () =>
+    c.events.some((e) => e.event === "channel_upserted" && e.data.id === dst.id && e.data.name === "other title"));
+  ok(true, "the moved shell's title names its new tab");
+  ok((await c.call("hello")).sessions.find((x: Json) => x.id === bs.id).channel_id === dst.id, "session.move persisted (hello)");
+  ok((await c.call("session.move", { id: bs.id, channel_id: dst.id })).channel_id === dst.id, "session.move to its own channel is a no-op");
+  await c.call("session.move", { id: bs.id, channel_id: plain.id }).then(
+    () => ok(false, "session.move refuses an archived channel"),
+    (e) => ok(String(e).includes("archived"), "session.move refuses an archived channel"),
+  );
+  await c.call("session.move", { id: bs.id, channel_id: 99999 }).then(
+    () => ok(false, "session.move refuses an unknown channel"),
+    (e) => ok(String(e).includes("no such channel"), "session.move refuses an unknown channel"),
+  );
+  await c.call("session.move", { id: bs.id, channel_id: bare.id });
+  await c.call("channel.archive", { id: dst.id, remove_worktree: false });
   // Tabs: move, reorder, rename, raise.
   const mv = await c.call("channel.move", { id: auto.id, window_id: 2, index: 0 });
   ok(mv.window_id === 2, "channel.move");

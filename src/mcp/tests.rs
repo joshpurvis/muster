@@ -522,6 +522,21 @@ async fn whoami_and_lists() {
     assert_eq!(calls[0].3["ok"], true);
 }
 
+/// `session.move`: a caller's channel comes from its current session info, never its env.
+#[tokio::test]
+async fn moved_caller_resolves_its_new_channel() {
+    let (m, st) = state();
+    m.d.lock().channels.insert(11, channel(11, "other"));
+    m.update(1, |s| s.channel_id = 11);
+    let v = parse(&call(&st, "whoami", json!({})).await.0);
+    assert_eq!(v["channel"]["id"], 11);
+    let v = parse(&call(&st, "list_sessions", json!({"channel_id": 11})).await.0);
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["is_me"], true);
+    let d = m.d.lock();
+    assert_eq!(d.events.last().unwrap().0, Some(11), "calls are logged in the new channel");
+}
+
 #[tokio::test]
 async fn unknown_tool_is_protocol_error_and_logged() {
     let (m, st) = state();

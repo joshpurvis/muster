@@ -2073,19 +2073,52 @@ impl Hub {
         let cid = entry.info.channel_id;
         {
             let mut g = self.inner.lock();
-            let mut t = Titles::default();
-            for e in g.sessions.values().filter(|e| e.info.channel_id == cid) {
-                if let Some(clean) = e.usable_title.clone() {
-                    match e.info.kind {
-                        SessionKind::Shell => t.shell = Some(clean),
-                        SessionKind::Claude | SessionKind::Codex => t.agent = Some(clean),
-                    }
-                }
-            }
+            let t = titles_of(&g, cid);
             g.titles.insert(cid, t);
         }
         self.rederive_name(cid);
         Ok(())
+    }
+
+    /// Move a session to another channel (the UI merges a tab into another one as a split).
+    /// The process keeps running as it is: its cwd, its permission flags, and its environment,
+    /// so `MUSTER_CHANNEL_ID` and `PORT` still name the old channel until it restarts (a restart
+    /// applies the new channel's permission profile). Both channels' auto names are re-derived.
+    /// Moving into the session's own channel is a no-op.
+    pub fn move_session(&self, id: SessionId, channel_id: ChannelId) -> anyhow::Result<SessionInfo> {
+        let (info, from) = {
+            let mut g = self.inner.lock();
+            match g.channels.get(&channel_id) {
+                None => anyhow::bail!("no such channel: {channel_id}"),
+                Some(c) if c.archived => anyhow::bail!("channel {channel_id} is archived"),
+                Some(_) => {}
+            }
+            let e = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+            let from = e.info.channel_id;
+            if from == channel_id {
+                return Ok(e.info.clone());
+            }
+            // A start in progress reads the channel it is starting in.
+            if e.busy {
+                anyhow::bail!("session {id} is starting");
+            }
+            let mut next = e.info.clone();
+            next.channel_id = channel_id;
+            self.store.update_session(&next)?;
+            e.info = next.clone();
+            for cid in [from, channel_id] {
+                let t = titles_of(&g, cid);
+                g.titles.insert(cid, t);
+            }
+            (next, from)
+        };
+        self.emit(ServerEvent::SessionUpserted(info.clone()));
+        self.rederive_name(from);
+        self.rederive_name(channel_id);
+        Ok(info)
     }
 
     /// Wait (off the async workers) for a removed session's processes to die, SIGKILL them after
@@ -2313,6 +2346,20 @@ fn cap_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect::<String>().trim_end().to_string()
 }
 
+/// Auto-naming inputs of a channel rebuilt from its sessions' last usable titles.
+fn titles_of(g: &Inner, cid: ChannelId) -> Titles {
+    let mut t = Titles::default();
+    for e in g.sessions.values().filter(|e| e.info.channel_id == cid) {
+        if let Some(clean) = e.usable_title.clone() {
+            match e.info.kind {
+                SessionKind::Shell => t.shell = Some(clean),
+                SessionKind::Claude | SessionKind::Codex => t.agent = Some(clean),
+            }
+        }
+    }
+    t
+}
+
 /// The folder a channel is named after until something better shows up.
 fn folder_name(ws: &Workspace) -> String {
     Path::new(&ws.path)
@@ -2475,6 +2522,89 @@ mod tests {
         assert!(!is_initial_branch("muster/7-x", 7));
         assert!(!is_initial_branch("muster/7-", 7));
         assert!(!is_initial_branch("muster/fix-auth", 7));
+    }
+
+    /// A hub over an in-memory store: workspace `/w/repo`, auto-named channels 1 and 2 (window
+    /// 1), archived channel 3, sessions of channel 1: a shell titled "build the widget" and a
+    /// claude without a title.
+    fn move_fixture() -> Arc<Hub> {
+        let store = Store::open_memory().unwrap();
+        let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
+        let ch = |name: &str, archived| Channel {
+            id: 0,
+            workspace_id: ws,
+            name: name.into(),
+            cwd: "/w/repo".into(),
+            branch: None,
+            base_branch: None,
+            owns_worktree: false,
+            port_base: 20000,
+            archived,
+            layout: None,
+            created_at: 0,
+            last_read_at: 0,
+            sort_order: 0,
+            permissions: Permissions::default(),
+            window_id: Some(1),
+            auto_named: true,
+            first_prompt: None,
+        };
+        assert_eq!(store.insert_channel(&ch("build the widget", false)).unwrap(), 1);
+        assert_eq!(store.insert_channel(&ch("repo", false)).unwrap(), 2);
+        assert_eq!(store.insert_channel(&ch("old", true)).unwrap(), 3);
+        store.upsert_window(1, "1", 0, 0).unwrap();
+        for (kind, title) in [(SessionKind::Shell, Some("✳ build the widget")), (SessionKind::Claude, None)] {
+            let mut info = crate::mcp::guard::test_session(0, None);
+            info.kind = kind;
+            info.title = title.map(Into::into);
+            store
+                .insert_session(&StoredSession {
+                    info,
+                    extra_args: vec![],
+                })
+                .unwrap();
+        }
+        let cfg = HubConfig {
+            port: 0,
+            client_token: "t".into(),
+            muster_bin: PathBuf::from("/bin/true"),
+        };
+        Hub::new(cfg, store).unwrap()
+    }
+
+    #[test]
+    fn move_session_between_channels() {
+        let hub = move_fixture();
+        let mut rx = hub.subscribe();
+        let s = hub.move_session(1, 2).unwrap();
+        assert_eq!(s.channel_id, 2);
+        assert_eq!(hub.session(1).unwrap().channel_id, 2);
+        // Persisted.
+        let stored = hub.store.load_sessions().unwrap();
+        assert_eq!(stored.iter().find(|x| x.info.id == 1).unwrap().info.channel_id, 2);
+        // The shell title now names channel 2; channel 1 falls back to its folder.
+        assert_eq!(hub.channel(2).unwrap().name, "build the widget");
+        assert_eq!(hub.channel(1).unwrap().name, "repo");
+        let mut seen = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ServerEvent::SessionUpserted(i) => seen.push(format!("s{}@{}", i.id, i.channel_id)),
+                ServerEvent::ChannelUpserted(c) => seen.push(format!("c{}={}", c.id, c.name)),
+                _ => {}
+            }
+        }
+        assert_eq!(seen, ["s1@2", "c1=repo", "c2=build the widget"]);
+        // Same channel: no-op, no event.
+        assert_eq!(hub.move_session(1, 2).unwrap().channel_id, 2);
+        assert!(rx.try_recv().is_err());
+        // Archived, unknown channel, unknown session.
+        assert!(hub.move_session(2, 3).unwrap_err().to_string().contains("archived"));
+        assert!(hub.move_session(2, 99).unwrap_err().to_string().contains("no such channel"));
+        assert!(hub.move_session(42, 2).unwrap_err().to_string().contains("no such session"));
+        assert_eq!(hub.session(2).unwrap().channel_id, 1);
+        // Moving the last session out leaves an empty channel (the UI archives it).
+        hub.move_session(2, 2).unwrap();
+        assert!(hub.sessions().iter().all(|s| s.channel_id == 2));
     }
 
     #[test]

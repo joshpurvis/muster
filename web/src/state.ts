@@ -481,12 +481,7 @@ export function applyEvent(ev: ServerEvent) {
       if (ev.data.id === windowId.value) { for (const f of windowLostListeners) f(); }
       break;
     case "session_upserted": {
-      const prev = sessions.value.get(ev.data.id);
-      const m = new Map(sessions.value);
-      m.set(ev.data.id, ev.data);
-      sessions.value = m;
-      if (!prev && spawnHolds.has(ev.data.channel_id)) held.add(ev.data.id);
-      if (!prev) reconcileChannel(ev.data.channel_id);
+      upsertSession(ev.data);
       const cc = confirmClose.value;
       if (cc?.kind === "session" && cc.id === ev.data.id && !BUSY_STATES.has(ev.data.state)) {
         confirmClose.value = null;
@@ -519,6 +514,25 @@ export function applyEvent(ev: ServerEvent) {
       toast(ev.data.level === "error" ? "error" : ev.data.level === "warn" ? "warn" : "info", ev.data.text);
       break;
   }
+}
+
+/**
+ * Record a session (event or RPC reply). One that moved to another tab (`session.move`) leaves the
+ * old tab's layout and arrives in the new one like a new session: held while a merge there is
+ * placing it, else reconciled into the focused pane.
+ */
+export function upsertSession(s: SessionInfo) {
+  const prev = sessions.value.get(s.id);
+  const m = new Map(sessions.value);
+  m.set(s.id, s);
+  sessions.value = m;
+  const moved = !!prev && prev.channel_id !== s.channel_id;
+  if (!prev || moved) {
+    if (spawnHolds.has(s.channel_id)) held.add(s.id);
+    else held.delete(s.id);
+  }
+  if (moved) reconcileChannel(prev.channel_id);
+  if (!prev || moved) reconcileChannel(s.channel_id);
 }
 
 function removeChannel(id: ChannelId) {

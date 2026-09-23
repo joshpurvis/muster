@@ -236,6 +236,15 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             let p: Rename<SessionId> = parse(params)?;
             to_value(hub.rename_session(p.id, p.name)?)
         }
+        "session.move" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                channel_id: ChannelId,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.move_session(p.id, p.channel_id)?)
+        }
         "session.send" => {
             #[derive(Deserialize)]
             struct P {

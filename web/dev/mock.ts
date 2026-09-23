@@ -565,6 +565,18 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       broadcast("session_removed", { id: p.id });
       return {};
     }
+    case "session.move": {
+      const s = sessions.get(p.id);
+      const c = channels.find((c) => c.id === p.channel_id);
+      if (!s) throw new Error(`no such session: ${p.id}`);
+      if (!c) throw new Error(`no such channel: ${p.channel_id}`);
+      if (c.archived) throw new Error(`channel ${c.id} is archived`);
+      if (s.channel_id !== c.id) {
+        s.channel_id = c.id;
+        upsert(s);
+      }
+      return s;
+    }
     case "session.rename": {
       const s = sessions.get(p.id)!;
       s.name = p.name;

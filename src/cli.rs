@@ -908,12 +908,21 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     }
     let ws = client::rpc(d, "workspace.add", json!({ "path": abs }))?;
     let ws_id = ws["id"].as_i64().context("workspace.add returned no id")?;
-    // Inside a muster session, the new tab goes to that session's window.
+    // Inside a muster session, the new tab goes to that session's window. The session's current
+    // channel wins over MUSTER_CHANNEL_ID, which is stale once the session moved to another tab.
+    let env_id = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok());
     let window = match o.window {
         Some(w) => Some(w),
-        None => match std::env::var("MUSTER_CHANNEL_ID").ok().and_then(|v| v.trim().parse::<i64>().ok()) {
-            Some(ch) => Snapshot::fetch(d)?.channel(ch).and_then(|c| c.window_id),
-            None => None,
+        None => match (env_id("MUSTER_SESSION_ID"), env_id("MUSTER_CHANNEL_ID")) {
+            (None, None) => None,
+            (sid, ch) => {
+                let snap = Snapshot::fetch(d)?;
+                sid.and_then(|sid| snap.sessions.iter().find(|s| i64::from(s.id) == sid))
+                    .map(|s| s.channel_id)
+                    .or(ch)
+                    .and_then(|ch| snap.channel(ch))
+                    .and_then(|c| c.window_id)
+            }
         },
     };
     let mut p = json!({ "workspace_id": ws_id, "worktree": o.worktree });

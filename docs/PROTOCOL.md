@@ -116,6 +116,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
 | `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`) |
 | `session.rename` | `{id, name}` | `SessionInfo` |
+| `session.move` | `{id, channel_id}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session that is starting, is an error. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to merge a tab into another (docs/UI.md); the emptied channel stays open until the client archives it. |
 | `session.send` | `{id, text, mode?: "queue"\|"interrupt"}` | `{delivered, queued}`. For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
 | `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny"}` | `{}` |
 | `session.interrupt` | `{id}` | `{}` |
@@ -255,3 +256,7 @@ Every session gets: `MUSTER=1`, `MUSTER_SESSION_ID`, `MUSTER_CHANNEL_ID`, `MUSTE
 the run's processes for reaping, and unlike `MUSTER_TOKEN` it survives agent CLIs that strip
 `*TOKEN*`/`*KEY*`/`*SECRET*` variables from the commands they run), `MUSTER_BIN`, `PORT` and `MUSTER_PORT_BASE` (channel port block
 of 10), `TERM=xterm-256color`, `COLORTERM=truecolor`.
+
+They are set when the process starts. After `session.move` the channel values (`MUSTER_CHANNEL_ID`,
+`PORT`, `MUSTER_PORT_BASE`) are stale until the session restarts; `MUSTER_SESSION_ID` stays
+right, so tools should look the channel up from the session (as `muster new` does).

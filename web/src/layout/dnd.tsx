@@ -1,15 +1,18 @@
 // Pointer-based tab drag & drop (Obsidian-style). Dragging a tab over a pane shows where it
-// will land: edges split, center joins the pane's tabs, tab strips reorder.
+// will land: edges split, center joins the pane's tabs, tab strips reorder. Dropping it on the
+// empty part of the tab bar moves the session into a new tab. The same drop zones serve a
+// top-level tab dragged onto the panes (TabBar.tsx), which merges that tab into this one.
 
 import { signal } from "@preact/signals";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import { type DropZone, isNoopMove, moveTab, splitFits } from "./tree.ts";
 import { layouts, updateLayout } from "../state.ts";
-import { focusActiveTerminalSoon } from "../actions.ts";
+import { focusActiveTerminalSoon, moveSessionToNewTab } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
 import { KindIcon } from "../icons.tsx";
 
-interface Target {
+export interface Target {
+  /** "" for the tab bar (`newTab`). */
   paneId: string;
   zone: DropZone;
   index?: number;
@@ -17,6 +20,8 @@ interface Target {
   rect: { left: number; top: number; width: number; height: number };
   /** Insertion marker for tab strips. */
   line?: { left: number; top: number; height: number };
+  /** The empty part of the tab bar: the session moves into a new tab. */
+  newTab?: boolean;
 }
 
 interface DragState {
@@ -75,7 +80,8 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
       onClick();
       return;
     }
-    if (d?.target) {
+    if (d?.target?.newTab) moveSessionToNewTab(ch, s.id);
+    else if (d?.target) {
       const t = d.target;
       updateLayout(ch, (l) => moveTab(l, s.id, t.paneId, t.zone, t.index));
       focusActiveTerminalSoon();
@@ -99,11 +105,32 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
   addEventListener("blur", cancel);
 }
 
-function computeTarget(x: number, y: number, ch: number, sid: number): Target | null {
+/**
+ * Where a drop at (x, y) lands in tab `ch`'s panes. `sid`: the session dragged within that tab
+ * (drops that change nothing give null, and the tab bar's empty part is a target); null for a
+ * whole tab dragged in from the tab bar.
+ */
+export function computeTarget(x: number, y: number, ch: number, sid: number | null): Target | null {
   const el = document.elementFromPoint(x, y) as HTMLElement | null;
   if (!el) return null;
   const l = layouts.value.get(ch);
   if (!l) return null;
+  const noop = (paneId: string, zone: DropZone, index?: number) =>
+    sid !== null && isNoopMove(l, sid, paneId, zone, index);
+  if (sid !== null && (el.closest(".tb-space") || (el.closest(".tb-tabs") && !el.closest(".ttab")))) {
+    const strip = document.querySelector<HTMLElement>(".tabbar .tb-tabs");
+    const last = strip?.querySelector<HTMLElement>(".ttab:last-child");
+    if (!strip) return null;
+    const sr = strip.getBoundingClientRect();
+    const lx = Math.min(sr.right - 1, last ? last.getBoundingClientRect().right : sr.left + 4);
+    return {
+      paneId: "",
+      zone: "center",
+      newTab: true,
+      rect: { left: sr.left, top: sr.top, width: sr.width, height: sr.height },
+      line: { left: lx - 1, top: sr.top + 5, height: sr.height - 10 },
+    };
+  }
   const strip = el.closest("[data-tabstrip]") as HTMLElement | null;
   if (strip) {
     const paneId = strip.dataset.tabstrip!;
@@ -121,7 +148,7 @@ function computeTarget(x: number, y: number, ch: number, sid: number): Target | 
     if (tabs.length === 0) lineX = sr.left + 4;
     else if (index < tabs.length) lineX = tabs[index].getBoundingClientRect().left;
     else lineX = tabs[tabs.length - 1].getBoundingClientRect().right;
-    if (isNoopMove(l, sid, paneId, "center", index)) return null;
+    if (noop(paneId, "center", index)) return null;
     return {
       paneId,
       zone: "center",
@@ -134,7 +161,7 @@ function computeTarget(x: number, y: number, ch: number, sid: number): Target | 
   const head = el.closest("[data-pane-head]") as HTMLElement | null;
   if (head) {
     const paneId = head.dataset.paneHead!;
-    if (isNoopMove(l, sid, paneId, "center")) return null;
+    if (noop(paneId, "center")) return null;
     const r = (head.closest("[data-pane]") ?? head).getBoundingClientRect();
     return { paneId, zone: "center", rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
   }
@@ -155,7 +182,7 @@ function computeTarget(x: number, y: number, ch: number, sid: number): Target | 
     const box = document.querySelector(".panes")?.getBoundingClientRect();
     if (box && !splitFits(l.root, paneId, zone, { w: box.width, h: box.height })) zone = "center";
   }
-  if (isNoopMove(l, sid, paneId, zone)) return null;
+  if (noop(paneId, zone)) return null;
   let rect = { left: r.left, top: r.top, width: r.width, height: r.height };
   if (zone === "left") rect = { ...rect, width: r.width / 2 };
   if (zone === "right") rect = { ...rect, left: r.left + r.width / 2, width: r.width / 2 };
@@ -167,7 +194,16 @@ function computeTarget(x: number, y: number, ch: number, sid: number): Target | 
 export function DragOverlay() {
   const d = drag.value;
   if (!d) return null;
-  const t = d.target;
+  return (
+    <>
+      <DropMarker t={d.target} />
+      <Ghost x={d.x} y={d.y} kind={d.kind} name={d.name} />
+    </>
+  );
+}
+
+/** The drop-zone overlay of a target (half a pane, a whole pane) or its insertion line. */
+export function DropMarker({ t }: { t: Target | null }) {
   return (
     <>
       {t && !t.line && (
@@ -187,7 +223,6 @@ export function DragOverlay() {
           style={{ left: t.line.left + "px", top: t.line.top + "px", height: t.line.height + "px" }}
         />
       )}
-      <Ghost x={d.x} y={d.y} kind={d.kind} name={d.name} />
     </>
   );
 }

@@ -20,6 +20,7 @@ import {
   panePx,
   paneRects,
   parseLayout,
+  placeSessions,
   reconcile,
   removeSession,
   reorderTab,
@@ -356,3 +357,41 @@ Deno.test("chromeForNew predicts the chrome where a new session lands", () => {
   s = splitPane(s, "bottom", null);
   assertEquals(chromeForNew(s, "tab", s.focus), "head", "empty pane among others");
 });
+
+Deno.test("placeSessions: a merged tab's sessions become one new pane on the drop side", () => {
+  const s = emptyLayout([1]);
+  const p1 = s.focus;
+  const r = placeSessions(s, [5, 6, 7], p1, "right", 6);
+  assertEquals(sig(r.root), "row([1] [5,6,7])");
+  const np = paneOfSession(r.root, 5)!;
+  assertEquals(np.active, 6, "the dragged tab's active session stays active");
+  assertEquals(r.focus, np.id, "the new pane takes focus");
+  assertEquals(sig(placeSessions(s, [5], p1, "left").root), "row([5] [1])");
+  assertEquals(sig(placeSessions(s, [5], p1, "top").root), "col([5] [1])");
+  assertEquals(sig(placeSessions(s, [5], p1, "bottom").root), "col([1] [5])");
+  // Beside one pane of an existing row: a sibling, not a nested split.
+  const two = splitPane(s, "right", 2);
+  const p2 = paneOfSession(two.root, 2)!.id;
+  assertEquals(sig(placeSessions(two, [5], p2, "left").root), "row([1] [5] [2])");
+  // An unknown active falls back to the first.
+  assertEquals(paneOfSession(placeSessions(s, [5, 6], p1, "right", 99).root, 5)!.active, 5);
+});
+
+Deno.test("placeSessions: center joins the pane's tabs; reconciled copies are taken out first", () => {
+  const s = emptyLayout([1, 2]);
+  const p1 = s.focus;
+  const c = placeSessions(s, [5, 6], p1, "center", 6);
+  assertEquals(sig(c.root), "[1,2,5,6]");
+  assertEquals(findActive(c), 6);
+  assertEquals(sig(placeSessions(s, [5], p1, "center", undefined, 1).root), "[1,5,2]", "at an index");
+  // Reconcile dumped them into the focused pane before placement: they move out of it.
+  const dumped = reconcile(s, [1, 2, 5, 6]);
+  assertEquals(sig(dumped.root), "[1,2,5,6]");
+  assertEquals(sig(placeSessions(dumped, [5, 6], p1, "bottom").root), "col([1,2] [5,6])");
+  // Nothing to place: unchanged.
+  assert(placeSessions(s, [], p1, "right") === s);
+});
+
+function findActive(s: LayoutState): number | null {
+  return allPanes(s.root).find((p) => p.id === s.focus)?.active ?? null;
+}

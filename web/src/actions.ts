@@ -33,6 +33,7 @@ import {
   tabs,
   toast,
   updateLayout,
+  upsertSession,
   windowId,
   windowOf,
   windows,
@@ -55,9 +56,11 @@ import type {
 import {
   activateTab,
   addTab,
+  allSessions,
   chromeForNew,
   cycleTab,
   type Direction,
+  type DropZone,
   equalize as equalizeTree,
   findPane,
   focusDirection,
@@ -65,6 +68,7 @@ import {
   type LayoutState,
   panePx,
   pathOfPane,
+  placeSessions,
   resizeFocused,
   type Side,
   type Size,
@@ -537,6 +541,83 @@ export function closeTab(id: ChannelId, force = false) {
   confirmClose.value = null;
   rpc.call("channel.archive", { id, remove_worktree: false })
     .catch(fail("Close failed")).catch(() => {});
+}
+
+/**
+ * A tab dragged onto the active tab's panes: every session of `src` (live and exited) moves into
+ * tab `dst` (`session.move`) as one pane at the drop position, in `src`'s pane order with its
+ * focused session active, then the emptied `src` closes. A failed move stops there: what moved
+ * stays placed, the rest stays in `src`, which stays open.
+ */
+export async function mergeTab(
+  src: ChannelId,
+  dst: ChannelId,
+  paneId: string,
+  zone: DropZone,
+  index?: number,
+) {
+  const list = (sessionsByChannel.value.get(src) ?? []).map((s) => s.id);
+  if (src === dst || !list.length) return;
+  const l = layoutOf(src);
+  const inLayout = allSessions(l.root).filter((id) => list.includes(id));
+  const order = [...inLayout, ...list.filter((id) => !inLayout.includes(id))];
+  const active = findPane(l.root, l.focus)?.active ?? undefined;
+  // Held so reconcile doesn't first drop them into the focused pane (and size them for it).
+  holdNewSessions(dst);
+  const moved: SessionId[] = [];
+  try {
+    for (const id of order) {
+      try {
+        upsertSession(await rpc.call<SessionInfo>("session.move", { id, channel_id: dst }));
+        moved.push(id);
+      } catch (e) {
+        toast("error", `Couldn't move ${sessions.value.get(id)?.name ?? "a session"}: ${errText(e)}`);
+        break;
+      }
+    }
+    if (moved.length) updateLayout(dst, (l) => placeSessions(l, moved, paneId, zone, active, index));
+  } finally {
+    releaseNewSessions(dst);
+  }
+  if (moved.length === order.length) {
+    rpc.call("channel.archive", { id: src, remove_worktree: false }).catch(fail("Close failed")).catch(
+      () => {},
+    );
+  }
+  if (dst === activeChannel.value?.id) focusActiveTerminalSoon();
+}
+
+/**
+ * A pane header or pane-tab dropped on the empty part of the tab bar: the session moves into a
+ * new tab of the same folder (workspace) and window, which becomes active.
+ */
+export async function moveSessionToNewTab(src: ChannelId, sid: SessionId) {
+  const c = channelById.value.get(src);
+  const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;
+  if (!c || !sessions.value.has(sid)) return;
+  const here = windowId.value;
+  let nc: Channel;
+  try {
+    nc = await rpc.call<Channel>("channel.create", {
+      workspace_id: c.workspace_id,
+      // Daemons without auto naming need a name: the folder's.
+      name: windowsSupported.value ? undefined : basename(ws?.path ?? c.cwd),
+      window_id: here ?? undefined,
+    });
+  } catch (e) {
+    toast("error", `Couldn't open a tab: ${errText(e)}`);
+    return;
+  }
+  knowChannel(here !== null ? { ...nc, window_id: nc.window_id ?? here } : nc);
+  if (here !== null) windows.value = moveChannelLocally(windows.value, nc.id, here);
+  try {
+    upsertSession(await rpc.call<SessionInfo>("session.move", { id: sid, channel_id: nc.id }));
+  } catch (e) {
+    toast("error", `Couldn't move the session: ${errText(e)}`);
+    rpc.call("channel.archive", { id: nc.id, remove_worktree: false }).catch(() => {});
+    return;
+  }
+  selectTab(nc.id);
 }
 
 /** Close a tab and delete its worktree (asks first: uncommitted work there is lost). */

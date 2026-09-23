@@ -4,8 +4,8 @@
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-write=<shots> \
 //     --allow-read=<shots> dev/e2e.ts http://127.0.0.1:17761/#token=dev <shots-dir> <repo-path> [windows|legacy]
 //
-// `legacy` runs the single-window part only (a daemon without windows). It never starts an agent:
-// only the mock fakes them, a real daemon would run a real one.
+// `legacy` runs the single-window part only (a daemon without windows). It never starts an agent
+// outside the mock: only the mock fakes them, a real daemon would run a real one.
 import { type Browser, launch } from "./cdp.ts";
 
 const [url, shots, repo, mode = "windows"] = Deno.args;
@@ -91,19 +91,21 @@ try {
 
   // ---- an agent tab that needs approval, auto-named from its first prompt. Only the mock
   // (windows mode) fakes agents: against a real daemon this would start a real one.
+  const mock = String((await R(a, "hello", {}) as any).version).includes("mock");
+  const fake = windows && mock;
   const ws = await R(a, "workspace.add", { path: repo });
   const c: any = await R(a, "channel.create", {
     workspace_id: ws.id,
     worktree: false,
-    agent: windows ? "claude" : "shell",
-    prompt: windows ? "Fix the flaky login redirect test" : undefined,
+    agent: fake ? "claude" : "shell",
+    prompt: fake ? "Fix the flaky login redirect test" : undefined,
     window_id: await a.eval(`${M}.windowId.value ?? undefined`),
-    name: windows ? undefined : "flaky",
+    name: fake ? undefined : "flaky",
     cols: 120,
     rows: 30,
   });
   await a.wait(`${tabIds}.includes(${c.id})`, 6000);
-  if (windows) {
+  if (fake) {
     await a.wait(
       `[...document.querySelectorAll('.ttab-name')].some((e) => e.textContent === 'Fix the flaky login redirect test')`,
       4000,
@@ -112,7 +114,7 @@ try {
   }
   const sid = await a.eval(`[...${M}.sessions.value.values()].find((s) => s.channel_id === ${c.id}).id`);
   let needs = false;
-  if (windows) {
+  if (fake) {
     await a.sleep(4000); // the fake agent goes idle
     await R(a, "session.send", { id: sid, text: "ask for approval" });
     await a.wait(`${M}.sessions.value.get(${sid}).state === 'needs_approval'`, 8000).catch(() => {});
@@ -245,6 +247,72 @@ try {
     await a.wait(`!!document.querySelector('.app')`, 8000);
     check(await a.eval(`${M}.windowId.value`) === w1, "reload reclaimed the same window");
     ok("reload reclaimed the same window (sessionStorage)");
+
+    // ---- drag a tab onto the right edge of the active tab's single pane: merged as a split.
+    const winId = await a.eval(`${M}.windowId.value`);
+    const into: any = await R(a, "channel.create", {
+      workspace_id: ws.id,
+      agent: "shell",
+      window_id: winId,
+      name: "into",
+    });
+    const merged: any = await R(a, "channel.create", {
+      workspace_id: ws.id,
+      agent: "shell",
+      window_id: winId,
+      name: "merged",
+    });
+    await a.wait(`${tabIds}.includes(${into.id}) && ${tabIds}.includes(${merged.id})`, 6000);
+    await a.click(`[data-tab-id="${into.id}"]`);
+    await a.wait(
+      `${M}.activeChannel.value?.id === ${into.id} && document.querySelectorAll('.pane').length === 1 && !!document.querySelector('.pane .xterm')`,
+      6000,
+    );
+    const sidsOf = (ch: number) =>
+      a.eval(`[...${M}.sessions.value.values()].filter((s) => s.channel_id === ${ch}).map((s) => s.id)`);
+    const want: number[] = [...await sidsOf(into.id), ...await sidsOf(merged.id)];
+    check(want.length === 2, "each new tab has one session");
+    const from = await a.rect(`[data-tab-id="${merged.id}"]`);
+    const body = await a.rect(".pane-body");
+    await a.drag([from!.x + 30, from!.y + from!.h / 2], [body!.x + body!.w - 20, body!.y + body!.h / 2], 16);
+    await a.wait(`!${tabIds}.includes(${merged.id})`, 6000);
+    await a.wait(`document.querySelectorAll('.pane').length === 2`, 4000);
+    const layout = await a.eval(`JSON.stringify(${M}.layouts.value.get(${into.id}).root)`);
+    const root = JSON.parse(layout);
+    check(root.type === "split" && root.dir === "row", `a row split: ${layout}`);
+    check(
+      JSON.stringify(root.children.map((p: any) => p.tabs)) === JSON.stringify(want.map((id) => [id])),
+      `left pane keeps its session, the dragged tab's session is on the right: ${layout}`,
+    );
+    check(
+      (await sidsOf(into.id)).length === 2 &&
+        !(await a.eval(`${M}.tabs.value.some((c) => c.id === ${merged.id})`)),
+      "both sessions now belong to the active tab; the dragged tab closed",
+    );
+    ok("dragging a tab onto the right edge of the active pane merged it as a split and closed it");
+    await shot(a, "06b-merged");
+
+    // ---- and back: the right pane's header dropped on the empty part of the tab bar.
+    const head = await a.rect(".split-child:last-child .pane-head");
+    const space = await a.rect(".tb-space");
+    const nTabs: number = (await a.eval(tabIds)).length;
+    await a.drag(
+      [head!.x + 60, head!.y + head!.h / 2],
+      [space!.x + space!.w / 2, space!.y + space!.h / 2],
+      16,
+    );
+    await a.wait(`${tabIds}.length === ${nTabs + 1}`, 6000);
+    await a.wait(
+      `${M}.activeChannel.value?.id !== ${into.id} && document.querySelectorAll('.pane').length === 1`,
+      4000,
+    );
+    const newTab: number = await a.eval(`${M}.activeChannel.value.id`);
+    check(
+      JSON.stringify(await sidsOf(newTab)) === JSON.stringify([want[1]]) &&
+        JSON.stringify(await sidsOf(into.id)) === JSON.stringify([want[0]]),
+      "the session moved into the new, active tab",
+    );
+    ok("dropping a pane header on the tab bar moved its session into a new tab");
   }
 
   // ---- light theme

@@ -436,7 +436,7 @@ impl Store {
     pub fn update_session(&self, i: &SessionInfo) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET name=?2, cwd=?3, state=?4, state_detail=?5, state_since=?6, title=?7, pid=?8,
-                    exit_code=?9, cols=?10, rows=?11, queued=?12 WHERE id=?1",
+                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13 WHERE id=?1",
             params![
                 i.id,
                 i.name,
@@ -449,7 +449,8 @@ impl Store {
                 i.exit_code,
                 i.cols,
                 i.rows,
-                i.queued
+                i.queued,
+                i.channel_id
             ],
         )?;
         Ok(())

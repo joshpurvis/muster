@@ -434,6 +434,41 @@ export function moveTab(
   return finish({ ...base, root, focus: np.id, zoom: null });
 }
 
+/**
+ * Place sessions that just joined this tab (another tab merged into it) as one pane: a new
+ * split of `targetPaneId` on `zone`, or, for "center", tabs of that pane at `index` (default
+ * the end). They keep their order; `active` (default the first) becomes the active one and the
+ * pane takes focus. Wherever reconcile may already have put them, they are taken out first.
+ */
+export function placeSessions(
+  s: LayoutState,
+  sids: number[],
+  targetPaneId: string,
+  zone: DropZone,
+  active?: number,
+  index?: number,
+): LayoutState {
+  if (!sids.length) return s;
+  const act = active !== undefined && sids.includes(active) ? active : sids[0];
+  let base = s;
+  for (const sid of sids) base = removeFromTabs(base, sid);
+  const tgt = findPane(base.root, targetPaneId) ?? findPane(base.root, base.focus);
+  if (!tgt) return s;
+  // Into the pane's tabs, or into the pane itself when taking them out emptied it.
+  if (zone === "center" || tgt.tabs.length === 0) {
+    const root = mapPanes(base.root, (p) => {
+      if (p.id !== tgt.id) return p;
+      const tabs = [...p.tabs];
+      tabs.splice(Math.max(0, Math.min(index ?? tabs.length, tabs.length)), 0, ...sids);
+      return { ...p, tabs, active: act };
+    });
+    return finish({ ...base, root, focus: tgt.id, zoom: null });
+  }
+  const np = { ...pane(sids), active: act };
+  const root = insertBeside(base.root, tgt.id, np, zone);
+  return finish({ ...base, root, focus: np.id, zoom: null });
+}
+
 export function reorderTab(s: LayoutState, sid: number, index: number): LayoutState {
   const p = paneOfSession(s.root, sid);
   if (!p) return s;

@@ -464,7 +464,7 @@ export function TabBar() {
       >
         <IconSearch size={13} />
         <span>Jump</span>
-        <Kbd k="Ctrl+K" />
+        <Kbd k="Ctrl+Space" />
       </button>
       <button
         ref={menuRef}

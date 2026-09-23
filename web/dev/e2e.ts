@@ -142,7 +142,13 @@ try {
   await a.wait(`document.querySelector('.sw-mode')?.textContent === 'Commands'`);
   await shot(a, "05-palette");
   await a.key("Escape");
-  ok("Jump and command palette open and close");
+  // Ctrl+Space opens Jump from inside a terminal, and closes it again.
+  await a.click(".pane .xterm");
+  await a.key("Ctrl+Space");
+  await a.wait(`!!document.querySelector('.switcher')`);
+  await a.key("Ctrl+Space");
+  await a.wait(`!document.querySelector('.switcher')`);
+  ok("Jump and command palette open and close (Ctrl+Space toggles Jump from a terminal)");
 
   // ---- rename by double-click
   const first = await a.rect(".ttab");

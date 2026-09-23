@@ -188,7 +188,7 @@ function EmptyWindow() {
         <LaunchButtons pick={pick} last={prefs.value.lastAgent} />
         <div class="welcome-keys">
           <span>
-            <Kbd k="Ctrl+K" /> jump
+            <Kbd k="Ctrl+Space" /> jump
           </span>
           <span>
             <Kbd k="Alt+Shift+N" /> more options

@@ -27,6 +27,7 @@ const KEYS: Record<string, { key: string; code: string; vk: number }> = {
   Enter: { key: "Enter", code: "Enter", vk: 13 },
   Escape: { key: "Escape", code: "Escape", vk: 27 },
   Tab: { key: "Tab", code: "Tab", vk: 9 },
+  Space: { key: " ", code: "Space", vk: 32 },
   Backspace: { key: "Backspace", code: "Backspace", vk: 8 },
   Left: { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
   Up: { key: "ArrowUp", code: "ArrowUp", vk: 38 },

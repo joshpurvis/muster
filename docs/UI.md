@@ -35,7 +35,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 
 ```
 ┌ tab bar (34px) ─────────────────────────────────────────────────────────────────────────┐
-│ ● fix auth bug ⎇ ×│ ◐ muster ×│ ● new api ⎇ 🛡 ×│  +  ▾        [🔍 Ctrl K]  ⋯ │
+│ ● fix auth bug ⎇ ×│ ◐ muster ×│ ● new api ⎇ 🛡 ×│  +  ▾        [🔍 Ctrl Space] ⋯ │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
 │ ┌ pane ──────────────────────────────┬ pane ───────────────────────┐                     │
 │ │ [approval banner when needed]      │                             │                     │
@@ -110,7 +110,7 @@ copies) and branch (click copies), plus the number of sessions. On the right: a 
 chip, which is the same as Alt+J, and a connection dot.
 
 ### Overlays
-- **Jump** (Ctrl+Shift+K anywhere, Ctrl+K outside terminals): fuzzy search over every tab and
+- **Jump** (Ctrl+Space or Ctrl+Shift+K anywhere, Ctrl+K outside terminals; Ctrl+Space again closes it): fuzzy search over every tab and
   session in **all windows**, and folders for "new tab here" (recent folders and known
   workspaces; choosing one opens a tab there with the last agent kind). Rows show the state dot,
   name, tab, window (for other windows), cwd and state detail. A tab with a single session is
@@ -177,7 +177,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 
 | Keys | Action |
 |---|---|
-| Ctrl+Shift+K (Ctrl+K outside terminals) | Jump |
+| Ctrl+Space or Ctrl+Shift+K (Ctrl+K outside terminals) | Jump (Ctrl+Space again closes it) |
 | Ctrl+Shift+P | Command palette |
 | Alt+T or Ctrl+Shift+T | New tab (same folder, last agent, no worktree) |
 | Ctrl+Shift+N | New worktree tab (same folder, last agent) |

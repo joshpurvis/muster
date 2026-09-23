@@ -130,8 +130,9 @@ export const commands: Command[] = [
     id: "jump",
     title: "Jump to a tab, session or folder",
     group: "Navigate",
-    keys: ["Ctrl+Shift+K", "Ctrl+K"],
-    run: () => A.openJump(),
+    // Ctrl+Space is free in shells and agent CLIs (it only sends NUL); it also closes Jump.
+    keys: ["Ctrl+Space", "Ctrl+Shift+K", "Ctrl+K"],
+    run: () => (overlay.value?.kind === "jump" ? (overlay.value = null) : A.openJump()),
   },
   {
     id: "palette",

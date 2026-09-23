@@ -1109,6 +1109,16 @@ async fn new_channel_is_a_tab_next_to_the_caller_and_may_be_unnamed() {
     assert!(!err, "{t}");
     let id = parse(&t)["channel"]["id"].as_i64().unwrap();
     assert!(m.d.lock().channels.get(&id).unwrap().auto_named);
+    // A caller shown in another window than its task's: the new task goes to the caller's
+    // window (and the hub puts the new session there too, as the caller is its parent).
+    m.d.lock().sessions.get_mut(&1).unwrap().window_id = Some(6);
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex", "new_channel": {}})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    let id = v["channel"]["id"].as_i64().unwrap();
+    assert_eq!(m.d.lock().channels.get(&id).unwrap().window_id, Some(6));
+    let sid = v["session"]["id"].as_u64().unwrap() as SessionId;
+    assert_eq!(m.d.lock().sessions.get(&sid).unwrap().parent_id, Some(1));
 }
 
 #[tokio::test]

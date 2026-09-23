@@ -704,8 +704,8 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
                 // Never more than the caller has: the new channel gets the caller's profile.
                 permissions: Some(my_ch.permissions),
                 window_id: None,
-                // A new tab next to the caller's.
-                prefer_window: my_ch.window_id,
+                // The caller's window (its task's, if the caller has none).
+                prefer_window: me.window_id.or(my_ch.window_id),
                 cols: crate::hub::default_cols(),
                 rows: crate::hub::default_rows(),
             })
@@ -734,6 +734,8 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         cols: 120,
         rows: 32,
         parent_id: Some(caller),
+        // The caller's window (as the parent): a new tab next to the caller's.
+        window_id: None,
     };
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,

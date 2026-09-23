@@ -328,6 +328,7 @@ async function main() {
   await c.waitFor("session_upserted", () => c.events.some((e) => e.event === "session_upserted" && e.data.channel_id === ch.id));
   const sess = c.events.find((e) => e.event === "session_upserted" && e.data.channel_id === ch.id)!.data;
   ok(sess.kind === "shell" && sess.pid > 0, "shell session spawned");
+  ok(sess.window_id === ch.window_id, "channel.create's first session is in the channel's window");
   const sid: number = sess.id;
 
   // attach: result, then replay frame, then live output
@@ -553,6 +554,64 @@ async function main() {
   await c.waitFor("window 3 removed", () => c.events.some((e) => e.event === "window_removed" && e.data.id === 3));
   ok(true, "empty window deleted when its client leaves");
 
+  // ----- groups layout (v2): a tab is a session in a window -----
+  const layout = { type: "pane", id: "g1", tabs: [sid], active: sid };
+  // JSON with sorted keys: the daemon keeps the layout's content, not its key order.
+  const canon = (v: unknown): string =>
+    JSON.stringify(v, (_, x) => x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort()) : x);
+  c.events = [];
+  ok(JSON.stringify(await c.call("window.set_layout", { id: 1, layout })) === "{}", "window.set_layout returns {}");
+  ok(canon((await c.call("hello")).windows.find((w: Json) => w.id === 1).layout) === canon(layout), "hello carries the window layout");
+  ok(!c.events.some((e) => e.event === "window_upserted"), "window.set_layout has no event echo");
+  await c.call("window.set_layout", { id: 99, layout }).then(
+    () => ok(false, "window.set_layout rejects an unknown window"),
+    (e) => ok(String(e).includes("no such window"), "window.set_layout rejects an unknown window"),
+  );
+  const task = await c.call("channel.create", { workspace_id: ws.id, agent: "shell", window_id: 1 });
+  await c.waitFor("task session", () => c.events.some((e) => e.event === "session_upserted" && e.data.channel_id === task.id));
+  const t1 = c.events.find((e) => e.event === "session_upserted" && e.data.channel_id === task.id)!.data;
+  const t2 = await c.call("session.spawn", { channel_id: task.id, kind: "shell" });
+  ok(t1.window_id === 1 && t2.window_id === 1, "sessions start in their task's window");
+  const side = await c.call("window.create", {});
+  c.events = [];
+  const sw = await c.call("session.set_window", { id: t1.id, window_id: side.id, from_window_id: 1 });
+  ok(sw.window_id === side.id && sw.channel_id === task.id && sw.pid === t1.pid, "session.set_window moves the tab, same task and process");
+  ok(c.events.some((e) => e.event === "session_upserted" && e.data.id === t1.id && e.data.window_id === side.id), "session.set_window emits session_upserted");
+  ok((await c.call("hello")).channels.find((x: Json) => x.id === task.id).window_id === 1, "the task stays while one of its tabs is left behind");
+  await c.call("session.set_window", { id: t1.id, window_id: 1, from_window_id: 1 }).then(
+    () => ok(false, "session.set_window refuses a stale from_window_id"),
+    (e) => ok(String(e).includes("no longer in window 1"), "session.set_window refuses a stale from_window_id"),
+  );
+  await c.call("session.set_window", { id: t1.id, window_id: 99 }).then(
+    () => ok(false, "session.set_window rejects an unknown window"),
+    (e) => ok(String(e).includes("no such window"), "session.set_window rejects an unknown window"),
+  );
+  // `muster move`: the other tab follows; now all of the task's tabs are there, so is the task.
+  const mvOut = await new Deno.Command(BIN, { args: ["move", String(t2.id), "--window", String(side.id)], env: cliEnv, stdout: "piped", stderr: "piped" }).output();
+  ok(mvOut.success && dec.decode(mvOut.stdout).includes(`window 1 -> ${side.id}`), "muster move --window");
+  await c.waitFor("task follows its tabs", () =>
+    c.events.some((e) => e.event === "channel_upserted" && e.data.id === task.id && e.data.window_id === side.id));
+  ok(true, "the task follows once all its tabs are in the new window");
+  const lsJson = await new Deno.Command(BIN, { args: ["ls", "--json"], env: cliEnv, stdout: "piped" }).output();
+  ok(JSON.parse(dec.decode(lsJson.stdout)).find((x: Json) => x.id === t2.id)?.window_id === side.id, "muster ls --json shows the session's window");
+  const t3 = await c.call("session.spawn", { channel_id: task.id, kind: "shell", window_id: 1 });
+  ok(t3.window_id === 1, "session.spawn with window_id");
+  // A task closes with its last session; one created without an agent stays until then.
+  const empty = await c.call("channel.create", { workspace_id: ws.id, window_id: 1 });
+  c.events = [];
+  for (const x of [t1, t2]) await c.call("session.remove", { id: x.id });
+  ok(!c.events.some((e) => e.event === "channel_removed" && e.data.id === task.id), "the task stays while it has a session");
+  await c.waitFor(`window ${side.id} removed with its last tab`, () => c.events.some((e) => e.event === "window_removed" && e.data.id === side.id));
+  ok(true, "an unheld window loses its last tab: deleted");
+  await c.call("session.remove", { id: t3.id });
+  await c.waitFor("task closed", () => c.events.some((e) => e.event === "channel_removed" && e.data.id === task.id));
+  ok(true, "removing a task's last session closes the task");
+  ok((await c.call("hello")).channels.some((x: Json) => x.id === empty.id), "a task without sessions isn't closed by that");
+  const es = await c.call("session.spawn", { channel_id: empty.id, kind: "shell" });
+  await c.call("session.remove", { id: es.id });
+  await c.waitFor("empty task closed", () => c.events.some((e) => e.event === "channel_removed" && e.data.id === empty.id));
+  ok(true, "...only once a session of it is removed");
+
   // flood: 20 MB of output must not wedge the daemon or lose the tail
   c.input(sid, "head -c 20000000 /dev/zero | tr '\\0' x; echo; echo FLOOD$((40+2))\r");
   await c.waitFor("flood tail", () => c.terminal(sid).includes("FLOOD42"), 60000);
@@ -598,6 +657,7 @@ async function main() {
   let s = h.sessions.find((x: Json) => x.id === sid);
   ok(s.state === "exited" && s.state_detail === "daemon restarted", "after crash: session exited (daemon restarted)");
   ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
+  ok(canon(h.windows.find((w: Json) => w.id === 1).layout) === canon(layout) && s.window_id === 1, "window layouts and session windows persist");
   await c.call("session.attach", { id: sid });
   await c.waitFor("replay after restart", () => c.frames.some((f) => f.id === sid && f.type === 0x03));
   const replayed = c.terminal(sid);

@@ -263,6 +263,18 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             }
             to_value(info)
         }
+        "session.set_window" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                window_id: WindowId,
+                /// Refuse unless the session is still in this window (stale-view guard).
+                #[serde(default)]
+                from_window_id: Option<WindowId>,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.set_session_window(p.id, p.window_id, p.from_window_id)?)
+        }
         "session.send" => {
             #[derive(Deserialize)]
             struct P {
@@ -326,6 +338,17 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             }
             let p: P = parse(params)?;
             to_value(hub.create_window(p.name)?)
+        }
+        "window.set_layout" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: WindowId,
+                #[serde(default)]
+                layout: Value,
+            }
+            let p: P = parse(params)?;
+            hub.set_window_layout(p.id, p.layout)?;
+            Ok(json!({}))
         }
         "window.focused" => {
             let p: IdParam<WindowId> = parse(params)?;

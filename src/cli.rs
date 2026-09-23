@@ -67,6 +67,9 @@ pub struct Sess {
     pub state_since: i64,
     #[serde(default)]
     pub queued: u32,
+    /// The window the session is a tab in.
+    #[serde(default)]
+    pub window_id: Option<i64>,
     /// The daemon's JSON as received (for `--json`).
     #[serde(skip)]
     pub raw: Value,
@@ -138,13 +141,18 @@ impl Snapshot {
         self.sessions.iter().filter(|s| self.channel(s.channel_id).is_some())
     }
 
-    /// A session's JSON with `channel_name` and `window_id` added.
+    /// A session's window: its own (a tab is a session), else its tab's (older daemons).
+    fn window_of(&self, s: &Sess) -> Option<i64> {
+        s.window_id.or_else(|| self.channel(s.channel_id).and_then(|c| c.window_id))
+    }
+
+    /// A session's JSON with `channel_name` added, and `window_id` if the daemon had none.
     fn session_json(&self, s: &Sess) -> Value {
         let mut v = s.raw.clone();
         if let Some(o) = v.as_object_mut() {
             let ch = self.channel(s.channel_id);
             o.insert("channel_name".into(), json!(ch.map(|c| c.name.clone())));
-            o.insert("window_id".into(), json!(ch.and_then(|c| c.window_id)));
+            o.insert("window_id".into(), json!(self.window_of(s)));
         }
         v
     }
@@ -483,7 +491,7 @@ pub fn ls(d: Option<&Discovery>, all: bool, as_json: bool) -> anyhow::Result<()>
     let snap = Snapshot::fetch(d)?;
     let order = |s: &Sess| {
         let pos = snap.channels.iter().position(|c| c.id == s.channel_id).unwrap_or(usize::MAX);
-        let win = snap.channel(s.channel_id).and_then(|c| c.window_id).unwrap_or(i64::MAX);
+        let win = snap.window_of(s).unwrap_or(i64::MAX);
         (win, pos, s.id)
     };
     let mut list: Vec<&Sess> = snap.visible().filter(|s| all || s.live()).collect();
@@ -509,7 +517,7 @@ pub fn ls(d: Option<&Discovery>, all: bool, as_json: bool) -> anyhow::Result<()>
             }
             vec![
                 Cell::plain(s.id.to_string()),
-                Cell::plain(ch.and_then(|c| c.window_id).map_or("-".into(), |w| w.to_string())),
+                Cell::plain(snap.window_of(s).map_or("-".into(), |w| w.to_string())),
                 Cell::plain(clip(ch.map_or("?", |c| c.name.as_str()), 28)),
                 Cell::plain(clip(&s.name, 20)),
                 Cell::plain(s.kind.clone()),
@@ -875,6 +883,21 @@ pub fn by_id(d: &Discovery, t: &str, method: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `muster move <target> --window N`: show the session (tab) in window N (`session.set_window`,
+/// guarded against a concurrent move). Prints `id  tab/name: window A -> N`.
+pub fn move_to_window(d: &Discovery, t: &str, window: i64) -> anyhow::Result<()> {
+    let (snap, s) = target(d, t)?;
+    let from = snap.window_of(&s);
+    let mut p = json!({ "id": s.id, "window_id": window });
+    if let Some(f) = from {
+        p["from_window_id"] = json!(f);
+    }
+    client::rpc(d, "session.set_window", p)?;
+    let from = from.map_or("-".into(), |w| w.to_string());
+    println!("{}  {}: window {from} -> {window}", s.id, snap.label(&s));
+    Ok(())
+}
+
 /// `muster rename`: the session, or with `tab` its tab.
 pub fn rename(d: &Discovery, t: &str, name: &str, tab: bool) -> anyhow::Result<()> {
     if name.trim().is_empty() {
@@ -913,8 +936,9 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     }
     let ws = client::rpc(d, "workspace.add", json!({ "path": abs }))?;
     let ws_id = ws["id"].as_i64().context("workspace.add returned no id")?;
-    // Inside a muster session, the new tab goes to that session's window. The session's current
-    // channel wins over MUSTER_CHANNEL_ID, which is stale once the session moved to another tab.
+    // Inside a muster session, the new tab goes to that session's window (the daemon puts the
+    // task's first session in the task's window). Without the session, MUSTER_CHANNEL_ID's task
+    // window (stale once the session moved to another task, so only a fallback).
     let env_id = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<i64>().ok());
     let window = match o.window {
         Some(w) => Some(w),
@@ -922,11 +946,10 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
             (None, None) => None,
             (sid, ch) => {
                 let snap = Snapshot::fetch(d)?;
-                sid.and_then(|sid| snap.sessions.iter().find(|s| i64::from(s.id) == sid))
-                    .map(|s| s.channel_id)
-                    .or(ch)
-                    .and_then(|ch| snap.channel(ch))
-                    .and_then(|c| c.window_id)
+                match sid.and_then(|sid| snap.sessions.iter().find(|s| i64::from(s.id) == sid)) {
+                    Some(s) => snap.window_of(s),
+                    None => ch.and_then(|ch| snap.channel(ch)).and_then(|c| c.window_id),
+                }
             }
         },
     };
@@ -961,7 +984,10 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     } else if let Some(s) = sess {
         println!("{}", s.id);
     } else if o.agent == "none" {
-        eprintln!("muster: created tab {ch_id} ({}) with no session", ch["name"].as_str().unwrap_or("?"));
+        eprintln!(
+            "muster: created tab {ch_id} ({}) with no session; no window shows it until one starts in it",
+            ch["name"].as_str().unwrap_or("?")
+        );
     }
     if o.agent != "none" && sess.is_none() {
         anyhow::bail!("tab {ch_id} was created but {} did not start (see the tab's timeline)", o.agent);
@@ -1044,6 +1070,11 @@ impl EventTracker {
         }
     }
 
+    /// The `--session` session's own window (a tab can be in another window than its task).
+    fn session_window(&self) -> Option<i64> {
+        self.filter.session.and_then(|id| self.sessions.get(&id)).and_then(|s| s.window_id)
+    }
+
     fn unfiltered(&self) -> bool {
         self.filter.session.is_none() && self.filter.channel.is_none()
     }
@@ -1112,7 +1143,9 @@ impl EventTracker {
                     .as_array()
                     .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
                     .unwrap_or_default();
-                let pass = self.unfiltered() || self.focus_tab().is_some_and(|c| tabs.contains(&c));
+                let pass = self.unfiltered()
+                    || self.focus_tab().is_some_and(|c| tabs.contains(&c))
+                    || self.session_window().is_some_and(|w| Some(w) == id);
                 if let Some(id) = id {
                     self.windows.insert(id, tabs);
                 }
@@ -1120,7 +1153,9 @@ impl EventTracker {
             }
             "window_removed" => {
                 let tabs = id.and_then(|id| self.windows.remove(&id)).unwrap_or_default();
-                self.unfiltered() || self.focus_tab().is_some_and(|c| tabs.contains(&c))
+                self.unfiltered()
+                    || self.focus_tab().is_some_and(|c| tabs.contains(&c))
+                    || self.session_window().is_some_and(|w| Some(w) == id)
             }
             "lagged" => true,
             _ => self.unfiltered(),
@@ -1220,7 +1255,7 @@ mod tests {
             ],
             "sessions": [
                 {"id": 10, "channel_id": 1, "kind": "claude", "name": "claude", "state": "working", "state_since": 0},
-                {"id": 11, "channel_id": 1, "kind": "shell", "name": "server", "state": "idle"},
+                {"id": 11, "channel_id": 1, "kind": "shell", "name": "server", "state": "idle", "window_id": 3},
                 {"id": 20, "channel_id": 2, "kind": "codex", "name": "writer", "state": "idle"},
                 {"id": 21, "channel_id": 2, "kind": "claude", "name": "gone", "state": "exited"},
                 {"id": 30, "channel_id": 3, "kind": "shell", "name": "sh", "state": "idle"},
@@ -1304,6 +1339,11 @@ mod tests {
         assert!(t.apply(&ev("session_removed", json!({"id": 10}))).pass);
         assert!(t.apply(&ev("channel_removed", json!({"id": 1}))).pass);
         assert!(t.apply(&ev("window_removed", json!({"id": 1}))).pass);
+        // A session shown in another window than its tab's: that window's events pass too.
+        let mut t = EventTracker::new(&snap(), EventFilter { session: Some(11), channel: None });
+        assert!(t.apply(&ev("window_upserted", json!({"id": 3, "channel_ids": []}))).pass);
+        assert!(t.apply(&ev("window_upserted", json!({"id": 1, "channel_ids": [1]}))).pass);
+        assert!(!t.apply(&ev("window_upserted", json!({"id": 2, "channel_ids": [2]}))).pass);
 
         let by_tab = EventFilter { session: None, channel: Some(6) };
         let mut t = EventTracker::new(&snap(), by_tab);
@@ -1636,5 +1676,9 @@ mod tests {
         assert_eq!(v["channel_name"], "fix-auth");
         assert_eq!(v["window_id"], 1);
         assert_eq!(v["kind"], "claude");
+        // A session's own window wins over its tab's.
+        let sess = s.sessions.iter().find(|x| x.id == 11).unwrap();
+        assert_eq!(s.window_of(sess), Some(3));
+        assert_eq!(s.session_json(sess)["window_id"], 3);
     }
 }

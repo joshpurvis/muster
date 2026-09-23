@@ -29,6 +29,8 @@ interface Session {
   rows: number;
   queued: number;
   created_at: number;
+  /** The window this session is a tab in (docs/PROTOCOL.md "Groups layout (v2)"). */
+  window_id: number | null;
 }
 
 const now = () => Date.now();
@@ -45,7 +47,8 @@ const scrollback = new Map<number, Uint8Array[]>();
 const clients = new Set<WebSocket>();
 const attached = new Map<WebSocket, Set<number>>();
 
-// ---------- windows (docs/PROTOCOL.md "Windows, tabs and naming") ----------
+// ---------- windows (docs/PROTOCOL.md "Windows, tabs and naming", "Groups layout (v2)") ----------
+// A tab is a session (`Session.window_id`); `channel_ids` are the tasks whose window it is.
 
 interface Win {
   id: number;
@@ -54,6 +57,8 @@ interface Win {
   open: boolean;
   last_focused_at: number;
   created_at: number;
+  /** Opaque split layout from the frontend (`window.set_layout`). */
+  layout: unknown;
 }
 const windows: Win[] = [];
 /** Which window each connection holds. */
@@ -68,22 +73,57 @@ function newWindow(id?: number, name?: string): Win {
     open: false,
     last_focused_at: 0,
     created_at: now(),
+    layout: null,
   };
   windows.push(w);
   windows.sort((a, b) => a.id - b.id);
   return w;
 }
 
-const liveTabs = (w: Win) => w.channel_ids.filter((id) => channels.some((c) => c.id === id && !c.archived));
+const liveTasks = (w: Win) => w.channel_ids.filter((id) => channels.some((c) => c.id === id && !c.archived));
+const hasTabs = (w: Win) => [...sessions.values()].some((s) => s.window_id === w.id);
+const winById = (id: number | null | undefined) => windows.find((x) => x.id === id);
 
 function upsertWindow(w: Win) {
   broadcast("window_upserted", w);
 }
 
-function removeWindowIfEmpty(w: Win) {
-  if (w.open || liveTabs(w).length) return;
+/** Delete a window nobody holds once no tab (session) or task refers to it. */
+function removeWindowIfEmpty(w: Win | undefined): boolean {
+  if (!w || w.open || hasTabs(w) || liveTasks(w).length || !windows.includes(w)) return false;
   windows.splice(windows.indexOf(w), 1);
   broadcast("window_removed", { id: w.id });
+  return true;
+}
+
+/** A task's window follows its tabs: to the one window they are all in, else (none left in its
+ *  window) to `prefer` if one of them is there, else the oldest session's window. */
+function taskFollows(c: any, prefer?: number) {
+  if (!c || c.archived) return;
+  const wins = [...sessions.values()]
+    .filter((s) => s.channel_id === c.id && winById(s.window_id))
+    .sort((a, b) => a.id - b.id)
+    .map((s) => s.window_id as number);
+  if (!wins.length) return;
+  let target: number;
+  if (wins.every((w) => w === wins[0])) target = wins[0];
+  else if (!wins.includes(c.window_id)) target = prefer !== undefined && wins.includes(prefer) ? prefer : wins[0];
+  else return;
+  if (target === c.window_id) return;
+  const from = winById(c.window_id);
+  placeChannel(c, winById(target)!);
+  removeWindowIfEmpty(from);
+}
+
+/** The window a new session goes to: `requested` (must exist), else the parent's, else the
+ *  task's, else where a new task would go. */
+function sessionWindow(requested: number | undefined, parent: number | undefined, ch: any): Win {
+  if (requested != null) {
+    const w = winById(requested);
+    if (!w) throw new Error(`no such window: ${requested}`);
+    return w;
+  }
+  return winById(sessions.get(parent as number)?.window_id) ?? winById(ch.window_id) ?? defaultWindow();
 }
 
 /** Put channel `c` in window `w` at `index` (default end), taking it out of any other window. */
@@ -130,7 +170,7 @@ function claim(ws: WebSocket, id?: number): Win {
   let w: Win | undefined;
   if (id !== undefined) w = windows.find((x) => x.id === id) ?? newWindow(id);
   else {
-    w = windows.find((x) => !x.open && liveTabs(x).length) ?? newWindow();
+    w = windows.find((x) => !x.open && hasTabs(x)) ?? newWindow();
   }
   w.open = true;
   holding.set(ws, w.id);
@@ -138,6 +178,12 @@ function claim(ws: WebSocket, id?: number): Win {
   for (const c of channels) {
     if (c.archived) continue;
     if (c.window_id == null || !windows.some((x) => x.id === c.window_id)) placeChannel(c, w);
+  }
+  for (const s of sessions.values()) {
+    if (!winById(s.window_id)) {
+      s.window_id = w.id;
+      upsert(s);
+    }
   }
   upsertWindow(w);
   return w;
@@ -266,6 +312,8 @@ function spawn(req: any): Session {
   const ch = channels.find((c) => c.id === req.channel_id);
   if (!ch) throw new Error("no such channel");
   const kind = req.kind as Kind;
+  if (ch.archived) throw new Error(`channel ${ch.id} is archived`);
+  const win = sessionWindow(req.window_id, req.parent_id, ch);
   const count = [...sessions.values()].filter((x) => x.channel_id === ch.id && x.kind === kind).length;
   const s: Session = {
     id: seq++,
@@ -284,6 +332,7 @@ function spawn(req: any): Session {
     rows: req.rows ?? 32,
     queued: 0,
     created_at: now(),
+    window_id: win.id,
   };
   sessions.set(s.id, s);
   upsert(s);
@@ -376,6 +425,28 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       upsertWindow(w);
       return w;
     }
+    case "window.set_layout": {
+      const w = winById(p.id);
+      if (!w) throw new Error(`no such window: ${p.id}`);
+      w.layout = p.layout ?? null; // no event echo
+      return {};
+    }
+    case "session.set_window": {
+      const s = sessions.get(p.id);
+      const w = winById(p.window_id);
+      if (!w) throw new Error(`no such window: ${p.window_id}`);
+      if (!s) throw new Error(`no such session: ${p.id}`);
+      if (p.from_window_id != null && p.from_window_id !== s.window_id) {
+        throw new Error(`session ${s.id} is no longer in window ${p.from_window_id} (now in ${s.window_id ?? "none"})`);
+      }
+      if (s.window_id === w.id) return s;
+      const from = winById(s.window_id);
+      s.window_id = w.id;
+      upsert(s);
+      taskFollows(channels.find((c) => c.id === s.channel_id), w.id);
+      removeWindowIfEmpty(from);
+      return s;
+    }
     case "window.raise":
       // No window manager here: the client pulls the tab instead.
       return { raised: false };
@@ -386,7 +457,15 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!w) throw new Error(`no such window: ${p.window_id}`);
       const from = windows.find((x) => x.id === c.window_id);
       placeChannel(c, w, p.index);
-      if (from && from !== w) removeWindowIfEmpty(from);
+      // The task's sessions (tabs) go with it.
+      const left = new Set<Win | undefined>([from]);
+      for (const s of sessions.values()) {
+        if (s.channel_id !== c.id || s.window_id === w.id) continue;
+        left.add(winById(s.window_id));
+        s.window_id = w.id;
+        upsert(s);
+      }
+      for (const o of left) if (o !== w) removeWindowIfEmpty(o);
       return c;
     }
     case "workspace.add": {
@@ -436,7 +515,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         permissions: p.permissions ?? { codex_sandbox: "workspace_write", claude_mode: "default" },
       };
       channels.push(c);
-      const target = windows.find((x) => x.id === p.window_id) ?? defaultWindow();
+      if (p.window_id != null && !winById(p.window_id)) throw new Error(`no such window: ${p.window_id}`);
+      const target = winById(p.window_id) ?? defaultWindow();
       placeChannel(c, target);
       logEvent(c.id, null, "system", {
         text: `Channel created${wt ? ` on ${c.branch}` : ""}`,
@@ -466,9 +546,11 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const c = channels.find((c) => c.id === p.id);
       if (!c) return {};
       c.archived = true;
+      const left = new Set<Win | undefined>();
       for (const s of [...sessions.values()].filter((s) => s.channel_id === c.id)) {
         kill(s.id);
         sessions.delete(s.id);
+        left.add(winById(s.window_id));
         broadcast("session_removed", { id: s.id });
       }
       broadcast("channel_removed", { id: c.id });
@@ -478,6 +560,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         upsertWindow(w);
         removeWindowIfEmpty(w);
       }
+      for (const o of left) removeWindowIfEmpty(o);
       return {};
     }
     case "channel.set_layout": {
@@ -560,9 +643,16 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       return s;
     }
     case "session.remove": {
+      const s = sessions.get(p.id);
+      if (!s) throw new Error(`no such session: ${p.id}`);
       kill(p.id);
       sessions.delete(p.id);
       broadcast("session_removed", { id: p.id });
+      // A task closes with its last session (worktree kept); else its window follows its tabs.
+      const c = channels.find((x) => x.id === s.channel_id);
+      const closed = (await handle("channel.close_if_empty", { id: s.channel_id }) as any).closed;
+      if (!closed) taskFollows(c);
+      removeWindowIfEmpty(winById(s.window_id));
       return {};
     }
     case "session.move": {

@@ -64,9 +64,9 @@ enum Cmd {
     Stop,
     /// Print the UI URL (with its access token).
     Url,
-    /// Open a UI window; with PATH, add the folder and open a new tab there.
+    /// Open a UI window; with PATH, add the folder and open a shell tab there.
     Open {
-        /// Folder or repo to open a tab in (added as a workspace if new).
+        /// Folder or repo to open a shell tab in (added as a workspace if new).
         path: Option<PathBuf>,
         /// Window to open (and to put the new tab in).
         #[arg(long, value_name = "N")]
@@ -200,6 +200,14 @@ muster new --agent claude -- --model haiku")]
         #[arg(long)]
         tab: bool,
     },
+    /// Move a session (tab) to another window.
+    Move {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// The window to show it in (must exist).
+        #[arg(long, value_name = "N")]
+        window: i64,
+    },
     /// Kill a session.
     Kill {
         #[arg(help = TARGET_HELP)]
@@ -324,6 +332,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Kill { target } => cli::by_id(d, &target, "session.kill"),
         Cmd::Restart { target } => cli::by_id(d, &target, "session.restart"),
         Cmd::Rename { target, name, tab } => cli::rename(d, &target, &name, tab),
+        Cmd::Move { target, window } => cli::move_to_window(d, &target, window),
         Cmd::New {
             path,
             agent,
@@ -492,8 +501,9 @@ fn is_muster_process(pid: u32) -> bool {
 }
 
 /// `muster open [PATH] [--window N]`: with PATH, add the folder (`workspace.add`, idempotent)
-/// and open a new tab there (`channel.create` without an agent, so the tab shows the
-/// launcher) in window N or a new window (`window.create`); then open the UI on that window.
+/// and open a new shell tab there (`channel.create` with a shell: a task without a session
+/// would have no tab to show) in window N or a new window (`window.create`); then open the UI
+/// on that window.
 fn open(path: Option<PathBuf>, window: Option<i64>) -> anyhow::Result<()> {
     let d = ensure_daemon()?;
     let window = match path {
@@ -511,7 +521,7 @@ fn open(path: Option<PathBuf>, window: Option<i64>) -> anyhow::Result<()> {
             let ch = client::rpc(
                 &d,
                 "channel.create",
-                serde_json::json!({ "workspace_id": ws_id, "window_id": win, "worktree": false }),
+                serde_json::json!({ "workspace_id": ws_id, "window_id": win, "worktree": false, "agent": "shell" }),
             )?;
             println!(
                 "{}: tab {} in window {win}",

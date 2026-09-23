@@ -11,6 +11,16 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::*;
 
+/// A persisted window row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredWindow {
+    pub id: WindowId,
+    pub name: String,
+    pub last_focused_at: i64,
+    pub created_at: i64,
+    pub layout: Option<serde_json::Value>,
+}
+
 /// Session fields that are persisted but not part of `SessionInfo`.
 #[derive(Debug, Clone)]
 pub struct StoredSession {
@@ -119,6 +129,13 @@ const MIGRATIONS: &[&str] = &[
             SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order, id) - 1 AS rn
             FROM channels WHERE archived = 0) r WHERE r.id = channels.id)
     WHERE archived = 0;
+    "#,
+    // v5: groups layout. A tab is a session, so each session belongs to a window (at first its
+    // channel's), and a window keeps its split layout (opaque JSON from the frontend).
+    r#"
+    ALTER TABLE windows ADD COLUMN layout TEXT;
+    ALTER TABLE sessions ADD COLUMN window_id INTEGER;
+    UPDATE sessions SET window_id = (SELECT c.window_id FROM channels c WHERE c.id = sessions.channel_id);
     "#,
 ];
 
@@ -342,15 +359,33 @@ impl Store {
 
     // ----- windows -----
 
-    /// (id, name, last_focused_at, created_at) of every window.
-    pub fn load_windows(&self) -> anyhow::Result<Vec<(WindowId, String, i64, i64)>> {
+    pub fn load_windows(&self) -> anyhow::Result<Vec<StoredWindow>> {
         let conn = self.conn.lock();
-        let mut st = conn.prepare("SELECT id, name, last_focused_at, created_at FROM windows ORDER BY id")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let mut st =
+            conn.prepare("SELECT id, name, last_focused_at, created_at, layout FROM windows ORDER BY id")?;
+        let rows = st.query_map([], |r| {
+            let layout: Option<String> = r.get(4)?;
+            Ok(StoredWindow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                last_focused_at: r.get(2)?,
+                created_at: r.get(3)?,
+                layout: layout.and_then(|s| serde_json::from_str(&s).ok()),
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Insert or update a window row.
+    /// Store a window's layout (None clears it). The row must exist.
+    pub fn set_window_layout(&self, id: WindowId, layout: Option<&serde_json::Value>) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE windows SET layout = ?2 WHERE id = ?1",
+            params![id, layout.map(|v| v.to_string())],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or update a window row (not its layout).
     pub fn upsert_window(&self, id: WindowId, name: &str, last_focused_at: i64, created_at: i64) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "INSERT INTO windows (id, name, last_focused_at, created_at) VALUES (?1, ?2, ?3, ?4)
@@ -371,7 +406,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
-                    exit_code, cols, rows, queued, extra_args, created_at FROM sessions ORDER BY id",
+                    exit_code, cols, rows, queued, extra_args, created_at, window_id FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -395,6 +430,7 @@ impl Store {
                     rows: r.get::<_, i64>(13)?.clamp(1, u16::MAX as i64) as u16,
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     created_at: r.get(16)?,
+                    window_id: r.get(17)?,
                 },
                 extra_args: serde_json::from_str(&extra).unwrap_or_default(),
             })
@@ -408,8 +444,8 @@ impl Store {
         let i = &s.info;
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
-                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -426,7 +462,8 @@ impl Store {
                 i.rows,
                 i.queued,
                 serde_json::to_string(&s.extra_args).unwrap_or_else(|_| "[]".into()),
-                i.created_at
+                i.created_at,
+                i.window_id
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -436,7 +473,7 @@ impl Store {
     pub fn update_session(&self, i: &SessionInfo) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET name=?2, cwd=?3, state=?4, state_detail=?5, state_since=?6, title=?7, pid=?8,
-                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13 WHERE id=?1",
+                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14 WHERE id=?1",
             params![
                 i.id,
                 i.name,
@@ -450,7 +487,8 @@ impl Store {
                 i.cols,
                 i.rows,
                 i.queued,
-                i.channel_id
+                i.channel_id,
+                i.window_id
             ],
         )?;
         Ok(())
@@ -651,7 +689,7 @@ mod tests {
         s.migrate().unwrap();
         let wins = s.load_windows().unwrap();
         assert_eq!(wins.len(), 1);
-        assert_eq!((wins[0].0, wins[0].1.as_str()), (1, "1"));
+        assert_eq!((wins[0].id, wins[0].name.as_str()), (1, "1"));
         let chans = s.load_channels().unwrap();
         let live: Vec<(ChannelId, Option<WindowId>, i64, bool)> = chans
             .iter()
@@ -675,9 +713,63 @@ mod tests {
         assert_eq!(back.window_id, Some(7));
         s.upsert_window(2, "two", 5, 6).unwrap();
         s.upsert_window(2, "zwei", 9, 0).unwrap();
-        assert_eq!(s.load_windows().unwrap()[1], (2, "zwei".to_string(), 9, 6));
+        let w = &s.load_windows().unwrap()[1];
+        assert_eq!((w.id, w.name.as_str(), w.last_focused_at, w.created_at), (2, "zwei", 9, 6));
         s.delete_window(2).unwrap();
         assert_eq!(s.load_windows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_v5_puts_sessions_in_their_channels_window() {
+        let conn = Connection::open_in_memory().unwrap();
+        let s = Store { conn: Mutex::new(conn) };
+        {
+            let c = s.conn.lock();
+            for sql in &MIGRATIONS[..4] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 4).unwrap();
+            c.execute("INSERT INTO windows (id, name, created_at) VALUES (2, '2', 0)", []).unwrap();
+            // Channel 1 in window 1, channel 2 in window 2, channel 3 archived (no window).
+            for (id, win, archived) in [(1, Some(1), 0), (2, Some(2), 0), (3, None, 1)] {
+                c.execute(
+                    "INSERT INTO channels (id, workspace_id, name, cwd, owns_worktree, port_base, archived,
+                                           created_at, last_read_at, sort_order, window_id)
+                     VALUES (?1, 1, 'n', '/', 0, 20000, ?3, 0, 0, 0, ?2)",
+                    params![id, win, archived],
+                )
+                .unwrap();
+            }
+            for (id, ch) in [(10, 1), (11, 2), (12, 2), (13, 3), (14, 99)] {
+                c.execute(
+                    "INSERT INTO sessions (id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
+                     VALUES (?1, ?2, 'shell', 's', '/', 'exited', 0, 80, 24, 0)",
+                    params![id, ch],
+                )
+                .unwrap();
+            }
+        }
+        s.migrate().unwrap();
+        let got: Vec<(SessionId, Option<WindowId>)> =
+            s.load_sessions().unwrap().iter().map(|x| (x.info.id, x.info.window_id)).collect();
+        assert_eq!(got, vec![(10, Some(1)), (11, Some(2)), (12, Some(2)), (13, None), (14, None)]);
+        assert!(s.load_windows().unwrap().iter().all(|w| w.layout.is_none()));
+        // Round trips: a session's window, a window's layout (upserts keep it).
+        let mut info = s.load_sessions().unwrap()[0].info.clone();
+        info.window_id = Some(2);
+        s.update_session(&info).unwrap();
+        assert_eq!(s.load_sessions().unwrap()[0].info.window_id, Some(2));
+        let layout = serde_json::json!({"type": "split", "children": []});
+        s.set_window_layout(2, Some(&layout)).unwrap();
+        s.upsert_window(2, "two", 3, 0).unwrap();
+        let w = s.load_windows().unwrap().into_iter().find(|w| w.id == 2).unwrap();
+        assert_eq!((w.name.as_str(), w.layout), ("two", Some(layout)));
+        s.set_window_layout(2, None).unwrap();
+        assert!(s.load_windows().unwrap().iter().all(|w| w.layout.is_none()));
+        let mut new = s.load_sessions().unwrap()[1].clone();
+        new.info.window_id = Some(7);
+        let id = s.insert_session(&new).unwrap();
+        assert_eq!(s.load_sessions().unwrap().iter().find(|x| x.info.id == id).unwrap().info.window_id, Some(7));
     }
 
     #[test]

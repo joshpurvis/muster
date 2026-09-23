@@ -22,6 +22,10 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
+    // Unit tests never touch the user's data (session logs, worktrees).
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("muster-unit-{}", std::process::id()));
+    #[cfg(not(test))]
     env_path("MUSTER_DATA_DIR")
         .or_else(|| dirs::data_dir().map(|d| d.join("muster")))
         .unwrap_or_else(|| home_dir().join(".local/share/muster"))

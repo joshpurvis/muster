@@ -111,7 +111,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell}` |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running or starting session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. From that re-check until the delete finishes, the directory is reserved: starting or restarting a session whose cwd is inside it fails. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
@@ -122,24 +122,26 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.post` | `{id, text}` | `Event` (a `note`) |
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
 | `channel.diff` | `{id}` | `{diff: string}` |
-| `session.spawn` | `SpawnSession` (src/hub.rs) | `SessionInfo` |
+| `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?}` | `SessionInfo`. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
 | `session.attach` | `{id}` | `{}` then a `0x03` replay frame, then live `0x01` frames |
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins) |
 | `session.kill` | `{id}` | `{}` |
 | `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
-| `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`) |
+| `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session closes the channel (see "Groups layout (v2)"). |
 | `session.rename` | `{id, name}` | `SessionInfo` |
 | `session.move` | `{id, channel_id, from_channel_id?, close_empty_source? = false}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session whose process is being started or restarted right now (the start reads its channel), is an error; a session merely reporting the `starting` state (its process already launched) can move. With `from_channel_id`, the move is refused unless the session is still in that channel, so a client acting on a stale view can't move a session another client already moved. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to merge a tab into another (docs/UI.md); the emptied channel stays open until the client archives it. Refused while the source channel is being closed (archived), so a session can't slip out of an archive in progress. With `close_empty_source`, the source channel is then closed if this move emptied it (as `channel.close_if_empty`): the UI's tab merge uses this instead of archiving the source itself. The process keeps the port block it started with; that block stays reserved (not handed to a new channel) while the process runs. |
+| `session.set_window` | `{id, window_id, from_window_id?}` | `SessionInfo`. Shows the session (tab) in another window; see "Groups layout (v2)". |
 | `session.send` | `{id, text, mode?: "queue"\|"interrupt"}` | `{delivered, queued}`. For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
 | `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny"}` | `{}` |
 | `session.interrupt` | `{id}` | `{}` |
 | `session.clear_queue` | `{id}` | `{}` |
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
 | `fs.complete` | `{prefix}` | `{entries: string[]}` directory completions for the "add workspace" path box |
-| `channel.move` | `{id, window_id, index?}` | `Channel` (moves the tab to another window, at `index` or the end; emits `channel_upserted` and `window_upserted` for both windows, or `window_removed` for the old one when nobody holds it and it has no tabs left) |
-| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window that has tabs and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. Claiming a window another connection holds takes it over (a reload's new connection may arrive before the old one closes). Also adopts orphaned channels (below). |
+| `channel.move` | `{id, window_id, index?}` | `Channel` (moves the task and all its sessions to another window, at `index` among the window's `channel_ids` or the end; emits `channel_upserted`, `session_upserted` for each session that changed window, and `window_upserted` for both windows, or `window_removed` for a window left unheld without tabs or tasks) |
+| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window that has tabs (sessions) and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. Claiming a window another connection holds takes it over (a reload's new connection may arrive before the old one closes). Also adopts orphaned channels and sessions (below). |
 | `window.create` | `{name?}` | `Window` (a new window, not held; used by `muster open` to put a tab in it before the UI claims it). New windows get the lowest free id (1, 2, 3...). |
+| `window.set_layout` | `{id, layout}` | `{}`. Stores the window's split layout (opaque JSON; `null` clears it). No event echo (like `channel.set_layout`). Unknown window: error. |
 | `window.focused` | `{id}` | `{}` (records `last_focused_at`; clients call it on window focus) |
 | `window.rename` | `{id, name}` | `Window` |
 | `window.reorder_tabs` | `{id, channel_ids: []}` | `Window` (ids not in the window are ignored; tabs left out keep their relative order after the listed ones) |
@@ -175,17 +177,22 @@ that session whose environment carries every marker), and the start waits until 
 A **window** is a client window; a channel is shown as a **tab** in exactly one window.
 
 ```ts
-type Window = { id: number; name: string /* default: String(id) */; channel_ids: number[] /* tab order */;
-                open: boolean /* a connection holds it */; last_focused_at: number; created_at: number };
+type Window = { id: number; name: string /* default: String(id) */; channel_ids: number[] /* tasks, in order */;
+                open: boolean /* a connection holds it */; last_focused_at: number; created_at: number;
+                layout: object | null /* v2: the frontend's split layout */ };
 ```
+
+(Since v2 a tab is a session: see "Groups layout (v2)". What this section says about channels
+as tabs still holds for `channel_ids`, the tasks whose window it is.)
 
 `Channel` gains `window_id: number | null` and `auto_named: boolean`. Events:
 `{"event":"window_upserted","data":Window}` and `{"event":"window_removed","data":{"id":n}}`.
 When a connection holding a window closes, the window is released (`open: false`), and deleted
-(`window_removed`) if it has no non-archived channels. Store migration: one window (`1`) is
+(`window_removed`) if it has no sessions and no non-archived channels. Store migration: one window (`1`) is
 created and every existing non-archived channel is put in it, in `sort_order`; existing
-channels get `auto_named: false`. Channels whose `window_id` is null or points at a deleted
-window are adopted by the next `window.claim`.
+channels get `auto_named: false`. Channels and sessions whose `window_id` is null or points at
+a deleted window are adopted by the next `window.claim` (with `channel_upserted` /
+`session_upserted`).
 
 Where new channels go: `window_id` if given; for MCP `spawn_agent` creating a channel, the
 caller's channel's window; else the open window with the latest `last_focused_at`, else the
@@ -220,26 +227,47 @@ directory never moves.
 ## Groups layout (v2)
 
 The UI's structure is window → split groups → tabs, where a tab is one session. So a session
-belongs to a window directly, and the split layout belongs to the window:
+belongs to a window directly, and the split layout belongs to the window. A channel is a
+**task**: folder, worktree, permissions, port block, name; its `window_id` is the task's default
+window (for new sessions) and what `Window.channel_ids` lists.
 
-- `SessionInfo.window_id: number | null` (store migration: every session gets its channel's
-  `window_id`). `session.spawn` takes `window_id?` (default: the spawning MCP caller's window,
-  else the channel's `window_id`, else the placement rules for new channels). `channel.create`'s
-  first session gets the channel's window.
-- `Window.layout: object | null`, opaque JSON owned by the frontend (the split tree of groups),
-  stored verbatim. `window.set_layout {id, layout}` → `{}` (no event echo, like the old
-  `channel.set_layout`). `Window.channel_ids` stays for tasks' default window but tabs are
-  sessions now; a window "has tabs" (for `window.claim` and deletion on release) when it has
-  sessions.
-- `session.set_window {id, window_id, from_window_id?}` → `SessionInfo`: moves a session (tab)
-  to another window (emits `session_upserted`). With `from_window_id`, refused unless it is
-  still there. The session stays in its task (channel); the task's `window_id` follows only if
-  all its sessions are in the new window.
-- A task (channel) whose last session is removed is closed by the daemon (as
-  `channel.close_if_empty`; worktree kept). `channel.archive` still closes a task with all its
-  sessions.
+- `SessionInfo.window_id: number | null`: the window the session is a tab in. Store migration
+  v5: every existing session gets its channel's `window_id`; windows gain a `layout` column.
+- Where a new session goes (`session.spawn`): `window_id` if given (must exist); else the
+  parent session's window (`parent_id`: MCP `spawn_agent` sets it to the caller, so an agent's
+  new sessions land in the caller's window); else the channel's window; else where a new
+  channel would go ("Where new channels go", which may create window 1). `channel.create`'s
+  first session gets the channel's window. MCP `spawn_agent` with `new_channel` puts the new
+  channel in the caller's window (its own, else its channel's).
+- `Window.layout: object | null`: opaque JSON owned by the frontend (the split tree of groups),
+  in `hello` `windows[]` and every `window_upserted`. `window.set_layout {id, layout}` → `{}`
+  with no event. Stored as JSON: the content round-trips, object key order may not (keys come
+  back sorted), as with `channel.set_layout`.
+- `session.set_window {id, window_id, from_window_id?}` → `SessionInfo`. Unknown window or
+  session: error. With `from_window_id`, refused (`session N is no longer in window A (now in
+  B)`) unless the session is still in that window. Moving to its own window is a no-op (no
+  event). Otherwise emits `session_upserted`. The session stays in its channel (task), and
+  keeps its process. The task's window **follows its tabs**: it becomes the new window when all
+  its sessions are there, or when none of them is left in the task's window (so a task never
+  holds on to a window without any of its tabs); then `channel_upserted` and `window_upserted`
+  for the task's old and new windows. The window the session left, and the task's old window,
+  are deleted (`window_removed`) when nobody holds them and they have no sessions and no
+  non-archived channels.
+- A window "has tabs" when it has sessions: `window.claim` without an id takes the lowest-id
+  unheld window with sessions; a released window is deleted only when it has no sessions and no
+  non-archived channels (also at daemon start, for every window).
+- A channel whose last session is removed (`session.remove`) is closed by the daemon, as
+  `channel.close_if_empty` (worktree kept): `session_removed`, then `channel_removed` and the
+  window's update. The check and the close happen under one lock, and a spawn checks that its
+  channel is open and inserts its session under that same lock, so a session spawned (or moved)
+  into the channel meanwhile keeps it open. Only removals close: a channel created without an
+  agent, or emptied by `session.move`, stays until one of its sessions is removed or the client
+  closes it. When the channel stays open, its window follows its remaining tabs as above.
+  `channel.archive` still closes a channel with all its sessions.
+- `session.move` (between channels) doesn't change the session's window.
 - `channel.move` stays for API clients: it moves the task and all its sessions to the window.
-- `muster ls` shows each session's own `window_id`.
+- `muster ls` shows each session's own `window_id`; `muster move <target> --window N` calls
+  `session.set_window`.
 
 ## Channel permissions
 

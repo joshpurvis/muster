@@ -147,20 +147,24 @@ pub struct Channel {
     pub first_prompt: Option<String>,
 }
 
-/// A client window. Its tabs are the non-archived channels with this `window_id`, in
+/// A client window. Its tabs are the sessions with this `window_id` (arranged by `layout`);
+/// `channel_ids` are the tasks (non-archived channels) whose default window it is, in
 /// `sort_order`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Window {
     pub id: WindowId,
     /// Default: the id as a string.
     pub name: String,
-    /// Tab order.
+    /// Tasks whose window this is, in order.
     pub channel_ids: Vec<ChannelId>,
     /// A client connection holds (shows) this window.
     pub open: bool,
     /// Unix ms of the last `window.focused`.
     pub last_focused_at: i64,
     pub created_at: i64,
+    /// Opaque JSON owned by the frontend (the split tree of groups). Stored verbatim.
+    #[serde(default)]
+    pub layout: Option<serde_json::Value>,
 }
 
 /// Codex `--sandbox` policy for a channel's Codex sessions. Ordered least to most permissive.
@@ -264,6 +268,9 @@ pub struct SessionInfo {
     /// Messages waiting in the injection queue.
     pub queued: u32,
     pub created_at: i64,
+    /// Client window this session is a tab in (None: adopted by the next `window.claim`).
+    #[serde(default)]
+    pub window_id: Option<WindowId>,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).

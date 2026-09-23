@@ -9,7 +9,7 @@
 //! Locking rule: never hold a Hub lock across an `.await` or while calling into another
 //! module's code.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -116,6 +116,10 @@ pub struct SpawnSession {
     /// Set when an agent spawns another agent through MCP.
     #[serde(default)]
     pub parent_id: Option<SessionId>,
+    /// Window to show the session in (must exist). Default: the parent session's window, else
+    /// the channel's, else where a new channel would go (see `session_window_locked`).
+    #[serde(default)]
+    pub window_id: Option<WindowId>,
 }
 
 pub fn default_cols() -> u16 {
@@ -206,6 +210,8 @@ struct WinEntry {
     created_at: i64,
     /// Client connection showing this window (`window.claim`).
     holder: Option<u64>,
+    /// The frontend's split layout (`window.set_layout`), stored verbatim.
+    layout: Option<serde_json::Value>,
 }
 
 /// Latest usable (cleaned) terminal titles of a channel's sessions: auto-naming inputs.
@@ -300,28 +306,6 @@ impl Hub {
         for c in store.load_channels()? {
             inner.channels.insert(c.id, c);
         }
-        for (id, name, last_focused_at, created_at) in store.load_windows()? {
-            // Nothing holds a window at startup: empty ones are gone for good.
-            let empty = !inner
-                .channels
-                .values()
-                .any(|c| !c.archived && c.window_id == Some(id));
-            if empty {
-                if let Err(e) = store.delete_window(id) {
-                    tracing::warn!(window = id, "deleting empty window: {e}");
-                }
-                continue;
-            }
-            inner.windows.insert(
-                id,
-                WinEntry {
-                    name,
-                    last_focused_at,
-                    created_at,
-                    holder: None,
-                },
-            );
-        }
         for s in store.load_sessions()? {
             let StoredSession { info, extra_args } = s;
             let usable_title = info.title.as_deref().and_then(|t| clean_title(t, info.kind));
@@ -340,6 +324,25 @@ impl Hub {
                     kill_requested: false,
                     usable_title,
                     port_base: 0,
+                },
+            );
+        }
+        for w in store.load_windows()? {
+            // Nothing holds a window at startup: ones without tabs or tasks are gone for good.
+            if window_unused(&inner, w.id) {
+                if let Err(e) = store.delete_window(w.id) {
+                    tracing::warn!(window = w.id, "deleting empty window: {e}");
+                }
+                continue;
+            }
+            inner.windows.insert(
+                w.id,
+                WinEntry {
+                    name: w.name,
+                    last_focused_at: w.last_focused_at,
+                    created_at: w.created_at,
+                    holder: None,
+                    layout: w.layout,
                 },
             );
         }
@@ -1087,6 +1090,8 @@ impl Hub {
                 cols: req.cols,
                 rows: req.rows,
                 parent_id: None,
+                // The channel's window (just placed above).
+                window_id: None,
             };
             if let Err(e) = self.spawn_session(spawn).await {
                 let text = format!("Could not start {}: {e:#}", kind.as_str());
@@ -1261,6 +1266,7 @@ impl Hub {
                 last_focused_at: 0,
                 created_at: now,
                 holder: None,
+                layout: None,
             },
         );
         Ok(())
@@ -1314,8 +1320,9 @@ impl Hub {
     }
 
     /// `window.claim` for connection `conn`: with `id`, that window (created if missing);
-    /// else the lowest-id window with tabs that nobody holds, else a new one. Releases the
-    /// connection's previous window and adopts channels without a (live) window.
+    /// else the lowest-id window with tabs (sessions) that nobody holds, else a new one.
+    /// Releases the connection's previous window and adopts channels and sessions without a
+    /// (live) window.
     pub fn claim_window(&self, conn: u64, id: Option<WindowId>) -> anyhow::Result<Window> {
         let mut events = Vec::new();
         let w = {
@@ -1332,7 +1339,7 @@ impl Hub {
                     let free = g
                         .windows
                         .iter()
-                        .find(|(wid, w)| w.holder.is_none() && !tab_ids(&g, **wid).is_empty())
+                        .find(|(wid, w)| w.holder.is_none() && has_sessions(&g, **wid))
                         .map(|(wid, _)| *wid);
                     match free {
                         Some(wid) => wid,
@@ -1375,6 +1382,23 @@ impl Hub {
                 g.channels.insert(cid, next.clone());
                 events.push(ServerEvent::ChannelUpserted(next));
             }
+            let orphans: Vec<SessionId> = g
+                .sessions
+                .values()
+                .filter(|e| e.info.window_id.is_none_or(|w| !g.windows.contains_key(&w)))
+                .map(|e| e.info.id)
+                .collect();
+            for sid in orphans {
+                let Some(e) = g.sessions.get_mut(&sid) else { continue };
+                let mut next = e.info.clone();
+                next.window_id = Some(target);
+                if let Err(err) = self.store.update_session(&next) {
+                    tracing::warn!(session = sid, "adopting into window {target}: {err}");
+                    continue;
+                }
+                e.info = next.clone();
+                events.push(ServerEvent::SessionUpserted(next));
+            }
             for p in prev {
                 self.release_locked(&mut g, p, &mut events);
             }
@@ -1414,21 +1438,42 @@ impl Hub {
         self.gc_window_locked(g, id, events);
     }
 
-    /// After a window lost a tab or its holder: delete it if nobody holds it and it has no
-    /// tabs, else report its new state.
+    /// After a window lost a task or its holder: delete it if nobody holds it and it has no
+    /// tabs (sessions) or tasks, else report its new state.
     fn gc_window_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) {
-        let Some(w) = g.windows.get(&id) else {
-            return;
-        };
-        if w.holder.is_none() && tab_ids(g, id).is_empty() {
-            if let Err(e) = self.store.delete_window(id) {
-                tracing::warn!(window = id, "deleting window: {e}");
-            }
-            g.windows.remove(&id);
-            events.push(ServerEvent::WindowRemoved { id });
-        } else if let Some(v) = window_view(g, id) {
+        if !self.drop_if_unused_locked(g, id, events)
+            && let Some(v) = window_view(g, id)
+        {
             events.push(ServerEvent::WindowUpserted(v));
         }
+    }
+
+    /// After a window lost a tab (session): delete it if nobody holds it and it has no tabs or
+    /// tasks left. Returns whether it was deleted. (Its `Window` view is unchanged otherwise.)
+    fn drop_if_unused_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) -> bool {
+        if !g.windows.get(&id).is_some_and(|w| w.holder.is_none()) || !window_unused(g, id) {
+            return false;
+        }
+        if let Err(e) = self.store.delete_window(id) {
+            tracing::warn!(window = id, "deleting window: {e}");
+        }
+        g.windows.remove(&id);
+        events.push(ServerEvent::WindowRemoved { id });
+        true
+    }
+
+    /// `window.set_layout`: store the frontend's split layout (null clears it). No event: the
+    /// window that saved it already has it, and echoing it would fight concurrent edits.
+    pub fn set_window_layout(&self, id: WindowId, layout: serde_json::Value) -> anyhow::Result<()> {
+        let layout = if layout.is_null() { None } else { Some(layout) };
+        let mut g = self.inner.lock();
+        let w = g
+            .windows
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("no such window: {id}"))?;
+        self.store.set_window_layout(id, layout.as_ref())?;
+        w.layout = layout;
+        Ok(())
     }
 
     /// Mutate a window under the lock, persist, broadcast.
@@ -1493,7 +1538,8 @@ impl Hub {
         Ok(())
     }
 
-    /// Move a tab to another window, at `index` (default: the end).
+    /// Move a task and all its sessions (tabs) to another window, at `index` among the window's
+    /// tasks (default: the end).
     pub fn move_channel(&self, id: ChannelId, window_id: WindowId, index: Option<usize>) -> anyhow::Result<Channel> {
         let mut events = Vec::new();
         let ch = {
@@ -1516,8 +1562,28 @@ impl Hub {
             self.renumber_locked(&mut g, &order)?;
             let ch = g.channels.get(&id).cloned().ok_or_else(|| anyhow::anyhow!("no such channel: {id}"))?;
             events.push(ServerEvent::ChannelUpserted(ch.clone()));
+            let mut left: BTreeSet<WindowId> = BTreeSet::new();
+            let sids: Vec<SessionId> = g
+                .sessions
+                .values()
+                .filter(|e| e.info.channel_id == id && e.info.window_id != Some(window_id))
+                .map(|e| e.info.id)
+                .collect();
+            for sid in sids {
+                let Some(e) = g.sessions.get_mut(&sid) else { continue };
+                let mut next = e.info.clone();
+                next.window_id = Some(window_id);
+                self.store.update_session(&next)?;
+                left.extend(e.info.window_id);
+                e.info = next.clone();
+                events.push(ServerEvent::SessionUpserted(next));
+            }
             if let Some(o) = old.filter(|o| *o != window_id) {
+                left.remove(&o);
                 self.gc_window_locked(&mut g, o, &mut events);
+            }
+            for o in left {
+                self.drop_if_unused_locked(&mut g, o, &mut events);
             }
             if let Some(w) = window_view(&g, window_id) {
                 events.push(ServerEvent::WindowUpserted(w));
@@ -1711,12 +1777,15 @@ impl Hub {
         }
         let (cols, rows) = pty::clamp_size(req.cols, req.rows);
         let now = now_ms();
+        let mut events = Vec::new();
         let id = {
             let mut g = self.inner.lock();
-            // Re-check: the channel may have been archived while we awaited above.
+            // Re-check: the channel may have been archived while we awaited above. (Checked and
+            // inserted under one lock: closing a task that lost its last session can't miss it.)
             if g.channels.get(&ch.id).is_none_or(|c| c.archived) {
                 anyhow::bail!("channel {} is archived", ch.id);
             }
+            let window_id = self.session_window_locked(&mut g, req.window_id, req.parent_id, ch.id, &mut events)?;
             let base = req
                 .name
                 .as_deref()
@@ -1752,6 +1821,7 @@ impl Hub {
                 rows,
                 queued: 0,
                 created_at: now,
+                window_id: Some(window_id),
             };
             let stored = StoredSession {
                 info,
@@ -1779,6 +1849,9 @@ impl Hub {
             );
             id
         };
+        for ev in events {
+            self.emit(ev);
+        }
         let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
         let started = self.start_process(id, prompt.clone());
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
@@ -1818,6 +1891,29 @@ impl Hub {
                 let _ = std::fs::remove_dir_all(paths::session_dir(id));
                 Err(e)
             }
+        }
+    }
+
+    /// The window a new session of channel `cid` goes to: `requested` (must exist); else the
+    /// parent (spawning) session's window; else the channel's; else where a new channel would
+    /// go (`place_locked`, which may create window 1).
+    fn session_window_locked(
+        &self,
+        g: &mut Inner,
+        requested: Option<WindowId>,
+        parent: Option<SessionId>,
+        cid: ChannelId,
+        events: &mut Vec<ServerEvent>,
+    ) -> anyhow::Result<WindowId> {
+        if requested.is_some() {
+            return self.place_locked(g, requested, None, events);
+        }
+        let live = |w: &Option<WindowId>| w.filter(|w| g.windows.contains_key(w));
+        let found = live(&parent.and_then(|p| g.sessions.get(&p)).and_then(|e| e.info.window_id))
+            .or_else(|| live(&g.channels.get(&cid).and_then(|c| c.window_id)));
+        match found {
+            Some(w) => Ok(w),
+            None => self.place_locked(g, None, None, events),
         }
     }
 
@@ -2180,15 +2276,138 @@ impl Hub {
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
         self.emit(ServerEvent::SessionRemoved { id });
-        // A removed session's title no longer names the channel: rebuild from the rest.
         let cid = entry.info.channel_id;
+        // A task closes with its last session (worktree kept). Checked and closed under one
+        // lock, so a session spawned or moved into it meanwhile keeps it open. A task being
+        // archived is already marked, so this is a no-op there.
+        let closed = self.archive_if_empty(cid).unwrap_or_else(|e| {
+            tracing::warn!(channel = cid, "closing emptied task: {e}");
+            false
+        });
+        let mut events = Vec::new();
         {
             let mut g = self.inner.lock();
-            let t = titles_of(&g, cid);
-            g.titles.insert(cid, t);
+            if !closed {
+                self.task_follows_locked(&mut g, cid, None, &mut events);
+            }
+            if let Some(w) = entry.info.window_id {
+                self.drop_if_unused_locked(&mut g, w, &mut events);
+            }
         }
-        self.rederive_name(cid);
+        for ev in events {
+            self.emit(ev);
+        }
+        if !closed {
+            // A removed session's title no longer names the channel: rebuild from the rest.
+            {
+                let mut g = self.inner.lock();
+                let t = titles_of(&g, cid);
+                g.titles.insert(cid, t);
+            }
+            self.rederive_name(cid);
+        }
         Ok(())
+    }
+
+    /// A task's window follows its tabs (sessions): to the one window they are all in, else,
+    /// when none is left in the task's window, to `prefer` (if one of them is there) or the
+    /// window of its oldest session, so a task never holds on to a window without its tabs.
+    /// Emits `channel_upserted` and the windows' updates (deleting the old one if unused).
+    fn task_follows_locked(
+        &self,
+        g: &mut Inner,
+        cid: ChannelId,
+        prefer: Option<WindowId>,
+        events: &mut Vec<ServerEvent>,
+    ) {
+        let Some(c) = g.channels.get(&cid).filter(|c| !c.archived) else {
+            return;
+        };
+        let old = c.window_id;
+        // By session id: the oldest first.
+        let wins: Vec<WindowId> = g
+            .sessions
+            .values()
+            .filter(|e| e.info.channel_id == cid)
+            .filter_map(|e| e.info.window_id)
+            .filter(|w| g.windows.contains_key(w))
+            .collect();
+        let Some(first) = wins.first().copied() else {
+            return;
+        };
+        let target = if wins.iter().all(|w| *w == first) {
+            first
+        } else if old.is_none_or(|o| !wins.contains(&o)) {
+            prefer.filter(|p| wins.contains(p)).unwrap_or(first)
+        } else {
+            return;
+        };
+        if old == Some(target) {
+            return;
+        }
+        let mut nc = c.clone();
+        nc.window_id = Some(target);
+        nc.sort_order = next_tab_order(g, target);
+        if let Err(err) = self.store.update_channel(&nc) {
+            tracing::warn!(channel = cid, "moving task to window {target}: {err}");
+            return;
+        }
+        g.channels.insert(cid, nc.clone());
+        events.push(ServerEvent::ChannelUpserted(nc));
+        if let Some(o) = old {
+            self.gc_window_locked(g, o, events);
+        }
+        if let Some(v) = window_view(g, target) {
+            events.push(ServerEvent::WindowUpserted(v));
+        }
+    }
+
+    /// `session.set_window`: show a session (tab) in another window. With `expect_from`, refused
+    /// unless it is still in that window (a client acting on a stale view). The session stays in
+    /// its task; the task's own window follows when all its sessions are now in `window_id`, or
+    /// when none is left in the task's window (`task_follows_locked`). A window left without
+    /// tabs or tasks is deleted when nobody holds it.
+    pub fn set_session_window(
+        &self,
+        id: SessionId,
+        window_id: WindowId,
+        expect_from: Option<WindowId>,
+    ) -> anyhow::Result<SessionInfo> {
+        let mut events = Vec::new();
+        let info = {
+            let mut g = self.inner.lock();
+            if !g.windows.contains_key(&window_id) {
+                anyhow::bail!("no such window: {window_id}");
+            }
+            let e = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+            let from = e.info.window_id;
+            if let Some(expected) = expect_from
+                && from != Some(expected)
+            {
+                let now = from.map_or("none".to_string(), |w| w.to_string());
+                anyhow::bail!("session {id} is no longer in window {expected} (now in {now})");
+            }
+            if from == Some(window_id) {
+                return Ok(e.info.clone());
+            }
+            let mut next = e.info.clone();
+            next.window_id = Some(window_id);
+            self.store.update_session(&next)?;
+            e.info = next.clone();
+            events.push(ServerEvent::SessionUpserted(next.clone()));
+            self.task_follows_locked(&mut g, next.channel_id, Some(window_id), &mut events);
+            if let Some(w) = from {
+                self.drop_if_unused_locked(&mut g, w, &mut events);
+            }
+            next
+        };
+        for ev in events {
+            self.emit(ev);
+        }
+        Ok(info)
     }
 
     /// Move a session to another channel (the UI merges a tab into another one as a split).
@@ -2449,7 +2668,19 @@ fn window_view(g: &Inner, id: WindowId) -> Option<Window> {
         open: w.holder.is_some(),
         last_focused_at: w.last_focused_at,
         created_at: w.created_at,
+        layout: w.layout.clone(),
     })
+}
+
+/// Does window `id` show any tab (session)?
+fn has_sessions(g: &Inner, id: WindowId) -> bool {
+    g.sessions.values().any(|e| e.info.window_id == Some(id))
+}
+
+/// No tab (session) and no task (live channel) refers to window `id`: once nobody holds it,
+/// it can go.
+fn window_unused(g: &Inner, id: WindowId) -> bool {
+    !has_sessions(g, id) && tab_ids(g, id).is_empty()
 }
 
 /// sort_order for a tab appended to window `id`.
@@ -2670,8 +2901,8 @@ mod tests {
     }
 
     /// A hub over an in-memory store: workspace `/w/repo`, auto-named channels 1 and 2 (window
-    /// 1), archived channel 3, sessions of channel 1: a shell titled "build the widget" and a
-    /// claude without a title.
+    /// 1), archived channel 3, sessions of channel 1 (window 1): a shell titled "build the
+    /// widget" and a claude without a title.
     fn move_fixture() -> Arc<Hub> {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
@@ -2702,6 +2933,7 @@ mod tests {
             let mut info = crate::mcp::guard::test_session(0, None);
             info.kind = kind;
             info.title = title.map(Into::into);
+            info.window_id = Some(1);
             store
                 .insert_session(&StoredSession {
                     info,
@@ -2780,6 +3012,248 @@ mod tests {
         assert_eq!(hub.session(1).unwrap().channel_id, 2);
     }
 
+    /// Events waiting on `rx`, compactly: `s<id>@w<window>`, `c<id>@w<window>`, `w<id>`
+    /// (upserted), `-s<id>`, `-c<id>`, `-w<id>` (removed).
+    fn drain(rx: &mut broadcast::Receiver<ServerEvent>) -> Vec<String> {
+        let w = |w: Option<WindowId>| w.map_or("-".into(), |w| w.to_string());
+        let mut out = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            out.push(match ev {
+                ServerEvent::SessionUpserted(i) => format!("s{}@w{}", i.id, w(i.window_id)),
+                ServerEvent::SessionRemoved { id } => format!("-s{id}"),
+                ServerEvent::ChannelUpserted(c) => format!("c{}@w{}", c.id, w(c.window_id)),
+                ServerEvent::ChannelRemoved { id } => format!("-c{id}"),
+                ServerEvent::WindowUpserted(v) => format!("w{}", v.id),
+                ServerEvent::WindowRemoved { id } => format!("-w{id}"),
+                _ => continue,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn set_window_moves_a_tab_and_the_task_follows() {
+        let hub = move_fixture();
+        let w2 = hub.create_window(None).unwrap().id;
+        assert_eq!(w2, 2);
+        let mut rx = hub.subscribe();
+        // One of channel 1's two sessions moves: the task stays in window 1.
+        let s = hub.set_session_window(1, 2, Some(1)).unwrap();
+        assert_eq!((s.window_id, s.channel_id), (Some(2), 1));
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(1));
+        assert_eq!(drain(&mut rx), ["s1@w2"]);
+        let stored = hub.store.load_sessions().unwrap();
+        assert_eq!(stored.iter().find(|x| x.info.id == 1).unwrap().info.window_id, Some(2));
+        // A client with a stale view (session 1 still in window 1) is refused.
+        let e = hub.set_session_window(1, 1, Some(1)).unwrap_err().to_string();
+        assert!(e.contains("no longer in window 1"), "{e}");
+        assert_eq!(hub.session(1).unwrap().window_id, Some(2));
+        // Same window: no-op, no event. Unknown window or session: errors.
+        assert_eq!(hub.set_session_window(1, 2, None).unwrap().window_id, Some(2));
+        assert!(hub.set_session_window(1, 9, None).unwrap_err().to_string().contains("no such window"));
+        assert!(hub.set_session_window(42, 2, None).unwrap_err().to_string().contains("no such session"));
+        assert!(drain(&mut rx).is_empty());
+        // The other one follows: now all of the task's sessions are in window 2, so is the task.
+        hub.set_session_window(2, 2, Some(1)).unwrap();
+        let ch = hub.channel(1).unwrap();
+        assert_eq!(ch.window_id, Some(2));
+        assert_eq!(hub.window(2).unwrap().channel_ids, vec![1]);
+        assert_eq!(hub.window(1).unwrap().channel_ids, vec![2]);
+        assert_eq!(drain(&mut rx), ["s2@w2", "c1@w2", "w1", "w2"]);
+        assert_eq!(hub.store.load_channels().unwrap()[0].window_id, Some(2));
+    }
+
+    #[test]
+    fn set_window_task_leaves_a_window_without_its_tabs() {
+        let hub = move_fixture();
+        for _ in 0..2 {
+            hub.create_window(None).unwrap();
+        }
+        // Task 1's sessions spread over windows 2 and 3: none is left in window 1, so the task
+        // follows the last move instead of keeping window 1.
+        hub.set_session_window(1, 2, None).unwrap();
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(1));
+        let mut rx = hub.subscribe();
+        hub.set_session_window(2, 3, None).unwrap();
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(3));
+        assert_eq!(drain(&mut rx), ["s2@w3", "c1@w3", "w1", "w3"]);
+        // Window 2 (nobody holds it) loses its only tab and has no task: deleted.
+        hub.set_session_window(1, 3, None).unwrap();
+        assert_eq!(drain(&mut rx), ["s1@w3", "-w2"]);
+        assert!(hub.window(2).is_none());
+        assert!(hub.store.load_windows().unwrap().iter().all(|w| w.id != 2));
+        // A window a client holds is kept, also without tabs or tasks.
+        hub.claim_window(7, Some(1)).unwrap();
+        hub.move_channel(2, 3, None).unwrap();
+        assert!(hub.window(1).is_some_and(|w| w.open && w.channel_ids.is_empty()));
+    }
+
+    #[test]
+    fn channel_move_takes_its_sessions() {
+        let hub = move_fixture();
+        hub.create_window(None).unwrap();
+        hub.set_session_window(1, 2, None).unwrap();
+        let mut rx = hub.subscribe();
+        hub.move_channel(1, 2, None).unwrap();
+        assert!(hub.sessions().iter().all(|s| s.window_id == Some(2)));
+        assert_eq!(drain(&mut rx), ["c1@w2", "s2@w2", "w1", "w2"]);
+    }
+
+    #[test]
+    fn last_session_closes_the_task() {
+        let hub = move_fixture();
+        let mut rx = hub.subscribe();
+        hub.remove_session(1).unwrap();
+        assert!(!hub.channel(1).unwrap().archived, "one session left");
+        // The removed shell's title no longer names the task.
+        assert_eq!(drain(&mut rx), ["-s1", "c1@w1"]);
+        hub.remove_session(2).unwrap();
+        assert!(hub.channel(1).unwrap().archived);
+        assert!(hub.store.load_channels().unwrap()[0].archived);
+        // Window 1 keeps task 2, which has no sessions and isn't closed by any of this.
+        assert_eq!(drain(&mut rx), ["-s2", "-c1", "w1"]);
+        assert!(!hub.channel(2).unwrap().archived);
+        let w = hub.window(1).unwrap();
+        assert_eq!(w.channel_ids, vec![2]);
+    }
+
+    #[test]
+    fn removing_the_tab_left_in_a_tasks_window_moves_the_task() {
+        let hub = move_fixture();
+        hub.create_window(None).unwrap();
+        hub.set_session_window(1, 2, None).unwrap();
+        let mut rx = hub.subscribe();
+        hub.remove_session(2).unwrap();
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(2));
+        assert_eq!(drain(&mut rx), ["-s2", "c1@w2", "w1", "w2"]);
+    }
+
+    #[test]
+    fn a_task_emptied_by_a_move_waits_for_a_removal() {
+        let hub = move_fixture();
+        // Moving both sessions into task 2 empties task 1 but doesn't close it (the client
+        // does, with `close_empty_source`); removing one of them later leaves task 2 open.
+        hub.move_session(1, 2).unwrap();
+        hub.move_session(2, 2).unwrap();
+        assert!(!hub.channel(1).unwrap().archived);
+        hub.remove_session(1).unwrap();
+        assert!(!hub.channel(2).unwrap().archived);
+        // Its last one: closed.
+        hub.remove_session(2).unwrap();
+        assert!(hub.channel(2).unwrap().archived);
+        assert!(!hub.channel(1).unwrap().archived);
+    }
+
+    #[test]
+    fn claim_and_release_count_sessions_as_tabs() {
+        let hub = move_fixture();
+        hub.create_window(None).unwrap();
+        hub.create_window(None).unwrap();
+        hub.set_session_window(1, 2, None).unwrap();
+        // Window 1 has tabs and comes first.
+        assert_eq!(hub.claim_window(1, None).unwrap().id, 1);
+        // Window 2 has a tab (session 1), though no task: it is the next one with tabs.
+        assert_eq!(hub.claim_window(2, None).unwrap().id, 2);
+        // Window 3 has no tabs: a third claim gets a new window.
+        assert_eq!(hub.claim_window(3, None).unwrap().id, 4);
+        // Released: window 2 keeps its tab; window 4 has none and goes.
+        let mut rx = hub.subscribe();
+        hub.release_windows(2);
+        hub.release_windows(3);
+        assert!(hub.window(2).is_some_and(|w| !w.open));
+        assert!(hub.window(4).is_none());
+        assert_eq!(drain(&mut rx), ["w2", "-w4"]);
+        // Its tab removed, window 2 (not held) goes too.
+        hub.remove_session(1).unwrap();
+        assert_eq!(drain(&mut rx), ["-s1", "-w2", "c1@w1"]);
+    }
+
+    #[test]
+    fn claim_adopts_orphan_sessions() {
+        let hub = move_fixture();
+        {
+            let mut g = hub.inner.lock();
+            g.sessions.get_mut(&1).unwrap().info.window_id = None;
+            g.sessions.get_mut(&2).unwrap().info.window_id = Some(99);
+        }
+        let mut rx = hub.subscribe();
+        let w = hub.claim_window(5, Some(3)).unwrap();
+        assert_eq!(w.id, 3);
+        assert!(hub.sessions().iter().all(|s| s.window_id == Some(3)));
+        assert_eq!(drain(&mut rx), ["s1@w3", "s2@w3", "w3"]);
+    }
+
+    #[test]
+    fn window_layout_is_stored_without_an_event() {
+        let hub = move_fixture();
+        let mut rx = hub.subscribe();
+        let layout = serde_json::json!({"type": "pane", "id": "g1", "tabs": [1, 2], "active": 1});
+        hub.set_window_layout(1, layout.clone()).unwrap();
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(hub.window(1).unwrap().layout, Some(layout.clone()));
+        assert_eq!(hub.store.load_windows().unwrap()[0].layout, Some(layout));
+        assert!(hub.set_window_layout(9, serde_json::json!({})).is_err());
+        hub.set_window_layout(1, serde_json::Value::Null).unwrap();
+        assert_eq!(hub.window(1).unwrap().layout, None);
+    }
+
+    #[test]
+    fn startup_keeps_windows_with_sessions() {
+        let store = Store::open_memory().unwrap();
+        for id in [1, 2, 3] {
+            store.upsert_window(id, &id.to_string(), 0, 0).unwrap();
+        }
+        store.set_window_layout(2, Some(&serde_json::json!({"x": 1}))).unwrap();
+        // Window 1: a task. Window 2: a session of that task. Window 3: nothing.
+        let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
+        let mut ch = move_fixture().channel(1).unwrap();
+        ch.workspace_id = ws;
+        let cid = store.insert_channel(&ch).unwrap();
+        let mut info = crate::mcp::guard::test_session(0, None);
+        info.channel_id = cid;
+        info.window_id = Some(2);
+        store
+            .insert_session(&StoredSession {
+                info,
+                extra_args: vec![],
+            })
+            .unwrap();
+        let hub = Hub::new(
+            HubConfig {
+                port: 0,
+                client_token: "t".into(),
+                muster_bin: PathBuf::from("/bin/true"),
+            },
+            store,
+        )
+        .unwrap();
+        let ids: Vec<WindowId> = hub.windows().iter().map(|w| w.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(hub.window(2).unwrap().layout, Some(serde_json::json!({"x": 1})));
+    }
+
+    #[test]
+    fn new_sessions_window() {
+        let hub = move_fixture();
+        hub.create_window(None).unwrap();
+        hub.set_session_window(2, 2, None).unwrap();
+        let mut ev = vec![];
+        let mut g = hub.inner.lock();
+        let mut pick = |req, parent, cid| hub.session_window_locked(&mut g, req, parent, cid, &mut ev);
+        // Explicit (must exist), else the parent's window, else the task's.
+        assert_eq!(pick(Some(1), Some(2), 1).unwrap(), 1);
+        assert!(pick(Some(9), None, 1).unwrap_err().to_string().contains("no such window"));
+        assert_eq!(pick(None, Some(2), 1).unwrap(), 2);
+        assert_eq!(pick(None, Some(1), 2).unwrap(), 1);
+        assert_eq!(pick(None, None, 1).unwrap(), 1);
+        assert_eq!(pick(None, Some(42), 1).unwrap(), 1, "unknown parent");
+        // A task without a (live) window: where a new task would go (the lowest window here).
+        g.channels.get_mut(&1).unwrap().window_id = Some(77);
+        let mut pick = |req, parent, cid| hub.session_window_locked(&mut g, req, parent, cid, &mut ev);
+        assert_eq!(pick(None, None, 1).unwrap(), 1);
+        assert!(ev.is_empty());
+    }
+
     #[test]
     fn worktree_users() {
         let mut ch = move_fixture().channel(1).unwrap();
@@ -2815,6 +3289,7 @@ mod tests {
                     last_focused_at: 0,
                     created_at: 0,
                     holder: None,
+                    layout: None,
                 },
             );
         }

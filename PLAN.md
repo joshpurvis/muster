@@ -3,6 +3,18 @@
 > Working name: TBD (shortlist: Muster, Drove, Switchyard, Corral, Tessel).
 > Status: personal tool first. Distribution, teams, and monetization are explicitly deferred until the concept is proven.
 
+## 0. Direction change (2026-09-23)
+
+The Slack-style UI (sidebar of channels, inbox, timeline, composer, diff panel) is replaced by a
+slim tiling-terminal UI: tabs with splits, one fuzzy jump across everything, and several client
+windows at once so the window manager can tile them. Tabs are unnamed at creation and named
+from what the agent does. Worktrees are opt-in (Ctrl+Shift+N). A CLI (`muster ls/read/send/wait/
+keys/approve/new`, see docs/CLI.md) drives running agents from a shell or another agent. The
+daemon, PTY handling, state detection, injection and MCP server stay; "channel" remains the API
+name for a tab. Specs: docs/UI.md, docs/PROTOCOL.md (Windows, tabs and naming), docs/CLI.md.
+Sections below describe the original v0 plan; where they mention the channel sidebar, inbox,
+timeline or composer, section 0 wins.
+
 ## 1. What this is
 
 A desktop app for running many coding agents (Claude Code, Codex CLI, plain shells) side by side. It is a terminal multiplexer rebuilt around agents: a Slack-like interface where each channel is a task backed by real terminals, with the app understanding what each agent is doing and letting agents control the environment themselves via MCP.

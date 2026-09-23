@@ -1,212 +1,186 @@
-# Muster UI spec (v0)
+# Muster UI spec (v1: tabs and splits)
 
-Goal: feels like Slack × Obsidian × a great terminal (kitty/wezterm). Dense but calm, fast,
-every action discoverable by mouse AND keyboard, nothing surprising. Human attention is the
-scarce resource: surface what needs the human; hide what doesn't.
+Goal: a great tiling terminal for agents, in the spirit of kitty/wezterm. Tabs across the top,
+splits inside each tab, and one fuzzy jump for everything. There is no sidebar, inbox,
+timeline, composer or diff panel. Attention comes from state dots, the approval banner,
+desktop notifications and a "next that needs me" key.
+
+Several windows may be open at once (one muster client each), so the window manager can tile
+them. The daemon owns every terminal. Closing a window never kills anything, and reopening
+restores that window's tabs.
+
+## Concepts
+
+- **Window**: one client window. It owns an ordered list of tabs, persisted by the daemon
+  (`Window`, see docs/PROTOCOL.md). Windows are numbered 1, 2, 3...
+- **Tab**: what the API calls a **channel**. It has a folder (`cwd`), an optional git worktree,
+  a permissions profile, a split tree of panes and a name.
+- **Pane**: a leaf of the split tree showing one terminal session. A pane can still hold several
+  sessions as pane-tabs (drop a pane header onto another pane's center). Its tab strip only
+  appears when it holds 2 or more.
+- **Workspace**: a folder the daemon knows about. It's not shown as UI. New tabs pick a folder,
+  and the frontend adds it as a workspace behind the scenes (`workspace.add` is idempotent by
+  path).
 
 ## Visual language
 
-- Dark by default, light theme via `prefers-color-scheme` + manual toggle (`data-theme` on `<html>`).
-  All colors are CSS custom properties on `:root`.
-- Dark palette (starting point, tune by eye):
-  `--bg-0 #0f0f11` (rail/topbar) · `--bg-1 #151518` (sidebar) · `--bg-2 #1a1a1e` (main, terminal bg)
-  `--bg-3 #222228` (hover/raised) · `--bg-4 #2a2a31` (active) · `--border #26262d` · `--border-strong #34343d`
-  `--text #e4e4e8` · `--text-muted #9d9daa` · `--text-faint #6a6a76` · `--accent #8b7cf6` (violet) · `--accent-soft rgba(139,124,246,.14)`
-- State colors (used everywhere a state appears: dots, pills, tab underline, inbox):
-  starting gray (pulsing) · working `#4ea1ff` (soft pulse/spinner) · needs_approval & asking_question `#f0a020`
-  · idle `#3fb950` · error `#f85149` · stuck `#e0823d` · exited `#6a6a76` (hollow dot).
-- Type: UI `Inter, "SF Pro Text", system-ui, sans-serif` 13px; terminal
-  `"JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace` 13px (user adjustable).
-  No web font downloads (works offline).
-- Radii 6px (controls) / 10px (overlays). 1px hairline borders; shadows only on overlays.
-  Motion: 120–160ms ease-out; respect `prefers-reduced-motion`.
-- Icons: inline SVG (Lucide-style strokes, 1.5px), no icon font.
+Unchanged from v0. Dark by default with a light theme (`prefers-color-scheme` plus a manual
+toggle). All colors are CSS custom properties on `:root`. State colors: starting gray
+(pulsing), working `#4ea1ff`, needs_approval / asking_question `#f0a020`, idle `#3fb950`,
+error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, JetBrains Mono
+13px terminal, no web font downloads. Radii 6/10px, hairline borders, 120–160ms motion,
+`prefers-reduced-motion` respected, inline SVG icons.
 
 ## Layout
 
 ```
-┌ topbar (36px): ◧ sidebar toggle · [🔍 Search or jump to…  Ctrl K] · inbox bell(3) · ⚙ ──────────┐
-├ sidebar (resizable 180–420, collapsible) ┬ channel header (44px) ─────────────────────┬ right panel ┤
-│  Inbox                               3   │ # fix-auth  ⎇ muster/fix-auth  ~/r/.. [+▾][⫽][⊟][☰][⋯] │ Timeline│Diff │
-│  ▾ muster                            +   │ ┌ pane ───────────────┬ pane ─────────────┐│ (resizable, │
-│    ● # fix-auth            (bold=unread) │ │ tabs: ● claude ×  + │ ● shell ×  +      ││  toggle)    │
-│       ◦ claude  working                  │ │ [approval banner]   │                   ││             │
-│       ◦ shell   idle                     │ │ xterm               │ xterm             ││             │
-│    ● # new-api                         2 │ │                     ├───────────────────┤│             │
-│  ▸ other-repo                            │ │                     │ ...               ││             │
-│                                          │ └─────────────────────┴───────────────────┘│             │
-│  + Add workspace          ● connected    │ composer: [→ claude ▾] Message…   queued 1 ⏎ │             │
-└──────────────────────────────────────────┴──────────────────────────────────────────┴─────────────┘
+┌ tab bar (34px) ─────────────────────────────────────────────────────────────────────────┐
+│ ● fix auth bug ⎇ ×│ ◐ muster ×│ ● new api ⎇ 🛡 ×│  +  ▾        [🔍 Ctrl K]  ⋯ │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│ ┌ pane ──────────────────────────────┬ pane ───────────────────────┐                     │
+│ │ [approval banner when needed]      │                             │                     │
+│ │ xterm                              │ xterm                       │                     │
+│ │                                    ├─────────────────────────────┤                     │
+│ │                                    │ xterm                       │                     │
+│ └────────────────────────────────────┴─────────────────────────────┘                     │
+└ status line (22px, optional): ~/p/muster · ⎇ muster/fix-auth-bug · 3 sessions  ● connected ┘
 ```
 
-### Sidebar
-- "Inbox" row on top with count badge (count = sessions whose state `needs_human()`).
-- One collapsible section per workspace (name, hover shows `+` new channel and `⋯`).
-- Channel row: aggregate state dot, `#` + name, right side: queued/inbox count badge or spinner.
-  Bold when unread (any timeline event newer than `last_read_at`). Active channel highlighted
-  with `--bg-4` + accent left bar.
-- The active channel expands to list its sessions (kind icon, name, state word in muted text).
-  Clicking a session focuses its tab (activates it in its pane).
-- Drag channels to reorder (`channel.reorder`). Double-click to rename inline. Right-click →
-  context menu (Rename, New session ▸, Copy path, Mark read, Archive…).
-- Footer: "+ Add workspace", connection status dot (green / amber "Reconnecting…").
-- Aggregate state priority: needs_approval > asking_question > error > stuck > working > starting > idle > exited.
+### Tab bar
+- One tab per channel in this window, in the window's order. Each tab shows the aggregate state
+  dot, the name and an optional `⎇` (worktree) icon. It shows a permissions icon when the
+  profile is elevated: amber globe/shield for network or accept edits, red warning shield for
+  full access or bypass. Tabs have a `×` on hover.
+- An **unnamed** tab (`auto_named: true`) shows its derived name in normal text. Before
+  anything was derived, it shows the folder name in muted italics.
+- Active tab: `--bg-2` background joined to the content, with an accent top bar. Unread
+  activity (state changed since you last viewed it) shows a bold name.
+- Double-click renames inline. Middle-click closes. Drag reorders (`window.reorder_tabs`), and
+  dragging a tab out of the bar onto the jump button or a "→ window N" entry moves it. The
+  context menu has Rename, Permissions…, Copy path, Copy branch, Move to window ▸ (existing
+  windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree).
+- `+` makes a new tab (same folder as the active tab, no worktree, last agent kind). `▾` next
+  to it opens a menu: New tab…, New worktree tab, and Claude / Codex / Shell.
+- Past about 8 tabs the strip scrolls sideways (the wheel scrolls it and the active tab stays in
+  view). A `N ▾` overflow button lists all tabs.
+- Closing a tab (Alt+W on the last pane, `×`, menu) archives the channel. If an agent is
+  working, the tab turns into an inline "Close? ⏎ / Esc" confirmation first. Closing never
+  removes a worktree unless the "+ remove worktree" action is chosen.
+- A window with no tabs shows the empty launcher (Claude / Codex / Shell, keys 1 2 3, folder
+  picker).
 
-### Channel header
-`# name` (double-click to rename), branch chip `⎇ branch` (click copies), cwd (muted, truncated
-from the left, click copies), then icon buttons with tooltips showing shortcuts:
-New session (split-button with Claude/Codex/Shell), Split right, Split down, Timeline, Diff, `⋯`
-(Rename, Copy path, Permissions…, Restart exited sessions, Archive, Archive + remove worktree).
-When the channel's permission profile is more permissive than the defaults (Codex network or
-full access, Claude accept edits or bypass), a chip after the workspace chip shows it: amber
-with a globe/shield for network or accept edits, red with a warning shield for full access or
-bypass. Clicking it opens the Permissions dialog; in narrow headers it shows the icon only.
+### Panes
+Everything in v0 "Panes" carries over: the layout tree, reconcile, min sizes, gutters, drag and
+drop with drop-zone overlays, zoom, the reparented cached xterm instances, and the exited-session
+bar. Differences:
+- A pane shows a thin **pane header** (22px: kind icon, session name, state word, `×`) only
+  when the tab has 2 or more panes. With one pane there is no chrome at all. Dragging the
+  header works like dragging a v0 pane-tab.
+- The pane tab strip only appears when the pane holds 2+ sessions.
+- Focus: with several panes, the focused one has a faint accent ring and the others sit under a
+  light dim veil.
+- Approval banner above the terminal for needs_approval / asking_question, as in v0:
+  **Approve** (Alt+A), **Always**, **Deny** (Alt+Shift+A), "Jump to prompt".
+- Empty pane: centered launcher (Claude / Codex / Shell, keys 1 2 3).
 
-### Panes (the core; must feel great)
-- Layout is a tree persisted per channel via `channel.set_layout` (debounced 400ms):
-  ```ts
-  type Layout =
-    | { type: "split"; dir: "row" | "col"; sizes: number[] /* fractions sum 1 */; children: Layout[] }
-    | { type: "pane"; id: string; tabs: number[] /* session ids */; active: number | null };
-  ```
-  On load, reconcile with live sessions: drop unknown ids, append sessions not in any pane to the
-  focused/first pane. Collapse empty panes (except the last) and single-child splits.
-- Tab strip (30px): tabs show kind icon, name, state dot; close `×` on hover; middle-click closes;
-  double-click renames; `+` after the tabs opens a small menu (Claude / Codex / Shell, keys 1/2/3).
-  Active tab of the focused pane gets an accent underline; others muted. Tabs keep a 96px
-  minimum; past that the strip scrolls (vertical wheel scrolls it sideways, the active tab is
-  kept in view) and a `N ▾` button lists every tab. Split/zoom buttons appear on hover
-  (not clickable while hidden) and drop out in panes narrower than 260px.
-- Focus: with several panes, the focused one has a faint accent ring and a brighter tab strip;
-  the others sit under a light dim veil (text stays readable).
-- Splits never create a pane smaller than ~240×120px (checked before splitting, by keyboard,
-  buttons, menus or drag; drag degrades to "join tabs"). No room → toast "Not enough room — zoom
-  or close a pane". When the window shrinks, panes keep a 96×64px floor. New sessions are
-  spawned with the cols/rows of the pane they will land in, so the PTY starts at the right size.
-- Gutters: 5px hit area, 1px visible line, accent on hover/drag, `col-resize`/`row-resize` cursor.
-  Drag to resize with min pane size ~120px. Double-click gutter equalizes siblings.
-- Drag & drop tabs (Obsidian-style): dragging a tab over a pane shows a translucent overlay for
-  the drop zone: left/right/top/bottom half-edges create a split, center moves into that pane's
-  tabs. Dropping within a tab strip reorders. Use pointer events (not HTML5 DnD) for smoothness.
-  Drops that would change nothing (a pane's only tab onto itself, a tab onto its own slot) show
-  no overlay. Esc, window blur or pointercancel abort a drag.
-- Zoom: maximize the focused pane (others hidden, not destroyed); indicator in the tab strip.
-- Terminals: one `xterm.js` instance per session, created once and cached in a registry keyed by
-  session id. Its DOM element is **reparented** when layout changes — never disposed on
-  re-layout (avoids replay flicker). Addons: fit (ResizeObserver + rAF debounce), webgl (fallback
-  on context loss), unicode11, web-links, search. Scrollback 10k. Only visible terminals send
-  `session.resize`. xterm theme derived from CSS vars.
-- Exited session: dim terminal + bottom bar "Exited (code N) · Restart (Enter) · Close".
-- Approval banner (above terminal when state is needs_approval/asking_question): amber strip with
-  `state_detail` text and buttons **Approve** (Alt+A), **Always**, **Deny** (Alt+Shift+A),
-  plus "Jump to prompt". For asking_question: just "Answer in terminal" + Focus.
-- Empty pane: centered launcher with three large buttons (Claude / Codex / Shell, keys 1 2 3).
-
-### Composer (Slack message box, bottom of channel)
-- Target chip on the left: which session receives the message (defaults to the focused pane's
-  active agent session; dropdown lists channel sessions with state).
-- Auto-growing textarea (max ~40% height). Enter = send (queues if agent busy),
-  Shift+Enter = newline, Ctrl+Enter = send & interrupt. Up-arrow in empty box recalls last message.
-- Shows "queued N" chip (from `SessionInfo.queued`) with a clear (×) action.
-- Esc returns focus to the target's terminal. Alt+C focuses the composer.
-- Exited sessions are never the target. If every session has exited, the composer says
-  "Restart <name> to send" and shows a Restart button.
-- `/note text` posts a human note to the timeline instead of sending to the agent.
-
-### Right panel (resizable, toggle)
-- **Timeline** tab: Slack-like feed for the channel, grouped by minute/author. Human notes and
-  prompts as messages ("You → claude"), agent posts (MCP `post_to_channel`) as messages with the
-  session as author, state changes / session start/exit / MCP calls as compact system lines
-  (collapsible runs). Infinite scroll back via `channel.timeline` `before`.
-- **Diff** tab: `channel.diff`, rendered as a file list + unified hunks, +/− colored, refresh button.
-
-### Inbox view (Alt+I, or click Inbox)
-- Replaces the pane area. Cards sorted by urgency then age: channel · session · state pill · detail ·
-  "2m ago", a live mini preview of the last ~8 screen lines (`session.screen`, refresh on state
-  change), and actions: Approve / Always / Deny / Reply (inline input → `session.send`) / Open.
-- Keyboard: j/k (or ↑/↓) move, `a` approve, `d` deny, `r` reply, Enter open.
-- Empty state: "Nothing needs you. ✓" with muted illustration-free styling.
+### Status line (optional, on by default, toggle in the palette)
+It sits at the bottom, 22px, muted: the active tab's cwd (truncated from the left, click
+copies) and branch (click copies), plus the number of sessions. On the right: a "needs you: N"
+chip, which is the same as Alt+J, and a connection dot.
 
 ### Overlays
-- **Quick switcher** (Ctrl+K when focus isn't in a terminal, Ctrl+Shift+K anywhere): fuzzy search
-  over channels, sessions, workspaces; `>` prefix switches to commands (Ctrl+Shift+P opens with `>`).
-  Every command lists its shortcut. Arrow keys + Enter, Esc closes. Recent items first.
-- **New channel** (Alt+Shift+N): name (live slug preview + branch name), workspace select, agent
-  segmented control (Claude · Codex · Shell · None; remembers last), worktree toggle (default on for
-  git), base branch (optional), initial prompt textarea, and a **Permissions** section, collapsed
-  by default to a one-line summary ("Codex: workspace · Claude: default"; amber/red when
-  elevated). The body scrolls when the section is open. Ctrl+Enter / Enter on name creates.
-- **Permissions** (channel `⋯` menu, sidebar channel menu, header chip, command palette
-  "Channel permissions…"): two segmented controls, least to most permissive left to right:
-  Codex sandbox (Read only · Workspace · Workspace + network · Full access) and Claude permission
-  mode (Plan · Default · Accept edits · Bypass), each with a one-line description of the choice.
-  Full access and Bypass carry a warning shield, turn red when selected and show a one-line
-  warning; Save turns into a danger button then. The subtitle says the profile "applies to new
-  and restarted sessions", and running sessions of an affected kind are named as keeping their
-  current permissions until restarted. "Reset to defaults" when not at the defaults. Arrow keys
-  move within a control.
-- **Add workspace**: path input with `fs.complete` suggestions (Tab completes), optional name.
-- **Shortcuts sheet** (Alt+/ or F1).
-- Context menus: custom (not native), keyboard navigable.
-- Toasts bottom-right (above the composer) for `notice` events and RPC errors; auto-dismiss 4s,
-  errors sticky-ish 8s.
-- Modals trap Tab and keep focus away from the terminal behind them. Destructive confirm
-  dialogs open with Cancel focused.
-- Window width: the center keeps ≥480px; the sidebar and right panel shrink first. Below 1100px
-  viewport width the right panel closes itself (it can still be reopened).
-- Confirm destructive actions inline (e.g. closing a working agent's tab turns the tab into
-  "Kill? ⏎ / Esc") rather than modal dialogs where possible. Never use `alert/confirm/prompt`.
-  The inline confirm takes Enter/Esc even from a focused terminal, and clears itself when the
-  session stops being busy, on a click elsewhere, or on a channel switch.
+- **Jump** (Ctrl+Shift+K anywhere, Ctrl+K outside terminals): fuzzy search over every tab and
+  session in **all windows**, and folders for "new tab here". Rows show the state dot,
+  name, tab, window number, cwd and state detail. Sessions that need you come first, then recent
+  ones. `>` switches to commands (Ctrl+Shift+P opens with `>`), and every command lists its
+  shortcut. Choosing something in another window **pulls that tab into this window**
+  (`channel.move`) by default. The setting "Jump focuses the other window" (palette, stored in
+  localStorage) makes it call `window.raise` instead, falling back to pulling when that returns
+  `raised: false`.
+- **New tab…** (Alt+Shift+N): folder (path input with `fs.complete`, defaults to the active
+  tab's folder; recent folders listed), agent segmented control (Claude · Codex · Shell · None;
+  remembers last), worktree toggle (default **off**; on when opened via Ctrl+Shift+N), base
+  branch (only when worktree is on), optional name (blank = auto), optional first prompt, and
+  the collapsed Permissions section from v0. Enter or Ctrl+Enter creates.
+- **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).
+- **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
+  bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
+
+## Naming (no names up front)
+
+New tabs are created **without a name**. The daemon names them (`auto_named: true`) and keeps
+the name updated until the human renames the tab:
+1. an agent's terminal title (Claude Code and Codex set a task summary via OSC 0/2), cleaned
+   of spinner glyphs and ignored when it's just the program name or a path;
+2. else the first prompt sent to the tab (first few words);
+3. else a shell session's title (e.g. the running command);
+4. else the folder name (shown muted).
+Renaming (double-click, menu, `muster rename`) sets `auto_named: false` for good.
+
+## Worktrees
+
+Off by default. **Ctrl+Shift+N** creates a worktree tab directly: same folder and agent as the
+active tab, no dialog. **Alt+Shift+N** opens the New tab dialog, where worktree is a toggle. The
+worktree folder is keyed by the tab's id, so it never moves. The branch starts as
+`muster/<id>`. The daemon renames it once, to `muster/<slug of the first real name>`, and again
+on each explicit rename, as long as muster created the branch and it has no upstream.
+
+## Windows
+
+- `muster` (no arguments) opens a new window every time. It **claims** the lowest-numbered
+  window that has tabs but no client connected (so reopening after closing restores your
+  tabs), else a new empty window. `muster open [path] [--window N]` opens a window on a folder
+  (a new tab there) or reclaims window N.
+- The window keeps its number in `sessionStorage`, so a reload reclaims the same window.
+- `document.title` = `muster · <window name>` with a `(N) ` prefix when N sessions in this window
+  need you. The native window mirrors the document title, and the WM helpers find windows by
+  this title.
+- Closing a window leaves its tabs attached to it. A released window with no tabs is deleted by
+  the daemon.
+- New tabs created outside a window (CLI `muster new`, MCP `spawn_agent` in a new channel)
+  go to the spawning session's window, else the most recently focused window.
 
 ## Keyboard map
 
-App shortcuts use Alt (Zellij/iTerm-style) and Ctrl+Shift; all are intercepted in the capture
-phase before xterm sees them. Avoid browser-reserved combos (Ctrl+N/T/W, Ctrl+Shift+N/T/W/I/J).
-
-Conflicts with shells and agents, and how they're handled:
-- Keys agents and shells rely on are not app shortcuts: Alt+M (Claude Code permission mode),
-  Alt+B / Alt+F (readline and fish word motion).
-- In the composer and every other text field, Alt+letters and Alt+←↑→↓ are left alone (word
-  motion and editing); only Alt+Shift+…, Alt+digits, Alt+[ ] / and Ctrl+Shift+… act there.
-- Alt+←↑→↓ move pane focus when a terminal or the app itself has focus.
-- Setting **Terminal gets Alt keys** (command palette; stored in localStorage prefs): while a
-  terminal has focus, every Alt shortcut except Alt+Shift+… goes to the terminal instead.
-  Ctrl+Shift+… shortcuts keep working.
+App shortcuts use Alt and Ctrl+Shift, intercepted in the capture phase before xterm. Keys
+agents and shells rely on (Alt+M, Alt+B, Alt+F) are not app shortcuts. In text fields, plain
+Alt+letters and Alt+arrows are left alone. The setting **Terminal gets Alt keys** sends every
+Alt shortcut except Alt+Shift+… to a focused terminal. Ctrl+Shift+T/N are browser-reserved in
+Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks.
 
 | Keys | Action |
 |---|---|
-| Ctrl+Shift+K (Ctrl+K outside terminals) | Quick switcher |
+| Ctrl+Shift+K (Ctrl+K outside terminals) | Jump |
 | Ctrl+Shift+P | Command palette |
-| Alt+Shift+N | New channel |
-| Alt+N | New session tab in focused pane |
-| Alt+D / Alt+Shift+D | Split right / split down (new shell by default; picker via menu) |
-| Alt+W | Close tab (inline confirm if agent is working) |
+| Alt+T or Ctrl+Shift+T | New tab (same folder, last agent, no worktree) |
+| Ctrl+Shift+N | New worktree tab (same folder, last agent) |
+| Alt+Shift+N | New tab… dialog |
+| Alt+1…9 | Go to tab N in this window (hold Alt to see numbers) |
+| Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+Alt+→ / ← | Next / previous tab |
+| Alt+Shift+[ / Alt+Shift+] | Move tab left / right |
+| Alt+J | Jump to the next session that needs you (all windows; pulls its tab here) |
+| Alt+D / Alt+Shift+D | Split right / down (new shell; picker via menu) |
+| Alt+N | New session as a pane-tab in the focused pane |
+| Alt+W | Close pane (closes the tab when it's the last pane; inline confirm if working) |
 | Alt+←↑→↓ | Focus pane in direction |
 | Alt+Shift+←↑→↓ | Resize focused pane |
-| Alt+Z | Zoom (maximize) focused pane |
-| Alt+[ / Alt+] | Previous / next tab in pane |
-| Alt+1…9 | Jump to channel N (sidebar order; hold Alt to see the numbers) |
-| Ctrl+Alt+↑ / ↓ | Previous / next channel |
-| Alt+I | Inbox |
+| Alt+Z | Zoom focused pane |
+| Alt+[ / Alt+] | Previous / next pane-tab in pane |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
-| Alt+C | Focus composer |
-| Ctrl+Shift+B | Toggle sidebar |
-| Alt+L | Toggle right panel (timeline) · Alt+G diff |
 | Ctrl+Shift+F | Find in terminal |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Terminal font size |
 | Alt+/ or F1 | Shortcuts sheet |
 
 ## Behavior details
-- Reconnect: on WS close show an unobtrusive "Reconnecting…" pill; exponential backoff to 5s;
-  on reconnect call `hello` and re-attach every cached terminal (replay frame resets it).
-- While disconnected, terminals refuse input (xterm `disableStdin`) under a "Disconnected ·
-  reconnecting" veil, instead of dropping keystrokes silently.
-- After a reconnect, open timelines refetch; if more than a page was missed, the timeline restarts
-  from the fresh page (older events load on scroll) rather than showing a silent gap.
-- `document.title` = `(N) Muster` when N items need the human.
-- Per-viewer prefs in `localStorage` (try/catch): sidebar width/collapsed, right panel width/tab/open,
-  font size, theme, last agent kind, collapsed workspaces, "Terminal gets Alt keys".
-- Performance: batch incoming output per animation frame per terminal; never re-render the Preact
-  tree on output bytes (terminals live outside the VDOM).
+- Reconnect: an unobtrusive "Reconnecting…" pill with exponential backoff to 5s. On reconnect,
+  call `hello`, re-claim the same window and re-attach every visible terminal. Terminals refuse
+  input while disconnected, under a veil.
+- Other windows' changes arrive as events. A tab moved away disappears (its terminals stay
+  cached for a while in case it comes back), and a tab moved here appears.
+- Only attach sessions shown in this window. Detach terminals of tabs that left.
+- Desktop notifications (daemon, `notify.rs`) are unchanged.
+- Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
+  folders, status line on/off, "Terminal gets Alt keys", "Jump focuses the other window".
+- Performance: batch output per animation frame per terminal. Never re-render the Preact tree on
+  output bytes.

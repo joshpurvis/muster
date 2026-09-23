@@ -232,6 +232,25 @@ export const IconGrip = (p: P) => (
     <circle cx="15" cy="18" r="1" />
   </Svg>
 );
+export const IconShield = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6z" />
+  </Svg>
+);
+export const IconShieldAlert = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6z" />
+    <path d="M12 8v4.5" />
+    <path d="M12 16h.01" />
+  </Svg>
+);
+export const IconGlobe = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M3.5 12h17" />
+    <path d="M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5S9.7 5.9 12 3.5z" />
+  </Svg>
+);
 export const IconDot = (p: P) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="3" />

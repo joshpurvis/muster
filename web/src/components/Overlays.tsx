@@ -31,7 +31,9 @@ import {
   IconX,
   KindIcon,
 } from "../icons.tsx";
-import type { SessionKind } from "../types.ts";
+import type { Permissions, SessionKind } from "../types.ts";
+import { DEFAULT_PERMISSIONS } from "../types.ts";
+import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { STATE_LABEL } from "../types.ts";
 import { cx, fuzzy, slugify, tildify } from "../util.ts";
 
@@ -126,6 +128,8 @@ export function Overlays() {
       return <Shortcuts />;
     case "confirm":
       return <Confirm {...o} />;
+    case "permissions":
+      return <PermissionsDialog key={o.channelId} channelId={o.channelId} Modal={Modal} close={close} />;
   }
 }
 
@@ -412,6 +416,7 @@ function NewChannel({ workspaceId }: { workspaceId?: number }) {
   const [worktree, setWorktree] = useState(true);
   const [base, setBase] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [permissions, setPermissions] = useState<Permissions>({ ...DEFAULT_PERMISSIONS });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -436,6 +441,7 @@ function NewChannel({ workspaceId }: { workspaceId?: number }) {
         base: base.trim() || undefined,
         agent: agent === "none" ? null : agent,
         prompt: agent !== "none" && agent !== "shell" ? prompt.trim() || undefined : undefined,
+        permissions,
       });
       overlay.value = null;
     } catch (e) {
@@ -468,7 +474,7 @@ function NewChannel({ workspaceId }: { workspaceId?: number }) {
   }
 
   return (
-    <Modal class="dialog" label="New channel">
+    <Modal class="dialog dialog-scroll" label="New channel">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -580,6 +586,7 @@ function NewChannel({ workspaceId }: { workspaceId?: number }) {
               />
             </label>
           )}
+          <PermissionsSection value={permissions} onChange={setPermissions} />
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">

@@ -218,12 +218,20 @@ async function main() {
   const lc = await (await fetch(`${base}/api/launch-code`, { method: "POST", headers: { Authorization: `Bearer ${d.token}` } })).json();
   ok(typeof lc.code === "string" && lc.code.length >= 32 && lc.code !== d.token, "launch-code mints a code");
   const exchange = (code: string) =>
-    fetch(`${base}/api/exchange`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+    fetch(`${base}/api/exchange`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: base },
+      body: JSON.stringify({ code }),
+    });
   const lcBody = JSON.stringify({ code: lc.code });
   const evilExchange = await rawHttp(
     `POST /api/exchange HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: ${lcBody.length}\r\nConnection: close\r\n\r\n${lcBody}`,
   );
   ok(evilExchange.startsWith("HTTP/1.1 403"), "exchange with foreign Origin -> 403");
+  const noOrigin = await rawHttp(
+    `POST /api/exchange HTTP/1.1\r\nHost: 127.0.0.1:${PORT}\r\nContent-Type: application/json\r\nContent-Length: ${lcBody.length}\r\nConnection: close\r\n\r\n${lcBody}`,
+  );
+  ok(noOrigin.startsWith("HTTP/1.1 403"), "exchange without Origin -> 403 (code not consumed)");
   const ex = await exchange(lc.code);
   ok(ex.status === 200 && (await ex.json()).token === d.token, "exchange trades the code for the client token");
   const reuse = await exchange(lc.code);
@@ -276,6 +284,40 @@ async function main() {
   ok(wtList.includes(ch.cwd), "git knows the worktree");
   const ch2 = await c.call("channel.create", { workspace_id: ws.id, name: "smoke test", worktree: true });
   ok(ch2.branch === "muster/smoke-test-2", "branch name deduplicated");
+
+  // Per-channel agent permissions: defaults, create with a profile, set_permissions round trip.
+  ok(
+    ch.permissions?.codex_sandbox === "workspace_write" && ch.permissions?.claude_mode === "default",
+    "new channel gets the default permission profile",
+  );
+  const netPerms = { codex_sandbox: "workspace_write_network", claude_mode: "accept_edits" };
+  const ch3 = await c.call("channel.create", {
+    workspace_id: ws.id,
+    name: "perms",
+    worktree: false,
+    permissions: netPerms,
+  });
+  ok(
+    ch3.permissions.codex_sandbox === "workspace_write_network" && ch3.permissions.claude_mode === "accept_edits",
+    "channel.create accepts permissions",
+  );
+  const before = c.events.length;
+  const setP = await c.call("channel.set_permissions", {
+    id: ch3.id,
+    permissions: { codex_sandbox: "read_only", claude_mode: "plan" },
+  });
+  ok(setP.permissions.codex_sandbox === "read_only" && setP.permissions.claude_mode === "plan", "set_permissions returns the channel");
+  await c.waitFor("channel_upserted", () =>
+    c.events.slice(before).some((e) => e.event === "channel_upserted" && e.data.id === ch3.id));
+  const again = (await c.call("hello")).channels.find((x: { id: number }) => x.id === ch3.id);
+  ok(again.permissions.codex_sandbox === "read_only" && again.permissions.claude_mode === "plan", "permissions persisted (hello)");
+  let bad = "";
+  try {
+    await c.call("channel.set_permissions", { id: ch3.id, permissions: { codex_sandbox: "yolo" } });
+  } catch (e) {
+    bad = String(e);
+  }
+  ok(bad.includes("unknown variant"), "set_permissions rejects unknown values");
 
   await c.waitFor("session_upserted", () => c.events.some((e) => e.event === "session_upserted" && e.data.channel_id === ch.id));
   const sess = c.events.find((e) => e.event === "session_upserted" && e.data.channel_id === ch.id)!.data;

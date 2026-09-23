@@ -13,23 +13,29 @@ mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
 | `POST /api/rpc` | `Authorization: Bearer <client token>` | Same JSON methods as the WebSocket (body `{id?, method, params}`, reply `{id, result}` / `{id, error}`), except `session.attach`/`session.detach`. Used by the CLI. |
 | `POST /api/launch-code` | `Authorization: Bearer <client token>` | `{"code": "<64 hex>"}`: a single-use launch code, valid 60 s. Used by the CLI to open the UI. |
-| `POST /api/exchange` | the launch code | Body `{"code": "..."}` → `200 {"token": "<client token>"}` and the code is consumed. Unknown, used or expired code, or a bad body: `403 {"error": {"message": "invalid or expired launch code"}}`. |
+| `POST /api/exchange` | the launch code | Body `{"code": "..."}` → `200 {"token": "<client token>"}` and the code is consumed. Unknown, used or expired code, or a bad body: `403 {"error": {"message": "invalid or expired launch code"}}`. Also `403` (code not consumed) when the request has no `Origin` or a foreign one, or when the connecting TCP socket isn't owned by the daemon's own uid (looked up in `/proc/net/tcp` / `tcp6`): a code on a browser command line is readable by other local users, who must not be able to redeem it. |
 
 ### Opening the UI
 
-`muster` and `muster open` get a launch code from `POST /api/launch-code` and open
-`http://127.0.0.1:<port>/#code=<code>`. The client token itself never goes on the browser's
+With the native window (`gui` feature, the default UI when built with it), `muster` and
+`muster open` hand the client token to the window in-process: an initialization script puts it
+in `sessionStorage["muster.token"]` (only on the daemon's origin) before the page loads, and the
+window loads the plain URL. No token or code ever goes into a URL. Otherwise (or with
+`MUSTER_BROWSER` set), `muster` and `muster open` get a launch code from `POST /api/launch-code`
+and open `http://127.0.0.1:<port>/#code=<code>` in a browser. The client token itself never goes on the browser's
 command line (`/proc/<pid>/cmdline` is readable by every user). The frontend:
 
 1. If `location.hash` has `code=<code>`: `POST /api/exchange` with
    `Content-Type: application/json` and body `{"code": "<code>"}` (same origin). On `200`, store
    `token` from the reply like a `#token=` token. On `403`, the code was already used or has
    expired (60 s): fall back to a token already in `sessionStorage`, else tell the user to run
-   `muster` again (or `muster url`).
+   `muster` again (or `muster url`). The `code` is removed from the URL only after the daemon
+   answered (`200` or `403`); after a network error it stays, so a reload retries.
 2. Else if `location.hash` has `token=<client token>` (printed by `muster url`, and still accepted
    for compatibility): use it directly.
-3. Either way, strip the hash from the URL (`history.replaceState`) and keep the token in
-   `sessionStorage`, so a reload doesn't need the (already consumed) code.
+3. Else use the token in `sessionStorage` (put there by 1, 2 or the native window).
+4. Strip `token=` from the URL (`history.replaceState`) and keep the token in `sessionStorage`,
+   so a reload doesn't need the (already consumed) code.
 
 `muster url` prints the `#token=` URL, because the user asked for it explicitly.
 
@@ -63,12 +69,15 @@ Text frames carry JSON. Binary frames carry terminal bytes.
 | `0x02` | client → daemon | Keyboard input bytes (from xterm `onData`, UTF-8). |
 | `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. |
 
-Terminal queries: the daemon itself answers DA1 (`CSI c`), DSR status (`CSI 5 n`) and cursor
-position requests (`CSI 6 n`) that programs print, whether or not clients are attached. An
-input frame that consists **only** of answers to those (`ESC [ ? <n;…> c`, `ESC [ 0 n`, and,
-within 5 s of a cursor position request, `ESC [ <row> ; <col> R`) is dropped, so a program gets
-one answer no matter how many clients watch. Frames with anything else in them are written as
-they are (so keystrokes such as Shift+F3, `ESC [ 1 ; 2 R`, are never eaten outside that window).
+Terminal queries: the daemon is the **only** responder for DA1 (`CSI c` → `CSI ? 1 ; 2 c`),
+DA2 (`CSI > c` → `CSI > 0 ; 276 ; 0 c`), DSR status (`CSI 5 n` → `CSI 0 n`) and cursor position
+requests (`CSI 6 n` → `CSI <row> ; <col> R`, `CSI ? 6 n` → `CSI ? <row> ; <col> R`) that programs
+print, whether or not clients are attached. Clients must not answer these (the web UI registers
+xterm.js parser handlers that swallow them), so a program gets exactly one answer however many
+clients watch, and input frames are always written to the PTY as they are (keys such as
+Shift+F3, `ESC [ 1 ; 2 R`, are never mistaken for replies). Queries only a client can answer
+(colors via OSC 4/10/11/12, DECRQM, DECRQSS) are answered live by the client, but not while it
+parses replayed scrollback (the web UI brackets each replay with private in-band OSC markers).
 
 Replay: the ring buffer holds the last 2 MiB of output, so the sequences that turned on terminal
 modes may have scrolled out of it. Every replay therefore starts with the current input modes
@@ -76,7 +85,9 @@ modes may have scrolled out of it. Every replay therefore starts with the curren
 terminal emulator) and, if the replayed bytes begin inside the alternate screen, a switch to it
 (`CSI ? 1049 h`). When the ring still holds everything, later bytes set the same modes again,
 which is harmless. Replays of an exited session from an earlier daemon run (served from
-output.log) get the same prefix, computed from the log.
+output.log) get the same prefix, computed from the log (off the async workers, and cached per
+session while the log is unchanged). output.log holds the ring's bytes exactly; readers skip a
+partial first line once it has wrapped.
 
 ## Methods
 
@@ -87,11 +98,12 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], home, default_shell}` |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`) |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs) | `Channel` (plus sessions arrive via `session_upserted`) |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name, worktree? = true, base?, agent?, prompt?, permissions?: Permissions, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
 | `channel.rename` | `{id, name}` | `Channel` |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`) |
+| `channel.set_permissions` | `{id, permissions: {codex_sandbox, claude_mode}}` (both required) | `Channel` (emits `channel_upserted`). Human only: the MCP server has no way to call it. Applies to sessions started or restarted afterwards; running sessions keep the permissions they started with. |
 | `channel.set_layout` | `{id, layout}` | `{}` (opaque JSON; no event echo to avoid fights) |
-| `channel.mark_read` | `{id}` | `{}` |
+| `channel.mark_read` | `{id, at?}` | `{}` (`last_read_at` = max(current, `at` or now); `at` is capped at now) |
 | `channel.reorder` | `{ids: []}` | `{}` |
 | `channel.post` | `{id, text}` | `Event` (a `note`) |
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
@@ -121,14 +133,60 @@ from it return at most the last 2 MiB.
 Session processes: `session.kill`, `session.remove`, `session.restart` and daemon shutdown
 signal the whole session (the process muster started is a session leader), also after that
 process exited, so background jobs it left behind (`sleep 1000 &` then `exit`) are killed:
-SIGHUP, then SIGKILL after 3 s. The session id and the run's `MUSTER_TOKEN` are stored, and
-leftovers of an earlier daemon run are killed at the next start (only processes in that session
-whose environment carries that session's `MUSTER_SESSION_ID` and that run's `MUSTER_TOKEN`).
+SIGHUP, then SIGKILL after 3 s. Once the process muster started has been reaped, its pid (the
+session id) could be reused, so from then on only processes of that session that carry the run's
+markers (`MUSTER_RUN` and `MUSTER_SESSION_ID` in their environment), or that hold this PTY's
+slave open while the daemon still has its master, are signalled. `session.restart` waits until
+the old process and its leftovers are gone (SIGKILL after the grace period) before starting the
+new process, so e.g. a dev server can't keep the port. The process session id and the run's
+markers are stored; `session.remove` keeps them (in a pending-reap record) until the kill is
+confirmed. At the next daemon start, leftovers of earlier runs are killed (only processes in
+that session whose environment carries every marker), and the start waits until they are gone
+(up to about 4 s); records of processes that survive are kept for the next start.
+
+## Channel permissions
+
+Every `Channel` has `permissions: {codex_sandbox, claude_mode}`, a profile the human picks per
+channel. The daemon maps it to CLI flags whenever a session's process starts (spawn and
+restart), for every agent in the channel, including agents spawned through MCP:
+
+| `codex_sandbox` | Codex flags |
+|---|---|
+| `read_only` | `--sandbox read-only` |
+| `workspace_write` (default) | `--sandbox workspace-write -c sandbox_workspace_write.network_access=false` |
+| `workspace_write_network` | `--sandbox workspace-write -c sandbox_workspace_write.network_access=true` |
+| `full_access` | `--sandbox danger-full-access` |
+
+| `claude_mode` | Claude Code flags |
+|---|---|
+| `default` (default) | no flag: your own Claude Code setting (`permissions.defaultMode`) applies |
+| `accept_edits` | `--permission-mode acceptEdits` |
+| `plan` | `--permission-mode plan` |
+| `bypass` | `--permission-mode bypassPermissions` |
+
+The flags are always passed, so the channel profile (not a `sandbox_mode`, `network_access` or
+`defaultMode` in the user's own config) decides how a session starts. Approval policies are not
+touched. The user's `extra_args` for a session come after these flags. Shells are not affected.
+Channels created before this existed have the defaults (store migration v3). `permissions` in
+`channel.create` and `channel.set_permissions` must name both fields (a partial profile is
+rejected, so it can't silently reset the other half).
+
+Limits: the profile bounds what muster starts agents with; it is not a boundary against the
+agents themselves. Codex's workspace-write sandbox can still read the whole disk, including
+the discovery file with the client token, so with network access (`workspace_write_network`),
+and in any unsandboxed mode (`full_access`, `bypass`, or commands the human approves), an agent
+can call this API as the user, e.g. `channel.set_permissions` on its own channel. Pick those
+modes only for work you would let run with your own access. Sources: `codex
+--help` (0.155.1), the Codex config reference and "agent approvals & security" docs
+(`sandbox_workspace_write.network_access`, off by default), `claude --help` (2.1.280) and
+code.claude.com/docs/en/permissions (`default` is labelled "Manual", `manual` is an alias).
 
 ## Event log
 
-`channel.timeline` reads the event log. Retention: events older than 30 days, and all but the
-newest 5000 per channel, are deleted at daemon start and every hour. `session.remove` deletes
+`channel.timeline` reads the event log. Retention applies to noise only (`hook`,
+`state_change`, `mcp_call`): those older than 30 days, and all but the newest 5000 of them per
+channel, are deleted at daemon start and every hour. Notes, prompts, agent posts, approvals,
+session start/exit and system notices are never pruned. `session.remove` deletes
 the session's `hook` and `state_change` events. A `hook` event stores only a summary:
 `{session_id, event, summary: {hook_event_name?, tool_name?, notification_type?, matcher?,
 source?, reason?, type?}}` (string fields, 120 chars max), never the full payload.
@@ -136,5 +194,7 @@ source?, reason?, type?}}` (string fields, 120 chars max), never the full payloa
 ## Session environment
 
 Every session gets: `MUSTER=1`, `MUSTER_SESSION_ID`, `MUSTER_CHANNEL_ID`, `MUSTER_URL`,
-`MUSTER_TOKEN` (session token), `MUSTER_BIN`, `PORT` and `MUSTER_PORT_BASE` (channel port block
+`MUSTER_TOKEN` (session token), `MUSTER_RUN` (random per process start, not a secret: it marks
+the run's processes for reaping, and unlike `MUSTER_TOKEN` it survives agent CLIs that strip
+`*TOKEN*`/`*KEY*`/`*SECRET*` variables from the commands they run), `MUSTER_BIN`, `PORT` and `MUSTER_PORT_BASE` (channel port block
 of 10), `TERM=xterm-256color`, `COLORTERM=truecolor`.

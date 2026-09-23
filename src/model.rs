@@ -131,6 +131,89 @@ pub struct Channel {
     /// Unix ms of the last event the human has seen (for unread badges / catch me up).
     pub last_read_at: i64,
     pub sort_order: i64,
+    /// What agents started in this channel may do. Set by the human only (UI / RPC), applied
+    /// when a session's process starts.
+    #[serde(default)]
+    pub permissions: Permissions,
+}
+
+/// Codex `--sandbox` policy for a channel's Codex sessions. Ordered least to most permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSandbox {
+    /// `--sandbox read-only`
+    ReadOnly,
+    /// `--sandbox workspace-write`, no network (Codex's own default).
+    #[default]
+    WorkspaceWrite,
+    /// `--sandbox workspace-write` plus `sandbox_workspace_write.network_access=true`.
+    WorkspaceWriteNetwork,
+    /// `--sandbox danger-full-access`: no sandbox at all.
+    FullAccess,
+}
+
+/// Claude Code `--permission-mode` for a channel's Claude sessions. Ordered least to most
+/// permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeMode {
+    /// `plan`
+    Plan,
+    /// `default` (asks before edits and commands; "Manual" in the CLI).
+    #[default]
+    Default,
+    /// `acceptEdits`
+    AcceptEdits,
+    /// `bypassPermissions`: no permission prompts.
+    Bypass,
+}
+
+/// Per-channel agent permission profile. Defaults match the CLIs' own defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Permissions {
+    #[serde(default)]
+    pub codex_sandbox: CodexSandbox,
+    #[serde(default)]
+    pub claude_mode: ClaudeMode,
+}
+
+/// A complete profile as a client sends it (both fields required, so a partial update can't
+/// silently reset the other half to its default).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsInput {
+    pub codex_sandbox: CodexSandbox,
+    pub claude_mode: ClaudeMode,
+}
+
+impl From<PermissionsInput> for Permissions {
+    fn from(p: PermissionsInput) -> Self {
+        Permissions {
+            codex_sandbox: p.codex_sandbox,
+            claude_mode: p.claude_mode,
+        }
+    }
+}
+
+impl Permissions {
+    /// Would an agent of `kind` get more in a channel with `self` than in one with `other`?
+    /// (Shells are not governed by the profile.)
+    pub fn exceeds_for(&self, other: &Permissions, kind: SessionKind) -> bool {
+        match kind {
+            SessionKind::Codex => self.codex_sandbox > other.codex_sandbox,
+            SessionKind::Claude => self.claude_mode > other.claude_mode,
+            SessionKind::Shell => false,
+        }
+    }
+
+    /// More permissive than the defaults in any respect.
+    #[allow(dead_code)] // used by tests and documented for clients
+    pub fn is_elevated(&self) -> bool {
+        matches!(
+            self.codex_sandbox,
+            CodexSandbox::WorkspaceWriteNetwork | CodexSandbox::FullAccess
+        ) || matches!(self.claude_mode, ClaudeMode::AcceptEdits | ClaudeMode::Bypass)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

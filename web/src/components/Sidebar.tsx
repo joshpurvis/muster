@@ -310,6 +310,7 @@ function ChannelRow(
     { label: "Copy path", icon: <IconCopy size={14} />, run: () => A.copy(c.cwd, "Path copied") },
     ...(c.branch ? [{ label: "Copy branch name", run: () => A.copy(c.branch!, "Branch copied") }] : []),
     { label: "Mark read", disabled: !unread.value.has(c.id), run: () => A.markChannelRead(c.id) },
+    { label: "Permissions…", run: () => A.openPermissions(c.id) },
     "sep",
     { label: "Archive…", icon: <IconArchive size={14} />, danger: true, run: () => confirmArchive(c, false) },
     ...(c.owns_worktree

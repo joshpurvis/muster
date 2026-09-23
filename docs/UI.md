@@ -56,7 +56,11 @@ scarce resource: surface what needs the human; hide what doesn't.
 `# name` (double-click to rename), branch chip `⎇ branch` (click copies), cwd (muted, truncated
 from the left, click copies), then icon buttons with tooltips showing shortcuts:
 New session (split-button with Claude/Codex/Shell), Split right, Split down, Timeline, Diff, `⋯`
-(Rename, Archive, Archive + remove worktree, Copy path).
+(Rename, Copy path, Permissions…, Restart exited sessions, Archive, Archive + remove worktree).
+When the channel's permission profile is more permissive than the defaults (Codex network or
+full access, Claude accept edits or bypass), a chip after the workspace chip shows it: amber
+with a globe/shield for network or accept edits, red with a warning shield for full access or
+bypass. Clicking it opens the Permissions dialog; in narrow headers it shows the icon only.
 
 ### Panes (the core; must feel great)
 - Layout is a tree persisted per channel via `channel.set_layout` (debounced 400ms):
@@ -129,7 +133,18 @@ New session (split-button with Claude/Codex/Shell), Split right, Split down, Tim
   Every command lists its shortcut. Arrow keys + Enter, Esc closes. Recent items first.
 - **New channel** (Alt+Shift+N): name (live slug preview + branch name), workspace select, agent
   segmented control (Claude · Codex · Shell · None; remembers last), worktree toggle (default on for
-  git), base branch (optional), initial prompt textarea. Ctrl+Enter / Enter on name creates.
+  git), base branch (optional), initial prompt textarea, and a **Permissions** section, collapsed
+  by default to a one-line summary ("Codex: workspace · Claude: default"; amber/red when
+  elevated). The body scrolls when the section is open. Ctrl+Enter / Enter on name creates.
+- **Permissions** (channel `⋯` menu, sidebar channel menu, header chip, command palette
+  "Channel permissions…"): two segmented controls, least to most permissive left to right:
+  Codex sandbox (Read only · Workspace · Workspace + network · Full access) and Claude permission
+  mode (Plan · Default · Accept edits · Bypass), each with a one-line description of the choice.
+  Full access and Bypass carry a warning shield, turn red when selected and show a one-line
+  warning; Save turns into a danger button then. The subtitle says the profile "applies to new
+  and restarted sessions", and running sessions of an affected kind are named as keeping their
+  current permissions until restarted. "Reset to defaults" when not at the defaults. Arrow keys
+  move within a control.
 - **Add workspace**: path input with `fs.complete` suggestions (Tab completes), optional name.
 - **Shortcuts sheet** (Alt+/ or F1).
 - Context menus: custom (not native), keyboard navigable.

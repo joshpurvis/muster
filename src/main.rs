@@ -242,18 +242,25 @@ fn open(path: Option<PathBuf>) -> anyhow::Result<()> {
     open_ui(&d)
 }
 
-/// Open the UI with a single-use launch code, so the client token never appears on the
-/// browser's command line (/proc/<pid>/cmdline is world-readable).
+/// Open the UI: the native window gets the client token in-process; a browser gets a
+/// single-use launch code, so the token never appears on its command line
+/// (/proc/<pid>/cmdline is world-readable).
 fn open_ui(d: &Discovery) -> anyhow::Result<()> {
+    gui::open_ui(d, || browser_url(d))
+}
+
+/// URL for opening the UI in a browser: a launch-code URL, or the token URL for an old daemon
+/// without launch codes.
+fn browser_url(d: &Discovery) -> anyhow::Result<String> {
     match client::launch_code(d).context("getting a launch code from the daemon")? {
-        Some(code) => gui::open(&d.launch_url(&code)),
+        Some(code) => Ok(d.launch_url(&code)),
         None => {
             eprintln!(
                 "muster: the running daemon (version {}) has no launch codes; opening with the token URL. \
                  Restart it (`muster stop`) to stop passing the token on the browser command line.",
                 d.version
             );
-            gui::open(&d.ui_url())
+            Ok(d.ui_url())
         }
     }
 }
@@ -388,7 +395,11 @@ async fn daemon_main() -> anyhow::Result<()> {
     let mut hup = signal(SignalKind::hangup())?;
 
     let app = server::router(hub.clone());
-    let serve = axum::serve(listener, app);
+    // Peer addresses let `/api/exchange` check which local user owns the connecting socket.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    );
 
     paths::write_discovery(&Discovery {
         pid: std::process::id(),

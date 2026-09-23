@@ -33,6 +33,7 @@ import type {
   Channel,
   ChannelId,
   Decision,
+  Permissions,
   SessionId,
   SessionInfo,
   SessionKind,
@@ -352,6 +353,8 @@ export interface NewChannelReq {
   base?: string;
   agent: SessionKind | null;
   prompt?: string;
+  /** Omitted: the daemon's defaults. */
+  permissions?: Permissions;
 }
 
 export async function createChannel(req: NewChannelReq): Promise<Channel> {
@@ -366,6 +369,7 @@ export async function createChannel(req: NewChannelReq): Promise<Channel> {
     base: req.base || undefined,
     agent: req.agent ?? undefined,
     prompt: req.prompt || undefined,
+    permissions: req.permissions,
     ...grid,
   });
   setPref("lastAgent", req.agent ?? "none");
@@ -388,6 +392,19 @@ export function renameChannel(id: ChannelId, name: string) {
   const c = channelById.value.get(id);
   if (!n || !c || n === c.name) return;
   rpc.call("channel.rename", { id, name: n }).catch(fail("Rename failed")).catch(() => {});
+}
+
+/** Human-only: the channel's agent permission profile (new and restarted sessions). */
+export async function setPermissions(id: ChannelId, permissions: Permissions): Promise<Channel> {
+  const c = await rpc.call<Channel>("channel.set_permissions", { id, permissions });
+  // channel_upserted may lag the reply.
+  channels.value = channels.value.map((x) => (x.id === c.id ? c : x));
+  toast("success", "Permissions saved. They apply to new and restarted sessions.");
+  return c;
+}
+
+export function openPermissions(id: ChannelId) {
+  overlay.value = { kind: "permissions", channelId: id };
 }
 
 export function archiveChannel(id: ChannelId, removeWorktree: boolean) {

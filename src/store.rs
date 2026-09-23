@@ -90,13 +90,39 @@ const MIGRATIONS: &[&str] = &[
         'summary', json_object())
     WHERE kind = 'hook' AND json_valid(data);
     "#,
+    // v3: per-channel agent permission profile (JSON `Permissions`; '{}' = the defaults).
+    r#"
+    ALTER TABLE channels ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}';
+    CREATE TABLE reap (
+        session_id INTEGER NOT NULL,
+        sid INTEGER NOT NULL,
+        run_marker TEXT NOT NULL,
+        PRIMARY KEY (session_id, sid)
+    );
+    "#,
 ];
+
+/// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
+/// approvals, session start/exit and system notices are the channel's history and are kept.
+pub const NOISE_EVENT_KINDS: &[EventKind] = &[EventKind::Hook, EventKind::StateChange, EventKind::McpCall];
+
+fn noise_kinds_sql() -> String {
+    NOISE_EVENT_KINDS
+        .iter()
+        .map(|k| format!("'{}'", enum_to_str(k)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn enum_to_str<T: serde::Serialize>(v: &T) -> String {
     match serde_json::to_value(v) {
         Ok(serde_json::Value::String(s)) => s,
         _ => String::new(),
     }
+}
+
+fn perms_json(p: &Permissions) -> String {
+    serde_json::to_string(p).unwrap_or_else(|_| "{}".into())
 }
 
 fn enum_from_str<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
@@ -208,6 +234,10 @@ impl Store {
             created_at: r.get(10)?,
             last_read_at: r.get(11)?,
             sort_order: r.get(12)?,
+            permissions: r
+                .get::<_, Option<String>>(13)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
         })
     }
 
@@ -215,7 +245,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base, archived,
-                    layout, created_at, last_read_at, sort_order FROM channels ORDER BY id",
+                    layout, created_at, last_read_at, sort_order, permissions FROM channels ORDER BY id",
         )?;
         let rows = st.query_map([], Self::row_channel)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -226,8 +256,8 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO channels (workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base,
-                                   archived, layout, created_at, last_read_at, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                   archived, layout, created_at, last_read_at, sort_order, permissions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 c.workspace_id,
                 c.name,
@@ -240,7 +270,8 @@ impl Store {
                 c.layout.as_ref().map(|v| v.to_string()),
                 c.created_at,
                 c.last_read_at,
-                c.sort_order
+                c.sort_order,
+                perms_json(&c.permissions)
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -249,7 +280,8 @@ impl Store {
     pub fn update_channel(&self, c: &Channel) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE channels SET workspace_id=?2, name=?3, cwd=?4, branch=?5, base_branch=?6, owns_worktree=?7,
-                    port_base=?8, archived=?9, layout=?10, created_at=?11, last_read_at=?12, sort_order=?13
+                    port_base=?8, archived=?9, layout=?10, created_at=?11, last_read_at=?12, sort_order=?13,
+                    permissions=?14
              WHERE id=?1",
             params![
                 c.id,
@@ -264,7 +296,8 @@ impl Store {
                 c.layout.as_ref().map(|v| v.to_string()),
                 c.created_at,
                 c.last_read_at,
-                c.sort_order
+                c.sort_order,
+                perms_json(&c.permissions)
             ],
         )?;
         Ok(())
@@ -367,30 +400,73 @@ impl Store {
 
     /// Record the session id (= pid of the process muster started) of a session's current
     /// process. Kept after the process exits, so leftovers can be reaped at the next start.
-    /// `marker` is a `KEY=value` from that process's environment unique to the run
-    /// (`MUSTER_TOKEN=…`), used to recognize its leftovers.
-    pub fn set_session_sid(&self, id: SessionId, sid: Option<u32>, marker: Option<&str>) -> anyhow::Result<()> {
+    /// `markers` are `KEY=value`s from that process's environment unique to the run
+    /// (`MUSTER_RUN=…`, `MUSTER_SESSION_ID=…`), used to recognize its leftovers.
+    pub fn set_session_sid(&self, id: SessionId, sid: Option<u32>, markers: &[String]) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET sid = ?2, run_marker = ?3 WHERE id = ?1",
-            params![id, sid, marker],
+            params![id, sid, markers.join("\n")],
         )?;
         Ok(())
     }
 
-    /// Every session's last process session id: (id, sid, marker).
-    pub fn session_sids(&self) -> anyhow::Result<Vec<(SessionId, u32, Option<String>)>> {
+    /// Every process session to reap at startup: (muster session id, sid, markers), from
+    /// sessions' last processes and from removed sessions whose kill hadn't finished.
+    pub fn session_sids(&self) -> anyhow::Result<Vec<(SessionId, u32, Vec<String>)>> {
         let conn = self.conn.lock();
-        let mut st = conn.prepare("SELECT id, sid, run_marker FROM sessions WHERE sid IS NOT NULL")?;
+        let mut st = conn.prepare(
+            "SELECT id, sid, run_marker FROM sessions WHERE sid IS NOT NULL
+             UNION ALL SELECT session_id, sid, run_marker FROM reap",
+        )?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)? as SessionId, r.get::<_, i64>(1)? as u32, r.get(2)?))
+            let m: Option<String> = r.get(2)?;
+            Ok((
+                r.get::<_, i64>(0)? as SessionId,
+                r.get::<_, i64>(1)? as u32,
+                m.map(|m| m.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+                    .unwrap_or_default(),
+            ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn clear_session_sids(&self) -> anyhow::Result<()> {
-        self.conn.lock().execute(
-            "UPDATE sessions SET sid = NULL, run_marker = NULL WHERE sid IS NOT NULL",
+    /// Forget recorded process sessions, except those of `keep` (their processes survived).
+    pub fn clear_session_sids(&self, keep: &std::collections::HashSet<SessionId>) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let keep: Vec<String> = keep.iter().map(|i| i.to_string()).collect();
+        let keep = keep.join(",");
+        conn.execute(
+            &format!("UPDATE sessions SET sid = NULL, run_marker = NULL WHERE sid IS NOT NULL AND id NOT IN ({keep})"),
             [],
+        )?;
+        conn.execute(&format!("DELETE FROM reap WHERE session_id NOT IN ({keep})"), [])?;
+        Ok(())
+    }
+
+    /// A removed session whose processes are still being killed: remember them until the kill
+    /// is confirmed, so a daemon stop in between doesn't leave them unreaped.
+    pub fn add_reap(&self, id: SessionId, sid: u32, markers: &[String]) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO reap (session_id, sid, run_marker) VALUES (?1, ?2, ?3)",
+            params![id, sid, markers.join("\n")],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_reap(&self, id: SessionId, sid: u32) -> anyhow::Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM reap WHERE session_id = ?1 AND sid = ?2", params![id, sid])?;
+        Ok(())
+    }
+
+    /// Before a session row is deleted: keep its recorded process session (processes that
+    /// survived an earlier reaping) for the next start's reaper.
+    pub fn keep_sid_for_reap(&self, id: SessionId) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO reap (session_id, sid, run_marker)
+             SELECT id, sid, COALESCE(run_marker, '') FROM sessions WHERE id = ?1 AND sid IS NOT NULL",
+            [id],
         )?;
         Ok(())
     }
@@ -422,18 +498,26 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Retention: delete events older than `cutoff_ts`, and all but the newest `per_channel`
-    /// events of each channel. Returns the number of rows deleted.
+    /// Retention: delete noise events (`NOISE_EVENT_KINDS`) older than `cutoff_ts`, and all but
+    /// the newest `per_channel` noise events of each channel. The channel's history (notes,
+    /// prompts, agent posts, approvals, session start/exit, system notices) is never pruned.
+    /// Returns the number of rows deleted.
     pub fn prune_events(&self, cutoff_ts: i64, per_channel: usize) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
-        let old = conn.execute("DELETE FROM events WHERE ts < ?1", [cutoff_ts])?;
+        let kinds = noise_kinds_sql();
+        let old = conn.execute(
+            &format!("DELETE FROM events WHERE ts < ?1 AND kind IN ({kinds})"),
+            [cutoff_ts],
+        )?;
         let over = conn.execute(
-            "DELETE FROM events WHERE id IN (
-                SELECT id FROM (
-                    SELECT id, ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY id DESC) AS rn
-                    FROM events
-                ) WHERE rn > ?1
-            )",
+            &format!(
+                "DELETE FROM events WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (PARTITION BY channel_id ORDER BY id DESC) AS rn
+                        FROM events WHERE kind IN ({kinds})
+                    ) WHERE rn > ?1
+                )"
+            ),
             [per_channel as i64],
         )?;
         Ok(old + over)
@@ -484,18 +568,20 @@ mod tests {
     fn event_retention() {
         let s = Store::open_memory().unwrap();
         let v = serde_json::json!({"x": 1});
-        // Channel 1: 10 old + 20 new; channel 2: 3 new; no channel: 2 old.
+        // Channel 1: 10 old + 20 new hook events; channel 2: 3 new; no channel: 2 old.
         for i in 0..10 {
-            s.insert_event(Some(1), None, EventKind::Note, &v, 100 + i).unwrap();
+            s.insert_event(Some(1), None, EventKind::Hook, &v, 100 + i).unwrap();
         }
         for i in 0..20 {
-            s.insert_event(Some(1), None, EventKind::Note, &v, 10_000 + i).unwrap();
+            s.insert_event(Some(1), None, EventKind::StateChange, &v, 10_000 + i)
+                .unwrap();
         }
         for i in 0..3 {
-            s.insert_event(Some(2), None, EventKind::Note, &v, 10_000 + i).unwrap();
+            s.insert_event(Some(2), None, EventKind::McpCall, &v, 10_000 + i)
+                .unwrap();
         }
         for i in 0..2 {
-            s.insert_event(None, None, EventKind::System, &v, 50 + i).unwrap();
+            s.insert_event(None, None, EventKind::Hook, &v, 50 + i).unwrap();
         }
         let n = s.prune_events(5_000, 15).unwrap();
         assert_eq!(n, 12 + 5);
@@ -504,6 +590,43 @@ mod tests {
         // The newest ones of channel 1 are kept.
         assert_eq!(count(&s, "SELECT MIN(ts) FROM events WHERE channel_id = 1"), 10_005);
         assert_eq!(s.timeline(1, None, 100).unwrap().len(), 15);
+    }
+
+    #[test]
+    fn retention_never_prunes_history() {
+        let s = Store::open_memory().unwrap();
+        let v = serde_json::json!({});
+        let history = [
+            EventKind::Note,
+            EventKind::Prompt,
+            EventKind::AgentPost,
+            EventKind::Approval,
+            EventKind::SessionStarted,
+            EventKind::SessionExited,
+            EventKind::System,
+        ];
+        // Old history, then far more (old and new) noise than the per-channel cap.
+        for k in history {
+            s.insert_event(Some(1), Some(3), k, &v, 1).unwrap();
+        }
+        for i in 0..50 {
+            s.insert_event(
+                Some(1),
+                Some(3),
+                NOISE_EVENT_KINDS[i % 3],
+                &v,
+                if i < 25 { 2 } else { 10_000 },
+            )
+            .unwrap();
+        }
+        s.prune_events(5_000, 5).unwrap();
+        let left = s.timeline(1, None, 1000).unwrap();
+        for k in history {
+            assert!(left.iter().any(|e| e.kind == k), "{k:?} was pruned");
+        }
+        let noise = left.iter().filter(|e| NOISE_EVENT_KINDS.contains(&e.kind)).count();
+        assert_eq!(noise, 5);
+        assert_eq!(left.len(), history.len() + 5);
     }
 
     #[test]
@@ -528,20 +651,51 @@ mod tests {
     fn sids_roundtrip() {
         let s = Store::open_memory().unwrap();
         assert!(s.session_sids().unwrap().is_empty());
+        for id in [3, 4] {
+            s.conn
+                .lock()
+                .execute(
+                    "INSERT INTO sessions (id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
+                     VALUES (?1, 1, 'shell', 's', '/', 'exited', 0, 80, 24, 0)",
+                    [id],
+                )
+                .unwrap();
+        }
+        let m = vec!["MUSTER_RUN=ab".to_string(), "MUSTER_SESSION_ID=3".to_string()];
+        s.set_session_sid(3, Some(4242), &m).unwrap();
+        s.set_session_sid(4, Some(4343), &m[..1]).unwrap();
+        s.add_reap(7, 4444, &m).unwrap();
+        let mut got = s.session_sids().unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(3, 4242, m.clone()), (4, 4343, m[..1].to_vec()), (7, 4444, m.clone())]
+        );
+        // Legacy single-marker rows still parse.
         s.conn
             .lock()
-            .execute(
-                "INSERT INTO sessions (id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
-                 VALUES (3, 1, 'shell', 's', '/', 'exited', 0, 80, 24, 0)",
-                [],
-            )
+            .execute("UPDATE sessions SET run_marker = 'MUSTER_TOKEN=x' WHERE id = 4", [])
             .unwrap();
-        s.set_session_sid(3, Some(4242), Some("MUSTER_TOKEN=ab")).unwrap();
+        assert!(
+            s.session_sids()
+                .unwrap()
+                .contains(&(4, 4343, vec!["MUSTER_TOKEN=x".to_string()]))
+        );
+        // Survivors are kept for the next attempt.
+        s.clear_session_sids(&[4, 7].into_iter().collect()).unwrap();
+        let ids: Vec<SessionId> = s.session_sids().unwrap().into_iter().map(|r| r.0).collect();
+        assert_eq!(ids, vec![4, 7]);
+        s.remove_reap(7, 4444).unwrap();
+        // A removed session's surviving record moves to the reap list.
+        s.keep_sid_for_reap(4).unwrap();
+        s.delete_session(4).unwrap();
         assert_eq!(
             s.session_sids().unwrap(),
-            vec![(3, 4242, Some("MUSTER_TOKEN=ab".to_string()))]
+            vec![(4, 4343, vec!["MUSTER_TOKEN=x".to_string()])]
         );
-        s.clear_session_sids().unwrap();
+        s.keep_sid_for_reap(3).unwrap(); // no sid recorded: nothing to keep
+        assert_eq!(s.session_sids().unwrap().len(), 1);
+        s.clear_session_sids(&Default::default()).unwrap();
         assert!(s.session_sids().unwrap().is_empty());
     }
 }

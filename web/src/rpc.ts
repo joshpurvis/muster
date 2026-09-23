@@ -38,19 +38,24 @@ function storeToken(tok: string) {
   } catch { /* ignore */ }
 }
 
+/** Remove `keys` from the URL hash (history.replaceState, no reload). */
+function stripHash(keys: string[]) {
+  const params = new URLSearchParams(location.hash.slice(1));
+  for (const k of keys) params.delete(k);
+  const rest = params.toString();
+  history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+}
+
 /** Read the client token. `muster` opens `#code=<one-time code>`, which is exchanged for the
  * token (so the token never appears on a process command line); `muster url` links carry
- * `#token=` directly. Either way the hash is stripped and the token kept for this tab. */
+ * `#token=` directly; the native window puts it in sessionStorage before the page loads.
+ * The token is kept in sessionStorage for this tab. A code is stripped from the URL only once
+ * the daemon has answered (redeemed or refused), so a reload during the exchange can retry. */
 async function readToken(): Promise<string | null> {
   const params = new URLSearchParams(location.hash.slice(1));
   const code = params.get("code");
   let tok = params.get("token");
-  if (code || tok) {
-    params.delete("code");
-    params.delete("token");
-    const rest = params.toString();
-    history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
-  }
+  if (tok) stripHash(["token", "code"]);
   if (!tok && code) {
     try {
       const r = await fetch("/api/exchange", {
@@ -59,7 +64,9 @@ async function readToken(): Promise<string | null> {
         body: JSON.stringify({ code }),
       });
       if (r.ok) tok = ((await r.json()) as { token?: string }).token ?? null;
-    } catch { /* fall back to a stored token */ }
+      // Redeemed or refused (used/expired): either way the code is spent.
+      if (r.ok || r.status === 403) stripHash(["code"]);
+    } catch { /* network error: keep the code for a reload; fall back to a stored token */ }
   }
   if (tok) {
     storeToken(tok);

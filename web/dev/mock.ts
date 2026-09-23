@@ -278,6 +278,7 @@ async function handle(method: string, p: any): Promise<unknown> {
         created_at: now(),
         last_read_at: now(),
         sort_order: channels.length,
+        permissions: p.permissions ?? { codex_sandbox: "workspace_write", claude_mode: "default" },
       };
       channels.push(c);
       broadcast("channel_upserted", c);
@@ -286,6 +287,13 @@ async function handle(method: string, p: any): Promise<unknown> {
         level: "info",
       });
       if (p.agent) spawn({ channel_id: c.id, kind: p.agent, prompt: p.prompt });
+      return c;
+    }
+    case "channel.set_permissions": {
+      const c = channels.find((c) => c.id === p.id);
+      if (!c) throw new Error(`no such channel: ${p.id}`);
+      c.permissions = p.permissions;
+      broadcast("channel_upserted", c);
       return c;
     }
     case "channel.rename": {

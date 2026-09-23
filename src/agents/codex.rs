@@ -1,8 +1,10 @@
 //! Codex CLI adapter (verified against `codex` v0.155.1).
 //!
 //! Launch: `codex -c notify=[...] -c mcp_servers.muster.url=... -c
-//! mcp_servers.muster.bearer_token_env_var="MUSTER_TOKEN" [-c hooks.<Event>=[...]]... [extra args]
-//! [-- <initial prompt>]`. All settings are `-c` overrides for this process only;
+//! mcp_servers.muster.bearer_token_env_var="MUSTER_TOKEN" [-c hooks.<Event>=[...]]...
+//! --sandbox <mode> [-c sandbox_workspace_write.network_access=<bool>] [extra args]
+//! [-- <initial prompt>]`. The sandbox flags come from the channel's permission profile
+//! (`sandbox_args`). All settings are `-c` overrides for this process only;
 //! `~/.codex/config.toml` is never touched.
 //! - notify: Codex runs `<muster_bin> hook codex notify <json>` with the JSON payload as the last
 //!   argv item (`{"type":"agent-turn-complete","thread-id",...,"input-messages",
@@ -52,6 +54,24 @@ fn hooks_enabled() -> bool {
         std::env::var("MUSTER_CODEX_HOOKS").as_deref(),
         Ok("0") | Ok("false") | Ok("off") | Ok("no")
     )
+}
+
+/// Sandbox flags for the channel's profile: always an explicit `--sandbox`, plus the
+/// workspace-write network switch (set either way, so a `network_access = true` in the user's
+/// config.toml can't widen a no-network profile). Approval policy is left alone.
+pub fn sandbox_args(sandbox: CodexSandbox) -> Vec<String> {
+    let (mode, network) = match sandbox {
+        CodexSandbox::ReadOnly => ("read-only", None),
+        CodexSandbox::WorkspaceWrite => ("workspace-write", Some(false)),
+        CodexSandbox::WorkspaceWriteNetwork => ("workspace-write", Some(true)),
+        CodexSandbox::FullAccess => ("danger-full-access", None),
+    };
+    let mut out = vec!["--sandbox".to_string(), mode.to_string()];
+    if let Some(n) = network {
+        out.push("-c".to_string());
+        out.push(format!("sandbox_workspace_write.network_access={n}"));
+    }
+    out
 }
 
 /// The `-c` overrides muster adds for a session.
@@ -205,6 +225,7 @@ impl Adapter for CodexAdapter {
             args.push("-c".to_string());
             args.push(o);
         }
+        args.extend(sandbox_args(ctx.permissions.codex_sandbox));
         args.extend(ctx.extra_args.iter().cloned());
         let mut consumed = false;
         if let Some(p) = ctx.initial_prompt.as_ref().filter(|p| !p.trim().is_empty()) {
@@ -483,6 +504,83 @@ mod tests {
             a.on_hook("Stop", &json!({"last_assistant_message":"ok"})),
             Some(StateUpdate::with(AgentState::Idle, "ok"))
         );
+    }
+
+    fn ctx(sandbox: CodexSandbox, prompt: Option<&str>) -> SpawnCtx {
+        SpawnCtx {
+            session_id: 3,
+            cwd: "/tmp".into(),
+            muster_bin: "/m".into(),
+            daemon_url: "http://127.0.0.1:1".into(),
+            session_token: "t".into(),
+            session_dir: "/tmp".into(),
+            extra_args: vec!["--model".into(), "x".into()],
+            initial_prompt: prompt.map(str::to_string),
+            permissions: Permissions {
+                codex_sandbox: sandbox,
+                claude_mode: ClaudeMode::Bypass,
+            },
+        }
+    }
+
+    #[test]
+    fn sandbox_profile_maps_to_flags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            sandbox_args(CodexSandbox::ReadOnly),
+            s(&["--sandbox", "read-only"])
+        );
+        assert_eq!(
+            sandbox_args(CodexSandbox::WorkspaceWrite),
+            s(&[
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=false"
+            ])
+        );
+        assert_eq!(
+            sandbox_args(CodexSandbox::WorkspaceWriteNetwork),
+            s(&[
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=true"
+            ])
+        );
+        assert_eq!(
+            sandbox_args(CodexSandbox::FullAccess),
+            s(&["--sandbox", "danger-full-access"])
+        );
+        for sb in [
+            CodexSandbox::ReadOnly,
+            CodexSandbox::WorkspaceWrite,
+            CodexSandbox::WorkspaceWriteNetwork,
+            CodexSandbox::FullAccess,
+        ] {
+            let spec = CodexAdapter.command(&ctx(sb, Some("hi"))).unwrap();
+            assert_eq!(spec.program, "codex");
+            let a = &spec.args;
+            // Profile flags come before the user's extra args and the prompt, and nothing
+            // muster adds touches the approval policy or bypasses the sandbox wholesale.
+            let i = a.iter().position(|x| x == "--sandbox").unwrap();
+            let e = a.iter().position(|x| x == "--model").unwrap();
+            assert!(i < e);
+            assert_eq!(&a[a.len() - 2..], &["--", "hi"]);
+            assert!(!a.iter().any(|x| x.starts_with("--ask-for-approval")
+                || x == "-a"
+                || x.starts_with("--dangerously")
+                || x.contains("approval_policy")));
+        }
+        let spec = CodexAdapter
+            .command(&ctx(CodexSandbox::WorkspaceWriteNetwork, None))
+            .unwrap();
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "sandbox_workspace_write.network_access=true")
+        );
+        assert!(!spec.consumed_initial_prompt);
     }
 
     #[test]

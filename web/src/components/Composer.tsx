@@ -122,12 +122,15 @@ export function Composer({ c }: { c: Channel }) {
   };
 
   const submit = async (interrupt: boolean) => {
-    const raw = text;
+    // Read and clear the text through the ref, synchronously: two Enters in one frame both run
+    // before the re-render, and the second must see the box already empty.
+    const raw = textRef.current;
     const t = raw.trim();
     if (!t) return;
     if (t.startsWith("/note ") || t === "/note") {
       const body = t.slice(5).trim();
       if (!body) return;
+      textRef.current = "";
       setText("");
       pushHistory(c.id, t);
       setSending((n) => n + 1);
@@ -152,6 +155,7 @@ export function Composer({ c }: { c: Channel }) {
       return;
     }
     const to = target;
+    textRef.current = "";
     setText("");
     setHistIdx(-1);
     pushHistory(c.id, raw);
@@ -267,7 +271,8 @@ export function Composer({ c }: { c: Channel }) {
           placeholder={placeholder}
           spellcheck
           onInput={(e) => {
-            setText((e.target as HTMLTextAreaElement).value);
+            textRef.current = (e.target as HTMLTextAreaElement).value;
+            setText(textRef.current);
             setHistIdx(-1);
           }}
           onKeyDown={onKey}

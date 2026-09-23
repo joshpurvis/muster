@@ -1,7 +1,8 @@
 //! Claude Code adapter (verified against `claude` v2.1.280).
 //!
 //! Launch: `claude --mcp-config <session_dir>/mcp.json --settings <session_dir>/settings.json
-//! [extra args] [-- <initial prompt>]`.
+//! --permission-mode <mode> [extra args] [-- <initial prompt>]`. The mode comes from the
+//! channel's permission profile (`permission_mode`).
 //! - `settings.json` adds command hooks for this session only (merged with the user's own
 //!   settings): every event runs `<muster_bin> hook claude <Event>`, which reads the hook's JSON
 //!   payload on stdin and POSTs it to the daemon (see hookcmd.rs).
@@ -87,6 +88,19 @@ pub fn settings_json(muster_bin: &Path) -> Value {
         );
     }
     json!({ "hooks": hooks })
+}
+
+/// `--permission-mode` value for the channel's profile. Always passed explicitly, so the channel
+/// profile (not a `defaultMode` in the user's settings) decides how the session starts.
+/// `--permission-mode` value for a channel profile. `Default` passes no flag, so the user's
+/// own Claude Code setting (e.g. `permissions.defaultMode`) applies.
+pub fn permission_mode(mode: ClaudeMode) -> Option<&'static str> {
+    match mode {
+        ClaudeMode::Default => None,
+        ClaudeMode::AcceptEdits => Some("acceptEdits"),
+        ClaudeMode::Plan => Some("plan"),
+        ClaudeMode::Bypass => Some("bypassPermissions"),
+    }
 }
 
 pub fn mcp_json(daemon_url: &str, token: &str) -> Value {
@@ -274,6 +288,9 @@ impl Adapter for ClaudeAdapter {
             "--settings".to_string(),
             settings_path.to_string_lossy().into_owned(),
         ];
+        if let Some(mode) = permission_mode(ctx.permissions.claude_mode) {
+            args.extend(["--permission-mode".to_string(), mode.to_string()]);
+        }
         args.extend(ctx.extra_args.iter().cloned());
         let mut consumed = false;
         if let Some(p) = ctx.initial_prompt.as_ref().filter(|p| !p.trim().is_empty()) {
@@ -654,6 +671,7 @@ mod tests {
             session_dir: dir.clone(),
             extra_args: vec!["--model".into(), "haiku".into()],
             initial_prompt: Some("-do it".into()),
+            permissions: Permissions::default(),
         };
         let spec = ClaudeAdapter.command(&ctx).unwrap();
         assert!(spec.consumed_initial_prompt);
@@ -665,7 +683,26 @@ mod tests {
         }
         assert_eq!(spec.args[0], "--mcp-config");
         assert_eq!(spec.args[2], "--settings");
+        // The default profile passes no --permission-mode (the user's own setting applies).
+        assert!(!spec.args.iter().any(|a| a == "--permission-mode"));
         assert_eq!(&spec.args[4..], &["--model", "haiku", "--", "-do it"]);
+        for (mode, flag) in [
+            (ClaudeMode::AcceptEdits, "acceptEdits"),
+            (ClaudeMode::Plan, "plan"),
+            (ClaudeMode::Bypass, "bypassPermissions"),
+        ] {
+            let mut c = ctx.clone();
+            c.permissions = Permissions {
+                codex_sandbox: CodexSandbox::FullAccess,
+                claude_mode: mode,
+            };
+            let a = ClaudeAdapter.command(&c).unwrap().args;
+            let i = a.iter().position(|x| x == "--permission-mode").unwrap();
+            assert_eq!(a[i + 1], flag);
+            assert_eq!(a.iter().filter(|x| *x == "--permission-mode").count(), 1);
+            assert!(!a.iter().any(|x| x.contains("dangerously")));
+            assert!(i < a.iter().position(|x| x == "--model").unwrap());
+        }
         let mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("claude-mcp.json")).unwrap())
                 .unwrap();

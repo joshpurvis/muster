@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::model::{AgentState, Decision, SessionId, SessionKind, StateUpdate};
+use crate::model::{AgentState, Decision, Permissions, SessionId, SessionKind, StateUpdate};
 
 pub mod claude;
 pub mod codex;
@@ -29,6 +29,8 @@ pub struct SpawnCtx {
     pub extra_args: Vec<String>,
     /// Optional initial prompt (adapters may pass it on the command line instead of injecting).
     pub initial_prompt: Option<String>,
+    /// The channel's permission profile (chosen by the human), mapped to CLI flags.
+    pub permissions: Permissions,
 }
 
 #[derive(Debug, Clone)]

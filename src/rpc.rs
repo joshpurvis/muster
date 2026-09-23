@@ -120,6 +120,15 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             hub.archive_channel(p.id, p.remove_worktree).await?;
             Ok(json!({}))
         }
+        "channel.set_permissions" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: ChannelId,
+                permissions: PermissionsInput,
+            }
+            let p: P = parse(params)?;
+            to_value(hub.set_permissions(p.id, p.permissions.into())?)
+        }
         "channel.set_layout" => {
             #[derive(Deserialize)]
             struct P {
@@ -132,8 +141,14 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             Ok(json!({}))
         }
         "channel.mark_read" => {
-            let p: IdParam<ChannelId> = parse(params)?;
-            hub.mark_read(p.id)?;
+            #[derive(Deserialize)]
+            struct P {
+                id: ChannelId,
+                #[serde(default)]
+                at: Option<i64>,
+            }
+            let p: P = parse(params)?;
+            hub.mark_read(p.id, p.at)?;
             Ok(json!({}))
         }
         "channel.reorder" => {
@@ -415,7 +430,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
             Message::Binary(data) => {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-                    if let Err(e) = hub.write_client_input(id, &data[5..]) {
+                    if let Err(e) = hub.write_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");
                     }
                 }
@@ -461,7 +476,7 @@ async fn handle_request(
             }
             // Subscribe to the bus before snapshotting so a restart can't slip between.
             let bus = hub.subscribe();
-            match hub.attach(id) {
+            match hub.attach(id).await {
                 Ok(att) => {
                     // Result first, then the replay frame, then live frames (all through the
                     // same ordered outbox, all queued before this call returns).
@@ -562,7 +577,7 @@ async fn resend_replay(
     rx: &mut Option<broadcast::Receiver<Bytes>>,
     out: &Outbox,
 ) -> bool {
-    let (replay, new_rx, new_gen) = match hub.attach(id) {
+    let (replay, new_rx, new_gen) = match hub.attach(id).await {
         Ok(Attach::Live(r, rx, g)) => (r, Some(rx), Some(g)),
         Ok(Attach::Replay(r)) => (r, None, None),
         Err(_) => return false,

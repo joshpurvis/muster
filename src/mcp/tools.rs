@@ -70,7 +70,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "whoami",
             "Who am I",
-            "Describe the calling session: its id, kind, channel, workspace, working directory, git branch, parent, and remaining spawn budget. Call this first to orient yourself.",
+            "Describe the calling session: its id, kind, channel (including its agent permission profile: Codex sandbox and Claude permission mode, set by the human), workspace, working directory, git branch, parent, and remaining spawn budget. Call this first to orient yourself.",
             empty_schema(),
             true,
         ),
@@ -97,7 +97,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_agent",
             "Spawn agent",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -307,6 +307,20 @@ fn channel_json(c: &Channel, ws: Option<&Workspace>) -> Value {
         "cwd": c.cwd,
         "branch": c.branch,
         "base_branch": c.base_branch,
+        "permissions": permissions_json(&c.permissions),
+    })
+}
+
+/// The channel's agent permission profile, with the CLI flags it maps to, so agents know what
+/// they and their children may do. Only the human can change it.
+fn permissions_json(p: &Permissions) -> Value {
+    let codex = crate::agents::codex::sandbox_args(p.codex_sandbox);
+    json!({
+        "codex_sandbox": p.codex_sandbox,
+        "claude_mode": p.claude_mode,
+        "codex_flags": codex.join(" "),
+        "claude_permission_mode": crate::agents::claude::permission_mode(p.claude_mode).unwrap_or("user default"),
+        "set_by": "human (muster UI); agents can't change it",
     })
 }
 
@@ -442,6 +456,42 @@ fn check_no_shell_escape<B: Backend>(
         return Err(format!(
             "a message starting with `!` runs as a shell command in {}, which agents may not do. Rephrase it. {HOW_SHELL}",
             kind.as_str()
+        ));
+    }
+    Ok(())
+}
+
+const HOW_PERMS: &str = "Only the human can grant that: ask them to change your channel's permissions, or to run it themselves.";
+
+/// Agents can't reach an agent of `kind` that runs with more than they have: spawning into, or
+/// messaging a session in, a channel whose profile is more permissive (for that kind of agent)
+/// than the caller's channel is refused.
+fn check_not_more_permissive<B: Backend>(
+    st: &McpState<B>,
+    me: &SessionInfo,
+    target: &Channel,
+    kind: SessionKind,
+) -> Result<(), String> {
+    let mine = st
+        .backend
+        .channel(me.channel_id)
+        .map(|c| c.permissions)
+        .ok_or("your channel no longer exists")?;
+    if target.id != me.channel_id && target.permissions.exceeds_for(&mine, kind) {
+        return Err(format!(
+            "channel {} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
+            target.id,
+            kind.as_str(),
+            match kind {
+                SessionKind::Codex => format!(
+                    "sandbox {:?} vs {:?}",
+                    target.permissions.codex_sandbox, mine.codex_sandbox
+                ),
+                _ => format!(
+                    "mode {:?} vs {:?}",
+                    target.permissions.claude_mode, mine.claude_mode
+                ),
+            }
         ));
     }
     Ok(())
@@ -598,6 +648,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
     };
     if let Some(ch) = &target_channel {
         check_channel_reach(st, caller, ch)?;
+        check_not_more_permissive(st, &me, ch, kind)?;
     }
 
     // Serialize spawns so concurrent calls can't overshoot the limits.
@@ -655,6 +706,10 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
                 base: nc.str("base")?.map(str::to_string),
                 agent: None,
                 prompt: None,
+                // Never more than the caller has: the new channel gets the caller's profile.
+                permissions: Some(my_ch.permissions),
+                cols: crate::hub::default_cols(),
+                rows: crate::hub::default_rows(),
             })
         })();
         let req = parsed.inspect_err(|_| refund())?;
@@ -731,6 +786,12 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let info = reachable_session(st, caller, target)?;
+    if let (Some(me), Some(ch)) = (
+        st.backend.session(caller),
+        st.backend.channel(info.channel_id),
+    ) {
+        check_not_more_permissive(st, &me, &ch, info.kind)?;
+    }
     if info.kind == SessionKind::Shell && !st.limits.allow_shell {
         return Err(format!(
             "session {target} is a shell: a message would run as a shell command, which agents may not do. {HOW_SHELL}"

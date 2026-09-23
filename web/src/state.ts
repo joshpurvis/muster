@@ -242,6 +242,7 @@ export type Overlay =
   | { kind: "new_channel"; workspaceId?: number }
   | { kind: "add_workspace" }
   | { kind: "shortcuts" }
+  | { kind: "permissions"; channelId: number }
   | {
     kind: "confirm";
     title: string;
@@ -517,23 +518,27 @@ function removeChannel(id: ChannelId) {
 
 // ---------------- read tracking ----------------
 
-// One pending mark per channel: switching channels quickly must not drop the first one.
-const readTimers = new Map<ChannelId, number>();
+// One pending mark per channel: switching channels quickly must not drop the first one. Each
+// mark while one is pending moves its `seenAt` forward (what was on screen at the latest look).
+const readTimers = new Map<ChannelId, { timer: number; seenAt: number }>();
 function markReadSoon(ch: ChannelId) {
-  if (readTimers.has(ch)) return;
   // What was on screen when we looked counts as read; events after that (e.g. after leaving
   // the channel within the delay) stay unread.
-  const seenAt = Date.now();
-  readTimers.set(
-    ch,
-    setTimeout(() => {
-      readTimers.delete(ch);
-      const c = channelById.value.get(ch);
-      if (!c || c.last_read_at >= seenAt) return;
-      channels.value = upsertBy(channels.value, { ...c, last_read_at: seenAt });
-      rpc.call("channel.mark_read", { id: ch }).catch(() => {});
-    }, 600),
-  );
+  const pending = readTimers.get(ch);
+  if (pending) {
+    pending.seenAt = Date.now();
+    return;
+  }
+  const entry = { timer: 0, seenAt: Date.now() };
+  entry.timer = setTimeout(() => {
+    readTimers.delete(ch);
+    const seenAt = entry.seenAt;
+    const c = channelById.value.get(ch);
+    if (!c || c.last_read_at >= seenAt) return;
+    channels.value = upsertBy(channels.value, { ...c, last_read_at: seenAt });
+    rpc.call("channel.mark_read", { id: ch, at: seenAt }).catch(() => {});
+  }, 600);
+  readTimers.set(ch, entry);
 }
 
 export function markRead(ch: ChannelId) {

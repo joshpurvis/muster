@@ -38,7 +38,22 @@ export interface Channel {
   created_at: number;
   last_read_at: number;
   sort_order: number;
+  /** Agent permission profile (set by the human only). Missing from old daemons. */
+  permissions?: Permissions;
 }
+
+export type CodexSandbox = "read_only" | "workspace_write" | "workspace_write_network" | "full_access";
+export type ClaudeMode = "default" | "accept_edits" | "plan" | "bypass";
+
+export interface Permissions {
+  codex_sandbox: CodexSandbox;
+  claude_mode: ClaudeMode;
+}
+
+export const DEFAULT_PERMISSIONS: Permissions = {
+  codex_sandbox: "workspace_write",
+  claude_mode: "default",
+};
 
 export interface SessionInfo {
   id: SessionId;

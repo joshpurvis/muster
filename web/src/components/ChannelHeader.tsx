@@ -6,6 +6,7 @@ import { IconButton, InlineEdit } from "./common.tsx";
 import { type MenuItem, openMenuAt } from "./Menu.tsx";
 import { spawnMenuItems } from "../layout/Pane.tsx";
 import { confirmArchive } from "./Sidebar.tsx";
+import { PermissionChip } from "./Permissions.tsx";
 import {
   IconArchive,
   IconBranch,
@@ -18,6 +19,7 @@ import {
   IconPencil,
   IconPlus,
   IconRestart,
+  IconShield,
   IconSplitDown,
   IconSplitRight,
   IconTimeline,
@@ -51,6 +53,11 @@ export function ChannelHeader({ c }: { c: Channel }) {
         run: () => A.copy(c.branch!, "Branch copied"),
       }]
       : []),
+    {
+      label: "Permissions…",
+      icon: <IconShield size={14} />,
+      run: () => A.openPermissions(c.id),
+    },
     {
       label: "Restart exited sessions",
       icon: <IconRestart size={14} />,
@@ -102,6 +109,7 @@ export function ChannelHeader({ c }: { c: Channel }) {
       </div>
       <div class="ch-meta">
         {ws && <span class="chip chip-ws" data-tip={ws.path}>{ws.name}</span>}
+        <PermissionChip c={c} />
         {c.branch && (
           <button
             type="button"

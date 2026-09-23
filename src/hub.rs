@@ -68,6 +68,18 @@ pub struct CreateChannel {
     pub agent: Option<SessionKind>,
     /// Initial prompt for that agent.
     pub prompt: Option<String>,
+    /// Agent permission profile. Default: the CLIs' own defaults (see `Permissions`).
+    #[serde(default, deserialize_with = "de_permissions")]
+    pub permissions: Option<Permissions>,
+    /// Terminal size for that first agent (what the client will show it at).
+    #[serde(default = "default_cols")]
+    pub cols: u16,
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+}
+
+fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permissions>, D::Error> {
+    Ok(Option::<PermissionsInput>::deserialize(d)?.map(Into::into))
 }
 
 fn yes() -> bool {
@@ -93,10 +105,10 @@ pub struct SpawnSession {
     pub parent_id: Option<SessionId>,
 }
 
-fn default_cols() -> u16 {
+pub fn default_cols() -> u16 {
     120
 }
-fn default_rows() -> u16 {
+pub fn default_rows() -> u16 {
     32
 }
 
@@ -184,8 +196,13 @@ pub struct Hub {
     inner: Mutex<Inner>,
     generation: AtomicU64,
     shutting_down: AtomicBool,
+    /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
+    /// 2 MiB), keyed by session and the log's (length, mtime).
+    replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
     weak: Weak<Hub>,
 }
+
+const REPLAY_CACHE_MAX: usize = 8;
 
 impl Hub {
     /// Load persisted state. Sessions that were running when the previous daemon died are
@@ -193,24 +210,31 @@ impl Hub {
     pub fn new(cfg: HubConfig, store: Store) -> anyhow::Result<Arc<Hub>> {
         // Processes that outlived a crashed daemon (or ignored SIGHUP, or were left behind by
         // an exited shell) would otherwise keep running unmanaged next to a restarted copy.
+        // Waits until they are gone (a few seconds at most, and only if there are any); the
+        // records of sessions whose processes survive are kept for the next start.
         let url = format!("MUSTER_URL=http://127.0.0.1:{}", cfg.port);
-        pty::reap_leftovers(
+        let survivors = pty::reap_leftovers(
             store
                 .session_sids()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(id, sid, marker)| {
-                    // The per-run token marks that run's processes (whatever port it used); rows
-                    // from before markers were stored fall back to this daemon's URL.
-                    (
-                        sid,
-                        id,
-                        vec![format!("MUSTER_SESSION_ID={id}"), marker.unwrap_or_else(|| url.clone())],
-                    )
+                .map(|(id, sid, mut markers)| {
+                    // The per-run marker identifies that run's processes (whatever port it
+                    // used); rows from before markers were stored fall back to this daemon's URL.
+                    if markers.is_empty() {
+                        markers.push(url.clone());
+                    }
+                    let own = format!("MUSTER_SESSION_ID={id}");
+                    if !markers.contains(&own) {
+                        markers.push(own);
+                    }
+                    (sid, id, markers)
                 })
                 .collect(),
         );
-        let _ = store.clear_session_sids();
+        if let Err(e) = store.clear_session_sids(&survivors) {
+            tracing::warn!("clearing reaped process sessions: {e}");
+        }
         store.mark_all_exited("daemon restarted", now_ms())?;
         match store.prune_events(now_ms() - EVENT_MAX_AGE_MS, EVENTS_PER_CHANNEL) {
             Ok(n) if n > 0 => tracing::info!("pruned {n} old events"),
@@ -249,6 +273,7 @@ impl Hub {
             inner: Mutex::new(inner),
             generation: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
+            replay_cache: Mutex::new(HashMap::new()),
             weak: weak.clone(),
         }))
     }
@@ -421,16 +446,6 @@ impl Hub {
         }
     }
 
-    /// Keyboard input from an attached client's terminal (`0x02` frames). Answers to terminal
-    /// queries are dropped: the daemon answers those itself.
-    pub fn write_client_input(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
-        match self.pty(id) {
-            Some(p) => p.write_client(bytes),
-            None if self.session(id).is_some() => anyhow::bail!("session {id} is not running"),
-            None => anyhow::bail!("no such session: {id}"),
-        }
-    }
-
     /// Generation of the session's current process (changes on every restart), if it has one
     /// this daemon run.
     pub fn pty_generation(&self, id: SessionId) -> Option<u64> {
@@ -466,8 +481,9 @@ impl Hub {
         self.pty(id).map(|p| p.seq()).unwrap_or(0)
     }
 
-    /// Replay + live subscription for a client attach.
-    pub fn attach(&self, id: SessionId) -> anyhow::Result<Attach> {
+    /// Replay + live subscription for a client attach. For a session without a PTY the replay
+    /// is rebuilt from output.log off the async workers, and cached while the log is unchanged.
+    pub async fn attach(&self, id: SessionId) -> anyhow::Result<Attach> {
         if let Some(p) = self.pty(id) {
             let (replay, rx) = p.attach();
             return Ok(Attach::Live(replay, rx, p.generation));
@@ -475,11 +491,30 @@ impl Hub {
         let info = self
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        Ok(Attach::Replay(pty::log_replay(
-            &paths::session_dir(id).join("output.log"),
-            info.cols,
-            info.rows,
-        )))
+        let path = paths::session_dir(id).join("output.log");
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        if let Some((len, mtime)) = stamp
+            && let Some((l, m, b)) = self.replay_cache.lock().get(&id)
+            && *l == len
+            && *m == mtime
+        {
+            return Ok(Attach::Replay(b.to_vec()));
+        }
+        let (cols, rows) = (info.cols, info.rows);
+        let p2 = path.clone();
+        let data = tokio::task::spawn_blocking(move || pty::log_replay(&p2, cols, rows)).await?;
+        if let Some((len, mtime)) = stamp {
+            let mut c = self.replay_cache.lock();
+            if c.len() >= REPLAY_CACHE_MAX && !c.contains_key(&id) {
+                if let Some(k) = c.keys().next().copied() {
+                    c.remove(&k);
+                }
+            }
+            c.insert(id, (len, mtime, Bytes::from(data.clone())));
+        }
+        Ok(Attach::Replay(data))
     }
 
     /// Apply a state change with precedence rules:
@@ -636,10 +671,30 @@ impl Hub {
         !p.is_alive() && p.is_drained() && p.log_persisted() && !p.has_processes()
     }
 
+    /// Release an exited process's PTY (and its in-memory ring) if it is releasable and its
+    /// exit has been recorded. Called after each of the events that can make it releasable
+    /// (exit recorded, reader drained, leftovers gone), each time after that event's state is
+    /// published, so whichever comes last sees all of them.
+    fn try_release(&self, id: SessionId, generation: u64) {
+        let Some(p) = self.pty(id).filter(|p| p.generation == generation) else {
+            return;
+        };
+        if !Self::releasable(&p) {
+            return;
+        }
+        let mut g = self.inner.lock();
+        // Only after `pty_exited` recorded the exit: it treats a missing PTY as "not installed
+        // yet" and would otherwise drop the exit.
+        if let Some(e) = g.sessions.get_mut(&id)
+            && e.generation == generation
+            && e.info.exit_code.is_some()
+            && e.pty.as_ref().is_some_and(|q| Arc::ptr_eq(q, &p))
+        {
+            e.pty = None;
+        }
+    }
+
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
-        let release = self
-            .pty(id)
-            .is_some_and(|p| p.generation == generation && Self::releasable(&p));
         let channel_id = {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else {
@@ -655,12 +710,6 @@ impl Hub {
             e.info.exit_code = Some(code);
             e.info.pid = None;
             e.info.queued = 0;
-            // Release the PTY and its in-memory ring once output.log holds the scrollback and
-            // no leftover process holds the terminal (the PTY is needed to kill those);
-            // replay/screen for exited sessions are served from the log.
-            if release && e.pty.as_ref().is_some_and(|p| p.generation == generation) {
-                e.pty = None;
-            }
             let token = e.token.take();
             let ch = e.info.channel_id;
             if let Some(t) = token {
@@ -668,6 +717,8 @@ impl Hub {
             }
             ch
         };
+        // Replay/screen for exited sessions are served from the log once the PTY is released.
+        self.try_release(id, generation);
         let detail = if self.shutting_down.load(Ordering::SeqCst) {
             "daemon stopped".to_string()
         } else {
@@ -695,22 +746,7 @@ impl Hub {
     /// The reader of a PTY saw EOF (nothing holds the terminal any more). Releases the PTY
     /// of an exited process.
     pub(crate) fn pty_drained(&self, id: SessionId, generation: u64) {
-        if !self
-            .pty(id)
-            .is_some_and(|p| p.generation == generation && Self::releasable(&p))
-        {
-            return;
-        }
-        let mut g = self.inner.lock();
-        // Only after `pty_exited` recorded the exit: it treats a missing PTY as "not installed
-        // yet" and would otherwise drop the exit.
-        if let Some(e) = g.sessions.get_mut(&id)
-            && e.generation == generation
-            && e.info.exit_code.is_some()
-            && e.pty.as_ref().is_some_and(|p| p.generation == generation)
-        {
-            e.pty = None;
-        }
+        self.try_release(id, generation);
     }
 
     // ----- mutations -----
@@ -841,6 +877,7 @@ impl Hub {
                 created_at: now,
                 last_read_at: now,
                 sort_order,
+                permissions: req.permissions.unwrap_or_default(),
             };
             ch.id = self.store.insert_channel(&ch)?;
             // Preferred block derives from the id; if an active channel already uses it
@@ -878,8 +915,8 @@ impl Hub {
                 cwd: None,
                 prompt: req.prompt.clone().filter(|p| !p.trim().is_empty()),
                 extra_args: Vec::new(),
-                cols: default_cols(),
-                rows: default_rows(),
+                cols: req.cols,
+                rows: req.rows,
                 parent_id: None,
             };
             if let Err(e) = self.spawn_session(spawn).await {
@@ -935,14 +972,25 @@ impl Hub {
         Ok(())
     }
 
+    /// Set a channel's agent permission profile (human only: the UI / RPC; never MCP). Applies
+    /// to sessions started or restarted afterwards.
+    pub fn set_permissions(&self, id: ChannelId, permissions: Permissions) -> anyhow::Result<Channel> {
+        if self.channel(id).is_some_and(|c| c.archived) {
+            anyhow::bail!("channel {id} is archived");
+        }
+        self.update_channel(id, true, |c| c.permissions = permissions)
+    }
+
     pub fn set_layout(&self, id: ChannelId, layout: serde_json::Value) -> anyhow::Result<()> {
         let layout = if layout.is_null() { None } else { Some(layout) };
         self.update_channel(id, false, |c| c.layout = layout).map(|_| ())
     }
 
-    pub fn mark_read(&self, id: ChannelId) -> anyhow::Result<Channel> {
+    /// Everything up to `at` (unix ms, default now; never later than now) has been seen.
+    pub fn mark_read(&self, id: ChannelId, at: Option<i64>) -> anyhow::Result<Channel> {
         let now = now_ms();
-        self.update_channel(id, true, |c| c.last_read_at = c.last_read_at.max(now))
+        let at = at.map_or(now, |a| a.min(now));
+        self.update_channel(id, true, |c| c.last_read_at = c.last_read_at.max(at))
     }
 
     pub fn reorder_channels(&self, ids: &[ChannelId]) -> anyhow::Result<()> {
@@ -1133,7 +1181,7 @@ impl Hub {
     /// The caller logs SessionStarted, then reports `early_exit` via `pty_exited`.
     fn start_process(self: &Arc<Self>, id: SessionId, prompt: Option<String>) -> anyhow::Result<Started> {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst);
-        let (info, extra_args, port_base) = {
+        let (info, extra_args, port_base, permissions) = {
             let mut g = self.inner.lock();
             let e = g
                 .sessions
@@ -1142,8 +1190,10 @@ impl Hub {
             e.generation = generation;
             e.early_exit = None;
             let (info, extra) = (e.info.clone(), e.extra_args.clone());
-            let port_base = g.channels.get(&info.channel_id).map(|c| c.port_base).unwrap_or(20000);
-            (info, extra, port_base)
+            let ch = g.channels.get(&info.channel_id);
+            let port_base = ch.map(|c| c.port_base).unwrap_or(20000);
+            let permissions = ch.map(|c| c.permissions).unwrap_or_default();
+            (info, extra, port_base, permissions)
         };
         let token = paths::random_token();
         let session_dir = paths::session_dir(id);
@@ -1157,6 +1207,7 @@ impl Hub {
             session_dir: session_dir.clone(),
             extra_args,
             initial_prompt: prompt,
+            permissions,
         };
         let spec = adapter_for(info.kind).command(&ctx)?;
         let mut env: BTreeMap<String, String> = BTreeMap::new();
@@ -1165,6 +1216,9 @@ impl Hub {
         env.insert("MUSTER_CHANNEL_ID".into(), info.channel_id.to_string());
         env.insert("MUSTER_URL".into(), self.daemon_url());
         env.insert("MUSTER_TOKEN".into(), token.clone());
+        // Non-secret per-run marker: recognizes this run's processes when reaping leftovers.
+        // (Agent CLIs may strip MUSTER_TOKEN from the commands they run; Codex does by default.)
+        env.insert("MUSTER_RUN".into(), paths::random_token()[..16].to_string());
         env.insert("MUSTER_BIN".into(), self.cfg.muster_bin.to_string_lossy().to_string());
         env.insert("PORT".into(), port_base.to_string());
         env.insert("MUSTER_PORT_BASE".into(), port_base.to_string());
@@ -1214,10 +1268,7 @@ impl Hub {
             e.info.exit_code = None;
             e.info.queued = 0;
             e.info.title = None;
-            if let Err(err) = self
-                .store
-                .set_session_sid(id, pty.pid, Some(&format!("MUSTER_TOKEN={token}")))
-            {
+            if let Err(err) = self.store.set_session_sid(id, pty.pid, pty.markers()) {
                 tracing::warn!(session = id, "persisting session id: {err}");
             }
             let early = e.early_exit.take();
@@ -1274,14 +1325,49 @@ impl Hub {
         if let Some(p) = self.pty(id) {
             // Also reaps leftovers (background jobs) of an already exited process.
             p.kill();
-        }
-        if let Some(p) = self.pty(id)
-            && p.is_alive()
-        {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
             while p.is_alive() || self.session(id).is_some_and(|s| s.state != AgentState::Exited) {
                 if tokio::time::Instant::now() > deadline {
                     anyhow::bail!("session {id} did not exit");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Leftovers (e.g. a dev server still holding the channel's port) must be gone before
+            // the new process starts: wait out the kill's grace period, then SIGKILL.
+            let deadline = tokio::time::Instant::now() + pty::KILL_GRACE;
+            loop {
+                let q = p.clone();
+                let busy = tokio::task::spawn_blocking(move || q.has_processes())
+                    .await
+                    .unwrap_or(false);
+                if !busy {
+                    break;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    let q = p.clone();
+                    let _ = tokio::task::spawn_blocking(move || q.kill_now()).await;
+                    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+                    let mut gone = false;
+                    while tokio::time::Instant::now() < end {
+                        let q = p.clone();
+                        if !tokio::task::spawn_blocking(move || q.has_processes())
+                            .await
+                            .unwrap_or(false)
+                        {
+                            gone = true;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // The new process's record replaces this one: keep the survivors' for the
+                    // next start's reaper (and keep trying meanwhile).
+                    if !gone && let Some(sid) = p.pid {
+                        if let Err(e) = self.store.add_reap(id, sid, p.markers()) {
+                            tracing::warn!(session = id, "recording pending reap: {e}");
+                        }
+                        self.confirm_reap(id, sid, p.clone());
+                    }
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1377,6 +1463,19 @@ impl Hub {
             p.discard();
             // Also reaps leftovers (background jobs) of an already exited process.
             p.kill();
+            // Until the kill is confirmed, remember the process session: if the daemon stops
+            // during the grace period, the next start reaps what ignored SIGHUP.
+            // (Whether any are left is checked by `confirm_reap`, off the async workers.)
+            if let Some(sid) = p.pid
+                && !p.markers().is_empty()
+            {
+                if let Err(e) = self.store.add_reap(id, sid, p.markers()) {
+                    tracing::warn!(session = id, "recording pending reap: {e}");
+                }
+                self.confirm_reap(id, sid, p.clone());
+            }
+        } else if let Err(e) = self.store.keep_sid_for_reap(id) {
+            tracing::warn!(session = id, "keeping recorded process session: {e}");
         }
         if let Err(e) = self.store.delete_session(id) {
             tracing::warn!(session = id, "deleting session: {e}");
@@ -1385,8 +1484,34 @@ impl Hub {
             tracing::warn!(session = id, "deleting session events: {e}");
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
+        self.replay_cache.lock().remove(&id);
         self.emit(ServerEvent::SessionRemoved { id });
         Ok(())
+    }
+
+    /// Wait (off the async workers) for a removed session's processes to die, SIGKILL them after
+    /// the grace period, then drop the pending-reap record once none are left.
+    fn confirm_reap(&self, id: SessionId, sid: u32, p: Arc<PtySession>) {
+        let weak = self.weak.clone();
+        let _ = std::thread::Builder::new().name(format!("reap-{id}")).spawn(move || {
+            let deadline = std::time::Instant::now() + pty::KILL_GRACE + Duration::from_millis(500);
+            while p.has_processes() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if p.has_processes() {
+                p.kill_now();
+                let end = std::time::Instant::now() + Duration::from_secs(1);
+                while p.has_processes() && std::time::Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if !p.has_processes()
+                && let Some(hub) = weak.upgrade()
+                && let Err(e) = hub.store.remove_reap(id, sid)
+            {
+                tracing::warn!(session = id, "clearing pending reap: {e}");
+            }
+        });
     }
 
     pub fn rename_session(&self, id: SessionId, name: String) -> anyhow::Result<SessionInfo> {
@@ -1452,6 +1577,10 @@ impl Hub {
     pub fn flush_logs(&self) {
         for p in self.all_ptys() {
             p.flush_log();
+            // Exited processes whose leftovers died since: release their PTY now.
+            if !p.is_alive() {
+                self.try_release(p.id, p.generation);
+            }
         }
     }
 

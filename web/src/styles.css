@@ -3682,3 +3682,194 @@ textarea {
   font-size: 11px;
   margin: 0 2px;
 }
+
+/* ---------- channel permissions ---------- */
+
+.perm-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.perm-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.perm-seg .seg-btn {
+  padding: 0 8px;
+  font-size: 12px;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.perm-seg .seg-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Dangerous choices read as such before and after they're picked. */
+.perm-seg .seg-btn.seg-danger:not(.on) {
+  color: color-mix(in srgb, var(--st-error) 70%, var(--text-muted));
+}
+
+.perm-seg .seg-btn.seg-danger.on {
+  background: color-mix(in srgb, var(--st-error) 22%, var(--bg-overlay));
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--st-error) 55%, transparent);
+}
+
+.perm-warn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--st-error);
+}
+
+.perm-warn .icon {
+  flex: none;
+}
+
+.perm-note {
+  line-height: 1.45;
+}
+
+.perm-section {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  background: var(--bg-1);
+}
+
+.perm-disclosure {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 0 10px;
+  text-align: left;
+  border-radius: var(--r);
+}
+
+.perm-disclosure:hover {
+  background: var(--hover);
+}
+
+.perm-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.perm-disc-chev {
+  display: inline-flex;
+  color: var(--text-faint);
+  transition: transform var(--t) var(--ease);
+}
+
+.perm-section.open .perm-disc-chev {
+  transform: rotate(90deg);
+}
+
+.perm-summary {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.perm-summary.elevated {
+  color: var(--st-attn);
+}
+
+.perm-summary.danger {
+  color: var(--st-error);
+}
+
+.perm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 12px 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.dlg-foot-left {
+  margin-right: auto;
+}
+
+.chip-perm {
+  flex: none;
+}
+
+.chip-perm.elevated {
+  color: var(--st-attn);
+  background: var(--attn-bg);
+}
+
+.chip-perm.danger {
+  color: var(--st-error);
+  background: color-mix(in srgb, var(--st-error) 13%, transparent);
+}
+
+button.chip-perm.elevated:hover {
+  color: var(--st-attn);
+  background: color-mix(in srgb, var(--st-attn) 20%, transparent);
+}
+
+button.chip-perm.danger:hover {
+  color: var(--st-error);
+  background: color-mix(in srgb, var(--st-error) 20%, transparent);
+}
+
+/* The permission chip gets its own column after the workspace chip. */
+.ch-meta:has(> .chip-perm) {
+  grid-template-columns: auto auto minmax(0, max-content) minmax(0, 1fr);
+}
+
+.ch-meta > .chip-perm {
+  grid-column: 2;
+}
+
+.ch-meta:has(> .chip-perm) > .chip-branch {
+  grid-column: 3;
+}
+
+.ch-meta:has(> .chip-perm) > .chip-path {
+  grid-column: 4;
+}
+
+/* Narrow headers: the chip keeps its icon (and tooltip) only. */
+@container (max-width: 900px) {
+  .ch-meta .chip-perm > span {
+    display: none;
+  }
+}
+
+/* Tall dialogs (New channel with permissions open) scroll their body, head and foot stay. */
+.dialog-scroll {
+  overflow: hidden;
+}
+
+.dialog-scroll form {
+  flex: 1 1 auto;
+}
+
+.dialog-scroll .dlg-body {
+  overflow-y: auto;
+  min-height: 0;
+  padding-bottom: 12px;
+}
+
+/* Content scrolling under the head fades out instead of butting against it. */
+.dialog-scroll .dlg-body {
+  mask-image: linear-gradient(to bottom, transparent 0, #000 12px);
+}

@@ -85,16 +85,40 @@ and targets in them are refused.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
-| `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `state` (aggregate), `sessions`, `live_sessions`. |
+| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd, `permissions`), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
+| `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `permissions`, `state` (aggregate), `sessions`, `live_sessions`. |
 | `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, parent_id, title, exit_code, is_me. |
-| `spawn_agent` | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `channel_id?` **or** `new_channel?: {name, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. `new_channel` is created in the caller's workspace. `kind: shell` with a `prompt` is refused unless shell commands are allowed. |
+| `spawn_agent` | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `channel_id?` **or** `new_channel?: {name, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. `new_channel` is created in the caller's workspace, with the caller's channel's permission profile. `kind: shell` with a `prompt` is refused unless shell commands are allowed. |
 | `send_message` | `session_id`, `text`, `interrupt? = false` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
 | `get_recent_output` | `session_id`, `lines? = 100` (max 2000) | Last N lines, ANSI stripped. |
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
+
+### Permissions
+
+Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see
+PROTOCOL.md): `codex_sandbox` (`read_only`, `workspace_write`, `workspace_write_network`,
+`full_access`) and `claude_mode` (`default`, `accept_edits`, `plan`, `bypass`). Every agent in
+the channel starts with it, including ones spawned through MCP:
+
+- `spawn_agent` always uses the target channel's profile. It has no argument to ask for more
+  (unknown arguments are ignored), and no tool changes a profile.
+- An agent can't use a sibling channel's wider profile: `spawn_agent` with a `channel_id` whose
+  profile gives that `kind` more than the caller's own channel does (Codex: `codex_sandbox`,
+  Claude: `claude_mode`, ordered `read_only < workspace_write < workspace_write_network <
+  full_access` and `plan < default < accept_edits < bypass`) is refused, and so is
+  `send_message` to an agent running in such a channel. Shells aren't governed by the profile.
+  Spawning into or messaging an equal or narrower channel is fine.
+- A `new_channel` created through `spawn_agent` gets the **caller's** channel profile, never
+  more (and never the defaults if the caller has less).
+- `whoami` and `list_channels` show each channel's `permissions` as
+  `{codex_sandbox, claude_mode, codex_flags, claude_permission_mode, set_by}`, so an agent knows
+  whether a child could, say, reach the network before it spawns one. If a task needs more, the
+  agent should ask the human to change the channel's permissions (or post to the channel).
+- The profile is not a sandbox around muster itself: see "Limits" under "Channel permissions"
+  in PROTOCOL.md (a networked or unsandboxed agent can read the client token).
 
 ### wait_for_state semantics
 

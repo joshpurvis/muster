@@ -380,15 +380,27 @@ function Diff({ c }: { c: Channel }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const bodyRef = useRef<HTMLDivElement>(null);
 
+  // Only the latest request for the channel on screen may set the state: a slow answer for the
+  // previous channel (or an older refresh) is dropped.
+  const reqSeq = useRef(0);
   const load = () => {
+    const my = ++reqSeq.current;
+    const id = c.id;
+    const current = () => my === reqSeq.current;
     setState((s) => ({ ...s, loading: true }));
-    rpc.call<{ diff: string }>("channel.diff", { id: c.id })
-      .then((r) => setState({ loading: false, files: parseDiff(r.diff ?? ""), raw: r.diff }))
+    rpc.call<{ diff: string }>("channel.diff", { id })
+      .then((r) => current() && setState({ loading: false, files: parseDiff(r.diff ?? ""), raw: r.diff }))
       .catch((e) =>
+        current() &&
         setState({ loading: false, files: null, error: e instanceof Error ? e.message : String(e) })
       );
   };
-  useEffect(load, [c.id]);
+  useEffect(() => {
+    setState({ loading: true, files: null });
+    setCollapsed(new Set());
+    load();
+    return () => void ++reqSeq.current;
+  }, [c.id]);
 
   const files = state.files ?? [];
   const tot = files.reduce((a, f) => ({ add: a.add + f.add, del: a.del + f.del }), { add: 0, del: 0 });

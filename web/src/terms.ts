@@ -26,9 +26,18 @@ interface Entry {
   queue: Uint8Array[];
   queued: number;
   raf: number;
-  /** Replayed scrollback is being parsed: drop the replies xterm generates for old
-   * terminal queries (DA, cursor reports) so they don't reach the live program as keys. */
-  replaying: boolean;
+  /** Fallback flush for hidden tabs (no rAF there). */
+  flushTimer: number;
+  /** The parser is inside replayed scrollback (between the in-band markers, see
+   * `writeReplay`): queries in it are old, so xterm must not answer them. Typing is never
+   * blocked. */
+  inReplay: boolean;
+  /** Ctrl+Shift+V: fallback clipboard read if no native paste event shows up. */
+  pasteTimer: number;
+  /** The fallback's clipboard read in flight; a native paste arriving meanwhile cancels it. */
+  pasteRead: { cancelled: boolean } | null;
+  /** Until then, a late native paste event is dropped (the fallback already pasted). */
+  pasteBlockUntil: number;
   attached: boolean;
   lastUse: number;
   resizeTimer: number;
@@ -162,20 +171,58 @@ function create(sid: number): Entry {
       return false;
     }
     if (plainCtrlShift && ev.code === "KeyV") {
-      // The browser's own paste event (Ctrl+Shift+V = paste as plain text) reaches xterm's
-      // textarea and pastes once; no clipboard permission needed. Just keep xterm from also
-      // sending ^V.
+      // Chromium turns Ctrl+Shift+V into a native paste event on xterm's textarea (no
+      // clipboard permission needed). WebKitGTK (the native window) may not: if no paste
+      // event arrives shortly, read the clipboard ourselves. Either way xterm must not also
+      // send ^V, and the text is pasted once.
+      if (ev.type === "keydown" && !ev.repeat) {
+        clearTimeout(entry.pasteTimer);
+        entry.pasteTimer = setTimeout(() => {
+          entry.pasteTimer = 0;
+          if (!navigator.clipboard?.readText) return;
+          const read = { cancelled: false };
+          entry.pasteRead = read;
+          const done = () => {
+            if (entry.pasteRead === read) entry.pasteRead = null;
+          };
+          navigator.clipboard.readText()
+            .then((t) => {
+              done();
+              if (read.cancelled || !t || entries.get(sid) !== entry) return;
+              term.paste(t);
+              // Only now can a late native paste be a duplicate.
+              entry.pasteBlockUntil = Date.now() + 1500;
+            })
+            .catch(done);
+        }, 50);
+      }
       return false;
     }
     return !shortcutMatcher(ev);
   });
 
+  el.addEventListener("paste", (ev) => {
+    if (entry.pasteTimer) {
+      // The native paste arrived in time: it does the pasting.
+      clearTimeout(entry.pasteTimer);
+      entry.pasteTimer = 0;
+    } else if (entry.pasteRead) {
+      // Late, but the fallback hasn't pasted yet: the native paste wins, the read is dropped.
+      entry.pasteRead.cancelled = true;
+      entry.pasteRead = null;
+    } else if (Date.now() < entry.pasteBlockUntil) {
+      // Too late: the clipboard fallback already pasted this.
+      entry.pasteBlockUntil = 0;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+    }
+  }, true);
+
+  installQueryHandlers(term, () => entry.inReplay, (v) => (entry.inReplay = v));
+
   const enc = new TextEncoder();
-  term.onData((d) => {
-    if (!entry.replaying) rpc.sendInput(sid, enc.encode(d));
-  });
+  term.onData((d) => rpc.sendInput(sid, enc.encode(d)));
   term.onBinary((d) => {
-    if (entry.replaying) return;
     const b = new Uint8Array(d.length);
     for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 0xff;
     rpc.sendInput(sid, b);
@@ -195,7 +242,11 @@ function create(sid: number): Entry {
     queue: [],
     queued: 0,
     raf: 0,
-    replaying: false,
+    flushTimer: 0,
+    inReplay: false,
+    pasteTimer: 0,
+    pasteRead: null,
+    pasteBlockUntil: 0,
     attached: false,
     lastUse: Date.now(),
     resizeTimer: 0,
@@ -204,6 +255,51 @@ function create(sid: number): Entry {
   };
   entries.set(sid, entry);
   return entry;
+}
+
+/** In-band markers around replayed scrollback. The parser reaches them in stream order, so the
+ * "inside a replay" flag is exact however writes and replays interleave. The nonce keeps
+ * program output from toggling it. */
+const REPLAY_OSC = 7717;
+const REPLAY_NONCE = Math.random().toString(36).slice(2, 10);
+const REPLAY_START = `\x1b]${REPLAY_OSC};${REPLAY_NONCE};start\x07`;
+const REPLAY_END = `\x1b]${REPLAY_OSC};${REPLAY_NONCE};end\x07`;
+
+/** Terminal query answers. The daemon answers device attributes (DA1/DA2) and status/cursor
+ * reports (DSR 5/6, DECXCPR) itself, for every program output, whether or not a client is
+ * attached. xterm must never answer those too, or the program gets one extra reply per
+ * attached client (and old ones from every replay). Other queries only xterm can answer
+ * (colors, modes, settings) are answered live, but not inside a replay. */
+function installQueryHandlers(term: Terminal, inReplay: () => boolean, setReplay: (v: boolean) => void) {
+  const p = term.parser;
+  p.registerOscHandler(REPLAY_OSC, (data) => {
+    if (data === `${REPLAY_NONCE};start`) setReplay(true);
+    else if (data === `${REPLAY_NONCE};end`) setReplay(false);
+    return true;
+  });
+  // Always swallowed: the daemon is the only responder.
+  p.registerCsiHandler({ final: "c" }, () => true); // DA1 (primary; no prefix)
+  p.registerCsiHandler({ prefix: ">", final: "c" }, () => true); // DA2 (secondary)
+  p.registerCsiHandler({ final: "n" }, () => true); // DSR 5 (status), DSR 6 (cursor)
+  p.registerCsiHandler({ prefix: "?", final: "n" }, () => true); // DECXCPR (?6n)
+  // Answered by xterm live, swallowed while replaying old output.
+  p.registerCsiHandler({ intermediates: "$", final: "p" }, () => inReplay()); // DECRQM
+  p.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, () => inReplay());
+  p.registerDcsHandler({ intermediates: "$", final: "q" }, () => inReplay()); // DECRQSS
+  for (const osc of [4, 10, 11, 12]) {
+    // Color queries (`?`); color changes still apply during a replay.
+    p.registerOscHandler(osc, (data) => inReplay() && data.includes("?"));
+  }
+}
+
+function writeReplay(e: Entry, payload: Uint8Array) {
+  // RIS in the stream (not term.reset()) so output already handed to xterm is parsed first.
+  e.term.write("\x1bc");
+  if (payload.length) {
+    e.term.write(REPLAY_START);
+    e.term.write(payload);
+    e.term.write(REPLAY_END);
+  }
 }
 
 function sendResize(e: Entry, cols: number, rows: number, now = false) {
@@ -340,6 +436,13 @@ export function dispose(sid: number) {
   const e = entries.get(sid);
   if (!e) return;
   entries.delete(sid);
+  if (e.raf) cancelAnimationFrame(e.raf);
+  clearTimeout(e.flushTimer);
+  clearTimeout(e.pasteTimer);
+  clearTimeout(e.resizeTimer);
+  e.raf = e.flushTimer = e.pasteTimer = 0;
+  e.queue = [];
+  e.queued = 0;
   if (e.host) ro.unobserve(e.host);
   disableWebgl(e);
   e.term.dispose();
@@ -347,8 +450,10 @@ export function dispose(sid: number) {
 }
 
 function flush(e: Entry) {
-  e.raf = 0;
-  if (!e.queue.length) return;
+  if (e.raf) cancelAnimationFrame(e.raf);
+  clearTimeout(e.flushTimer);
+  e.raf = e.flushTimer = 0;
+  if (!e.queue.length || entries.get(e.sid) !== e) return;
   let data: Uint8Array;
   if (e.queue.length === 1) data = e.queue[0];
   else {
@@ -368,17 +473,13 @@ rpc.onBinary = (type, sid, payload) => {
   const e = entries.get(sid);
   if (!e) return;
   if (type === FRAME_REPLAY) {
+    // Output not yet handed to xterm is superseded by the replay.
     e.queue = [];
     e.queued = 0;
     if (e.raf) cancelAnimationFrame(e.raf);
-    e.raf = 0;
-    e.term.reset();
-    if (payload.length) {
-      e.replaying = true;
-      e.term.write(payload.slice(), () => {
-        e.replaying = false;
-      });
-    }
+    clearTimeout(e.flushTimer);
+    e.raf = e.flushTimer = 0;
+    writeReplay(e, payload.slice());
     return;
   }
   if (type !== FRAME_OUTPUT) return;
@@ -389,7 +490,7 @@ rpc.onBinary = (type, sid, payload) => {
   else if (!e.raf) {
     e.raf = requestAnimationFrame(() => flush(e));
     // Hidden tabs don't run rAF; make sure output still lands.
-    setTimeout(() => e.raf && flush(e), 250);
+    e.flushTimer = setTimeout(() => flush(e), 250);
   }
 };
 

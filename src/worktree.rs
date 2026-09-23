@@ -12,8 +12,19 @@ const MAX_DIFF_BYTES: usize = 4 * 1024 * 1024;
 /// code: no fsmonitor daemon command, no hooks (e.g. post-checkout on `worktree add`).
 const SAFE_CONFIG: &[&str] = &["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
 
+#[cfg(test)]
+static TEST_ENV: parking_lot::Mutex<Vec<(PathBuf, Vec<(String, String)>)>> = parking_lot::Mutex::new(Vec::new());
+
 fn git(cwd: &Path) -> Command {
     let mut c = Command::new("git");
+    // Tests give their own repos a private HOME / global config without touching the
+    // process environment (other tests run git concurrently).
+    #[cfg(test)]
+    for (prefix, env) in TEST_ENV.lock().iter() {
+        if cwd.starts_with(prefix) {
+            c.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
+    }
     c.args(SAFE_CONFIG)
         .arg("-C")
         .arg(cwd)
@@ -24,28 +35,89 @@ fn git(cwd: &Path) -> Command {
     c
 }
 
-/// `-c` overrides that disable every filter driver the repo configures
-/// (`filter.<name>.clean/smudge/process`): `.gitattributes` would otherwise make `diff` and
-/// `worktree add` run them.
+/// Config scopes a repository controls (a cloned or downloaded repo's own settings). Filter
+/// drivers from system/global config (e.g. git-lfs) are the user's own and stay in effect.
+const REPO_SCOPES: &[&str] = &["local", "worktree"];
+const FILTER_KEYS: &[&str] = &["clean", "smudge", "process", "required"];
+
+/// `-c` overrides for `git config --show-scope -z --get-regexp '^filter\.'` output: every
+/// filter driver defined (or redefined) in the repo's local/worktree config is neutralized
+/// (`.gitattributes` would otherwise make `diff` and `worktree add` run it). A driver that
+/// system/global config also defines gets those values back instead of the repo's.
+fn filter_overrides(listing: &[u8]) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // (name, key) -> last value outside the repo's scopes.
+    let mut user: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut repo_names: BTreeSet<String> = BTreeSet::new();
+    let mut it = listing.split(|b| *b == 0);
+    while let (Some(scope), Some(entry)) = (it.next(), it.next()) {
+        let scope = String::from_utf8_lossy(scope);
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, "true"));
+        let Some((name, k)) = key.strip_prefix("filter.").and_then(|r| r.rsplit_once('.')) else {
+            continue;
+        };
+        if REPO_SCOPES.contains(&scope.as_ref()) {
+            repo_names.insert(name.to_string());
+        } else {
+            user.insert((name.to_string(), k.to_ascii_lowercase()), value.to_string());
+        }
+    }
+    let mut args = Vec::new();
+    for n in repo_names {
+        for k in FILTER_KEYS {
+            let v = match user.get(&(n.clone(), k.to_string())) {
+                Some(v) => v.clone(),
+                None if *k == "required" => "false".to_string(),
+                None => String::new(),
+            };
+            args.push("-c".to_string());
+            args.push(format!("filter.{n}.{k}={v}"));
+        }
+    }
+    args
+}
+
+/// `-c` overrides that disable the filter drivers the repository itself configures. Fails
+/// closed: if the scoped listing isn't available (git < 2.26) or fails, every configured
+/// filter driver is disabled.
 async fn no_filters(cwd: &Path) -> Vec<String> {
-    let Ok(out) = git(cwd)
-        .args(["config", "--name-only", "--get-regexp", r"^filter\."])
+    let scoped = git(cwd)
+        .args(["config", "--show-scope", "-z", "--get-regexp", r"^filter\."])
+        .output()
+        .await;
+    match scoped {
+        Ok(out) if out.status.success() => return filter_overrides(&out.stdout),
+        // Exit 1: no matching keys.
+        Ok(out) if out.status.code() == Some(1) => return Vec::new(),
+        _ => {}
+    }
+    let names = match git(cwd)
+        .args(["config", "--name-only", "-z", "--get-regexp", r"^filter\."])
         .output()
         .await
-    else {
-        return Vec::new();
+    {
+        Ok(out) => out.stdout,
+        Err(_) => Vec::new(),
     };
-    let names = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            l.strip_prefix("filter.")
+    disable_all(&names)
+}
+
+/// Overrides that neutralize every filter driver in a `--name-only -z` listing.
+fn disable_all(names: &[u8]) -> Vec<String> {
+    let names: std::collections::BTreeSet<String> = names
+        .split(|b| *b == 0)
+        .filter_map(|k| {
+            String::from_utf8_lossy(k)
+                .strip_prefix("filter.")
                 .and_then(|r| r.rsplit_once('.'))
                 .map(|(n, _)| n.to_string())
         })
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect();
     let mut args = Vec::new();
     for n in names {
-        for (k, v) in [("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")] {
+        for k in FILTER_KEYS {
+            let v = if *k == "required" { "false" } else { "" };
             args.push("-c".to_string());
             args.push(format!("filter.{n}.{k}={v}"));
         }
@@ -285,6 +357,116 @@ mod tests {
             .filter(|n| n.starts_with("pwned"))
             .collect();
         assert!(hits.is_empty(), "repo config ran commands: {hits:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn filter_overrides_keep_user_drivers() {
+        let listing = b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0global\0filter.lfs.required\ntrue\0\
+local\0filter.evil.smudge\ntouch x\0local\0filter.lfs.smudge\nevil\0worktree\0filter.w.x.clean\nbad\0\
+system\0filter.sys.clean\nok\0local\0filter.bare.required\0";
+        let o = filter_overrides(listing);
+        let pairs: Vec<&str> = o
+            .chunks(2)
+            .map(|c| {
+                assert_eq!(c[0], "-c");
+                c[1].as_str()
+            })
+            .collect();
+        // Repo-defined drivers are neutralized; a redefined user driver gets the user's values.
+        for want in [
+            "filter.evil.clean=",
+            "filter.evil.smudge=",
+            "filter.evil.process=",
+            "filter.evil.required=false",
+            "filter.lfs.clean=git-lfs clean -- %f",
+            "filter.lfs.smudge=",
+            "filter.lfs.required=true",
+            "filter.w.x.clean=",
+            "filter.bare.required=false",
+        ] {
+            assert!(pairs.contains(&want), "{want} missing from {pairs:?}");
+        }
+        // Drivers only the user defines are left alone.
+        assert!(!pairs.iter().any(|p| p.starts_with("filter.sys.")));
+        assert_eq!(pairs.len(), 4 * 4);
+    }
+
+    #[test]
+    fn fallback_disables_every_driver() {
+        let o = disable_all(b"filter.lfs.clean\0filter.a.b.smudge\0");
+        assert_eq!(o.len(), 2 * 4 * 2);
+        assert!(o.contains(&"filter.lfs.clean=".to_string()));
+        assert!(o.contains(&"filter.a.b.required=false".to_string()));
+    }
+
+    #[tokio::test]
+    async fn global_filters_apply_repo_filters_dont() {
+        let base = std::env::temp_dir().join(format!("muster-wt-filters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let home = base.join("home");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let gcfg = home.join("gitconfig");
+        let pwned = base.join("pwned");
+        // A benign, globally configured LFS-like filter: stores "POINTER <content>", checks out
+        // the content. Plus a repo-local evil filter.
+        std::fs::write(
+            &gcfg,
+            "[filter \"fake\"]\n\tclean = sed -e 's/^/POINTER /'\n\tsmudge = sed -e 's/^POINTER //'\n\trequired = true\n",
+        )
+        .unwrap();
+        let env = vec![
+            ("HOME".to_string(), home.display().to_string()),
+            ("GIT_CONFIG_GLOBAL".to_string(), gcfg.display().to_string()),
+            ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ];
+        TEST_ENV.lock().push((base.clone(), env.clone()));
+        let run = |script: &str| {
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(&repo)
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{script}");
+        };
+        let p = pwned.display();
+        run(&format!(
+            "git init -q -b main && git config user.name t && git config user.email t@t && \
+             printf '*.bin filter=fake\\nevil.txt filter=evil\\n' > .gitattributes && \
+             printf 'data\\n' > a.bin && printf 'e\\n' > evil.txt && git add -A && git commit -qm init && \
+             git config filter.evil.clean 'touch {p}.clean; cat' && \
+             git config filter.evil.smudge 'touch {p}.smudge; cat' && \
+             printf 'x\\n' >> evil.txt"
+        ));
+        // The committed blob is the pointer; the work tree has the content.
+        let blob = std::process::Command::new("git")
+            .args(["-C", &repo.display().to_string(), "cat-file", "-p", "HEAD:a.bin"])
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&blob.stdout), "POINTER data\n");
+        let wt = create(&repo, &base.join("wts"), "x", None).await.unwrap();
+        // The global filter ran on checkout: content, not the pointer.
+        assert_eq!(std::fs::read_to_string(wt.path.join("a.bin")).unwrap(), "data\n");
+        // And diff doesn't report the filtered file as changed.
+        let d = diff(&repo, Some("main")).await.unwrap();
+        assert!(!d.contains("a.bin"), "{d}");
+        assert!(d.contains("+x"), "{d}");
+        let d = diff(&wt.path, Some("main")).await.unwrap();
+        assert!(!d.contains("a.bin"), "{d}");
+        let hits: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("pwned"))
+            .collect();
+        assert!(hits.is_empty(), "the repo's filter ran: {hits:?}");
+        TEST_ENV.lock().retain(|(b, _)| b != &base);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

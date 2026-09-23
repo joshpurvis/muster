@@ -7,16 +7,37 @@ use std::process::{Command, Stdio};
 
 use anyhow::Context;
 
-/// Open the UI at `url`. With the `gui` feature this runs the window's event loop and only
-/// returns (exits the process) when the window is closed.
-pub fn open(url: &str) -> anyhow::Result<()> {
+/// Open the UI of daemon `d`. With the `gui` feature this runs a native window (and only
+/// returns, by exiting the process, when it is closed); the window is handed the client token
+/// in-process and loads the plain URL, so no token or launch code ever goes into a URL or
+/// onto a command line. Otherwise (or with MUSTER_BROWSER set) a browser opens
+/// `browser_url()`, a single-use launch-code URL.
+pub fn open_ui(
+    d: &crate::paths::Discovery,
+    browser_url: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
     {
         if std::env::var_os("MUSTER_BROWSER").is_none() {
-            native::run(url);
+            native::run(&d.base_url(), &d.token, browser_url);
         }
     }
-    open_browser(url)
+    #[cfg(not(feature = "gui"))]
+    let _ = d;
+    open_browser(&browser_url()?)
+}
+
+/// Script run before the page's own scripts on every load of the native window: puts the
+/// client token where the frontend keeps it (rpc.ts reads `sessionStorage["muster.token"]`),
+/// only on the daemon's own origin.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn token_init_script(origin: &str, token: &str) -> String {
+    let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(function(){{try{{if(location.origin==={o}){{sessionStorage.setItem(\"muster.token\",{t});}}}}catch(e){{}}}})();",
+        o = q(origin),
+        t = q(token)
+    )
 }
 
 fn find_in_path(prog: &str) -> Option<PathBuf> {
@@ -89,7 +110,25 @@ mod native {
     use wry::{NewWindowResponse, WebViewBuilder};
 
     /// Runs the native window; never returns (tao's event loop exits the process).
-    pub fn run(url: &str) -> ! {
+    pub fn run(base_url: &str, token: &str, browser_url: impl FnOnce() -> anyhow::Result<String>) -> ! {
+        let origin = base_url.trim_end_matches('/').to_string();
+        let url = format!("{origin}/");
+        let mut browser_url = Some(browser_url);
+        let mut fallback = move |why: &str| -> ! {
+            eprintln!("muster: native window unavailable ({why}); opening a browser instead");
+            let r = browser_url
+                .take()
+                .map(|f| f())
+                .unwrap_or_else(|| Err(anyhow::anyhow!("no URL")));
+            let code = match r.and_then(|u| super::open_browser(&u)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("muster: {e:#}");
+                    1
+                }
+            };
+            std::process::exit(code)
+        };
         // WebKitGTK's DMA-BUF renderer dies with "Error 71 (Protocol error)" on many Wayland
         // setups (notably NVIDIA). Opt out unless the user chose otherwise.
         #[cfg(target_os = "linux")]
@@ -104,11 +143,11 @@ mod native {
             .build(&event_loop)
         {
             Ok(w) => w,
-            Err(e) => fallback(url, &e.to_string()),
+            Err(e) => fallback(&e.to_string()),
         };
-        let origin = url.split("/#").next().unwrap_or(url).trim_end_matches('/').to_string();
         let builder = WebViewBuilder::new()
-            .with_url(url)
+            .with_initialization_script(super::token_init_script(&origin, token))
+            .with_url(&url)
             .with_devtools(cfg!(debug_assertions))
             // Links that try to open a new window go to the system browser.
             .with_new_window_req_handler(|target, _features| {
@@ -132,12 +171,12 @@ mod native {
             use wry::WebViewBuilderExtUnix;
             match window.default_vbox() {
                 Some(vbox) => builder.build_gtk(vbox),
-                None => fallback(url, "no GTK container"),
+                None => fallback("no GTK container"),
             }
         };
         let webview = match webview {
             Ok(w) => w,
-            Err(e) => fallback(url, &e.to_string()),
+            Err(e) => fallback(&e.to_string()),
         };
 
         event_loop.run(move |event, _, control_flow| {
@@ -152,16 +191,14 @@ mod native {
             }
         })
     }
+}
 
-    fn fallback(url: &str, why: &str) -> ! {
-        eprintln!("muster: native window unavailable ({why}); opening a browser instead");
-        let code = match super::open_browser(url) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("muster: {e:#}");
-                1
-            }
-        };
-        std::process::exit(code)
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn token_script_is_scoped_and_quoted() {
+        let s = super::token_init_script("http://127.0.0.1:7433", "ab\"c");
+        assert!(s.contains(r#"location.origin==="http://127.0.0.1:7433""#), "{s}");
+        assert!(s.contains(r#"sessionStorage.setItem("muster.token","ab\"c")"#), "{s}");
     }
 }

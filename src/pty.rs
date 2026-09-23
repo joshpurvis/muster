@@ -29,7 +29,7 @@ use crate::model::{SessionId, now_ms};
 pub const RING_CAP: usize = 2 * 1024 * 1024;
 const SCROLLBACK_LINES: usize = 5000;
 const OUTPUT_BROADCAST_CAP: usize = 1024;
-const KILL_GRACE: Duration = Duration::from_secs(3);
+pub const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Input queued for a program that isn't reading its terminal is capped at this.
 const MAX_PENDING_INPUT: usize = 8 * 1024 * 1024;
 
@@ -41,11 +41,10 @@ pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
 struct TitleCb {
     title: Option<String>,
     changed: bool,
-    /// Answers to terminal queries seen in the output. The daemon always sends them and drops
-    /// the attached clients' own answers (see `is_query_reply_frame`).
+    /// Answers to terminal queries seen in the output. The daemon is the only responder for
+    /// these: the web UI's xterm.js is told not to answer them (see web/src/terms.ts), so a
+    /// program gets exactly one reply however many clients watch, and none from replays.
     replies: Vec<Vec<u8>>,
-    /// A cursor position report (DSR 6) was requested in the last chunk.
-    cpr_asked: bool,
 }
 
 impl vt100::Callbacks for TitleCb {
@@ -67,14 +66,22 @@ impl vt100::Callbacks for TitleCb {
         c: char,
     ) {
         let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        // Same answers xterm.js would give (TERM=xterm-256color).
         match (i1, c) {
-            // DA1. Programs such as fish block until it is answered; reply like xterm.js does.
+            // DA1. Programs such as fish block until it is answered.
             (None, 'c') if p0 == 0 => self.replies.push(b"\x1b[?1;2c".to_vec()),
+            // DA2 (secondary device attributes).
+            (Some(b'>'), 'c') if p0 == 0 => self.replies.push(b"\x1b[>0;276;0c".to_vec()),
             // DSR cursor position report.
             (None, 'n') if p0 == 6 => {
                 let (row, col) = screen.cursor_position();
                 self.replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
-                self.cpr_asked = true;
+            }
+            // DECXCPR (DEC-private cursor position report).
+            (Some(b'?'), 'n') if p0 == 6 => {
+                let (row, col) = screen.cursor_position();
+                self.replies
+                    .push(format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes());
             }
             // DSR status report.
             (None, 'n') if p0 == 5 => self.replies.push(b"\x1b[0n".to_vec()),
@@ -102,9 +109,6 @@ struct LogState {
     /// Appended since the last fsync.
     unsynced: bool,
 }
-
-/// How long after a program asks for the cursor position a client's CPR reply is dropped.
-const CPR_REPLY_WINDOW_MS: i64 = 5000;
 
 pub struct SpawnParams {
     pub id: SessionId,
@@ -134,8 +138,6 @@ pub struct PtySession {
     parser: Mutex<vt100::Parser<TitleCb>>,
     seq: AtomicU64,
     last_output_at: AtomicI64,
-    /// Unix ms of the last cursor position query in the output.
-    last_cpr_query_at: AtomicI64,
     alive: AtomicBool,
     /// `wait()` returned: the leader's pid may be reused from now on, so it and its process
     /// group are no longer signalled directly (only verified session members are).
@@ -148,9 +150,32 @@ pub struct PtySession {
     /// Serializes output.log writes with each other and with `discard`.
     log: Mutex<LogState>,
     log_path: PathBuf,
-    /// `KEY=value` from the process environment that marks processes of this run
-    /// (`MUSTER_TOKEN=...`), to recognize leftovers after the leader exited.
-    marker: Option<String>,
+    /// `KEY=value` pairs from the process environment that mark processes of this run
+    /// (`MUSTER_RUN=…`, `MUSTER_SESSION_ID=…`), to recognize leftovers after the leader exited.
+    markers: Vec<String>,
+    /// The slave side of this PTY (`/dev/pts/N`). While our master is open the number can't
+    /// be reused, so a process holding it open is one of ours even if it cleared its env.
+    tty: Option<PathBuf>,
+}
+
+/// Environment variables whose values mark a run's processes (all present ones must match).
+/// Neither contains KEY/SECRET/TOKEN, so agent CLIs that filter secrets out of the environment
+/// of the commands they run (Codex does by default) keep them.
+pub const RUN_MARKER_VARS: &[&str] = &["MUSTER_RUN", "MUSTER_SESSION_ID"];
+
+/// The marker set for a spawn environment. Falls back to `MUSTER_TOKEN` for callers that set
+/// neither marker variable.
+pub fn run_markers(env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut m: Vec<String> = RUN_MARKER_VARS
+        .iter()
+        .filter_map(|k| env.get(*k).map(|v| format!("{k}={v}")))
+        .collect();
+    if !env.contains_key("MUSTER_RUN")
+        && let Some(v) = env.get("MUSTER_TOKEN")
+    {
+        m.push(format!("MUSTER_TOKEN={v}"));
+    }
+    m
 }
 
 /// Spawn a process in a new PTY. The returned session is already running.
@@ -197,9 +222,8 @@ pub fn spawn(p: SpawnParams, hub: Weak<Hub>) -> anyhow::Result<Arc<PtySession>> 
     let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let input_pending = Arc::new(AtomicUsize::new(0));
     let (out_tx, _) = broadcast::channel(OUTPUT_BROADCAST_CAP);
-    let marker = ["MUSTER_TOKEN", "MUSTER_SESSION_ID"]
-        .iter()
-        .find_map(|k| p.env.get(*k).map(|v| format!("{k}={v}")));
+    let markers = run_markers(&p.env);
+    let tty = master.tty_name();
 
     let sess = Arc::new(PtySession {
         id: p.id,
@@ -222,7 +246,6 @@ pub fn spawn(p: SpawnParams, hub: Weak<Hub>) -> anyhow::Result<Arc<PtySession>> 
         )),
         seq: AtomicU64::new(0),
         last_output_at: AtomicI64::new(0),
-        last_cpr_query_at: AtomicI64::new(0),
         alive: AtomicBool::new(true),
         reaped: AtomicBool::new(false),
         reader_done: AtomicBool::new(false),
@@ -236,7 +259,8 @@ pub fn spawn(p: SpawnParams, hub: Weak<Hub>) -> anyhow::Result<Arc<PtySession>> 
             unsynced: false,
         }),
         log_path: p.log_path,
-        marker,
+        markers,
+        tty,
     });
 
     // writer
@@ -336,9 +360,6 @@ impl PtySession {
             title = Some(cb.title.clone());
         }
         let replies = std::mem::take(&mut cb.replies);
-        if std::mem::take(&mut cb.cpr_asked) {
-            self.last_cpr_query_at.store(now_ms(), Ordering::SeqCst);
-        }
         let chunk = Bytes::copy_from_slice(data);
         {
             let mut out = self.out.lock();
@@ -352,8 +373,7 @@ impl PtySession {
             self.seq.fetch_add(1, Ordering::SeqCst);
             self.last_output_at.store(now_ms(), Ordering::SeqCst);
             let _ = self.out_tx.send(chunk);
-            // Always answer terminal queries here; attached clients' answers are dropped
-            // (`write_client`), so programs get exactly one reply however many clients watch.
+            // The daemon answers terminal queries itself (clients don't).
             for r in &replies {
                 let _ = self.write(r);
             }
@@ -363,11 +383,19 @@ impl PtySession {
         title
     }
 
-    fn snapshot_locked(out: &OutBuf) -> Vec<u8> {
+    /// The ring's bytes exactly (what output.log persists).
+    fn raw_locked(out: &OutBuf) -> Vec<u8> {
         let (a, b) = out.ring.as_slices();
         let mut v = Vec::with_capacity(a.len() + b.len());
         v.extend_from_slice(a);
         v.extend_from_slice(b);
+        v
+    }
+
+    /// The ring's bytes for a client replay: once it wrapped, starting after the first
+    /// newline so the replay doesn't begin inside an escape sequence or UTF-8 character.
+    fn snapshot_locked(out: &OutBuf) -> Vec<u8> {
+        let mut v = Self::raw_locked(out);
         if out.wrapped {
             // Don't start the replay in the middle of an escape sequence / UTF-8 char.
             if let Some(pos) = v.iter().take(64 * 1024).position(|&c| c == b'\n') {
@@ -427,16 +455,6 @@ impl PtySession {
             }
             None => anyhow::bail!("session {} is not running", self.id),
         }
-    }
-
-    /// Input from an attached client's terminal. A frame that only holds answers to terminal
-    /// queries the daemon already answered is dropped.
-    pub fn write_client(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let cpr_expected = now_ms() - self.last_cpr_query_at.load(Ordering::SeqCst) < CPR_REPLY_WINDOW_MS;
-        if is_query_reply_frame(bytes, cpr_expected) {
-            return Ok(());
-        }
-        self.write(bytes)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
@@ -516,8 +534,10 @@ impl PtySession {
             let out = self.out.lock();
             let pending = out.total - st.persisted;
             let rewrite = st.rewrite || pending > out.ring.len() as u64 || st.size + pending > 2 * RING_CAP as u64;
+            // Persist the ring exactly (`total` counts every byte of it); readers trim the
+            // partial first line (`read_log`).
             let data = if rewrite {
-                Self::snapshot_locked(&out)
+                Self::raw_locked(&out)
             } else {
                 let skip = out.ring.len() - pending as usize;
                 out.ring.range(skip..).copied().collect()
@@ -567,17 +587,27 @@ impl PtySession {
         self.discarded.store(true, Ordering::SeqCst);
     }
 
-    /// Processes of this session to signal once the leader has exited. The session id is the
-    /// leader's pid; while any process is left in the session that id can't be reused, and
-    /// while one of them holds the terminal open (reader not drained) they are ours. After
-    /// that, only processes whose environment carries this run's marker are touched.
-    fn leftovers(sid: i32, drained: bool, marker: Option<&str>) -> Vec<i32> {
-        let members = session_members(sid);
-        if !drained {
-            return members;
+    /// Processes of this session to signal once the leader has been reaped. Its pid (the
+    /// session id) may then be reused, so session membership alone is never trusted: a process
+    /// must also carry this run's environment markers, or hold this PTY's slave open while our
+    /// master still reserves its number (not drained).
+    fn leftovers(&self, sid: i32) -> Vec<i32> {
+        let markers: Vec<&str> = self.markers.iter().map(String::as_str).collect();
+        let tty = if self.is_drained() { None } else { self.tty.as_deref() };
+        session_members(sid)
+            .into_iter()
+            .filter(|&p| (!markers.is_empty() && has_env(p, &markers)) || tty.is_some_and(|t| holds_tty(p, t)))
+            .collect()
+    }
+
+    /// Members to signal: every session member while the leader hasn't been reaped (its pid
+    /// can't be reused yet), verified leftovers after that.
+    fn targets(&self, sid: i32) -> Vec<i32> {
+        if self.reaped.load(Ordering::SeqCst) {
+            self.leftovers(sid)
+        } else {
+            session_members(sid)
         }
-        let Some(marker) = marker else { return Vec::new() };
-        members.into_iter().filter(|&p| has_env(p, &[marker])).collect()
     }
 
     /// SIGHUP the session's process group (and the foreground job's group) and every other
@@ -590,7 +620,7 @@ impl PtySession {
             return;
         };
         let alive = self.is_alive();
-        if !alive && self.is_drained() && self.marker.is_none() {
+        if !alive && self.is_drained() && self.markers.is_empty() {
             return;
         }
         // Groups are signalled only while the leader hasn't been reaped (its pid, which is
@@ -602,13 +632,7 @@ impl PtySession {
             None
         };
         let me = self.clone();
-        let targets = move || -> Vec<i32> {
-            if me.is_alive() {
-                session_members(pid)
-            } else {
-                Self::leftovers(pid, me.is_drained(), me.marker.as_deref())
-            }
-        };
+        let targets = move || -> Vec<i32> { me.targets(pid) };
         // The child is a session leader (setsid). Signal its group, the foreground job's
         // group, and every other process in the session (background jobs).
         let signal_all = |sig: i32, members: &[i32]| {
@@ -651,12 +675,9 @@ impl PtySession {
         let Some(pid) = self.pid.map(|p| p as i32).filter(|p| *p > 0) else {
             return;
         };
-        // Session membership is re-read, so a recycled pid outside the session is never hit.
-        let members = if self.is_alive() {
-            session_members(pid)
-        } else {
-            Self::leftovers(pid, self.is_drained(), self.marker.as_deref())
-        };
+        // Session membership (and, once reaped, the run markers) are re-read, so a recycled
+        // pid is never hit.
+        let members = self.targets(pid);
         // SAFETY: as in `kill`.
         unsafe {
             for p in members {
@@ -676,8 +697,22 @@ impl PtySession {
         let Some(pid) = self.pid.map(|p| p as i32).filter(|p| *p > 0) else {
             return false;
         };
-        !Self::leftovers(pid, self.is_drained(), self.marker.as_deref()).is_empty()
+        !self.targets(pid).is_empty()
     }
+
+    /// `KEY=value` markers of this run (stored so a later daemon can reap leftovers).
+    pub fn markers(&self) -> &[String] {
+        &self.markers
+    }
+}
+
+/// Does `pid` have `tty` open on any file descriptor?
+fn holds_tty(pid: i32, tty: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    rd.filter_map(|e| e.ok())
+        .any(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == tty))
 }
 
 /// Does `pid`'s environment contain every `KEY=value` in `needles`?
@@ -708,20 +743,24 @@ fn proc_session_id(pid: i32) -> Option<i32> {
     rest.split_whitespace().nth(3)?.parse().ok()
 }
 
-/// At daemon start: terminate processes left from sessions of a previous daemon run (the
-/// daemon crashed, or they ignored SIGHUP, or an exited shell left background jobs). Each
+/// Terminate processes left from sessions of a previous daemon run (the daemon crashed, or
+/// they ignored SIGHUP, or an exited shell left background jobs), or of removed sessions. Each
 /// entry is (session id = pid of the process muster started, muster session id, `KEY=value`
 /// environment markers). Only processes in that session whose environment carries every
-/// marker are touched, which guards against pid reuse. One /proc walk for all of them.
-pub fn reap_leftovers(sessions: Vec<(u32, SessionId, Vec<String>)>) {
+/// marker are touched, which guards against pid reuse. Blocks: SIGHUP, up to `KILL_GRACE` for
+/// them to exit, SIGKILL, and a short wait to confirm. Returns the muster session ids that
+/// still have processes (their records must be kept for the next attempt).
+pub fn reap_leftovers(sessions: Vec<(u32, SessionId, Vec<String>)>) -> std::collections::HashSet<SessionId> {
     let wanted: Vec<(i32, SessionId, Vec<String>)> = sessions
         .into_iter()
         .filter_map(|(sid, id, n)| i32::try_from(sid).ok().filter(|s| *s > 0).map(|s| (s, id, n)))
+        // Without markers a recycled session id can't be told apart: never signal those.
+        .filter(|(_, _, n)| !n.is_empty())
         .collect();
     if wanted.is_empty() {
-        return;
+        return Default::default();
     }
-    let ours = move || -> Vec<(i32, SessionId)> {
+    let ours = || -> Vec<(i32, SessionId)> {
         let Ok(rd) = std::fs::read_dir("/proc") else {
             return Vec::new();
         };
@@ -743,7 +782,7 @@ pub fn reap_leftovers(sessions: Vec<(u32, SessionId, Vec<String>)>) {
     };
     let found = ours();
     if found.is_empty() {
-        return;
+        return Default::default();
     }
     tracing::info!("terminating {} leftover process(es) from a previous run", found.len());
     // SAFETY: kill(2) on processes verified to belong to those muster sessions.
@@ -753,15 +792,28 @@ pub fn reap_leftovers(sessions: Vec<(u32, SessionId, Vec<String>)>) {
             libc::kill(p, libc::SIGCONT);
         }
     }
-    let _ = std::thread::Builder::new().name("reap".into()).spawn(move || {
-        std::thread::sleep(KILL_GRACE);
-        // SAFETY: as above; membership and environment re-read.
-        unsafe {
-            for (p, _) in ours() {
-                libc::kill(p, libc::SIGKILL);
-            }
+    let deadline = std::time::Instant::now() + KILL_GRACE;
+    while std::time::Instant::now() < deadline && !ours().is_empty() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // SAFETY: as above; membership and environment re-read.
+    unsafe {
+        for (p, _) in ours() {
+            libc::kill(p, libc::SIGKILL);
         }
-    });
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let left = ours();
+        if left.is_empty() {
+            return Default::default();
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!("{} leftover process(es) survived SIGKILL", left.len());
+            return left.into_iter().map(|(_, id)| id).collect();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Rewrite `p` (tmp + rename, mode 0600), fsync only if `sync`.
@@ -855,46 +907,6 @@ fn first_alt_switch(data: &[u8]) -> Option<bool> {
     None
 }
 
-/// True if a client input frame consists only of answers to terminal queries the daemon
-/// answers itself: DA1 (`ESC [ ? <n;…> c`), DSR status (`ESC [ 0 n`) and, only while a cursor
-/// position query is outstanding, CPR (`ESC [ <row> ; <col> R`). CPR is gated because xterm
-/// encodes F3 with modifiers the same way (`ESC [ 1 ; 2 R`). Anything else in the frame
-/// (a keystroke, a partial sequence) keeps the whole frame.
-pub fn is_query_reply_frame(data: &[u8], cpr_expected: bool) -> bool {
-    let mut i = 0;
-    if data.is_empty() {
-        return false;
-    }
-    while i < data.len() {
-        let Some(rest) = data[i..].strip_prefix(b"\x1b[") else {
-            return false;
-        };
-        let (private, body) = match rest.strip_prefix(b"?") {
-            Some(b) => (true, b),
-            None => (false, rest),
-        };
-        let len = body
-            .iter()
-            .position(|c| !(c.is_ascii_digit() || *c == b';'))
-            .unwrap_or(body.len());
-        let Some(&fin) = body.get(len) else { return false };
-        let params = &body[..len];
-        let nums: Vec<&[u8]> = params.split(|c| *c == b';').collect();
-        let all_digits = nums.iter().all(|n| !n.is_empty());
-        let ok = match (private, fin) {
-            (true, b'c') => all_digits,
-            (false, b'n') => params == b"0",
-            (false, b'R') => cpr_expected && nums.len() == 2 && all_digits,
-            _ => false,
-        };
-        if !ok {
-            return false;
-        }
-        i += 2 + private as usize + len + 1;
-    }
-    true
-}
-
 /// Map portable-pty's exit status to a shell-style code (128 + signal when killed).
 fn exit_code_of(st: &portable_pty::ExitStatus) -> i32 {
     let Some(name) = st.signal() else {
@@ -966,8 +978,10 @@ pub fn read_log(path: &Path) -> Vec<u8> {
         return Vec::new();
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let cut = len > RING_CAP as u64;
-    if cut && f.seek(SeekFrom::Start(len - RING_CAP as u64)).is_err() {
+    // A log rewritten from a wrapped ring is exactly RING_CAP bytes and starts mid-line; longer
+    // ones are read from the middle. Either way, start after the first newline.
+    let cut = len >= RING_CAP as u64;
+    if len > RING_CAP as u64 && f.seek(SeekFrom::Start(len - RING_CAP as u64)).is_err() {
         return Vec::new();
     }
     let mut data = Vec::with_capacity(len.min(RING_CAP as u64) as usize);
@@ -1128,7 +1142,7 @@ mod tests {
     fn kill_reaps_background_jobs_after_the_shell_exited() {
         let dir = std::env::temp_dir().join(format!("muster-pty-leftover-{}", std::process::id()));
         let marker = format!("leftover-test-{}", std::process::id());
-        let sess = test_spawn(&dir, &[("MUSTER_TOKEN", &marker)]);
+        let sess = test_spawn(&dir, &[("MUSTER_RUN", &marker), ("MUSTER_SESSION_ID", "1")]);
         let sid = sess.pid.unwrap() as i32;
         std::thread::sleep(Duration::from_millis(300));
         sess.write(b"sleep 777 &\r").unwrap();
@@ -1145,6 +1159,76 @@ mod tests {
         assert!(sess.master.lock().is_none(), "master fd not released");
         assert!(!sess.has_processes());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leftovers_after_reap_need_the_run_markers() {
+        let dir = std::env::temp_dir().join(format!("muster-pty-g2-{}", std::process::id()));
+        let run = format!("g2-{}", std::process::id());
+        let sess = test_spawn(&dir, &[("MUSTER_RUN", &run), ("MUSTER_SESSION_ID", "1")]);
+        let sid = sess.pid.unwrap() as i32;
+        std::thread::sleep(Duration::from_millis(300));
+        // One marked job, one that cleared its env and detached from the terminal (it can't
+        // be proven ours once the leader is gone), then the shell exits.
+        sess.write(b"sleep 771 & env -i /bin/sh -c 'exec sleep 772' </dev/null >/dev/null 2>&1 &\r")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        sess.write(b"exit\r").unwrap();
+        wait_until("the shell to exit", 5, || sess.reaped.load(Ordering::SeqCst));
+        let members = session_members(sid);
+        assert_eq!(members.len(), 2, "{members:?}");
+        let marked: Vec<i32> = members
+            .iter()
+            .copied()
+            .filter(|&p| has_env(p, &[&format!("MUSTER_RUN={run}")]))
+            .collect();
+        assert_eq!(marked.len(), 1);
+        // `sleep 771` still holds the tty and carries the marker; the env-less one holds no
+        // tty and has no marker: after the reap it is never a target.
+        let t = sess.targets(sid);
+        assert!(t.contains(&marked[0]));
+        let unmarked: Vec<i32> = members.iter().copied().filter(|p| !marked.contains(p)).collect();
+        assert!(!t.contains(&unmarked[0]), "unverified process targeted: {t:?}");
+        sess.kill_now();
+        wait_until("the marked job to die", 5, || {
+            !std::path::Path::new(&format!("/proc/{}", marked[0])).exists()
+        });
+        assert!(std::path::Path::new(&format!("/proc/{}", unmarked[0])).exists());
+        // SAFETY: test cleanup of the process this test started.
+        unsafe {
+            libc::kill(unmarked[0], libc::SIGKILL);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_reaper_kills_only_marked_leftovers_and_waits() {
+        let run = format!("reap-{}", std::process::id());
+        // A detached session (setsid) holding a SIGHUP-ignoring marked process, like one a
+        // crashed daemon left behind.
+        let mut child = std::process::Command::new("setsid")
+            .args(["-w", "sh", "-c", "trap '' HUP; sleep 600 & wait"])
+            .env("MUSTER_RUN", &run)
+            .env("MUSTER_SESSION_ID", "9")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let sh = child.id() as i32;
+        let sid = proc_session_id(sh).unwrap();
+        assert!(session_members(sid).len() >= 2);
+        let wrong = reap_leftovers(vec![(sid as u32, 9, vec!["MUSTER_RUN=other".into()])]);
+        assert!(wrong.is_empty());
+        assert!(session_members(sid).len() >= 2, "unmarked processes were killed");
+        let left = reap_leftovers(vec![(
+            sid as u32,
+            9,
+            vec![format!("MUSTER_RUN={run}"), "MUSTER_SESSION_ID=9".into()],
+        )]);
+        // It returns only after they are gone (SIGHUP is ignored, so via SIGKILL).
+        assert!(left.is_empty());
+        let _ = child.wait();
+        assert!(session_members(sid).is_empty());
     }
 
     #[test]
@@ -1190,59 +1274,40 @@ mod tests {
         for _ in 0..(RING_CAP / 1024 + 64) {
             sess.ingest(&line);
         }
+        // A ring that doesn't end on a line boundary: the log holds it byte for byte (G10),
+        // and only readers skip the partial first line.
+        sess.ingest(b"tail-without-newline");
         sess.flush_log_final();
-        assert!(std::fs::metadata(&path).unwrap().len() <= RING_CAP as u64);
+        let ring = PtySession::raw_locked(&sess.out.lock());
+        assert_eq!(std::fs::read(&path).unwrap(), ring);
+        assert_eq!(ring.len(), RING_CAP);
+        let replay = read_log(&path);
+        assert!(replay.ends_with(b"tail-without-newline"));
+        assert_eq!(
+            replay.len(),
+            ring.len() - (ring.iter().position(|&c| c == b'\n').unwrap() + 1)
+        );
+        // Appending after the rewrite keeps the file equal to everything since.
+        sess.ingest(b"\nmore\n");
+        sess.flush_log_final();
+        assert!(std::fs::read(&path).unwrap().ends_with(b"tail-without-newline\nmore\n"));
+        assert!(std::fs::metadata(&path).unwrap().len() <= RING_CAP as u64 + 6);
         assert!(sess.log_persisted());
         sess.discard();
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn client_query_replies_filter() {
-        // Exact reply frames are dropped.
-        assert!(is_query_reply_frame(b"\x1b[?1;2c", false));
-        assert!(is_query_reply_frame(b"\x1b[?62;22c", false));
-        assert!(is_query_reply_frame(b"\x1b[0n", false));
-        assert!(is_query_reply_frame(b"\x1b[12;40R", true));
-        assert!(is_query_reply_frame(b"\x1b[?1;2c\x1b[3;1R", true));
-        // CPR only while a query is outstanding (Shift+F3 is ESC [ 1 ; 2 R).
-        assert!(!is_query_reply_frame(b"\x1b[1;2R", false));
-        // Keystrokes and anything mixed with them are kept.
-        for keys in [
-            &b""[..],
-            b"a",
-            b"\x1b[A",
-            b"\x1b[1;5C",
-            b"\x1b[?1;2cls\r",
-            b"x\x1b[0n",
-            b"\x1b[?c",
-            b"\x1b[>0;276;0c",
-            b"\x1b[5n",
-            b"\x1b[12;R",
-            b"\x1b[12;40",
-            b"\x1b[3~",
-            b"\x1b[200~text\x1b[201~",
-        ] {
-            assert!(!is_query_reply_frame(keys, true), "{keys:?}");
-        }
-    }
-
-    #[test]
-    fn client_cpr_reply_dropped_only_after_a_query() {
-        let dir = std::env::temp_dir().join(format!("muster-pty-da-{}", std::process::id()));
-        let sess = test_spawn(&dir, &[]);
-        sess.kill_now();
-        wait_until("exit", 5, || !sess.is_alive());
-        // Writes to an exited process fail, so Ok means "dropped before writing".
-        assert!(sess.write_client(b"\x1b[?1;2c").is_ok());
-        assert!(
-            sess.write_client(b"\x1b[1;2R").is_err(),
-            "Shift+F3 without a query must pass"
+    fn daemon_answers_terminal_queries() {
+        let mut p = parser_with(b"ab\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[>1c\x1b[?u", 5);
+        let r: Vec<String> = std::mem::take(&mut p.callbacks_mut().replies)
+            .into_iter()
+            .map(|r| String::from_utf8(r).unwrap())
+            .collect();
+        assert_eq!(
+            r,
+            ["\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[0n", "\x1b[1;3R", "\x1b[?1;3R"]
         );
-        sess.ingest(b"\x1b[6n");
-        assert!(sess.write_client(b"\x1b[1;1R").is_ok());
-        assert!(sess.write_client(b"a").is_err());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

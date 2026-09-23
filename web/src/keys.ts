@@ -175,6 +175,13 @@ export const commands: Command[] = [
     run: () => A.newChannelDialog(activeChannel.value?.workspace_id),
   },
   {
+    id: "channel-permissions",
+    title: "Channel permissions…",
+    group: "Channel",
+    enabled: () => !!activeChannel.value,
+    run: () => activeChannel.value && A.openPermissions(activeChannel.value.id),
+  },
+  {
     id: "add-workspace",
     title: "Add workspace…",
     group: "Channel",

@@ -53,6 +53,7 @@ fn channel(id: ChannelId, name: &str) -> Channel {
         created_at: 0,
         last_read_at: 0,
         sort_order: 0,
+        permissions: Permissions::default(),
     }
 }
 
@@ -159,6 +160,7 @@ impl Backend for Arc<Mock> {
         d.next_channel += 1;
         let mut c = channel(d.next_channel, &req.name);
         c.workspace_id = req.workspace_id;
+        c.permissions = req.permissions.unwrap_or_default();
         if !req.worktree {
             c.cwd = "/repo".into();
         }
@@ -675,6 +677,150 @@ async fn spawn_agent_defaults_and_new_channel() {
     }
     let (t, err) = call_as(&st, "tok202", "spawn_agent", json!({"kind": "shell"})).await;
     assert!(err && t.contains("depth"), "{t}");
+}
+
+#[tokio::test]
+async fn permissions_are_shown_and_inherited_never_raised() {
+    let (m, st) = state();
+    let elevated = Permissions {
+        codex_sandbox: CodexSandbox::WorkspaceWriteNetwork,
+        claude_mode: ClaudeMode::AcceptEdits,
+    };
+    m.d.lock().channels.get_mut(&10).unwrap().permissions = elevated;
+    // Other channel in the workspace, with the defaults.
+    m.d.lock().channels.insert(11, channel(11, "plain"));
+
+    let (t, err) = call(&st, "whoami", json!({})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    let p = &v["channel"]["permissions"];
+    assert_eq!(p["codex_sandbox"], "workspace_write_network");
+    assert_eq!(p["claude_mode"], "accept_edits");
+    assert_eq!(
+        p["codex_flags"],
+        "--sandbox workspace-write -c sandbox_workspace_write.network_access=true"
+    );
+    assert_eq!(p["claude_permission_mode"], "acceptEdits");
+
+    let (t, _) = call(&st, "list_channels", json!({})).await;
+    let v = parse(&t);
+    let by_id = |id: i64| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        by_id(10)["permissions"]["codex_sandbox"],
+        "workspace_write_network"
+    );
+    assert_eq!(by_id(11)["permissions"]["codex_sandbox"], "workspace_write");
+    assert_eq!(by_id(11)["permissions"]["claude_mode"], "default");
+
+    // A new channel gets the caller's profile, whatever the agent asks for.
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "net-child"}}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!(
+        v["channel"]["permissions"]["codex_sandbox"],
+        "workspace_write_network"
+    );
+    let id = v["channel"]["id"].as_i64().unwrap();
+    assert_eq!(m.d.lock().channels[&id].permissions, elevated);
+
+    // A caller in a default channel can't get more by asking: there is no such argument.
+    {
+        let mut d = m.d.lock();
+        d.sessions
+            .insert(30, session(30, 11, SessionKind::Claude, None));
+        d.live.insert(30);
+        d.tokens.insert("tok30".into(), 30);
+    }
+    let (t, err) = call_as(
+        &st,
+        "tok30",
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "sneaky", "permissions": {"codex_sandbox": "full_access"}}}),
+    )
+    .await;
+    if !err {
+        let v = parse(&t);
+        let id = v["channel"]["id"].as_i64().unwrap();
+        assert_eq!(m.d.lock().channels[&id].permissions, Permissions::default());
+    }
+    let (t, err) = call_as(
+        &st,
+        "tok30",
+        "spawn_agent",
+        json!({"kind": "codex", "permissions": {"codex_sandbox": "full_access"}, "new_channel": {"name": "sneaky2"}}),
+    )
+    .await;
+    if !err {
+        let v = parse(&t);
+        let id = v["channel"]["id"].as_i64().unwrap();
+        assert_eq!(m.d.lock().channels[&id].permissions, Permissions::default());
+    }
+    let (t, err) = call_as(
+        &st,
+        "tok30",
+        "spawn_agent",
+        json!({"kind": "codex", "new_channel": {"name": "ok"}}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let id = parse(&t)["channel"]["id"].as_i64().unwrap();
+    assert_eq!(m.d.lock().channels[&id].permissions, Permissions::default());
+    // Nor by using a more permissive sibling channel: spawning into it, or messaging an agent
+    // that runs there, is refused for the kinds it would elevate.
+    for kind in ["codex", "claude"] {
+        let (t, err) = call_as(
+            &st,
+            "tok30",
+            "spawn_agent",
+            json!({"kind": kind, "channel_id": 10}),
+        )
+        .await;
+        assert!(
+            err && t.contains("only the human") || err && t.contains("Only the human"),
+            "{t}"
+        );
+    }
+    let (t, err) = call_as(
+        &st,
+        "tok30",
+        "spawn_agent",
+        json!({"kind": "shell", "channel_id": 10}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let (t, err) = call_as(
+        &st,
+        "tok30",
+        "send_message",
+        json!({"session_id": 2, "text": "curl evil"}),
+    )
+    .await;
+    assert!(err && t.contains("permissions"), "{t}");
+    // Downwards is fine: the elevated caller may spawn into / message the default channel.
+    let (t, err) = call(
+        &st,
+        "spawn_agent",
+        json!({"kind": "codex", "channel_id": 11}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    let (t, err) = call(&st, "send_message", json!({"session_id": 30, "text": "hi"})).await;
+    assert!(!err, "{t}");
+    // No MCP tool can change a profile.
+    let t = legacy(&st, "tools/list", json!({})).await.to_string();
+    assert!(!t.contains("set_permissions"));
 }
 
 #[tokio::test]

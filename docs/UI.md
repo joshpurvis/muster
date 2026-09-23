@@ -55,6 +55,8 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   anything was derived, it shows the folder name in muted italics.
 - Active tab: `--bg-2` background joined to the content, with an accent top bar. Unread
   activity (state changed since you last viewed it) shows a bold name.
+- The strip uses a roving tabindex: ←/→/Home/End select tabs, Enter focuses the terminal, F2
+  renames.
 - Double-click renames inline. Middle-click closes. Drag reorders (`window.reorder_tabs`). While
   a tab is dragged, "→ Window N" and "→ New window" targets appear in the bar; dropping on one
   moves the tab there, and dropping on the Jump button opens a "Move tab to" menu. The

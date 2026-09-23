@@ -30,33 +30,46 @@ export function tabsOf(win: Win | null, channels: Channel[]): Channel[] {
   return mine.sort((a, b) => at(a) - at(b) || a.created_at - b.created_at || a.id - b.id);
 }
 
-/** Move `id` to insertion slot `index` of `ids` (a slot counts gaps before removal, as a drop
- * marker does). Unknown ids leave the list as is. */
-export function moveTo(ids: number[], id: number, index: number): number[] {
-  const from = ids.indexOf(id);
-  if (from < 0) return ids;
-  const out = ids.filter((x) => x !== id);
-  const at = index > from ? index - 1 : index;
-  out.splice(Math.max(0, Math.min(at, out.length)), 0, id);
-  return out;
+/** Whether task `c` names window `win` as its window (`window_id`, else the window's list). */
+function taskInWindow(c: Channel, win: Win): boolean {
+  return c.window_id === win.id || (c.window_id === undefined && win.channel_ids.includes(c.id));
 }
 
-/** Move `id` one step left (-1) or right (+1); stops at the ends. */
-export function moveBy(ids: number[], id: number, delta: number): number[] {
-  const from = ids.indexOf(id);
-  if (from < 0) return ids;
-  const to = Math.max(0, Math.min(ids.length - 1, from + delta));
-  if (to === from) return ids;
-  const out = [...ids];
-  out.splice(from, 1);
-  out.splice(to, 0, id);
-  return out;
+/**
+ * The window showing session `s` as a tab. `window_id` (v2) wins; daemons without it show a
+ * session in its task's window.
+ */
+export function sessionWindowId(s: SessionInfo, task: Channel | undefined, windows: Win[]): WindowId | null {
+  if (s.window_id !== undefined) return s.window_id;
+  return task ? windowIdOf(task, windows) : null;
 }
 
-/** Whether a drop at insertion slot `index` would leave `id` where it is. */
-export function isNoopSlot(ids: number[], id: number, index: number): boolean {
-  const from = ids.indexOf(id);
-  return from < 0 || index === from || index === from + 1;
+/**
+ * Sessions shown as tabs in window `win`: its own (`window_id`), or, from daemons without
+ * per-session windows, those of its tasks. Only sessions of live tasks. Ordered by their task's
+ * place in the window's task list (other tasks after, oldest first), then age: the order new
+ * tabs join a group in. `win === null` (no windows): every session of a live task.
+ */
+export function sessionsOfWindow(
+  win: Win | null,
+  sessions: Iterable<SessionInfo>,
+  channels: Channel[],
+): SessionInfo[] {
+  const live = new Map(channels.filter((c) => !c.archived).map((c) => [c.id, c]));
+  const pos = new Map((win?.channel_ids ?? []).map((id, i) => [id, i]));
+  const taskKey = (c: Channel) => pos.get(c.id) ?? Number.MAX_SAFE_INTEGER;
+  const out = [...sessions].filter((s) => {
+    const c = live.get(s.channel_id);
+    if (!c) return false;
+    if (!win) return true;
+    return s.window_id !== undefined ? s.window_id === win.id : taskInWindow(c, win);
+  });
+  return out.sort((a, b) => {
+    const ca = live.get(a.channel_id)!;
+    const cb = live.get(b.channel_id)!;
+    return taskKey(ca) - taskKey(cb) || (win ? 0 : ca.sort_order - cb.sort_order) ||
+      ca.created_at - cb.created_at || ca.id - cb.id || a.created_at - b.created_at || a.id - b.id;
+  });
 }
 
 export function upsertWindow(list: Win[], w: Win): Win[] {
@@ -105,11 +118,11 @@ export function basename(path: string): string {
 }
 
 /**
- * What a tab shows. A human-named tab shows its name. An auto-named tab shows its derived
- * name; until something was derived, the daemon's placeholder (the folder name) is shown
+ * A task's name as tabs show it. A human-named task shows its name. An auto-named task shows its
+ * derived name; until something was derived, the daemon's placeholder (the folder name) is shown
  * muted.
  */
-export function tabLabel(
+export function taskLabel(
   c: Pick<Channel, "name" | "cwd" | "auto_named">,
   ws?: Pick<Workspace, "name" | "path"> | null,
 ): { text: string; muted: boolean } {
@@ -121,6 +134,39 @@ export function tabLabel(
     if (placeholders.includes(name)) return { text: name, muted: true };
   }
   return { text: name, muted: false };
+}
+
+export interface TabLabel {
+  /** The task's name (or the session's, when its task is unknown). */
+  text: string;
+  /** Only the folder name so far (shown muted, italic). */
+  muted: boolean;
+  /** The session's own name, when its task has several sessions (`fix auth · shell`). */
+  sub: string | null;
+}
+
+/** What a tab (one session) shows: its task's label, plus the session's name when the task has
+ * `siblings` > 1 sessions. */
+export function tabLabel(
+  s: Pick<SessionInfo, "name">,
+  task: Pick<Channel, "name" | "cwd" | "auto_named"> | undefined,
+  ws: Pick<Workspace, "name" | "path"> | null | undefined,
+  siblings: number,
+): TabLabel {
+  if (!task) return { text: s.name, muted: false, sub: null };
+  const t = taskLabel(task, ws);
+  return { ...t, sub: siblings > 1 ? s.name : null };
+}
+
+/** One line: `fix auth · shell`. */
+export function tabText(l: TabLabel): string {
+  return l.sub ? `${l.text} · ${l.sub}` : l.text;
+}
+
+/** A task's main session (what renaming its tab renames the task for): its first agent, else its
+ * first session. `list` is in age order. */
+export function mainSession<T extends Pick<SessionInfo, "id" | "kind">>(list: T[]): T | null {
+  return list.find((s) => s.kind !== "shell") ?? list[0] ?? null;
 }
 
 // ---------------- state ----------------
@@ -154,19 +200,19 @@ export function nextInCycle<T extends { id: number }>(list: T[], current: number
 // ---------------- Jump ----------------
 
 export interface JumpCandidate {
-  /** Stable key, also used for recency ("c:<id>", "s:<id>", "f:<path>", "cmd:<id>"). */
+  /** Stable key, also used for recency ("s:<id>", "f:<path>", "cmd:<id>"). */
   key: string;
   /** Text matched against the query; the label is its prefix (for highlighting). */
   hay: string;
   label: string;
-  /** A session that needs the human (or a tab holding one). */
+  /** A session that needs the human. */
   needs: boolean;
   /** Urgency among `needs` items (lower first) and how long they've waited. */
   pri?: number;
   since?: number;
   /** Lives in this window. */
   here?: boolean;
-  /** Small bias for the kind of item (tabs over sessions over folders). */
+  /** Small bias for the kind of item (tabs over folders). */
   boost?: number;
 }
 
@@ -218,6 +264,27 @@ export function rankJump<T extends JumpCandidate>(
     });
   }
   return out.slice(0, limit).map(({ item, score, hits }) => ({ item, score, hits }));
+}
+
+/**
+ * Jump's base order of sessions (before ranking): this window's tabs in `here` order (the layout's
+ * groups and strips), then other windows' by window id (no window last), then age.
+ */
+export function jumpOrder<T extends Pick<SessionInfo, "id" | "created_at">>(
+  all: T[],
+  here: number[],
+  windowOf: (s: T) => WindowId | null,
+): T[] {
+  const pos = new Map(here.map((id, i) => [id, i]));
+  const win = (s: T) => windowOf(s) ?? Number.MAX_SAFE_INTEGER;
+  return [...all].sort((a, b) => {
+    const pa = pos.get(a.id);
+    const pb = pos.get(b.id);
+    if (pa !== undefined || pb !== undefined) {
+      return (pa ?? Number.MAX_SAFE_INTEGER) - (pb ?? Number.MAX_SAFE_INTEGER);
+    }
+    return win(a) - win(b) || a.created_at - b.created_at || a.id - b.id;
+  });
 }
 
 /** Push `key` to the front of a most-recent-first list (deduplicated, capped). */

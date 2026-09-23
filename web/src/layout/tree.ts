@@ -1,8 +1,9 @@
-// Split-tree model and pure reducers. No DOM, no signals: everything here is unit tested.
+// A window's split tree of groups, and pure reducers. No DOM, no signals: everything here is unit
+// tested. A leaf ("pane" in the JSON) is a group: its tabs are session ids, one of them active.
 //
-// Persisted form (opaque to the daemon, stored via channel.set_layout):
+// Persisted form (opaque to the daemon, stored per window via window.set_layout):
 //   { v: 1, root: Layout, focus: paneId, zoom: paneId | null }
-// A bare Layout (as in docs/UI.md) is also accepted on load.
+// A bare Layout is also accepted on load.
 
 export type Dir = "row" | "col";
 
@@ -245,14 +246,13 @@ export function parseLayout(raw: unknown): LayoutState | null {
 }
 
 /**
- * Drop unknown session ids, append sessions not in any pane to the focused pane (in the
- * given order), collapse empties.
+ * Drop unknown session ids (a focused group that empties hands focus to its nearest neighbour),
+ * append sessions not in any group to the focused group (in the given order), collapse empties.
  */
 export function reconcile(s: LayoutState, live: number[]): LayoutState {
   const liveSet = new Set(live);
-  let root = mapPanes(s.root, (p) => ({ ...p, tabs: p.tabs.filter((t) => liveSet.has(t)) }));
-  root = normalize(root);
-  let st = fixFocus({ ...s, root });
+  let st = fixFocus({ ...s, root: normalize(s.root) });
+  for (const id of allSessions(st.root)) if (!liveSet.has(id)) st = removeSession(st, id);
   const present = new Set(allSessions(st.root));
   const missing = live.filter((id) => !present.has(id));
   if (missing.length) {
@@ -374,7 +374,7 @@ function insertBeside(root: Layout, targetId: string, newNode: Layout, side: Sid
 
 /**
  * Split pane `paneId` (default focused) on `side`. The new pane gets `sid` as its only tab
- * (or is empty, showing the launcher). Focus moves to the new pane.
+ * (or is empty). Focus moves to the new pane.
  */
 export function splitPane(
   s: LayoutState,
@@ -434,60 +434,56 @@ export function moveTab(
   return finish({ ...base, root, focus: np.id, zoom: null });
 }
 
-/**
- * Place sessions that just joined this tab (another tab merged into it) as one pane: a new
- * split of `targetPaneId` on `zone`, or, for "center", tabs of that pane at `index` (default
- * the end). They keep their order; `active` (default the first) becomes the active one and the
- * pane takes focus. Wherever reconcile may already have put them, they are taken out first.
- */
-/** `placeSessions` target meaning "beside the whole layout" (an edge of the pane area). */
-export const ROOT_PANE = "@root";
-
-export function placeSessions(
-  s: LayoutState,
-  sids: number[],
-  targetPaneId: string,
-  zone: DropZone,
-  active?: number,
-  index?: number,
-): LayoutState {
-  if (!sids.length) return s;
-  const act = active !== undefined && sids.includes(active) ? active : sids[0];
-  let base = s;
-  for (const sid of sids) base = removeFromTabs(base, sid);
-  // Beside everything: a new split at the root (unless the layout is one empty pane).
-  if (targetPaneId === ROOT_PANE && zone !== "center" && !(base.root.type === "pane" && !base.root.tabs.length)) {
-    const np = { ...pane(sids), active: act };
-    const before = zone === "left" || zone === "top";
-    const root: Layout = {
-      type: "split",
-      dir: sideDir(zone),
-      sizes: [0.5, 0.5],
-      children: before ? [np, base.root] : [base.root, np],
-    };
-    return finish({ ...base, root, focus: np.id, zoom: null });
-  }
-  const tgt = findPane(base.root, targetPaneId) ?? findPane(base.root, base.focus);
-  if (!tgt) return s;
-  // Into the pane's tabs, or into the pane itself when taking them out emptied it.
-  if (zone === "center" || tgt.tabs.length === 0) {
-    const root = mapPanes(base.root, (p) => {
-      if (p.id !== tgt.id) return p;
-      const tabs = [...p.tabs];
-      tabs.splice(Math.max(0, Math.min(index ?? tabs.length, tabs.length)), 0, ...sids);
-      return { ...p, tabs, active: act };
-    });
-    return finish({ ...base, root, focus: tgt.id, zoom: null });
-  }
-  const np = { ...pane(sids), active: act };
-  const root = insertBeside(base.root, tgt.id, np, zone);
-  return finish({ ...base, root, focus: np.id, zoom: null });
-}
-
 export function reorderTab(s: LayoutState, sid: number, index: number): LayoutState {
   const p = paneOfSession(s.root, sid);
   if (!p) return s;
   return moveTab(s, sid, p.id, "center", index);
+}
+
+/** Move a tab one place left (-1) or right (+1) within its group; stops at the ends. */
+export function shiftTab(s: LayoutState, sid: number, delta: number): LayoutState {
+  const p = paneOfSession(s.root, sid);
+  if (!p) return s;
+  const from = p.tabs.indexOf(sid);
+  const to = Math.max(0, Math.min(p.tabs.length - 1, from + delta));
+  if (to === from) return s;
+  return moveTab(s, sid, p.id, "center", to > from ? to + 1 : to);
+}
+
+const DIR_SIDE: Record<Direction, Side> = { left: "left", right: "right", up: "top", down: "bottom" };
+
+export function sideOf(dir: Direction): Side {
+  return DIR_SIDE[dir];
+}
+
+/**
+ * Ctrl+Alt+arrow: move a tab to the end of the neighbouring group in that direction. At the
+ * window's edge (no neighbour) its group splits on that side with the tab in the new group, unless
+ * it is the group's only tab. Unzooms.
+ */
+export function moveTabToNeighbour(s: LayoutState, sid: number, dir: Direction): LayoutState {
+  const from = paneOfSession(s.root, sid);
+  if (!from) return s;
+  const n = neighbour(s.root, from.id, dir);
+  if (n) return moveTab({ ...s, zoom: null }, sid, n, "center");
+  if (from.tabs.length < 2) return s;
+  return moveTab(s, sid, from.id, DIR_SIDE[dir]);
+}
+
+/** The group at the window's top-right corner (it carries the window controls). */
+export function topRightPane(root: Layout): string {
+  let best = "";
+  let bx = -Infinity;
+  let by = Infinity;
+  for (const [id, r] of paneRects(root)) {
+    const right = r.x + r.w;
+    if (right > bx + 1e-6 || (Math.abs(right - bx) <= 1e-6 && r.y < by)) {
+      bx = right;
+      by = r.y;
+      best = id;
+    }
+  }
+  return best;
 }
 
 export function setSizes(s: LayoutState, path: number[], sizes: number[]): LayoutState {
@@ -650,26 +646,6 @@ export function isNoopMove(
   if (index === undefined) return true;
   const old = from.tabs.indexOf(sid);
   return index === old || index === old + 1;
-}
-
-// ---------- pane chrome ----------
-
-/**
- * What a pane shows above its terminal: a pane-tab strip when it holds 2+ sessions, else a thin
- * header when the tab has 2+ panes, else nothing (a lone pane with one session).
- */
-export type PaneChrome = "strip" | "head" | "none";
-
-export function chromeOf(sessionsInPane: number, panesInTab: number): PaneChrome {
-  if (sessionsInPane >= 2) return "strip";
-  return panesInTab >= 2 ? "head" : "none";
-}
-
-/** Chrome of the pane a new session will land in: a new pane-tab of `paneId`, or a split. */
-export function chromeForNew(s: LayoutState, type: "tab" | "split", paneId: string): PaneChrome {
-  if (type === "split") return "head";
-  const p = findPane(s.root, paneId);
-  return chromeOf((p?.tabs.length ?? 0) + 1, allPanes(s.root).length);
 }
 
 /** Compact structural signature (for tests / debugging). */

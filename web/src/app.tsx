@@ -6,29 +6,28 @@ import { effect } from "@preact/signals";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { connStatus, rpc } from "./rpc.ts";
 import {
-  activeChannel,
   applyEvent,
   applyHello,
+  focusedSession,
   helloDone,
-  layoutOf,
-  layouts,
+  hereIds,
+  layout,
   meta,
   prefs,
   removedSessionListeners,
   sessions,
-  tabIdSet,
-  tabs,
   toast,
   updateLayout,
   windowId,
   windowLostListeners,
+  windowSessions,
   windowsSupported,
   workspaces,
 } from "./state.ts";
 import * as terms from "./terms.ts";
 import * as A from "./actions.ts";
 import { installKeys } from "./keys.ts";
-import { TabBar, TabDragOverlay } from "./components/TabBar.tsx";
+import { WindowControls } from "./components/WindowControls.tsx";
 import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
@@ -85,31 +84,29 @@ addEventListener("focus", () => A.windowFocused());
 removedSessionListeners.push((id) => terms.dispose(id));
 // Restarts need no client action: the daemon follows the session and sends a fresh replay.
 
-// Only sessions of this window's tabs stream here: detach terminals whose tab moved away (they
+// Only this window's tabs stream here: detach terminals whose tab moved to another window (they
 // stay cached for a while in case it comes back).
 effect(() => {
-  const here = tabIdSet.value;
+  const here = hereIds.value;
   const all = sessions.value;
   if (!helloDone.value || (windowsSupported.value && windowId.value === null)) return;
   for (const sid of terms.attachedSids()) {
-    const s = all.get(sid);
-    if (s && !here.has(s.channel_id)) terms.detach(sid);
+    if (all.has(sid) && !here.has(sid)) terms.detach(sid);
   }
 });
 
 terms.onTerminalFocus((sid) => {
-  const s = sessions.value.get(sid);
-  if (!s) return;
-  const l = layouts.value.get(s.channel_id);
-  if (!l) return;
-  const p = paneOfSession(l.root, sid);
-  if (p && l.focus !== p.id) updateLayout(s.channel_id, (x) => focusPane(x, p.id));
+  const l = layout.value;
+  const p = l ? paneOfSession(l.root, sid) : null;
+  if (l && p && l.focus !== p.id) updateLayout((x) => focusPane(x, p.id));
 });
 
-// Ensure a layout exists for the active tab.
+// The focused tab closed or moved to another window while its terminal had focus: focus falls to
+// <body>, so hand it to the tab that took its place (never steal it from a dialog or field).
 effect(() => {
-  const c = activeChannel.value;
-  if (c) layoutOf(c.id);
+  void focusedSession.value?.id;
+  const a = document.activeElement;
+  if (!a || a === document.body) A.focusActiveTerminalSoon();
 });
 
 installKeys();
@@ -118,11 +115,11 @@ rpc.start();
 // Read-only debug handle (used by dev/e2e.ts; handy in devtools).
 (globalThis as Record<string, unknown>).__muster = {
   rpc,
-  layouts,
+  layout,
   sessions,
-  tabs,
+  windowSessions,
   windowId,
-  activeChannel,
+  focusedSession,
   termText: (sid: number) => {
     const t = terms.terminal(sid);
     if (!t) return null;
@@ -138,7 +135,8 @@ rpc.start();
 
 const KINDS: SessionKind[] = ["claude", "codex", "shell"];
 
-/** A window with no tabs: pick a folder and what to run (keys 1 2 3). */
+/** A window with no tabs: pick a folder and what to run (keys 1 2 3). The first tab starts a
+ * group. */
 function EmptyWindow() {
   const home = meta.value.home;
   const [folder, setFolder] = useState(() => tildify(A.defaultFolder(), home));
@@ -160,7 +158,7 @@ function EmptyWindow() {
   };
   return (
     <div
-      class="welcome"
+      class="welcome empty"
       ref={ref}
       tabIndex={-1}
       onKeyDown={(e) => {
@@ -173,12 +171,15 @@ function EmptyWindow() {
         }
       }}
     >
+      <div class="empty-controls">
+        <WindowControls empty />
+      </div>
       <div class="welcome-card empty-window">
         <div class="welcome-mark">m</div>
         <h1>{first ? "Welcome to muster" : "No tabs in this window"}</h1>
         <p>
           {first
-            ? "Run coding agents and shells in tabs and splits. Pick a folder and what to start there."
+            ? "Run coding agents and shells in tabs and split groups. Pick a folder and what to start there."
             : "Pick a folder and what to start there."}
         </p>
         <label class="field empty-folder">
@@ -239,19 +240,22 @@ function App() {
       </>
     );
   }
-  const c = activeChannel.value;
-  const l = c ? layouts.value.get(c.id) : undefined;
+  const l = layout.value;
   return (
     <div class="app">
-      <TabBar />
       <main class="content">
-        {c ? <div class="panes">{l ? <SplitView ch={c.id} layout={l} /> : null}</div> : <EmptyWindow />}
+        {l && windowSessions.value.length
+          ? (
+            <div class="panes">
+              <SplitView layout={l} />
+            </div>
+          )
+          : <EmptyWindow />}
       </main>
       {prefs.value.statusLine && <StatusLine />}
       <Overlays />
       <MenuHost />
       <DragOverlay />
-      <TabDragOverlay />
       <TooltipHost />
       <Toasts />
     </div>

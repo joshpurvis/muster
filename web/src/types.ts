@@ -34,7 +34,8 @@ export interface Channel {
   owns_worktree: boolean;
   port_base: number;
   archived: boolean;
-  layout: unknown;
+  /** v1 per-channel split layout (only read to migrate). */
+  layout?: unknown;
   created_at: number;
   last_read_at: number;
   sort_order: number;
@@ -48,12 +49,14 @@ export interface Channel {
 
 export type WindowId = number;
 
-/** A client window: an ordered list of tabs (docs/PROTOCOL.md "Windows, tabs and naming"). */
+/** A client window (docs/PROTOCOL.md "Windows, tabs and naming", "Groups layout (v2)"). */
 export interface Win {
   id: WindowId;
   name: string;
-  /** Tab order. */
+  /** Tasks whose default window this is (v1: the tab order). */
   channel_ids: ChannelId[];
+  /** The split tree of groups (opaque to the daemon, owned by this UI). Missing before v2. */
+  layout?: unknown;
   /** A connection holds it. */
   open: boolean;
   last_focused_at: number;
@@ -90,6 +93,8 @@ export interface SessionInfo {
   rows: number;
   queued: number;
   created_at: number;
+  /** The window showing this session as a tab. Missing before v2: then its channel's window. */
+  window_id?: WindowId | null;
 }
 
 export type EventKind =

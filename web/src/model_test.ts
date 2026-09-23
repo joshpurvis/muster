@@ -2,17 +2,20 @@ import {
   aggregateState,
   basename,
   documentTitle,
-  isNoopSlot,
   type JumpCandidate,
-  moveBy,
+  jumpOrder,
+  mainSession,
   moveChannelLocally,
-  moveTo,
   needsYouOrder,
   nextInCycle,
   pushFront,
   rankJump,
+  sessionsOfWindow,
+  sessionWindowId,
   tabLabel,
   tabsOf,
+  tabText,
+  taskLabel,
   upsertWindow,
   windowIdOf,
   windowLabel,
@@ -49,7 +52,13 @@ function win(id: number, channel_ids: number[], extra: Partial<Win> = {}): Win {
   return { id, name: String(id), channel_ids, open: true, last_focused_at: 0, created_at: 0, ...extra };
 }
 
-function sess(id: number, channel_id: number, state: AgentState, state_since = 0): SessionInfo {
+function sess(
+  id: number,
+  channel_id: number,
+  state: AgentState,
+  state_since = 0,
+  extra: Partial<SessionInfo> = {},
+): SessionInfo {
   return {
     id,
     channel_id,
@@ -67,6 +76,7 @@ function sess(id: number, channel_id: number, state: AgentState, state_since = 0
     rows: 24,
     queued: 0,
     created_at: 0,
+    ...extra,
   };
 }
 
@@ -123,27 +133,57 @@ Deno.test("windowIdOf prefers the channel's window_id", () => {
   assertEquals(windowIdOf(ch(1, { window_id: null }), ws), null);
 });
 
-Deno.test("moveTo uses insertion slots like a drop marker", () => {
-  assertEquals(moveTo([1, 2, 3, 4], 1, 3), [2, 3, 1, 4]);
-  assertEquals(moveTo([1, 2, 3, 4], 4, 0), [4, 1, 2, 3]);
-  assertEquals(moveTo([1, 2, 3, 4], 2, 4), [1, 3, 4, 2]);
-  assertEquals(moveTo([1, 2, 3], 2, 1), [1, 2, 3], "own slot");
-  assertEquals(moveTo([1, 2, 3], 9, 0), [1, 2, 3], "unknown id");
+// ---------------- sessions as tabs (v2) ----------------
+
+const sids = (ss: SessionInfo[]) => ss.map((s) => s.id);
+
+Deno.test("sessionsOfWindow: a session's own window_id decides, whatever its task's window", () => {
+  const cs = [ch(1, { window_id: 1 }), ch(2, { window_id: 2 })];
+  const w1 = win(1, [1]);
+  const ss = [
+    sess(10, 1, "idle", 0, { window_id: 1 }),
+    sess(11, 1, "idle", 0, { window_id: 2 }), // pulled into window 2, its task stays in 1
+    sess(20, 2, "idle", 0, { window_id: 1 }), // pulled here from window 2's task
+    sess(21, 2, "idle", 0, { window_id: 2 }),
+  ];
+  assertEquals(sids(sessionsOfWindow(w1, ss, cs)), [10, 20]);
+  assertEquals(sids(sessionsOfWindow(win(2, [2]), ss, cs)), [21, 11], "own tasks first, then others");
 });
 
-Deno.test("moveBy steps one place and stops at the ends", () => {
-  assertEquals(moveBy([1, 2, 3], 2, -1), [2, 1, 3]);
-  assertEquals(moveBy([1, 2, 3], 2, 1), [1, 3, 2]);
-  const l = [1, 2, 3];
-  assertEquals(moveBy(l, 1, -1) === l, true, "first can't go left");
-  assertEquals(moveBy(l, 3, 1) === l, true, "last can't go right");
+Deno.test("sessionsOfWindow without per-session windows: those of the window's tasks", () => {
+  const cs = [
+    ch(1, { window_id: 1 }),
+    ch(2, { window_id: 2 }),
+    ch(3),
+    ch(4, { window_id: 1, archived: true }),
+  ];
+  const w1 = win(1, [3, 1]);
+  const ss = [sess(10, 1, "idle"), sess(20, 2, "idle"), sess(30, 3, "idle"), sess(40, 4, "idle")];
+  // Task 3 has no window_id: matched by the window's list, which also orders the tasks.
+  assertEquals(sids(sessionsOfWindow(w1, ss, cs)), [30, 10]);
+  // No windows at all: every session of a live task.
+  assertEquals(sids(sessionsOfWindow(null, ss, cs)), [10, 20, 30]);
 });
 
-Deno.test("isNoopSlot: the two slots around a tab change nothing", () => {
-  assertEquals(isNoopSlot([1, 2, 3], 2, 1), true);
-  assertEquals(isNoopSlot([1, 2, 3], 2, 2), true);
-  assertEquals(isNoopSlot([1, 2, 3], 2, 0), false);
-  assertEquals(isNoopSlot([1, 2, 3], 2, 3), false);
+Deno.test("sessionsOfWindow orders a task's sessions by age", () => {
+  const cs = [ch(1, { window_id: 1 })];
+  const ss = [
+    sess(12, 1, "idle", 0, { created_at: 5, window_id: 1 }),
+    sess(11, 1, "idle", 0, { created_at: 9, window_id: 1 }),
+  ];
+  assertEquals(sids(sessionsOfWindow(win(1, [1]), ss, cs)), [12, 11]);
+});
+
+Deno.test("sessionWindowId: window_id wins, else the task's window", () => {
+  const ws = [win(1, [1]), win(2, [2])];
+  assertEquals(sessionWindowId(sess(1, 1, "idle", 0, { window_id: 2 }), ch(1, { window_id: 1 }), ws), 2);
+  assertEquals(
+    sessionWindowId(sess(1, 1, "idle", 0, { window_id: null }), ch(1, { window_id: 1 }), ws),
+    null,
+  );
+  assertEquals(sessionWindowId(sess(1, 1, "idle"), ch(1, { window_id: 1 }), ws), 1);
+  assertEquals(sessionWindowId(sess(1, 2, "idle"), ch(2), ws), 2, "task matched by the windows' lists");
+  assertEquals(sessionWindowId(sess(1, 9, "idle"), undefined, ws), null);
 });
 
 Deno.test("moveChannelLocally moves a tab between windows' orders", () => {
@@ -189,22 +229,46 @@ Deno.test("basename", () => {
   assertEquals(basename("/"), "/");
 });
 
-Deno.test("tabLabel: human names as is; auto names muted until something was derived", () => {
+Deno.test("taskLabel: human names as is; auto names muted until something was derived", () => {
   const ws = { name: "proj", path: "/home/u/proj" };
-  assertEquals(tabLabel(ch(1, { name: "fix auth" }), ws), { text: "fix auth", muted: false });
-  assertEquals(tabLabel(ch(1, { name: "Fix the login bug", auto_named: true }), ws), {
+  assertEquals(taskLabel(ch(1, { name: "fix auth" }), ws), { text: "fix auth", muted: false });
+  assertEquals(taskLabel(ch(1, { name: "Fix the login bug", auto_named: true }), ws), {
     text: "Fix the login bug",
     muted: false,
   });
-  assertEquals(tabLabel(ch(1, { name: "proj", auto_named: true }), ws), { text: "proj", muted: true });
-  // A worktree tab: cwd is <data>/worktrees/<slug>/<id>, the placeholder is still the folder name.
+  assertEquals(taskLabel(ch(1, { name: "proj", auto_named: true }), ws), { text: "proj", muted: true });
+  // A worktree task: cwd is <data>/worktrees/<slug>/<id>, the placeholder is still the folder name.
   const wt = ch(7, { name: "proj", auto_named: true, cwd: "/data/worktrees/proj-1/7", owns_worktree: true });
-  assertEquals(tabLabel(wt, ws), { text: "proj", muted: true });
-  // A human may name a tab like its folder: then it isn't a placeholder.
-  assertEquals(tabLabel(ch(1, { name: "proj", auto_named: false }), ws), { text: "proj", muted: false });
+  assertEquals(taskLabel(wt, ws), { text: "proj", muted: true });
+  // A human may name a task like its folder: then it isn't a placeholder.
+  assertEquals(taskLabel(ch(1, { name: "proj", auto_named: false }), ws), { text: "proj", muted: false });
   // Nothing at all: the folder, muted.
-  assertEquals(tabLabel(ch(1, { name: "  " }), ws), { text: "proj", muted: true });
-  assertEquals(tabLabel(ch(1, { name: "" }), null), { text: "proj", muted: true });
+  assertEquals(taskLabel(ch(1, { name: "  " }), ws), { text: "proj", muted: true });
+  assertEquals(taskLabel(ch(1, { name: "" }), null), { text: "proj", muted: true });
+});
+
+Deno.test("tabLabel: the task's name, plus the session's when the task has several", () => {
+  const ws = { name: "proj", path: "/home/u/proj" };
+  const c = ch(1, { name: "fix auth" });
+  const shell = { ...sess(2, 1, "idle"), name: "shell" };
+  assertEquals(tabLabel(shell, c, ws, 1), { text: "fix auth", muted: false, sub: null });
+  assertEquals(tabLabel(shell, c, ws, 2), { text: "fix auth", muted: false, sub: "shell" });
+  assertEquals(tabText(tabLabel(shell, c, ws, 2)), "fix auth · shell");
+  assertEquals(tabText(tabLabel(shell, c, ws, 1)), "fix auth");
+  // Still only the folder: muted, with the session part.
+  const auto = ch(1, { name: "proj", auto_named: true });
+  assertEquals(tabLabel(shell, auto, ws, 3), { text: "proj", muted: true, sub: "shell" });
+  // Task unknown (its event lags): the session's own name.
+  assertEquals(tabLabel(shell, undefined, ws, 1), { text: "shell", muted: false, sub: null });
+});
+
+Deno.test("mainSession: a task's first agent, else its first session", () => {
+  const a = { id: 1, kind: "shell" as const };
+  const b = { id: 2, kind: "codex" as const };
+  const c = { id: 3, kind: "claude" as const };
+  assertEquals(mainSession([a, b, c])?.id, 2);
+  assertEquals(mainSession([a])?.id, 1);
+  assertEquals(mainSession([]), null);
 });
 
 // ---------------- needs you ----------------
@@ -243,6 +307,37 @@ Deno.test("Alt+J cycles through what needs you and wraps", () => {
 function cand(key: string, label: string, extra: Partial<JumpCandidate> = {}): JumpCandidate {
   return { key, label, hay: label, needs: false, ...extra };
 }
+
+Deno.test("jumpOrder: this window's tabs in layout order, then other windows' by window and age", () => {
+  const at = (id: number, created_at: number) => ({ id, created_at });
+  const winOf = new Map([[1, 1], [2, 3], [3, 2], [4, 2], [5, 1], [6, 0]]);
+  const all = [at(1, 1), at(2, 2), at(3, 5), at(4, 3), at(5, 4), at(6, 0)];
+  // Window 1 shows 5 then 1 (its groups' order); 6 has no window (0 → null here).
+  const out = jumpOrder(all, [5, 1], (s) => winOf.get(s.id) || null).map((s) => s.id);
+  assertEquals(out, [5, 1, 4, 3, 2, 6]);
+});
+
+Deno.test("Jump ranking over tabs of all windows: needs you, then recent, then this window's order", () => {
+  const order = jumpOrder(
+    [{ id: 1, created_at: 0 }, { id: 2, created_at: 0 }, { id: 3, created_at: 0 }, { id: 4, created_at: 0 }],
+    [2, 1],
+    (s) => (s.id <= 2 ? 1 : 2),
+  );
+  const items = order.map((s) =>
+    cand("s:" + s.id, "tab " + s.id, {
+      here: s.id <= 2,
+      needs: s.id === 4,
+      pri: 0,
+      since: 1,
+      boost: 2,
+    })
+  );
+  items.push(cand("f:/p", "p", { boost: -3 }));
+  assertEquals(rankJump(items, "", ["s:3"]).map((r) => r.item.key), ["s:4", "s:3", "s:2", "s:1", "f:/p"]);
+  // With a query, a tab of this window beats an equal match elsewhere.
+  const two = [cand("s:9", "api", { here: false }), cand("s:8", "api", { here: true })];
+  assertEquals(rankJump(two, "api", [])[0].item.key, "s:8");
+});
 
 Deno.test("rankJump without a query: needs you, then recent, then the given order", () => {
   const items = [

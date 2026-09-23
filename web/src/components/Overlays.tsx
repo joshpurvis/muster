@@ -3,41 +3,32 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  channelById,
   channels,
   dismissToast,
+  hereIds,
+  layoutOrder,
   meta,
   myWindow,
   overlay,
   prefs,
   sessions,
-  sessionsByChannel,
-  tabIdSet,
-  tabs,
   toasts,
   windowById,
-  windowOf,
+  windowOfSession,
   windows,
-  workspaceById,
   workspaces,
 } from "../state.ts";
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
-import {
-  IconBranch,
-  IconCheck,
-  IconCodex,
-  IconFolder,
-  IconSpark,
-  IconTerminal,
-  IconX,
-  KindIcon,
-} from "../icons.tsx";
+import { IconBranch, IconCheck, IconCodex, IconFolder, IconSpark, IconTerminal, IconX } from "../icons.tsx";
 import type { Permissions, SessionKind } from "../types.ts";
-import { DEFAULT_PERMISSIONS, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
+import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { FolderInput } from "./FolderInput.tsx";
-import { aggregateState, basename, type JumpCandidate, rankJump, tabLabel, windowLabel } from "../model.ts";
+import { labelOf } from "../layout/Pane.tsx";
+import { basename, type JumpCandidate, jumpOrder, rankJump, tabText, windowLabel } from "../model.ts";
 import { cx, fuzzy, tildify } from "../util.ts";
 
 const FOCUSABLE =
@@ -189,83 +180,41 @@ function commandEntries(): Entry[] {
   return out;
 }
 
-/** Tabs and sessions of every window, and folders for a new tab. */
+/** Every tab (session) of every window, and folders for a new tab. */
 function jumpEntries(): Entry[] {
   const out: Entry[] = [];
   const home = meta.value.home;
-  const here = tabIdSet.value;
+  const here = hereIds.value;
   const winName = (id: number | null) => {
     const w = id !== null ? windowById.value.get(id) : undefined;
     return w ? windowLabel(w) : "no window";
   };
-  const live = channels.value.filter((c) => !c.archived);
-  // This window's tabs first, in tab order, then other windows'.
-  // This window's tabs in tab order, then other windows' (by window, then age).
-  const tabPos = new Map(tabs.value.map((c, i) => [c.id, i]));
-  const ordered = [...live].sort((a, b) =>
-    Number(here.has(b.id)) - Number(here.has(a.id)) ||
-    (tabPos.get(a.id) ?? 0) - (tabPos.get(b.id) ?? 0) ||
-    (windowOf(a) ?? 0) - (windowOf(b) ?? 0) || a.id - b.id
-  );
-  const tabOf = new Map<number, string>();
-  for (const c of ordered) {
-    const list = sessionsByChannel.value.get(c.id) ?? [];
-    const label = tabLabel(c, workspaceById.value.get(c.workspace_id)).text;
-    tabOf.set(c.id, label);
-    const isHere = here.has(c.id);
-    const where = isHere ? tildify(c.cwd, home) : `${winName(windowOf(c))} · ${tildify(c.cwd, home)}`;
-    // A tab with one session is that session: one row, which carries its urgency.
-    const only = list.length === 1 ? list[0] : null;
-    const agg = aggregateState(list);
-    const detail = only
-      ? only.state_detail ?? (agg ? STATE_LABEL[agg] : "")
-      : agg
-      ? STATE_LABEL[agg]
-      : "empty";
+  const live = [...sessions.value.values()].filter((s) => {
+    const c = channelById.value.get(s.channel_id);
+    return !!c && !c.archived;
+  });
+  for (const s of jumpOrder(live, layoutOrder.value, windowOfSession)) {
+    const c = channelById.value.get(s.channel_id)!;
+    const label = tabText(labelOf(s));
+    const isHere = here.has(s.id);
+    const folder = tildify(c.cwd, home);
     out.push({
-      key: "c:" + c.id,
+      key: "s:" + s.id,
       label,
-      hay: `${label} ${basename(c.cwd)} ${c.branch ?? ""}`,
-      needs: !!only && needsHuman(only.state),
-      pri: only ? STATE_PRIORITY.indexOf(only.state) : undefined,
-      since: only?.state_since,
+      hay: `${label} ${basename(c.cwd)} ${c.branch ?? ""} ${KIND_LABEL[s.kind]}`,
+      needs: needsHuman(s.state),
+      pri: STATE_PRIORITY.indexOf(s.state),
+      since: s.state_since,
       here: isHere,
       boost: 2,
-      sub: where,
-      icon: <StateDot state={agg} />,
-      right: <span class="sw-detail">{detail}</span>,
+      sub: isHere ? folder : `${winName(windowOfSession(s))} · ${folder}`,
+      icon: <StateDot state={s.state} />,
+      right: <span class="sw-detail">{s.state_detail || STATE_LABEL[s.state]}</span>,
       run: () => {
         overlay.value = null;
-        A.gotoChannel(c.id, only?.id);
+        A.gotoSession(s.id);
       },
     });
-  }
-  for (const c of ordered) {
-    const list = sessionsByChannel.value.get(c.id) ?? [];
-    if (list.length < 2) continue;
-    const isHere = here.has(c.id);
-    for (const s of list) {
-      out.push({
-        key: "s:" + s.id,
-        label: s.name,
-        hay: `${s.name} ${tabOf.get(c.id)}`,
-        needs: needsHuman(s.state),
-        pri: STATE_PRIORITY.indexOf(s.state),
-        since: s.state_since,
-        here: isHere,
-        sub: isHere ? tabOf.get(c.id) : `${tabOf.get(c.id)} · ${winName(windowOf(c))}`,
-        icon: <KindIcon kind={s.kind} size={14} />,
-        right: (
-          <span class="sw-state">
-            <StateDot state={s.state} /> {s.state_detail || STATE_LABEL[s.state]}
-          </span>
-        ),
-        run: () => {
-          overlay.value = null;
-          A.gotoChannel(c.id, s.id);
-        },
-      });
-    }
   }
   const folders = [...prefs.value.recentFolders];
   for (const w of workspaces.value) if (!folders.includes(w.path)) folders.push(w.path);
@@ -282,11 +231,7 @@ function jumpEntries(): Entry[] {
       right: <span class="sw-detail">new tab</span>,
       run: () => {
         overlay.value = null;
-        A.createTab({
-          path: f,
-          agent: prefs.value.lastAgent === "none" ? null : prefs.value.lastAgent,
-          worktree: false,
-        })
+        A.createTab({ path: f, agent: A.lastKind(), worktree: false })
           .catch((e) => A.fail("Couldn't open a tab")(e)).catch(() => {});
       },
     });
@@ -329,7 +274,7 @@ function Jump({ initial }: { initial: string }) {
     const cmds = rankJump(commandEntries(), query, [], 10).map((r) => ({ e: r.item, hits: r.hits }));
     return [...ranked, ...cmds];
     // Live: states and tabs change while Jump is open.
-  }, [q, sessions.value, channels.value, windows.value]);
+  }, [q, sessions.value, channels.value, windows.value, layoutOrder.value]);
 
   useEffect(() => setSel(0), [q]);
   useEffect(() => {
@@ -358,7 +303,9 @@ function Jump({ initial }: { initial: string }) {
           ref={inputRef}
           class="sw-input"
           value={q}
-          placeholder={cmdMode ? "Type a command…" : "Jump to a tab, session or folder…   (> for commands)"}
+          placeholder={cmdMode
+            ? "Type a command…"
+            : "Jump to a tab or folder, in any window…   (> for commands)"}
           spellcheck={false}
           aria-label={cmdMode ? "Command" : "Jump to"}
           onInput={(e) => setQ((e.target as HTMLInputElement).value)}
@@ -432,17 +379,16 @@ function SearchGlyph() {
 
 // ---------------- new tab ----------------
 
-const AGENTS: { k: SessionKind | "none"; label: string; icon: ComponentChildren }[] = [
+const AGENTS: { k: SessionKind; label: string; icon: ComponentChildren }[] = [
   { k: "claude", label: "Claude", icon: <IconSpark size={14} /> },
   { k: "codex", label: "Codex", icon: <IconCodex size={14} /> },
   { k: "shell", label: "Shell", icon: <IconTerminal size={14} /> },
-  { k: "none", label: "None", icon: <IconX size={14} /> },
 ];
 
 function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string }) {
   const home = meta.value.home;
   const [folder, setFolder] = useState(tildify(cwd ?? A.defaultFolder(), home));
-  const [agent, setAgent] = useState<SessionKind | "none">(prefs.value.lastAgent);
+  const [agent, setAgent] = useState<SessionKind>(A.lastKind());
   const [worktree, setWorktree] = useState(!!wtInit);
   const [base, setBase] = useState("");
   const [name, setName] = useState("");
@@ -469,7 +415,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
         name: name.trim() || undefined,
         worktree: worktree && !notGit,
         base: worktree ? base.trim() || undefined : undefined,
-        agent: agent === "none" ? null : agent,
+        agent,
         prompt: agent === "claude" || agent === "codex" ? prompt.trim() || undefined : undefined,
         permissions,
       });
@@ -496,7 +442,9 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
       >
         <div class="dlg-head">
           <h2>New tab</h2>
-          <span class="muted">A folder and what to start in it. The tab names itself.</span>
+          <span class="muted">
+            A folder and what to start in it, in the focused group. The tab names itself.
+          </span>
         </div>
         <div class="dlg-body">
           <label class="field">
@@ -658,15 +606,14 @@ function RenameWindow() {
 
 const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Go to tab N", keys: ["Alt+1", "Alt+9"], group: "Navigate" },
-  { title: "Focus pane in direction (not in text fields)", keys: ["Alt+←↑→↓"], group: "Panes" },
-  { title: "Resize focused pane", keys: ["Alt+Shift+←↑→↓"], group: "Panes" },
+  { title: "Focus group in direction (not in text fields)", keys: ["Alt+←↑→↓"], group: "Groups" },
+  { title: "Resize focused group", keys: ["Alt+Shift+←↑→↓"], group: "Groups" },
   { title: "Copy / paste in terminal", keys: ["Ctrl+Shift+C", "Ctrl+Shift+V"], group: "View" },
-  { title: "Close a tab or pane-tab", keys: ["Middle-click"], group: "Tab" },
-  { title: "Rename a tab or session", keys: ["Double-click"], group: "Tab" },
-  { title: "Reorder, or move to another window", keys: ["Drag tab"], group: "Tab" },
-  { title: "Move a session / new split", keys: ["Drag pane header"], group: "Panes" },
-  { title: "Pane menu (Shift for programs using the mouse)", keys: ["Right-click"], group: "Panes" },
-  { title: "Equalize splits", keys: ["Double-click gutter"], group: "Panes" },
+  { title: "Close a tab", keys: ["Middle-click"], group: "Tab" },
+  { title: "Rename (the task, on its main tab)", keys: ["Double-click", "F2"], group: "Tab" },
+  { title: "Reorder, move to a group, split or window", keys: ["Drag tab"], group: "Tab" },
+  { title: "Group menu (Shift for programs using the mouse)", keys: ["Right-click"], group: "Groups" },
+  { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },
 ];
 
 type ScGroup = [string, { title: string; keys: string[] }[]];

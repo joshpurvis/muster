@@ -1,18 +1,16 @@
-// Pointer-based tab drag & drop (Obsidian-style). Dragging a tab over a pane shows where it
-// will land: edges split, center joins the pane's tabs, tab strips reorder. Dropping it on the
-// empty part of the tab bar moves the session into a new tab. The same drop zones serve a
-// top-level tab dragged onto the panes (TabBar.tsx), which merges that tab into this one.
+// Pointer-based tab drag & drop. Dragging a tab over a group shows where it will land: the body's
+// edges split that group, its center joins the group's tabs, a strip inserts at the marker. The
+// "→ Window N / → New window" targets in the focused strip move it to another window.
 
 import { signal } from "@preact/signals";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
-import { type DropZone, isNoopMove, moveTab, splitFits } from "./tree.ts";
-import { layouts, updateLayout } from "../state.ts";
-import { focusActiveTerminalSoon, moveSessionToNewTab } from "../actions.ts";
+import { type DropZone, isNoopMove, splitFits } from "./tree.ts";
+import { layout } from "../state.ts";
+import { dropTab, moveTabToWindow, revealSession } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
 import { KindIcon } from "../icons.tsx";
 
 export interface Target {
-  /** "" for the tab bar (`newTab`). */
   paneId: string;
   zone: DropZone;
   index?: number;
@@ -20,29 +18,25 @@ export interface Target {
   rect: { left: number; top: number; width: number; height: number };
   /** Insertion marker for tab strips. */
   line?: { left: number; top: number; height: number };
-  /** The empty part of the tab bar: the session moves into a new tab. */
-  newTab?: boolean;
 }
 
 interface DragState {
   sid: number;
-  ch: number;
-  name: string;
+  label: string;
   kind: SessionInfo["kind"];
   x: number;
   y: number;
   target: Target | null;
+  /** Over a "→ Window N" (id) or "→ New window" target. */
+  win: number | "new" | null;
 }
 
 export const drag = signal<DragState | null>(null);
 
 const THRESHOLD = 5;
 
-/**
- * Call from a tab's pointerdown. Resolves to true if a drag happened (so the caller should
- * suppress click behaviour).
- */
-export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClick: () => void) {
+/** Call from a tab's pointerdown. A press without movement is a click (`onClick`). */
+export function startTabDrag(e: PointerEvent, s: SessionInfo, label: string, onClick: () => void) {
   if (e.button !== 0) return;
   const sx = e.clientX;
   const sy = e.clientY;
@@ -54,14 +48,15 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
       document.body.classList.add("dragging");
     }
     ev.preventDefault();
+    const win = windowTarget(ev.clientX, ev.clientY);
     drag.value = {
       sid: s.id,
-      ch,
-      name: s.name,
+      label,
       kind: s.kind,
       x: ev.clientX,
       y: ev.clientY,
-      target: computeTarget(ev.clientX, ev.clientY, ch, s.id),
+      win,
+      target: win !== null ? null : computeTarget(ev.clientX, ev.clientY, s.id),
     };
   };
   const cleanup = () => {
@@ -80,11 +75,11 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
       onClick();
       return;
     }
-    if (d?.target?.newTab) moveSessionToNewTab(ch, s.id);
+    if (d?.win != null) moveTabToWindow(s.id, d.win);
     else if (d?.target) {
       const t = d.target;
-      updateLayout(ch, (l) => moveTab(l, s.id, t.paneId, t.zone, t.index));
-      focusActiveTerminalSoon();
+      dropTab(s.id, t.paneId, t.zone, t.index);
+      revealSession(s.id);
     }
   };
   const cancel = () => {
@@ -105,32 +100,21 @@ export function startTabDrag(e: PointerEvent, ch: number, s: SessionInfo, onClic
   addEventListener("blur", cancel);
 }
 
-/**
- * Where a drop at (x, y) lands in tab `ch`'s panes. `sid`: the session dragged within that tab
- * (drops that change nothing give null, and the tab bar's empty part is a target); null for a
- * whole tab dragged in from the tab bar.
- */
-export function computeTarget(x: number, y: number, ch: number, sid: number | null): Target | null {
-  const el = document.elementFromPoint(x, y) as HTMLElement | null;
+function windowTarget(x: number, y: number): number | "new" | null {
+  const el = (document.elementFromPoint(x, y) as HTMLElement | null)?.closest("[data-move-to]") as
+    | HTMLElement
+    | null;
   if (!el) return null;
-  const l = layouts.value.get(ch);
-  if (!l) return null;
-  const noop = (paneId: string, zone: DropZone, index?: number) =>
-    sid !== null && isNoopMove(l, sid, paneId, zone, index);
-  if (sid !== null && (el.closest(".tb-space") || (el.closest(".tb-tabs") && !el.closest(".ttab")))) {
-    const strip = document.querySelector<HTMLElement>(".tabbar .tb-tabs");
-    const last = strip?.querySelector<HTMLElement>(".ttab:last-child");
-    if (!strip) return null;
-    const sr = strip.getBoundingClientRect();
-    const lx = Math.min(sr.right - 1, last ? last.getBoundingClientRect().right : sr.left + 4);
-    return {
-      paneId: "",
-      zone: "center",
-      newTab: true,
-      rect: { left: sr.left, top: sr.top, width: sr.width, height: sr.height },
-      line: { left: lx - 1, top: sr.top + 5, height: sr.height - 10 },
-    };
-  }
+  const v = el.dataset.moveTo!;
+  return v === "new" ? "new" : Number(v);
+}
+
+/** Where a drop of tab `sid` at (x, y) lands among the groups (null: nowhere, or no change). */
+export function computeTarget(x: number, y: number, sid: number): Target | null {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null;
+  const l = layout.value;
+  if (!el || !l) return null;
+  const noop = (paneId: string, zone: DropZone, index?: number) => isNoopMove(l, sid, paneId, zone, index);
   const strip = el.closest("[data-tabstrip]") as HTMLElement | null;
   if (strip) {
     const paneId = strip.dataset.tabstrip!;
@@ -143,12 +127,14 @@ export function computeTarget(x: number, y: number, ch: number, sid: number | nu
         break;
       }
     }
+    if (noop(paneId, "center", index)) return null;
+    const box = (strip.querySelector(".tabs") ?? strip).getBoundingClientRect();
     const sr = strip.getBoundingClientRect();
     let lineX: number;
-    if (tabs.length === 0) lineX = sr.left + 4;
+    if (tabs.length === 0) lineX = box.left + 4;
     else if (index < tabs.length) lineX = tabs[index].getBoundingClientRect().left;
     else lineX = tabs[tabs.length - 1].getBoundingClientRect().right;
-    if (noop(paneId, "center", index)) return null;
+    lineX = Math.max(box.left + 1, Math.min(box.right - 1, lineX));
     return {
       paneId,
       zone: "center",
@@ -156,14 +142,6 @@ export function computeTarget(x: number, y: number, ch: number, sid: number | nu
       rect: { left: sr.left, top: sr.top, width: sr.width, height: sr.height },
       line: { left: lineX - 1, top: sr.top + 4, height: sr.height - 8 },
     };
-  }
-  // A pane header joins that pane's sessions (like dropping on its center).
-  const head = el.closest("[data-pane-head]") as HTMLElement | null;
-  if (head) {
-    const paneId = head.dataset.paneHead!;
-    if (noop(paneId, "center")) return null;
-    const r = (head.closest("[data-pane]") ?? head).getBoundingClientRect();
-    return { paneId, zone: "center", rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
   }
   const body = el.closest("[data-pane-body]") as HTMLElement | null;
   if (!body) return null;
@@ -177,7 +155,7 @@ export function computeTarget(x: number, y: number, ch: number, sid: number | nu
   const d = { left: rx, right: 1 - rx, top: ry, bottom: 1 - ry };
   const nearest = (Object.keys(d) as (keyof typeof d)[]).reduce((a, b) => (d[a] < d[b] ? a : b));
   if (d[nearest] < edge) zone = nearest;
-  // No room for another split there: joining the pane's tabs is the only option.
+  // No room for another split there: joining the group's tabs is the only option.
   if (zone !== "center") {
     const box = document.querySelector(".panes")?.getBoundingClientRect();
     if (box && !splitFits(l.root, paneId, zone, { w: box.width, h: box.height })) zone = "center";
@@ -197,13 +175,13 @@ export function DragOverlay() {
   return (
     <>
       <DropMarker t={d.target} />
-      <Ghost x={d.x} y={d.y} kind={d.kind} name={d.name} />
+      <Ghost x={d.x} y={d.y} kind={d.kind} label={d.label} />
     </>
   );
 }
 
-/** The drop-zone overlay of a target (half a pane, a whole pane) or its insertion line. */
-export function DropMarker({ t }: { t: Target | null }) {
+/** The drop-zone overlay of a target (half a group, a whole group) or its insertion line. */
+function DropMarker({ t }: { t: Target | null }) {
   return (
     <>
       {t && !t.line && (
@@ -228,13 +206,13 @@ export function DropMarker({ t }: { t: Target | null }) {
 }
 
 /** The dragged tab's label, following the pointer but kept inside the window. */
-function Ghost({ x, y, kind, name }: { x: number; y: number; kind: SessionInfo["kind"]; name: string }) {
+function Ghost({ x, y, kind, label }: { x: number; y: number; kind: SessionInfo["kind"]; label: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 160, h: 26 });
   useLayoutEffect(() => {
     const r = ref.current?.getBoundingClientRect();
     if (r && (r.width !== size.w || r.height !== size.h)) setSize({ w: r.width, h: r.height });
-  }, [name]);
+  }, [label]);
   let left = x + 12;
   let top = y + 10;
   if (left + size.w > innerWidth - 4) left = x - size.w - 8;
@@ -244,7 +222,7 @@ function Ghost({ x, y, kind, name }: { x: number; y: number; kind: SessionInfo["
   return (
     <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
       <KindIcon kind={kind} size={13} />
-      <span>{name}</span>
+      <span>{label}</span>
     </div>
   );
 }

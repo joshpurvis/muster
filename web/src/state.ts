@@ -1,5 +1,6 @@
-// App state as signals. Server state is replaced/merged from hello + ServerEvents;
-// UI prefs persist to localStorage.
+// App state as signals. Server state is replaced/merged from hello + ServerEvents; this window's
+// layout (its split tree of groups) is owned here and saved with window.set_layout; UI prefs
+// persist to localStorage.
 
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
@@ -18,8 +19,23 @@ import type {
 import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { debounce, load, save } from "./util.ts";
-import { emptyLayout, type LayoutState, parseLayout, reconcile } from "./layout/tree.ts";
-import { documentTitle, needsYouOrder, pushFront, tabsOf, upsertWindow, windowIdOf } from "./model.ts";
+import {
+  allSessions,
+  emptyLayout,
+  findPane,
+  type LayoutState,
+  type PaneNode,
+  parseLayout,
+  reconcile,
+} from "./layout/tree.ts";
+import {
+  documentTitle,
+  needsYouOrder,
+  pushFront,
+  sessionsOfWindow,
+  sessionWindowId,
+  upsertWindow,
+} from "./model.ts";
 
 // ---------------- server state ----------------
 
@@ -31,7 +47,7 @@ export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 
 /** Every window the daemon knows (all clients). */
 export const windows = signal<Win[]>([]);
-/** The daemon has windows (hello carried `windows`). Without them every channel is a tab here. */
+/** The daemon has windows (hello carried `windows`). Without them every session is a tab here. */
 export const windowsSupported = signal(false);
 /** The window this client claimed (null until claimed, or without window support). */
 export const windowId = signal<WindowId | null>(null);
@@ -40,6 +56,7 @@ export const channelById = computed(() => new Map(channels.value.map((c) => [c.i
 export const workspaceById = computed(() => new Map(workspaces.value.map((w) => [w.id, w])));
 export const windowById = computed(() => new Map(windows.value.map((w) => [w.id, w])));
 
+/** Sessions per task (channel), oldest first. */
 export const sessionsByChannel = computed(() => {
   const m = new Map<ChannelId, SessionInfo[]>();
   for (const s of sessions.value.values()) {
@@ -55,34 +72,32 @@ export const myWindow = computed(() =>
   windowId.value !== null ? windowById.value.get(windowId.value) ?? null : null
 );
 
-/** This window's tabs, in order. */
-export const tabs = computed((): Channel[] => {
-  if (!windowsSupported.value) return tabsOf(null, channels.value);
+/** The sessions shown as tabs in this window (see `sessionsOfWindow`). */
+export const windowSessions = computed((): SessionInfo[] => {
+  if (!windowsSupported.value) return sessionsOfWindow(null, sessions.value.values(), channels.value);
   const w = myWindow.value;
-  return w ? tabsOf(w, channels.value) : [];
+  return w ? sessionsOfWindow(w, sessions.value.values(), channels.value) : [];
 });
 
-export const tabIdSet = computed(() => new Set(tabs.value.map((c) => c.id)));
+export const hereIds = computed(() => new Set(windowSessions.value.map((s) => s.id)));
 
-/** Window a channel is a tab in (null: none, or no window support). */
-export function windowOf(c: Channel): WindowId | null {
+/** The window a session is a tab in (null: none). Without window support: this one. */
+export function windowOfSession(s: SessionInfo): WindowId | null {
   if (!windowsSupported.value) return windowId.value;
-  return windowIdOf(c, windows.value);
+  return sessionWindowId(s, channelById.value.get(s.channel_id), windows.value);
 }
 
-/** Sessions needing the human in any window, in Alt+J order. */
-export const needsYou = computed(() =>
-  needsYouOrder(sessions.value.values(), new Set(channels.value.filter((c) => !c.archived).map((c) => c.id)))
-);
+const liveTaskIds = computed(() => new Set(channels.value.filter((c) => !c.archived).map((c) => c.id)));
 
-/** How many of those are in this window's tabs. */
-export const needsYouHere = computed(() =>
-  needsYou.value.filter((s) => tabIdSet.value.has(s.channel_id)).length
-);
+/** Sessions needing the human in any window, in Alt+J order. */
+export const needsYou = computed(() => needsYouOrder(sessions.value.values(), liveTaskIds.value));
+
+/** How many of those are tabs of this window. */
+export const needsYouHere = computed(() => needsYou.value.filter((s) => hereIds.value.has(s.id)).length);
 
 // ---------------- unread ----------------
 
-/** Latest "notable" event per channel (what makes a tab bold/unread). */
+/** Latest "notable" event per task (what makes its tabs bold/unread). */
 export const latestNotable = signal<Map<ChannelId, number>>(new Map());
 
 export function isNotable(e: TimelineEvent): boolean {
@@ -124,22 +139,13 @@ export const unread = computed(() => {
   return out;
 });
 
-// ---------------- UI state ----------------
-
-const activeKey = () => `active.${windowId.value ?? 0}`;
-export const activeChannelId = signal<ChannelId | null>(null);
-
-export const activeChannel = computed(() => {
-  const id = activeChannelId.value;
-  if (id === null || !tabIdSet.value.has(id)) return null;
-  return channelById.value.get(id) ?? null;
-});
+// ---------------- prefs ----------------
 
 export interface Prefs {
   fontSize: number;
   theme: "system" | "dark" | "light";
   lastAgent: "claude" | "codex" | "shell" | "none";
-  /** Jump recency keys ("c:<id>", "s:<id>", "f:<path>"), most recent first. */
+  /** Jump recency keys ("s:<id>", "f:<path>"), most recent first. */
   recent: string[];
   /** Folders new tabs were opened in, most recent first. */
   recentFolders: string[];
@@ -193,6 +199,8 @@ export function pushRecentFolder(path: string) {
   setPref("recentFolders", pushFront(prefs.value.recentFolders, path.replace(/\/+$/, "") || "/", 12));
 }
 
+// ---------------- overlays, toasts, inline UI ----------------
+
 // Overlays (only one modal at a time).
 export type Overlay =
   | { kind: "jump"; initial: string }
@@ -211,7 +219,6 @@ export type Overlay =
   | null;
 export const overlay = signal<Overlay>(null);
 
-// Toasts
 export interface Toast {
   id: number;
   level: "info" | "warn" | "error" | "success";
@@ -230,109 +237,151 @@ export function dismissToast(id: number) {
   toasts.value = toasts.value.filter((t) => t.id !== id);
 }
 
-/** A close awaiting inline confirmation: a session (pane) or a whole tab. */
-export type PendingClose = { kind: "session"; id: SessionId } | { kind: "channel"; id: ChannelId };
-export const confirmClose = signal<PendingClose | null>(null);
-// A pending "Close?" never survives a tab switch.
-effect(() => {
-  void activeChannelId.value;
-  confirmClose.value = null;
-});
+/** A tab (session) whose close awaits the inline "Close? ⏎ / Esc". */
+export const confirmClose = signal<SessionId | null>(null);
 
 /** States in which closing asks first. */
 export const BUSY_STATES = new Set<AgentState>(["working", "starting", "needs_approval", "asking_question"]);
 
-export function channelBusy(ch: ChannelId): boolean {
-  return (sessionsByChannel.value.get(ch) ?? []).some((s) => BUSY_STATES.has(s.state));
-}
-
-/** Alt has been held on its own for a moment (tabs show their Alt+1..9 numbers). */
+/** Alt has been held on its own for a moment (the focused strip shows its Alt+1..9 numbers). */
 export const altHeld = signal(false);
 
-/** What is being renamed inline. */
-export const renaming = signal<{ kind: "channel" | "session"; id: number } | null>(null);
+/** What is being renamed inline: a task or a session, edited in tab `sid`. */
+export const renaming = signal<{ kind: "channel" | "session"; id: number; sid: SessionId } | null>(null);
 
-// ---------------- active tab ----------------
+// ---------------- the window's layout (groups) ----------------
 
-let lastOrder: ChannelId[] = [];
-/** Called after the active tab closed or moved away and a neighbour took its place. */
-export const activeTabReplacedListeners: (() => void)[] = [];
-// Keep a valid active tab: the stored one for this window, else a neighbour of the one that
-// just left (closed or moved to another window), else the first.
-effect(() => {
-  const list = tabs.value;
-  const ids = list.map((c) => c.id);
-  const cur = activeChannelId.peek();
-  if (!helloDone.value) return;
-  if (cur !== null && ids.includes(cur)) {
-    lastOrder = ids;
-    return;
-  }
-  let next: ChannelId | null = null;
-  if (cur === null) {
-    const stored = load<ChannelId | null>(activeKey(), null);
-    if (stored !== null && ids.includes(stored)) next = stored;
-  } else {
-    const i = lastOrder.indexOf(cur);
-    const survivors = lastOrder.filter((id) => ids.includes(id));
-    if (i >= 0) {
-      const before = lastOrder.slice(0, i).filter((id) => ids.includes(id));
-      next = survivors[before.length] ?? survivors[before.length - 1] ?? null;
-    }
-  }
-  lastOrder = ids;
-  activeChannelId.value = next ?? ids[0] ?? null;
-  if (cur !== null) queueMicrotask(() => { for (const f of activeTabReplacedListeners) f(); });
-});
-effect(() => {
-  const id = activeChannelId.value;
-  // Only a tab of this window (a stale id from before a claim must not land under its key).
-  if (id !== null && helloDone.peek() && tabIdSet.value.has(id)) save(activeKey(), id);
+/** This window's split tree of groups. Null until the window is known. */
+export const layout = signal<LayoutState | null>(null);
+/** The window `layout` belongs to (undefined: none built yet; null: no window support). */
+let layoutOwner: WindowId | null | undefined = undefined;
+
+export const focusedGroup = computed((): PaneNode | null => {
+  const l = layout.value;
+  return l ? findPane(l.root, l.focus) : null;
 });
 
-// ---------------- layouts ----------------
+/** The focused group's visible tab. */
+export const focusedSession = computed((): SessionInfo | null => {
+  const p = focusedGroup.value;
+  if (!p || p.active === null || !hereIds.value.has(p.active)) return null;
+  return sessions.value.get(p.active) ?? null;
+});
 
-export const layouts = signal<Map<ChannelId, LayoutState>>(new Map());
+/** The focused tab's task. */
+export const focusedTask = computed((): Channel | null => {
+  const s = focusedSession.value;
+  return s ? channelById.value.get(s.channel_id) ?? null : null;
+});
 
-const saveTimers = new Map<ChannelId, number>();
-const lastSaved = new Map<ChannelId, string>();
+// A pending "Close?" never survives a focus change.
+effect(() => {
+  void focusedSession.value?.id;
+  confirmClose.value = null;
+});
 
-function scheduleSave(ch: ChannelId) {
-  clearTimeout(saveTimers.get(ch));
-  saveTimers.set(
-    ch,
-    setTimeout(() => {
-      saveTimers.delete(ch);
-      const l = layouts.value.get(ch);
-      if (!l || !channelById.value.has(ch) || !tabIdSet.value.has(ch)) return;
-      const json = JSON.stringify(l);
-      if (lastSaved.get(ch) === json) return;
-      lastSaved.set(ch, json);
-      rpc.call("channel.set_layout", { id: ch, layout: l }).catch(() => lastSaved.delete(ch));
-    }, 400),
-  );
+// Sessions we create are placed by the call that creates them (a tab of a given group, or a new
+// split). While such a call is in flight, sessions that newly show up in this window are held out
+// of the layout, so they don't first land in the focused group, attach there and size the PTY
+// for the wrong group. Once no call is pending, anything still held joins the focused group.
+let holds = 0;
+const held = signal<ReadonlySet<SessionId>>(new Set());
+
+export function holdNewSessions() {
+  holds++;
 }
 
-// Sessions we spawned are placed by the spawn call itself (a tab in a given pane, or a new
-// split). While a spawn is in flight, new sessions in that channel are held out of the layout so
-// they don't first land in the focused pane, attach there and size the PTY for the wrong pane.
-const spawnHolds = new Map<ChannelId, number>();
-const held = new Set<SessionId>();
+/** Release one hold. */
+export function releaseNewSessions() {
+  holds = Math.max(0, holds - 1);
+  if (holds === 0 && held.peek().size) held.value = new Set();
+}
 
-export function holdNewSessions(ch: ChannelId) {
-  spawnHolds.set(ch, (spawnHolds.get(ch) ?? 0) + 1);
+/** Session ids the layout shows: this window's, minus held ones, in joining order. */
+const liveIds = computed(() => windowSessions.value.filter((s) => !held.value.has(s.id)).map((s) => s.id));
+
+/** The session ids of the layout in on-screen order (groups, then their strips). */
+export const layoutOrder = computed(() => (layout.value ? allSessions(layout.value.root) : []));
+
+/**
+ * Change the layout. `fn` gets the current one; the result is reconciled with this window's
+ * sessions. `place` names sessions the change puts on screen: they stop being held first.
+ */
+export function updateLayout(fn: (l: LayoutState) => LayoutState, place: SessionId[] = []) {
+  const cur = layout.peek();
+  if (!cur) return;
+  batch(() => {
+    if (place.some((id) => held.peek().has(id))) {
+      const h = new Set(held.peek());
+      for (const id of place) h.delete(id);
+      held.value = h;
+    }
+    const next = reconcile(fn(cur), liveIds.peek());
+    if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
+  });
 }
 
 /**
- * Record a session we learned about from an RPC reply. The daemon sends queued events before
- * each reply today, so session_upserted normally arrives first; this keeps placement correct
- * if that ever changes (reconcile drops ids it doesn't know).
+ * Build this window's layout when the window becomes known (or changes): the one the daemon
+ * stored (`Window.layout`), else, for a window that has none yet (first v2 run, or a daemon
+ * without it), one group holding all its sessions.
  */
-export function knowSession(s: SessionInfo) {
-  if (sessions.value.has(s.id)) return;
-  const m = new Map(sessions.value);
-  m.set(s.id, s);
-  sessions.value = m;
+effect(() => {
+  if (!helloDone.value) return;
+  const supported = windowsSupported.value;
+  const id = windowId.value;
+  if (supported && id === null) return;
+  const owner = supported ? id : null;
+  if (layoutOwner === owner) return;
+  const w = supported ? myWindow.peek() : null;
+  const stored = w?.layout ? parseLayout(w.layout) : null;
+  layoutOwner = owner;
+  lastSaved = stored ? JSON.stringify(w!.layout) : "";
+  clearTimeout(saveTimer);
+  layout.value = reconcile(stored ?? emptyLayout([]), liveIds.peek());
+});
+
+// Every change to this window's sessions reconciles the layout: new ones join the focused group,
+// gone ones leave (a focused group that empties hands focus to its neighbour), empty groups close.
+effect(() => {
+  const ids = liveIds.value;
+  const cur = layout.peek();
+  if (!cur) return;
+  const next = reconcile(cur, ids);
+  if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
+});
+
+// Save the layout (debounced). The daemon doesn't echo it back; daemons without
+// `window.set_layout` just don't keep it (a reload builds one group).
+let saveTimer = 0;
+let lastSaved = "";
+let setLayoutMissing = false;
+effect(() => {
+  const l = layout.value;
+  const id = windowId.value;
+  if (!l || id === null || !windowsSupported.value || setLayoutMissing || layoutOwner !== id) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const cur = layout.peek();
+    if (!cur || windowId.peek() !== id || layoutOwner !== id) return;
+    const json = JSON.stringify(cur);
+    if (json === lastSaved) return;
+    lastSaved = json;
+    rpc.call("window.set_layout", { id, layout: cur }).catch((e) => {
+      lastSaved = "";
+      if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) setLayoutMissing = true;
+    });
+  }, 400);
+});
+
+// ---------------- server event handling ----------------
+
+function upsertBy<T extends { id: number }>(arr: T[], item: T): T[] {
+  const i = arr.findIndex((x) => x.id === item.id);
+  if (i < 0) return [...arr, item];
+  const out = [...arr];
+  out[i] = item;
+  return out;
 }
 
 /** Record a channel from an RPC reply (its channel_upserted event may lag). */
@@ -345,80 +394,37 @@ export function knowWindow(w: Win) {
   windows.value = upsertWindow(windows.value, w);
 }
 
-/** Release one hold; once none remain, anything still held is placed normally. */
-export function releaseNewSessions(ch: ChannelId, placed?: SessionId) {
-  if (placed !== undefined) held.delete(placed);
-  const n = (spawnHolds.get(ch) ?? 1) - 1;
-  if (n > 0) {
-    spawnHolds.set(ch, n);
-    return;
-  }
-  spawnHolds.delete(ch);
-  for (const id of [...held]) if (sessions.value.get(id)?.channel_id === ch) held.delete(id);
-  reconcileChannel(ch);
-}
-
-export function liveIds(ch: ChannelId): number[] {
-  return (sessionsByChannel.value.get(ch) ?? []).filter((s) => !held.has(s.id)).map((s) => s.id);
-}
-
-export function layoutOf(ch: ChannelId): LayoutState {
-  let l = layouts.value.get(ch);
-  if (!l) {
-    const c = channelById.value.get(ch);
-    l = reconcile((c && parseLayout(c.layout)) || emptyLayout([]), liveIds(ch));
-    const m = new Map(layouts.value);
-    m.set(ch, l);
-    layouts.value = m;
-    if (c?.layout) lastSaved.set(ch, JSON.stringify(c.layout));
-  }
-  return l;
-}
-
-export function updateLayout(ch: ChannelId, fn: (l: LayoutState) => LayoutState) {
-  const cur = layoutOf(ch);
-  const next = fn(cur);
-  if (next === cur) return;
-  const m = new Map(layouts.value);
-  m.set(ch, next);
-  layouts.value = m;
-  scheduleSave(ch);
-}
-
-function forgetLayout(ch: ChannelId) {
-  clearTimeout(saveTimers.get(ch));
-  saveTimers.delete(ch);
-  lastSaved.delete(ch);
-  if (!layouts.value.has(ch)) return;
-  const m = new Map(layouts.value);
-  m.delete(ch);
-  layouts.value = m;
-}
-
-function reconcileChannel(ch: ChannelId) {
-  if (!layouts.value.has(ch)) return; // lazily created on first view
-  updateLayout(ch, (l) => {
-    const r = reconcile(l, liveIds(ch));
-    return JSON.stringify(r) === JSON.stringify(l) ? l : r;
-  });
-}
-
-// ---------------- server event handling ----------------
-
-function upsertBy<T extends { id: number }>(arr: T[], item: T): T[] {
-  const i = arr.findIndex((x) => x.id === item.id);
-  if (i < 0) return [...arr, item];
-  const out = [...arr];
-  out[i] = item;
-  return out;
-}
-
 export const removedSessionListeners: ((id: SessionId) => void)[] = [];
 /** Called when the window this client holds disappeared (it must claim again). */
 export const windowLostListeners: (() => void)[] = [];
 
+/** While a placement is pending, hold the sessions that appeared in this window since `before`. */
+function holdArrivals(before: ReadonlySet<SessionId>) {
+  if (holds === 0) return;
+  const now = hereIds.peek();
+  const h = new Set(held.peek());
+  let changed = false;
+  for (const id of now) {
+    if (!before.has(id) && !h.has(id)) {
+      h.add(id);
+      changed = true;
+    }
+  }
+  if (changed) held.value = h;
+}
+
+/** Apply a change; sessions it brings into this window are held if a placement is pending. */
+function withHolds(fn: () => void) {
+  batch(() => {
+    const before = hereIds.peek();
+    fn();
+    holdArrivals(before);
+  });
+}
+
 export function applyHello(h: HelloResult) {
   batch(() => {
+    const before = hereIds.peek();
     meta.value = { version: h.version, home: h.home, default_shell: h.default_shell };
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     channels.value = h.channels.filter((c) => !c.archived);
@@ -426,21 +432,13 @@ export function applyHello(h: HelloResult) {
     windows.value = [...(h.windows ?? [])].sort((a, b) => a.id - b.id);
     const prev = sessions.value;
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
-    for (const s of h.sessions) {
-      if (!prev.has(s.id) && spawnHolds.has(s.channel_id)) held.add(s.id);
-    }
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
     }
-    // Drop layouts for channels that are gone; reconcile the rest.
-    const m = new Map<ChannelId, LayoutState>();
-    for (const [ch, l] of layouts.value) {
-      if (channelById.value.has(ch)) m.set(ch, reconcile(l, liveIds(ch)));
-    }
-    layouts.value = m;
+    if (helloDone.peek()) holdArrivals(before);
     helloDone.value = true;
   });
-  // Seed unread state with a little history per channel.
+  // Seed unread state with a little history per task.
   for (const c of h.channels) {
     if (c.archived) continue;
     rpc.call<TimelineEvent[]>("channel.timeline", { id: c.id, limit: 30 }).then((evs) => {
@@ -462,46 +460,40 @@ export function applyEvent(ev: ServerEvent) {
         removeChannel(ev.data.id);
         break;
       }
-      // Keep our local layout while the tab stays here; the daemon doesn't echo set_layout and
-      // we own it. A tab that leaves this window or arrives from another one drops the cached
-      // layout (and any pending save), so another window's splits are adopted, never overwritten.
-      const wasHere = tabIdSet.peek().has(ev.data.id);
-      channels.value = upsertBy(channels.value, ev.data);
-      if (wasHere !== tabIdSet.peek().has(ev.data.id)) forgetLayout(ev.data.id);
+      withHolds(() => (channels.value = upsertBy(channels.value, ev.data)));
       break;
     }
     case "channel_removed":
       removeChannel(ev.data.id);
       break;
-    case "window_upserted":
-      windows.value = upsertWindow(windows.value, ev.data);
+    case "window_upserted": {
+      // Our own layout is ours: the daemon stores what we send and never echoes it.
+      withHolds(() => (windows.value = upsertWindow(windows.value, ev.data)));
       break;
+    }
     case "window_removed":
       windows.value = windows.value.filter((w) => w.id !== ev.data.id);
       if (ev.data.id === windowId.value) { for (const f of windowLostListeners) f(); }
       break;
     case "session_upserted": {
       upsertSession(ev.data);
-      const cc = confirmClose.value;
-      if (cc?.kind === "session" && cc.id === ev.data.id && !BUSY_STATES.has(ev.data.state)) {
-        confirmClose.value = null;
-      }
-      if (cc?.kind === "channel" && cc.id === ev.data.channel_id && !channelBusy(cc.id)) {
-        confirmClose.value = null;
-      }
+      if (confirmClose.value === ev.data.id && !BUSY_STATES.has(ev.data.state)) confirmClose.value = null;
       break;
     }
     case "session_removed": {
-      const prev = sessions.value.get(ev.data.id);
-      if (!prev) break;
+      if (!sessions.value.has(ev.data.id)) break;
       const m = new Map(sessions.value);
       m.delete(ev.data.id);
-      sessions.value = m;
-      held.delete(ev.data.id);
+      batch(() => {
+        sessions.value = m;
+        if (held.peek().has(ev.data.id)) {
+          const h = new Set(held.peek());
+          h.delete(ev.data.id);
+          held.value = h;
+        }
+        if (confirmClose.value === ev.data.id) confirmClose.value = null;
+      });
       for (const f of removedSessionListeners) f(ev.data.id);
-      reconcileChannel(prev.channel_id);
-      const cc = confirmClose.value;
-      if (cc?.kind === "session" && cc.id === ev.data.id) confirmClose.value = null;
       break;
     }
     case "event": {
@@ -517,39 +509,29 @@ export function applyEvent(ev: ServerEvent) {
 }
 
 /**
- * Record a session (event or RPC reply). One that moved to another tab (`session.move`) leaves the
- * old tab's layout and arrives in the new one like a new session: held while a merge there is
- * placing it, else reconciled into the focused pane.
+ * Record a session (event or RPC reply). One that newly shows up in this window (spawned, or
+ * moved here from another window) is held while a placement is pending, else it joins the
+ * focused group; one that left (moved to another window) leaves the layout.
  */
 export function upsertSession(s: SessionInfo) {
-  const prev = sessions.value.get(s.id);
   const m = new Map(sessions.value);
   m.set(s.id, s);
-  sessions.value = m;
-  const moved = !!prev && prev.channel_id !== s.channel_id;
-  if (!prev || moved) {
-    if (spawnHolds.has(s.channel_id)) held.add(s.id);
-    else held.delete(s.id);
-  }
-  if (moved) reconcileChannel(prev.channel_id);
-  if (!prev || moved) reconcileChannel(s.channel_id);
+  withHolds(() => (sessions.value = m));
+}
+
+/** Record a session we learned about from an RPC reply, unless an event already did. */
+export function knowSession(s: SessionInfo) {
+  if (!sessions.value.has(s.id)) upsertSession(s);
 }
 
 function removeChannel(id: ChannelId) {
-  batch(() => {
-    channels.value = channels.value.filter((c) => c.id !== id);
-    const m = new Map(layouts.value);
-    m.delete(id);
-    layouts.value = m;
-    const cc = confirmClose.value;
-    if (cc?.kind === "channel" && cc.id === id) confirmClose.value = null;
-  });
+  channels.value = channels.value.filter((c) => c.id !== id);
 }
 
 // ---------------- read tracking ----------------
 
-// One pending mark per channel: switching tabs quickly must not drop the first one. Each
-// mark while one is pending moves its `seenAt` forward (what was on screen at the latest look).
+// One pending mark per task: switching tabs quickly must not drop the first one. Each mark while
+// one is pending moves its `seenAt` forward (what was on screen at the latest look).
 const readTimers = new Map<ChannelId, { timer: number; seenAt: number }>();
 function markReadSoon(ch: ChannelId) {
   const pending = readTimers.get(ch);
@@ -574,18 +556,18 @@ export function markRead(ch: ChannelId) {
 }
 
 function maybeMarkRead(ch: ChannelId) {
-  if (ch === activeChannel.value?.id && document.visibilityState === "visible" && document.hasFocus()) {
+  if (ch === focusedTask.value?.id && document.visibilityState === "visible" && document.hasFocus()) {
     markReadSoon(ch);
   }
 }
 
 effect(() => {
-  const c = activeChannel.value;
+  const c = focusedTask.value;
   if (c) markRead(c.id);
 });
 
 addEventListener("focus", () => {
-  const c = activeChannel.value;
+  const c = focusedTask.value;
   if (c) markRead(c.id);
 });
 

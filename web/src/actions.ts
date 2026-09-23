@@ -549,13 +549,20 @@ export function closeTab(id: ChannelId, force = false) {
  * focused session active, then the emptied `src` closes. A failed move stops there: what moved
  * stays placed, the rest stays in `src`, which stays open.
  */
-export async function mergeTab(
-  src: ChannelId,
-  dst: ChannelId,
-  paneId: string,
-  zone: DropZone,
-  index?: number,
-) {
+// Merges into one tab run one at a time: each holds new sessions out of the layout and places
+// its own afterwards, and overlapping holds would place one drop's sessions with the other's.
+const mergeQueue = new Map<ChannelId, Promise<void>>();
+
+export function mergeTab(src: ChannelId, dst: ChannelId, paneId: string, zone: DropZone, index?: number) {
+  const run = (mergeQueue.get(dst) ?? Promise.resolve()).then(() => mergeTabNow(src, dst, paneId, zone, index));
+  const done = run.catch(() => {}).finally(() => {
+    if (mergeQueue.get(dst) === done) mergeQueue.delete(dst);
+  });
+  mergeQueue.set(dst, done);
+  return run;
+}
+
+async function mergeTabNow(src: ChannelId, dst: ChannelId, paneId: string, zone: DropZone, index?: number) {
   const list = (sessionsByChannel.value.get(src) ?? []).map((s) => s.id);
   if (src === dst || !list.length) return;
   const l = layoutOf(src);
@@ -568,7 +575,12 @@ export async function mergeTab(
   try {
     for (const id of order) {
       try {
-        upsertSession(await rpc.call<SessionInfo>("session.move", { id, channel_id: dst }));
+        // The daemon closes the source tab once it is empty, in the same step: a session another
+        // window adds to it meanwhile is never closed with it, and a lost reply can't make us
+        // close a tab that still holds (or received) a session.
+        upsertSession(
+          await rpc.call<SessionInfo>("session.move", { id, channel_id: dst, close_empty_source: true }),
+        );
         moved.push(id);
       } catch (e) {
         toast("error", `Couldn't move ${sessions.value.get(id)?.name ?? "a session"}: ${errText(e)}`);
@@ -578,11 +590,6 @@ export async function mergeTab(
     if (moved.length) updateLayout(dst, (l) => placeSessions(l, moved, paneId, zone, active, index));
   } finally {
     releaseNewSessions(dst);
-  }
-  if (moved.length === order.length) {
-    rpc.call("channel.archive", { id: src, remove_worktree: false }).catch(fail("Close failed")).catch(
-      () => {},
-    );
   }
   if (dst === activeChannel.value?.id) focusActiveTerminalSoon();
 }
@@ -614,7 +621,8 @@ export async function moveSessionToNewTab(src: ChannelId, sid: SessionId) {
     upsertSession(await rpc.call<SessionInfo>("session.move", { id: sid, channel_id: nc.id }));
   } catch (e) {
     toast("error", `Couldn't move the session: ${errText(e)}`);
-    rpc.call("channel.archive", { id: nc.id, remove_worktree: false }).catch(() => {});
+    // Only if nothing arrived: the move may have happened even though its reply was lost.
+    rpc.call("channel.close_if_empty", { id: nc.id }).catch(() => {});
     return;
   }
   selectTab(nc.id);

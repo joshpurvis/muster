@@ -236,14 +236,32 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             let p: Rename<SessionId> = parse(params)?;
             to_value(hub.rename_session(p.id, p.name)?)
         }
+        "channel.close_if_empty" => {
+            #[derive(Deserialize)]
+            struct P {
+                id: ChannelId,
+            }
+            let p: P = parse(params)?;
+            Ok(json!({ "closed": hub.archive_if_empty(p.id)? }))
+        }
         "session.move" => {
             #[derive(Deserialize)]
             struct P {
                 id: SessionId,
                 channel_id: ChannelId,
+                /// Close the source channel if this move emptied it (checked atomically).
+                #[serde(default)]
+                close_empty_source: bool,
             }
             let p: P = parse(params)?;
-            to_value(hub.move_session(p.id, p.channel_id)?)
+            let from = hub.session(p.id).map(|s| s.channel_id);
+            let info = hub.move_session(p.id, p.channel_id)?;
+            if p.close_empty_source
+                && let Some(from) = from.filter(|f| *f != p.channel_id)
+            {
+                hub.archive_if_empty(from)?;
+            }
+            to_value(info)
         }
         "session.send" => {
             #[derive(Deserialize)]

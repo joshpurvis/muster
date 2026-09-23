@@ -191,6 +191,9 @@ struct SessEntry {
     /// The last title this session set that was usable as a channel name (`clean_title`).
     /// Later unusable titles (a shell prompt, the program name) don't clear it.
     usable_title: Option<String>,
+    /// Port block (`PORT`) the current process was started with; it stays reserved while that
+    /// process runs, also after the session moved to another channel. 0: none yet.
+    port_base: u16,
 }
 
 struct WinEntry {
@@ -325,6 +328,7 @@ impl Hub {
                     busy: false,
                     kill_requested: false,
                     usable_title,
+                    port_base: 0,
                 },
             );
         }
@@ -1014,11 +1018,14 @@ impl Hub {
             ch.archived = false;
             // Preferred block derives from the id; if an active channel already uses it
             // (ids 1000 apart), take the next free block.
+            // Blocks of live channels, and of running processes (a session moved out of a closed
+            // channel still uses the block it started with).
             let used: HashSet<u16> = g
                 .channels
                 .values()
                 .filter(|c| !c.archived)
                 .map(|c| c.port_base)
+                .chain(g.sessions.values().filter(|e| e.pty.is_some() && e.port_base != 0).map(|e| e.port_base))
                 .collect();
             let pref = port_base_for(ch.id);
             ch.port_base = (0..1000u16)
@@ -1506,6 +1513,16 @@ impl Hub {
     /// Kills and removes the channel's sessions, marks it archived, optionally removes the
     /// worktree (the branch is kept).
     pub async fn archive_channel(self: &Arc<Self>, id: ChannelId, remove_worktree: bool) -> anyhow::Result<()> {
+        if remove_worktree
+            && let Some(ch) = self.channel(id).filter(|c| c.owns_worktree)
+            && let Some(user) = self.worktree_user(&ch)
+        {
+            anyhow::bail!(
+                "the worktree {} is still used by session {} in another tab; close that first",
+                ch.cwd,
+                user
+            );
+        }
         let ch = self.update_channel(id, false, |c| c.archived = true)?;
         let sids: Vec<SessionId> = self
             .inner
@@ -1537,12 +1554,54 @@ impl Hub {
                 if !sids.is_empty() {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
-                if let Err(e) = worktree::remove(&repo, Path::new(&ch.cwd)).await {
+                // Re-checked: a session may have moved out between the check above and here.
+                if let Some(user) = self.worktree_user(&ch) {
+                    self.notice(
+                        "warn",
+                        format!("Kept worktree {}: session {user} in another tab still runs in it", ch.cwd),
+                    );
+                } else if let Err(e) = worktree::remove(&repo, Path::new(&ch.cwd)).await {
                     self.notice("warn", format!("Could not remove worktree {}: {e:#}", ch.cwd));
                 }
             }
         }
         Ok(())
+    }
+
+    /// A running session outside `ch` whose cwd is inside `ch`'s worktree (it moved out of `ch`,
+    /// or was started there by hand), if any.
+    fn worktree_user(&self, ch: &Channel) -> Option<SessionId> {
+        let g = self.inner.lock();
+        dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some())))
+    }
+
+    /// Archive `id` (keeping any worktree) only if it has no sessions left, checked and marked
+    /// under one lock so a session spawned or moved into it meanwhile is never removed with it.
+    /// Returns whether it was archived.
+    pub fn archive_if_empty(&self, id: ChannelId) -> anyhow::Result<bool> {
+        let events = {
+            let mut g = self.inner.lock();
+            if g.sessions.values().any(|e| e.info.channel_id == id) {
+                return Ok(false);
+            }
+            let Some(c) = g.channels.get(&id).filter(|c| !c.archived) else {
+                return Ok(false);
+            };
+            let mut next = c.clone();
+            next.archived = true;
+            self.store.update_channel(&next)?;
+            g.channels.insert(id, next.clone());
+            g.titles.remove(&id);
+            let mut events = vec![ServerEvent::ChannelRemoved { id }];
+            if let Some(wid) = next.window_id {
+                self.gc_window_locked(&mut g, wid, &mut events);
+            }
+            events
+        };
+        for ev in events {
+            self.emit(ev);
+        }
+        Ok(true)
     }
 
     /// Set a channel's agent permission profile (human only: the UI / RPC; never MCP). Applies
@@ -1674,6 +1733,7 @@ impl Hub {
                     busy: true,
                     kill_requested: false,
                     usable_title: None,
+                    port_base: 0,
                 },
             );
             id
@@ -1769,6 +1829,9 @@ impl Hub {
             let ch = g.channels.get(&info.channel_id);
             let port_base = ch.map(|c| c.port_base).unwrap_or(20000);
             let permissions = ch.map(|c| c.permissions).unwrap_or_default();
+            if let Some(e) = g.sessions.get_mut(&id) {
+                e.port_base = port_base;
+            }
             (info, extra, port_base, permissions)
         };
         let token = paths::random_token();
@@ -2093,11 +2156,18 @@ impl Hub {
                 Some(c) if c.archived => anyhow::bail!("channel {channel_id} is archived"),
                 Some(_) => {}
             }
-            let e = g
+            let from = g
                 .sessions
-                .get_mut(&id)
-                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-            let from = e.info.channel_id;
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?
+                .info
+                .channel_id;
+            // Archiving marks the channel first, then removes the sessions it finds: a session
+            // must not slip out in between (nor out of a closed channel at all).
+            if from != channel_id && g.channels.get(&from).is_some_and(|c| c.archived) {
+                anyhow::bail!("session {id}'s channel {from} is being closed");
+            }
+            let e = g.sessions.get_mut(&id).expect("checked above");
             if from == channel_id {
                 return Ok(e.info.clone());
             }
@@ -2438,6 +2508,15 @@ pub fn prompt_name(text: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The first running session (`(info, running)`) outside `ch` whose cwd is inside `ch.cwd`.
+fn dir_user<'a>(ch: &Channel, sessions: impl Iterator<Item = (&'a SessionInfo, bool)>) -> Option<SessionId> {
+    let root = Path::new(&ch.cwd);
+    sessions
+        .filter(|(i, running)| *running && i.channel_id != ch.id && Path::new(&i.cwd).starts_with(root))
+        .map(|(i, _)| i.id)
+        .next()
+}
+
 /// Where an auto-named channel's name came from, worst to best.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NameSource {
@@ -2602,9 +2681,50 @@ mod tests {
         assert!(hub.move_session(2, 99).unwrap_err().to_string().contains("no such channel"));
         assert!(hub.move_session(42, 2).unwrap_err().to_string().contains("no such session"));
         assert_eq!(hub.session(2).unwrap().channel_id, 1);
-        // Moving the last session out leaves an empty channel (the UI archives it).
+        // Channel 1 still has session 2: not closed.
+        assert!(!hub.archive_if_empty(1).unwrap());
+        assert!(!hub.channel(1).unwrap().archived);
+        // Moving the last session out leaves an empty channel; closing it is then allowed.
         hub.move_session(2, 2).unwrap();
         assert!(hub.sessions().iter().all(|s| s.channel_id == 2));
+        let mut rx = hub.subscribe();
+        assert!(hub.archive_if_empty(1).unwrap());
+        assert!(hub.channel(1).unwrap().archived);
+        assert!(matches!(rx.try_recv(), Ok(ServerEvent::ChannelRemoved { id: 1 })));
+        assert!(!hub.archive_if_empty(1).unwrap(), "already closed");
+        assert!(!hub.archive_if_empty(2).unwrap(), "has sessions");
+    }
+
+    #[test]
+    fn no_move_out_of_a_closing_channel() {
+        let hub = move_fixture();
+        // archive_channel marks the channel archived before it collects its sessions.
+        hub.update_channel(1, false, |c| c.archived = true).unwrap();
+        assert!(hub.move_session(1, 2).unwrap_err().to_string().contains("being closed"));
+        assert_eq!(hub.session(1).unwrap().channel_id, 1);
+    }
+
+    #[test]
+    fn worktree_users() {
+        let mut ch = move_fixture().channel(1).unwrap();
+        ch.cwd = "/data/wt/7".into();
+        let s = |id, channel_id, cwd: &str| {
+            let mut i = crate::mcp::guard::test_session(id, None);
+            i.channel_id = channel_id;
+            i.cwd = cwd.into();
+            i
+        };
+        let (own, moved, nested, other, prefix) = (
+            s(1, 1, "/data/wt/7"),
+            s(2, 2, "/data/wt/7"),
+            s(3, 2, "/data/wt/7/sub"),
+            s(4, 2, "/w/repo"),
+            s(5, 2, "/data/wt/70"),
+        );
+        assert_eq!(dir_user(&ch, [(&own, true), (&other, true), (&prefix, true)].into_iter()), None);
+        assert_eq!(dir_user(&ch, [(&moved, false)].into_iter()), None, "exited sessions don't count");
+        assert_eq!(dir_user(&ch, [(&moved, true)].into_iter()), Some(2));
+        assert_eq!(dir_user(&ch, [(&nested, true)].into_iter()), Some(3));
     }
 
     #[test]

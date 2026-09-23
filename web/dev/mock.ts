@@ -571,11 +571,19 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!s) throw new Error(`no such session: ${p.id}`);
       if (!c) throw new Error(`no such channel: ${p.channel_id}`);
       if (c.archived) throw new Error(`channel ${c.id} is archived`);
-      if (s.channel_id !== c.id) {
+      const from = s.channel_id;
+      if (from !== c.id) {
         s.channel_id = c.id;
         upsert(s);
+        if (p.close_empty_source) await handle("channel.close_if_empty", { id: from });
       }
       return s;
+    }
+    case "channel.close_if_empty": {
+      const c = channels.find((c) => c.id === p.id);
+      if (!c || c.archived || [...sessions.values()].some((s) => s.channel_id === c.id)) return { closed: false };
+      await handle("channel.archive", { id: c.id });
+      return { closed: true };
     }
     case "session.rename": {
       const s = sessions.get(p.id)!;

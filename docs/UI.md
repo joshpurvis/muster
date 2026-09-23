@@ -64,8 +64,11 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   overlay as a pane drag (edge halves split that side, the center or a header joins that pane,
   a tab strip inserts at the marker); dropping merges the tab there: all its sessions, live and
   exited, move over (`session.move`) into one pane, in their pane order with its focused session
-  active, and the emptied tab closes (`channel.archive`, worktree kept). If a move fails, a
-  toast says so and what moved stays placed; the rest stays in the (still open) dragged tab.
+  active, and the daemon closes the emptied tab in the same step (`close_empty_source`,
+  worktree kept), so a session added to it meanwhile keeps it open. Merges into one tab run one
+  at a time. If a move fails, a toast says so and what moved stays placed; the rest stays in
+  the (still open) dragged tab. A worktree that a moved session still runs in can't be removed
+  ("Close tab + remove worktree" refuses until that session is closed).
   Esc, window blur or a cancelled pointer abort any tab drag. The
   context menu has Rename, Permissions…, Copy path, Copy branch, Move to window ▸ (existing
   windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree,
@@ -100,7 +103,8 @@ bar. Differences:
   on a header joins that pane. Double-click renames the session.
 - Dropping a pane header or pane-tab on the empty part of the tab bar (a marker shows at the
   end of the strip) moves that session into a new tab: `channel.create` without an agent, same
-  folder and window, then `session.move`; the new tab becomes active. A moved session keeps its
+  folder and window, then `session.move`; the new tab becomes active. If the move fails, the new
+  tab is closed only if nothing arrived in it (`channel.close_if_empty`). A moved session keeps its
   process, cwd and permissions (`MUSTER_CHANNEL_ID` in its environment stays stale until it
   restarts, and a restart applies the new tab's permission profile).
 - The panes also take a whole tab dragged from the tab bar (see Tab bar): it lands as a split

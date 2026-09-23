@@ -41,6 +41,8 @@ pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
 struct TitleCb {
     title: Option<String>,
     changed: bool,
+    /// Answers to terminal queries seen in the output (sent only when no client is attached).
+    replies: Vec<Vec<u8>>,
 }
 
 impl vt100::Callbacks for TitleCb {
@@ -50,6 +52,29 @@ impl vt100::Callbacks for TitleCb {
         if t != self.title {
             self.title = t;
             self.changed = true;
+        }
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        _i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, c) {
+            // DA1. Programs such as fish block until it is answered; reply like xterm.js does.
+            (None, 'c') if p0 == 0 => self.replies.push(b"\x1b[?1;2c".to_vec()),
+            // DSR cursor position report.
+            (None, 'n') if p0 == 6 => {
+                let (row, col) = screen.cursor_position();
+                self.replies.push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            }
+            // DSR status report.
+            (None, 'n') if p0 == 5 => self.replies.push(b"\x1b[0n".to_vec()),
+            _ => {}
         }
     }
 }
@@ -243,6 +268,7 @@ impl PtySession {
     /// the program changed it.
     fn ingest(&self, data: &[u8]) -> Option<Option<String>> {
         let mut title = None;
+        let replies: Vec<Vec<u8>>;
         {
             let mut parser = self.parser.lock();
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(data))).is_ok();
@@ -256,6 +282,7 @@ impl PtySession {
                 cb.changed = false;
                 title = Some(cb.title.clone());
             }
+            replies = std::mem::take(&mut cb.replies);
         }
         let chunk = Bytes::copy_from_slice(data);
         {
@@ -268,7 +295,15 @@ impl PtySession {
             }
             self.seq.fetch_add(1, Ordering::SeqCst);
             self.last_output_at.store(now_ms(), Ordering::SeqCst);
+            // Receivers are exactly the attached clients' forwarders. With a client attached,
+            // its terminal answers queries; without one, we do (or e.g. fish hangs at startup).
+            let headless = self.out_tx.receiver_count() == 0;
             let _ = self.out_tx.send(chunk);
+            if headless {
+                for r in &replies {
+                    let _ = self.write(r);
+                }
+            }
         }
         self.dirty.store(true, Ordering::SeqCst);
         title
@@ -642,6 +677,44 @@ mod tests {
         assert_eq!(tail_text(&mut p, 3), "line27\nline28\nline29");
         let all = tail_text(&mut p, 100);
         assert!(all.starts_with("line0\n") && all.ends_with("line29"));
+    }
+
+    #[test]
+    fn foreground_busy_tracks_running_job() {
+        let dir = std::env::temp_dir().join(format!("muster-pty-test-{}", std::process::id()));
+        let sess = spawn(
+            SpawnParams {
+                id: 1,
+                generation: 1,
+                program: std::env::var("MUSTER_TEST_SHELL").unwrap_or_else(|_| "bash".into()),
+                args: match std::env::var("MUSTER_TEST_SHELL") {
+                    Ok(_) => vec!["-l".into()],
+                    Err(_) => vec!["--noprofile".into(), "--norc".into(), "-i".into()],
+                },
+                env: BTreeMap::new(),
+                env_remove: vec![],
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+                log_path: dir.join("output.log"),
+            },
+            Weak::new(),
+        )
+        .expect("spawn bash");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!sess.screen().foreground_busy, "idle shell reported busy");
+        sess.write(b"sleep 3\r").unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let snap = sess.screen();
+        assert!(
+            snap.foreground_busy,
+            "running job not reported busy: fg={:?} pid={:?} screen={:?}",
+            sess.foreground_pgrp(),
+            sess.pid,
+            snap.lines
+        );
+        sess.kill();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

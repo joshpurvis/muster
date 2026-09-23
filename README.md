@@ -11,8 +11,7 @@ protocol and [docs/UI.md](docs/UI.md) for the UI spec, including the keyboard sh
 ## Build
 
 ```sh
-cd web && deno task build && cd ..   # frontend -> web/dist (embedded into release builds)
-cargo build --release                # browser-window mode
+deno task build                      # web/dist, then cargo build --release (browser-window mode)
 cargo build --release --features gui # native window (needs webkit2gtk-4.1 on Linux)
 ```
 

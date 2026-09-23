@@ -62,6 +62,7 @@ class Rpc {
   private everOpened = false;
   private backoff = 250;
   private token: string | null = null;
+  private retryTimer = 0;
 
   onEvent: EventHandler = () => {};
   onBinary: BinaryHandler = () => {};
@@ -89,6 +90,11 @@ class Rpc {
   }
 
   private connect() {
+    clearTimeout(this.retryTimer);
+    this.retryTimer = 0;
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED && this.ws.readyState !== WebSocket.CLOSING) {
+      return;
+    }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(this.token!)}`;
     let ws: WebSocket;
@@ -102,11 +108,16 @@ class Rpc {
     this.ws = ws;
     this.ready = false;
     ws.onopen = () => {
+      if (this.ws !== ws) {
+        ws.close();
+        return;
+      }
       this.backoff = 250;
       const reconnect = this.everOpened;
       this.everOpened = true;
       const id = this.nextId++;
       this.track(id, "hello").then((h) => {
+        if (this.ws !== ws) return;
         this.ready = true;
         connStatus.value = "open";
         this.onHello(h as HelloResult, reconnect);
@@ -141,7 +152,8 @@ class Rpc {
   private scheduleReconnect() {
     const d = this.backoff;
     this.backoff = Math.min(5000, this.backoff * 2);
-    setTimeout(() => this.connect(), d);
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.connect(), d);
   }
 
   private handleText(text: string) {

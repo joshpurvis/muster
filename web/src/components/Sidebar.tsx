@@ -167,7 +167,7 @@ function WorkspaceSection({ w }: { w: Workspace }) {
           </button>
         </span>
       </div>
-      <ChannelList w={w} list={visible} />
+      <ChannelList w={w} list={visible} reorderable={!collapsed} />
       {!collapsed && list.length === 0 && (
         <button
           type="button"
@@ -186,12 +186,14 @@ function needs(list: SessionInfo[] | undefined) {
 }
 
 /** Channel rows with pointer-based drag-to-reorder. */
-function ChannelList({ w, list }: { w: Workspace; list: Channel[] }) {
+function ChannelList(
+  { w, list, reorderable }: { w: Workspace; list: Channel[]; reorderable: boolean },
+) {
   const ref = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<{ id: number; index: number; y: number } | null>(null);
 
   const startDrag = (e: PointerEvent, c: Channel) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || !reorderable) return;
     const sy = e.clientY;
     let started = false;
     let index = -1;

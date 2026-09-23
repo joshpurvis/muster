@@ -343,24 +343,54 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
 
     // Server events -> client. If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
+    // Server events and method responses both go through this task, so a response is sent
+    // only after every event emitted before it (e.g. `workspace_upserted` before the
+    // `workspace.add` result). If this client falls too far behind the event bus, close the
+    // connection: the client reconnects and re-syncs with `hello`.
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
     let events = {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
+            let forward = |ev: ServerEvent| serde_json::to_string(&ev).ok().map(|t| Message::Text(t.into()));
             loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        let Ok(text) = serde_json::to_string(&ev) else { continue };
-                        if out.send(Message::Text(text.into())).await.is_err() {
+                tokio::select! {
+                    ev = rx.recv() => match ev {
+                        Ok(ev) => {
+                            if let Some(m) = forward(ev)
+                                && out.send(m).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("client lagged {n} events behind; closing so it resyncs");
+                            let _ = out.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    resp = resp_rx.recv() => {
+                        let Some(resp) = resp else { break };
+                        // Flush events that were emitted before this response was produced.
+                        loop {
+                            match rx.try_recv() {
+                                Ok(ev) => {
+                                    if let Some(m) = forward(ev) {
+                                        let _ = out.send(m).await;
+                                    }
+                                }
+                                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                                    let _ = out.send(Message::Close(None)).await;
+                                    return;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if out.send(resp).await.is_err() {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("client lagged {n} events behind; closing so it resyncs");
-                        let _ = out.send(Message::Close(None)).await;
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
@@ -380,7 +410,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         continue;
                     }
                 };
-                handle_request(&hub, req, &out_tx, &attachments).await;
+                handle_request(&hub, req, &out_tx, &resp_tx, &attachments).await;
             }
             Message::Binary(data) => {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
@@ -398,6 +428,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     for (_, h) in attachments.lock().drain() {
         h.abort();
     }
+    drop(resp_tx);
     events.abort();
     drop(out_tx);
     let _ = writer.await;
@@ -407,6 +438,7 @@ async fn handle_request(
     hub: &Arc<Hub>,
     req: Request,
     out: &Outbox,
+    resp: &Outbox,
     attachments: &Arc<Mutex<HashMap<SessionId, JoinHandle<()>>>>,
 ) {
     match req.method.as_str() {
@@ -465,10 +497,10 @@ async fn handle_request(
         _ => {
             // Run concurrently: some methods (send, diff, restart) take a while.
             let hub = hub.clone();
-            let out = out.clone();
+            let resp = resp.clone();
             tokio::spawn(async move {
                 let r = dispatch(&hub, &req.method, req.params).await;
-                let _ = out.send(Message::Text(response(&req.id, r).to_string().into())).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
         }
     }

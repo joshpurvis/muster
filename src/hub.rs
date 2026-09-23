@@ -119,6 +119,17 @@ pub enum Attach {
     Replay(Vec<u8>),
 }
 
+/// Env vars that mark "running inside another agent session" and must not leak from the
+/// daemon's own environment into sessions (configuration vars are kept).
+const INHERITED_SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+];
+
 /// Result of `start_process`.
 struct Started {
     info: SessionInfo,
@@ -1052,7 +1063,7 @@ impl Hub {
                 args: spec.args.clone(),
                 env,
                 // Don't leak "you are inside another agent" markers from the daemon's own env.
-                env_remove: vec!["CLAUDECODE".into(), "CLAUDE_CODE_ENTRYPOINT".into()],
+                env_remove: INHERITED_SESSION_MARKERS.iter().map(|s| s.to_string()).collect(),
                 cwd: PathBuf::from(&info.cwd),
                 cols: info.cols,
                 rows: info.rows,

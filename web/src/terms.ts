@@ -25,6 +25,9 @@ interface Entry {
   queue: Uint8Array[];
   queued: number;
   raf: number;
+  /** Replayed scrollback is being parsed: drop the replies xterm generates for old
+   * terminal queries (DA, cursor reports) so they don't reach the live program as keys. */
+  replaying: boolean;
   attached: boolean;
   lastUse: number;
   resizeTimer: number;
@@ -159,8 +162,11 @@ function create(sid: number): Entry {
   });
 
   const enc = new TextEncoder();
-  term.onData((d) => rpc.sendInput(sid, enc.encode(d)));
+  term.onData((d) => {
+    if (!entry.replaying) rpc.sendInput(sid, enc.encode(d));
+  });
   term.onBinary((d) => {
+    if (entry.replaying) return;
     const b = new Uint8Array(d.length);
     for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 0xff;
     rpc.sendInput(sid, b);
@@ -180,6 +186,7 @@ function create(sid: number): Entry {
     queue: [],
     queued: 0,
     raf: 0,
+    replaying: false,
     attached: false,
     lastUse: Date.now(),
     resizeTimer: 0,
@@ -298,7 +305,8 @@ function attach(e: Entry) {
       .catch(() => {})
       .then(() => rpc.call("session.attach", { id: e.sid }))
       .catch(() => {
-        e.attached = false;
+        // Keep `attached` (= wanted): a reconnect's reattachAll retries it. If the session is
+        // gone, session_removed disposes the entry.
       });
   e.sentCols = e.term.cols;
   e.sentRows = e.term.rows;
@@ -356,7 +364,12 @@ rpc.onBinary = (type, sid, payload) => {
     if (e.raf) cancelAnimationFrame(e.raf);
     e.raf = 0;
     e.term.reset();
-    if (payload.length) e.term.write(payload.slice());
+    if (payload.length) {
+      e.replaying = true;
+      e.term.write(payload.slice(), () => {
+        e.replaying = false;
+      });
+    }
     return;
   }
   if (type !== FRAME_OUTPUT) return;

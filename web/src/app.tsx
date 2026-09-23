@@ -138,7 +138,7 @@ function ChannelView() {
     <div class="channel">
       <ChannelHeader c={c} />
       <div class="panes">{l ? <SplitView ch={c.id} layout={l} /> : null}</div>
-      <Composer c={c} />
+      <Composer key={c.id} c={c} />
     </div>
   );
 }

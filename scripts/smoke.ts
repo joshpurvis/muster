@@ -242,11 +242,13 @@ async function main() {
 
   const ws = await c.call("workspace.add", { path: REPO });
   ok(ws.is_git && ws.name === "repo", "workspace.add on git repo");
+  ok(c.events.some((e) => e.event === "workspace_upserted" && e.data.id === ws.id), "workspace_upserted arrives before the result");
   const ws2 = await c.call("workspace.add", { path: REPO + "/" });
   ok(ws2.id === ws.id, "workspace.add is idempotent");
 
   const ch = await c.call("channel.create", { workspace_id: ws.id, name: "Smoke Test!", agent: "shell" });
   ok(ch.branch === "muster/smoke-test" && ch.owns_worktree, "channel.create made branch muster/smoke-test");
+  ok(c.events.some((e) => e.event === "channel_upserted" && e.data.id === ch.id), "channel_upserted arrives before the result");
   ok(await exists(`${ch.cwd}/README.md`), "worktree checked out");
   ok(ch.port_base === 20000 + (ch.id % 1000) * 10, "port_base from channel id");
   const wtList = await git(REPO, "worktree", "list");

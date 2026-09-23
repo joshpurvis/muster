@@ -52,6 +52,7 @@ export function Pane(
 
   const onBodyKey = (e: KeyboardEvent) => {
     if (!active || active.state !== "exited") return;
+    if (!(e.target as HTMLElement).closest?.(".term-host, .launcher") || e.isComposing) return;
     if (e.key === "Enter" && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       e.stopPropagation();

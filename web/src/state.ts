@@ -414,7 +414,8 @@ export function applyEvent(ev: ServerEvent) {
       noteNotable(e);
       if (e.channel_id !== null) {
         const t = timelines.get(e.channel_id);
-        if (t && t.value.loaded && !t.value.events.some((x) => x.id === e.id)) {
+        // Buffer even before the first load finishes; loadTimeline merges by id.
+        if (t && !t.value.events.some((x) => x.id === e.id)) {
           t.value = { ...t.value, events: [...t.value.events, e] };
         }
         maybeMarkRead(e.channel_id);
@@ -433,6 +434,7 @@ function removeChannel(id: ChannelId) {
     const m = new Map(layouts.value);
     m.delete(id);
     layouts.value = m;
+    timelines.delete(id);
     if (activeChannelId.value === id) activeChannelId.value = channelOrder.value[0]?.id ?? null;
   });
 }

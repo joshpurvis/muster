@@ -83,7 +83,7 @@ export function Overlays() {
   if (!o) return null;
   switch (o.kind) {
     case "switcher":
-      return <Switcher initial={o.initial} />;
+      return <Switcher key={o.initial} initial={o.initial} />;
     case "new_channel":
       return <NewChannel workspaceId={o.workspaceId} />;
     case "add_workspace":
@@ -152,7 +152,7 @@ function commandEntries(q: string): Entry[] {
 function runCommand(c: Command) {
   overlay.value = null;
   c.run();
-  if (!overlay.value) A.focusActiveTerminalSoon();
+  if (!overlay.value && !A.findOpen.value && c.id !== "composer") A.focusActiveTerminalSoon();
 }
 
 function Switcher({ initial }: { initial: string }) {

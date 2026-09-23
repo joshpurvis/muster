@@ -372,11 +372,13 @@ export function installKeys() {
     "keydown",
     (e) => {
       // Inline "Kill? ⏎ / Esc" confirmation for closing a busy tab.
-      if (confirmClose.value !== null && !overlay.value) {
+      const pendingClose = confirmClose.value !== null ? A.sessionInActiveChannel(confirmClose.value) : false;
+      if (confirmClose.value !== null && !pendingClose) confirmClose.value = null;
+      if (pendingClose && !overlay.value && !(e.target as HTMLElement)?.closest?.("input, textarea")) {
         if (e.key === "Enter") {
           e.preventDefault();
           e.stopPropagation();
-          A.closeSession(confirmClose.value, true);
+          A.closeSession(confirmClose.value!, true);
           return;
         }
         if (e.key === "Escape") {

@@ -232,6 +232,11 @@ export function closeSession(sid: SessionId, force = false) {
   rpc.call("session.remove", { id: sid }).catch(fail("Close failed")).catch(() => {});
 }
 
+export function sessionInActiveChannel(sid: SessionId): boolean {
+  const s = sessions.value.get(sid);
+  return !!s && view.value === "channel" && s.channel_id === activeChannelId.value;
+}
+
 export function closeFocused() {
   const s = focusedSession();
   if (s) closeSession(s.id);

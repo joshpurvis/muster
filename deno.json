@@ -1,0 +1,9 @@
+{
+  "tasks": {
+    "web": "cd web && deno task build",
+    "build": "deno task web && cargo build --release",
+    "dev": "deno task web && cargo build && ./target/debug/muster",
+    "test": "cargo test && cd web && deno task check && deno task test",
+    "smoke": "sh scripts/smoke.sh"
+  }
+}

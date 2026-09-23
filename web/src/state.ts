@@ -255,6 +255,8 @@ export const renaming = signal<{ kind: "channel" | "session"; id: number } | nul
 // ---------------- active tab ----------------
 
 let lastOrder: ChannelId[] = [];
+/** Called after the active tab closed or moved away and a neighbour took its place. */
+export const activeTabReplacedListeners: (() => void)[] = [];
 // Keep a valid active tab: the stored one for this window, else a neighbour of the one that
 // just left (closed or moved to another window), else the first.
 effect(() => {
@@ -280,6 +282,7 @@ effect(() => {
   }
   lastOrder = ids;
   activeChannelId.value = next ?? ids[0] ?? null;
+  if (cur !== null) queueMicrotask(() => { for (const f of activeTabReplacedListeners) f(); });
 });
 effect(() => {
   const id = activeChannelId.value;
@@ -301,7 +304,7 @@ function scheduleSave(ch: ChannelId) {
     setTimeout(() => {
       saveTimers.delete(ch);
       const l = layouts.value.get(ch);
-      if (!l || !channelById.value.has(ch)) return;
+      if (!l || !channelById.value.has(ch) || !tabIdSet.value.has(ch)) return;
       const json = JSON.stringify(l);
       if (lastSaved.get(ch) === json) return;
       lastSaved.set(ch, json);
@@ -382,6 +385,16 @@ export function updateLayout(ch: ChannelId, fn: (l: LayoutState) => LayoutState)
   scheduleSave(ch);
 }
 
+function forgetLayout(ch: ChannelId) {
+  clearTimeout(saveTimers.get(ch));
+  saveTimers.delete(ch);
+  lastSaved.delete(ch);
+  if (!layouts.value.has(ch)) return;
+  const m = new Map(layouts.value);
+  m.delete(ch);
+  layouts.value = m;
+}
+
 function reconcileChannel(ch: ChannelId) {
   if (!layouts.value.has(ch)) return; // lazily created on first view
   updateLayout(ch, (l) => {
@@ -449,8 +462,12 @@ export function applyEvent(ev: ServerEvent) {
         removeChannel(ev.data.id);
         break;
       }
-      // Keep our local layout; the daemon doesn't echo set_layout and we own it.
+      // Keep our local layout while the tab stays here; the daemon doesn't echo set_layout and
+      // we own it. A tab that leaves this window or arrives from another one drops the cached
+      // layout (and any pending save), so another window's splits are adopted, never overwritten.
+      const wasHere = tabIdSet.peek().has(ev.data.id);
       channels.value = upsertBy(channels.value, ev.data);
+      if (wasHere !== tabIdSet.peek().has(ev.data.id)) forgetLayout(ev.data.id);
       break;
     }
     case "channel_removed":

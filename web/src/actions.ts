@@ -6,6 +6,7 @@ import { rpc } from "./rpc.ts";
 import {
   activeChannel,
   activeChannelId,
+  activeTabReplacedListeners,
   BUSY_STATES,
   channelBusy,
   channelById,
@@ -207,6 +208,13 @@ export function selectTab(id: ChannelId, focusTerm = true) {
   layoutOf(id);
   if (focusTerm) focusActiveTerminalSoon();
 }
+
+// The active tab closed or moved to another window while its terminal had focus: focus falls to
+// <body>, so hand it to the tab that took its place (never steal it from a dialog or field).
+activeTabReplacedListeners.push(() => {
+  const a = document.activeElement;
+  if (!a || a === document.body) focusActiveTerminalSoon();
+});
 
 export function stepTab(delta: number) {
   const order = tabs.value;

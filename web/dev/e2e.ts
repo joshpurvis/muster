@@ -206,6 +206,13 @@ try {
     ok("window 1 detached the moved tab's terminals");
     await shot(b2, "06-window2");
 
+    // Split it in B; the layout must travel with the tab when it goes back to A.
+    const panesBefore: number = await b2.eval(`document.querySelectorAll('.pane').length`);
+    await b2.click(".pane .xterm");
+    await b2.key("Alt+D");
+    await b2.wait(`document.querySelectorAll('.pane').length === ${panesBefore + 1}`, 5000);
+    await b2.sleep(700); // layout save is debounced (400ms)
+
     // Move back through the tab context menu.
     await b2.click(".ttab", { button: "right" });
     await b2.wait(`!!document.querySelector('.menu')`);
@@ -219,6 +226,11 @@ try {
     await a.wait(`${tabIds}.includes(${pulled})`, 5000);
     await b2.wait(`${tabIds}.length === 0`, 5000);
     ok("context menu → Move to window sent it back");
+    const idx: number = await a.eval(`${tabIds}.indexOf(${pulled})`);
+    await a.key(`Alt+${idx + 1}`);
+    await a.wait(`${M}.activeChannel.value?.id === ${pulled}`, 3000);
+    await a.wait(`document.querySelectorAll('.pane').length === ${panesBefore + 1}`, 5000);
+    ok("the split made in window 2 came back with the tab");
 
     // Reload keeps the window.
     await a.goto("about:blank");

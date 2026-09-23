@@ -69,6 +69,11 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   at a time. If a move fails, a toast says so and what moved stays placed; the rest stays in
   the (still open) dragged tab. A worktree that a moved session still runs in can't be removed
   ("Close tab + remove worktree" refuses until that session is closed).
+  Dragging the **active** tab onto its own panes shows the half of the pane area nearest the
+  pointer (left, right, top or bottom); dropping moves it into a split on that side of the
+  whole layout of the tab viewed before it (else its neighbour), which becomes active: the
+  usual way to go from one pane to a split view. With no other tab there is nothing to split
+  with, and no overlay.
   Esc, window blur or a cancelled pointer abort any tab drag. The
   context menu has Rename, Permissions…, Copy path, Copy branch, Move to window ▸ (existing
   windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree,

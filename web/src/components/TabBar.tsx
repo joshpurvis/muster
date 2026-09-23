@@ -42,6 +42,7 @@ import {
 import { aggregateState, isNoopSlot, tabLabel, windowLabel } from "../model.ts";
 import { cx } from "../util.ts";
 import { computeTarget, DropMarker, type Target } from "../layout/dnd.tsx";
+import { ROOT_PANE } from "../layout/tree.ts";
 
 // ---------------- drag ----------------
 
@@ -101,7 +102,8 @@ function startTabDrag(e: PointerEvent, c: Channel, label: string, onClick: () =>
       return;
     }
     if (!d) return;
-    const into = activeChannel.value?.id;
+    // The active tab dropped on its own panes goes beside the tab viewed before it.
+    const into = d.pane?.paneId === ROOT_PANE ? A.splitPartner(c.id) ?? undefined : activeChannel.value?.id;
     if (d.pane && into !== undefined && into !== c.id) {
       A.mergeTab(c.id, into, d.pane.paneId, d.pane.zone, d.pane.index);
     } else if (d.target?.kind === "window") A.moveTabToWindow(c.id, d.target.id);
@@ -135,9 +137,13 @@ function dropAt(x: number, y: number, id: number): Pick<TabDrag, "slot" | "line"
   if (!el) return none;
   // Off the bar, over the active tab's panes (not the dragged tab's own): merge there.
   const into = activeChannel.value;
-  if (!el.closest(".tabbar") && el.closest(".panes") && into && into.id !== id) {
+  if (!el.closest(".tabbar") && el.closest(".panes") && into) {
     if (!sessionsByChannel.value.get(id)?.length) return none;
-    return { ...none, pane: computeTarget(x, y, into.id, null) };
+    if (into.id !== id) return { ...none, pane: computeTarget(x, y, into.id, null) };
+    // The active tab itself: it moves into a split beside the tab viewed before it, on the
+    // half of the pane area nearest the pointer.
+    if (A.splitPartner(id) === null) return none;
+    return { ...none, pane: rootEdgeTarget(x, y) };
   }
   const mv = el.closest("[data-move-to]") as HTMLElement | null;
   if (mv) {
@@ -167,6 +173,25 @@ function dropAt(x: number, y: number, id: number): Pick<TabDrag, "slot" | "line"
   else lx = els[els.length - 1].getBoundingClientRect().right;
   lx = Math.max(sr.left + 1, Math.min(sr.right - 1, lx));
   return { slot, line: { left: lx - 1, top: sr.top + 5, height: sr.height - 10 }, target: null, pane: null };
+}
+
+/** The pane area's half nearest (x, y), as a drop target beside the whole layout. */
+function rootEdgeTarget(x: number, y: number): Target | null {
+  const r = document.querySelector(".panes")?.getBoundingClientRect();
+  if (!r) return null;
+  const d = {
+    left: (x - r.left) / r.width,
+    right: (r.right - x) / r.width,
+    top: (y - r.top) / r.height,
+    bottom: (r.bottom - y) / r.height,
+  };
+  const zone = (Object.keys(d) as (keyof typeof d)[]).reduce((a, b) => (d[a] < d[b] ? a : b));
+  let rect = { left: r.left, top: r.top, width: r.width, height: r.height };
+  if (zone === "left") rect = { ...rect, width: r.width / 2 };
+  if (zone === "right") rect = { ...rect, left: r.left + r.width / 2, width: r.width / 2 };
+  if (zone === "top") rect = { ...rect, height: r.height / 2 };
+  if (zone === "bottom") rect = { ...rect, top: r.top + r.height / 2, height: r.height / 2 };
+  return { paneId: ROOT_PANE, zone, rect };
 }
 
 export function TabDragOverlay() {

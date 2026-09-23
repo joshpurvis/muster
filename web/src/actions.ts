@@ -562,7 +562,23 @@ export function mergeTab(src: ChannelId, dst: ChannelId, paneId: string, zone: D
   return run;
 }
 
+/**
+ * The tab the active tab `id` goes beside when it is dragged onto its own panes: the tab of this
+ * window viewed most recently before it, else its neighbour.
+ */
+export function splitPartner(id: ChannelId): ChannelId | null {
+  const here = tabs.value.map((c) => c.id).filter((c) => c !== id);
+  for (const k of prefs.value.recent) {
+    const c = k.startsWith("c:") ? Number(k.slice(2)) : NaN;
+    if (here.includes(c)) return c;
+  }
+  const order = tabs.value.map((c) => c.id);
+  const i = order.indexOf(id);
+  return order[i + 1] ?? order[i - 1] ?? null;
+}
+
 async function mergeTabNow(src: ChannelId, dst: ChannelId, paneId: string, zone: DropZone, index?: number) {
+  const wasActive = activeChannelId.value === src;
   const list = (sessionsByChannel.value.get(src) ?? []).map((s) => s.id);
   if (src === dst || !list.length) return;
   const l = layoutOf(src);
@@ -596,6 +612,8 @@ async function mergeTabNow(src: ChannelId, dst: ChannelId, paneId: string, zone:
   } finally {
     releaseNewSessions(dst);
   }
+  // The active tab moved beside another one: show the result.
+  if (wasActive && moved.length) selectTab(dst, false);
   if (dst === activeChannel.value?.id) focusActiveTerminalSoon();
 }
 

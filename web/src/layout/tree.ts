@@ -440,6 +440,9 @@ export function moveTab(
  * the end). They keep their order; `active` (default the first) becomes the active one and the
  * pane takes focus. Wherever reconcile may already have put them, they are taken out first.
  */
+/** `placeSessions` target meaning "beside the whole layout" (an edge of the pane area). */
+export const ROOT_PANE = "@root";
+
 export function placeSessions(
   s: LayoutState,
   sids: number[],
@@ -452,6 +455,18 @@ export function placeSessions(
   const act = active !== undefined && sids.includes(active) ? active : sids[0];
   let base = s;
   for (const sid of sids) base = removeFromTabs(base, sid);
+  // Beside everything: a new split at the root (unless the layout is one empty pane).
+  if (targetPaneId === ROOT_PANE && zone !== "center" && !(base.root.type === "pane" && !base.root.tabs.length)) {
+    const np = { ...pane(sids), active: act };
+    const before = zone === "left" || zone === "top";
+    const root: Layout = {
+      type: "split",
+      dir: sideDir(zone),
+      sizes: [0.5, 0.5],
+      children: before ? [np, base.root] : [base.root, np],
+    };
+    return finish({ ...base, root, focus: np.id, zoom: null });
+  }
   const tgt = findPane(base.root, targetPaneId) ?? findPane(base.root, base.focus);
   if (!tgt) return s;
   // Into the pane's tabs, or into the pane itself when taking them out emptied it.

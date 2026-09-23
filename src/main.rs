@@ -35,7 +35,7 @@ use crate::paths::Discovery;
 #[command(
     name = "muster",
     version,
-    about = "Run many coding agents side by side, Slack-style.",
+    about = "Run many coding agents side by side, in tabs and splits.",
     after_help = "With no command: open a new window (starting the daemon if needed).\n\
 Session commands take a TARGET: an id, `.` (this session), a session or tab name, a unique\n\
 prefix, or tab/name. Exit codes: 0 ok, 1 error, 2 bad or ambiguous target, 124 timeout."
@@ -249,6 +249,15 @@ fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    // Printing commands die quietly on a closed pipe (`muster ls | head`) instead of panicking.
+    // Not the daemon or a window: they write to sockets and must keep ignoring SIGPIPE (a Rust
+    // binary starts with it ignored, so processes they spawn are unaffected either way).
+    if !matches!(cli.cmd, None | Some(Cmd::Daemon { foreground: true }) | Some(Cmd::NativeWindow { .. })) {
+        // SAFETY: setting a signal disposition before any threads exist.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let r = match cli.cmd {
         None => ensure_daemon().and_then(|d| open_ui(&d, None)),
         Some(Cmd::Daemon { foreground: true }) => run_daemon(),

@@ -297,6 +297,7 @@ try {
       "both sessions now belong to the active tab; the dragged tab closed",
     );
     ok("dragging a tab onto the right edge of the active pane merged it as a split and closed it");
+
     await shot(a, "06b-merged");
 
     // ---- and back: the right pane's header dropped on the empty part of the tab bar.
@@ -320,6 +321,27 @@ try {
       "the session moved into the new, active tab",
     );
     ok("dropping a pane header on the tab bar moved its session into a new tab");
+
+    // ---- drag the ACTIVE tab onto the right half of its own panes: it goes beside the tab
+    // viewed before it, which becomes active.
+    const beside: any = await R(a, "channel.create", {
+      workspace_id: ws.id,
+      agent: "shell",
+      window_id: winId,
+      name: "beside",
+    });
+    await a.wait(`${tabIds}.includes(${beside.id})`, 6000);
+    const partner: number = await a.eval(`${M}.activeChannel.value.id`); // viewed just before
+    await a.click(`[data-tab-id="${beside.id}"]`);
+    await a.wait(`${M}.activeChannel.value?.id === ${beside.id} && !!document.querySelector('.pane .xterm')`, 6000);
+    const bt = await a.rect(`[data-tab-id="${beside.id}"]`);
+    const area = await a.rect(".panes");
+    await a.drag([bt!.x + 30, bt!.y + bt!.h / 2], [area!.x + area!.w - 30, area!.y + area!.h / 2], 16);
+    await a.wait(`!${tabIds}.includes(${beside.id})`, 6000);
+    await a.wait(`${M}.activeChannel.value?.id === ${partner} && document.querySelectorAll('.pane').length === 2`, 6000);
+    const root2 = JSON.parse(await a.eval(`JSON.stringify(${M}.layouts.value.get(${partner}).root)`));
+    check(root2.type === "split" && root2.dir === "row", "the active tab went to the right of the whole layout");
+    ok("dragging the active tab onto its own panes put it in a split beside the previous tab");
   }
 
   // ---- light theme

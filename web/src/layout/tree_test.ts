@@ -21,6 +21,7 @@ import {
   paneRects,
   parseLayout,
   placeSessions,
+  ROOT_PANE,
   reconcile,
   removeSession,
   reorderTab,
@@ -375,6 +376,19 @@ Deno.test("placeSessions: a merged tab's sessions become one new pane on the dro
   assertEquals(sig(placeSessions(two, [5], p2, "left").root), "row([1] [5] [2])");
   // An unknown active falls back to the first.
   assertEquals(paneOfSession(placeSessions(s, [5, 6], p1, "right", 99).root, 5)!.active, 5);
+});
+
+Deno.test("placeSessions: ROOT_PANE puts the sessions beside the whole layout", () => {
+  const s = emptyLayout([1]);
+  assertEquals(sig(placeSessions(s, [5], ROOT_PANE, "right").root), "row([1] [5])");
+  assertEquals(sig(placeSessions(s, [5], ROOT_PANE, "top").root), "col([5] [1])");
+  // Beside a split: the whole of it, not one of its panes.
+  const two = splitPane(s, "bottom", 2);
+  const r = placeSessions(two, [5, 6], ROOT_PANE, "right", 6);
+  assertEquals(sig(r.root), "row(col([1] [2]) [5,6])");
+  assertEquals(r.focus, paneOfSession(r.root, 5)!.id);
+  // A lone empty pane just takes them.
+  assertEquals(sig(placeSessions(emptyLayout([]), [5], ROOT_PANE, "left").root), "[5]");
 });
 
 Deno.test("placeSessions: center joins the pane's tabs; reconciled copies are taken out first", () => {

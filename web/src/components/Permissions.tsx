@@ -4,7 +4,7 @@
 import type { ComponentChildren } from "preact";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import { channelById, overlay, sessionsByChannel, workspaceById } from "../state.ts";
-import { tabLabel } from "../model.ts";
+import { taskLabel } from "../model.ts";
 import * as A from "../actions.ts";
 import type { Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
 import { DEFAULT_PERMISSIONS } from "../types.ts";
@@ -262,7 +262,7 @@ export function PermissionsDialog(
         <div class="dlg-head">
           <h2>Permissions</h2>
           <span class="muted">
-            What agents in <b>{tabLabel(c, workspaceById.value.get(c.workspace_id)).text}</b>{" "}
+            What agents in <b>{taskLabel(c, workspaceById.value.get(c.workspace_id)).text}</b>{" "}
             may do. Applies to new and restarted sessions.
           </span>
         </div>

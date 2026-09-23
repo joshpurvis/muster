@@ -138,9 +138,7 @@
   --r-lg: 10px;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --t: 140ms;
-  --tabbar-h: 34px;
   --status-h: 22px;
-  --pane-head-h: 22px;
   --tab-h: 31px;
 }
 
@@ -295,242 +293,24 @@ body.dragging * {
   background: var(--bg-2);
 }
 
-/* ---------------- tab bar ---------------- */
+/* ---------------- window controls (top-right group's strip) ---------------- */
 
-.tabbar {
-  height: var(--tabbar-h);
-  flex: none;
-  display: flex;
-  align-items: stretch;
-  background: var(--bg-0);
-  border-bottom: 1px solid var(--border);
-  user-select: none;
-  min-width: 0;
-  padding-right: 4px;
-}
-
-.tb-tabs {
-  flex: 0 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: stretch;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-}
-
-.tb-tabs::-webkit-scrollbar {
-  display: none;
-}
-
-.ttab {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  flex: 0 1 auto;
-  min-width: 112px;
-  max-width: 230px;
-  padding: 0 6px 0 12px;
-  color: var(--text-muted);
-  border-right: 1px solid var(--border);
-  cursor: default;
-  transition: color var(--t) var(--ease), background var(--t) var(--ease);
-}
-
-.ttab:hover {
-  color: var(--text);
-  background: var(--hover);
-}
-
-/* Joined to the content below: same surface, no bottom border, accent bar on top. */
-.ttab.active {
-  color: var(--text);
-  background: var(--bg-2);
-}
-
-.ttab.active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
-  height: 1px;
-  background: var(--bg-2);
-}
-
-.ttab.active::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 2px;
-  background: var(--accent);
-}
-
-.ttab.unread .ttab-name {
-  font-weight: 650;
-  color: var(--text);
-}
-
-.ttab.dragging {
-  opacity: 0.4;
-}
-
-.ttab .dot {
-  width: 7px;
-  height: 7px;
-}
-
-.ttab-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Auto-named tab before anything was derived: the folder name, muted. */
-.ttab-name.placeholder {
-  font-style: italic;
-  color: var(--text-faint);
-}
-
-.ttab-num {
-  flex: none;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 3px;
-  border-radius: 4px;
-  background: var(--bg-4);
-  color: var(--text);
-  font-size: 10.5px;
-  font-weight: 650;
-  line-height: 15px;
-  text-align: center;
-  animation: fade-in 90ms var(--ease);
-}
-
-.ttab-wt {
-  display: inline-flex;
-  flex: none;
-  color: var(--text-faint);
-}
-
-.tab-perm {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-  width: 18px;
-  height: 18px;
-  border-radius: 4px;
-}
-
-.tab-perm.elevated {
-  color: var(--st-attn);
-}
-
-.tab-perm.danger {
-  color: var(--st-error);
-}
-
-.tab-perm:hover {
-  background: var(--hover-strong);
-}
-
-.ttab .tab-close {
-  opacity: 0;
-}
-
-.ttab:hover .tab-close {
-  opacity: 1;
-}
-
-.ttab.active:not(:hover) .tab-close {
-  opacity: 0.4;
-}
-
-.ttab.confirm {
-  background: rgba(248, 81, 73, 0.1);
-  color: var(--text);
-  gap: 6px;
-  padding-right: 6px;
-  max-width: none;
-}
-
-.tb-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 2px;
-  flex: none;
-  min-width: 30px;
-  padding: 0 6px;
-  color: var(--text-faint);
-  transition: color var(--t) var(--ease), background var(--t) var(--ease);
-}
-
-.tb-btn:hover {
-  color: var(--text);
-  background: var(--hover);
-}
-
-.tb-btn-narrow {
-  min-width: 0;
-  padding: 0 5px 0 2px;
-}
-
-.tb-new {
-  display: flex;
-  flex: none;
-}
-
-.tb-more {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-muted);
-  border-right: 1px solid var(--border);
-  box-shadow: -8px 0 10px -6px rgba(0, 0, 0, 0.45);
-}
-
-.tb-space {
-  flex: 1;
-  min-width: 12px;
-}
-
-.tb-move-targets {
+.win-controls {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 0 6px;
   flex: none;
-  animation: fade-in 120ms var(--ease);
+  padding: 0 4px 0 6px;
 }
 
-.tb-move {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 0 9px;
-  border-radius: 11px;
-  border: 1px dashed color-mix(in srgb, var(--accent) 60%, transparent);
-  color: var(--accent-strong);
-  font-size: 11.5px;
-  white-space: nowrap;
+.win-split {
+  display: flex;
+  flex: none;
 }
 
-.tb-move.over {
-  background: var(--accent-soft);
-  border-style: solid;
-}
-
-.tb-win {
-  align-self: center;
+.win-chip {
   height: 22px;
   padding: 0 8px;
-  margin-right: 6px;
   border-radius: 11px;
   font-size: 11.5px;
   color: var(--text-muted);
@@ -541,30 +321,17 @@ body.dragging * {
   text-overflow: ellipsis;
 }
 
-.tb-win:hover {
+.win-chip:hover {
   color: var(--text);
   background: var(--hover);
 }
 
-.tb-split {
-  display: flex;
-  flex: none;
-  margin-right: 4px;
-}
-
-.tb-split-btn {
-  min-width: 26px;
-  padding: 0 4px;
-}
-
 .jump-btn {
-  align-self: center;
   display: flex;
   align-items: center;
   gap: 7px;
-  height: 24px;
-  padding: 0 5px 0 9px;
-  margin-right: 2px;
+  height: 22px;
+  padding: 0 4px 0 8px;
   border-radius: var(--r);
   background: var(--bg-2);
   border: 1px solid var(--border);
@@ -579,20 +346,65 @@ body.dragging * {
   color: var(--text-muted);
 }
 
-.jump-btn.over {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--text);
-}
-
 .jump-btn kbd {
   height: 16px;
   min-width: 16px;
   font-size: 10px;
 }
 
-.reconnect-pill {
-  align-self: center;
+.win-more {
+  width: 26px;
+}
+
+/* Narrow top-right groups: keep the essentials (Jump and ⋯). */
+@container (max-width: 420px) {
+  .jump-label,
+  .jump-btn .kbd-group,
+  .win-chip,
+  .win-split {
+    display: none;
+  }
+}
+
+/* While a tab is dragged: "→ Window N" / "→ New window" in the focused strip. */
+.move-targets {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  flex: none;
+  animation: fade-in 120ms var(--ease);
+}
+
+.move-target {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 11px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 60%, transparent);
+  color: var(--accent-strong);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.move-target.over {
+  background: var(--accent-soft);
+  border-style: solid;
+}
+
+/* The empty window keeps Jump and ⋯ in its top-right corner. */
+.welcome.empty {
+  position: relative;
+}
+
+.empty-controls {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: var(--tab-h);
+  display: flex;
+  align-items: center;
 }
 
 /* ---------------- status line ---------------- */
@@ -1019,12 +831,83 @@ button.sl-item:hover {
   height: 7px;
 }
 
+/* The task part gives way first; the session part ("· shell") stays readable. */
 .tab-name {
   flex: 1;
   min-width: 0;
+  display: flex;
+  white-space: nowrap;
+}
+
+.tab-task {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+/* Auto-named task before anything was derived: the folder name, muted. */
+.tab-task.placeholder {
+  font-style: italic;
+  color: var(--text-faint);
+}
+
+/* The session's own name, when its task has several: "fix auth · shell". */
+.tab-sub {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: 4px;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.tab.unread .tab-task {
+  font-weight: 650;
+  color: var(--text);
+}
+
+.tab-num {
+  flex: none;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--bg-4);
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 15px;
+  text-align: center;
+  animation: fade-in 90ms var(--ease);
+}
+
+.tab-wt {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-faint);
+}
+
+.tab-perm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+}
+
+.tab-perm.elevated {
+  color: var(--st-attn);
+}
+
+.tab-perm.danger {
+  color: var(--st-error);
+}
+
+.tab-perm:hover {
+  background: var(--hover-strong);
 }
 
 .tab-edit {
@@ -1144,44 +1027,28 @@ button.sl-item:hover {
   font-variant-numeric: tabular-nums;
 }
 
+.tab-new {
+  display: flex;
+  flex: none;
+}
+
 .tab-add {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
+  width: 28px;
   flex: none;
   color: var(--text-faint);
+}
+
+.tab-add-more {
+  width: 18px;
+  margin-left: -4px;
 }
 
 .tab-add:hover {
   color: var(--text);
   background: var(--hover);
-}
-
-/* Hidden until the pane is hovered: invisible buttons must not catch clicks either. */
-.pane-actions {
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  padding: 0 4px;
-  flex: none;
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity var(--t) var(--ease), visibility 0s linear var(--t);
-}
-
-.pane:hover .pane-actions,
-.pane.zoomed .pane-actions,
-.pane-actions:focus-within {
-  opacity: 1;
-  visibility: visible;
-  transition: opacity var(--t) var(--ease), visibility 0s;
-}
-
-@container (max-width: 260px) {
-  .pane-actions {
-    display: none;
-  }
 }
 
 .strip-btn {
@@ -1204,6 +1071,8 @@ button.sl-item:hover {
 }
 
 .zoom-badge {
+  align-self: center;
+  flex: none;
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
@@ -1300,7 +1169,7 @@ button.sl-item:hover {
   filter: saturate(0.4);
 }
 
-/* With several panes, the focused one is obvious: accent ring + brighter strip; the others
+/* With several groups, the focused one is obvious: accent ring + brighter strip; the others
    sit under a light veil (text stays readable). */
 .split .pane::after {
   content: "";
@@ -1494,35 +1363,7 @@ button.sl-item:hover {
   transform: rotate(180deg);
 }
 
-/* launcher */
-
-.launcher {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 24px;
-  outline: none;
-  min-height: 0;
-  overflow: auto;
-}
-
-.launcher-title {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.launcher-sub {
-  color: var(--text-faint);
-  font-size: 12px;
-  margin-bottom: 14px;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+/* launch buttons (empty window) */
 
 .launcher-opts {
   display: flex;
@@ -1580,7 +1421,7 @@ button.sl-item:hover {
   right: 10px;
 }
 
-.launcher:focus-visible .launch-btn.last {
+.welcome:focus-visible .launch-btn.last {
   border-color: var(--accent);
 }
 
@@ -2541,92 +2382,6 @@ textarea {
   color: var(--text);
 }
 
-/* ---------------- pane header ---------------- */
-
-/* Only in tabs with 2+ panes, for panes holding one session (2+ get the pane-tab strip). */
-.pane-head {
-  container-type: inline-size;
-  height: var(--pane-head-h);
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 2px 0 8px;
-  background: var(--bg-1);
-  border-bottom: 1px solid var(--border);
-  font-size: 12px;
-  color: var(--text-muted);
-  user-select: none;
-  min-width: 0;
-  cursor: default;
-}
-
-.pane-head.focused {
-  color: var(--text);
-}
-
-.pane-head.dragging {
-  opacity: 0.45;
-}
-
-.pane-head-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pane-head-state {
-  flex: none;
-  font-size: 11px;
-  color: var(--text-faint);
-}
-
-.pane-head-state.st-working {
-  color: var(--st-working);
-}
-
-.pane-head-state.st-needs_approval,
-.pane-head-state.st-asking_question {
-  color: var(--st-attn);
-}
-
-.pane-head-state.st-error {
-  color: var(--st-error);
-}
-
-.pane-head-state.st-stuck {
-  color: var(--st-stuck);
-}
-
-.pane-head .strip-btn {
-  height: 18px;
-  width: 22px;
-}
-
-.pane-head-close {
-  opacity: 0.5;
-}
-
-.pane-head:hover .pane-head-close {
-  opacity: 1;
-}
-
-.pane-head.confirm {
-  background: rgba(248, 81, 73, 0.1);
-  color: var(--text);
-}
-
-@container (max-width: 200px) {
-  .pane-head-state {
-    display: none;
-  }
-}
-
-.split .pane.focused .pane-head {
-  background: var(--bg-2);
-}
-
 /* ---------------- empty window ---------------- */
 
 .welcome:focus {
@@ -2693,9 +2448,6 @@ textarea {
 /* ---------------- responsive ---------------- */
 
 @media (max-width: 760px) {
-  .jump-btn > span,
-  .jump-btn .kbd-group,
-  .tb-win,
   .sl-count {
     display: none;
   }

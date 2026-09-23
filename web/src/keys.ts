@@ -3,16 +3,14 @@
 
 import * as A from "./actions.ts";
 import {
-  activeChannel,
   altHeld,
   confirmClose,
+  focusedSession,
+  focusedTask,
+  hereIds,
   overlay,
-  type PendingClose,
   prefs,
-  renaming,
-  sessions,
   setPref,
-  tabIdSet,
   toast,
   windowId,
   windowsSupported,
@@ -118,7 +116,7 @@ export function keyLabel(s: string): string[] {
   });
 }
 
-const hasTab = () => activeChannel.value !== null;
+const hasTab = () => focusedSession.value !== null;
 
 function onOff(on: boolean, onText: string, offText: string) {
   toast("info", on ? onText : offText);
@@ -150,21 +148,21 @@ export const commands: Command[] = [
   },
   {
     id: "next-tab",
-    title: "Next tab",
+    title: "Next tab in group",
     group: "Navigate",
-    keys: ["Ctrl+Tab", "Ctrl+Alt+Right"],
-    run: () => A.stepTab(1),
+    keys: ["Ctrl+Tab", "Alt+]"],
+    run: () => A.tabStep(1),
   },
   {
     id: "prev-tab",
-    title: "Previous tab",
+    title: "Previous tab in group",
     group: "Navigate",
-    keys: ["Ctrl+Shift+Tab", "Ctrl+Alt+Left"],
-    run: () => A.stepTab(-1),
+    keys: ["Ctrl+Shift+Tab", "Alt+["],
+    run: () => A.tabStep(-1),
   },
   ...Array.from({ length: 9 }, (_, i): Command => ({
     id: `tab-${i + 1}`,
-    title: `Go to tab ${i + 1}`,
+    title: `Go to tab ${i + 1} of the group`,
     group: "Navigate",
     keys: [`Alt+${i + 1}`],
     hidden: true,
@@ -194,11 +192,40 @@ export const commands: Command[] = [
     run: () => A.newTabDialog(),
   },
   {
+    id: "new-terminal",
+    title: "New terminal in this task…",
+    group: "Tab",
+    keys: ["Alt+N"],
+    run: () => A.spawnPicker(),
+    enabled: hasTab,
+  },
+  {
+    id: "new-claude",
+    title: "New Claude in this task",
+    group: "Tab",
+    run: () => A.spawnHere("claude"),
+    enabled: hasTab,
+  },
+  {
+    id: "new-codex",
+    title: "New Codex in this task",
+    group: "Tab",
+    run: () => A.spawnHere("codex"),
+    enabled: hasTab,
+  },
+  {
+    id: "new-shell",
+    title: "New shell in this task",
+    group: "Tab",
+    run: () => A.spawnHere("shell"),
+    enabled: hasTab,
+  },
+  {
     id: "move-tab-left",
     title: "Move tab left",
     group: "Tab",
     keys: ["Alt+Shift+["],
-    run: () => A.moveActiveTab(-1),
+    run: () => A.shiftFocusedTab(-1),
     enabled: hasTab,
   },
   {
@@ -206,166 +233,134 @@ export const commands: Command[] = [
     title: "Move tab right",
     group: "Tab",
     keys: ["Alt+Shift+]"],
-    run: () => A.moveActiveTab(1),
+    run: () => A.shiftFocusedTab(1),
     enabled: hasTab,
   },
+  ...(["Left", "Right", "Up", "Down"] as const).map((d): Command => ({
+    id: `move-tab-${d.toLowerCase()}`,
+    title: `Move tab to the group ${d === "Left" || d === "Right" ? "to the " : ""}${
+      { Left: "left", Right: "right", Up: "above", Down: "below" }[d]
+    }`,
+    group: "Tab",
+    keys: [`Ctrl+Alt+${d}`],
+    run: () => A.moveFocusedTab(d.toLowerCase() as "left"),
+    enabled: hasTab,
+  })),
   {
     id: "rename-tab",
     title: "Rename tab",
     group: "Tab",
     enabled: hasTab,
     run: () => {
-      const c = activeChannel.value;
-      if (c) renaming.value = { kind: "channel", id: c.id };
+      const s = focusedSession.value;
+      if (s) A.renameIn("session", s.id);
+    },
+  },
+  {
+    id: "rename-task",
+    title: "Rename task",
+    group: "Tab",
+    enabled: hasTab,
+    run: () => {
+      const s = focusedSession.value;
+      if (s) A.renameIn("channel", s.id);
     },
   },
   {
     id: "tab-permissions",
-    title: "Tab permissions…",
+    title: "Task permissions…",
     group: "Tab",
     enabled: hasTab,
-    run: () => activeChannel.value && A.openPermissions(activeChannel.value.id),
+    run: () => focusedTask.value && A.openPermissions(focusedTask.value.id),
   },
   {
     id: "tab-new-window",
     title: "Move tab to a new window",
     group: "Tab",
     enabled: () => hasTab() && windowsSupported.value && windowId.value !== null,
-    run: () => activeChannel.value && A.moveTabToWindow(activeChannel.value.id, "new"),
+    run: () => focusedSession.value && A.moveTabToWindow(focusedSession.value.id, "new"),
   },
   {
     id: "close-tab",
     title: "Close tab",
     group: "Tab",
-    enabled: hasTab,
-    run: () => activeChannel.value && A.closeTab(activeChannel.value.id),
-  },
-  {
-    id: "rename-window",
-    title: "Rename window…",
-    group: "Tab",
-    enabled: () => windowId.value !== null,
-    run: () => (overlay.value = { kind: "rename_window" }),
-  },
-
-  // Sessions
-  {
-    id: "new-session",
-    title: "New session in pane…",
-    group: "Session",
-    keys: ["Alt+N"],
-    run: () => A.spawnPicker(),
-    enabled: hasTab,
-  },
-  {
-    id: "new-claude",
-    title: "New Claude session in pane",
-    group: "Session",
-    run: () => A.spawnHere("claude"),
-    enabled: hasTab,
-  },
-  {
-    id: "new-codex",
-    title: "New Codex session in pane",
-    group: "Session",
-    run: () => A.spawnHere("codex"),
-    enabled: hasTab,
-  },
-  {
-    id: "new-shell",
-    title: "New shell in pane",
-    group: "Session",
-    run: () => A.spawnHere("shell"),
-    enabled: hasTab,
-  },
-  {
-    id: "close-pane",
-    title: "Close pane",
-    group: "Session",
     keys: ["Alt+W"],
-    run: () => A.closeFocused(),
     enabled: hasTab,
+    run: () => A.closeFocused(),
   },
   {
     id: "restart",
-    title: "Restart session",
-    group: "Session",
+    title: "Restart tab's process",
+    group: "Tab",
     run: () => {
-      const s = A.focusedSession();
+      const s = focusedSession.value;
       if (s) A.restartSession(s.id);
     },
-    enabled: () => !!A.focusedSession(),
+    enabled: hasTab,
   },
   {
     id: "interrupt",
-    title: "Interrupt session (Esc to agent)",
-    group: "Session",
+    title: "Interrupt (Esc to agent)",
+    group: "Tab",
     run: () => {
-      const s = A.focusedSession();
+      const s = focusedSession.value;
       if (s) A.interruptSession(s.id);
     },
-    enabled: () => !!A.focusedSession(),
+    enabled: hasTab,
   },
   {
     id: "approve",
     title: "Approve prompt",
-    group: "Session",
+    group: "Tab",
     keys: ["Alt+A"],
     run: () => A.approveFocused("approve"),
   },
   {
     id: "deny",
     title: "Deny prompt",
-    group: "Session",
+    group: "Tab",
     keys: ["Alt+Shift+A"],
     run: () => A.approveFocused("deny"),
   },
+  {
+    id: "rename-window",
+    title: "Rename window…",
+    group: "Window",
+    enabled: () => windowId.value !== null,
+    run: () => (overlay.value = { kind: "rename_window" }),
+  },
 
-  // Panes
+  // Groups
   {
     id: "split-right",
-    title: "Split right (new shell)",
-    group: "Panes",
+    title: "Split right (new shell in this task)",
+    group: "Groups",
     keys: ["Alt+D"],
     run: () => A.splitFocused("right"),
     enabled: hasTab,
   },
   {
     id: "split-down",
-    title: "Split down (new shell)",
-    group: "Panes",
+    title: "Split down (new shell in this task)",
+    group: "Groups",
     keys: ["Alt+Shift+D"],
     run: () => A.splitFocused("bottom"),
     enabled: hasTab,
   },
-  { id: "zoom", title: "Zoom pane", group: "Panes", keys: ["Alt+Z"], run: () => A.zoomToggle() },
-  { id: "equalize", title: "Equalize splits", group: "Panes", run: () => A.equalizeAll() },
-  {
-    id: "prev-pane-tab",
-    title: "Previous session in pane",
-    group: "Panes",
-    keys: ["Alt+["],
-    run: () => A.paneTabStep(-1),
-  },
-  {
-    id: "next-pane-tab",
-    title: "Next session in pane",
-    group: "Panes",
-    keys: ["Alt+]"],
-    run: () => A.paneTabStep(1),
-  },
+  { id: "zoom", title: "Zoom group", group: "Groups", keys: ["Alt+Z"], run: () => A.zoomToggle() },
+  { id: "equalize", title: "Equalize splits", group: "Groups", run: () => A.equalizeAll() },
   ...(["Left", "Right", "Up", "Down"] as const).map((d): Command => ({
     id: `focus-${d.toLowerCase()}`,
-    title: `Focus pane ${d.toLowerCase()}`,
-    group: "Panes",
+    title: `Focus group ${d.toLowerCase()}`,
+    group: "Groups",
     keys: [`Alt+${d}`],
     hidden: true,
     run: () => A.focusDir(d.toLowerCase() as "left"),
   })),
   ...(["Left", "Right", "Up", "Down"] as const).map((d): Command => ({
     id: `resize-${d.toLowerCase()}`,
-    title: `Resize pane ${d.toLowerCase()}`,
-    group: "Panes",
+    title: `Resize group ${d.toLowerCase()}`,
+    group: "Groups",
     keys: [`Alt+Shift+${d}`],
     hidden: true,
     run: () => A.resizeDir(d.toLowerCase() as "left"),
@@ -498,10 +493,8 @@ function overlayAllows(b: Binding): boolean {
 }
 
 /** A pending "Close?" only takes keys while its question is on screen in this window. */
-function pendingHere(p: PendingClose): boolean {
-  if (p.kind === "channel") return tabIdSet.value.has(p.id);
-  const s = sessions.value.get(p.id);
-  return !!s && s.channel_id === activeChannel.value?.id;
+function pendingHere(sid: number): boolean {
+  return hereIds.value.has(sid);
 }
 
 export function installKeys() {
@@ -540,8 +533,7 @@ export function installKeys() {
           e.preventDefault();
           e.stopPropagation();
           confirmClose.value = null;
-          if (pending.kind === "session") A.closeSession(pending.id, true);
-          else A.closeTab(pending.id, true);
+          A.closeTab(pending, true);
           return;
         } else if (e.key === "Escape") {
           e.preventDefault();
@@ -575,7 +567,7 @@ export function installKeys() {
   );
 }
 
-/** Holding Alt alone for a moment shows the Alt+1..9 tab numbers. */
+/** Holding Alt alone for a moment shows the focused group's Alt+1..9 tab numbers. */
 function installAltHeld() {
   let timer = 0;
   const clear = () => {

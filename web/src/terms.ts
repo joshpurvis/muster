@@ -583,7 +583,6 @@ export function scrollToBottom(sid: number) {
 /** Pane chrome above a terminal (px): the pane-tab strip (2+ sessions in the pane) or the
  * pane header (2+ panes in the tab); a lone pane with one session has none. */
 export const PANE_STRIP_PX = 31;
-export const PANE_HEAD_PX = 22;
 // .term-host padding plus xterm's scrollbar gutter (FitAddon's DEFAULT_SCROLL_BAR_WIDTH).
 const HOST_PAD_X = 14 + 14;
 const HOST_PAD_Y = 10;

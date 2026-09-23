@@ -2,8 +2,6 @@ import {
   activateTab,
   addTab,
   allPanes,
-  chromeForNew,
-  chromeOf,
   cycleTab,
   dragGutter,
   emptyLayout,
@@ -13,6 +11,7 @@ import {
   type LayoutState,
   MIN_SPLIT,
   moveTab,
+  moveTabToNeighbour,
   neighbour,
   normalize,
   pane,
@@ -20,16 +19,16 @@ import {
   panePx,
   paneRects,
   parseLayout,
-  placeSessions,
-  ROOT_PANE,
   reconcile,
   removeSession,
   reorderTab,
   resizeFocused,
+  shiftTab,
   sig,
   splitFits,
   splitPane,
   toggleZoom,
+  topRightPane,
 } from "./tree.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
@@ -337,73 +336,128 @@ Deno.test("isNoopMove recognises drops that change nothing", () => {
   assert(isNoopMove(s, 99, p1, "center"), "unknown session");
 });
 
-Deno.test("pane chrome: none alone, header with 2+ panes, strip with 2+ sessions", () => {
-  assertEquals(chromeOf(1, 1), "none");
-  assertEquals(chromeOf(0, 1), "none", "empty lone pane (launcher)");
-  assertEquals(chromeOf(1, 2), "head");
-  assertEquals(chromeOf(2, 1), "strip");
-  assertEquals(chromeOf(3, 4), "strip", "a strip replaces the header");
+// ---------- groups (v2: the window's layout; a tab is one session) ----------
+
+/** Row [1,2] | col([3] [4]): four groups' worth of tabs in three groups. */
+function threeGroups(): LayoutState {
+  let s = emptyLayout([1, 2]);
+  s = splitPane(s, "right", 3);
+  s = splitPane(s, "bottom", 4);
+  return s;
+}
+
+Deno.test("groups reconcile with the window's sessions: new ones join the focused group", () => {
+  let s = threeGroups();
+  assertEquals(sig(s.root), "row([1,2] col([3] [4]))");
+  s = { ...s, focus: paneOfSession(s.root, 1)!.id };
+  // 5 arrived (spawned elsewhere, or moved here from another window), 3 left (closed or moved).
+  s = reconcile(s, [1, 2, 4, 5]);
+  assertEquals(sig(s.root), "row([1,2,5] [4])");
+  assertEquals(findActive(s), 1, "the focused group keeps its active tab");
+  // An empty window starts one group with its sessions in order.
+  const e = reconcile(emptyLayout([]), [7, 8]);
+  assertEquals(sig(e.root), "[7,8]");
+  assertEquals(findActive(e), 7);
 });
 
-Deno.test("chromeForNew predicts the chrome where a new session lands", () => {
-  let s = emptyLayout([1]);
-  const p1 = s.focus;
-  assertEquals(chromeForNew(s, "tab", p1), "strip", "second session in the only pane");
-  assertEquals(chromeForNew(s, "split", p1), "head", "a split makes two panes");
-  s = emptyLayout([]);
-  assertEquals(chromeForNew(s, "tab", s.focus), "none", "first session of a new tab");
-  s = splitPane(emptyLayout([1]), "right", 2);
-  const p2 = paneOfSession(s.root, 2)!.id;
-  assertEquals(chromeForNew(s, "tab", p2), "strip");
-  s = splitPane(s, "bottom", null);
-  assertEquals(chromeForNew(s, "tab", s.focus), "head", "empty pane among others");
+Deno.test("closing the last tab of a group removes the group; focus goes to a neighbour", () => {
+  let s = threeGroups();
+  const g4 = paneOfSession(s.root, 4)!.id;
+  s = { ...s, focus: g4 };
+  s = reconcile(s, [1, 2, 3]);
+  assertEquals(sig(s.root), "row([1,2] [3])");
+  assertEquals(findActive(s), 3, "the group above takes focus, not the first one");
+  s = reconcile(s, [1, 2]);
+  assertEquals(sig(s.root), "[1,2]");
+  s = reconcile(s, []);
+  assertEquals(sig(s.root), "[]", "an empty window keeps one empty group");
 });
 
-Deno.test("placeSessions: a merged tab's sessions become one new pane on the drop side", () => {
-  const s = emptyLayout([1]);
-  const p1 = s.focus;
-  const r = placeSessions(s, [5, 6, 7], p1, "right", 6);
-  assertEquals(sig(r.root), "row([1] [5,6,7])");
-  const np = paneOfSession(r.root, 5)!;
-  assertEquals(np.active, 6, "the dragged tab's active session stays active");
-  assertEquals(r.focus, np.id, "the new pane takes focus");
-  assertEquals(sig(placeSessions(s, [5], p1, "left").root), "row([5] [1])");
-  assertEquals(sig(placeSessions(s, [5], p1, "top").root), "col([5] [1])");
-  assertEquals(sig(placeSessions(s, [5], p1, "bottom").root), "col([1] [5])");
-  // Beside one pane of an existing row: a sibling, not a nested split.
-  const two = splitPane(s, "right", 2);
-  const p2 = paneOfSession(two.root, 2)!.id;
-  assertEquals(sig(placeSessions(two, [5], p2, "left").root), "row([1] [5] [2])");
-  // An unknown active falls back to the first.
-  assertEquals(paneOfSession(placeSessions(s, [5, 6], p1, "right", 99).root, 5)!.active, 5);
+Deno.test("reconcile keeps a layout that already matches (no churn)", () => {
+  const s = threeGroups();
+  assertEquals(JSON.stringify(reconcile(s, [1, 2, 3, 4])), JSON.stringify(s));
 });
 
-Deno.test("placeSessions: ROOT_PANE puts the sessions beside the whole layout", () => {
-  const s = emptyLayout([1]);
-  assertEquals(sig(placeSessions(s, [5], ROOT_PANE, "right").root), "row([1] [5])");
-  assertEquals(sig(placeSessions(s, [5], ROOT_PANE, "top").root), "col([5] [1])");
-  // Beside a split: the whole of it, not one of its panes.
-  const two = splitPane(s, "bottom", 2);
-  const r = placeSessions(two, [5, 6], ROOT_PANE, "right", 6);
-  assertEquals(sig(r.root), "row(col([1] [2]) [5,6])");
-  assertEquals(r.focus, paneOfSession(r.root, 5)!.id);
-  // A lone empty pane just takes them.
-  assertEquals(sig(placeSessions(emptyLayout([]), [5], ROOT_PANE, "left").root), "[5]");
+Deno.test("dragging a tab between groups: into a strip at the marker, onto a body, onto an edge", () => {
+  let s = threeGroups();
+  const g1 = paneOfSession(s.root, 1)!.id;
+  const g3 = paneOfSession(s.root, 3)!.id;
+  // Into another group's strip, before its first tab.
+  s = moveTab(s, 2, g3, "center", 0);
+  assertEquals(sig(s.root), "row([1] col([2,3] [4]))");
+  assertEquals(s.focus, g3);
+  assertEquals(findActive(s), 2, "the dropped tab is active in its new group");
+  // Onto another group's right edge: a new split beside that group only.
+  s = moveTab(s, 4, g1, "right");
+  assertEquals(sig(s.root), "row([1] [4] [2,3])");
+  assertEquals(findActive(s), 4);
+  // Onto a body's center: the end of that group's tabs; the emptied group closes.
+  s = moveTab(s, 4, g3, "center");
+  assertEquals(sig(s.root), "row([1] [2,3,4])");
 });
 
-Deno.test("placeSessions: center joins the pane's tabs; reconciled copies are taken out first", () => {
-  const s = emptyLayout([1, 2]);
-  const p1 = s.focus;
-  const c = placeSessions(s, [5, 6], p1, "center", 6);
-  assertEquals(sig(c.root), "[1,2,5,6]");
-  assertEquals(findActive(c), 6);
-  assertEquals(sig(placeSessions(s, [5], p1, "center", undefined, 1).root), "[1,5,2]", "at an index");
-  // Reconcile dumped them into the focused pane before placement: they move out of it.
-  const dumped = reconcile(s, [1, 2, 5, 6]);
-  assertEquals(sig(dumped.root), "[1,2,5,6]");
-  assertEquals(sig(placeSessions(dumped, [5, 6], p1, "bottom").root), "col([1,2] [5,6])");
-  // Nothing to place: unchanged.
-  assert(placeSessions(s, [], p1, "right") === s);
+Deno.test("dragging a group's active tab onto its own edge splits it off", () => {
+  let s = emptyLayout([1, 2]);
+  const g = s.focus;
+  assert(!isNoopMove(s, 2, g, "bottom"));
+  s = moveTab(s, 2, g, "bottom");
+  assertEquals(sig(s.root), "col([1] [2])");
+});
+
+Deno.test("Ctrl+Alt+arrow moves a tab to the neighbouring group, splitting at the edge", () => {
+  let s = threeGroups();
+  // 2 → right: the nearest group on the right that overlaps (the top one, 3).
+  s = moveTabToNeighbour(s, 2, "right");
+  assertEquals(sig(s.root), "row([1] col([3,2] [4]))");
+  assertEquals(findActive(s), 2);
+  // 2 → down: into the group below.
+  s = moveTabToNeighbour(s, 2, "down");
+  assertEquals(sig(s.root), "row([1] col([3] [4,2]))");
+  // 2 → down again: no group below, so the group splits downward with 2 in the new group.
+  s = moveTabToNeighbour(s, 2, "down");
+  assertEquals(sig(s.root), "row([1] col([3] [4] [2]))");
+  // A group's only tab at the edge stays put.
+  const before = JSON.stringify(s);
+  assertEquals(JSON.stringify(moveTabToNeighbour(s, 2, "down")), before);
+  assertEquals(JSON.stringify(moveTabToNeighbour(s, 1, "left")), JSON.stringify(s));
+  // Left from the right column: back to the first group; the emptied group closes.
+  s = moveTabToNeighbour(s, 2, "left");
+  assertEquals(sig(s.root), "row([1,2] col([3] [4]))");
+});
+
+Deno.test("Ctrl+Alt+arrow while zoomed unzooms", () => {
+  let s = threeGroups();
+  s = toggleZoom(s, paneOfSession(s.root, 1)!.id);
+  assert(s.zoom !== null);
+  s = moveTabToNeighbour(s, 1, "right");
+  assertEquals(s.zoom, null);
+  assertEquals(sig(s.root), "row([2] col([3,1] [4]))");
+});
+
+Deno.test("shiftTab reorders within the group and stops at the ends", () => {
+  let s = emptyLayout([1, 2, 3]);
+  s = shiftTab(s, 1, 1);
+  assertEquals(sig(s.root), "[2,1,3]");
+  s = shiftTab(s, 1, 1);
+  assertEquals(sig(s.root), "[2,3,1]");
+  const end = s;
+  assert(shiftTab(s, 1, 1) === end, "already last");
+  s = shiftTab(s, 2, -1);
+  assertEquals(sig(s.root), "[2,3,1]", "already first");
+  s = shiftTab(s, 3, -1);
+  assertEquals(sig(s.root), "[3,2,1]");
+});
+
+Deno.test("topRightPane: the group in the window's top-right corner carries the controls", () => {
+  const one = emptyLayout([1]);
+  assertEquals(topRightPane(one.root), one.focus);
+  const s = threeGroups();
+  assertEquals(topRightPane(s.root), paneOfSession(s.root, 3)!.id);
+  const col = splitPane(emptyLayout([1]), "bottom", 2);
+  assertEquals(topRightPane(col.root), paneOfSession(col.root, 1)!.id, "top of a column");
+  const row = splitPane(col, "right", 3);
+  // col([1] row([2] [3])): the top group spans the full width, so it is the corner.
+  assertEquals(topRightPane(row.root), paneOfSession(row.root, 1)!.id);
 });
 
 function findActive(s: LayoutState): number | null {

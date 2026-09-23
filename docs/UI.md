@@ -51,27 +51,32 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 ```
 
 ### Group tab strips
-- Every group has a tab strip (30px), always shown, even with one tab. Tabs show the kind icon,
-  the state dot, the label, an optional `⎇` (worktree) and permissions icon (amber for network
-  or accept edits, red for full access or bypass), and `×` on hover.
+- Every group has a tab strip (31px), always shown, even with one tab. Tabs show the state dot,
+  the kind icon, the label, an optional `⎇` (worktree) and permissions icon (amber for network
+  or accept edits, red for full access or bypass; both on every tab of the task), and `×` on
+  hover.
 - **Label**: the task's name (auto-derived, muted italics while it's only the folder name). When
-  the task has several sessions, a secondary muted part names the session (`fix auth · shell`).
+  the task has several sessions, a secondary muted part names the session (`fix auth · shell`);
+  the task part is truncated first.
   Tooltip: full name, folder, branch, state detail.
 - The active tab of the focused group has an accent top bar; other groups' active tabs are
   muted. Unread activity shows a bold label.
-- Double-click renames (the task for its main agent tab, the session otherwise; the context
-  menu offers both). Middle-click closes. `+` at the end of each strip opens a new tab in that
-  group (same folder as the group's active tab, no worktree, last agent kind); `▾` next to it:
+- Double-click renames (the task for its main tab, i.e. the task's first agent session or else
+  its first session; the session otherwise; the context menu offers both). Middle-click
+  closes. `+` at the end of each strip opens a new tab in that group (same folder as the group's active tab, no worktree, last agent kind); `▾` next to it:
   New tab…, New worktree tab, New terminal in this task, and Claude / Codex / Shell.
 - The **top-right group's** strip ends with the window controls: Split right `◫`, Split down
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
   Alt keys, Jump focuses the other window, Command palette, Keyboard shortcuts), plus a
-  "Reconnecting…" pill when disconnected.
+  "Reconnecting…" pill when disconnected. The top-right group is the one touching the window's
+  right edge highest up; a zoomed group carries the controls; narrow strips keep only Jump and
+  `⋯`.
 - Strips scroll sideways past their width (wheel scrolls, active tab kept in view) with an
   `N ▾` overflow list. Roving tabindex: ←/→/Home/End, Enter focuses the terminal, F2 renames.
 - Context menu: Rename tab, Rename task, Permissions… (task), Copy path, Copy branch, New
-  terminal in this task, Split right ▸ / Split down ▸, Move to window ▸ (existing windows plus
+  terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
+  Shell in this task there), Move to window ▸ (existing windows plus
   "New window"), Restart, Interrupt, Close tab, and when it is the task's last session with a
   worktree, Close + remove worktree (confirmed in a dialog).
 
@@ -84,7 +89,8 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   left empty by a drag closes.
 - Onto the "→ Window N / → New window" targets that appear in the focused strip's right end
   while dragging: moves the session to that window (`session.set_window`), shown there (the
-  daemon launches the window if no client shows it, `window.show`).
+  daemon launches the window if no client shows it, `window.show`). A dropped tab becomes the
+  active tab of its group, which takes focus.
 - Esc, window blur or pointercancel abort. Drops that change nothing show no overlay.
 
 ### Groups
@@ -93,12 +99,18 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   "Not enough room" toast), zoom (Alt+Z maximizes the focused group), focus ring and dim veil
   on unfocused groups, the reparented cached xterm instances, the exited-session bar, the
   approval banner (**Approve** Alt+A, **Always**, **Deny** Alt+Shift+A, "Jump to prompt"),
-  and the right-click pane menu (Shift+right-click inside mouse-tracking programs).
+  and the right-click group menu (Shift+right-click inside mouse-tracking programs). A zoomed
+  group shows a "zoomed" badge in its strip (click restores).
 - A window with no tabs shows the empty launcher (folder input with `fs.complete`, then
-  Claude / Codex / Shell, keys 1 2 3). An empty group (only possible transiently) closes.
+  Claude / Codex / Shell, keys 1 2 3), with Jump and `⋯` in its top-right corner. An empty group
+  (only possible transiently) closes.
 - The window layout is saved with `window.set_layout` (debounced 400ms) and reconciled on load
   and on every session change: sessions of this window that aren't in the layout join the
-  focused group; unknown or foreign sessions are dropped; empty groups collapse.
+  focused group; unknown or foreign sessions are dropped; empty groups collapse (a focused group
+  that empties hands focus to its nearest neighbour). A window whose `layout` is null (first
+  run after v1, or a daemon without it) starts as one group holding its sessions in task order;
+  v1's per-channel layouts are not migrated. Sessions this client creates (new tab, new
+  terminal, split) are held out of the layout until their call returns and places them.
 
 ### Status line (optional, on by default, toggle in the palette)
 22px, muted: the focused tab's task folder (truncated from the left, click copies), branch
@@ -119,7 +131,7 @@ a connection dot.
   that).
 - **New tab…** (Alt+Shift+N): opens in the focused group. Folder (path input with `fs.complete`, defaults to the focused
   tab's folder; recent folders as chips), agent segmented control (Claude · Codex · Shell ·
-  remembers last), worktree toggle (default **off**; disabled for a known non-git
+  remembers last; no "None": a tab is a session), worktree toggle (default **off**; disabled for a known non-git
   folder), base branch (only when worktree is on), optional name (blank = auto), optional first
   prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
   Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees).
@@ -189,6 +201,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+←↑→↓ | Focus the group in that direction |
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
+| F2 (in a focused strip) | Rename the tab (the task on its main tab) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
@@ -207,10 +220,16 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - Every hello (first connect and reconnects) re-claims the window, then re-attaches. If
   `window_removed` names this client's window, it claims the same id again (created if
   missing).
-- Daemons without windows (hello has no `windows`): every channel is a tab of this window, in
-  `sort_order`; reordering uses `channel.reorder`; window UI (window chip, Move to window, Jump
-  focuses the other window, Rename window) is hidden; new tabs send the folder name as `name`,
-  since such daemons require one. A failed `window.claim` degrades the same way.
+- Daemons without windows (hello has no `windows`): every session is a tab of this window, in
+  task `sort_order`; the layout is kept in memory only; window UI (window chip, Move to window,
+  Jump focuses the other window, Rename window) is hidden; new tabs send the folder name as
+  `name`, since such daemons require one. A failed `window.claim` degrades the same way.
+- Daemons with windows but before v2 (sessions without `window_id`): a session is a tab of its
+  task's window. Without `session.set_window` ("unknown method"), moving a tab to another window
+  or pulling it here falls back to `channel.move`, which works only for a task's lone session
+  (else an error toast). Without `window.set_layout` the layout isn't saved (a reload rebuilds
+  one group). Closing a task's last tab also calls `channel.close_if_empty`, for daemons that
+  don't close emptied tasks themselves.
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
   folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other

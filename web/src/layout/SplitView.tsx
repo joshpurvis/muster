@@ -1,4 +1,4 @@
-// Renders a split tree with draggable gutters.
+// Renders the window's split tree of groups with draggable gutters.
 import { useRef } from "preact/hooks";
 import {
   dragGutter,
@@ -8,43 +8,53 @@ import {
   type LayoutState,
   setSizes,
   type SplitNode,
+  topRightPane,
 } from "./tree.ts";
 import { updateLayout } from "../state.ts";
-import { Pane } from "./Pane.tsx";
+import { Group } from "./Pane.tsx";
 import { cx } from "../util.ts";
 
 const MIN_PX = 120;
 const GUTTER = 1; // visible px; hit area is widened in CSS
 
-export function SplitView({ ch, layout }: { ch: number; layout: LayoutState }) {
+export function SplitView({ layout }: { layout: LayoutState }) {
   if (layout.zoom) {
     const p = findPane(layout.root, layout.zoom);
     if (p) {
       return (
         <div class="split-root">
-          <Pane ch={ch} pane={p} focused zoomed multi />
+          <Group pane={p} focused zoomed multi controls />
         </div>
       );
     }
   }
+  const corner = topRightPane(layout.root);
   return (
     <div class="split-root">
-      <Node ch={ch} node={layout.root} path={[]} focus={layout.focus} />
+      <Node node={layout.root} path={[]} focus={layout.focus} corner={corner} />
     </div>
   );
 }
 
 function Node(
-  { ch, node, path, focus }: { ch: number; node: Layout; path: number[]; focus: string },
+  { node, path, focus, corner }: { node: Layout; path: number[]; focus: string; corner: string },
 ) {
   if (node.type === "pane") {
-    return <Pane ch={ch} pane={node} focused={node.id === focus} zoomed={false} multi={path.length > 0} />;
+    return (
+      <Group
+        pane={node}
+        focused={node.id === focus}
+        zoomed={false}
+        multi={path.length > 0}
+        controls={node.id === corner}
+      />
+    );
   }
-  return <Split ch={ch} node={node} path={path} focus={focus} />;
+  return <Split node={node} path={path} focus={focus} corner={corner} />;
 }
 
 function Split(
-  { ch, node, path, focus }: { ch: number; node: SplitNode; path: number[]; focus: string },
+  { node, path, focus, corner }: { node: SplitNode; path: number[]; focus: string; corner: string },
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const out = [];
@@ -57,14 +67,13 @@ function Split(
         class="split-child"
         style={{ flex: `${node.sizes[i]} 1 0px` }}
       >
-        <Node ch={ch} node={c} path={[...path, i]} focus={focus} />
+        <Node node={c} path={[...path, i]} focus={focus} corner={corner} />
       </div>,
     );
     if (i < node.children.length - 1) {
       out.push(
         <Gutter
           key={"g" + key}
-          ch={ch}
           dir={node.dir}
           path={path}
           index={i}
@@ -82,8 +91,7 @@ function firstPaneId(n: Layout): string {
 }
 
 function Gutter(
-  { ch, dir, path, index, sizes, container }: {
-    ch: number;
+  { dir, path, index, sizes, container }: {
     dir: "row" | "col";
     path: number[];
     index: number;
@@ -112,7 +120,7 @@ function Gutter(
       raf = requestAnimationFrame(() => {
         raf = 0;
         const next = dragGutter(startSizes, index, last / total, minFrac);
-        updateLayout(ch, (l) => setSizes(l, path, next));
+        updateLayout((l) => setSizes(l, path, next));
       });
     };
     const up = () => {
@@ -125,7 +133,7 @@ function Gutter(
         cancelAnimationFrame(raf);
         raf = 0;
         const next = dragGutter(startSizes, index, last / total, minFrac);
-        updateLayout(ch, (l) => setSizes(l, path, next));
+        updateLayout((l) => setSizes(l, path, next));
       }
       el.classList.remove("dragging");
       document.body.classList.remove("resizing-col", "resizing-row");
@@ -141,7 +149,7 @@ function Gutter(
       role="separator"
       aria-orientation={dir === "row" ? "vertical" : "horizontal"}
       onPointerDown={onDown}
-      onDblClick={() => updateLayout(ch, (l) => equalize(l, path))}
+      onDblClick={() => updateLayout((l) => equalize(l, path))}
     />
   );
 }

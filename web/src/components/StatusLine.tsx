@@ -1,6 +1,6 @@
-// Optional bottom line: the active tab's folder and branch (click copies), its session count,
-// a "needs you" chip (same as Alt+J) and the connection dot.
-import { activeChannel, meta, needsYou, sessionsByChannel } from "../state.ts";
+// Optional bottom line: the focused tab's task folder and branch (click copies), the number of
+// tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
+import { focusedTask, meta, needsYou, windowSessions } from "../state.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { IconBranch, IconFolder } from "../icons.tsx";
@@ -14,10 +14,11 @@ const CONN_LABEL = {
 } as const;
 
 export function StatusLine() {
-  const c = activeChannel.value;
+  const c = focusedTask.value;
   const n = needsYou.value.length;
   const status = connStatus.value;
-  const count = c ? (sessionsByChannel.value.get(c.id) ?? []).length : 0;
+  const count = windowSessions.value.length;
+  const cwd = c?.cwd ?? "";
   return (
     <footer class="statusline">
       {c && (
@@ -25,11 +26,11 @@ export function StatusLine() {
           type="button"
           class="sl-item sl-path"
           data-tip={`Copy path · ports ${c.port_base}–${c.port_base + 9}`}
-          onClick={() => A.copy(c.cwd, "Path copied")}
+          onClick={() => A.copy(cwd, "Path copied")}
         >
           <IconFolder size={12} />
           <span class="path-rtl">
-            <bdi>{tildify(c.cwd, meta.value.home)}</bdi>
+            <bdi>{tildify(cwd, meta.value.home)}</bdi>
           </span>
         </button>
       )}
@@ -44,7 +45,7 @@ export function StatusLine() {
           <span>{c.branch}</span>
         </button>
       )}
-      {c && <span class="sl-item sl-count">{count === 1 ? "1 session" : `${count} sessions`}</span>}
+      {count > 0 && <span class="sl-item sl-count">{count === 1 ? "1 tab" : `${count} tabs`}</span>}
       <span class="sl-space" />
       {n > 0 && (
         <button

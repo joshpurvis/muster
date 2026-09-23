@@ -1,7 +1,16 @@
 // Pure logic for windows, tabs, naming, Jump ranking and "needs you" cycling. No signals, no
 // DOM: everything here is unit tested (model_test.ts).
 
-import type { AgentState, Channel, ChannelId, SessionInfo, Win, WindowId, Workspace } from "./types.ts";
+import type {
+  AgentState,
+  Channel,
+  ChannelId,
+  SessionId,
+  SessionInfo,
+  Win,
+  WindowId,
+  Workspace,
+} from "./types.ts";
 import { needsHuman, STATE_PRIORITY } from "./types.ts";
 import { fuzzy } from "./util.ts";
 
@@ -290,4 +299,56 @@ export function jumpOrder<T extends Pick<SessionInfo, "id" | "created_at">>(
 /** Push `key` to the front of a most-recent-first list (deduplicated, capped). */
 export function pushFront<T>(list: T[], key: T, max = 20): T[] {
   return [key, ...list.filter((x) => x !== key)].slice(0, max);
+}
+
+// ---------------- session replies and the inline close confirmation ----------------
+
+/**
+ * Change counters for sessions, so a late RPC reply can't roll state back. Every session event
+ * (`session_upserted`, `session_removed`) bumps its session; a hello bumps them all. A call
+ * notes `mark()` before it starts; its reply about session `id` is applied only if `fresh(id,
+ * mark)`: nothing about that session arrived since (else the event already has the newer truth,
+ * or the session is gone and the reply would bring it back).
+ */
+export class SessionVersions {
+  #clock = 0;
+  #epoch = 0;
+  #seen = new Map<SessionId, number>();
+
+  /** An event about session `id` arrived. */
+  bump(id: SessionId) {
+    this.#seen.set(id, ++this.#clock);
+  }
+
+  /** A hello replaced every session. */
+  bumpAll() {
+    this.#epoch = ++this.#clock;
+    this.#seen.clear();
+  }
+
+  mark(): number {
+    return this.#clock;
+  }
+
+  fresh(id: SessionId, mark: number): boolean {
+    return this.#epoch <= mark && (this.#seen.get(id) ?? 0) <= mark;
+  }
+}
+
+/** The armed "Close?" after focus moved from `prev` to `next`: it never survives a focus change. */
+export function confirmAfterFocus(
+  pending: SessionId | null,
+  prev: SessionId | null,
+  next: SessionId | null,
+): SessionId | null {
+  return prev === next ? pending : null;
+}
+
+/** The armed "Close?" after session `s` changed: disarmed when that session stops being busy. */
+export function confirmAfterUpsert(
+  pending: SessionId | null,
+  s: Pick<SessionInfo, "id" | "state">,
+  busy: ReadonlySet<AgentState>,
+): SessionId | null {
+  return pending === s.id && !busy.has(s.state) ? null : pending;
 }

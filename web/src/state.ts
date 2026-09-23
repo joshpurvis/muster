@@ -29,10 +29,13 @@ import {
   reconcile,
 } from "./layout/tree.ts";
 import {
+  confirmAfterFocus,
+  confirmAfterUpsert,
   documentTitle,
   needsYouOrder,
   pushFront,
   sessionsOfWindow,
+  SessionVersions,
   sessionWindowId,
   upsertWindow,
 } from "./model.ts";
@@ -274,10 +277,15 @@ export const focusedTask = computed((): Channel | null => {
   return s ? channelById.value.get(s.channel_id) ?? null : null;
 });
 
+/** The focused tab's session id: changes only when focus moves, not when its metadata does. */
+export const focusedSessionId = computed(() => focusedSession.value?.id ?? null);
+
 // A pending "Close?" never survives a focus change.
+let confirmFocus: SessionId | null = null;
 effect(() => {
-  void focusedSession.value?.id;
-  confirmClose.value = null;
+  const id = focusedSessionId.value;
+  confirmClose.value = confirmAfterFocus(confirmClose.peek(), confirmFocus, id);
+  confirmFocus = id;
 });
 
 // Sessions we create are placed by the call that creates them (a tab of a given group, or a new
@@ -431,6 +439,7 @@ export function applyHello(h: HelloResult) {
     windowsSupported.value = Array.isArray(h.windows);
     windows.value = [...(h.windows ?? [])].sort((a, b) => a.id - b.id);
     const prev = sessions.value;
+    versions.bumpAll();
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
@@ -476,11 +485,13 @@ export function applyEvent(ev: ServerEvent) {
       if (ev.data.id === windowId.value) { for (const f of windowLostListeners) f(); }
       break;
     case "session_upserted": {
+      versions.bump(ev.data.id);
       upsertSession(ev.data);
-      if (confirmClose.value === ev.data.id && !BUSY_STATES.has(ev.data.state)) confirmClose.value = null;
+      confirmClose.value = confirmAfterUpsert(confirmClose.peek(), ev.data, BUSY_STATES);
       break;
     }
     case "session_removed": {
+      versions.bump(ev.data.id);
       if (!sessions.value.has(ev.data.id)) break;
       const m = new Map(sessions.value);
       m.delete(ev.data.id);
@@ -508,8 +519,15 @@ export function applyEvent(ev: ServerEvent) {
   }
 }
 
+const versions = new SessionVersions();
+
+/** Note before an RPC whose reply carries a session; pass the mark to `knowSession`. */
+export function sessionMark(): number {
+  return versions.mark();
+}
+
 /**
- * Record a session (event or RPC reply). One that newly shows up in this window (spawned, or
+ * Record a session (from an event). One that newly shows up in this window (spawned, or
  * moved here from another window) is held while a placement is pending, else it joins the
  * focused group; one that left (moved to another window) leaves the layout.
  */
@@ -519,9 +537,34 @@ export function upsertSession(s: SessionInfo) {
   withHolds(() => (sessions.value = m));
 }
 
-/** Record a session we learned about from an RPC reply, unless an event already did. */
-export function knowSession(s: SessionInfo) {
-  if (!sessions.value.has(s.id)) upsertSession(s);
+/**
+ * Record a session from an RPC reply of a call that started at `mark` (`sessionMark()`). Ignored
+ * when an event about it arrived since: that event is newer (a later move, or its removal).
+ */
+export function knowSession(s: SessionInfo, mark: number) {
+  if (versions.fresh(s.id, mark)) upsertSession(s);
+}
+
+/**
+ * The first session of task `ch` (a new task's comes as an event, maybe after the reply).
+ * Null when none arrives within `ms`.
+ */
+export function firstSessionOf(ch: ChannelId, ms: number): Promise<SessionInfo | null> {
+  const known = sessionsByChannel.peek().get(ch)?.[0];
+  if (known) return Promise.resolve(known);
+  return new Promise((resolve) => {
+    const finish = (s: SessionInfo | null) => {
+      clearTimeout(timer);
+      // Not from inside the effect's own run.
+      queueMicrotask(stop);
+      resolve(s);
+    };
+    const timer = setTimeout(() => finish(null), ms);
+    const stop = effect(() => {
+      const s = sessionsByChannel.value.get(ch)?.[0];
+      if (s) finish(s);
+    });
+  });
 }
 
 function removeChannel(id: ChannelId) {

@@ -9,6 +9,7 @@ import {
   applyEvent,
   applyHello,
   focusedSession,
+  focusedSessionId,
   helloDone,
   hereIds,
   layout,
@@ -104,7 +105,7 @@ terms.onTerminalFocus((sid) => {
 // The focused tab closed or moved to another window while its terminal had focus: focus falls to
 // <body>, so hand it to the tab that took its place (never steal it from a dialog or field).
 effect(() => {
-  void focusedSession.value?.id;
+  void focusedSessionId.value;
   const a = document.activeElement;
   if (!a || a === document.body) A.focusActiveTerminalSoon();
 });
@@ -153,6 +154,7 @@ function EmptyWindow() {
       await A.createTab({ path: folder.trim(), agent: k, worktree: false });
     } catch (e) {
       toast("error", `Couldn't open a tab: ${e instanceof Error ? e.message : e}`);
+    } finally {
       setBusy(false);
     }
   };

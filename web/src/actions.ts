@@ -7,6 +7,7 @@ import {
   BUSY_STATES,
   channelById,
   confirmClose,
+  firstSessionOf,
   focusedGroup,
   focusedSession,
   focusedTask,
@@ -24,12 +25,12 @@ import {
   pushRecentFolder,
   releaseNewSessions,
   renaming,
+  sessionMark,
   sessions,
   sessionsByChannel,
   setPref,
   toast,
   updateLayout,
-  upsertSession,
   windowId,
   windowOfSession,
   windows,
@@ -182,12 +183,13 @@ function openClientWindowHere(id: WindowId) {
  */
 async function setSessionWindow(s: SessionInfo, to: WindowId, from: WindowId | null): Promise<void> {
   try {
+    const mark = sessionMark();
     const r = await rpc.call<SessionInfo>("session.set_window", {
       id: s.id,
       window_id: to,
       from_window_id: from ?? undefined,
     });
-    upsertSession({ ...r, window_id: r.window_id ?? to });
+    knowSession({ ...r, window_id: r.window_id ?? to }, mark);
   } catch (e) {
     if (!unknownMethod(e)) throw e;
     if ((sessionsByChannel.value.get(s.channel_id) ?? []).length > 1) {
@@ -429,6 +431,7 @@ export async function spawn(
   const grid = gridFor(at);
   holdNewSessions();
   try {
+    const mark = sessionMark();
     const s = await rpc.call<SessionInfo>("session.spawn", {
       channel_id: ch,
       kind,
@@ -436,7 +439,7 @@ export async function spawn(
       window_id: windowId.value ?? undefined,
       ...grid,
     });
-    knowSession(s);
+    knowSession(s, mark);
     if (kind !== "shell") setPref("lastAgent", kind);
     place(s.id, at);
     return s;
@@ -552,7 +555,8 @@ export function renameSession(sid: SessionId, name: string) {
   const n = name.trim();
   const s = sessions.value.get(sid);
   if (!n || !s || n === s.name) return;
-  rpc.call<SessionInfo>("session.rename", { id: sid, name: n }).then(upsertSession)
+  const mark = sessionMark();
+  rpc.call<SessionInfo>("session.rename", { id: sid, name: n }).then((r) => knowSession(r, mark))
     .catch(fail("Rename failed")).catch(() => {});
 }
 
@@ -617,7 +621,13 @@ export interface NewTabReq {
   group?: string;
 }
 
-/** A new tab: a new task (`channel.create`) whose first session joins group `req.group`. */
+/** How long a new task's first session may take to show up before the tab counts as failed. */
+const FIRST_SESSION_MS = 8000;
+
+/**
+ * A new tab: a new task (`channel.create`) whose first session joins group `req.group`. Fails
+ * when that session never shows up (its start failed): the empty task is closed again.
+ */
 export async function createTab(req: NewTabReq): Promise<Channel> {
   const ws = req.workspace_id !== undefined
     ? workspaceById.value.get(req.workspace_id) ?? await ensureWorkspace(req.path ?? "")
@@ -643,8 +653,12 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
     knowChannel(here !== null ? { ...c, window_id: c.window_id ?? here } : c);
     // Optimistic: the window_upserted that lists the new task may lag the reply.
     if (here !== null) windows.value = moveChannelLocally(windows.value, c.id, here);
-    const first = sessionsByChannel.value.get(c.id)?.[0];
-    if (first) place(first.id, at);
+    const first = await firstSessionOf(c.id, FIRST_SESSION_MS);
+    if (!first) {
+      rpc.call("channel.close_if_empty", { id: c.id }).catch(() => {});
+      throw new Error(`${req.agent} didn't start`);
+    }
+    place(first.id, at);
     return c;
   } finally {
     releaseNewSessions();

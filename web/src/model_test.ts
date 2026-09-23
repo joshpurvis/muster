@@ -1,6 +1,8 @@
 import {
   aggregateState,
   basename,
+  confirmAfterFocus,
+  confirmAfterUpsert,
   documentTitle,
   type JumpCandidate,
   jumpOrder,
@@ -11,6 +13,7 @@ import {
   pushFront,
   rankJump,
   sessionsOfWindow,
+  SessionVersions,
   sessionWindowId,
   tabLabel,
   tabsOf,
@@ -377,4 +380,42 @@ Deno.test("rankJump highlights only within the label and respects the limit", ()
 Deno.test("pushFront dedupes and caps", () => {
   assertEquals(pushFront([1, 2, 3], 2), [2, 1, 3]);
   assertEquals(pushFront([1, 2, 3], 4, 3), [4, 1, 2]);
+});
+
+Deno.test("SessionVersions: a reply is stale once an event about its session arrived", () => {
+  const v = new SessionVersions();
+  v.bump(1);
+  const mark = v.mark();
+  assertEquals(v.fresh(1, mark), true, "nothing since the call started");
+  assertEquals(v.fresh(7, mark), true, "a session not seen yet (a spawn's reply)");
+  v.bump(2);
+  assertEquals(v.fresh(1, mark), true, "events about other sessions don't matter");
+  v.bump(1);
+  assertEquals(v.fresh(1, mark), false, "a later move or removal of the same session wins");
+  v.bump(7);
+  assertEquals(v.fresh(7, mark), false, "a new session's own event came first");
+  assertEquals(v.fresh(1, v.mark()), true, "a call started after the event is fresh");
+});
+
+Deno.test("SessionVersions: a hello makes every earlier reply stale", () => {
+  const v = new SessionVersions();
+  const mark = v.mark();
+  v.bumpAll();
+  assertEquals(v.fresh(3, mark), false);
+  assertEquals(v.fresh(3, v.mark()), true);
+});
+
+Deno.test("confirmAfterFocus keeps the Close? only while focus stays", () => {
+  assertEquals(confirmAfterFocus(4, 4, 4), 4, "same tab (its metadata changed)");
+  assertEquals(confirmAfterFocus(4, 4, 5), null, "another tab");
+  assertEquals(confirmAfterFocus(4, 4, null), null, "nothing focused");
+  assertEquals(confirmAfterFocus(null, 4, 4), null);
+});
+
+Deno.test("confirmAfterUpsert disarms only when that session stops being busy", () => {
+  const busy = new Set<AgentState>(["working", "starting"]);
+  assertEquals(confirmAfterUpsert(4, { id: 4, state: "working" }, busy), 4, "still busy (e.g. renamed)");
+  assertEquals(confirmAfterUpsert(4, { id: 4, state: "idle" }, busy), null, "went idle");
+  assertEquals(confirmAfterUpsert(4, { id: 5, state: "idle" }, busy), 4, "another session");
+  assertEquals(confirmAfterUpsert(null, { id: 4, state: "idle" }, busy), null);
 });

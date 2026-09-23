@@ -1,0 +1,218 @@
+//! Shared data model. Everything that crosses a module boundary or the wire lives here.
+//! Wire format is JSON with snake_case fields; enums are snake_case strings.
+
+use serde::{Deserialize, Serialize};
+
+pub type WorkspaceId = i64;
+pub type ChannelId = i64;
+pub type SessionId = u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Claude,
+    Codex,
+    Shell,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Claude => "claude",
+            SessionKind::Codex => "codex",
+            SessionKind::Shell => "shell",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(SessionKind::Claude),
+            "codex" => Some(SessionKind::Codex),
+            "shell" => Some(SessionKind::Shell),
+            _ => None,
+        }
+    }
+}
+
+/// Normalized agent state. Shells use `Idle` (prompt) / `Working` (foreground job running).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Starting,
+    Working,
+    NeedsApproval,
+    AskingQuestion,
+    Idle,
+    Error,
+    Stuck,
+    /// Process has exited (or the daemon restarted and the PTY is gone).
+    Exited,
+}
+
+impl AgentState {
+    /// States that put an item in the decision inbox.
+    pub fn needs_human(self) -> bool {
+        matches!(
+            self,
+            AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Error | AgentState::Stuck
+        )
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Starting => "starting",
+            AgentState::Working => "working",
+            AgentState::NeedsApproval => "needs_approval",
+            AgentState::AskingQuestion => "asking_question",
+            AgentState::Idle => "idle",
+            AgentState::Error => "error",
+            AgentState::Stuck => "stuck",
+            AgentState::Exited => "exited",
+        }
+    }
+}
+
+/// Where a state change came from. Hooks beat screen parsing: a screen-derived update
+/// never overrides a hook-derived state younger than a short grace window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateSource {
+    Hook,
+    Screen,
+    Process,
+    Timer,
+    Daemon,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateUpdate {
+    pub state: AgentState,
+    /// Short human text, e.g. "Bash: cargo test" or the question being asked.
+    pub detail: Option<String>,
+}
+
+impl StateUpdate {
+    pub fn new(state: AgentState) -> Self {
+        Self { state, detail: None }
+    }
+    pub fn with(state: AgentState, detail: impl Into<String>) -> Self {
+        Self { state, detail: Some(detail.into()) }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: WorkspaceId,
+    pub name: String,
+    /// Absolute path to the repo or folder.
+    pub path: String,
+    pub is_git: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: ChannelId,
+    pub workspace_id: WorkspaceId,
+    pub name: String,
+    /// Working directory for sessions: the worktree path, or the workspace path when no worktree.
+    pub cwd: String,
+    pub branch: Option<String>,
+    pub base_branch: Option<String>,
+    /// True when `cwd` is a worktree muster created (and may remove on archive).
+    pub owns_worktree: bool,
+    /// First port of this channel's reserved block (exported as PORT / MUSTER_PORT_BASE).
+    pub port_base: u16,
+    pub archived: bool,
+    /// Opaque JSON owned by the frontend (pane/split tree). Daemon stores it verbatim.
+    pub layout: Option<serde_json::Value>,
+    pub created_at: i64,
+    /// Unix ms of the last event the human has seen (for unread badges / catch me up).
+    pub last_read_at: i64,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: SessionId,
+    pub channel_id: ChannelId,
+    pub kind: SessionKind,
+    pub name: String,
+    pub cwd: String,
+    pub state: AgentState,
+    pub state_detail: Option<String>,
+    /// Unix ms when `state` last changed.
+    pub state_since: i64,
+    /// Window title set by the program via OSC 0/2, if any.
+    pub title: Option<String>,
+    /// Session that spawned this one through MCP, if any.
+    pub parent_id: Option<SessionId>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub cols: u16,
+    pub rows: u16,
+    /// Messages waiting in the injection queue.
+    pub queued: u32,
+    pub created_at: i64,
+}
+
+/// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// Human wrote a note in the channel. data: {text}
+    Note,
+    /// Human (or MCP) sent a prompt to an agent. data: {text, session_id, from, queued}
+    Prompt,
+    /// data: {session_id, from, to, detail}
+    StateChange,
+    /// data: {session_id, kind, name, parent_id?}
+    SessionStarted,
+    /// data: {session_id, exit_code}
+    SessionExited,
+    /// Raw hook callback. data: {session_id, event, payload}
+    Hook,
+    /// An agent called an MCP tool. data: {session_id, tool, args, ok}
+    McpCall,
+    /// Agent posted to the channel via MCP. data: {session_id, text}
+    AgentPost,
+    /// data: {session_id, decision}
+    Approval,
+    /// Generic daemon notice. data: {text, level}
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub channel_id: Option<ChannelId>,
+    pub session_id: Option<SessionId>,
+    pub kind: EventKind,
+    pub data: serde_json::Value,
+    /// Unix ms.
+    pub ts: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Approve,
+    /// Approve and don't ask again for this kind of action (if the CLI offers it).
+    ApproveAlways,
+    Deny,
+}
+
+/// One entry in the decision inbox. Derived from session state; not persisted separately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub session_id: SessionId,
+    pub channel_id: ChannelId,
+    pub state: AgentState,
+    pub detail: Option<String>,
+    pub since: i64,
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}

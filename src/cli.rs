@@ -986,6 +986,11 @@ pub struct EventTracker {
     filter: EventFilter,
     sessions: std::collections::HashMap<u32, Sess>,
     tabs: std::collections::HashMap<i64, String>,
+    /// Last known tab of the `--session` session: its tab and window can close after the
+    /// session itself was removed (archiving removes sessions first).
+    session_tab: Option<i64>,
+    /// Tabs of each window, from `window_upserted`, so a `window_removed` can be matched.
+    windows: std::collections::HashMap<i64, Vec<i64>>,
 }
 
 /// One event, as far as `muster events` is concerned.
@@ -1010,6 +1015,15 @@ impl EventTracker {
     /// Replace what is known with a fresh snapshot (after missed events).
     pub fn resync(&mut self, snap: &Snapshot) {
         self.sessions = snap.sessions.iter().map(|s| (s.id, s.clone())).collect();
+        self.note_session_tab();
+        for c in &snap.channels {
+            if let Some(w) = c.window_id {
+                let tabs = self.windows.entry(w).or_default();
+                if !tabs.contains(&c.id) {
+                    tabs.push(c.id);
+                }
+            }
+        }
         // Names of tabs closed earlier stay, for labels of their sessions.
         self.tabs.extend(snap.channels.iter().map(|c| (c.id, c.name.clone())));
     }
@@ -1021,9 +1035,13 @@ impl EventTracker {
     /// The tab a tab or window event must concern to pass: the `--tab` one, else the
     /// `--session` session's.
     fn focus_tab(&self) -> Option<i64> {
-        self.filter
-            .channel
-            .or_else(|| self.filter.session.and_then(|id| self.sessions.get(&id)).map(|s| s.channel_id))
+        self.filter.channel.or(self.session_tab)
+    }
+
+    fn note_session_tab(&mut self) {
+        if let Some(s) = self.filter.session.and_then(|id| self.sessions.get(&id)) {
+            self.session_tab = Some(s.channel_id);
+        }
     }
 
     fn unfiltered(&self) -> bool {
@@ -1045,6 +1063,11 @@ impl EventTracker {
                     return Seen { pass: false, change };
                 };
                 let prev = self.sessions.get(&s.id);
+                // Queued before the snapshot we already have (or a resync): nothing new, and
+                // no transition that never happened.
+                if prev.is_some_and(|p| s.state_since < p.state_since) {
+                    return Seen { pass: false, change };
+                }
                 // A session moved out of (or into) the tab counts for that tab.
                 let pass = self.filter.session.is_none_or(|id| id == s.id)
                     && (self.tab_ok(s.channel_id) || prev.is_some_and(|p| self.tab_ok(p.channel_id)));
@@ -1065,6 +1088,7 @@ impl EventTracker {
                     change = Some((at, line));
                 }
                 self.sessions.insert(s.id, s);
+                self.note_session_tab();
                 pass
             }
             "session_removed" => {
@@ -1084,12 +1108,19 @@ impl EventTracker {
             }
             "channel_removed" => self.unfiltered() || self.focus_tab().is_some_and(|c| Some(c) == id),
             "window_upserted" => {
-                self.unfiltered()
-                    || self.focus_tab().is_some_and(|c| {
-                        data["channel_ids"]
-                            .as_array()
-                            .is_some_and(|a| a.iter().any(|v| v.as_i64() == Some(c)))
-                    })
+                let tabs: Vec<i64> = data["channel_ids"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                    .unwrap_or_default();
+                let pass = self.unfiltered() || self.focus_tab().is_some_and(|c| tabs.contains(&c));
+                if let Some(id) = id {
+                    self.windows.insert(id, tabs);
+                }
+                pass
+            }
+            "window_removed" => {
+                let tabs = id.and_then(|id| self.windows.remove(&id)).unwrap_or_default();
+                self.unfiltered() || self.focus_tab().is_some_and(|c| tabs.contains(&c))
             }
             "lagged" => true,
             _ => self.unfiltered(),
@@ -1269,6 +1300,10 @@ mod tests {
         assert!(!t.apply(&ev("window_upserted", json!({"id": 2, "channel_ids": [2]}))).pass);
         assert!(!t.apply(&ev("window_removed", json!({"id": 2}))).pass);
         assert!(t.apply(&ev("lagged", json!({"missed": 1}))).pass);
+        // Closing the session's tab: the session goes first, its tab and window after.
+        assert!(t.apply(&ev("session_removed", json!({"id": 10}))).pass);
+        assert!(t.apply(&ev("channel_removed", json!({"id": 1}))).pass);
+        assert!(t.apply(&ev("window_removed", json!({"id": 1}))).pass);
 
         let by_tab = EventFilter { session: None, channel: Some(6) };
         let mut t = EventTracker::new(&snap(), by_tab);
@@ -1280,6 +1315,22 @@ mod tests {
         assert!(t.apply(&ev("channel_removed", json!({"id": 6}))).pass);
         assert!(!t.apply(&ev("channel_removed", json!({"id": 2}))).pass);
         assert!(t.apply(&ev("session_removed", json!({"id": 62}))).pass);
+    }
+
+    #[test]
+    fn events_skip_updates_older_than_what_is_known() {
+        let mut t = EventTracker::new(&snap(), EventFilter::default());
+        let at = |state: &str, since: i64| {
+            ev(
+                "session_upserted",
+                json!({"id": 30, "channel_id": 3, "kind": "shell", "name": "sh", "state": state, "state_since": since}),
+            )
+        };
+        assert!(t.apply(&at("working", 2_000)).change.is_some());
+        // Queued before that (e.g. replayed after a snapshot): no made-up `working -> idle`.
+        let old = t.apply(&at("idle", 1_000));
+        assert!(old.change.is_none() && !old.pass);
+        assert!(t.apply(&at("idle", 3_000)).change.is_some());
     }
 
     #[test]

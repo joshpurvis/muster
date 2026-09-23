@@ -579,7 +579,12 @@ async function mergeTabNow(src: ChannelId, dst: ChannelId, paneId: string, zone:
         // window adds to it meanwhile is never closed with it, and a lost reply can't make us
         // close a tab that still holds (or received) a session.
         upsertSession(
-          await rpc.call<SessionInfo>("session.move", { id, channel_id: dst, close_empty_source: true }),
+          await rpc.call<SessionInfo>("session.move", {
+            id,
+            channel_id: dst,
+            from_channel_id: src,
+            close_empty_source: true,
+          }),
         );
         moved.push(id);
       } catch (e) {
@@ -618,7 +623,9 @@ export async function moveSessionToNewTab(src: ChannelId, sid: SessionId) {
   knowChannel(here !== null ? { ...nc, window_id: nc.window_id ?? here } : nc);
   if (here !== null) windows.value = moveChannelLocally(windows.value, nc.id, here);
   try {
-    upsertSession(await rpc.call<SessionInfo>("session.move", { id: sid, channel_id: nc.id }));
+    upsertSession(
+      await rpc.call<SessionInfo>("session.move", { id: sid, channel_id: nc.id, from_channel_id: src }),
+    );
   } catch (e) {
     toast("error", `Couldn't move the session: ${errText(e)}`);
     // Only if nothing arrived: the move may have happened even though its reply was lost.

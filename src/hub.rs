@@ -224,6 +224,8 @@ struct Inner {
     /// Per channel, the source of the derived name its branch was last renamed after this run.
     /// A better source (agent title > first prompt > shell title) renames it again.
     branch_named_from: HashMap<ChannelId, NameSource>,
+    /// Worktree directories being deleted right now: no process may start inside them.
+    removing_worktrees: HashSet<PathBuf>,
     sessions: BTreeMap<SessionId, SessEntry>,
     tokens: HashMap<String, SessionId>,
     /// One-time launch code -> expiry.
@@ -757,12 +759,15 @@ impl Hub {
         let Some(clean) = info.title.as_deref().and_then(|t| clean_title(t, info.kind)) else {
             return;
         };
-        {
+        // The channel as of this lock: the session may have moved since `info` was read.
+        let cid = {
             let mut g = self.inner.lock();
-            if let Some(e) = g.sessions.get_mut(&id) {
-                e.usable_title = Some(clean.clone());
-            }
-            let t = g.titles.entry(info.channel_id).or_default();
+            let Some(e) = g.sessions.get_mut(&id) else {
+                return;
+            };
+            e.usable_title = Some(clean.clone());
+            let cid = e.info.channel_id;
+            let t = g.titles.entry(cid).or_default();
             let slot = match info.kind {
                 SessionKind::Shell => &mut t.shell,
                 SessionKind::Claude | SessionKind::Codex => &mut t.agent,
@@ -771,8 +776,9 @@ impl Hub {
                 return;
             }
             *slot = Some(clean);
-        }
-        self.rederive_name(info.channel_id);
+            cid
+        };
+        self.rederive_name(cid);
     }
 
     /// Can an exited process's PTY be dropped from the hub? Only once output.log holds the
@@ -944,8 +950,10 @@ impl Hub {
         {
             anyhow::bail!("no such window: {w}");
         }
-        if req.agent.is_none() && !req.extra_args.is_empty() {
-            anyhow::bail!("extra_args needs an agent");
+        match req.agent {
+            None if !req.extra_args.is_empty() => anyhow::bail!("extra_args needs an agent"),
+            Some(kind) => crate::agents::check_extra_args(kind, &req.extra_args)?,
+            None => {}
         }
         let explicit = req
             .name
@@ -1561,13 +1569,18 @@ impl Hub {
                 if !sids.is_empty() {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
-                // Re-checked: a session may have moved out between the check above and here.
-                if let Some(user) = self.worktree_user(&ch) {
+                // Re-checked, and reserved until the delete is done: a session may have moved out
+                // (or be starting) since the check above.
+                if let Err(user) = self.reserve_worktree_removal(&ch) {
                     self.notice(
                         "warn",
                         format!("Kept worktree {}: session {user} in another tab still runs in it", ch.cwd),
                     );
-                } else if let Err(e) = worktree::remove(&repo, Path::new(&ch.cwd)).await {
+                } else if let Err(e) = {
+                    let r = worktree::remove(&repo, Path::new(&ch.cwd)).await;
+                    self.release_worktree(&ch);
+                    r
+                } {
                     self.notice("warn", format!("Could not remove worktree {}: {e:#}", ch.cwd));
                 }
             }
@@ -1578,8 +1591,23 @@ impl Hub {
     /// A running session outside `ch` whose cwd is inside `ch`'s worktree (it moved out of `ch`,
     /// or was started there by hand), if any.
     fn worktree_user(&self, ch: &Channel) -> Option<SessionId> {
-        let g = self.inner.lock();
-        dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some())))
+        dir_user(ch, self.inner.lock().sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy)))
+    }
+
+    /// Mark `ch`'s worktree as being deleted, unless a session outside `ch` runs (or is
+    /// starting) in it; checked and marked under one lock, and `start_process` refuses cwds
+    /// inside a marked directory, so nothing can start there until `release_worktree`.
+    fn reserve_worktree_removal(&self, ch: &Channel) -> Result<(), SessionId> {
+        let mut g = self.inner.lock();
+        if let Some(user) = dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy))) {
+            return Err(user);
+        }
+        g.removing_worktrees.insert(PathBuf::from(&ch.cwd));
+        Ok(())
+    }
+
+    fn release_worktree(&self, ch: &Channel) {
+        self.inner.lock().removing_worktrees.remove(Path::new(&ch.cwd));
     }
 
     /// Archive `id` (keeping any worktree) only if it has no sessions left, checked and marked
@@ -1654,6 +1682,7 @@ impl Hub {
         let ch = self
             .channel(req.channel_id)
             .ok_or_else(|| anyhow::anyhow!("no such channel: {}", req.channel_id))?;
+        crate::agents::check_extra_args(req.kind, &req.extra_args)?;
         if ch.archived {
             anyhow::bail!("channel {} is archived", ch.id);
         }
@@ -1826,10 +1855,17 @@ impl Hub {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst);
         let (info, extra_args, port_base, permissions) = {
             let mut g = self.inner.lock();
-            let e = g
-                .sessions
-                .get_mut(&id)
-                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+            let cwd = PathBuf::from(
+                &g.sessions
+                    .get(&id)
+                    .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?
+                    .info
+                    .cwd,
+            );
+            if g.removing_worktrees.iter().any(|w| cwd.starts_with(w)) {
+                anyhow::bail!("session {id}'s folder is a worktree being removed");
+            }
+            let e = g.sessions.get_mut(&id).expect("looked up above");
             e.generation = generation;
             e.early_exit = None;
             let (info, extra) = (e.info.clone(), e.extra_args.clone());
@@ -2155,7 +2191,20 @@ impl Hub {
     /// so `MUSTER_CHANNEL_ID` and `PORT` still name the old channel until it restarts (a restart
     /// applies the new channel's permission profile). Both channels' auto names are re-derived.
     /// Moving into the session's own channel is a no-op.
+    #[cfg(test)]
     pub fn move_session(&self, id: SessionId, channel_id: ChannelId) -> anyhow::Result<SessionInfo> {
+        self.move_session_from(id, channel_id, None).map(|(info, _)| info)
+    }
+
+    /// `move_session`, also returning the channel the session was in (read under the same lock
+    /// as the move). With `expect_from`, refused unless the session is still in that channel, so
+    /// a client acting on a stale view (another window moved it meanwhile) can't move it again.
+    pub fn move_session_from(
+        &self,
+        id: SessionId,
+        channel_id: ChannelId,
+        expect_from: Option<ChannelId>,
+    ) -> anyhow::Result<(SessionInfo, ChannelId)> {
         let (info, from) = {
             let mut g = self.inner.lock();
             match g.channels.get(&channel_id) {
@@ -2169,6 +2218,11 @@ impl Hub {
                 .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?
                 .info
                 .channel_id;
+            if let Some(expected) = expect_from
+                && expected != from
+            {
+                anyhow::bail!("session {id} is no longer in channel {expected} (now in {from})");
+            }
             // Archiving marks the channel first, then removes the sessions it finds: a session
             // must not slip out in between (nor out of a closed channel at all).
             if from != channel_id && g.channels.get(&from).is_some_and(|c| c.archived) {
@@ -2176,7 +2230,7 @@ impl Hub {
             }
             let e = g.sessions.get_mut(&id).expect("checked above");
             if from == channel_id {
-                return Ok(e.info.clone());
+                return Ok((e.info.clone(), from));
             }
             // A start in progress reads the channel it is starting in.
             if e.busy {
@@ -2195,7 +2249,7 @@ impl Hub {
         self.emit(ServerEvent::SessionUpserted(info.clone()));
         self.rederive_name(from);
         self.rederive_name(channel_id);
-        Ok(info)
+        Ok((info, from))
     }
 
     /// Wait (off the async workers) for a removed session's processes to die, SIGKILL them after
@@ -2709,6 +2763,16 @@ mod tests {
         hub.update_channel(1, false, |c| c.archived = true).unwrap();
         assert!(hub.move_session(1, 2).unwrap_err().to_string().contains("being closed"));
         assert_eq!(hub.session(1).unwrap().channel_id, 1);
+    }
+
+    #[test]
+    fn stale_moves_are_refused() {
+        let hub = move_fixture();
+        assert_eq!(hub.move_session_from(1, 2, Some(1)).unwrap().1, 1);
+        // A second client still thinks session 1 is in channel 1.
+        let e = hub.move_session_from(1, 1, Some(1)).unwrap_err().to_string();
+        assert!(e.contains("no longer in channel 1"), "{e}");
+        assert_eq!(hub.session(1).unwrap().channel_id, 2);
     }
 
     #[test]

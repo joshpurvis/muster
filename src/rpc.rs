@@ -252,13 +252,13 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
                 /// Close the source channel if this move emptied it (checked atomically).
                 #[serde(default)]
                 close_empty_source: bool,
+                /// Refuse unless the session is still in this channel (stale-view guard).
+                #[serde(default)]
+                from_channel_id: Option<ChannelId>,
             }
             let p: P = parse(params)?;
-            let from = hub.session(p.id).map(|s| s.channel_id);
-            let info = hub.move_session(p.id, p.channel_id)?;
-            if p.close_empty_source
-                && let Some(from) = from.filter(|f| *f != p.channel_id)
-            {
+            let (info, from) = hub.move_session_from(p.id, p.channel_id, p.from_channel_id)?;
+            if p.close_empty_source && from != p.channel_id {
                 hub.archive_if_empty(from)?;
             }
             to_value(info)

@@ -33,6 +33,50 @@ pub struct SpawnCtx {
     pub permissions: Permissions,
 }
 
+/// Refuse extra args that would change what an agent may do: the channel's permission profile
+/// (set by the human, applied as flags before the extra args) must stay what decides it, and the
+/// CLIs let a later flag win. Shells take anything.
+pub fn check_extra_args(kind: SessionKind, args: &[String]) -> anyhow::Result<()> {
+    let (flags, config_flags): (&[&str], &[&str]) = match kind {
+        SessionKind::Claude => (
+            &["--permission-mode", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"],
+            &[],
+        ),
+        SessionKind::Codex => (
+            &[
+                "--sandbox",
+                "-s",
+                "--full-auto",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--yolo",
+                "--profile",
+                "-p",
+            ],
+            &["-c", "--config"],
+        ),
+        SessionKind::Shell => return Ok(()),
+    };
+    let name = |a: &str| a.split_once('=').map_or(a, |(n, _)| n).to_string();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let n = name(a);
+        if flags.contains(&n.as_str()) {
+            anyhow::bail!("{n} changes the agent's permissions; set the tab's permissions instead");
+        }
+        if config_flags.contains(&n.as_str()) {
+            // `-c key=value`, `--config key=value`, `--config=key=value`.
+            let kv = match a.split_once('=') {
+                Some((_, rest)) if n == "--config" || n == "-c" => Some(rest.to_string()),
+                _ => it.peek().map(|v| v.to_string()),
+            };
+            if kv.as_deref().is_some_and(|kv| kv.trim_start().starts_with("sandbox")) {
+                anyhow::bail!("{n} sandbox settings change the agent's permissions; set the tab's permissions instead");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
     pub program: String,
@@ -127,5 +171,43 @@ pub fn adapter_for(kind: SessionKind) -> &'static dyn Adapter {
         SessionKind::Claude => &claude::ClaudeAdapter,
         SessionKind::Codex => &codex::CodexAdapter,
         SessionKind::Shell => &shell::ShellAdapter,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(kind: SessionKind, args: &[&str]) -> bool {
+        check_extra_args(kind, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).is_ok()
+    }
+
+    #[test]
+    fn extra_args_cannot_change_permissions() {
+        use SessionKind::*;
+        assert!(check(Codex, &["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]));
+        assert!(check(Claude, &["--model", "haiku"]));
+        for bad in [
+            &["--sandbox", "danger-full-access"][..],
+            &["-s", "read-only"],
+            &["--sandbox=danger-full-access"],
+            &["--full-auto"],
+            &["--yolo"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["--profile", "wide"],
+            &["-c", "sandbox_workspace_write.network_access=true"],
+            &["--config", "sandbox_mode=danger-full-access"],
+            &["--config=sandbox_mode=danger-full-access"],
+        ] {
+            assert!(!check(Codex, bad), "{bad:?}");
+        }
+        for bad in [
+            &["--permission-mode", "bypassPermissions"][..],
+            &["--permission-mode=acceptEdits"],
+            &["--dangerously-skip-permissions"],
+        ] {
+            assert!(!check(Claude, bad), "{bad:?}");
+        }
+        assert!(check(Shell, &["--sandbox", "-c", "sandbox"]), "shells take anything");
     }
 }

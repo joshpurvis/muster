@@ -572,6 +572,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!c) throw new Error(`no such channel: ${p.channel_id}`);
       if (c.archived) throw new Error(`channel ${c.id} is archived`);
       const from = s.channel_id;
+      if (p.from_channel_id != null && p.from_channel_id !== from) {
+        throw new Error(`session ${s.id} is no longer in channel ${p.from_channel_id} (now in ${from})`);
+      }
       if (from !== c.id) {
         s.channel_id = c.id;
         upsert(s);

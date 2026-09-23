@@ -13,6 +13,7 @@ protocol and [docs/UI.md](docs/UI.md) for the UI spec, including the keyboard sh
 ```sh
 deno task build                      # web/dist, then cargo build --release (browser-window mode)
 cargo build --release --features gui # native window (needs webkit2gtk-4.1 on Linux)
+deno task build:all                  # web/dist, then the release build with the native window
 ```
 
 Debug builds serve `web/dist` from disk, so you can rebuild the frontend without recompiling.

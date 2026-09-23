@@ -2,6 +2,7 @@
   "tasks": {
     "web": "cd web && deno task build",
     "build": "deno task web && cargo build --release",
+    "build:all": "deno task web && cargo build --release --features gui",
     "dev": "deno task web && cargo build && ./target/debug/muster",
     "test": "cargo test && cd web && deno task check && deno task test",
     "smoke": "sh scripts/smoke.sh"

@@ -217,6 +217,30 @@ result carries the new branch), the daemon renames the branch to `muster/<slug(n
 --abbrev-ref <branch>@{upstream}` fails). Failures are logged, never fatal. The worktree
 directory never moves.
 
+## Groups layout (v2)
+
+The UI's structure is window → split groups → tabs, where a tab is one session. So a session
+belongs to a window directly, and the split layout belongs to the window:
+
+- `SessionInfo.window_id: number | null` (store migration: every session gets its channel's
+  `window_id`). `session.spawn` takes `window_id?` (default: the spawning MCP caller's window,
+  else the channel's `window_id`, else the placement rules for new channels). `channel.create`'s
+  first session gets the channel's window.
+- `Window.layout: object | null`, opaque JSON owned by the frontend (the split tree of groups),
+  stored verbatim. `window.set_layout {id, layout}` → `{}` (no event echo, like the old
+  `channel.set_layout`). `Window.channel_ids` stays for tasks' default window but tabs are
+  sessions now; a window "has tabs" (for `window.claim` and deletion on release) when it has
+  sessions.
+- `session.set_window {id, window_id, from_window_id?}` → `SessionInfo`: moves a session (tab)
+  to another window (emits `session_upserted`). With `from_window_id`, refused unless it is
+  still there. The session stays in its task (channel); the task's `window_id` follows only if
+  all its sessions are in the new window.
+- A task (channel) whose last session is removed is closed by the daemon (as
+  `channel.close_if_empty`; worktree kept). `channel.archive` still closes a task with all its
+  sessions.
+- `channel.move` stays for API clients: it moves the task and all its sessions to the window.
+- `muster ls` shows each session's own `window_id`.
+
 ## Channel permissions
 
 Every `Channel` has `permissions: {codex_sandbox, claude_mode}`, a profile the human picks per

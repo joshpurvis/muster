@@ -1,5 +1,5 @@
-// Shared bits: state dots/pills, kbd, icon buttons, delegated tooltips, inline edit.
-import type { ComponentChildren, JSX } from "preact";
+// Shared bits: state dots, kbd, delegated tooltips, inline edit, spinner.
+import type { JSX } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { AgentState } from "../types.ts";
 import { STATE_LABEL } from "../types.ts";
@@ -11,49 +11,11 @@ export function StateDot({ state, class: c }: { state: AgentState | null; class?
   return <span class={cx("dot", "st-" + state, c)} title={STATE_LABEL[state]} />;
 }
 
-export function StatePill({ state }: { state: AgentState }) {
-  return (
-    <span class={cx("pill", "st-" + state)}>
-      <span class={cx("dot", "st-" + state)} />
-      {STATE_LABEL[state]}
-    </span>
-  );
-}
-
 export function Kbd({ k }: { k: string }) {
   return (
     <span class="kbd-group">
       {keyLabel(k).map((p, i) => <kbd key={i}>{p}</kbd>)}
     </span>
-  );
-}
-
-export function IconButton(
-  props: {
-    icon: ComponentChildren;
-    tip: string;
-    keys?: string;
-    onClick?: (e: MouseEvent) => void;
-    active?: boolean;
-    class?: string;
-    disabled?: boolean;
-    label?: string;
-  },
-) {
-  return (
-    <button
-      type="button"
-      class={cx("icon-btn", props.active && "active", props.class)}
-      data-tip={props.tip}
-      data-keys={props.keys}
-      aria-label={props.tip}
-      aria-pressed={props.active}
-      disabled={props.disabled}
-      onClick={props.onClick}
-    >
-      {props.icon}
-      {props.label && <span class="icon-btn-label">{props.label}</span>}
-    </button>
   );
 }
 

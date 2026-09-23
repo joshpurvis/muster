@@ -2,6 +2,8 @@ import {
   activateTab,
   addTab,
   allPanes,
+  chromeForNew,
+  chromeOf,
   cycleTab,
   dragGutter,
   emptyLayout,
@@ -331,4 +333,26 @@ Deno.test("isNoopMove recognises drops that change nothing", () => {
   assert(!isNoopMove(s, 1, p3, "center"), "other pane");
   assert(!isNoopMove(s, 3, p1, "left"), "other pane edge");
   assert(isNoopMove(s, 99, p1, "center"), "unknown session");
+});
+
+Deno.test("pane chrome: none alone, header with 2+ panes, strip with 2+ sessions", () => {
+  assertEquals(chromeOf(1, 1), "none");
+  assertEquals(chromeOf(0, 1), "none", "empty lone pane (launcher)");
+  assertEquals(chromeOf(1, 2), "head");
+  assertEquals(chromeOf(2, 1), "strip");
+  assertEquals(chromeOf(3, 4), "strip", "a strip replaces the header");
+});
+
+Deno.test("chromeForNew predicts the chrome where a new session lands", () => {
+  let s = emptyLayout([1]);
+  const p1 = s.focus;
+  assertEquals(chromeForNew(s, "tab", p1), "strip", "second session in the only pane");
+  assertEquals(chromeForNew(s, "split", p1), "head", "a split makes two panes");
+  s = emptyLayout([]);
+  assertEquals(chromeForNew(s, "tab", s.focus), "none", "first session of a new tab");
+  s = splitPane(emptyLayout([1]), "right", 2);
+  const p2 = paneOfSession(s.root, 2)!.id;
+  assertEquals(chromeForNew(s, "tab", p2), "strip");
+  s = splitPane(s, "bottom", null);
+  assertEquals(chromeForNew(s, "tab", s.focus), "head", "empty pane among others");
 });

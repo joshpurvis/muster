@@ -40,6 +40,24 @@ export interface Channel {
   sort_order: number;
   /** Agent permission profile (set by the human only). Missing from old daemons. */
   permissions?: Permissions;
+  /** Window showing this channel as a tab. Missing from daemons without windows. */
+  window_id?: WindowId | null;
+  /** Name is derived by the daemon until the human renames the tab. Missing = false. */
+  auto_named?: boolean;
+}
+
+export type WindowId = number;
+
+/** A client window: an ordered list of tabs (docs/PROTOCOL.md "Windows, tabs and naming"). */
+export interface Win {
+  id: WindowId;
+  name: string;
+  /** Tab order. */
+  channel_ids: ChannelId[];
+  /** A connection holds it. */
+  open: boolean;
+  last_focused_at: number;
+  created_at: number;
 }
 
 export type CodexSandbox = "read_only" | "workspace_write" | "workspace_write_network" | "full_access";
@@ -104,13 +122,17 @@ export type ServerEvent =
   | { event: "session_upserted"; data: SessionInfo }
   | { event: "session_removed"; data: { id: SessionId } }
   | { event: "event"; data: TimelineEvent }
-  | { event: "notice"; data: { level: "info" | "warn" | "error"; text: string } };
+  | { event: "notice"; data: { level: "info" | "warn" | "error"; text: string } }
+  | { event: "window_upserted"; data: Win }
+  | { event: "window_removed"; data: { id: WindowId } };
 
 export interface HelloResult {
   version: string;
   workspaces: Workspace[];
   channels: Channel[];
   sessions: SessionInfo[];
+  /** Missing from daemons without windows: then every channel is a tab of this window. */
+  windows?: Win[];
   home: string;
   default_shell: string;
 }

@@ -4,14 +4,18 @@
 import * as A from "./actions.ts";
 import {
   activeChannel,
-  activeChannelId,
   altHeld,
   confirmClose,
   overlay,
+  type PendingClose,
   prefs,
+  renaming,
+  sessions,
   setPref,
+  tabIdSet,
   toast,
-  view,
+  windowId,
+  windowsSupported,
 } from "./state.ts";
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { isMac } from "./util.ts";
@@ -33,8 +37,6 @@ export interface Command {
   run: () => void;
   /** Hidden from the palette (still bound). */
   hidden?: boolean;
-  /** Only match the key when this returns true. */
-  when?: (ctx: KeyCtx) => boolean;
   enabled?: () => boolean;
 }
 
@@ -116,113 +118,172 @@ export function keyLabel(s: string): string[] {
   });
 }
 
-const inChannel = () => view.value === "channel" && activeChannelId.value !== null;
+const hasTab = () => activeChannel.value !== null;
+
+function onOff(on: boolean, onText: string, offText: string) {
+  toast("info", on ? onText : offText);
+}
 
 export const commands: Command[] = [
   // Navigation
   {
-    id: "switcher",
-    title: "Quick switcher",
+    id: "jump",
+    title: "Jump to a tab, session or folder",
     group: "Navigate",
     keys: ["Ctrl+Shift+K", "Ctrl+K"],
-    run: () => (overlay.value = { kind: "switcher", initial: "" }),
+    run: () => A.openJump(),
   },
   {
     id: "palette",
     title: "Command palette",
     group: "Navigate",
     keys: ["Ctrl+Shift+P"],
-    run: () => (overlay.value = { kind: "switcher", initial: ">" }),
-  },
-  { id: "inbox", title: "Toggle inbox", group: "Navigate", keys: ["Alt+I"], run: () => A.openInbox() },
-  {
-    id: "prev-channel",
-    title: "Previous channel",
-    group: "Navigate",
-    keys: ["Ctrl+Alt+Up"],
-    run: () => A.stepChannel(-1),
+    run: () => A.openJump(">"),
   },
   {
-    id: "next-channel",
-    title: "Next channel",
+    id: "next-needs-you",
+    title: "Next session that needs you",
     group: "Navigate",
-    keys: ["Ctrl+Alt+Down"],
-    run: () => A.stepChannel(1),
+    keys: ["Alt+J"],
+    run: () => A.nextNeedsYou(),
+  },
+  {
+    id: "next-tab",
+    title: "Next tab",
+    group: "Navigate",
+    keys: ["Ctrl+Tab", "Ctrl+Alt+Right"],
+    run: () => A.stepTab(1),
+  },
+  {
+    id: "prev-tab",
+    title: "Previous tab",
+    group: "Navigate",
+    keys: ["Ctrl+Shift+Tab", "Ctrl+Alt+Left"],
+    run: () => A.stepTab(-1),
   },
   ...Array.from({ length: 9 }, (_, i): Command => ({
-    id: `channel-${i + 1}`,
-    title: `Jump to channel ${i + 1}`,
+    id: `tab-${i + 1}`,
+    title: `Go to tab ${i + 1}`,
     group: "Navigate",
     keys: [`Alt+${i + 1}`],
     hidden: true,
-    run: () => A.jumpChannel(i),
+    run: () => A.gotoTabIndex(i),
   })),
-  {
-    // Not Alt+M: Claude Code uses it for its permission mode.
-    id: "composer",
-    title: "Focus composer",
-    group: "Navigate",
-    keys: ["Alt+C"],
-    run: () => A.focusComposer(),
-  },
 
-  // Channels & sessions
+  // Tabs
   {
-    id: "new-channel",
-    title: "New channel…",
-    group: "Channel",
-    keys: ["Alt+Shift+N"],
-    run: () => A.newChannelDialog(activeChannel.value?.workspace_id),
+    id: "new-tab",
+    title: "New tab (same folder)",
+    group: "Tab",
+    keys: ["Alt+T", "Ctrl+Shift+T"],
+    run: () => A.newTabHere(),
   },
   {
-    id: "channel-permissions",
-    title: "Channel permissions…",
-    group: "Channel",
-    enabled: () => !!activeChannel.value,
+    id: "new-worktree-tab",
+    title: "New worktree tab",
+    group: "Tab",
+    keys: ["Ctrl+Shift+N"],
+    run: () => A.newTabHere({ worktree: true }),
+  },
+  {
+    id: "new-tab-dialog",
+    title: "New tab…",
+    group: "Tab",
+    keys: ["Alt+Shift+N"],
+    run: () => A.newTabDialog(),
+  },
+  {
+    id: "move-tab-left",
+    title: "Move tab left",
+    group: "Tab",
+    keys: ["Alt+Shift+["],
+    run: () => A.moveActiveTab(-1),
+    enabled: hasTab,
+  },
+  {
+    id: "move-tab-right",
+    title: "Move tab right",
+    group: "Tab",
+    keys: ["Alt+Shift+]"],
+    run: () => A.moveActiveTab(1),
+    enabled: hasTab,
+  },
+  {
+    id: "rename-tab",
+    title: "Rename tab",
+    group: "Tab",
+    enabled: hasTab,
+    run: () => {
+      const c = activeChannel.value;
+      if (c) renaming.value = { kind: "channel", id: c.id };
+    },
+  },
+  {
+    id: "tab-permissions",
+    title: "Tab permissions…",
+    group: "Tab",
+    enabled: hasTab,
     run: () => activeChannel.value && A.openPermissions(activeChannel.value.id),
   },
   {
-    id: "add-workspace",
-    title: "Add workspace…",
-    group: "Channel",
-    run: () => (overlay.value = { kind: "add_workspace" }),
-  },
-  {
-    id: "new-session",
-    title: "New session tab…",
-    group: "Session",
-    keys: ["Alt+N"],
-    run: () => A.spawnPicker(),
-    enabled: inChannel,
-  },
-  {
-    id: "new-claude",
-    title: "New Claude session",
-    group: "Session",
-    run: () => A.spawnHere("claude"),
-    enabled: inChannel,
-  },
-  {
-    id: "new-codex",
-    title: "New Codex session",
-    group: "Session",
-    run: () => A.spawnHere("codex"),
-    enabled: inChannel,
-  },
-  {
-    id: "new-shell",
-    title: "New shell",
-    group: "Session",
-    run: () => A.spawnHere("shell"),
-    enabled: inChannel,
+    id: "tab-new-window",
+    title: "Move tab to a new window",
+    group: "Tab",
+    enabled: () => hasTab() && windowsSupported.value && windowId.value !== null,
+    run: () => activeChannel.value && A.moveTabToWindow(activeChannel.value.id, "new"),
   },
   {
     id: "close-tab",
     title: "Close tab",
+    group: "Tab",
+    enabled: hasTab,
+    run: () => activeChannel.value && A.closeTab(activeChannel.value.id),
+  },
+  {
+    id: "rename-window",
+    title: "Rename window…",
+    group: "Tab",
+    enabled: () => windowId.value !== null,
+    run: () => (overlay.value = { kind: "rename_window" }),
+  },
+
+  // Sessions
+  {
+    id: "new-session",
+    title: "New session in pane…",
+    group: "Session",
+    keys: ["Alt+N"],
+    run: () => A.spawnPicker(),
+    enabled: hasTab,
+  },
+  {
+    id: "new-claude",
+    title: "New Claude session in pane",
+    group: "Session",
+    run: () => A.spawnHere("claude"),
+    enabled: hasTab,
+  },
+  {
+    id: "new-codex",
+    title: "New Codex session in pane",
+    group: "Session",
+    run: () => A.spawnHere("codex"),
+    enabled: hasTab,
+  },
+  {
+    id: "new-shell",
+    title: "New shell in pane",
+    group: "Session",
+    run: () => A.spawnHere("shell"),
+    enabled: hasTab,
+  },
+  {
+    id: "close-pane",
+    title: "Close pane",
     group: "Session",
     keys: ["Alt+W"],
     run: () => A.closeFocused(),
-    enabled: inChannel,
+    enabled: hasTab,
   },
   {
     id: "restart",
@@ -266,7 +327,7 @@ export const commands: Command[] = [
     group: "Panes",
     keys: ["Alt+D"],
     run: () => A.splitFocused("right"),
-    enabled: inChannel,
+    enabled: hasTab,
   },
   {
     id: "split-down",
@@ -274,12 +335,24 @@ export const commands: Command[] = [
     group: "Panes",
     keys: ["Alt+Shift+D"],
     run: () => A.splitFocused("bottom"),
-    enabled: inChannel,
+    enabled: hasTab,
   },
   { id: "zoom", title: "Zoom pane", group: "Panes", keys: ["Alt+Z"], run: () => A.zoomToggle() },
   { id: "equalize", title: "Equalize splits", group: "Panes", run: () => A.equalizeAll() },
-  { id: "prev-tab", title: "Previous tab", group: "Panes", keys: ["Alt+["], run: () => A.tabStep(-1) },
-  { id: "next-tab", title: "Next tab", group: "Panes", keys: ["Alt+]"], run: () => A.tabStep(1) },
+  {
+    id: "prev-pane-tab",
+    title: "Previous session in pane",
+    group: "Panes",
+    keys: ["Alt+["],
+    run: () => A.paneTabStep(-1),
+  },
+  {
+    id: "next-pane-tab",
+    title: "Next session in pane",
+    group: "Panes",
+    keys: ["Alt+]"],
+    run: () => A.paneTabStep(1),
+  },
   ...(["Left", "Right", "Up", "Down"] as const).map((d): Command => ({
     id: `focus-${d.toLowerCase()}`,
     title: `Focus pane ${d.toLowerCase()}`,
@@ -298,22 +371,6 @@ export const commands: Command[] = [
   })),
 
   // View
-  // Not Alt+B: that's backward-word in readline and fish.
-  {
-    id: "sidebar",
-    title: "Toggle sidebar",
-    group: "View",
-    keys: ["Ctrl+Shift+B"],
-    run: () => A.toggleSidebar(),
-  },
-  {
-    id: "timeline",
-    title: "Toggle timeline",
-    group: "View",
-    keys: ["Alt+L"],
-    run: () => A.toggleRight("timeline"),
-  },
-  { id: "diff", title: "Toggle diff", group: "View", keys: ["Alt+G"], run: () => A.toggleRight("diff") },
   { id: "find", title: "Find in terminal", group: "View", keys: ["Ctrl+Shift+F"], run: () => A.openFind() },
   {
     id: "font-up",
@@ -338,6 +395,14 @@ export const commands: Command[] = [
   },
   { id: "theme", title: "Cycle theme (system / dark / light)", group: "View", run: () => A.cycleTheme() },
   {
+    id: "status-line",
+    get title() {
+      return `Status line: ${prefs.value.statusLine ? "on (turn off)" : "off (turn on)"}`;
+    },
+    group: "View",
+    run: () => A.toggleStatusLine(),
+  },
+  {
     id: "alt-to-terminal",
     get title() {
       return `Terminal gets Alt keys: ${prefs.value.altToTerminal ? "on (turn off)" : "off (turn on)"}`;
@@ -346,11 +411,27 @@ export const commands: Command[] = [
     run: () => {
       const on = !prefs.value.altToTerminal;
       setPref("altToTerminal", on);
-      toast(
-        "info",
-        on
-          ? "Alt keys now go to the terminal. App shortcuts: Alt+Shift+… and Ctrl+Shift+…"
-          : "Alt shortcuts work in terminals again",
+      onOff(
+        on,
+        "Alt keys now go to the terminal. App shortcuts: Alt+Shift+… and Ctrl+Shift+…",
+        "Alt shortcuts work in terminals again",
+      );
+    },
+  },
+  {
+    id: "jump-raises",
+    get title() {
+      return `Jump focuses the other window: ${prefs.value.jumpRaises ? "on (turn off)" : "off (turn on)"}`;
+    },
+    group: "View",
+    enabled: () => windowsSupported.value,
+    run: () => {
+      const on = !prefs.value.jumpRaises;
+      setPref("jumpRaises", on);
+      onOff(
+        on,
+        "Jump now focuses the window a tab is in (and pulls the tab here when it can't)",
+        "Jump pulls tabs from other windows into this one",
       );
     },
   },
@@ -365,7 +446,7 @@ export const commands: Command[] = [
 
 // Ctrl+K only when focus isn't in a terminal (shells use it for kill-line).
 const WHEN: Record<string, (ctx: KeyCtx, key: string) => boolean> = {
-  switcher: (ctx, key) => key !== "Ctrl+K" || !ctx.inTerminal,
+  jump: (ctx, key) => key !== "Ctrl+K" || !ctx.inTerminal,
 };
 
 interface Binding {
@@ -412,7 +493,14 @@ function overlayAllows(b: Binding): boolean {
   const o = overlay.value;
   if (!o) return true;
   // Toggle-style commands still work from inside overlays.
-  return ["switcher", "palette", "shortcuts"].includes(b.cmd.id);
+  return ["jump", "palette", "shortcuts"].includes(b.cmd.id);
+}
+
+/** A pending "Close?" only takes keys while its question is on screen in this window. */
+function pendingHere(p: PendingClose): boolean {
+  if (p.kind === "channel") return tabIdSet.value.has(p.id);
+  const s = sessions.value.get(p.id);
+  return !!s && s.channel_id === activeChannel.value?.id;
 }
 
 export function installKeys() {
@@ -420,12 +508,12 @@ export function installKeys() {
     const b = findBinding(e);
     return !!b && overlayAllows(b);
   });
-  // Clicking anywhere but the "Kill?" tab itself cancels it.
+  // Clicking anywhere but the "Close?" question itself cancels it.
   addEventListener(
     "pointerdown",
     (e) => {
       if (confirmClose.value === null) return;
-      if (!(e.target as HTMLElement)?.closest?.(".tab.confirm")) confirmClose.value = null;
+      if (!(e.target as HTMLElement)?.closest?.(".confirm-close")) confirmClose.value = null;
     },
     { capture: true },
   );
@@ -433,12 +521,13 @@ export function installKeys() {
   addEventListener(
     "keydown",
     (e) => {
-      // Inline "Kill? ⏎ / Esc" confirmation for closing a busy tab. Enter/Esc must not reach
-      // the terminal (Enter would submit the agent's prompt), so terminal focus counts here.
-      const pendingClose = confirmClose.value !== null ? A.sessionInActiveChannel(confirmClose.value) : false;
-      if (confirmClose.value !== null && !pendingClose) confirmClose.value = null;
+      // Inline "Close? ⏎ / Esc". Enter/Esc must not reach the terminal (Enter would submit the
+      // agent's prompt), so terminal focus counts here.
+      const pending = confirmClose.value;
+      const here = pending !== null && pendingHere(pending);
+      if (pending !== null && !here) confirmClose.value = null;
       if (
-        pendingClose && !overlay.value && !ctxOf(e).inInput && !e.isComposing &&
+        pending && here && !overlay.value && !ctxOf(e).inInput && !e.isComposing &&
         !document.querySelector(".menu")
       ) {
         const bare = !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
@@ -449,10 +538,11 @@ export function installKeys() {
         } else if (e.key === "Enter") {
           e.preventDefault();
           e.stopPropagation();
-          A.closeSession(confirmClose.value!, true);
+          confirmClose.value = null;
+          if (pending.kind === "session") A.closeSession(pending.id, true);
+          else A.closeTab(pending.id, true);
           return;
-        }
-        if (e.key === "Escape") {
+        } else if (e.key === "Escape") {
           e.preventDefault();
           e.stopPropagation();
           confirmClose.value = null;
@@ -469,7 +559,7 @@ export function installKeys() {
       e.preventDefault();
       e.stopPropagation();
       const o = overlay.value;
-      if (o?.kind === "switcher" && (b.cmd.id === "switcher" || b.cmd.id === "palette")) {
+      if (o?.kind === "jump" && (b.cmd.id === "jump" || b.cmd.id === "palette")) {
         const wantCmd = b.cmd.id === "palette";
         if (wantCmd === o.initial.startsWith(">")) {
           overlay.value = null;
@@ -484,7 +574,7 @@ export function installKeys() {
   );
 }
 
-/** Holding Alt alone for a moment shows the Alt+1..9 channel numbers in the sidebar. */
+/** Holding Alt alone for a moment shows the Alt+1..9 tab numbers. */
 function installAltHeld() {
   let timer = 0;
   const clear = () => {

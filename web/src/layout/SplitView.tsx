@@ -22,7 +22,7 @@ export function SplitView({ ch, layout }: { ch: number; layout: LayoutState }) {
     if (p) {
       return (
         <div class="split-root">
-          <Pane ch={ch} pane={p} focused zoomed />
+          <Pane ch={ch} pane={p} focused zoomed multi />
         </div>
       );
     }
@@ -38,7 +38,7 @@ function Node(
   { ch, node, path, focus }: { ch: number; node: Layout; path: number[]; focus: string },
 ) {
   if (node.type === "pane") {
-    return <Pane ch={ch} pane={node} focused={node.id === focus} zoomed={false} />;
+    return <Pane ch={ch} pane={node} focused={node.id === focus} zoomed={false} multi={path.length > 0} />;
   }
   return <Split ch={ch} node={node} path={path} focus={focus} />;
 }

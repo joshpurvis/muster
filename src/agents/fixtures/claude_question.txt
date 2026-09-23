@@ -1,0 +1,32 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo1
+
+
+❯ Call the AskUserQuestion tool now with one question: "Which color?" options red and blue.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color?
+
+❯ 1. Red
+     Warm and vibrant
+  2. Blue
+     Cool and calm
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+

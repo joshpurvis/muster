@@ -1,0 +1,883 @@
+//! Tool definitions (JSON Schemas) and dispatch. Every tool returns text; structured results
+//! are pretty-printed JSON. Failures are `isError: true` tool results, not protocol errors.
+
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
+use serde_json::{Map, Value, json};
+
+use super::McpState;
+use super::backend::Backend;
+use super::guard::{self, aggregate_state, check_spawn, spawn_budget};
+use super::wait::{self, Verdict, WaitCtx};
+use crate::hub::{CreateChannel, SpawnSession};
+use crate::inject::SendMode;
+use crate::model::*;
+
+pub struct ToolOutput {
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
+#[cfg(test)]
+pub const TOOL_NAMES: [&str; 10] = [
+    "whoami",
+    "list_channels",
+    "list_sessions",
+    "spawn_agent",
+    "send_message",
+    "read_screen",
+    "get_recent_output",
+    "wait_for_state",
+    "post_to_channel",
+    "get_diff",
+];
+
+const STATE_NAMES: [&str; 8] = [
+    "starting",
+    "working",
+    "needs_approval",
+    "asking_question",
+    "idle",
+    "error",
+    "stuck",
+    "exited",
+];
+
+fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool) -> Value {
+    json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": schema,
+        "annotations": {
+            "title": title,
+            "readOnlyHint": read_only,
+            "destructiveHint": false,
+            "openWorldHint": false,
+        },
+    })
+}
+
+fn empty_schema() -> Value {
+    json!({"type": "object", "properties": {}, "additionalProperties": false})
+}
+
+pub fn tool_definitions() -> Vec<Value> {
+    let session_id = json!({"type": "integer", "minimum": 1, "description": "Target session id (see list_sessions)."});
+    vec![
+        tool(
+            "whoami",
+            "Who am I",
+            "Describe the calling session: its id, kind, channel, workspace, working directory, git branch, parent, and remaining spawn budget. Call this first to orient yourself.",
+            empty_schema(),
+            true,
+        ),
+        tool(
+            "list_channels",
+            "List channels",
+            "List active (non-archived) channels. A channel is one unit of work with its own working directory (usually a git worktree + branch). Returns id, name, workspace, branch, cwd, session counts and an aggregate state (the most urgent state of its live sessions: needs_approval > asking_question > error > stuck > working > starting > idle > exited; 'empty' if no sessions).",
+            empty_schema(),
+            true,
+        ),
+        tool(
+            "list_sessions",
+            "List sessions",
+            "List terminal sessions (agents and shells), including exited ones. Each has id, channel_id, kind (claude|codex|shell), name, state, detail (e.g. the pending approval or question), queued (messages waiting to be delivered), parent_id (the session that spawned it via MCP) and is_me.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "integer", "description": "Only sessions in this channel. Omit for all channels."}
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "spawn_agent",
+            "Spawn agent",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel, or new_channel to create a fresh channel (by default with its own git worktree + branch, so parallel work doesn't collide). The prompt, if given, is delivered once the agent is ready. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["claude", "codex", "shell"], "description": "What to run."},
+                    "prompt": {"type": "string", "description": "Initial task for the agent (or command for a shell)."},
+                    "name": {"type": "string", "description": "Display name for the session."},
+                    "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},
+                    "new_channel": {
+                        "type": "object",
+                        "description": "Create a new channel in your workspace and spawn there.",
+                        "properties": {
+                            "name": {"type": "string", "description": "Channel name, e.g. 'fix-login-bug'."},
+                            "worktree": {"type": "boolean", "default": true, "description": "Create a git worktree + branch muster/<slug> (ignored for non-git workspaces)."},
+                            "base": {"type": "string", "description": "Branch or commit to base the worktree on. Default: workspace HEAD."}
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "send_message",
+            "Send message",
+            "Send a prompt to another session. It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Cannot target yourself, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller. Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": session_id,
+                    "text": {"type": "string", "description": "Message text; multi-line is fine."},
+                    "interrupt": {"type": "boolean", "default": false, "description": "Interrupt the agent's current turn, then deliver."}
+                },
+                "required": ["session_id", "text"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "read_screen",
+            "Read screen",
+            "Return the session's currently visible terminal screen as plain text (what a human would see right now). Good for checking a prompt or question the agent is showing.",
+            json!({
+                "type": "object",
+                "properties": {"session_id": session_id},
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "get_recent_output",
+            "Get recent output",
+            "Return the last N lines of a session's terminal output (scrollback + screen) as plain text with ANSI codes stripped.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": session_id,
+                    "lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 100, "description": "How many lines (max 2000)."}
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "wait_for_state",
+            "Wait for state",
+            "Block until a session is in one of the given states, or the timeout passes. Default states: idle, needs_approval, asking_question, error, stuck, exited (i.e. 'finished or needs help'). Returns immediately if already there, except that right after send_message an unchanged 'idle' (or idle with queued input) is treated as stale, so 'send then wait' waits for the agent to actually process the message. Pass after_ms (unix ms, e.g. send_message's sent_at_ms) to require a state entered at or after that time, or after_ms=0 to accept any current matching state. Timing out is not an error: check timed_out in the result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": session_id,
+                    "states": {"type": "array", "items": {"type": "string", "enum": STATE_NAMES}, "minItems": 1, "description": "States to wait for."},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 300},
+                    "after_ms": {"type": "integer", "minimum": 0, "description": "Only accept a state entered at/after this unix time in ms."}
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            true,
+        ),
+        tool(
+            "post_to_channel",
+            "Post to channel",
+            "Write a short message to a channel's human-visible timeline (status updates, findings, hand-offs). Defaults to your own channel.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Message (markdown ok)."},
+                    "channel_id": {"type": "integer", "description": "Target channel. Default: your channel."}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "get_diff",
+            "Get diff",
+            "Return the git diff of a channel's working tree against its base branch (committed + uncommitted changes, plus a summary of untracked files). Defaults to your channel. Large diffs are truncated with a note.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "integer", "description": "Channel. Default: your channel."},
+                    "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 400000, "default": 60000, "description": "Truncate the diff after this many bytes."}
+                },
+                "additionalProperties": false
+            }),
+            true,
+        ),
+    ]
+}
+
+// ----- argument helpers -----
+
+type TResult = Result<String, String>;
+
+struct Args<'a>(&'a Map<String, Value>);
+
+impl Args<'_> {
+    fn get(&self, k: &str) -> Option<&Value> {
+        self.0.get(k).filter(|v| !v.is_null())
+    }
+    /// Integer; tolerates numeric strings ("3") since some models send those.
+    fn int(&self, k: &str) -> Result<Option<i64>, String> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
+                .map(Some)
+                .ok_or_else(|| format!("`{k}` must be an integer")),
+            Some(Value::String(s)) => s
+                .trim()
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| format!("`{k}` must be an integer")),
+            Some(_) => Err(format!("`{k}` must be an integer")),
+        }
+    }
+    fn req_int(&self, k: &str) -> Result<i64, String> {
+        self.int(k)?
+            .ok_or_else(|| format!("missing required argument `{k}`"))
+    }
+    fn session_id(&self, k: &str) -> Result<SessionId, String> {
+        let v = self.req_int(k)?;
+        SessionId::try_from(v).map_err(|_| format!("`{k}` out of range"))
+    }
+    fn str(&self, k: &str) -> Result<Option<&str>, String> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s)),
+            Some(_) => Err(format!("`{k}` must be a string")),
+        }
+    }
+    fn req_str(&self, k: &str) -> Result<&str, String> {
+        self.str(k)?
+            .ok_or_else(|| format!("missing required argument `{k}`"))
+    }
+    fn bool(&self, k: &str) -> Result<Option<bool>, String> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(Value::String(s)) if s == "true" || s == "false" => Ok(Some(s == "true")),
+            Some(_) => Err(format!("`{k}` must be a boolean")),
+        }
+    }
+}
+
+fn parse_state(s: &str) -> Option<AgentState> {
+    if s == "done" {
+        return Some(AgentState::Idle);
+    }
+    serde_json::from_value(Value::String(s.to_string())).ok()
+}
+
+fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
+    json!({
+        "id": s.id,
+        "channel_id": s.channel_id,
+        "kind": s.kind,
+        "name": s.name,
+        "state": s.state,
+        "detail": s.state_detail,
+        "state_since_ms": s.state_since,
+        "queued": s.queued,
+        "parent_id": s.parent_id,
+        "title": s.title,
+        "exit_code": s.exit_code,
+        "is_me": s.id == caller,
+    })
+}
+
+fn channel_json(c: &Channel, ws: Option<&Workspace>) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "workspace_id": c.workspace_id,
+        "workspace": ws.map(|w| w.name.clone()),
+        "cwd": c.cwd,
+        "branch": c.branch,
+        "base_branch": c.base_branch,
+    })
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+pub fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Shorten long strings inside tool args before they go into the event log.
+pub fn truncate_args(v: &Value) -> Value {
+    const MAX_STR: usize = 500;
+    const MAX_TOTAL: usize = 4000;
+    fn walk(v: &Value) -> Value {
+        match v {
+            Value::String(s) if s.len() > MAX_STR => {
+                Value::String(format!("{}… [{} bytes]", truncate_str(s, MAX_STR), s.len()))
+            }
+            Value::Array(a) => Value::Array(a.iter().map(walk).collect()),
+            Value::Object(o) => {
+                Value::Object(o.iter().map(|(k, v)| (k.clone(), walk(v))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let out = walk(v);
+    let s = out.to_string();
+    if s.len() > MAX_TOTAL {
+        json!({"_truncated": format!("{}…", truncate_str(&s, MAX_TOTAL))})
+    } else {
+        out
+    }
+}
+
+// ----- dispatch -----
+
+/// Err(()) = unknown tool (a protocol error per spec).
+pub async fn call_tool<B: Backend>(
+    st: &McpState<B>,
+    caller: SessionId,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutput, ()> {
+    let empty = Map::new();
+    let map = match args {
+        Value::Object(m) => m,
+        Value::Null => &empty,
+        _ => {
+            return Ok(ToolOutput {
+                text: "arguments must be an object".into(),
+                is_error: true,
+            });
+        }
+    };
+    let a = Args(map);
+    let res = match name {
+        "whoami" => whoami(st, caller),
+        "list_channels" => list_channels(st),
+        "list_sessions" => list_sessions(st, caller, &a),
+        "spawn_agent" => spawn_agent(st, caller, &a).await,
+        "send_message" => send_message(st, caller, &a).await,
+        "read_screen" => read_screen(st, &a),
+        "get_recent_output" => get_recent_output(st, &a),
+        "wait_for_state" => wait_for_state(st, &a).await,
+        "post_to_channel" => post_to_channel(st, caller, &a),
+        "get_diff" => get_diff(st, caller, &a).await,
+        _ => return Err(()),
+    };
+    Ok(match res {
+        Ok(text) => ToolOutput {
+            text,
+            is_error: false,
+        },
+        Err(text) => ToolOutput {
+            text,
+            is_error: true,
+        },
+    })
+}
+
+fn caller_session<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<SessionInfo, String> {
+    st.backend
+        .session(caller)
+        .ok_or_else(|| "calling session no longer exists".to_string())
+}
+
+fn target_session<B: Backend>(st: &McpState<B>, id: SessionId) -> Result<SessionInfo, String> {
+    st.backend
+        .session(id)
+        .ok_or_else(|| format!("no session with id {id} (see list_sessions)"))
+}
+
+fn open_channel<B: Backend>(st: &McpState<B>, id: ChannelId) -> Result<Channel, String> {
+    match st.backend.channel(id) {
+        Some(c) if !c.archived => Ok(c),
+        Some(_) => Err(format!("channel {id} is archived")),
+        None => Err(format!("no channel with id {id} (see list_channels)")),
+    }
+}
+
+fn budget<B: Backend>(st: &McpState<B>, caller: SessionId) -> guard::SpawnBudget {
+    let sessions = st.backend.sessions();
+    let live: HashSet<SessionId> = st.backend.live_session_ids().into_iter().collect();
+    let recorded = st.guard.lock().spawned_depth.clone();
+    spawn_budget(&sessions, &live, &recorded, caller, &st.limits)
+}
+
+fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
+    let me = caller_session(st, caller)?;
+    let ch = st.backend.channel(me.channel_id);
+    let ws = ch
+        .as_ref()
+        .and_then(|c| st.backend.workspace(c.workspace_id));
+    Ok(pretty(&json!({
+        "session": session_json(&me, caller),
+        "cwd": me.cwd,
+        "channel": ch.as_ref().map(|c| channel_json(c, ws.as_ref())),
+        "workspace": ws.as_ref().map(|w| json!({"id": w.id, "name": w.name, "path": w.path, "is_git": w.is_git})),
+        "spawn_budget": budget(st, caller),
+        "agents_may_approve_prompts": guard::AGENTS_MAY_APPROVE,
+    })))
+}
+
+fn list_channels<B: Backend>(st: &McpState<B>) -> TResult {
+    let sessions = st.backend.sessions();
+    let live: HashSet<SessionId> = st.backend.live_session_ids().into_iter().collect();
+    let out: Vec<Value> = st
+        .backend
+        .channels()
+        .into_iter()
+        .filter(|c| !c.archived)
+        .map(|c| {
+            let ws = st.backend.workspace(c.workspace_id);
+            let mine: Vec<&SessionInfo> =
+                sessions.iter().filter(|s| s.channel_id == c.id).collect();
+            let mut v = channel_json(&c, ws.as_ref());
+            v["state"] = json!(aggregate_state(mine.iter().map(|s| s.state)));
+            v["sessions"] = json!(mine.len());
+            v["live_sessions"] = json!(mine.iter().filter(|s| live.contains(&s.id)).count());
+            v
+        })
+        .collect();
+    Ok(pretty(&Value::Array(out)))
+}
+
+fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let filter = a.int("channel_id")?;
+    let out: Vec<Value> = st
+        .backend
+        .sessions()
+        .iter()
+        .filter(|s| filter.is_none_or(|c| s.channel_id == c))
+        .map(|s| session_json(s, caller))
+        .collect();
+    Ok(pretty(&Value::Array(out)))
+}
+
+async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let kind_s = a.req_str("kind")?;
+    let kind = SessionKind::parse(kind_s)
+        .ok_or_else(|| format!("unknown kind `{kind_s}` (expected claude, codex or shell)"))?;
+    let prompt = a
+        .str("prompt")?
+        .filter(|p| !p.trim().is_empty())
+        .map(str::to_string);
+    let name = a
+        .str("name")?
+        .filter(|n| !n.trim().is_empty())
+        .map(str::to_string);
+    let channel_id = a.int("channel_id")?;
+    let new_channel = match a.get("new_channel") {
+        None => None,
+        Some(Value::Object(m)) => Some(m),
+        Some(_) => return Err("`new_channel` must be an object".into()),
+    };
+    if channel_id.is_some() && new_channel.is_some() {
+        return Err("pass either channel_id or new_channel, not both".into());
+    }
+    let me = caller_session(st, caller)?;
+
+    // Serialize spawns so concurrent calls can't overshoot the limits.
+    let _lock = st.spawn_lock.lock().await;
+    let b = budget(st, caller);
+    check_spawn(&b)?;
+
+    let (channel, created) = if let Some(nc) = new_channel {
+        let nc = Args(nc);
+        let ch_name = nc.req_str("name")?.trim().to_string();
+        if ch_name.is_empty() {
+            return Err("new_channel.name must not be empty".into());
+        }
+        let my_ch = st
+            .backend
+            .channel(me.channel_id)
+            .ok_or("your channel no longer exists")?;
+        let req = CreateChannel {
+            workspace_id: my_ch.workspace_id,
+            name: ch_name,
+            worktree: nc.bool("worktree")?.unwrap_or(true),
+            base: nc.str("base")?.map(str::to_string),
+            agent: None,
+            prompt: None,
+        };
+        let ch = st
+            .backend
+            .create_channel(req)
+            .await
+            .map_err(|e| format!("could not create channel: {e:#}"))?;
+        (ch, true)
+    } else {
+        (
+            open_channel(st, channel_id.unwrap_or(me.channel_id))?,
+            false,
+        )
+    };
+
+    let req = SpawnSession {
+        channel_id: channel.id,
+        kind,
+        name,
+        cwd: None,
+        prompt,
+        extra_args: Vec::new(),
+        cols: 120,
+        rows: 32,
+        parent_id: Some(caller),
+    };
+    let info = match st.backend.spawn_session(req).await {
+        Ok(info) => info,
+        Err(e) => {
+            // Don't leave an empty channel/worktree behind for a failed spawn.
+            let mut msg = format!("spawn failed: {e:#}");
+            if created {
+                if let Err(e2) = st.backend.archive_channel(channel.id, true).await {
+                    msg.push_str(&format!(
+                        " (the new channel {} could not be cleaned up: {e2:#}; pass channel_id={} to retry in it)",
+                        channel.id, channel.id
+                    ));
+                } else {
+                    msg.push_str(" (the new channel was removed again)");
+                }
+            }
+            return Err(msg);
+        }
+    };
+    st.guard
+        .lock()
+        .spawned_depth
+        .insert(info.id, b.caller_depth + 1);
+    let ws = st.backend.workspace(channel.workspace_id);
+    Ok(pretty(&json!({
+        "session": session_json(&info, caller),
+        "channel": channel_json(&channel, ws.as_ref()),
+        "channel_created": created,
+        "next": format!("Use wait_for_state(session_id={}) to wait until it finishes or needs help.", info.id),
+    })))
+}
+
+async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let target = a.session_id("session_id")?;
+    let text = a.req_str("text")?;
+    let interrupt = a.bool("interrupt")?.unwrap_or(false);
+    if target == caller {
+        return Err("you cannot send a message to yourself".into());
+    }
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    if text.chars().count() > st.limits.max_message_chars {
+        return Err(format!(
+            "text too long (max {} characters)",
+            st.limits.max_message_chars
+        ));
+    }
+    let info = target_session(st, target)?;
+    if info.state == AgentState::Exited {
+        return Err(format!("session {target} has exited"));
+    }
+    if interrupt && info.state == AgentState::NeedsApproval {
+        return Err(format!(
+            "session {target} is waiting on a permission prompt; only the human can answer it. \
+             Send without interrupt to queue the message, or post_to_channel to ask the human."
+        ));
+    }
+    let now = now_ms();
+    let prev_send = {
+        let mut g = st.guard.lock();
+        if let Err(wait_s) = g.sends.check_and_record(
+            caller,
+            now,
+            st.limits.send_per_window,
+            st.limits.send_window_ms,
+        ) {
+            return Err(format!(
+                "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
+                st.limits.send_per_window
+            ));
+        }
+        g.last_send.insert(target, now)
+    };
+    let mode = if interrupt {
+        SendMode::Interrupt
+    } else {
+        SendMode::Queue
+    };
+    let out = match st
+        .backend
+        .send(target, text.to_string(), mode, format!("session:{caller}"))
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            // Nothing was sent: give the rate-limit slot back and restore the send marker.
+            let mut g = st.guard.lock();
+            g.sends.refund(caller);
+            match prev_send {
+                Some(t) => g.last_send.insert(target, t),
+                None => g.last_send.remove(&target),
+            };
+            return Err(format!("send failed: {e:#}"));
+        }
+    };
+    if !out.delivered {
+        st.guard.lock().note_queued(target, out.queued);
+    }
+    Ok(pretty(&json!({
+        "session_id": target,
+        "delivered": out.delivered,
+        "queued": out.queued,
+        "sent_at_ms": now,
+    })))
+}
+
+fn read_screen<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+    let id = a.session_id("session_id")?;
+    let info = target_session(st, id)?;
+    let text = st
+        .backend
+        .screen_text(id)
+        .ok_or_else(|| format!("no screen available for session {id}"))?;
+    Ok(format!(
+        "[session {id} ({}) state={}]\n{}",
+        info.kind.as_str(),
+        info.state.as_str(),
+        text.trim_end()
+    ))
+}
+
+fn get_recent_output<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+    let id = a.session_id("session_id")?;
+    target_session(st, id)?;
+    let lines = a
+        .int("lines")?
+        .unwrap_or(st.limits.recent_default_lines as i64)
+        .clamp(1, st.limits.recent_max_lines as i64) as usize;
+    st.backend
+        .recent_output(id, lines)
+        .ok_or_else(|| format!("no output available for session {id}"))
+}
+
+async fn wait_for_state<B: Backend>(st: &McpState<B>, a: &Args<'_>) -> TResult {
+    let id = a.session_id("session_id")?;
+    let states: Vec<AgentState> = match a.get("states") {
+        None => wait::DEFAULT_STATES.to_vec(),
+        Some(Value::Array(items)) if !items.is_empty() => {
+            let mut v = Vec::new();
+            for it in items {
+                let s = it.as_str().ok_or("`states` must be an array of strings")?;
+                v.push(parse_state(s).ok_or_else(|| {
+                    format!(
+                        "unknown state `{s}` (expected one of {})",
+                        STATE_NAMES.join(", ")
+                    )
+                })?);
+            }
+            v
+        }
+        Some(Value::String(s)) => {
+            vec![parse_state(s).ok_or_else(|| format!("unknown state `{s}`"))?]
+        }
+        Some(_) => return Err("`states` must be a non-empty array of strings".into()),
+    };
+    let timeout_s = a
+        .int("timeout_seconds")?
+        .unwrap_or(st.limits.wait_default_s as i64)
+        .clamp(0, st.limits.wait_max_s as i64) as u64;
+    let after_ms = a.int("after_ms")?;
+    target_session(st, id)?;
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(timeout_s);
+    let mut rx = st.backend.subscribe();
+    loop {
+        let info = st
+            .backend
+            .session(id)
+            .ok_or_else(|| format!("session {id} was removed while waiting"))?;
+        let now_unix = now_ms();
+        let (last_send_ms, last_delivery_ms) = {
+            let mut g = st.guard.lock();
+            // Also observe here: the tracker task may not have seen this update yet.
+            g.observe_session(&info, now_unix);
+            (
+                g.last_send.get(&id).copied(),
+                g.last_delivery.get(&id).copied(),
+            )
+        };
+        let ctx = WaitCtx {
+            after_ms,
+            last_send_ms,
+            last_delivery_ms,
+            settle_grace_ms: st.limits.settle_grace_ms,
+            now_ms: now_unix,
+        };
+        let verdict = wait::evaluate(&info, &states, &ctx);
+        let now = Instant::now();
+        if verdict != Verdict::Wait || now >= deadline {
+            let reached = verdict == Verdict::Reached;
+            return Ok(pretty(&json!({
+                "session_id": id,
+                "state": info.state,
+                "detail": info.state_detail,
+                "state_since_ms": info.state_since,
+                "queued": info.queued,
+                "reached": reached,
+                "timed_out": verdict == Verdict::Wait,
+                "ended": (verdict == Verdict::Ended).then_some("exited"),
+                "waited_ms": started.elapsed().as_millis() as u64,
+            })));
+        }
+        // Re-check at least every second (grace expiry, missed events).
+        let tick = (deadline - now).min(Duration::from_secs(1));
+        wait::next_change(&mut rx, id, tick).await;
+    }
+}
+
+fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let text = a.req_str("text")?;
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    if text.chars().count() > st.limits.max_post_chars {
+        return Err(format!(
+            "text too long (max {} characters)",
+            st.limits.max_post_chars
+        ));
+    }
+    let ch_id = match a.int("channel_id")? {
+        Some(c) => c,
+        None => caller_session(st, caller)?.channel_id,
+    };
+    let ch = open_channel(st, ch_id)?;
+    if let Err(wait_s) = st.guard.lock().posts.check_and_record(
+        caller,
+        now_ms(),
+        st.limits.post_per_window,
+        st.limits.send_window_ms,
+    ) {
+        return Err(format!(
+            "rate limit: at most {} posts per minute. Try again in {wait_s}s.",
+            st.limits.post_per_window
+        ));
+    }
+    st.backend.log_event(
+        Some(ch.id),
+        Some(caller),
+        EventKind::AgentPost,
+        json!({"session_id": caller, "text": text}),
+    );
+    Ok(format!("Posted to channel {} (#{}).", ch.id, ch.name))
+}
+
+async fn get_diff<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let ch_id = match a.int("channel_id")? {
+        Some(c) => c,
+        None => caller_session(st, caller)?.channel_id,
+    };
+    let max = a
+        .int("max_bytes")?
+        .unwrap_or(st.limits.diff_default_bytes as i64)
+        .clamp(1000, st.limits.diff_max_bytes as i64) as usize;
+    let ch = open_channel(st, ch_id)?;
+    let diff = st
+        .backend
+        .diff(ch.cwd.clone(), ch.base_branch.clone())
+        .await
+        .map_err(|e| format!("diff failed: {e:#}"))?;
+    if diff.trim().is_empty() {
+        return Ok(format!(
+            "No changes in channel {} against {}.",
+            ch.id,
+            ch.base_branch.as_deref().unwrap_or("HEAD")
+        ));
+    }
+    if diff.len() <= max {
+        return Ok(diff);
+    }
+    let cut = truncate_str(&diff, max);
+    let cut = &cut[..cut.rfind('\n').map(|i| i + 1).unwrap_or(cut.len())];
+    let files: Vec<&str> = diff
+        .lines()
+        .filter_map(|l| l.strip_prefix("diff --git "))
+        .collect();
+    const MAX_FILES: usize = 200;
+    let listed = files.len().min(MAX_FILES);
+    let mut file_list = files[..listed].join("\n");
+    if files.len() > listed {
+        file_list.push_str(&format!("\n… and {} more", files.len() - listed));
+    }
+    Ok(format!(
+        "{cut}\n[diff truncated: showing {} of {} bytes. Files in full diff ({}):\n{}\nRaise max_bytes (max {}) or run `git diff` in {} for the rest.]",
+        cut.len(),
+        diff.len(),
+        files.len(),
+        file_list,
+        st.limits.diff_max_bytes,
+        ch.cwd
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn definitions_are_complete_and_ordered() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, TOOL_NAMES);
+        for d in &defs {
+            assert_eq!(d["inputSchema"]["type"], "object", "{}", d["name"]);
+            assert!(d["description"].as_str().unwrap().len() > 30);
+        }
+        assert!(!names.iter().any(|n| n.contains("approve")));
+    }
+
+    #[test]
+    fn args_are_lenient_about_numeric_strings() {
+        let m = json!({"session_id": "7", "lines": 5.0, "x": null, "b": "true"});
+        let a = Args(m.as_object().unwrap());
+        assert_eq!(a.session_id("session_id").unwrap(), 7);
+        assert_eq!(a.int("lines").unwrap(), Some(5));
+        assert_eq!(a.int("x").unwrap(), None);
+        assert_eq!(a.bool("b").unwrap(), Some(true));
+        assert!(a.req_str("text").unwrap_err().contains("missing"));
+    }
+
+    #[test]
+    fn truncation() {
+        assert_eq!(truncate_str("héllo", 2), "h");
+        let big = "x".repeat(2000);
+        let t = truncate_args(&json!({"text": big, "n": 1}));
+        assert!(t["text"].as_str().unwrap().ends_with("[2000 bytes]"));
+        assert_eq!(t["n"], 1);
+        let huge = json!({"a": vec!["y".repeat(400); 50]});
+        assert!(truncate_args(&huge).get("_truncated").is_some());
+    }
+
+    #[test]
+    fn done_alias() {
+        assert_eq!(parse_state("done"), Some(AgentState::Idle));
+        assert_eq!(
+            parse_state("needs_approval"),
+            Some(AgentState::NeedsApproval)
+        );
+        assert_eq!(parse_state("nope"), None);
+    }
+}

@@ -11,6 +11,7 @@ mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
+| `POST /api/rpc` | `Authorization: Bearer <client token>` | Same JSON methods as the WebSocket (body `{id?, method, params}`, reply `{id, result}` / `{id, error}`), except `session.attach`/`session.detach`. Used by the CLI. |
 
 The UI is opened as `http://127.0.0.1:<port>/#token=<client token>`. The frontend reads the
 token from the hash, stores it in `sessionStorage`, and strips it from the URL.

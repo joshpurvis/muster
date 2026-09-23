@@ -1,0 +1,32 @@
+> You are in /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo2
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt
+  injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

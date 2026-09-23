@@ -1,0 +1,32 @@
+╭───────────────────────────────────────────────────────────────╮
+│ ✨ Update available! 0.155.1 -> 0.156.1                       │
+│ See https://github.com/openai/codex for installation options. │
+│                                                               │
+│ See full release notes:                                       │
+│ https://github.com/openai/codex/releases/latest               │
+╰───────────────────────────────────────────────────────────────╯
+
+╭────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.155.1)                     │
+│                                                │
+│ model:     gpt-6-luna low   /model to change   │
+│ directory: /tmp/claude-1000/…/scratchpad/repo2 │
+╰────────────────────────────────────────────────╯
+
+  Tip: New Use /fast to enable our fastest inference with increased plan usage.
+
+⚠ 2 startup issues (1 MCP; 1 needs sign-in) · ctrl + t for details
+
+⚠ `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+
+• You have 2 usage limit resets available. Run /usage to use one.
+
+
+› Run exactly this shell command and nothing else: touch zzz.txt
+
+  gpt-6-luna low · /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo2
+
+
+
+
+

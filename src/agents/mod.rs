@@ -10,6 +10,7 @@ use crate::model::{AgentState, Decision, SessionId, SessionKind, StateUpdate};
 pub mod claude;
 pub mod codex;
 pub mod shell;
+pub mod tui;
 
 /// Everything an adapter needs to build a launch command.
 #[derive(Debug, Clone)]
@@ -104,6 +105,19 @@ pub trait Adapter: Send + Sync {
 
     /// Bytes that interrupt the current turn.
     fn interrupt_bytes(&self) -> Vec<u8>;
+
+    /// Text currently typed into the agent's input box, if this adapter can read it from
+    /// the screen. `Some("")` = input box visible and empty; `None` = unknown.
+    /// Used by the injector to verify submission and to avoid leaving half-typed input.
+    fn composer_text(&self, _screen: &ScreenSnapshot) -> Option<String> {
+        None
+    }
+
+    /// Bytes that clear a non-empty input box without doing anything else, if known.
+    /// Only sent when `composer_text` reported non-empty text.
+    fn clear_input_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 pub fn adapter_for(kind: SessionKind) -> &'static dyn Adapter {

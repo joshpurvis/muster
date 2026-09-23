@@ -898,6 +898,8 @@ pub struct NewOpts {
     pub window: Option<i64>,
     pub prompt: Option<String>,
     pub json: bool,
+    /// Arguments after `--`, for the agent CLI.
+    pub agent_args: Vec<String>,
 }
 
 /// `muster new`: `workspace.add`, `channel.create`, then `hello` for the new session.
@@ -905,6 +907,9 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     let abs = std::fs::canonicalize(&o.path).with_context(|| format!("{}", o.path.display()))?;
     if o.agent == "none" && o.prompt.is_some() {
         anyhow::bail!("--prompt needs an agent (not --agent none)");
+    }
+    if o.agent == "none" && !o.agent_args.is_empty() {
+        anyhow::bail!("arguments after `--` need an agent (not --agent none)");
     }
     let ws = client::rpc(d, "workspace.add", json!({ "path": abs }))?;
     let ws_id = ws["id"].as_i64().context("workspace.add returned no id")?;
@@ -944,6 +949,9 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     if let Some(w) = window {
         set(&mut p, "window_id", json!(w));
     }
+    if !o.agent_args.is_empty() {
+        set(&mut p, "extra_args", json!(o.agent_args));
+    }
     let ch = client::rpc(d, "channel.create", p)?;
     let ch_id = ch["id"].as_i64().context("channel.create returned no id")?;
     let snap = Snapshot::fetch(d)?;
@@ -958,6 +966,209 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     if o.agent != "none" && sess.is_none() {
         anyhow::bail!("tab {ch_id} was created but {} did not start (see the tab's timeline)", o.agent);
     }
+    Ok(())
+}
+
+// ----- events -----
+
+/// Which events `muster events` passes on: one session and/or one tab (with both, a session
+/// event must match both).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EventFilter {
+    pub session: Option<u32>,
+    pub channel: Option<i64>,
+}
+
+/// What `muster events` knows about sessions and tabs, kept current from the events, so a
+/// `session_upserted` can be printed as a state change (`from -> to`) with its tab name.
+#[derive(Debug, Default)]
+pub struct EventTracker {
+    filter: EventFilter,
+    sessions: std::collections::HashMap<u32, Sess>,
+    tabs: std::collections::HashMap<i64, String>,
+}
+
+/// One event, as far as `muster events` is concerned.
+#[derive(Debug, PartialEq)]
+pub struct Seen {
+    /// Passes the filter (`--json` prints it).
+    pub pass: bool,
+    /// A session state change that passes: (unix ms, `id  tab/name  from -> to  detail`).
+    pub change: Option<(i64, String)>,
+}
+
+impl EventTracker {
+    pub fn new(snap: &Snapshot, filter: EventFilter) -> EventTracker {
+        let mut t = EventTracker {
+            filter,
+            ..Default::default()
+        };
+        t.resync(snap);
+        t
+    }
+
+    /// Replace what is known with a fresh snapshot (after missed events).
+    pub fn resync(&mut self, snap: &Snapshot) {
+        self.sessions = snap.sessions.iter().map(|s| (s.id, s.clone())).collect();
+        // Names of tabs closed earlier stay, for labels of their sessions.
+        self.tabs.extend(snap.channels.iter().map(|c| (c.id, c.name.clone())));
+    }
+
+    fn tab_ok(&self, ch: i64) -> bool {
+        self.filter.channel.is_none_or(|c| c == ch)
+    }
+
+    /// The tab a tab or window event must concern to pass: the `--tab` one, else the
+    /// `--session` session's.
+    fn focus_tab(&self) -> Option<i64> {
+        self.filter
+            .channel
+            .or_else(|| self.filter.session.and_then(|id| self.sessions.get(&id)).map(|s| s.channel_id))
+    }
+
+    fn unfiltered(&self) -> bool {
+        self.filter.session.is_none() && self.filter.channel.is_none()
+    }
+
+    fn label(&self, s: &Sess) -> String {
+        format!("{}/{}", self.tabs.get(&s.channel_id).map_or("?", String::as_str), s.name)
+    }
+
+    /// Take one event (`{"event", "data"}`) into account.
+    pub fn apply(&mut self, ev: &Value) -> Seen {
+        let data = &ev["data"];
+        let id = data["id"].as_i64();
+        let mut change = None;
+        let pass = match ev["event"].as_str().unwrap_or("") {
+            "session_upserted" => {
+                let Some(s) = Sess::from_value(data.clone()) else {
+                    return Seen { pass: false, change };
+                };
+                let prev = self.sessions.get(&s.id);
+                // A session moved out of (or into) the tab counts for that tab.
+                let pass = self.filter.session.is_none_or(|id| id == s.id)
+                    && (self.tab_ok(s.channel_id) || prev.is_some_and(|p| self.tab_ok(p.channel_id)));
+                let from = prev.map(|p| p.state.clone());
+                if from.as_deref() != Some(s.state.as_str()) {
+                    let mut line = format!(
+                        "{}  {}  {} -> {}",
+                        s.id,
+                        self.label(&s),
+                        from.as_deref().unwrap_or("new"),
+                        s.state
+                    );
+                    if let Some(d) = s.state_detail.as_deref().filter(|d| !d.is_empty()) {
+                        line.push_str("  ");
+                        line.push_str(d);
+                    }
+                    let at = if s.state_since > 0 { s.state_since } else { now_ms() };
+                    change = Some((at, line));
+                }
+                self.sessions.insert(s.id, s);
+                pass
+            }
+            "session_removed" => {
+                let sid = id.and_then(|i| u32::try_from(i).ok()).unwrap_or(0);
+                let pass = self.filter.session.is_none_or(|id| id == sid)
+                    && self.sessions.get(&sid).is_none_or(|s| self.tab_ok(s.channel_id));
+                if let Some(s) = self.sessions.remove(&sid) {
+                    change = Some((now_ms(), format!("{}  {}  {} -> removed", s.id, self.label(&s), s.state)));
+                }
+                pass
+            }
+            "channel_upserted" => {
+                if let (Some(id), Some(name)) = (id, data["name"].as_str()) {
+                    self.tabs.insert(id, name.to_string());
+                }
+                self.unfiltered() || self.focus_tab().is_some_and(|c| Some(c) == id)
+            }
+            "channel_removed" => self.unfiltered() || self.focus_tab().is_some_and(|c| Some(c) == id),
+            "window_upserted" => {
+                self.unfiltered()
+                    || self.focus_tab().is_some_and(|c| {
+                        data["channel_ids"]
+                            .as_array()
+                            .is_some_and(|a| a.iter().any(|v| v.as_i64() == Some(c)))
+                    })
+            }
+            "lagged" => true,
+            _ => self.unfiltered(),
+        };
+        let change = change.filter(|_| pass);
+        Seen { pass, change }
+    }
+}
+
+/// `HH:MM:SS` in local time.
+fn clock(ms: i64) -> String {
+    let t = (ms / 1000) as libc::time_t;
+    // SAFETY: localtime_r fills a tm we own.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "--:--:--".into();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// Resolve `--tab NAME` (exact name, else unique prefix). Errors carry exit code 2.
+pub fn resolve_tab(snap: &Snapshot, tab: &str) -> anyhow::Result<i64> {
+    match match_tabs(snap, tab.trim()).as_slice() {
+        [c] => Ok(c.id),
+        [] => Err(exit(2, format!("no tab matches \"{tab}\""))),
+        many => Err(exit(
+            2,
+            format!(
+                "\"{tab}\" is ambiguous ({} tabs): {}",
+                many.len(),
+                many.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
+/// `muster events`: stream `GET /api/events`. Human lines per session state change, or with
+/// `--json` every event line as the daemon sent it. Ends (Ok) when the daemon goes away or
+/// stdout is closed.
+pub fn events(d: &Discovery, as_json: bool, session: Option<&str>, tab: Option<&str>) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    // Subscribed first, so nothing between the snapshot and the stream is lost.
+    let body = client::get_stream(d.port, "/api/events", &d.token)?;
+    let snap = Snapshot::fetch(d)?;
+    let mut filter = EventFilter::default();
+    if let Some(t) = session {
+        let env = std::env::var("MUSTER_SESSION_ID").ok();
+        filter.session = Some(resolve(&snap, t, env.as_deref())?.id);
+    }
+    if let Some(t) = tab {
+        filter.channel = Some(resolve_tab(&snap, t)?);
+    }
+    let mut tracker = EventTracker::new(&snap, filter);
+    let mut out = std::io::stdout().lock();
+    for line in std::io::BufReader::new(body).lines() {
+        let Ok(line) = line else { break };
+        let Ok(ev) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let seen = tracker.apply(&ev);
+        if ev["event"] == "lagged" {
+            eprintln!("muster: missed {} events; re-synced", ev["data"]["missed"]);
+            if let Ok(snap) = Snapshot::fetch(d) {
+                tracker.resync(&snap);
+            }
+        }
+        let text = if as_json {
+            seen.pass.then_some(line)
+        } else {
+            seen.change.map(|(at, l)| format!("{}  {l}", clock(at)))
+        };
+        if let Some(text) = text
+            && writeln!(out, "{text}").and_then(|_| out.flush()).is_err()
+        {
+            // The reader went away (`| head`).
+            return Ok(());
+        }
+    }
+    eprintln!("muster: the daemon stopped");
     Ok(())
 }
 
@@ -1004,6 +1215,90 @@ mod tests {
     fn code(t: &str, env: Option<&str>) -> u8 {
         let e = resolve(&snap(), t, env).expect_err(t);
         e.downcast_ref::<Exit>().map_or(1, |x| x.code)
+    }
+
+    fn ev(kind: &str, data: Value) -> Value {
+        json!({ "event": kind, "data": data })
+    }
+
+    fn upsert(id: u32, ch: i64, state: &str, detail: Option<&str>) -> Value {
+        ev(
+            "session_upserted",
+            json!({"id": id, "channel_id": ch, "kind": "shell", "name": "sh", "state": state,
+                   "state_detail": detail, "state_since": 1_700_000_000_000i64}),
+        )
+    }
+
+    #[test]
+    fn events_print_state_changes_only() {
+        let mut t = EventTracker::new(&snap(), EventFilter::default());
+        // Same state (e.g. a title change): passes for --json, no human line.
+        let s = t.apply(&upsert(30, 3, "idle", None));
+        assert!(s.pass && s.change.is_none());
+        let s = t.apply(&upsert(30, 3, "working", Some("cargo test")));
+        assert_eq!(
+            s.change,
+            Some((1_700_000_000_000, "30  fixtures/sh  idle -> working  cargo test".into()))
+        );
+        // A new session, in a tab renamed since the snapshot.
+        t.apply(&ev("channel_upserted", json!({"id": 3, "name": "renamed"})));
+        let s = t.apply(&upsert(99, 3, "starting", None));
+        assert_eq!(s.change.unwrap().1, "99  renamed/sh  new -> starting");
+        let s = t.apply(&ev("session_removed", json!({"id": 99})));
+        assert!(s.pass);
+        assert_eq!(s.change.unwrap().1, "99  renamed/sh  starting -> removed");
+        for kind in ["channel_removed", "window_upserted", "window_removed"] {
+            let s = t.apply(&ev(kind, json!({"id": 1, "channel_ids": []})));
+            assert!(s.pass && s.change.is_none(), "{kind}");
+        }
+        assert!(t.apply(&ev("lagged", json!({"missed": 3}))).pass);
+    }
+
+    #[test]
+    fn events_filter_by_session_and_tab() {
+        let by_session = EventFilter { session: Some(10), channel: None };
+        let mut t = EventTracker::new(&snap(), by_session);
+        assert!(t.apply(&upsert(10, 1, "idle", None)).change.is_some());
+        let other = t.apply(&upsert(11, 1, "working", None));
+        assert!(!other.pass && other.change.is_none());
+        assert!(!t.apply(&ev("session_removed", json!({"id": 11}))).pass);
+        // Tab and window events pass when they concern the session's tab.
+        assert!(t.apply(&ev("channel_upserted", json!({"id": 1, "name": "fix-auth"}))).pass);
+        assert!(!t.apply(&ev("channel_upserted", json!({"id": 2, "name": "docs"}))).pass);
+        assert!(t.apply(&ev("window_upserted", json!({"id": 1, "channel_ids": [5, 1]}))).pass);
+        assert!(!t.apply(&ev("window_upserted", json!({"id": 2, "channel_ids": [2]}))).pass);
+        assert!(!t.apply(&ev("window_removed", json!({"id": 2}))).pass);
+        assert!(t.apply(&ev("lagged", json!({"missed": 1}))).pass);
+
+        let by_tab = EventFilter { session: None, channel: Some(6) };
+        let mut t = EventTracker::new(&snap(), by_tab);
+        assert!(t.apply(&upsert(60, 6, "working", None)).pass);
+        assert!(!t.apply(&upsert(30, 3, "working", None)).pass);
+        // Moving out of the tab still shows (the old channel matches); after that it doesn't.
+        assert!(t.apply(&upsert(61, 2, "idle", None)).pass);
+        assert!(!t.apply(&upsert(61, 2, "working", None)).pass);
+        assert!(t.apply(&ev("channel_removed", json!({"id": 6}))).pass);
+        assert!(!t.apply(&ev("channel_removed", json!({"id": 2}))).pass);
+        assert!(t.apply(&ev("session_removed", json!({"id": 62}))).pass);
+    }
+
+    #[test]
+    fn events_tab_resolution() {
+        let snap = snap();
+        assert_eq!(resolve_tab(&snap, "docs").unwrap(), 2);
+        assert_eq!(resolve_tab(&snap, "SHE").unwrap(), 6);
+        // "fix-auth", "fixtures" and "Fix src/main.rs" share the prefix.
+        let e = resolve_tab(&snap, "fix").unwrap_err();
+        assert_eq!(e.downcast_ref::<Exit>().map(|x| x.code), Some(2));
+        assert!(resolve_tab(&snap, "old").is_err(), "archived tabs never match");
+    }
+
+    #[test]
+    fn clock_is_hh_mm_ss() {
+        let c = clock(1_700_000_000_000);
+        assert_eq!(c.len(), 8);
+        assert_eq!(c.as_bytes()[2], b':');
+        assert!(c.ends_with(":20"), "{c}");
     }
 
     #[test]

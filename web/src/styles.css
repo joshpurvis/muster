@@ -546,6 +546,17 @@ body.dragging * {
   background: var(--hover);
 }
 
+.tb-split {
+  display: flex;
+  flex: none;
+  margin-right: 4px;
+}
+
+.tb-split-btn {
+  min-width: 26px;
+  padding: 0 4px;
+}
+
 .jump-btn {
   align-self: center;
   display: flex;

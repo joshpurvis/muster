@@ -36,11 +36,13 @@ Each `muster` opens its own window and returns at once.
 ```sh
 muster ls                                # ID  WIN  TAB  NAME  KIND  STATE  FOR  DETAIL
 muster new ~/src/app --prompt "fix the flaky test"   # prints the new session id
+muster new . --agent codex -- -m gpt-6-sol           # args after -- go to the agent CLI
 muster send fix-auth "run the tests" --wait          # prompt, then wait until it settles
 muster read fix-auth -n 100              # last 100 lines of output, plain text
 muster wait 12 --until needs_human       # block until it needs you (exit 124 on timeout)
 muster approve 12                        # answer a permission prompt
 muster keys 12 esc text:/compact enter
+muster events --tab fix-auth             # one line per state change, until Ctrl-C (--json: every event)
 ```
 
 A target is a session id, `.` (the session you're in), a session or tab name, a unique

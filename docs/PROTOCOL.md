@@ -12,8 +12,21 @@ mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
 | `POST /api/rpc` | `Authorization: Bearer <client token>` | Same JSON methods as the WebSocket (body `{id?, method, params}`, reply `{id, result}` / `{id, error}`), except `session.attach`/`session.detach`. Used by the CLI. |
+| `GET /api/events` | `Authorization: Bearer <client token>` | The event stream as NDJSON (below). Used by `muster events`. Like `/ws`, a request with a foreign `Origin` gets `403`. |
 | `POST /api/launch-code` | `Authorization: Bearer <client token>` | `{"code": "<64 hex>"}`: a single-use launch code, valid 60 s. Used by the CLI to open the UI. |
 | `POST /api/exchange` | the launch code | Body `{"code": "..."}` → `200 {"token": "<client token>"}` and the code is consumed. Unknown, used or expired code, or a bad body: `403 {"error": {"message": "invalid or expired launch code"}}`. Also `403` (code not consumed) when the request has no `Origin` or a foreign one, or when the connecting TCP socket isn't owned by the daemon's own uid (looked up in `/proc/net/tcp` / `tcp6`): a code on a browser command line is readable by other local users, who must not be able to redeem it. |
+
+### Event stream (`GET /api/events`)
+
+`200`, `Content-Type: application/x-ndjson`, chunked, never ends while the daemon runs. Each
+line is one event exactly as the WebSocket sends it (`{"event": "...", "data": {...}}`), for
+`session_upserted`, `session_removed`, `channel_upserted`, `channel_removed`,
+`window_upserted` and `window_removed` only: no event-log entries (`event`), notices,
+workspace events, method results or terminal output (nothing needs attaching). The daemon
+subscribes before it sends the response headers, so a client that reads the headers and then
+calls `hello` misses nothing in between. A reader that falls more than the bus's buffer behind
+gets `{"event":"lagged","data":{"missed":N}}` and the stream goes on; call `hello` to re-sync.
+The stream ends when the daemon stops. `401` without a valid client token.
 
 ### Opening the UI
 
@@ -98,7 +111,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell}` |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `permissions` defaults to the CLIs' defaults. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
@@ -225,7 +238,8 @@ restart), for every agent in the channel, including agents spawned through MCP:
 
 The flags are always passed, so the channel profile (not a `sandbox_mode`, `network_access` or
 `defaultMode` in the user's own config) decides how a session starts. Approval policies are not
-touched. The user's `extra_args` for a session come after these flags. Shells are not affected.
+touched. The user's `extra_args` for a session (`session.spawn`, or `channel.create` for its first
+agent) come after these flags. Shells are not affected.
 Channels created before this existed have the defaults (store migration v3). `permissions` in
 `channel.create` and `channel.set_permissions` must name both fields (a partial profile is
 rejected, so it can't silently reset the other half).

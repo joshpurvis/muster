@@ -35,7 +35,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 
 ```
 ┌ tab bar (34px) ─────────────────────────────────────────────────────────────────────────┐
-│ ● fix auth bug ⎇ ×│ ◐ muster ×│ ● new api ⎇ 🛡 ×│  +  ▾        [🔍 Ctrl Space] ⋯ │
+│ ● fix auth bug ⎇ ×│ ◐ muster ×│ ● new api ⎇ 🛡 ×│  +  ▾   ◫ ⊟  [🔍 Ctrl Space] ⋯ │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
 │ ┌ pane ──────────────────────────────┬ pane ───────────────────────┐                     │
 │ │ [approval banner when needed]      │                             │                     │
@@ -82,9 +82,14 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 - Past about 8 tabs the strip scrolls sideways (the wheel scrolls it and the active tab stays in
   view). A `N ▾` overflow button lists all tabs.
 - Right side: a "Reconnecting…" pill when disconnected, a chip naming this window (only when 2+
-  windows exist; click renames it), the Jump button, and `⋯` (Rename window…, Theme ▸, Status
+  windows exist; click renames it), the split buttons, the Jump button, and `⋯` (Rename window…, Theme ▸, Status
   line, Terminal gets Alt keys, Jump focuses the other window, Command palette, Keyboard
   shortcuts).
+- **Split right** / **Split down** (`◫ ⊟`, just left of Jump): split the active tab's focused
+  pane with a new shell, exactly like Alt+D / Alt+Shift+D (including the "Not enough room"
+  toast). A lone pane has no chrome, so these are its always-visible split controls. Tooltips
+  show the shortcuts; both are ordinary buttons in the tab order. Hidden when the window has no
+  tabs.
 - Closing a tab (Alt+W on its last session, `×`, menu) archives the channel. If an agent is
   working, the tab turns into an inline "Close? ⏎ / Esc" confirmation first. Closing never
   removes a worktree unless the "+ remove worktree" action is chosen.
@@ -113,7 +118,7 @@ bar. Differences:
 - Right-click in a pane opens the pane menu: Copy, Paste, Find…, New session here ▸, Split
   right ▸, Split down ▸, Zoom, Rename session, Restart, Interrupt, Kill process, Close pane.
   Programs that track the mouse keep the right button; Shift+right-click still opens the menu.
-  This is how a lone pane (no chrome) splits by mouse.
+  This and the tab bar's split buttons are how a lone pane (no chrome) splits by mouse.
 - `×` / Alt+W on a pane closes that session; the last session of a tab closes the tab. A busy
   session asks inline first ("Close? ⏎ / Esc" in its header or pane-tab).
 - Focus: with several panes, the focused one has a faint accent ring and the others sit under a

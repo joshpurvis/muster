@@ -75,6 +75,10 @@ pub struct CreateChannel {
     pub agent: Option<SessionKind>,
     /// Initial prompt for that agent.
     pub prompt: Option<String>,
+    /// Extra CLI arguments for that agent (after the permission flags, like
+    /// `SpawnSession::extra_args`). Needs `agent`. Kept for restarts of that session only.
+    #[serde(default, alias = "args")]
+    pub extra_args: Vec<String>,
     /// Agent permission profile. Default: the CLIs' own defaults (see `Permissions`).
     #[serde(default, deserialize_with = "de_permissions")]
     pub permissions: Option<Permissions>,
@@ -940,6 +944,9 @@ impl Hub {
         {
             anyhow::bail!("no such window: {w}");
         }
+        if req.agent.is_none() && !req.extra_args.is_empty() {
+            anyhow::bail!("extra_args needs an agent");
+        }
         let explicit = req
             .name
             .as_deref()
@@ -1063,7 +1070,7 @@ impl Hub {
                 name: None,
                 cwd: None,
                 prompt,
-                extra_args: Vec::new(),
+                extra_args: req.extra_args,
                 cols: req.cols,
                 rows: req.rows,
                 parent_id: None,

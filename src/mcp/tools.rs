@@ -700,6 +700,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
                 base: nc.str("base")?.map(str::to_string),
                 agent: None,
                 prompt: None,
+                extra_args: Vec::new(),
                 // Never more than the caller has: the new channel gets the caller's profile.
                 permissions: Some(my_ch.permissions),
                 window_id: None,

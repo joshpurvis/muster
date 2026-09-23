@@ -370,18 +370,16 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
         }
         "window.show" => {
             let p: IdParam<WindowId> = parse(params)?;
-            let w = hub
-                .window(p.id)
-                .ok_or_else(|| RpcError(format!("no such window: {}", p.id)))?;
-            // Already on screen: bring it forward (best effort; without a WM helper it just
-            // stays where it is). Never a second client for a held window.
-            if w.open {
-                let raised = crate::wm::raise(&crate::wm::window_title(&w.name)).await;
-                return Ok(json!({ "shown": if raised { "raised" } else { "open" } }));
-            }
-            // Launched moments ago and not claimed yet: don't open a duplicate.
-            if !hub.begin_window_launch(p.id) {
-                return Ok(json!({ "shown": "launching" }));
+            match hub.window_launch(p.id).map_err(|e| RpcError(e.to_string()))? {
+                // Already on screen: bring it forward (best effort; without a WM helper it just
+                // stays where it is). Never a second client for a held window.
+                crate::hub::WindowLaunch::Held(name) => {
+                    let raised = crate::wm::raise(&crate::wm::window_title(&name)).await;
+                    return Ok(json!({ "shown": if raised { "raised" } else { "open" } }));
+                }
+                // Launched moments ago and not claimed yet: don't open a duplicate.
+                crate::hub::WindowLaunch::Launching => return Ok(json!({ "shown": "launching" })),
+                crate::hub::WindowLaunch::Go => {}
             }
             // A client can't open another native window itself: launch one, like
             // `muster open --window N` from a terminal (the daemon's environment has the display).
@@ -405,15 +403,30 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
                     return Err(RpcError(format!("launching a window: {e}")));
                 }
             };
-            // `open` hands off to a detached window process and exits: a quick non-zero exit
-            // means the launch failed (the UI then falls back). Reaped either way.
-            let wait = tokio::task::spawn_blocking(move || child.wait());
-            match tokio::time::timeout(Duration::from_secs(3), wait).await {
-                Ok(Ok(Ok(status))) if !status.success() => {
+            // `open` hands off to a detached window process and exits: a non-zero exit means the
+            // launch failed. Within 3 s the caller hears about it (and falls back); later, the
+            // launch record is dropped so the next `window.show` can retry. Reaped either way.
+            let mut wait = tokio::task::spawn_blocking(move || child.wait());
+            let failed = |r: &Result<std::io::Result<std::process::ExitStatus>, tokio::task::JoinError>| {
+                matches!(r, Ok(Ok(status)) if !status.success())
+            };
+            match tokio::time::timeout(Duration::from_secs(3), &mut wait).await {
+                Ok(r) if failed(&r) => {
                     hub.end_window_launch(p.id);
-                    Err(RpcError(format!("launching a window failed ({status})")))
+                    Err(RpcError("launching a window failed (see `muster open --window N` in a terminal)".into()))
                 }
-                _ => Ok(json!({ "shown": "launched" })),
+                Ok(_) => Ok(json!({ "shown": "launched" })),
+                Err(_) => {
+                    let (hub, id) = (hub.clone(), p.id);
+                    tokio::spawn(async move {
+                        let r = wait.await;
+                        if failed(&r) {
+                            hub.end_window_launch(id);
+                            hub.notice("warn", format!("Opening window {id} failed; try `muster open --window {id}`"));
+                        }
+                    });
+                    Ok(json!({ "shown": "launched" }))
+                }
             }
         }
         "window.raise" => {

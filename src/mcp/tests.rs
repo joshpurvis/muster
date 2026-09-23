@@ -662,6 +662,7 @@ async fn spawn_agent_model_effort_and_args() {
         json!({"kind": "claude", "args": ["--dangerously-skip-permissions"]}),
         json!({"kind": "claude", "args": "--model x"}),
         json!({"kind": "shell", "model": "sonnet"}),
+        json!({"kind": "shell", "args": ["-c", "printf MARKER"]}),
     ] {
         let (t, err) = call(&st, "spawn_agent", bad.clone()).await;
         assert!(err, "{bad}: {t}");

@@ -675,6 +675,12 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
     if channel_id.is_some() && new_channel.is_some() {
         return Err("pass either channel_id or new_channel, not both".into());
     }
+    // Arguments to a shell are a command too (`-c ...`, a script path): the same rule.
+    if kind == SessionKind::Shell && !extra_args.is_empty() && !st.limits.allow_shell {
+        return Err(format!(
+            "agents can't pass arguments to a shell (they would run a command); spawn it without args for the human to use, or spawn an agent instead. {HOW_SHELL}"
+        ));
+    }
     if kind == SessionKind::Shell && prompt.is_some() && !st.limits.allow_shell {
         return Err(format!(
             "agents can't start a shell with a command (prompt); spawn it without a prompt for the human to use, or spawn an agent instead. {HOW_SHELL}"

@@ -1015,6 +1015,8 @@ pub struct EventTracker {
     /// Last known tab of the `--session` session: its tab and window can close after the
     /// session itself was removed (archiving removes sessions first).
     session_tab: Option<i64>,
+    /// Last known window of the `--session` session (kept after it is removed, like its tab).
+    session_win: Option<i64>,
     /// Tabs of each window, from `window_upserted`, so a `window_removed` can be matched.
     windows: std::collections::HashMap<i64, Vec<i64>>,
 }
@@ -1069,12 +1071,15 @@ impl EventTracker {
     fn note_session_tab(&mut self) {
         if let Some(s) = self.filter.session.and_then(|id| self.sessions.get(&id)) {
             self.session_tab = Some(s.channel_id);
+            if s.window_id.is_some() {
+                self.session_win = s.window_id;
+            }
         }
     }
 
     /// The `--session` session's own window (a tab can be in another window than its task).
     fn session_window(&self) -> Option<i64> {
-        self.filter.session.and_then(|id| self.sessions.get(&id)).and_then(|s| s.window_id)
+        self.session_win
     }
 
     fn unfiltered(&self) -> bool {

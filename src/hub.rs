@@ -263,16 +263,26 @@ const REPLAY_CACHE_MAX: usize = 8;
 impl Hub {
     /// Load persisted state. Sessions that were running when the previous daemon died are
     /// marked Exited ("daemon restarted").
-    /// Record a client-window launch for `id`; false while an earlier launch (under 15 s ago)
-    /// hasn't been claimed yet, so repeated `window.show` calls don't open duplicates.
-    pub fn begin_window_launch(&self, id: WindowId) -> bool {
+    /// Decide, under one lock, whether `window.show` should launch a client for `id`: not when a
+    /// connection holds it, nor while an earlier launch (under 15 s ago) hasn't been claimed;
+    /// otherwise the launch is recorded (so concurrent calls can't both launch).
+    pub fn window_launch(&self, id: WindowId) -> anyhow::Result<WindowLaunch> {
         let mut g = self.inner.lock();
+        let w = g.windows.get(&id).ok_or_else(|| anyhow::anyhow!("no such window: {id}"))?;
+        if w.holder.is_some() {
+            return Ok(WindowLaunch::Held(w.name.clone()));
+        }
         let now = std::time::Instant::now();
         if g.launching.get(&id).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(15)) {
-            return false;
+            return Ok(WindowLaunch::Launching);
         }
         g.launching.insert(id, now);
-        true
+        Ok(WindowLaunch::Go)
+    }
+
+    #[cfg(test)]
+    pub fn begin_window_launch(&self, id: WindowId) -> bool {
+        matches!(self.window_launch(id), Ok(WindowLaunch::Go))
     }
 
     /// A launch failed: allow the next `window.show` to try again.
@@ -856,6 +866,7 @@ impl Hub {
             e.info.exit_code = Some(code);
             e.info.pid = None;
             e.info.queued = 0;
+            e.info.subagents = 0;
             let token = e.token.take();
             let ch = e.info.channel_id;
             if let Some(t) = token {
@@ -1670,8 +1681,16 @@ impl Hub {
                         "warn",
                         format!("Kept worktree {}: session {user} in another tab still runs in it", ch.cwd),
                     ),
-                    Ok(_reservation) => {
-                        if let Err(e) = worktree::remove(&repo, Path::new(&ch.cwd)).await {
+                    Ok(reservation) => {
+                        // The delete runs as its own task that owns the reservation: if this
+                        // request goes away mid-way, the delete still finishes before anything
+                        // may start in that directory again.
+                        let path = PathBuf::from(&ch.cwd);
+                        let del = tokio::spawn(async move {
+                            let _reservation = reservation;
+                            worktree::remove(&repo, &path).await
+                        });
+                        if let Ok(Err(e)) = del.await {
                             self.notice("warn", format!("Could not remove worktree {}: {e:#}", ch.cwd));
                         }
                     }
@@ -1690,14 +1709,14 @@ impl Hub {
     /// Mark `ch`'s worktree as being deleted, unless a session outside `ch` runs (or is
     /// starting) in it; checked and marked under one lock, and `start_process` refuses cwds
     /// inside a marked directory, so nothing can start there until `release_worktree`.
-    fn reserve_worktree_removal(&self, ch: &Channel) -> Result<WorktreeReservation<'_>, SessionId> {
+    fn reserve_worktree_removal(self: &Arc<Self>, ch: &Channel) -> Result<WorktreeReservation, SessionId> {
         let mut g = self.inner.lock();
         if let Some(user) = dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy))) {
             return Err(user);
         }
         let path = PathBuf::from(&ch.cwd);
         *g.removing_worktrees.entry(path.clone()).or_insert(0) += 1;
-        Ok(WorktreeReservation { hub: self, path })
+        Ok(WorktreeReservation { hub: self.clone(), path })
     }
 
     /// Archive `id` (keeping any worktree) only if it has no sessions left, checked and marked
@@ -1909,6 +1928,12 @@ impl Hub {
                 self.inner.lock().sessions.remove(&id);
                 let _ = self.store.delete_session(id);
                 let _ = std::fs::remove_dir_all(paths::session_dir(id));
+                self.emit(ServerEvent::SessionRemoved { id });
+                // Its task's last other session may have been removed while this start was
+                // pending (that removal kept the task open for it): close it now if empty.
+                if let Err(err) = self.archive_if_empty(ch.id) {
+                    tracing::warn!(channel = ch.id, "closing an emptied task: {err}");
+                }
                 Err(e)
             }
         }
@@ -2424,11 +2449,13 @@ impl Hub {
             if let Some(w) = from {
                 self.drop_if_unused_locked(&mut g, w, &mut events);
             }
+            // Published before the lock is released, so two concurrent moves can't publish
+            // their snapshots in the opposite order of the changes (emit never takes the lock).
+            for ev in events.drain(..) {
+                self.emit(ev);
+            }
             next
         };
-        for ev in events {
-            self.emit(ev);
-        }
         Ok(info)
     }
 
@@ -2490,9 +2517,16 @@ impl Hub {
                 let t = titles_of(&g, cid);
                 g.titles.insert(cid, t);
             }
+            // Both tasks' windows follow their sessions, as after `session.set_window`.
+            let mut events = vec![ServerEvent::SessionUpserted(next.clone())];
+            for cid in [from, channel_id] {
+                self.task_follows_locked(&mut g, cid, next.window_id, &mut events);
+            }
+            for ev in events {
+                self.emit(ev);
+            }
             (next, from)
         };
-        self.emit(ServerEvent::SessionUpserted(info.clone()));
         self.rederive_name(from);
         self.rederive_name(channel_id);
         Ok((info, from))
@@ -2848,14 +2882,24 @@ pub fn prompt_name(text: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// What `window.show` does for a window (`Hub::window_launch`).
+pub enum WindowLaunch {
+    /// A client shows it (its name, for raising it).
+    Held(String),
+    /// A launch for it is already on its way.
+    Launching,
+    /// Launch one now (recorded).
+    Go,
+}
+
 /// A worktree directory marked as being deleted; unmarked when dropped, however the delete
 /// ends (done, failed, or its future dropped).
-struct WorktreeReservation<'a> {
-    hub: &'a Hub,
+struct WorktreeReservation {
+    hub: Arc<Hub>,
     path: PathBuf,
 }
 
-impl Drop for WorktreeReservation<'_> {
+impl Drop for WorktreeReservation {
     fn drop(&mut self) {
         let mut g = self.hub.inner.lock();
         if let Some(n) = g.removing_worktrees.get_mut(&self.path) {
@@ -2877,7 +2921,8 @@ fn dir_user<'a>(ch: &Channel, sessions: impl Iterator<Item = (&'a SessionInfo, b
 }
 
 /// How a hook changes the count of built-in subagents: +1 when the Agent/Task tool starts, -1
-/// when it returns (or fails), reset (`Some(None)`) when a session starts or ends. `None`: no
+/// when it returns (or fails), reset (`Some(None)`) when a session starts or ends or a turn
+/// stops. `None`: no
 /// change. Background subagents return at launch, so only foreground ones are counted.
 fn subagent_delta(event: &str, payload: &serde_json::Value) -> Option<Option<i32>> {
     let tool = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2885,7 +2930,9 @@ fn subagent_delta(event: &str, payload: &serde_json::Value) -> Option<Option<i32
     match event {
         "PreToolUse" if agent_tool => Some(Some(1)),
         "PostToolUse" | "PostToolUseFailure" if agent_tool => Some(Some(-1)),
-        "SessionStart" | "SessionEnd" => Some(None),
+        // A turn's end: foreground subagents are done by then (and a missed PostToolUse can't
+        // leave the count stuck past it).
+        "SessionStart" | "SessionEnd" | "Stop" | "StopFailure" => Some(None),
         _ => None,
     }
 }
@@ -3352,13 +3399,33 @@ mod tests {
     #[test]
     fn window_launches_are_deduplicated_until_failed_or_claimed() {
         let hub = move_fixture();
+        let w2 = hub.create_window(None).unwrap().id;
         assert!(hub.begin_window_launch(1));
         assert!(!hub.begin_window_launch(1), "a launch is already on its way");
-        assert!(hub.begin_window_launch(2), "other windows are independent");
+        assert!(hub.begin_window_launch(w2), "other windows are independent");
+        assert!(!hub.begin_window_launch(99), "unknown window");
         hub.end_window_launch(1);
         assert!(hub.begin_window_launch(1), "a failed launch can be retried");
         hub.claim_window(7, Some(1)).unwrap();
         assert!(!hub.inner.lock().launching.contains_key(&1), "claimed: launch done");
+        assert!(
+            matches!(hub.window_launch(1), Ok(WindowLaunch::Held(_))),
+            "a held window is raised, never launched again"
+        );
+    }
+
+    #[test]
+    fn subagent_counting() {
+        let tool = |t: &str| serde_json::json!({"tool_name": t});
+        assert_eq!(subagent_delta("PreToolUse", &tool("Agent")), Some(Some(1)));
+        assert_eq!(subagent_delta("PreToolUse", &tool("Task")), Some(Some(1)));
+        assert_eq!(subagent_delta("PostToolUse", &tool("Agent")), Some(Some(-1)));
+        assert_eq!(subagent_delta("PostToolUseFailure", &tool("Task")), Some(Some(-1)));
+        assert_eq!(subagent_delta("PreToolUse", &tool("Bash")), None);
+        // A turn's end or a new/ended session resets it (a missed PostToolUse can't stick).
+        for ev in ["Stop", "StopFailure", "SessionStart", "SessionEnd"] {
+            assert_eq!(subagent_delta(ev, &serde_json::json!({})), Some(None), "{ev}");
+        }
     }
 
     #[test]

@@ -11,7 +11,10 @@
 import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
 
-const [url, shots, repo] = Deno.args;
+const [url, shots, repo, mode] = Deno.args;
+// `real`: against a real (isolated!) daemon. Agents are replaced by a named shell and the
+// approval steps are skipped, so no real agent ever starts.
+const real = mode === "real";
 if (!url || !shots || !repo) {
   console.error("usage: e2e.ts <url#token=..> <shots-dir> <repo-path>");
   Deno.exit(2);
@@ -70,7 +73,11 @@ const a = await open(9341, "/tmp/muster-cdp-a");
 let b2: Browser | null = null;
 try {
   const hello: any = await R(a, "hello", {});
-  if (!String(hello.version).includes("mock")) throw new Error("e2e runs against the mock daemon only");
+  if (!real && !String(hello.version).includes("mock")) {
+    throw new Error(
+      "e2e runs against the mock daemon (or pass `real` for an isolated real daemon; no agents start)",
+    );
+  }
   check(await a.eval(`${M}.windowId.value`) !== null, "the mock has windows");
   check(!(await a.eval(`location.href`)).includes("token="), "token stripped from URL");
   check(/^(\(\d+\) )?muster · \d+$/.test(await a.eval(`document.title`)), "title is muster · <window>");
@@ -201,8 +208,10 @@ try {
   const ws = await R(a, "workspace.add", { path: repo });
   const c: any = await R(a, "channel.create", {
     workspace_id: ws.id,
-    agent: "claude",
-    prompt: "Fix the flaky login redirect test",
+    agent: real ? "shell" : "claude",
+    ...(real
+      ? { name: "Fix the flaky login redirect test" }
+      : { prompt: "Fix the flaky login redirect test" }),
     window_id: await a.eval(`${M}.windowId.value`),
     cols: 120,
     rows: 30,
@@ -214,17 +223,19 @@ try {
     4000,
   );
   ok("a new task's tab joined the focused group, named from its first prompt");
-  await a.sleep(3800); // the fake agent goes idle
-  await R(a, "session.send", { id: agent, text: "ask for approval" });
-  await a.wait(`${M}.sessions.value.get(${agent}).state === 'needs_approval'`, 8000);
-  await a.wait(`/^\\(1\\) muster/.test(document.title) && !!document.querySelector('.sl-needs')`, 3000);
-  await a.click(`[data-tab-sid="${t2}"]`);
-  await a.key("Alt+J");
-  await a.wait(`${M}.focusedSession.value?.id === ${agent} && !!document.querySelector('.approval')`, 3000);
-  ok("needs approval: (1) in the title, status line chip; Alt+J went there and shows the banner");
-  await shot(a, "03-approval");
-  await a.key("Alt+A");
-  await a.wait(`${M}.sessions.value.get(${agent}).state !== 'needs_approval'`, 4000);
+  if (!real) {
+    await a.sleep(3800); // the fake agent goes idle
+    await R(a, "session.send", { id: agent, text: "ask for approval" });
+    await a.wait(`${M}.sessions.value.get(${agent}).state === 'needs_approval'`, 8000);
+    await a.wait(`/^\\(1\\) muster/.test(document.title) && !!document.querySelector('.sl-needs')`, 3000);
+    await a.click(`[data-tab-sid="${t2}"]`);
+    await a.key("Alt+J");
+    await a.wait(`${M}.focusedSession.value?.id === ${agent} && !!document.querySelector('.approval')`, 3000);
+    ok("needs approval: (1) in the title, status line chip; Alt+J went there and shows the banner");
+    await shot(a, "03-approval");
+    await a.key("Alt+A");
+    await a.wait(`${M}.sessions.value.get(${agent}).state !== 'needs_approval'`, 4000);
+  }
 
   // ---- Jump: a tab of this window
   await a.click(`[data-tab-sid="${agent}"]`);
@@ -327,15 +338,20 @@ try {
   if (v2) {
     // One tab of a two-tab task moves on its own: a second shell in t2's task, pulled by Jump.
     const task: number = await a.eval(`${M}.sessions.value.get(${t2}).channel_id`);
-    const sib: any = await R(a, "session.spawn", { channel_id: task, kind: "shell", window_id: w1 });
+    const sib: any = await R(a, "session.spawn", {
+      channel_id: task,
+      kind: "shell",
+      name: "sibling",
+      window_id: w1,
+    });
     await a.wait(`${M}.windowSessions.value.some((s) => s.id === ${sib.id})`, 4000);
     await a.wait(
-      `document.querySelector('[data-tab-sid="${sib.id}"] .tab-sub')?.textContent === '· shell-2'`,
+      `document.querySelector('[data-tab-sid="${sib.id}"] .tab-sub')?.textContent === '· sibling'`,
       3000,
     );
     await b2.key("Ctrl+Space");
     await b2.wait(`!!document.querySelector('.switcher')`);
-    await b2.type("shell-2");
+    await b2.type("sibling");
     await b2.sleep(150);
     await b2.key("Enter");
     await b2.wait(`${M}.windowSessions.value.some((s) => s.id === ${sib.id})`, 4000);

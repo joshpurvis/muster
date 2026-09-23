@@ -2616,3 +2616,15 @@ textarea {
 .dialog-scroll .dlg-body {
   mask-image: linear-gradient(to bottom, transparent 0, #000 12px);
 }
+
+/* Built-in subagents running inside the tab's agent: a small count after the label. */
+.tab-subagents {
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  line-height: 14px;
+  color: var(--st-working);
+  background: var(--accent-soft);
+  flex: none;
+}

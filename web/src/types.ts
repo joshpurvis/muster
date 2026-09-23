@@ -92,6 +92,8 @@ export interface SessionInfo {
   cols: number;
   rows: number;
   queued: number;
+  /** Built-in subagents the agent is running right now (runtime only). */
+  subagents?: number;
   created_at: number;
   /** The window showing this session as a tab. Missing before v2: then its channel's window. */
   window_id?: WindowId | null;

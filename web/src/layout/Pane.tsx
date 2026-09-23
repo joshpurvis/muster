@@ -573,6 +573,11 @@ function GroupTab(
           <span class="tab-name">
             <span class={cx("tab-task", label.muted && "placeholder")}>{label.text}</span>
             {label.sub && <span class="tab-sub">· {label.sub}</span>}
+            {!!s.subagents && (
+              <span class="tab-subagents" title={`${s.subagents} subagent${s.subagents === 1 ? "" : "s"} running`}>
+                +{s.subagents}
+              </span>
+            )}
           </span>
         )}
       {c?.owns_worktree && (

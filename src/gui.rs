@@ -90,6 +90,13 @@ mod native {
 
     /// Runs the native window; never returns (tao's event loop exits the process).
     pub fn run(url: &str) -> ! {
+        // WebKitGTK's DMA-BUF renderer dies with "Error 71 (Protocol error)" on many Wayland
+        // setups (notably NVIDIA). Opt out unless the user chose otherwise.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            // SAFETY: called before the event loop or any other thread of this process starts.
+            unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+        }
         let event_loop = EventLoop::new();
         let window = match WindowBuilder::new()
             .with_title("Muster")

@@ -75,8 +75,10 @@ pub fn config_overrides(muster_bin: &str, daemon_url: &str, with_hooks: bool) ->
     if with_hooks {
         let bin = sh_quote(muster_bin);
         for ev in HOOK_EVENTS {
+            // Codex clamps Interrupt hooks to 3s and prints a warning for anything longer.
+            let timeout = if *ev == "Interrupt" { 3 } else { 10 };
             out.push(format!(
-                "hooks.{ev}=[{{hooks=[{{type=\"command\",command={},timeout=10}}]}}]",
+                "hooks.{ev}=[{{hooks=[{{type=\"command\",command={},timeout={timeout}}}]}}]",
                 toml_str(&format!("{bin} hook codex {ev}"))
             ));
         }

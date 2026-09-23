@@ -1,4 +1,4 @@
-// Small helpers: fuzzy matching, time formatting, slugs, clipboard, storage.
+// Small helpers: fuzzy matching, paths, clipboard, storage.
 
 /**
  * Fuzzy subsequence score. Returns null when `q` isn't a subsequence of `s`.
@@ -31,39 +31,6 @@ export function fuzzy(q: string, s: string, hits?: number[]): number | null {
   score -= s.length * 0.02;
   if (sl.startsWith(ql)) score += 8;
   return score;
-}
-
-export function timeAgo(ms: number, now = Date.now()): string {
-  const d = Math.max(0, now - ms) / 1000;
-  if (d < 45) return "now";
-  if (d < 3600) return `${Math.round(d / 60)}m`;
-  if (d < 86400) return `${Math.round(d / 3600)}h`;
-  if (d < 86400 * 7) return `${Math.round(d / 86400)}d`;
-  return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
-
-export function clockTime(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-}
-
-export function dayLabel(ms: number): string {
-  const d = new Date(ms);
-  const today = new Date();
-  const yest = new Date(Date.now() - 86400000);
-  if (d.toDateString() === today.toDateString()) return "Today";
-  if (d.toDateString() === yest.toDateString()) return "Yesterday";
-  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
-}
-
-/** Mirror of the daemon's slug rule (guess: lowercase, [a-z0-9-], collapse dashes). */
-export function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 48);
 }
 
 export function tildify(path: string, home: string): string {
@@ -115,10 +82,6 @@ export function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number)
     t = setTimeout(() => fn(...a), ms);
   };
   return d;
-}
-
-export function clamp(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v));
 }
 
 export const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);

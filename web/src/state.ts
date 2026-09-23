@@ -1,7 +1,7 @@
 // App state as signals. Server state is replaced/merged from hello + ServerEvents;
 // UI prefs persist to localStorage.
 
-import { batch, computed, effect, type Signal, signal } from "@preact/signals";
+import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AgentState,
   Channel,
@@ -11,12 +11,15 @@ import type {
   SessionId,
   SessionInfo,
   TimelineEvent,
+  Win,
+  WindowId,
   Workspace,
 } from "./types.ts";
-import { needsHuman, STATE_PRIORITY } from "./types.ts";
+import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { debounce, load, save } from "./util.ts";
 import { emptyLayout, type LayoutState, parseLayout, reconcile } from "./layout/tree.ts";
+import { documentTitle, needsYouOrder, pushFront, tabsOf, upsertWindow, windowIdOf } from "./model.ts";
 
 // ---------------- server state ----------------
 
@@ -26,8 +29,16 @@ export const workspaces = signal<Workspace[]>([]);
 export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 
+/** Every window the daemon knows (all clients). */
+export const windows = signal<Win[]>([]);
+/** The daemon has windows (hello carried `windows`). Without them every channel is a tab here. */
+export const windowsSupported = signal(false);
+/** The window this client claimed (null until claimed, or without window support). */
+export const windowId = signal<WindowId | null>(null);
+
 export const channelById = computed(() => new Map(channels.value.map((c) => [c.id, c])));
 export const workspaceById = computed(() => new Map(workspaces.value.map((w) => [w.id, w])));
+export const windowById = computed(() => new Map(windows.value.map((w) => [w.id, w])));
 
 export const sessionsByChannel = computed(() => {
   const m = new Map<ChannelId, SessionInfo[]>();
@@ -40,108 +51,38 @@ export const sessionsByChannel = computed(() => {
   return m;
 });
 
-/** Channels in sidebar order, grouped by workspace. */
-export const channelsByWorkspace = computed(() => {
-  const m = new Map<number, Channel[]>();
-  for (const c of channels.value) {
-    if (c.archived) continue;
-    let arr = m.get(c.workspace_id);
-    if (!arr) m.set(c.workspace_id, arr = []);
-    arr.push(c);
-  }
-  for (const arr of m.values()) arr.sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
-  return m;
+export const myWindow = computed(() =>
+  windowId.value !== null ? windowById.value.get(windowId.value) ?? null : null
+);
+
+/** This window's tabs, in order. */
+export const tabs = computed((): Channel[] => {
+  if (!windowsSupported.value) return tabsOf(null, channels.value);
+  const w = myWindow.value;
+  return w ? tabsOf(w, channels.value) : [];
 });
 
-/** Flat sidebar order (for Alt+1..9 and Ctrl+Alt+Up/Down). Skips collapsed workspaces? No: all. */
-export const channelOrder = computed(() => {
-  const out: Channel[] = [];
-  for (const w of workspaces.value) out.push(...(channelsByWorkspace.value.get(w.id) ?? []));
-  return out;
-});
+export const tabIdSet = computed(() => new Set(tabs.value.map((c) => c.id)));
 
-export function aggregateState(list: SessionInfo[] | undefined): AgentState | null {
-  if (!list || !list.length) return null;
-  let best: AgentState = list[0].state;
-  for (const s of list) {
-    if (STATE_PRIORITY.indexOf(s.state) < STATE_PRIORITY.indexOf(best)) best = s.state;
-  }
-  return best;
+/** Window a channel is a tab in (null: none, or no window support). */
+export function windowOf(c: Channel): WindowId | null {
+  if (!windowsSupported.value) return windowId.value;
+  return windowIdOf(c, windows.value);
 }
 
-export const inboxItems = computed(() => {
-  const items = [...sessions.value.values()].filter((s) =>
-    needsHuman(s.state) && channelById.value.get(s.channel_id) &&
-    !channelById.value.get(s.channel_id)!.archived
-  );
-  items.sort((a, b) =>
-    STATE_PRIORITY.indexOf(a.state) - STATE_PRIORITY.indexOf(b.state) ||
-    a.state_since - b.state_since
-  );
-  return items;
-});
+/** Sessions needing the human in any window, in Alt+J order. */
+export const needsYou = computed(() =>
+  needsYouOrder(sessions.value.values(), new Set(channels.value.filter((c) => !c.archived).map((c) => c.id)))
+);
 
-// ---------------- timeline + unread ----------------
+/** How many of those are in this window's tabs. */
+export const needsYouHere = computed(() =>
+  needsYou.value.filter((s) => tabIdSet.value.has(s.channel_id)).length
+);
 
-export interface TimelineState {
-  events: TimelineEvent[];
-  loaded: boolean;
-  loading: boolean;
-  hasMore: boolean;
-}
+// ---------------- unread ----------------
 
-const timelines = new Map<ChannelId, Signal<TimelineState>>();
-
-export function timelineOf(ch: ChannelId): Signal<TimelineState> {
-  let t = timelines.get(ch);
-  if (!t) {
-    t = signal({ events: [], loaded: false, loading: false, hasMore: true });
-    timelines.set(ch, t);
-  }
-  return t;
-}
-
-export async function loadTimeline(ch: ChannelId, older = false) {
-  const t = timelineOf(ch);
-  if (t.value.loading) return;
-  if (older && !t.value.hasMore) return;
-  const lastBefore = t.value.events[t.value.events.length - 1]?.id;
-  t.value = { ...t.value, loading: true };
-  try {
-    const before = older && t.value.events.length ? t.value.events[0].id : undefined;
-    const limit = 150;
-    const evs = await rpc.call<TimelineEvent[]>("channel.timeline", { id: ch, before, limit });
-    const cur = t.value;
-    const full = evs.length >= limit;
-    // A refresh after a long disconnect can return a full page that doesn't reach back to what
-    // we already have. Merging would hide the hole, so start over from the fresh page instead;
-    // scrolling up loads the rest in order.
-    // Compare with what we had before the call: live events appended meanwhile would hide it.
-    const gap = !older && full && lastBefore !== undefined && evs.length > 0 && evs[0].id > lastBefore;
-    const merged = older
-      ? [...evs, ...cur.events]
-      : gap
-      ? mergeEvents(evs, cur.events.filter((e) => e.id > evs[evs.length - 1].id))
-      : mergeEvents(cur.events, evs);
-    t.value = {
-      events: merged,
-      loaded: true,
-      loading: false,
-      hasMore: older || gap || !cur.loaded ? full : cur.hasMore,
-    };
-  } catch {
-    t.value = { ...t.value, loading: false };
-  }
-}
-
-function mergeEvents(a: TimelineEvent[], b: TimelineEvent[]): TimelineEvent[] {
-  const m = new Map<number, TimelineEvent>();
-  for (const e of a) m.set(e.id, e);
-  for (const e of b) m.set(e.id, e);
-  return [...m.values()].sort((x, y) => x.id - y.id);
-}
-
-/** Latest "notable" event per channel (what makes a channel bold/unread). */
+/** Latest "notable" event per channel (what makes a tab bold/unread). */
 export const latestNotable = signal<Map<ChannelId, number>>(new Map());
 
 export function isNotable(e: TimelineEvent): boolean {
@@ -185,45 +126,58 @@ export const unread = computed(() => {
 
 // ---------------- UI state ----------------
 
-export type View = "channel" | "inbox";
-export const view = signal<View>("channel");
-export const activeChannelId = signal<ChannelId | null>(load("activeChannel", null));
-effect(() => save("activeChannel", activeChannelId.value));
+const activeKey = () => `active.${windowId.value ?? 0}`;
+export const activeChannelId = signal<ChannelId | null>(null);
 
-export const activeChannel = computed(() =>
-  activeChannelId.value !== null ? channelById.value.get(activeChannelId.value) ?? null : null
-);
+export const activeChannel = computed(() => {
+  const id = activeChannelId.value;
+  if (id === null || !tabIdSet.value.has(id)) return null;
+  return channelById.value.get(id) ?? null;
+});
 
 export interface Prefs {
-  sidebarWidth: number;
-  sidebarCollapsed: boolean;
-  rightWidth: number;
-  rightOpen: boolean;
-  rightTab: "timeline" | "diff";
   fontSize: number;
   theme: "system" | "dark" | "light";
   lastAgent: "claude" | "codex" | "shell" | "none";
-  collapsedWorkspaces: number[];
+  /** Jump recency keys ("c:<id>", "s:<id>", "f:<path>"), most recent first. */
   recent: string[];
+  /** Folders new tabs were opened in, most recent first. */
+  recentFolders: string[];
+  statusLine: boolean;
   /** Pass Alt shortcuts (except Alt+Shift+…) through to a focused terminal. */
   altToTerminal: boolean;
+  /** Jump / Alt+J focus the other window (window.raise) instead of pulling its tab here. */
+  jumpRaises: boolean;
 }
 
 const defaultPrefs: Prefs = {
-  sidebarWidth: 248,
-  sidebarCollapsed: false,
-  rightWidth: 340,
-  rightOpen: false,
-  rightTab: "timeline",
   fontSize: 13,
   theme: "system",
   lastAgent: "claude",
-  collapsedWorkspaces: [],
   recent: [],
+  recentFolders: [],
+  statusLine: true,
   altToTerminal: false,
+  jumpRaises: false,
 };
 
-export const prefs = signal<Prefs>({ ...defaultPrefs, ...load<Partial<Prefs>>("prefs", {}) });
+function loadPrefs(): Prefs {
+  const raw = load<Partial<Prefs>>("prefs", {});
+  const out: Prefs = { ...defaultPrefs };
+  for (const k of Object.keys(defaultPrefs) as (keyof Prefs)[]) {
+    const v = raw?.[k];
+    // Only keep values of the expected type (old builds stored other shapes).
+    if (
+      v !== undefined && typeof v === typeof defaultPrefs[k] &&
+      Array.isArray(v) === Array.isArray(defaultPrefs[k])
+    ) {
+      (out as unknown as Record<string, unknown>)[k] = v;
+    }
+  }
+  return out;
+}
+
+export const prefs = signal<Prefs>(loadPrefs());
 const savePrefs = debounce((p: Prefs) => save("prefs", p), 200);
 effect(() => savePrefs(prefs.value));
 
@@ -232,17 +186,20 @@ export function setPref<K extends keyof Prefs>(k: K, v: Prefs[K]) {
 }
 
 export function pushRecent(key: string) {
-  const r = [key, ...prefs.value.recent.filter((x) => x !== key)].slice(0, 20);
-  setPref("recent", r);
+  setPref("recent", pushFront(prefs.value.recent, key, 30));
+}
+
+export function pushRecentFolder(path: string) {
+  setPref("recentFolders", pushFront(prefs.value.recentFolders, path.replace(/\/+$/, "") || "/", 12));
 }
 
 // Overlays (only one modal at a time).
 export type Overlay =
-  | { kind: "switcher"; initial: string }
-  | { kind: "new_channel"; workspaceId?: number }
-  | { kind: "add_workspace" }
+  | { kind: "jump"; initial: string }
+  | { kind: "new_tab"; worktree?: boolean; cwd?: string }
   | { kind: "shortcuts" }
   | { kind: "permissions"; channelId: number }
+  | { kind: "rename_window" }
   | {
     kind: "confirm";
     title: string;
@@ -273,29 +230,62 @@ export function dismissToast(id: number) {
   toasts.value = toasts.value.filter((t) => t.id !== id);
 }
 
-/** Session whose tab close is awaiting inline confirmation. */
-export const confirmClose = signal<SessionId | null>(null);
-// A pending "Kill?" never survives a channel switch.
+/** A close awaiting inline confirmation: a session (pane) or a whole tab. */
+export type PendingClose = { kind: "session"; id: SessionId } | { kind: "channel"; id: ChannelId };
+export const confirmClose = signal<PendingClose | null>(null);
+// A pending "Close?" never survives a tab switch.
 effect(() => {
   void activeChannelId.value;
-  void view.value;
   confirmClose.value = null;
 });
 
-/** States in which closing a tab asks first. */
+/** States in which closing asks first. */
 export const BUSY_STATES = new Set<AgentState>(["working", "starting", "needs_approval", "asking_question"]);
 
-/** The right panel was closed by a narrow window (not by the user; prefs keep their wish). */
-export const rightSuppressed = signal(false);
-export const rightVisible = computed(() => prefs.value.rightOpen && !rightSuppressed.value);
+export function channelBusy(ch: ChannelId): boolean {
+  return (sessionsByChannel.value.get(ch) ?? []).some((s) => BUSY_STATES.has(s.state));
+}
 
-/** Alt has been held on its own for a moment (sidebar shows Alt+1..9 numbers). */
+/** Alt has been held on its own for a moment (tabs show their Alt+1..9 numbers). */
 export const altHeld = signal(false);
 
-/** Session ids being renamed inline (tab or sidebar). */
-export const renaming = signal<{ kind: "channel" | "session"; id: number; where: string } | null>(
-  null,
-);
+/** What is being renamed inline. */
+export const renaming = signal<{ kind: "channel" | "session"; id: number } | null>(null);
+
+// ---------------- active tab ----------------
+
+let lastOrder: ChannelId[] = [];
+// Keep a valid active tab: the stored one for this window, else a neighbour of the one that
+// just left (closed or moved to another window), else the first.
+effect(() => {
+  const list = tabs.value;
+  const ids = list.map((c) => c.id);
+  const cur = activeChannelId.peek();
+  if (!helloDone.value) return;
+  if (cur !== null && ids.includes(cur)) {
+    lastOrder = ids;
+    return;
+  }
+  let next: ChannelId | null = null;
+  if (cur === null) {
+    const stored = load<ChannelId | null>(activeKey(), null);
+    if (stored !== null && ids.includes(stored)) next = stored;
+  } else {
+    const i = lastOrder.indexOf(cur);
+    const survivors = lastOrder.filter((id) => ids.includes(id));
+    if (i >= 0) {
+      const before = lastOrder.slice(0, i).filter((id) => ids.includes(id));
+      next = survivors[before.length] ?? survivors[before.length - 1] ?? null;
+    }
+  }
+  lastOrder = ids;
+  activeChannelId.value = next ?? ids[0] ?? null;
+});
+effect(() => {
+  const id = activeChannelId.value;
+  // Only a tab of this window (a stale id from before a claim must not land under its key).
+  if (id !== null && helloDone.peek() && tabIdSet.value.has(id)) save(activeKey(), id);
+});
 
 // ---------------- layouts ----------------
 
@@ -340,6 +330,16 @@ export function knowSession(s: SessionInfo) {
   const m = new Map(sessions.value);
   m.set(s.id, s);
   sessions.value = m;
+}
+
+/** Record a channel from an RPC reply (its channel_upserted event may lag). */
+export function knowChannel(c: Channel) {
+  channels.value = upsertBy(channels.value, c);
+}
+
+/** Record a window from an RPC reply. */
+export function knowWindow(w: Win) {
+  windows.value = upsertWindow(windows.value, w);
 }
 
 /** Release one hold; once none remain, anything still held is placed normally. */
@@ -400,24 +400,22 @@ function upsertBy<T extends { id: number }>(arr: T[], item: T): T[] {
   return out;
 }
 
-export type SessionListener = (s: SessionInfo, prev: SessionInfo | undefined) => void;
-const sessionListeners: SessionListener[] = [];
-export function onSessionChange(f: SessionListener) {
-  sessionListeners.push(f);
-}
 export const removedSessionListeners: ((id: SessionId) => void)[] = [];
+/** Called when the window this client holds disappeared (it must claim again). */
+export const windowLostListeners: (() => void)[] = [];
 
 export function applyHello(h: HelloResult) {
   batch(() => {
     meta.value = { version: h.version, home: h.home, default_shell: h.default_shell };
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     channels.value = h.channels.filter((c) => !c.archived);
+    windowsSupported.value = Array.isArray(h.windows);
+    windows.value = [...(h.windows ?? [])].sort((a, b) => a.id - b.id);
     const prev = sessions.value;
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
     for (const s of h.sessions) {
       if (!prev.has(s.id) && spawnHolds.has(s.channel_id)) held.add(s.id);
     }
-    for (const s of h.sessions) for (const f of sessionListeners) f(s, prev.get(s.id));
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
     }
@@ -427,20 +425,15 @@ export function applyHello(h: HelloResult) {
       if (channelById.value.has(ch)) m.set(ch, reconcile(l, liveIds(ch)));
     }
     layouts.value = m;
-    if (activeChannelId.value !== null && !channelById.value.has(activeChannelId.value)) {
-      activeChannelId.value = channelOrder.value[0]?.id ?? null;
-    }
-    if (activeChannelId.value === null) activeChannelId.value = channelOrder.value[0]?.id ?? null;
     helloDone.value = true;
   });
   // Seed unread state with a little history per channel.
   for (const c of h.channels) {
+    if (c.archived) continue;
     rpc.call<TimelineEvent[]>("channel.timeline", { id: c.id, limit: 30 }).then((evs) => {
       for (const e of evs) noteNotable(e);
     }).catch(() => {});
   }
-  // Timelines that were open need refreshing (we may have missed events).
-  for (const [ch, t] of timelines) if (t.value.loaded) loadTimeline(ch);
 }
 
 export function applyEvent(ev: ServerEvent) {
@@ -463,15 +456,27 @@ export function applyEvent(ev: ServerEvent) {
     case "channel_removed":
       removeChannel(ev.data.id);
       break;
+    case "window_upserted":
+      windows.value = upsertWindow(windows.value, ev.data);
+      break;
+    case "window_removed":
+      windows.value = windows.value.filter((w) => w.id !== ev.data.id);
+      if (ev.data.id === windowId.value) { for (const f of windowLostListeners) f(); }
+      break;
     case "session_upserted": {
       const prev = sessions.value.get(ev.data.id);
       const m = new Map(sessions.value);
       m.set(ev.data.id, ev.data);
       sessions.value = m;
-      for (const f of sessionListeners) f(ev.data, prev);
       if (!prev && spawnHolds.has(ev.data.channel_id)) held.add(ev.data.id);
       if (!prev) reconcileChannel(ev.data.channel_id);
-      if (confirmClose.value === ev.data.id && !BUSY_STATES.has(ev.data.state)) confirmClose.value = null;
+      const cc = confirmClose.value;
+      if (cc?.kind === "session" && cc.id === ev.data.id && !BUSY_STATES.has(ev.data.state)) {
+        confirmClose.value = null;
+      }
+      if (cc?.kind === "channel" && cc.id === ev.data.channel_id && !channelBusy(cc.id)) {
+        confirmClose.value = null;
+      }
       break;
     }
     case "session_removed": {
@@ -483,20 +488,14 @@ export function applyEvent(ev: ServerEvent) {
       held.delete(ev.data.id);
       for (const f of removedSessionListeners) f(ev.data.id);
       reconcileChannel(prev.channel_id);
-      if (confirmClose.value === ev.data.id) confirmClose.value = null;
+      const cc = confirmClose.value;
+      if (cc?.kind === "session" && cc.id === ev.data.id) confirmClose.value = null;
       break;
     }
     case "event": {
       const e = ev.data;
       noteNotable(e);
-      if (e.channel_id !== null) {
-        const t = timelines.get(e.channel_id);
-        // Buffer even before the first load finishes; loadTimeline merges by id.
-        if (t && !t.value.events.some((x) => x.id === e.id)) {
-          t.value = { ...t.value, events: [...t.value.events, e] };
-        }
-        maybeMarkRead(e.channel_id);
-      }
+      if (e.channel_id !== null) maybeMarkRead(e.channel_id);
       break;
     }
     case "notice":
@@ -511,19 +510,17 @@ function removeChannel(id: ChannelId) {
     const m = new Map(layouts.value);
     m.delete(id);
     layouts.value = m;
-    timelines.delete(id);
-    if (activeChannelId.value === id) activeChannelId.value = channelOrder.value[0]?.id ?? null;
+    const cc = confirmClose.value;
+    if (cc?.kind === "channel" && cc.id === id) confirmClose.value = null;
   });
 }
 
 // ---------------- read tracking ----------------
 
-// One pending mark per channel: switching channels quickly must not drop the first one. Each
+// One pending mark per channel: switching tabs quickly must not drop the first one. Each
 // mark while one is pending moves its `seenAt` forward (what was on screen at the latest look).
 const readTimers = new Map<ChannelId, { timer: number; seenAt: number }>();
 function markReadSoon(ch: ChannelId) {
-  // What was on screen when we looked counts as read; events after that (e.g. after leaving
-  // the channel within the delay) stay unread.
   const pending = readTimers.get(ch);
   if (pending) {
     pending.seenAt = Date.now();
@@ -546,24 +543,21 @@ export function markRead(ch: ChannelId) {
 }
 
 function maybeMarkRead(ch: ChannelId) {
-  if (
-    ch === activeChannelId.value && view.value === "channel" && document.visibilityState === "visible" &&
-    document.hasFocus()
-  ) {
+  if (ch === activeChannel.value?.id && document.visibilityState === "visible" && document.hasFocus()) {
     markReadSoon(ch);
   }
 }
 
 effect(() => {
-  const ch = activeChannelId.value;
-  if (ch !== null && view.value === "channel") markRead(ch);
+  const c = activeChannel.value;
+  if (c) markRead(c.id);
 });
 
 addEventListener("focus", () => {
-  if (activeChannelId.value !== null && view.value === "channel") markRead(activeChannelId.value);
+  const c = activeChannel.value;
+  if (c) markRead(c.id);
 });
 
 effect(() => {
-  const n = inboxItems.value.length;
-  document.title = n ? `(${n}) Muster` : "Muster";
+  document.title = documentTitle(windowsSupported.value ? myWindow.value : null, needsYouHere.value);
 });

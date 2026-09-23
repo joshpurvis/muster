@@ -130,6 +130,14 @@ function computeTarget(x: number, y: number, ch: number, sid: number): Target | 
       line: { left: lineX - 1, top: sr.top + 4, height: sr.height - 8 },
     };
   }
+  // A pane header joins that pane's sessions (like dropping on its center).
+  const head = el.closest("[data-pane-head]") as HTMLElement | null;
+  if (head) {
+    const paneId = head.dataset.paneHead!;
+    if (isNoopMove(l, sid, paneId, "center")) return null;
+    const r = (head.closest("[data-pane]") ?? head).getBoundingClientRect();
+    return { paneId, zone: "center", rect: { left: r.left, top: r.top, width: r.width, height: r.height } };
+  }
   const body = el.closest("[data-pane-body]") as HTMLElement | null;
   if (!body) return null;
   const paneId = body.dataset.paneBody!;

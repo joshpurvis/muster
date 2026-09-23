@@ -55,28 +55,49 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   anything was derived, it shows the folder name in muted italics.
 - Active tab: `--bg-2` background joined to the content, with an accent top bar. Unread
   activity (state changed since you last viewed it) shows a bold name.
-- Double-click renames inline. Middle-click closes. Drag reorders (`window.reorder_tabs`), and
-  dragging a tab out of the bar onto the jump button or a "→ window N" entry moves it. The
+- The strip uses a roving tabindex: ←/→/Home/End select tabs, Enter focuses the terminal, F2
+  renames.
+- Double-click renames inline. Middle-click closes. Drag reorders (`window.reorder_tabs`). While
+  a tab is dragged, "→ Window N" and "→ New window" targets appear in the bar; dropping on one
+  moves the tab there, and dropping on the Jump button opens a "Move tab to" menu. The
   context menu has Rename, Permissions…, Copy path, Copy branch, Move to window ▸ (existing
-  windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree).
-- `+` makes a new tab (same folder as the active tab, no worktree, last agent kind). `▾` next
-  to it opens a menu: New tab…, New worktree tab, and Claude / Codex / Shell.
+  windows plus "New window"), Close tab and Close tab + remove worktree (only with a worktree,
+  confirmed in a dialog).
+- "New window" creates a window (`window.create`), moves the tab there and opens it as a new
+  browser window (`#window=<id>`); when that is blocked, a toast says to run
+  `muster open --window N`. Moving a tab to a window no client shows opens it the same way.
+- `+` makes a new tab (same folder as the active tab, no worktree, last agent kind).
+  Double-clicking the empty part of the bar does the same. `▾` next to it opens a menu: New
+  tab…, New worktree tab, and Claude / Codex / Shell (a new tab here with that agent).
 - Past about 8 tabs the strip scrolls sideways (the wheel scrolls it and the active tab stays in
   view). A `N ▾` overflow button lists all tabs.
-- Closing a tab (Alt+W on the last pane, `×`, menu) archives the channel. If an agent is
+- Right side: a "Reconnecting…" pill when disconnected, a chip naming this window (only when 2+
+  windows exist; click renames it), the Jump button, and `⋯` (Rename window…, Theme ▸, Status
+  line, Terminal gets Alt keys, Jump focuses the other window, Command palette, Keyboard
+  shortcuts).
+- Closing a tab (Alt+W on its last session, `×`, menu) archives the channel. If an agent is
   working, the tab turns into an inline "Close? ⏎ / Esc" confirmation first. Closing never
   removes a worktree unless the "+ remove worktree" action is chosen.
-- A window with no tabs shows the empty launcher (Claude / Codex / Shell, keys 1 2 3, folder
-  picker).
+- A window with no tabs shows the empty launcher (folder input with `fs.complete`, then
+  Claude / Codex / Shell, keys 1 2 3).
+- The active tab is remembered per window (localStorage). When the active tab closes or moves
+  away, its neighbour becomes active.
 
 ### Panes
 Everything in v0 "Panes" carries over: the layout tree, reconcile, min sizes, gutters, drag and
 drop with drop-zone overlays, zoom, the reparented cached xterm instances, and the exited-session
 bar. Differences:
-- A pane shows a thin **pane header** (22px: kind icon, session name, state word, `×`) only
-  when the tab has 2 or more panes. With one pane there is no chrome at all. Dragging the
-  header works like dragging a v0 pane-tab.
-- The pane tab strip only appears when the pane holds 2+ sessions.
+- A pane shows a thin **pane header** (22px: kind icon, session name, state word, split/zoom
+  buttons on hover, `×`) only when the tab has 2 or more panes. With one pane there is no
+  chrome at all. Dragging the header works like dragging a v0 pane-tab, and dropping a session
+  on a header joins that pane. Double-click renames the session.
+- The pane tab strip only appears when the pane holds 2+ sessions; it replaces the header.
+- Right-click in a pane opens the pane menu: Copy, Paste, Find…, New session here ▸, Split
+  right ▸, Split down ▸, Zoom, Rename session, Restart, Interrupt, Kill process, Close pane.
+  Programs that track the mouse keep the right button; Shift+right-click still opens the menu.
+  This is how a lone pane (no chrome) splits by mouse.
+- `×` / Alt+W on a pane closes that session; the last session of a tab closes the tab. A busy
+  session asks inline first ("Close? ⏎ / Esc" in its header or pane-tab).
 - Focus: with several panes, the focused one has a faint accent ring and the others sit under a
   light dim veil.
 - Approval banner above the terminal for needs_approval / asking_question, as in v0:
@@ -90,18 +111,24 @@ chip, which is the same as Alt+J, and a connection dot.
 
 ### Overlays
 - **Jump** (Ctrl+Shift+K anywhere, Ctrl+K outside terminals): fuzzy search over every tab and
-  session in **all windows**, and folders for "new tab here". Rows show the state dot,
-  name, tab, window number, cwd and state detail. Sessions that need you come first, then recent
-  ones. `>` switches to commands (Ctrl+Shift+P opens with `>`), and every command lists its
+  session in **all windows**, and folders for "new tab here" (recent folders and known
+  workspaces; choosing one opens a tab there with the last agent kind). Rows show the state dot,
+  name, tab, window (for other windows), cwd and state detail. A tab with a single session is
+  one row; tabs with several also list each session. Sessions that need you come first, then
+  recent ones, then this window's tabs in order. Plain queries also match commands (ranked
+  last). `>` switches to commands (Ctrl+Shift+P opens with `>`), and every command lists its
   shortcut. Choosing something in another window **pulls that tab into this window**
-  (`channel.move`) by default. The setting "Jump focuses the other window" (palette, stored in
-  localStorage) makes it call `window.raise` instead, falling back to pulling when that returns
-  `raised: false`.
+  (`channel.move`) by default. The setting "Jump focuses the other window" (palette or `⋯`,
+  stored in localStorage) makes it call `window.raise` instead, falling back to pulling when
+  that returns `raised: false`. Raising doesn't select the tab over there (there is no RPC for
+  that).
 - **New tab…** (Alt+Shift+N): folder (path input with `fs.complete`, defaults to the active
-  tab's folder; recent folders listed), agent segmented control (Claude · Codex · Shell · None;
-  remembers last), worktree toggle (default **off**; on when opened via Ctrl+Shift+N), base
-  branch (only when worktree is on), optional name (blank = auto), optional first prompt, and
-  the collapsed Permissions section from v0. Enter or Ctrl+Enter creates.
+  tab's folder; recent folders as chips), agent segmented control (Claude · Codex · Shell ·
+  None; remembers last), worktree toggle (default **off**; disabled for a known non-git
+  folder), base branch (only when worktree is on), optional name (blank = auto), optional first
+  prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
+  Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees).
+- **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
 - **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).
 - **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
   bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
@@ -158,10 +185,10 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+1…9 | Go to tab N in this window (hold Alt to see numbers) |
 | Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+Alt+→ / ← | Next / previous tab |
 | Alt+Shift+[ / Alt+Shift+] | Move tab left / right |
-| Alt+J | Jump to the next session that needs you (all windows; pulls its tab here) |
+| Alt+J | Jump to the next session that needs you (all windows; pulls its tab here, or raises its window with "Jump focuses the other window"). Order: most urgent state, then longest waiting; repeated presses cycle |
 | Alt+D / Alt+Shift+D | Split right / down (new shell; picker via menu) |
 | Alt+N | New session as a pane-tab in the focused pane |
-| Alt+W | Close pane (closes the tab when it's the last pane; inline confirm if working) |
+| Alt+W | Close the focused pane's session (closes the tab when it's the last one; inline confirm if working) |
 | Alt+←↑→↓ | Focus pane in direction |
 | Alt+Shift+←↑→↓ | Resize focused pane |
 | Alt+Z | Zoom focused pane |
@@ -176,11 +203,22 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - Reconnect: an unobtrusive "Reconnecting…" pill with exponential backoff to 5s. On reconnect,
   call `hello`, re-claim the same window and re-attach every visible terminal. Terminals refuse
   input while disconnected, under a veil.
-- Other windows' changes arrive as events. A tab moved away disappears (its terminals stay
-  cached for a while in case it comes back), and a tab moved here appears.
-- Only attach sessions shown in this window. Detach terminals of tabs that left.
+- Other windows' changes arrive as events. A tab moved away disappears (its terminals are
+  detached with `session.detach` but stay cached for 5 minutes in case it comes back; showing
+  it again re-attaches and the replay resets it), and a tab moved here appears.
+- Only attach sessions shown in this window (a terminal attaches when its pane is first shown).
+  Detach terminals of tabs that left.
+- Every hello (first connect and reconnects) re-claims the window, then re-attaches. If
+  `window_removed` names this client's window, it claims the same id again (created if
+  missing).
+- Daemons without windows (hello has no `windows`): every channel is a tab of this window, in
+  `sort_order`; reordering uses `channel.reorder`; window UI (window chip, Move to window, Jump
+  focuses the other window, Rename window) is hidden; new tabs send the folder name as `name`,
+  since such daemons require one. A failed `window.claim` degrades the same way.
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
-  folders, status line on/off, "Terminal gets Alt keys", "Jump focuses the other window".
+  folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other
+  window", and the active tab per window.
+- `window.focused` is called on window focus and right after a claim when the page has focus.
 - Performance: batch output per animation frame per terminal. Never re-render the Preact tree on
   output bytes.

@@ -1,9 +1,10 @@
-// Per-channel agent permission profile: the controls (New Channel dialog and the Permissions
-// dialog), a one-line summary, and the header chip shown when a channel is more permissive
-// than the defaults. Only the human sets this; agents (MCP) can't.
+// Per-tab agent permission profile: the controls (New tab dialog and the Permissions dialog), a
+// one-line summary, and the badge a tab shows when it is more permissive than the defaults.
+// Only the human sets this; agents (MCP) can't.
 import type { ComponentChildren } from "preact";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
-import { channelById, overlay, sessionsByChannel } from "../state.ts";
+import { channelById, overlay, sessionsByChannel, workspaceById } from "../state.ts";
+import { tabLabel } from "../model.ts";
 import * as A from "../actions.ts";
 import type { Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
 import { DEFAULT_PERMISSIONS } from "../types.ts";
@@ -32,14 +33,14 @@ export const CODEX_OPTS: Opt<CodexSandbox>[] = [
     v: "workspace_write",
     label: "Workspace",
     short: "workspace",
-    hint: "Edits files in the channel's folder. No network (Codex's default).",
+    hint: "Edits files in the tab's folder. No network (Codex's default).",
   },
   {
     v: "workspace_write_network",
     label: "Workspace + network",
     short: "workspace + network",
     hint:
-      "Edits the channel's folder and may use the network, including muster itself as you (it can read your muster token).",
+      "Edits the tab's folder and may use the network, including muster itself as you (it can read your muster token).",
   },
   {
     v: "full_access",
@@ -175,7 +176,7 @@ export function PermissionFields(
   );
 }
 
-/** Collapsible "Permissions" section for the New Channel dialog. */
+/** Collapsible "Permissions" section for the New tab dialog. */
 export function PermissionsSection(
   { value, onChange }: { value: Permissions; onChange: (p: Permissions) => void },
 ) {
@@ -206,7 +207,8 @@ export function PermissionsSection(
         <div class="perm-body">
           <PermissionFields value={value} onChange={onChange} />
           <span class="field-hint perm-note">
-            Applies to every agent in the channel, including ones other agents start. Agents can't change it through muster's tools.
+            Applies to every agent in the tab, including ones other agents start. Agents can't change it
+            through muster's tools.
           </span>
         </div>
       )}
@@ -214,7 +216,7 @@ export function PermissionsSection(
   );
 }
 
-/** Dialog opened from the channel menu, header chip or command palette. */
+/** Dialog opened from the tab menu, the tab's badge or the command palette. */
 export function PermissionsDialog(
   { channelId, Modal, close }: {
     channelId: number;
@@ -250,7 +252,7 @@ export function PermissionsDialog(
     }
   };
   return (
-    <Modal class="dialog perm-dlg" label="Channel permissions">
+    <Modal class="dialog perm-dlg" label="Tab permissions">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -260,7 +262,8 @@ export function PermissionsDialog(
         <div class="dlg-head">
           <h2>Permissions</h2>
           <span class="muted">
-            What agents in <b>#{c.name}</b> may do. Applies to new and restarted sessions.
+            What agents in <b>{tabLabel(c, workspaceById.value.get(c.workspace_id)).text}</b>{" "}
+            may do. Applies to new and restarted sessions.
           </span>
         </div>
         <div class="dlg-body" ref={first}>
@@ -298,29 +301,30 @@ export function PermissionsDialog(
   );
 }
 
-/** Header chip, only when the channel is more permissive than the defaults. */
-export function PermissionChip({ c }: { c: Channel }) {
+/** A tab's permission badge, only when it is more permissive than the defaults: amber globe
+ * (network) or shield (accept edits), red warning shield (full access, bypass). Opens the
+ * Permissions dialog. */
+export function PermBadge({ c }: { c: Channel }) {
   const p = perms(c);
   if (!isElevated(p)) return null;
   const danger = isDangerous(p);
-  const parts: string[] = [];
-  if (p.codex_sandbox === "full_access") parts.push("Codex: full access");
-  else if (p.codex_sandbox === "workspace_write_network") parts.push("Network");
-  if (p.claude_mode === "bypass") parts.push("Claude: bypass");
-  else if (p.claude_mode === "accept_edits") parts.push("Accept edits");
   return (
     <button
       type="button"
-      class={cx("chip chip-perm", danger ? "danger" : "elevated")}
+      class={cx("tab-perm", danger ? "danger" : "elevated")}
       data-tip={`${summary(p)} · click to change`}
-      onClick={() => (overlay.value = { kind: "permissions", channelId: c.id })}
+      aria-label={`Permissions: ${summary(p)}`}
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        overlay.value = { kind: "permissions", channelId: c.id };
+      }}
     >
       {danger
         ? <IconShieldAlert size={12} />
         : p.codex_sandbox === "workspace_write_network"
         ? <IconGlobe size={12} />
         : <IconShield size={12} />}
-      <span>{parts.join(" · ")}</span>
     </button>
   );
 }

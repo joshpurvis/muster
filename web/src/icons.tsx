@@ -23,22 +23,10 @@ function Svg(props: P & { children: JSX.Element | JSX.Element[] }) {
   );
 }
 
-export const IconSidebar = (p: P) => (
-  <Svg {...p}>
-    <rect x="3" y="4" width="18" height="16" rx="2.5" />
-    <path d="M9 4v16" />
-  </Svg>
-);
 export const IconSearch = (p: P) => (
   <Svg {...p}>
     <circle cx="11" cy="11" r="6.5" />
     <path d="m20 20-4.2-4.2" />
-  </Svg>
-);
-export const IconInbox = (p: P) => (
-  <Svg {...p}>
-    <path d="M22 12h-6l-2 3h-4l-2-3H2" />
-    <path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
   </Svg>
 );
 export const IconPlus = (p: P) => (
@@ -71,20 +59,6 @@ export const IconSplitDown = (p: P) => (
   <Svg {...p}>
     <rect x="3" y="4" width="18" height="16" rx="2.5" />
     <path d="M3 12h18" />
-  </Svg>
-);
-export const IconTimeline = (p: P) => (
-  <Svg {...p}>
-    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-    <path d="M8 9h8M8 13h5" />
-  </Svg>
-);
-export const IconDiff = (p: P) => (
-  <Svg {...p}>
-    <circle cx="6" cy="6" r="2.5" />
-    <circle cx="18" cy="18" r="2.5" />
-    <path d="M6 8.5V15a3 3 0 0 0 3 3h6.5" />
-    <path d="M18 15.5V9a3 3 0 0 0-3-3H8.5" />
   </Svg>
 );
 export const IconMore = (p: P) => (
@@ -147,91 +121,7 @@ export const IconCheck = (p: P) => (
     <path d="M20 6 9 17l-5-5" />
   </Svg>
 );
-export const IconSun = (p: P) => (
-  <Svg {...p}>
-    <circle cx="12" cy="12" r="4" />
-    <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
-  </Svg>
-);
-export const IconMoon = (p: P) => (
-  <Svg {...p}>
-    <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" />
-  </Svg>
-);
-export const IconMonitor = (p: P) => (
-  <Svg {...p}>
-    <rect x="2" y="3" width="20" height="14" rx="2" />
-    <path d="M8 21h8M12 17v4" />
-  </Svg>
-);
 /** Half-filled circle: "follow the system" theme. */
-export const IconContrast = (p: P) => (
-  <Svg {...p}>
-    <circle cx="12" cy="12" r="8.5" />
-    <path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none" />
-  </Svg>
-);
-export const IconCopy = (p: P) => (
-  <Svg {...p}>
-    <rect x="9" y="9" width="12" height="12" rx="2" />
-    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-  </Svg>
-);
-export const IconHash = (p: P) => (
-  <Svg {...p}>
-    <path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18" />
-  </Svg>
-);
-export const IconArchive = (p: P) => (
-  <Svg {...p}>
-    <rect x="2" y="3" width="20" height="5" rx="1" />
-    <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4" />
-  </Svg>
-);
-export const IconPencil = (p: P) => (
-  <Svg {...p}>
-    <path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z" />
-  </Svg>
-);
-export const IconSend = (p: P) => (
-  <Svg {...p}>
-    <path d="M22 2 11 13" />
-    <path d="M22 2 15 22l-4-9-9-4z" />
-  </Svg>
-);
-export const IconKeyboard = (p: P) => (
-  <Svg {...p}>
-    <rect x="2" y="5" width="20" height="14" rx="2" />
-    <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 17h6M10 13h4" />
-  </Svg>
-);
-export const IconRefresh = (p: P) => (
-  <Svg {...p}>
-    <path d="M21 12a9 9 0 0 1-15.5 6.2L3 16" />
-    <path d="M3 12a9 9 0 0 1 15.5-6.2L21 8" />
-    <path d="M21 3v5h-5M3 21v-5h5" />
-  </Svg>
-);
-export const IconStop = (p: P) => (
-  <Svg {...p}>
-    <rect x="6" y="6" width="12" height="12" rx="1.5" />
-  </Svg>
-);
-export const IconArrowUpRight = (p: P) => (
-  <Svg {...p}>
-    <path d="M7 17 17 7M8 7h9v9" />
-  </Svg>
-);
-export const IconGrip = (p: P) => (
-  <Svg {...p}>
-    <circle cx="9" cy="6" r="1" />
-    <circle cx="9" cy="12" r="1" />
-    <circle cx="9" cy="18" r="1" />
-    <circle cx="15" cy="6" r="1" />
-    <circle cx="15" cy="12" r="1" />
-    <circle cx="15" cy="18" r="1" />
-  </Svg>
-);
 export const IconShield = (p: P) => (
   <Svg {...p}>
     <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6z" />
@@ -249,11 +139,6 @@ export const IconGlobe = (p: P) => (
     <circle cx="12" cy="12" r="8.5" />
     <path d="M3.5 12h17" />
     <path d="M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5S9.7 5.9 12 3.5z" />
-  </Svg>
-);
-export const IconDot = (p: P) => (
-  <Svg {...p}>
-    <circle cx="12" cy="12" r="3" />
   </Svg>
 );
 

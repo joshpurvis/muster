@@ -602,6 +602,26 @@ export function isNoopMove(
   return index === old || index === old + 1;
 }
 
+// ---------- pane chrome ----------
+
+/**
+ * What a pane shows above its terminal: a pane-tab strip when it holds 2+ sessions, else a thin
+ * header when the tab has 2+ panes, else nothing (a lone pane with one session).
+ */
+export type PaneChrome = "strip" | "head" | "none";
+
+export function chromeOf(sessionsInPane: number, panesInTab: number): PaneChrome {
+  if (sessionsInPane >= 2) return "strip";
+  return panesInTab >= 2 ? "head" : "none";
+}
+
+/** Chrome of the pane a new session will land in: a new pane-tab of `paneId`, or a split. */
+export function chromeForNew(s: LayoutState, type: "tab" | "split", paneId: string): PaneChrome {
+  if (type === "split") return "head";
+  const p = findPane(s.root, paneId);
+  return chromeOf((p?.tabs.length ?? 0) + 1, allPanes(s.root).length);
+}
+
 /** Compact structural signature (for tests / debugging). */
 export function sig(n: Layout): string {
   if (n.type === "pane") return `[${n.tabs.join(",")}]`;

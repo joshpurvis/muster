@@ -2,46 +2,45 @@
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
 import { render } from "preact";
-import { effect, signal } from "@preact/signals";
-import { useRef } from "preact/hooks";
+import { effect } from "@preact/signals";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { connStatus, rpc } from "./rpc.ts";
 import {
   activeChannel,
-  activeChannelId,
   applyEvent,
   applyHello,
   helloDone,
   layoutOf,
   layouts,
-  overlay,
+  meta,
   prefs,
   removedSessionListeners,
-  rightSuppressed,
-  rightVisible,
   sessions,
-  setPref,
+  tabIdSet,
+  tabs,
+  toast,
   updateLayout,
-  view,
+  windowId,
+  windowLostListeners,
+  windowsSupported,
   workspaces,
 } from "./state.ts";
 import * as terms from "./terms.ts";
 import * as A from "./actions.ts";
 import { installKeys } from "./keys.ts";
-import { Topbar } from "./components/Topbar.tsx";
-import { Sidebar } from "./components/Sidebar.tsx";
-import { ChannelHeader } from "./components/ChannelHeader.tsx";
-import { Composer } from "./components/Composer.tsx";
-import { RightPanel } from "./components/RightPanel.tsx";
-import { Inbox } from "./components/Inbox.tsx";
+import { TabBar, TabDragOverlay } from "./components/TabBar.tsx";
+import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
-import { TooltipHost } from "./components/common.tsx";
+import { Kbd, TooltipHost } from "./components/common.tsx";
+import { FolderInput } from "./components/FolderInput.tsx";
 import { SplitView } from "./layout/SplitView.tsx";
 import { DragOverlay } from "./layout/dnd.tsx";
+import { LaunchButtons } from "./layout/Pane.tsx";
 import { focusPane, paneOfSession } from "./layout/tree.ts";
-import { IconFolder, IconPlus } from "./icons.tsx";
-import { clamp, cx } from "./util.ts";
-import { Kbd } from "./components/common.tsx";
+import { windowParam } from "./model.ts";
+import type { SessionKind } from "./types.ts";
+import { tildify } from "./util.ts";
 
 // ---------- theme ----------
 const mq = matchMedia("(prefers-color-scheme: light)");
@@ -55,17 +54,48 @@ function applyThemePref() {
 effect(applyThemePref);
 mq.addEventListener("change", applyThemePref);
 
+// ---------- which window this client shows ----------
+// A launcher may ask for a window with `#window=<id>` (`muster open --window N`). It wins over
+// the one this tab had; keep it in sessionStorage (a reload reclaims it) and drop it from the URL.
+{
+  const w = windowParam(location.hash);
+  if (w !== null) {
+    A.rememberWindow(w);
+    const params = new URLSearchParams(location.hash.slice(1));
+    params.delete("window");
+    const rest = params.toString();
+    history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+  }
+}
+
 // ---------- wiring ----------
 terms.setFontSize(prefs.value.fontSize);
 
-rpc.onHello = (h, reconnect) => {
+rpc.onHello = async (h, reconnect) => {
   applyHello(h);
+  // Re-claim on every hello: after a reconnect the daemon released our window.
+  await A.claimWindow();
   if (reconnect) terms.reattachAll();
 };
 rpc.onEvent = applyEvent;
 
+windowLostListeners.push(() => A.claimWindow());
+addEventListener("focus", () => A.windowFocused());
+
 removedSessionListeners.push((id) => terms.dispose(id));
 // Restarts need no client action: the daemon follows the session and sends a fresh replay.
+
+// Only sessions of this window's tabs stream here: detach terminals whose tab moved away (they
+// stay cached for a while in case it comes back).
+effect(() => {
+  const here = tabIdSet.value;
+  const all = sessions.value;
+  if (!helloDone.value || (windowsSupported.value && windowId.value === null)) return;
+  for (const sid of terms.attachedSids()) {
+    const s = all.get(sid);
+    if (s && !here.has(s.channel_id)) terms.detach(sid);
+  }
+});
 
 terms.onTerminalFocus((sid) => {
   const s = sessions.value.get(sid);
@@ -76,10 +106,10 @@ terms.onTerminalFocus((sid) => {
   if (p && l.focus !== p.id) updateLayout(s.channel_id, (x) => focusPane(x, p.id));
 });
 
-// Ensure a layout exists for the active channel.
+// Ensure a layout exists for the active tab.
 effect(() => {
-  const ch = activeChannelId.value;
-  if (ch !== null && helloDone.value && activeChannel.value) layoutOf(ch);
+  const c = activeChannel.value;
+  if (c) layoutOf(c.id);
 });
 
 installKeys();
@@ -90,7 +120,9 @@ rpc.start();
   rpc,
   layouts,
   sessions,
-  activeChannelId,
+  tabs,
+  windowId,
+  activeChannel,
   termText: (sid: number) => {
     const t = terms.terminal(sid);
     if (!t) return null;
@@ -99,134 +131,70 @@ rpc.start();
     for (let i = 0; i < b.length; i++) out.push(b.getLine(i)?.translateToString(true) ?? "");
     return out.join("\n");
   },
+  attached: () => terms.attachedSids(),
 };
-
-// ---------- window width: side panels yield to the center ----------
-
-/** The center (terminals) keeps at least this much width; side panels shrink first. */
-const CENTER_MIN = 480;
-/** Below this viewport width the right panel closes itself. */
-const RIGHT_AUTO_CLOSE = 1100;
-const SIDEBAR_MIN = 180;
-const RIGHT_MIN = 260;
-
-const winW = signal(innerWidth);
-let lastW = 0; // 0 = first run: a narrow window at startup also closes the panel
-function onWinResize() {
-  const w = innerWidth;
-  winW.value = w;
-  // Crossing the threshold hides/restores the panel without touching the saved preference.
-  if (w < RIGHT_AUTO_CLOSE && (lastW === 0 || lastW >= RIGHT_AUTO_CLOSE)) rightSuppressed.value = true;
-  if (w >= RIGHT_AUTO_CLOSE && (lastW === 0 || lastW < RIGHT_AUTO_CLOSE)) rightSuppressed.value = false;
-  lastW = w;
-}
-addEventListener("resize", onWinResize);
-onWinResize();
-
-/** Effective side panel widths for the current window (prefs are the user's wish). */
-function panelWidths(showSidebar: boolean, showRight: boolean) {
-  const p = prefs.value;
-  const room = winW.value - CENTER_MIN - 2; // 2 = the two 1px handles
-  let sw = showSidebar ? p.sidebarWidth : 0;
-  let rw = showRight ? p.rightWidth : 0;
-  if (sw + rw > room && showRight) rw = Math.max(RIGHT_MIN, room - sw);
-  if (sw + rw > room && showSidebar) sw = Math.max(SIDEBAR_MIN, room - rw);
-  return { sw, rw, room };
-}
 
 // ---------- components ----------
 
-function ResizeHandle(
-  { side, onDrag, onDone }: { side: "left" | "right"; onDrag: (dx: number) => void; onDone?: () => void },
-) {
+const KINDS: SessionKind[] = ["claude", "codex", "shell"];
+
+/** A window with no tabs: pick a folder and what to run (keys 1 2 3). */
+function EmptyWindow() {
+  const home = meta.value.home;
+  const [folder, setFolder] = useState(() => tildify(A.defaultFolder(), home));
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const first = !workspaces.value.length;
+  useEffect(() => {
+    if (document.activeElement === document.body || !document.activeElement) ref.current?.focus();
+  }, []);
+  const pick = async (k: SessionKind) => {
+    if (busy || !folder.trim()) return;
+    setBusy(true);
+    try {
+      await A.createTab({ path: folder.trim(), agent: k, worktree: false });
+    } catch (e) {
+      toast("error", `Couldn't open a tab: ${e instanceof Error ? e.message : e}`);
+      setBusy(false);
+    }
+  };
   return (
     <div
-      class={cx("panel-handle", "handle-" + side)}
-      onPointerDown={(e) => {
-        if (e.button !== 0) return;
-        e.preventDefault();
-        const el = e.currentTarget as HTMLElement;
-        el.setPointerCapture(e.pointerId);
-        el.classList.add("dragging");
-        document.body.classList.add("resizing-col");
-        const sx = e.clientX;
-        const move = (ev: PointerEvent) => onDrag(ev.clientX - sx);
-        const up = () => {
-          el.removeEventListener("pointermove", move);
-          el.removeEventListener("pointerup", up);
-          el.removeEventListener("pointercancel", up);
-          el.removeEventListener("lostpointercapture", up);
-          el.classList.remove("dragging");
-          document.body.classList.remove("resizing-col");
-          onDone?.();
-        };
-        el.addEventListener("pointermove", move);
-        el.addEventListener("pointerup", up);
-        el.addEventListener("pointercancel", up);
-        el.addEventListener("lostpointercapture", up);
+      class="welcome"
+      ref={ref}
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        if (e.altKey || e.ctrlKey || e.metaKey) return;
+        if ((e.target as HTMLElement).closest("input")) return;
+        const i = ["1", "2", "3"].indexOf(e.key);
+        if (i >= 0) {
+          e.preventDefault();
+          pick(KINDS[i]);
+        }
       }}
-    />
-  );
-}
-
-function ChannelView() {
-  const c = activeChannel.value;
-  if (!c) return <NoChannel />;
-  const l = layouts.value.get(c.id);
-  return (
-    <div class="channel">
-      <ChannelHeader c={c} />
-      <div class="panes">{l ? <SplitView ch={c.id} layout={l} /> : null}</div>
-      <Composer key={c.id} c={c} />
-    </div>
-  );
-}
-
-function NoChannel() {
-  const ws = workspaces.value;
-  if (!ws.length) {
-    return (
-      <div class="welcome">
-        <div class="welcome-card">
-          <div class="welcome-mark">m</div>
-          <h1>Welcome to muster</h1>
-          <p>
-            Run coding agents and shells side by side. Each <b>channel</b>{" "}
-            is a task with its own git worktree, terminals and timeline.
-          </p>
-          <button
-            type="button"
-            class="btn btn-primary btn-lg"
-            onClick={() => (overlay.value = { kind: "add_workspace" })}
-          >
-            <IconFolder size={16} /> Add a workspace
-          </button>
-          <div class="welcome-keys">
-            <span>
-              <Kbd k="Ctrl+K" /> jump anywhere
-            </span>
-            <span>
-              <Kbd k="Alt+/" /> all shortcuts
-            </span>
-          </div>
-        </div>
-      </div>
-    );
-  }
-  return (
-    <div class="welcome">
-      <div class="welcome-card">
-        <h1>No channel open</h1>
-        <p>Create a channel to start an agent in its own worktree.</p>
-        <button type="button" class="btn btn-primary btn-lg" onClick={() => A.newChannelDialog()}>
-          <IconPlus size={16} /> New channel
-        </button>
+    >
+      <div class="welcome-card empty-window">
+        <div class="welcome-mark">m</div>
+        <h1>{first ? "Welcome to muster" : "No tabs in this window"}</h1>
+        <p>
+          {first
+            ? "Run coding agents and shells in tabs and splits. Pick a folder and what to start there."
+            : "Pick a folder and what to start there."}
+        </p>
+        <label class="field empty-folder">
+          <span class="field-label">Folder</span>
+          <FolderInput value={folder} onChange={setFolder} />
+        </label>
+        <LaunchButtons pick={pick} last={prefs.value.lastAgent} />
         <div class="welcome-keys">
           <span>
-            <Kbd k="Alt+Shift+N" /> new channel
+            <Kbd k="Ctrl+K" /> jump
           </span>
           <span>
-            <Kbd k="Ctrl+K" /> jump anywhere
+            <Kbd k="Alt+Shift+N" /> more options
+          </span>
+          <span>
+            <Kbd k="Alt+/" /> shortcuts
           </span>
         </div>
       </div>
@@ -242,8 +210,8 @@ function Splash() {
         <div class="welcome-card">
           <h1>Not signed in</h1>
           <p>
-            This launch link has expired or was already used. Run <code>muster</code> again, or open the
-            link printed by <code>muster url</code>. Access is kept for this tab only.
+            This launch link has expired or was already used. Run <code>muster</code>{" "}
+            again, or open the link printed by <code>muster url</code>. Access is kept for this tab only.
           </p>
         </div>
       </div>
@@ -262,9 +230,8 @@ function Splash() {
 }
 
 function App() {
-  const p = prefs.value;
-  const startW = useRef(0);
-  if (!helloDone.value) {
+  const ready = helloDone.value && (!windowsSupported.value || windowId.value !== null);
+  if (!ready) {
     return (
       <>
         <Splash />
@@ -273,51 +240,18 @@ function App() {
     );
   }
   const c = activeChannel.value;
-  const showRight = rightVisible.value && view.value === "channel" && !!c;
-  const { sw, rw, room } = panelWidths(!p.sidebarCollapsed, showRight);
+  const l = c ? layouts.value.get(c.id) : undefined;
   return (
     <div class="app">
-      <Topbar />
-      <div class="main">
-        {!p.sidebarCollapsed && (
-          <>
-            <div class="sidebar-wrap" style={{ width: sw + "px" }}>
-              <Sidebar />
-            </div>
-            <ResizeHandle
-              side="left"
-              onDrag={(dx) => {
-                if (!startW.current) startW.current = sw;
-                const max = Math.max(SIDEBAR_MIN, Math.min(420, room - rw));
-                setPref("sidebarWidth", clamp(startW.current + dx, SIDEBAR_MIN, max));
-              }}
-              onDone={() => (startW.current = 0)}
-            />
-          </>
-        )}
-        <main class="center">
-          {view.value === "inbox" ? <Inbox /> : <ChannelView />}
-        </main>
-        {showRight && c && (
-          <>
-            <ResizeHandle
-              side="right"
-              onDrag={(dx) => {
-                if (!startW.current) startW.current = rw;
-                const max = Math.max(RIGHT_MIN, Math.min(720, innerWidth * 0.5, room - sw));
-                setPref("rightWidth", clamp(startW.current - dx, RIGHT_MIN, max));
-              }}
-              onDone={() => (startW.current = 0)}
-            />
-            <div class="right-wrap" style={{ width: rw + "px" }}>
-              <RightPanel c={c} />
-            </div>
-          </>
-        )}
-      </div>
+      <TabBar />
+      <main class="content">
+        {c ? <div class="panes">{l ? <SplitView ch={c.id} layout={l} /> : null}</div> : <EmptyWindow />}
+      </main>
+      {prefs.value.statusLine && <StatusLine />}
       <Overlays />
       <MenuHost />
       <DragOverlay />
+      <TabDragOverlay />
       <TooltipHost />
       <Toasts />
     </div>

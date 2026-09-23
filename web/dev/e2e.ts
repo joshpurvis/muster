@@ -1,291 +1,259 @@
-// End-to-end UI walkthrough against a running daemon (dev only).
-//   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-write=<shots>,/tmp/muster-cdp \
-//     --allow-read=<shots> dev/e2e.ts <ui-url-with-token> <shots-dir> <repo-path>
-import { launch } from "./cdp.ts";
+// End-to-end UI walkthrough (dev only). Two headless browsers act as two client windows.
+//
+//   deno task build:dev && MOCK_PORT=17761 deno task mock &
+//   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-write=<shots> \
+//     --allow-read=<shots> dev/e2e.ts http://127.0.0.1:17761/#token=dev <shots-dir> <repo-path> [windows|legacy]
+//
+// `legacy` runs the single-window part only (a daemon without windows). It never starts an agent:
+// only the mock fakes them, a real daemon would run a real one.
+import { type Browser, launch } from "./cdp.ts";
 
-const [url, shots, repo] = Deno.args;
+const [url, shots, repo, mode = "windows"] = Deno.args;
 if (!url || !shots || !repo) {
-  console.error("usage: e2e.ts <url#token=..> <shots-dir> <repo-path>");
+  console.error("usage: e2e.ts <url#token=..> <shots-dir> <repo-path> [windows|legacy]");
   Deno.exit(2);
 }
 
-const b = await launch(9333, "/tmp/muster-cdp");
 let step = 0;
 const ok = (msg: string) => console.log(`✓ ${++step}. ${msg}`);
-const shot = async (name: string) => {
-  await b.sleep(250);
+const M = "globalThis.__muster";
+const tabIds = `${M}.tabs.value.map((c) => c.id)`;
+const R = (b: Browser, m: string, p: unknown) =>
+  b.eval(`${M}.rpc.call(${JSON.stringify(m)}, ${JSON.stringify(p)})`);
+const shot = async (b: Browser, name: string) => {
+  await b.sleep(300);
   await b.shot(`${shots}/${name}.png`);
 };
-const M = "globalThis.__muster";
-const layoutSig = `(() => { const ch = ${M}.activeChannelId.value; const l = ${M}.layouts.value.get(ch);
-  const sig = (n) => n.type === 'pane' ? '[' + n.tabs.join(',') + ']' : n.dir + '(' + n.children.map(sig).join(' ') + ')';
-  return l ? sig(l.root) : null; })()`;
-const paneCount = `document.querySelectorAll('.pane').length`;
-const focusedSid = `(() => { const ch = ${M}.activeChannelId.value; const l = ${M}.layouts.value.get(ch);
-  const find = (n) => n.type === 'pane' ? (n.id === l.focus ? n : null) : n.children.map(find).find(Boolean);
-  return find(l.root)?.active ?? null; })()`;
+function check(cond: unknown, msg: string) {
+  if (!cond) throw new Error("check failed: " + msg);
+}
 
-try {
+async function open(port: number, dir: string): Promise<Browser> {
+  const b = await launch(port, dir);
   await b.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
   await b.size(1440, 900);
   await b.goto(url);
-  await b.wait(`!!document.querySelector('.topbar')`, 8000);
-  ok("connected; hello done");
-  // Token must be stripped from the URL.
-  const href = await b.eval(`location.href`);
-  if (href.includes("token=")) throw new Error("token not stripped from URL: " + href);
-  ok("token stripped from URL");
-  await shot("01-welcome");
+  await b.wait(`!!document.querySelector('.app')`, 10000);
+  return b;
+}
 
-  // Add workspace
-  await b.click(".welcome .btn-primary");
-  await b.wait(`!!document.querySelector('.dialog .path-box input')`);
-  await b.type(repo);
-  await b.sleep(300);
-  await shot("02-add-workspace");
-  await b.key("Enter");
-  await b.wait(`!!document.querySelector('.dialog .input-prefix input')`, 5000);
-  ok("workspace added; new channel dialog opened");
-
-  // New channel with a shell
-  await b.type("Fix auth redirect");
-  await b.eval(
-    `[...document.querySelectorAll('.dialog .seg-btn')].find(x => x.textContent.includes('Shell')).click()`,
-  );
-  await shot("03-new-channel");
-  await b.key("Ctrl+Enter");
-  await b.wait(`document.querySelectorAll('.pane .xterm').length === 1`, 8000);
-  ok("channel created with a shell terminal");
-  await b.sleep(800);
-
-  // Type into the terminal
-  let sid = await b.eval(focusedSid);
-  await b.click(".term-host");
-  await b.type("echo hello-$((6*7))");
-  await b.key("Enter");
-  await b.wait(`(${M}.termText(${sid}) || '').includes('hello-42')`, 5000);
-  ok("typing in terminal reaches the PTY and echoes back");
-  await shot("04-terminal");
-
-  // Splits
-  await b.key("Alt+d");
-  await b.wait(`${paneCount} === 2`, 5000);
-  await b.key("Alt+Shift+d");
-  await b.wait(`${paneCount} === 3`, 5000);
-  ok("split right + split down: " + await b.eval(layoutSig));
-  await b.sleep(700);
-  await shot("05-splits");
-
-  // Focus movement
-  const before = await b.eval(focusedSid);
-  await b.key("Alt+Left");
-  const after = await b.eval(focusedSid);
-  if (before === after) throw new Error("Alt+Left did not move focus");
-  ok("Alt+Left moved pane focus");
-
-  // New tab in focused pane, then drag it to the bottom edge of the right-top pane
-  await b.key("Alt+n");
-  await b.wait(`!!document.querySelector('.menu')`);
-  await shot("05b-spawn-menu");
-  await b.key("3");
-  await b.wait(`document.querySelectorAll('.pane')[0].querySelectorAll('.tab').length === 2`, 5000);
-  ok("Alt+N opened a second tab in the focused pane");
-  const tab = await b.rect(".pane:nth-of-type(1) .tab:last-of-type");
-  const tabs = await b.eval(
-    `[...document.querySelectorAll('.pane')[0].querySelectorAll('.tab')].map(t => { const r = t.getBoundingClientRect(); return [r.x + r.width/2, r.y + r.height/2]; })`,
-  );
-  const target = await b.eval(
-    `(() => { const r = document.querySelectorAll('.pane-body')[1].getBoundingClientRect(); return [r.x + r.width/2, r.y + r.height - 20]; })()`,
-  );
-  void tab;
-  const sigBefore = await b.eval(layoutSig);
-  await b.drag(tabs[1] as [number, number], target as [number, number], 16);
-  await b.wait(`${paneCount} === 4`, 3000);
-  ok(`dragged tab into a new split: ${sigBefore} -> ${await b.eval(layoutSig)}`);
-  await b.sleep(500);
-  await shot("06-dragged");
-
-  // Drag a gutter
-  const g = await b.rect(".split-root > .split > .gutter");
-  if (!g) throw new Error("no gutter");
-  const sizesBefore = await b.eval(`${M}.layouts.value.get(${M}.activeChannelId.value).root.sizes.join(',')`);
-  await b.drag([g.x + g.w / 2, g.y + 200], [g.x - 200, g.y + 200], 10);
-  const sizesAfter = await b.eval(`${M}.layouts.value.get(${M}.activeChannelId.value).root.sizes.join(',')`);
-  if (sizesBefore === sizesAfter) throw new Error("gutter drag did not resize");
-  ok(`gutter drag resized: ${sizesBefore} -> ${sizesAfter}`);
-
-  // Zoom
-  await b.key("Alt+z");
-  await b.wait(`${paneCount} === 1 && !!document.querySelector('.pane.zoomed')`, 3000);
-  await b.sleep(400);
-  await shot("07-zoomed");
-  await b.key("Alt+z");
-  await b.wait(`${paneCount} === 4`, 3000);
-  ok("Alt+Z zooms and restores (terminals survive)");
-
-  // Terminals were reparented, not recreated: the first shell still has its output.
-  if (!(await b.eval(`(${M}.termText(${sid}) || '').includes('hello-42')`))) {
-    throw new Error("terminal content lost across relayout");
+const a = await open(9341, "/tmp/muster-cdp-a");
+let b2: Browser | null = null;
+try {
+  const windows = await a.eval(`${M}.windowId.value`) !== null;
+  check(windows === (mode === "windows"), `window support is ${windows}, expected mode ${mode}`);
+  const href = await a.eval(`location.href`);
+  check(!href.includes("token="), "token stripped from URL");
+  ok(`connected (${mode}); token stripped`);
+  if (windows) {
+    check(/^(\(\d+\) )?muster · \d+$/.test(await a.eval(`document.title`)), "title is muster · <window>");
+    ok("document.title " + (await a.eval(`document.title`)));
   }
-  ok("terminal content survived relayouts");
 
-  // Second channel via Alt+Shift+N
-  await b.key("Alt+Shift+n");
-  await b.wait(`!!document.querySelector('.dialog .input-prefix input')`);
-  await b.type("new api");
-  await b.eval(
-    `[...document.querySelectorAll('.dialog .seg-btn')].find(x => x.textContent.includes('Shell')).click()`,
+  // ---- empty window → first tab
+  let n0 = (await a.eval(tabIds)).length;
+  if (n0 === 0) {
+    await a.wait(`!!document.querySelector('.empty-window')`);
+    await shot(a, "01-empty-window");
+    await a.eval(`(() => { const i = document.querySelector('.empty-window input');
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      set.call(i, ${JSON.stringify(repo)}); i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    await a.click(".empty-window .launch-btn:nth-child(3)");
+    await a.wait(`${tabIds}.length === 1 && !!document.querySelector('.pane .xterm')`, 8000);
+    ok("empty window: folder + Shell opened the first tab");
+    n0 = 1;
+  }
+  await a.sleep(500);
+  check(
+    await a.eval(`document.querySelectorAll('.pane-head, .tabstrip').length`) === 0,
+    "lone pane has no chrome",
   );
-  await b.key("Enter");
-  await b.wait(
-    `document.querySelectorAll('.ch-row').length === 2 && document.querySelectorAll('.pane').length === 1`,
-    8000,
-  );
-  ok("second channel created and selected");
-  await b.sleep(500);
+  ok("a lone pane with one session has no chrome");
 
-  // Switch back via sidebar
-  await b.eval(
-    `[...document.querySelectorAll('.ch-row')].find(r => r.textContent.includes('Fix auth')).click()`,
-  );
-  await b.wait(`${paneCount} === 4`, 3000);
-  ok("switched channel via sidebar (layout restored with 4 panes)");
-
-  // Switch via Ctrl+Shift+K
-  await b.key("Ctrl+Shift+k");
-  await b.wait(`!!document.querySelector('.switcher')`);
-  await b.type("new");
-  await b.sleep(150);
-  await shot("08-switcher");
-  await b.key("Enter");
-  await b.wait(`${paneCount} === 1 && !document.querySelector('.switcher')`, 3000);
-  ok("switched channel via Ctrl+Shift+K");
-  await b.key("Ctrl+Shift+k");
-  await b.type("fix");
-  await b.key("Enter");
-  await b.wait(`${paneCount} === 4`, 3000);
-
-  // Composer
-  sid = await b.eval(focusedSid);
-  await b.key("Alt+c");
-  await b.wait(`document.activeElement?.tagName === 'TEXTAREA'`);
-  await b.type("echo from-composer");
-  await b.sleep(100);
-  await shot("09-composer");
-  await b.key("Enter");
-  await b.wait(
-    `[...${M}.sessions.value.keys()].some(id => (${M}.termText(id) || '').includes('from-composer'))`,
+  // ---- new tab (Alt+T), split (Alt+D), pane-tab (Alt+N)
+  await a.key("Alt+T");
+  await a.wait(`${tabIds}.length === ${n0 + 1}`, 6000);
+  await a.wait(`!!document.querySelector('.pane .xterm')`, 6000);
+  ok("Alt+T opened a tab in the same folder");
+  await a.key("Alt+D");
+  await a.wait(`document.querySelectorAll('.pane').length === 2`, 6000);
+  await a.wait(`document.querySelectorAll('.pane-head').length === 2`, 3000);
+  ok("Alt+D split: both panes show a header");
+  await a.key("Alt+N");
+  await a.wait(`!!document.querySelector('.menu')`);
+  await a.key("3");
+  await a.wait(
+    `document.querySelectorAll('.tabstrip').length === 1 && document.querySelectorAll('.pane-head').length === 1`,
     6000,
-  )
-    .then(() => ok("composer message delivered to a terminal"))
-    .catch(() => {
-      console.log("✗ composer message did not show up in any terminal");
-    });
-
-  // Note + timeline
-  await b.key("Alt+c");
-  await b.type("/note checked the redirect flow");
-  await b.key("Enter");
-  // Alt+letters belong to the text field while the composer has focus; Esc goes back first.
-  await b.key("Alt+l");
-  if (await b.eval(`!!document.querySelector('.timeline')`)) {
-    throw new Error("Alt+L was intercepted inside the composer");
-  }
-  await b.key("Escape");
-  await b.key("Alt+l");
-  await b.wait(`!!document.querySelector('.timeline')`);
-  await b.wait(`document.querySelector('.timeline').textContent.includes('checked the redirect flow')`, 4000);
-  ok("note shows in timeline");
-  await b.sleep(400);
-  await shot("10-timeline");
-
-  // Diff tab
-  await b.key("Alt+g");
-  await b.wait(`!!document.querySelector('.diff')`);
-  await b.sleep(600);
-  await shot("11-diff");
-  await b.key("Alt+l");
-  await b.key("Alt+l");
-
-  // Exit + restart a shell
-  await b.eval(`document.querySelectorAll('.term-host')[0].click()`);
-  const s0 = await b.eval(
-    `(() => { const ch = ${M}.activeChannelId.value; const l = ${M}.layouts.value.get(ch);
-    const first = (n) => n.type === 'pane' ? n : first(n.children[0]); return first(l.root).active; })()`,
   );
-  await b.click(".pane .term-host");
-  await b.type("exit");
-  await b.key("Enter");
-  await b.wait(`${M}.sessions.value.get(${s0})?.state === 'exited'`, 5000);
-  await b.wait(`!!document.querySelector('.exited-bar')`, 2000);
-  await b.sleep(300);
-  await shot("12-exited");
-  ok("shell exit shows the exited bar");
-  await b.click(".pane .term-host");
-  await b.key("Enter");
-  await b.wait(`${M}.sessions.value.get(${s0})?.state !== 'exited'`, 5000);
-  ok("Enter restarted the exited session");
-  await b.sleep(600);
-  await b.type("echo again-$((1+1))");
-  await b.key("Enter");
-  await b.wait(`(${M}.termText(${s0}) || '').includes('again-2')`, 5000);
-  ok("restarted shell is interactive");
+  ok("Alt+N added a pane-tab: that pane shows a strip, the other keeps its header");
+  await shot(a, "02-split");
 
-  // Close a tab (idle shell closes immediately)
-  const nBefore = await b.eval(`${M}.sessions.value.size`);
-  await b.key("Alt+w");
-  await b.wait(`${M}.sessions.value.size === ${nBefore - 1}`, 5000);
-  ok("Alt+W closed the focused session");
-  const sigPreReload = await b.eval(layoutSig);
-
-  // Inbox + shortcuts
-  await b.key("Alt+i");
-  await b.wait(`!!document.querySelector('.inbox')`);
-  await shot("13-inbox-empty");
-  await b.key("Alt+i");
-  await b.key("Alt+/");
-  await b.wait(`!!document.querySelector('.shortcuts')`);
-  await shot("14-shortcuts");
-  await b.key("Escape");
-
-  // Context menu on a tab
-  const t = await b.rect(".tab");
-  await b.clickAt(t!.x + t!.w / 2, t!.y + t!.h / 2, { button: "right" });
-  await b.wait(`!!document.querySelector('.menu')`);
-  await shot("15-tab-menu");
-  await b.key("Escape");
-
-  // Layout survives reload (debounced save is 400ms)
-  await b.sleep(900);
-  await b.goto(url);
-  await b.wait(`!!document.querySelector('.pane')`, 8000);
-  await b.sleep(800);
-  const sigAfter = await b.eval(layoutSig);
-  if (sigAfter !== sigPreReload) {
-    throw new Error(`layout changed across reload: ${sigPreReload} -> ${sigAfter}`);
+  // ---- an agent tab that needs approval, auto-named from its first prompt. Only the mock
+  // (windows mode) fakes agents: against a real daemon this would start a real one.
+  const ws = await R(a, "workspace.add", { path: repo });
+  const c: any = await R(a, "channel.create", {
+    workspace_id: ws.id,
+    worktree: false,
+    agent: windows ? "claude" : "shell",
+    prompt: windows ? "Fix the flaky login redirect test" : undefined,
+    window_id: await a.eval(`${M}.windowId.value ?? undefined`),
+    name: windows ? undefined : "flaky",
+    cols: 120,
+    rows: 30,
+  });
+  await a.wait(`${tabIds}.includes(${c.id})`, 6000);
+  if (windows) {
+    await a.wait(
+      `[...document.querySelectorAll('.ttab-name')].some((e) => e.textContent === 'Fix the flaky login redirect test')`,
+      4000,
+    );
+    ok("auto-named tab shows the name derived from its first prompt");
   }
-  ok(`layout survived reload: ${sigAfter}`);
-  await shot("16-after-reload");
+  const sid = await a.eval(`[...${M}.sessions.value.values()].find((s) => s.channel_id === ${c.id}).id`);
+  let needs = false;
+  if (windows) {
+    await a.sleep(4000); // the fake agent goes idle
+    await R(a, "session.send", { id: sid, text: "ask for approval" });
+    await a.wait(`${M}.sessions.value.get(${sid}).state === 'needs_approval'`, 8000).catch(() => {});
+    needs = await a.eval(`${M}.sessions.value.get(${sid}).state === 'needs_approval'`);
+  }
+  if (needs) {
+    await a.wait(`/^\\(1\\) muster/.test(document.title)`, 3000);
+    await a.wait(`!!document.querySelector('.sl-needs')`, 3000);
+    ok("needs approval: title (1) prefix and status line chip");
+    // Alt+J goes there.
+    await a.key("Alt+J");
+    await a.wait(`${M}.activeChannel.value?.id === ${c.id}`, 3000);
+    await a.wait(`!!document.querySelector('.approval')`, 3000);
+    ok("Alt+J jumped to the session that needs you; approval banner shown");
+    await shot(a, "03-approval");
+  } else ok("(skipped approval: this daemon has no fake agent)");
 
-  // Narrow + light
-  await b.size(900, 700);
-  await b.sleep(500);
-  await shot("17-narrow");
-  await b.send("Emulation.setEmulatedMedia", {
+  // ---- Jump overlay
+  await a.key("Ctrl+Shift+K");
+  await a.wait(`!!document.querySelector('.switcher')`);
+  await a.type("flaky");
+  await a.sleep(200);
+  await shot(a, "04-jump");
+  await a.key("Escape");
+  await a.wait(`!document.querySelector('.switcher')`);
+  await a.key("Ctrl+Shift+P");
+  await a.wait(`document.querySelector('.sw-mode')?.textContent === 'Commands'`);
+  await shot(a, "05-palette");
+  await a.key("Escape");
+  ok("Jump and command palette open and close");
+
+  // ---- rename by double-click
+  const first = await a.rect(".ttab");
+  await a.clickAt(first!.x + 40, first!.y + first!.h / 2, { count: 2 });
+  await a.wait(`!!document.querySelector('.ttab .inline-edit')`);
+  await a.key("Ctrl+a");
+  await a.type("renamed tab");
+  await a.key("Enter");
+  await a.wait(
+    `[...document.querySelectorAll('.ttab-name')].some((e) => e.textContent === 'renamed tab')`,
+    4000,
+  );
+  ok("double-click renamed a tab");
+
+  // ---- reorder: drag the first tab to the end, then Alt+Shift+[ back
+  const before: number[] = await a.eval(tabIds);
+  const r1 = await a.rect(".ttab");
+  const last = await a.eval(
+    `(() => { const t = [...document.querySelectorAll('.ttab')].pop().getBoundingClientRect(); return { x: t.right - 4, y: t.top + t.height / 2 }; })()`,
+  );
+  await a.drag([r1!.x + 30, r1!.y + r1!.h / 2], [last.x, last.y]);
+  await a.wait(`${tabIds}[${before.length - 1}] === ${before[0]}`, 3000);
+  ok("dragging a tab reordered it");
+  await a.key("Alt+Shift+[");
+  await a.sleep(200);
+  ok("Alt+Shift+[ moved the active tab left");
+
+  // ---- Alt+1 / Ctrl+Tab
+  await a.key("Alt+1");
+  await a.wait(`${M}.activeChannel.value?.id === ${tabIds}[0]`);
+  await a.key("Ctrl+Tab");
+  await a.wait(`${M}.activeChannel.value?.id === ${tabIds}[1]`);
+  ok("Alt+1 and Ctrl+Tab switch tabs");
+
+  if (windows) {
+    // ---- a second window
+    b2 = await open(9342, "/tmp/muster-cdp-b");
+    const w1 = await a.eval(`${M}.windowId.value`);
+    const w2 = await b2.eval(`${M}.windowId.value`);
+    check(w1 !== w2, "second client claimed another window");
+    await b2.wait(`!!document.querySelector('.empty-window')`, 4000);
+    ok(`second client claimed window ${w2} (first holds ${w1}); it starts empty`);
+    await a.wait(`!!document.querySelector('.tb-win')`, 3000);
+    ok("with 2 windows the tab bar names this window");
+
+    // Jump in B pulls a tab from A.
+    const pulled = await a.eval(`${M}.tabs.value.find((c) => c.name === 'renamed tab').id`);
+    const pulledSids: number[] = await a.eval(
+      `[...${M}.sessions.value.values()].filter((s) => s.channel_id === ${pulled}).map((s) => s.id)`,
+    );
+    await b2.key("Ctrl+Shift+K");
+    await b2.wait(`!!document.querySelector('.switcher')`);
+    await b2.type("renamed");
+    await b2.sleep(150);
+    await b2.key("Enter");
+    await b2.wait(`${tabIds}.includes(${pulled})`, 5000);
+    await a.wait(`!${tabIds}.includes(${pulled})`, 5000);
+    await b2.wait(`!!document.querySelector('.pane .xterm')`, 5000);
+    ok("Jump in window 2 pulled the tab over (channel.move); window 1 lost it");
+    await a.wait(`!${M}.attached().some((s) => ${JSON.stringify(pulledSids)}.includes(s))`, 3000);
+    ok("window 1 detached the moved tab's terminals");
+    await shot(b2, "06-window2");
+
+    // Move back through the tab context menu.
+    await b2.click(".ttab", { button: "right" });
+    await b2.wait(`!!document.querySelector('.menu')`);
+    await b2.eval(
+      `[...document.querySelectorAll('.menu-item')].find((e) => e.textContent.includes('Move to window')).dispatchEvent(new MouseEvent('mouseenter'))`,
+    );
+    await b2.sleep(200);
+    await b2.eval(
+      `[...document.querySelectorAll('.menu-item')].find((e) => e.textContent.includes('Window ${w1}')).click()`,
+    );
+    await a.wait(`${tabIds}.includes(${pulled})`, 5000);
+    await b2.wait(`${tabIds}.length === 0`, 5000);
+    ok("context menu → Move to window sent it back");
+
+    // Reload keeps the window.
+    await a.goto("about:blank");
+    await a.sleep(300);
+    await a.send("Page.navigate", { url: url.replace(/#.*/, "") });
+    await a.wait(`!!document.querySelector('.app')`, 8000);
+    check(await a.eval(`${M}.windowId.value`) === w1, "reload reclaimed the same window");
+    ok("reload reclaimed the same window (sessionStorage)");
+  }
+
+  // ---- light theme
+  await a.send("Emulation.setEmulatedMedia", {
     features: [{ name: "prefers-color-scheme", value: "light" }],
   });
-  await b.size(1440, 900);
-  await b.sleep(500);
-  await shot("18-light");
+  await a.sleep(300);
+  await shot(a, "07-light");
+  await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
 
-  const errs = b.console.filter((l) => l.startsWith("error") || l.startsWith("exception"));
-  if (errs.length) console.log("console errors:\n  " + errs.join("\n  "));
-  console.log("ALL OK");
+  // ---- shortcuts sheet
+  await a.key("F1");
+  await a.wait(`!!document.querySelector('.shortcuts')`);
+  await shot(a, "08-shortcuts");
+  await a.key("Escape");
+  ok("shortcuts sheet");
+
+  const errors = [...a.console, ...(b2?.console ?? [])].filter((l) => /^(error|exception)/.test(l));
+  if (errors.length) console.log("console errors:\n  " + errors.join("\n  "));
+  else ok("no console errors");
 } catch (e) {
-  console.error("FAILED:", e instanceof Error ? e.message : e);
-  await b.shot(`${shots}/zz-failure.png`).catch(() => {});
-  console.log(b.console.slice(-20).join("\n"));
+  console.error("✗", e instanceof Error ? e.message : e);
+  await a.shot(`${shots}/zz-failure-a.png`).catch(() => {});
+  if (b2) await b2.shot(`${shots}/zz-failure-b.png`).catch(() => {});
+  console.log([...a.console, ...(b2?.console ?? [])].slice(-20).join("\n"));
   Deno.exitCode = 1;
 } finally {
-  await b.close();
+  await a.close();
+  await b2?.close();
 }

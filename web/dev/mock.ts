@@ -45,6 +45,119 @@ const scrollback = new Map<number, Uint8Array[]>();
 const clients = new Set<WebSocket>();
 const attached = new Map<WebSocket, Set<number>>();
 
+// ---------- windows (docs/PROTOCOL.md "Windows, tabs and naming") ----------
+
+interface Win {
+  id: number;
+  name: string;
+  channel_ids: number[];
+  open: boolean;
+  last_focused_at: number;
+  created_at: number;
+}
+const windows: Win[] = [];
+/** Which window each connection holds. */
+const holding = new Map<WebSocket, number>();
+
+function newWindow(id?: number, name?: string): Win {
+  const wid = id ?? (windows.reduce((m, w) => Math.max(m, w.id), 0) + 1);
+  const w: Win = {
+    id: wid,
+    name: name || String(wid),
+    channel_ids: [],
+    open: false,
+    last_focused_at: 0,
+    created_at: now(),
+  };
+  windows.push(w);
+  windows.sort((a, b) => a.id - b.id);
+  return w;
+}
+
+const liveTabs = (w: Win) => w.channel_ids.filter((id) => channels.some((c) => c.id === id && !c.archived));
+
+function upsertWindow(w: Win) {
+  broadcast("window_upserted", w);
+}
+
+function removeWindowIfEmpty(w: Win) {
+  if (w.open || liveTabs(w).length) return;
+  windows.splice(windows.indexOf(w), 1);
+  broadcast("window_removed", { id: w.id });
+}
+
+/** Put channel `c` in window `w` at `index` (default end), taking it out of any other window. */
+function placeChannel(c: any, w: Win, index?: number) {
+  for (const o of windows) {
+    if (o === w) continue;
+    const i = o.channel_ids.indexOf(c.id);
+    if (i >= 0) {
+      o.channel_ids.splice(i, 1);
+      upsertWindow(o);
+    }
+  }
+  w.channel_ids = w.channel_ids.filter((x) => x !== c.id);
+  w.channel_ids.splice(
+    index === undefined ? w.channel_ids.length : Math.max(0, Math.min(index, w.channel_ids.length)),
+    0,
+    c.id,
+  );
+  c.window_id = w.id;
+  broadcast("channel_upserted", c);
+  upsertWindow(w);
+}
+
+/** Where new channels go: the open window focused last, else the lowest, else a new one. */
+function defaultWindow(): Win {
+  const open = windows.filter((w) => w.open).sort((a, b) => b.last_focused_at - a.last_focused_at);
+  return open[0] ?? windows[0] ?? newWindow();
+}
+
+function release(ws: WebSocket) {
+  const id = holding.get(ws);
+  holding.delete(ws);
+  const w = windows.find((x) => x.id === id);
+  if (!w || [...holding.values()].includes(w.id)) return;
+  w.open = false;
+  upsertWindow(w);
+  removeWindowIfEmpty(w);
+}
+
+function claim(ws: WebSocket, id?: number): Win {
+  const held = windows.find((x) => x.id === holding.get(ws));
+  if (held && (id === undefined || id === held.id)) return held;
+  release(ws);
+  let w: Win | undefined;
+  if (id !== undefined) w = windows.find((x) => x.id === id) ?? newWindow(id);
+  else {
+    w = windows.find((x) => !x.open && liveTabs(x).length) ?? newWindow();
+  }
+  w.open = true;
+  holding.set(ws, w.id);
+  // Adopt channels without a (live) window.
+  for (const c of channels) {
+    if (c.archived) continue;
+    if (c.window_id == null || !windows.some((x) => x.id === c.window_id)) placeChannel(c, w);
+  }
+  upsertWindow(w);
+  return w;
+}
+
+/** First prompt: first line, first 6 words, at most 40 chars. */
+function nameFromPrompt(text: string): string {
+  return text.split("\n")[0].trim().split(/\s+/).slice(0, 6).join(" ").slice(0, 40);
+}
+
+function maybeAutoName(channelId: number, prompt: string) {
+  const c = channels.find((x) => x.id === channelId);
+  if (!c || !c.auto_named || c.derived) return;
+  const n = nameFromPrompt(prompt);
+  if (!n) return;
+  c.name = n;
+  c.derived = true;
+  broadcast("channel_upserted", c);
+}
+
 function broadcast(event: string, data: unknown) {
   const msg = JSON.stringify({ event, data });
   for (const ws of clients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -222,7 +335,7 @@ function stripAnsi(s: string) {
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "").replace(/\r/g, "");
 }
 
-async function handle(method: string, p: any): Promise<unknown> {
+async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> {
   switch (method) {
     case "hello":
       return {
@@ -230,9 +343,52 @@ async function handle(method: string, p: any): Promise<unknown> {
         workspaces,
         channels: channels.filter((c) => !c.archived),
         sessions: [...sessions.values()],
+        windows,
         home: HOME,
         default_shell: "/bin/bash",
       };
+    case "window.claim": {
+      if (!ws) throw new Error("window.claim is WebSocket only");
+      return claim(ws, typeof p.id === "number" ? p.id : undefined);
+    }
+    case "window.create": {
+      const w = newWindow(undefined, p.name);
+      upsertWindow(w);
+      return w;
+    }
+    case "window.focused": {
+      const w = windows.find((x) => x.id === p.id);
+      if (w) w.last_focused_at = now();
+      return {};
+    }
+    case "window.rename": {
+      const w = windows.find((x) => x.id === p.id);
+      if (!w) throw new Error(`no such window: ${p.id}`);
+      w.name = String(p.name).trim() || String(w.id);
+      upsertWindow(w);
+      return w;
+    }
+    case "window.reorder_tabs": {
+      const w = windows.find((x) => x.id === p.id);
+      if (!w) throw new Error(`no such window: ${p.id}`);
+      const want = (p.channel_ids as number[]).filter((id) => w.channel_ids.includes(id));
+      w.channel_ids = [...want, ...w.channel_ids.filter((id) => !want.includes(id))];
+      upsertWindow(w);
+      return w;
+    }
+    case "window.raise":
+      // No window manager here: the client pulls the tab instead.
+      return { raised: false };
+    case "channel.move": {
+      const c = channels.find((x) => x.id === p.id && !x.archived);
+      if (!c) throw new Error(`no such channel: ${p.id}`);
+      const w = windows.find((x) => x.id === p.window_id);
+      if (!w) throw new Error(`no such window: ${p.window_id}`);
+      const from = windows.find((x) => x.id === c.window_id);
+      placeChannel(c, w, p.index);
+      if (from && from !== w) removeWindowIfEmpty(from);
+      return c;
+    }
     case "workspace.add": {
       let path = String(p.path).replace(/^~(?=\/|$)/, HOME).replace(/\/+$/, "");
       if (!path) path = "/";
@@ -258,18 +414,17 @@ async function handle(method: string, p: any): Promise<unknown> {
     case "channel.create": {
       const w = workspaces.find((w) => w.id === p.workspace_id);
       if (!w) throw new Error("no such workspace");
-      const slug = String(p.name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-      if (!slug) throw new Error("name is empty");
-      if (channels.some((c) => c.workspace_id === w.id && c.name === slug && !c.archived)) {
-        throw new Error(`a channel named ${slug} already exists`);
-      }
-      const wt = w.is_git && p.worktree !== false;
-      const c = {
-        id: seq++,
+      const given = String(p.name ?? "").trim();
+      const wt = w.is_git && p.worktree === true;
+      const id = seq++;
+      const c: any = {
+        id,
         workspace_id: w.id,
-        name: slug,
+        name: given || w.path.split("/").pop() || w.path,
+        auto_named: !given,
+        window_id: null,
         cwd: w.path, // the mock doesn't create worktrees
-        branch: wt ? `muster/${slug}` : null,
+        branch: wt ? `muster/${id}` : null,
         base_branch: wt ? (p.base || "main") : null,
         owns_worktree: wt,
         port_base: 20000 + channels.length * 10,
@@ -281,12 +436,14 @@ async function handle(method: string, p: any): Promise<unknown> {
         permissions: p.permissions ?? { codex_sandbox: "workspace_write", claude_mode: "default" },
       };
       channels.push(c);
-      broadcast("channel_upserted", c);
+      const target = windows.find((x) => x.id === p.window_id) ?? defaultWindow();
+      placeChannel(c, target);
       logEvent(c.id, null, "system", {
         text: `Channel created${wt ? ` on ${c.branch}` : ""}`,
         level: "info",
       });
-      if (p.agent) spawn({ channel_id: c.id, kind: p.agent, prompt: p.prompt });
+      if (p.agent) spawn({ channel_id: c.id, kind: p.agent, prompt: p.prompt, cols: p.cols, rows: p.rows });
+      if (p.prompt) maybeAutoName(c.id, p.prompt);
       return c;
     }
     case "channel.set_permissions": {
@@ -298,7 +455,10 @@ async function handle(method: string, p: any): Promise<unknown> {
     }
     case "channel.rename": {
       const c = channels.find((c) => c.id === p.id);
-      c.name = String(p.name).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      const n = String(p.name).trim();
+      if (!n) throw new Error("channel name is empty");
+      c.name = n;
+      c.auto_named = false;
       broadcast("channel_upserted", c);
       return c;
     }
@@ -312,6 +472,12 @@ async function handle(method: string, p: any): Promise<unknown> {
         broadcast("session_removed", { id: s.id });
       }
       broadcast("channel_removed", { id: c.id });
+      const w = windows.find((x) => x.id === c.window_id);
+      if (w) {
+        w.channel_ids = w.channel_ids.filter((id) => id !== c.id);
+        upsertWindow(w);
+        removeWindowIfEmpty(w);
+      }
       return {};
     }
     case "channel.set_layout": {
@@ -365,6 +531,7 @@ async function handle(method: string, p: any): Promise<unknown> {
       return { __attach: p.id };
     }
     case "session.detach":
+      if (ws) attached.get(ws)?.delete(p.id);
       return {};
     case "session.resize": {
       const s = sessions.get(p.id);
@@ -409,6 +576,7 @@ async function handle(method: string, p: any): Promise<unknown> {
       if (!s) throw new Error("no such session");
       const busy = s.state === "working" && p.mode !== "interrupt";
       logEvent(s.channel_id, s.id, "prompt", { text: p.text, session_id: s.id, from: "human", queued: busy });
+      maybeAutoName(s.channel_id, p.text);
       if (busy) {
         s.queued++;
         upsert(s);
@@ -489,6 +657,7 @@ function onSocket(ws: WebSocket) {
   ws.onclose = () => {
     clients.delete(ws);
     attached.delete(ws);
+    release(ws);
   };
   ws.onmessage = async (e) => {
     if (typeof e.data !== "string") {
@@ -500,7 +669,7 @@ function onSocket(ws: WebSocket) {
     }
     const msg = JSON.parse(e.data);
     try {
-      const result: any = await handle(msg.method, msg.params ?? {});
+      const result: any = await handle(msg.method, msg.params ?? {}, ws);
       if (result && result.__attach !== undefined) {
         const sid = result.__attach;
         ws.send(JSON.stringify({ id: msg.id, result: {} }));

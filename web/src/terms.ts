@@ -39,6 +39,8 @@ interface Entry {
   /** Until then, a late native paste event is dropped (the fallback already pasted). */
   pasteBlockUntil: number;
   attached: boolean;
+  /** Pending dispose of a detached terminal (its tab left this window). */
+  evictTimer: number;
   lastUse: number;
   resizeTimer: number;
   sentCols: number;
@@ -248,6 +250,7 @@ function create(sid: number): Entry {
     pasteRead: null,
     pasteBlockUntil: 0,
     attached: false,
+    evictTimer: 0,
     lastUse: Date.now(),
     resizeTimer: 0,
     sentCols: 0,
@@ -378,6 +381,8 @@ function fitNow(e: Entry) {
 export function mount(sid: number, host: HTMLElement) {
   const e = entries.get(sid) ?? create(sid);
   e.lastUse = Date.now();
+  clearTimeout(e.evictTimer);
+  e.evictTimer = 0;
   if (e.host && e.host !== host) ro.unobserve(e.host);
   e.host = host;
   host.dataset.hostSid = String(sid);
@@ -408,7 +413,10 @@ function attach(e: Entry) {
   const go = () =>
     rpc.call("session.resize", { id: e.sid, cols: e.term.cols, rows: e.term.rows })
       .catch(() => {})
-      .then(() => rpc.call("session.attach", { id: e.sid }))
+      // Detached (tab moved away) or disposed while the resize was in flight: don't attach.
+      .then(() =>
+        e.attached && entries.get(e.sid) === e ? rpc.call("session.attach", { id: e.sid }) : undefined
+      )
       .catch(() => {
         // Keep `attached` (= wanted): a reconnect's reattachAll retries it. If the session is
         // gone, session_removed disposes the entry.
@@ -416,6 +424,31 @@ function attach(e: Entry) {
   e.sentCols = e.term.cols;
   e.sentRows = e.term.rows;
   go();
+}
+
+/** How long a terminal whose tab left this window stays cached (it may come back). */
+const EVICT_MS = 5 * 60_000;
+
+/**
+ * Stop streaming session `sid` to this window (its tab moved to another window or this
+ * client no longer shows it). The xterm stays cached for a while; showing it again
+ * re-attaches, and the replay resets it.
+ */
+export function detach(sid: number) {
+  const e = entries.get(sid);
+  if (!e || !e.attached) return;
+  e.attached = false;
+  if (e.host) unmount(sid, e.host);
+  rpc.call("session.detach", { id: sid }).catch(() => {});
+  clearTimeout(e.evictTimer);
+  e.evictTimer = setTimeout(() => {
+    if (!entries.get(sid)?.attached) dispose(sid);
+  }, EVICT_MS);
+}
+
+/** Session ids with a live (attached) terminal in this client. */
+export function attachedSids(): number[] {
+  return [...entries.values()].filter((e) => e.attached).map((e) => e.sid);
 }
 
 /** After a reconnect, re-attach every terminal (the replay frame resets it). */
@@ -440,7 +473,12 @@ export function dispose(sid: number) {
   clearTimeout(e.flushTimer);
   clearTimeout(e.pasteTimer);
   clearTimeout(e.resizeTimer);
-  e.raf = e.flushTimer = e.pasteTimer = 0;
+  clearTimeout(e.evictTimer);
+  e.raf =
+    e.flushTimer =
+    e.pasteTimer =
+    e.evictTimer =
+      0;
   e.queue = [];
   e.queued = 0;
   if (e.host) ro.unobserve(e.host);
@@ -542,8 +580,10 @@ export function scrollToBottom(sid: number) {
   entries.get(sid)?.term.scrollToBottom();
 }
 
-/** Tab strip height (px) above each terminal. */
-export const TAB_STRIP_PX = 31;
+/** Pane chrome above a terminal (px): the pane-tab strip (2+ sessions in the pane) or the
+ * pane header (2+ panes in the tab); a lone pane with one session has none. */
+export const PANE_STRIP_PX = 31;
+export const PANE_HEAD_PX = 22;
 // .term-host padding plus xterm's scrollbar gutter (FitAddon's DEFAULT_SCROLL_BAR_WIDTH).
 const HOST_PAD_X = 14 + 14;
 const HOST_PAD_Y = 10;
@@ -584,11 +624,4 @@ effect(() => {
 
 export function refitAll() {
   for (const e of entries.values()) if (e.host) scheduleFit(e);
-}
-
-/** Re-attach one terminal (e.g. after a restart cleared its replay). */
-export function reattach(sid: number) {
-  const e = entries.get(sid);
-  if (!e || !e.attached) return;
-  rpc.call("session.attach", { id: sid }).catch(() => {});
 }

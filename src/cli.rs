@@ -176,16 +176,18 @@ pub fn resolve(snap: &Snapshot, target: &str, env_session: Option<&str>) -> anyh
             .parse()
             .map_err(|_| exit(2, format!("$MUSTER_SESSION_ID is not a session id: {id}")))?;
         return snap
-            .sessions
-            .iter()
+            .visible()
             .find(|s| s.id == id)
             .cloned()
             .ok_or_else(|| exit(2, format!("no such session: {id} ($MUSTER_SESSION_ID)")));
     }
-    if let Ok(id) = target.parse::<u32>()
-        && let Some(s) = snap.sessions.iter().find(|s| s.id == id)
-    {
-        return Ok(s.clone());
+    // All digits is always an id, never a name or prefix.
+    if let Ok(id) = target.parse::<u32>() {
+        return snap
+            .visible()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or_else(|| exit(2, format!("no such session: {id}")));
     }
     let found = match target.split_once('/') {
         Some((tab, name)) => resolve_tab_name(snap, tab, name),
@@ -593,7 +595,7 @@ pub fn send(d: &Discovery, t: &str, words: &[String], o: SendOpts) -> anyhow::Re
         Ok(s)
     })?;
     let (snap, s) = target(d, t)?;
-    let deadline = Instant::now() + Duration::from_secs(o.timeout);
+    let deadline = deadline_in(o.timeout);
     let sent_at = now_ms();
     let mode = if o.interrupt { "interrupt" } else { "queue" };
     let r = client::rpc(d, "session.send", json!({ "id": s.id, "text": text, "mode": mode }))?;
@@ -607,39 +609,57 @@ pub fn send(d: &Discovery, t: &str, words: &[String], o: SendOpts) -> anyhow::Re
         }
         return Ok(());
     }
-    wait_started(d, s.id, sent_at, deadline)?;
+    if !wait_started(d, s.id, sent_at, queued > 0 || r["delivered"] != true, deadline)? {
+        // Timed out before the prompt even started: report the state as it is now.
+        let r = session_wait(d, s.id, &[], Duration::ZERO)?;
+        return finish_wait(&snap, &json!({ "session": r["session"], "matched": false }), o.timeout);
+    }
     let until = if o.until.is_empty() { SETTLED.iter().map(|s| s.to_string()).collect() } else { o.until };
     let r = wait_until(d, s.id, &until, deadline)?;
     finish_wait(&snap, &r, o.timeout)
 }
 
-/// After a send: wait until the prompt left the queue and the session reacted (its state
-/// changed after `sent_at`, e.g. to working, or already back to idle for a quick answer). A
-/// session that never visibly reacts is let through after a grace period, so the settled
-/// wait that follows can't hang on it.
-fn wait_started(d: &Discovery, id: u32, sent_at: i64, deadline: Instant) -> anyhow::Result<()> {
+/// After a send: wait until the prompt left the queue and the session reacted. Delivered
+/// at once: any state change after `sent_at` counts (working, or already back to idle for a
+/// quick answer). Queued behind earlier work: the earlier work ending (idle) also changes the
+/// state, and the queue empties before our prompt is typed, so only a non-idle state that
+/// began after the queue was last seen non-empty counts. A session that never visibly reacts
+/// is let through after a grace period, so the settled wait that follows can't hang on it.
+/// `false`: the deadline passed first.
+fn wait_started(d: &Discovery, id: u32, sent_at: i64, queued: bool, deadline: Instant) -> anyhow::Result<bool> {
     const GRACE: Duration = Duration::from_secs(10);
     let mut delivered_at: Option<Instant> = None;
+    // Unix ms when the queue was last seen non-empty.
+    let mut last_queued = sent_at;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Ok(());
+            return Ok(false);
         }
         let chunk = left.min(Duration::from_secs(1));
+        let asked_at = now_ms();
         let r = session_wait(d, id, &["working", "exited"], chunk)?;
         let Some(s) = Sess::from_value(r["session"].clone()) else {
             anyhow::bail!("unexpected session.wait reply: {r}");
         };
         if s.state == "exited" {
-            return Ok(());
+            return Ok(true);
         }
-        if s.queued == 0 {
-            if s.state_since >= sent_at {
-                return Ok(());
+        if s.queued > 0 {
+            last_queued = asked_at;
+            delivered_at = None;
+        } else {
+            let reacted = if queued {
+                s.state != "idle" && s.state_since > last_queued
+            } else {
+                s.state_since >= sent_at
+            };
+            if reacted {
+                return Ok(true);
             }
             let at = *delivered_at.get_or_insert_with(Instant::now);
             if at.elapsed() >= GRACE {
-                return Ok(());
+                return Ok(true);
             }
         }
         if r["matched"] == true {
@@ -686,7 +706,7 @@ fn finish_wait(snap: &Snapshot, r: &Value, timeout: u64) -> anyhow::Result<()> {
 pub fn wait(d: &Discovery, t: &str, until: Vec<String>, timeout: u64, as_json: bool) -> anyhow::Result<()> {
     let (snap, s) = target(d, t)?;
     let until = if until.is_empty() { SETTLED.iter().map(|s| s.to_string()).collect() } else { until };
-    let r = wait_until(d, s.id, &until, Instant::now() + Duration::from_secs(timeout))?;
+    let r = wait_until(d, s.id, &until, deadline_in(timeout))?;
     if as_json {
         print_json(&r)?;
         if r["matched"] != true {
@@ -697,12 +717,20 @@ pub fn wait(d: &Discovery, t: &str, until: Vec<String>, timeout: u64, as_json: b
     finish_wait(&snap, &r, timeout)
 }
 
+/// `--timeout` from now, capped at 30 days (a huge value would overflow `Instant`).
+fn deadline_in(secs: u64) -> Instant {
+    Instant::now() + Duration::from_secs(secs.min(30 * 86400))
+}
+
 /// Bytes for one `keys` argument (see docs/CLI.md).
 pub fn parse_key(k: &str) -> anyhow::Result<String> {
     if let Some(text) = k.strip_prefix("text:") {
         return Ok(text.to_string());
     }
     let lower = k.to_ascii_lowercase();
+    if let Some(seq) = modified_cursor_key(&lower) {
+        return Ok(seq);
+    }
     if let Some(named) = named_key(&lower) {
         return Ok(named.to_string());
     }
@@ -740,6 +768,30 @@ pub fn parse_key(k: &str) -> anyhow::Result<String> {
         return Ok(k.to_string());
     }
     anyhow::bail!("unknown key: {k} (use text:{k} to type it literally)")
+}
+
+/// `ctrl+left`, `alt+up`, `ctrl+shift+end`...: xterm's `CSI 1 ; <mod> <final>`.
+fn modified_cursor_key(k: &str) -> Option<String> {
+    let (mods, base) = k.rsplit_once('+')?;
+    let fin = match base {
+        "up" => 'A',
+        "down" => 'B',
+        "right" => 'C',
+        "left" => 'D',
+        "home" => 'H',
+        "end" => 'F',
+        _ => return None,
+    };
+    let mut m = 1;
+    for part in mods.split('+') {
+        m += match part {
+            "shift" => 1,
+            "alt" => 2,
+            "ctrl" => 4,
+            _ => return None,
+        };
+    }
+    Some(format!("\x1b[1;{m}{fin}"))
 }
 
 fn named_key(k: &str) -> Option<&'static str> {
@@ -941,6 +993,7 @@ mod tests {
         assert_eq!(code("gon", None), 2, "exited sessions never match by prefix");
         assert_eq!(code("docs/go", None), 2);
         assert_eq!(code("ancient", None), 2, "archived tab");
+        assert_eq!(code("40", None), 2, "archived tab, by id");
         assert_eq!(code("old", None), 2, "archived tab name");
         assert_eq!(code("nope", None), 2);
         assert_eq!(code("999", None), 2, "unknown id");
@@ -977,6 +1030,9 @@ mod tests {
         assert_eq!(k("alt+x"), "\x1bx");
         assert_eq!(k("alt+X"), "\x1bX");
         assert_eq!(k("alt+enter"), "\x1b\r");
+        assert_eq!(k("ctrl+left"), "\x1b[1;5D");
+        assert_eq!(k("alt+up"), "\x1b[1;3A");
+        assert_eq!(k("ctrl+shift+end"), "\x1b[1;6F");
         assert_eq!(k("text:hello world"), "hello world");
         assert_eq!(k("text:"), "");
         assert_eq!(k("y"), "y");
@@ -1085,7 +1141,11 @@ mod tests {
 
     /// `send --wait` against a scripted session: `states(n)` is the session after the n-th
     /// `session.wait` call. Returns the `until` lists the CLI waited with.
-    fn send_wait(states: impl Fn(usize) -> Value + Send + 'static) -> (anyhow::Result<()>, Vec<Value>) {
+    fn send_wait(
+        queued: bool,
+        timeout: u64,
+        states: impl Fn(usize) -> Value + Send + 'static,
+    ) -> (anyhow::Result<()>, Vec<Value>) {
         use std::sync::{Arc, Mutex};
         let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
         let log = calls.clone();
@@ -1094,7 +1154,7 @@ mod tests {
                 "channels": [{"id": 1, "name": "tab"}],
                 "sessions": [{"id": 7, "channel_id": 1, "kind": "claude", "name": "claude", "state": "idle", "state_since": 1}],
             }),
-            "session.send" => json!({"delivered": true, "queued": 0}),
+            "session.send" => json!({"delivered": !queued, "queued": u32::from(queued)}),
             "session.wait" => {
                 let mut l = log.lock().unwrap();
                 l.push(params["until"].clone());
@@ -1109,7 +1169,7 @@ mod tests {
             interrupt: false,
             wait: true,
             until: Vec::new(),
-            timeout: 5,
+            timeout,
         };
         let r = send(&d, "7", &["hi".into()], o);
         let calls = calls.lock().unwrap().clone();
@@ -1123,7 +1183,7 @@ mod tests {
     #[test]
     fn send_wait_sees_work_then_settles() {
         let t = now_ms() + 10_000;
-        let (r, calls) = send_wait(move |n| match n {
+        let (r, calls) = send_wait(false, 5, move |n| match n {
             1 => sess("working", t, 0),
             _ => sess("idle", t + 1, 0),
         });
@@ -1137,7 +1197,7 @@ mod tests {
     fn send_wait_tolerates_instant_answers() {
         // Already back to idle when first polled, but the state changed after the send.
         let t = now_ms() + 10_000;
-        let (r, calls) = send_wait(move |_| sess("idle", t, 0));
+        let (r, calls) = send_wait(false, 5, move |_| sess("idle", t, 0));
         r.unwrap();
         assert_eq!(calls.len(), 2, "{calls:?}");
     }
@@ -1146,26 +1206,37 @@ mod tests {
     fn send_wait_waits_out_the_queue() {
         // Busy with earlier work (our prompt queued), then ours runs, then idle.
         let t = now_ms() + 10_000;
-        let (r, calls) = send_wait(move |n| match n {
+        let (r, calls) = send_wait(true, 5, move |n| match n {
             1..=2 => sess("working", 1, 1),
             3 => sess("idle", 2, 1),
-            4 => sess("working", t, 0),
+            // The earlier work ended and the queue emptied, but ours isn't typed yet.
+            4 => sess("idle", t, 0),
+            5 => sess("working", t + 1, 0),
             _ => sess("idle", t + 1, 0),
         });
         r.unwrap();
-        assert_eq!(calls.len(), 5, "{calls:?}");
-        assert_eq!(calls[4], json!(SETTLED));
+        assert_eq!(calls.len(), 6, "{calls:?}");
+        assert_eq!(calls[5], json!(SETTLED));
     }
 
     #[test]
     fn send_wait_timeout_exits_124() {
         let t = now_ms() + 10_000;
-        let (r, _) = send_wait(move |n| match n {
+        let (r, _) = send_wait(false, 5, move |n| match n {
             1 => sess("working", t, 0),
             _ => sess("working", t, 0),
         });
         let e = r.unwrap_err();
         assert_eq!(e.downcast_ref::<Exit>().map(|x| x.code), Some(124), "{e:#}");
+    }
+
+    #[test]
+    fn send_wait_times_out_before_the_prompt_starts() {
+        // Still busy with earlier work when the timeout hits: 124, not the idle that follows.
+        let (r, calls) = send_wait(true, 1, |_| sess("working", 1, 1));
+        let e = r.unwrap_err();
+        assert_eq!(e.downcast_ref::<Exit>().map(|x| x.code), Some(124), "{e:#}");
+        assert!(calls.iter().all(|c| *c != json!(SETTLED)), "no settled wait");
     }
 
     #[test]

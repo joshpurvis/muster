@@ -130,7 +130,7 @@ enum Cmd {
     },
     /// Send keys to a session's terminal.
     #[command(after_help = "Keys: enter, esc, tab, shift+tab, space, backspace, up, down, left, right, \
-home, end, delete, pageup, pagedown, ctrl+<x>, alt+<x>, a single character, or text:<literal>.\n\
+home, end, delete, pageup, pagedown, ctrl+<x>, alt+<x>, ctrl+left (etc.), a single character, or text:<literal>.\n\
 Example: muster keys 12 esc text:/compact enter")]
     Keys {
         #[arg(help = TARGET_HELP)]

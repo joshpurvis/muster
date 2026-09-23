@@ -129,9 +129,13 @@ impl Discovery {
     pub fn ui_url(&self) -> String {
         format!("{}/#token={}", self.base_url(), self.token)
     }
-    /// UI URL carrying a single-use launch code (safe to put on a browser command line).
-    pub fn launch_url(&self, code: &str) -> String {
-        format!("{}/#code={}", self.base_url(), code)
+    /// UI URL carrying a single-use launch code (safe to put on a browser command line), and
+    /// the window to claim, if any (`#code=...&window=3`).
+    pub fn launch_url(&self, code: &str, window: Option<i64>) -> String {
+        match window {
+            Some(w) => format!("{}/#code={code}&window={w}", self.base_url()),
+            None => format!("{}/#code={code}", self.base_url()),
+        }
     }
 }
 
@@ -188,4 +192,19 @@ pub fn token_eq(a: &str, b: &str) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn launch_url_carries_window() {
+        let d = super::Discovery {
+            pid: 1,
+            port: 7433,
+            token: "t".into(),
+            version: "0".into(),
+        };
+        assert_eq!(d.launch_url("abc", None), "http://127.0.0.1:7433/#code=abc");
+        assert_eq!(d.launch_url("abc", Some(3)), "http://127.0.0.1:7433/#code=abc&window=3");
+    }
 }

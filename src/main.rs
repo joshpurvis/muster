@@ -1,5 +1,6 @@
 mod agents;
 mod assets;
+mod cli;
 mod client;
 mod detect;
 mod gui;
@@ -32,7 +33,10 @@ use crate::paths::Discovery;
 #[command(
     name = "muster",
     version,
-    about = "Run many coding agents side by side, Slack-style."
+    about = "Run many coding agents side by side, Slack-style.",
+    after_help = "With no command: open a new window (starting the daemon if needed).\n\
+Session commands take a TARGET: an id, `.` (this session), a session or tab name, a unique\n\
+prefix, or tab/name. Exit codes: 0 ok, 1 error, 2 bad or ambiguous target, 124 timeout."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -58,9 +62,155 @@ enum Cmd {
     Stop,
     /// Print the UI URL (with its access token).
     Url,
-    /// Add a folder/repo as a workspace (default: current directory) and open the UI.
-    Open { path: Option<PathBuf> },
+    /// Open a UI window; with PATH, add the folder and open a new tab there.
+    Open {
+        /// Folder or repo to open a tab in (added as a workspace if new).
+        path: Option<PathBuf>,
+        /// Window to open (and to put the new tab in).
+        #[arg(long, value_name = "N")]
+        window: Option<i64>,
+    },
+    /// List live sessions (never starts the daemon).
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Include exited sessions.
+        #[arg(long)]
+        all: bool,
+        /// Print SessionInfo[] (with channel_name and window_id) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a session's recent output as plain text.
+    Read {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// How many lines (at most 10000).
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: u32,
+        /// Print the visible screen instead.
+        #[arg(long)]
+        screen: bool,
+        /// Print {id, lines} as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a prompt (bracketed paste + Enter; queued while the agent is busy).
+    #[command(after_help = "Examples:\n  muster send fix-auth run the tests --wait\n  git diff | muster send 12 -\n  muster send 12 -- -1 is not a flag here\n\nText starting with `-` goes after `--`.")]
+    Send {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Prompt words, joined by spaces. None or `-`: read stdin.
+        text: Vec<String>,
+        /// Interrupt a busy agent first.
+        #[arg(long)]
+        interrupt: bool,
+        /// Wait until the agent has started and settled again; print its state.
+        #[arg(long)]
+        wait: bool,
+        /// State to wait for (repeatable; implies --wait). Default: any settled state.
+        #[arg(long, value_name = "STATE", value_parser = cli::STATES)]
+        until: Vec<String>,
+        /// With --wait: give up after SECS (exit 124).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Block until a session reaches a state (exit 124 on timeout).
+    Wait {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// State to wait for (repeatable). Default: idle, needs_approval, asking_question,
+        /// error, stuck, exited.
+        #[arg(long, value_name = "STATE", value_parser = cli::STATES)]
+        until: Vec<String>,
+        /// Give up after SECS (exit 124).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        timeout: u64,
+        /// Print {session, matched, timed_out} as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send keys to a session's terminal.
+    #[command(after_help = "Keys: enter, esc, tab, shift+tab, space, backspace, up, down, left, right, \
+home, end, delete, pageup, pagedown, ctrl+<x>, alt+<x>, ctrl+left (etc.), a single character, or text:<literal>.\n\
+Example: muster keys 12 esc text:/compact enter")]
+    Keys {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Keys, sent in order (see below).
+        #[arg(required = true, allow_hyphen_values = true)]
+        keys: Vec<String>,
+    },
+    /// Answer a session's permission prompt (approve by default).
+    Approve {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Approve and don't ask again for this kind of action.
+        #[arg(long, conflicts_with = "deny")]
+        always: bool,
+        /// Deny instead.
+        #[arg(long)]
+        deny: bool,
+    },
+    /// Interrupt a session (Esc for agents, Ctrl-C for shells).
+    Interrupt {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
+    /// Open a new tab and start an agent in it; prints the new session id.
+    New {
+        /// Folder or repo (default: current directory).
+        path: Option<PathBuf>,
+        /// What to start in the tab (none: an empty tab).
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "shell", "none"])]
+        agent: String,
+        /// Work in a new worktree on branch muster/<tab>.
+        #[arg(long)]
+        worktree: bool,
+        /// Branch or commit the worktree starts from.
+        #[arg(long, value_name = "REF", requires = "worktree")]
+        base: Option<String>,
+        /// Tab name (default: named automatically).
+        #[arg(long)]
+        name: Option<String>,
+        /// Window for the tab (default: this session's window, else the last focused one).
+        #[arg(long, value_name = "N")]
+        window: Option<i64>,
+        /// First prompt for the agent.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+        /// Print {channel, session} as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a session, or its tab.
+    Rename {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// The new name.
+        name: String,
+        /// Rename the session's tab instead.
+        #[arg(long)]
+        tab: bool,
+    },
+    /// Kill a session.
+    Kill {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
+    /// Restart a session (same id, new process).
+    Restart {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
+    /// Run a native UI window in this process (started by `muster` / `muster open`).
+    #[command(hide = true)]
+    NativeWindow {
+        #[arg(long)]
+        window: Option<i64>,
+    },
 }
+
+const TARGET_HELP: &str = "Session: id, `.` (this session), session or tab name, unique prefix, or tab/name";
 
 fn main() -> ExitCode {
     // Hook callbacks run inside agent CLIs on every event: dispatch before anything else
@@ -77,21 +227,91 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let r = match cli.cmd {
-        None => ensure_daemon().and_then(|d| open_ui(&d)),
+        None => ensure_daemon().and_then(|d| open_ui(&d, None)),
         Some(Cmd::Daemon { foreground: true }) => run_daemon(),
         Some(Cmd::Daemon { foreground: false }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
-        Some(Cmd::Open { path }) => open(path),
+        Some(Cmd::Open { path, window }) => open(path, window),
+        Some(Cmd::NativeWindow { window }) => {
+            ensure_daemon().and_then(|d| gui::run_window(&d, window, || browser_url(&d, window)))
+        }
+        Some(Cmd::Ls { all, json }) => cli::ls(find_daemon().as_ref(), all, json),
+        Some(cmd) => ensure_daemon().and_then(|d| agent_cmd(&d, cmd)),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("muster: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(e.downcast_ref::<cli::Exit>().map_or(1, |x| x.code))
         }
+    }
+}
+
+/// Commands that act on sessions (docs/CLI.md).
+fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
+    match cmd {
+        Cmd::Read {
+            target,
+            lines,
+            screen,
+            json,
+        } => cli::read(d, &target, lines, screen, json),
+        Cmd::Send {
+            target,
+            text,
+            interrupt,
+            wait,
+            until,
+            timeout,
+        } => cli::send(
+            d,
+            &target,
+            &text,
+            cli::SendOpts {
+                interrupt,
+                wait,
+                until,
+                timeout,
+            },
+        ),
+        Cmd::Wait {
+            target,
+            until,
+            timeout,
+            json,
+        } => cli::wait(d, &target, until, timeout, json),
+        Cmd::Keys { target, keys } => cli::keys(d, &target, &keys),
+        Cmd::Approve { target, always, deny } => cli::approve(d, &target, always, deny),
+        Cmd::Interrupt { target } => cli::by_id(d, &target, "session.interrupt"),
+        Cmd::Kill { target } => cli::by_id(d, &target, "session.kill"),
+        Cmd::Restart { target } => cli::by_id(d, &target, "session.restart"),
+        Cmd::Rename { target, name, tab } => cli::rename(d, &target, &name, tab),
+        Cmd::New {
+            path,
+            agent,
+            worktree,
+            base,
+            name,
+            window,
+            prompt,
+            json,
+        } => cli::new(
+            d,
+            cli::NewOpts {
+                path: path.unwrap_or_else(|| PathBuf::from(".")),
+                agent,
+                worktree,
+                base,
+                name,
+                window,
+                prompt,
+                json,
+            },
+        ),
+        _ => unreachable!("dispatched in main"),
     }
 }
 
@@ -234,27 +454,51 @@ fn is_muster_process(pid: u32) -> bool {
     }
 }
 
-fn open(path: Option<PathBuf>) -> anyhow::Result<()> {
-    let path = path.unwrap_or_else(|| PathBuf::from("."));
-    let abs = std::fs::canonicalize(&path).with_context(|| format!("{}", path.display()))?;
+/// `muster open [PATH] [--window N]`: with PATH, add the folder (`workspace.add`, idempotent)
+/// and open a new tab there (`channel.create` without an agent, so the tab shows the
+/// launcher) in window N or a new window (`window.create`); then open the UI on that window.
+fn open(path: Option<PathBuf>, window: Option<i64>) -> anyhow::Result<()> {
     let d = ensure_daemon()?;
-    let ws = client::rpc(&d, "workspace.add", serde_json::json!({ "path": abs }))?;
-    println!("workspace: {} ({})", ws["name"].as_str().unwrap_or("?"), abs.display());
-    open_ui(&d)
+    let window = match path {
+        None => window,
+        Some(path) => {
+            let abs = std::fs::canonicalize(&path).with_context(|| format!("{}", path.display()))?;
+            let ws = client::rpc(&d, "workspace.add", serde_json::json!({ "path": abs }))?;
+            let ws_id = ws["id"].as_i64().context("workspace.add returned no id")?;
+            let win = match window {
+                Some(w) => w,
+                None => client::rpc(&d, "window.create", serde_json::json!({}))?["id"]
+                    .as_i64()
+                    .context("window.create returned no id")?,
+            };
+            let ch = client::rpc(
+                &d,
+                "channel.create",
+                serde_json::json!({ "workspace_id": ws_id, "window_id": win, "worktree": false }),
+            )?;
+            println!(
+                "{}: tab {} in window {win}",
+                abs.display(),
+                ch["name"].as_str().unwrap_or("?")
+            );
+            Some(win)
+        }
+    };
+    open_ui(&d, window)
 }
 
-/// Open the UI: the native window gets the client token in-process; a browser gets a
-/// single-use launch code, so the token never appears on its command line
-/// (/proc/<pid>/cmdline is world-readable).
-fn open_ui(d: &Discovery) -> anyhow::Result<()> {
-    gui::open_ui(d, || browser_url(d))
+/// Open the UI (on `window`, else a window the page claims): the native window gets the
+/// client token in-process; a browser gets a single-use launch code, so the token never
+/// appears on its command line (/proc/<pid>/cmdline is world-readable).
+fn open_ui(d: &Discovery, window: Option<i64>) -> anyhow::Result<()> {
+    gui::open_ui(d, window, || browser_url(d, window))
 }
 
 /// URL for opening the UI in a browser: a launch-code URL, or the token URL for an old daemon
 /// without launch codes.
-fn browser_url(d: &Discovery) -> anyhow::Result<String> {
+fn browser_url(d: &Discovery, window: Option<i64>) -> anyhow::Result<String> {
     match client::launch_code(d).context("getting a launch code from the daemon")? {
-        Some(code) => Ok(d.launch_url(&code)),
+        Some(code) => Ok(d.launch_url(&code, window)),
         None => {
             eprintln!(
                 "muster: the running daemon (version {}) has no launch codes; opening with the token URL. \

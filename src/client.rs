@@ -1,4 +1,4 @@
-//! Tiny blocking HTTP/1.1 client for the CLI (`muster status/open/...`). Only talks to our
+//! Tiny blocking HTTP/1.1 client for the CLI (`muster status/open/ls/...`). Only talks to our
 //! own daemon on 127.0.0.1, so it stays dependency-free and never needs a tokio runtime.
 
 use std::io::{Read, Write};
@@ -108,21 +108,26 @@ pub fn launch_code(d: &Discovery) -> anyhow::Result<Option<String>> {
 
 /// Call a JSON method through `POST /api/rpc`.
 pub fn rpc(d: &Discovery, method: &str, params: Value) -> anyhow::Result<Value> {
+    rpc_with_timeout(d, method, params, Duration::from_secs(60))
+}
+
+/// `rpc` with a custom read timeout (long enough for `session.wait`).
+pub fn rpc_with_timeout(d: &Discovery, method: &str, params: Value, timeout: Duration) -> anyhow::Result<Value> {
     let body = serde_json::to_vec(&json!({ "id": 1, "method": method, "params": params }))?;
-    let (status, resp) = request(
-        d.port,
-        "POST",
-        "/api/rpc",
-        Some(&d.token),
-        Some(&body),
-        Duration::from_secs(60),
-    )?;
+    let (status, resp) = request(d.port, "POST", "/api/rpc", Some(&d.token), Some(&body), timeout)?;
     if status != 200 {
         anyhow::bail!("daemon returned HTTP {status}");
     }
     let v: Value = serde_json::from_slice(&resp).context("invalid JSON from daemon")?;
     if let Some(err) = v.get("error") {
-        anyhow::bail!("{}", err["message"].as_str().unwrap_or("unknown error"));
+        let msg = err["message"].as_str().unwrap_or("unknown error");
+        if msg.starts_with("unknown method") {
+            anyhow::bail!(
+                "{msg} (the running daemon, version {}, doesn't support it; after an update, restart it with `muster stop`)",
+                d.version
+            );
+        }
+        anyhow::bail!("{msg}");
     }
     Ok(v["result"].clone())
 }

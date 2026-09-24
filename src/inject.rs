@@ -490,7 +490,17 @@ async fn accepted(
     }
 }
 
-pub fn approve(hub: &Arc<Hub>, id: SessionId, decision: Decision) -> anyhow::Result<()> {
+/// Answer the permission prompt on screen. `from` is logged ("human", "device:<id>").
+/// `seen` = the `(state_seq, state_since)` of the prompt the caller saw; if the session has
+/// moved on since (another prompt, none, or this one already answered), refuse rather than
+/// answer something the caller never saw.
+pub fn approve(
+    hub: &Arc<Hub>,
+    id: SessionId,
+    decision: Decision,
+    from: &str,
+    seen: (Option<u64>, Option<i64>),
+) -> anyhow::Result<()> {
     let info = hub
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
@@ -511,12 +521,19 @@ pub fn approve(hub: &Arc<Hub>, id: SessionId, decision: Decision) -> anyhow::Res
             info.state.as_str()
         );
     };
+    // Claim only once the keys are chosen (a prompt muster can't answer isn't consumed), then
+    // make sure the screen they were chosen from is still the one on display: the detector
+    // lags the screen, so a new prompt can be up before `state_seq` moves.
+    hub.claim_prompt(id, seen.0, seen.1)?;
+    if seen.0.is_some() && hub.screen(id).is_none_or(|now| now.lines != screen.lines) {
+        anyhow::bail!("stale: session {id}'s screen changed while answering; check it again");
+    }
     hub.write_input(id, &bytes)?;
     hub.log_event(
         Some(info.channel_id),
         Some(id),
         EventKind::Approval,
-        serde_json::json!({"session_id": id, "decision": decision}),
+        serde_json::json!({"session_id": id, "decision": decision, "from": from}),
     );
     Ok(())
 }

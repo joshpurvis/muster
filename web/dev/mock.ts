@@ -27,6 +27,7 @@ interface Session {
   exit_code: number | null;
   cols: number;
   rows: number;
+  size_owner: string | null;
   queued: number;
   created_at: number;
   /** The window this session is a tab in (docs/PROTOCOL.md "Groups layout (v2)"). */
@@ -46,6 +47,16 @@ const procs = new Map<
 const scrollback = new Map<number, Uint8Array[]>();
 const clients = new Set<WebSocket>();
 const attached = new Map<WebSocket, Set<number>>();
+const deviceClients = new Set<WebSocket>();
+const pairAttempts: number[] = [];
+const device = {
+  id: 1,
+  name: "Android phone",
+  scopes: ["view", "interact"],
+  created_at: now(),
+  last_seen_at: now(),
+  expires_at: now() + 30 * 86400000,
+};
 
 // ---------- windows (docs/PROTOCOL.md "Windows, tabs and naming", "Groups layout (v2)") ----------
 // A tab is a session (`Session.window_id`); `channel_ids` are the tasks whose window it is.
@@ -107,8 +118,9 @@ function taskFollows(c: any, prefer?: number) {
   if (!wins.length) return;
   let target: number;
   if (wins.every((w) => w === wins[0])) target = wins[0];
-  else if (!wins.includes(c.window_id)) target = prefer !== undefined && wins.includes(prefer) ? prefer : wins[0];
-  else return;
+  else if (!wins.includes(c.window_id)) {
+    target = prefer !== undefined && wins.includes(prefer) ? prefer : wins[0];
+  } else return;
   if (target === c.window_id) return;
   const from = winById(c.window_id);
   placeChannel(c, winById(target)!);
@@ -330,6 +342,7 @@ function spawn(req: any): Session {
     exit_code: null,
     cols: req.cols ?? 120,
     rows: req.rows ?? 32,
+    size_owner: null,
     queued: 0,
     created_at: now(),
     window_id: win.id,
@@ -385,6 +398,19 @@ function stripAnsi(s: string) {
 }
 
 async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> {
+  if (
+    ws && deviceClients.has(ws) && ![
+      "hello",
+      "session.attach",
+      "session.detach",
+      "session.resize",
+      "session.send",
+      "session.input",
+      "session.approve",
+      "session.interrupt",
+      "channel.mark_read",
+    ].includes(method)
+  ) throw new Error("This device does not have permission for " + method);
   switch (method) {
     case "hello":
       return {
@@ -437,7 +463,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!w) throw new Error(`no such window: ${p.window_id}`);
       if (!s) throw new Error(`no such session: ${p.id}`);
       if (p.from_window_id != null && p.from_window_id !== s.window_id) {
-        throw new Error(`session ${s.id} is no longer in window ${p.from_window_id} (now in ${s.window_id ?? "none"})`);
+        throw new Error(
+          `session ${s.id} is no longer in window ${p.from_window_id} (now in ${s.window_id ?? "none"})`,
+        );
       }
       if (s.window_id === w.id) return s;
       const from = winById(s.window_id);
@@ -611,7 +639,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     case "session.spawn":
       return spawn(p);
     case "session.attach": {
-      return { __attach: p.id };
+      if (!sessions.has(p.id)) throw new Error("no such session");
+      return { __attach: p.id, replay_bytes: p.replay_bytes };
     }
     case "session.detach":
       if (ws) attached.get(ws)?.delete(p.id);
@@ -621,6 +650,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (s) {
         s.cols = p.cols;
         s.rows = p.rows;
+        s.size_owner = ws && deviceClients.has(ws) ? `device:${device.id}` : "local";
+        upsert(s);
         // `script` can't resize its pty; tell bash via stty so line wrapping is right.
         write(p.id, "");
       }
@@ -674,7 +705,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     }
     case "channel.close_if_empty": {
       const c = channels.find((c) => c.id === p.id);
-      if (!c || c.archived || [...sessions.values()].some((s) => s.channel_id === c.id)) return { closed: false };
+      if (!c || c.archived || [...sessions.values()].some((s) => s.channel_id === c.id)) {
+        return { closed: false };
+      }
       await handle("channel.archive", { id: c.id });
       return { closed: true };
     }
@@ -708,6 +741,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     case "session.approve": {
       const s = sessions.get(p.id);
       if (!s) throw new Error("no such session");
+      if (p.state_since !== undefined && (p.state_since !== s.state_since || s.state !== "needs_approval")) {
+        throw new Error("Approval is stale: the prompt changed");
+      }
       logEvent(s.channel_id, s.id, "approval", { session_id: s.id, decision: p.decision });
       if (p.decision === "deny") setState(s, "idle");
       else {
@@ -716,8 +752,11 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       }
       return {};
     }
+    case "session.input":
+      write(p.id, String(p.data));
+      return {};
     case "session.interrupt":
-      write(p.id, "\x03");
+      write(p.id, sessions.get(p.id)?.kind === "shell" ? "\x03" : "\x1b");
       return {};
     case "session.clear_queue": {
       const s = sessions.get(p.id);
@@ -763,12 +802,14 @@ function concat(parts: Uint8Array[]) {
   return out;
 }
 
-function onSocket(ws: WebSocket) {
+function onSocket(ws: WebSocket, isDevice = false) {
   ws.binaryType = "arraybuffer";
   clients.add(ws);
+  if (isDevice) deviceClients.add(ws);
   attached.set(ws, new Set());
   ws.onclose = () => {
     clients.delete(ws);
+    deviceClients.delete(ws);
     attached.delete(ws);
     release(ws);
   };
@@ -787,7 +828,11 @@ function onSocket(ws: WebSocket) {
         const sid = result.__attach;
         ws.send(JSON.stringify({ id: msg.id, result: {} }));
         attached.get(ws)?.add(sid);
-        ws.send(frame(3, sid, concat(scrollback.get(sid) ?? [])));
+        const replay = concat(scrollback.get(sid) ?? []);
+        const limit = typeof result.replay_bytes === "number"
+          ? Math.max(0, result.replay_bytes)
+          : replay.length;
+        ws.send(frame(3, sid, replay.subarray(Math.max(0, replay.length - limit))));
         return;
       }
       ws.send(JSON.stringify({ id: msg.id, result }));
@@ -804,24 +849,78 @@ const TYPES: Record<string, string> = {
   js: "text/javascript; charset=utf-8",
   css: "text/css; charset=utf-8",
   map: "application/json",
+  webmanifest: "application/manifest+json",
+  svg: "image/svg+xml",
+  png: "image/png",
 };
 
 Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
   const url = new URL(req.url);
+  const cookie = /(?:^|;\s*)muster_device=mock-device(?:;|$)/.test(req.headers.get("cookie") ?? "");
+  if (url.pathname === "/api/device/me" && req.method === "GET") {
+    return cookie
+      ? Response.json({ device })
+      : Response.json({ error: { message: "Unpaired" } }, { status: 401 });
+  }
+  if (url.pathname.startsWith("/api/device/") && req.method === "POST") {
+    if (req.headers.get("X-Muster") !== "1") return new Response("missing X-Muster", { status: 403 });
+    if (url.pathname === "/api/device/pair") {
+      while (pairAttempts[0] < now() - 60000) pairAttempts.shift();
+      if (pairAttempts.length >= 5) {
+        return Response.json({ error: { message: "Too many pairing attempts" } }, { status: 429 });
+      }
+      pairAttempts.push(now());
+      const body = await req.json().catch(() => ({}));
+      if (body.code !== "ABCDEFGHJ" && !/^[a-f0-9]{64}$/i.test(body.code ?? "")) {
+        return Response.json({
+          error: { message: "Code expired or incorrect. Run muster pair for a new code." },
+        }, { status: 403 });
+      }
+      device.name = body.name || "Android phone";
+      return Response.json({ device }, {
+        headers: {
+          "set-cookie": "muster_device=mock-device; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
+        },
+      });
+    }
+    if (url.pathname === "/api/device/logout") {
+      for (const ws of deviceClients) ws.close();
+      return Response.json({}, {
+        headers: { "set-cookie": "muster_device=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" },
+      });
+    }
+  }
   if (url.pathname === "/ws") {
-    if (url.searchParams.get("token") !== TOKEN) return new Response("unauthorized", { status: 401 });
+    const isDevice = !url.searchParams.has("token") && cookie;
+    if (url.searchParams.get("token") !== TOKEN && !isDevice) {
+      return new Response("unauthorized", { status: 401 });
+    }
     const { socket, response } = Deno.upgradeWebSocket(req);
-    onSocket(socket);
+    onSocket(socket, isDevice);
     return response;
   }
   if (url.pathname === "/api/health") return Response.json({ ok: true, version: "mock" });
-  const path = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+  if (url.pathname === "/m") return Response.redirect(`${url.origin}/m/`, 302);
+  const path = url.pathname === "/"
+    ? "index.html"
+    : url.pathname === "/m/"
+    ? "m/index.html"
+    : url.pathname.slice(1);
   if (path.includes("..")) return new Response("no", { status: 400 });
   try {
     const body = await Deno.readFile(new URL(path, DIST));
     const ext = path.split(".").pop() ?? "";
     return new Response(body, {
-      headers: { "content-type": TYPES[ext] ?? "application/octet-stream", "cache-control": "no-store" },
+      headers: {
+        "content-type": TYPES[ext] ?? "application/octet-stream",
+        "cache-control": "no-store",
+        ...(path.startsWith("m/")
+          ? {
+            "content-security-policy":
+              "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+          }
+          : {}),
+      },
     });
   } catch {
     return new Response("not found", { status: 404 });

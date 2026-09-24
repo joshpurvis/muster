@@ -90,12 +90,19 @@ class Rpc {
   private backoff = 250;
   private token: string | null = null;
   private retryTimer = 0;
+  private suspended = false;
+  private cookie = /^\/m(?:\/|$)/.test(location.pathname);
 
   onEvent: EventHandler = () => {};
   onBinary: BinaryHandler = () => {};
   onHello: HelloHandler = () => {};
+  onClosed?: () => void | Promise<void>;
 
   async start() {
+    if (this.cookie) {
+      this.resume();
+      return;
+    }
     this.token = await readToken();
     if (!this.token) {
       connStatus.value = "no_token";
@@ -110,6 +117,7 @@ class Rpc {
   }
 
   private kick() {
+    if (this.suspended) return;
     if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
       this.backoff = 250;
       this.connect();
@@ -119,11 +127,13 @@ class Rpc {
   private connect() {
     clearTimeout(this.retryTimer);
     this.retryTimer = 0;
+    if (this.suspended) return;
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED && this.ws.readyState !== WebSocket.CLOSING) {
       return;
     }
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(this.token!)}`;
+    const auth = this.cookie ? "" : `?token=${encodeURIComponent(this.token!)}`;
+    const url = `${proto}//${location.host}/ws${auth}`;
     let ws: WebSocket;
     try {
       ws = new WebSocket(url);
@@ -155,6 +165,7 @@ class Rpc {
       ws.send(JSON.stringify({ id, method: "hello", params: {} }));
     };
     ws.onmessage = (e) => {
+      if (this.ws !== ws) return;
       if (typeof e.data === "string") this.handleText(e.data);
       else this.handleBinary(new Uint8Array(e.data as ArrayBuffer));
     };
@@ -171,16 +182,48 @@ class Rpc {
         }
       }
       connStatus.value = "reconnecting";
-      this.scheduleReconnect();
+      if (this.onClosed) {
+        Promise.resolve(this.onClosed()).catch(() => {}).finally(() => {
+          if (!this.ws) this.scheduleReconnect();
+        });
+      } else this.scheduleReconnect();
     };
     ws.onerror = () => {/* onclose follows */};
   }
 
   private scheduleReconnect() {
+    if (this.suspended) return;
     const d = this.backoff;
     this.backoff = Math.min(5000, this.backoff * 2);
     clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => this.connect(), d);
+  }
+
+  /** Background phones close deliberately; no action may survive into a later connection. */
+  suspend() {
+    this.suspended = true;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = 0;
+    const ws = this.ws;
+    this.ws = null;
+    this.ready = false;
+    this.queue = [];
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(new RpcError(p.method, "Connection suspended"));
+    }
+    this.pending.clear();
+    connStatus.value = "reconnecting";
+    if (ws) {
+      ws.close();
+      Promise.resolve(this.onClosed?.()).catch(() => {});
+    }
+  }
+
+  resume() {
+    this.suspended = false;
+    this.backoff = 250;
+    this.connect();
   }
 
   private handleText(text: string) {
@@ -229,6 +272,9 @@ class Rpc {
   }
 
   call<T = unknown>(method: string, params: unknown = {}): Promise<T> {
+    if (this.suspended || (this.cookie && !this.isOpen)) {
+      return Promise.reject(new RpcError(method, "Disconnected"));
+    }
     const id = this.nextId++;
     const frame = JSON.stringify({ id, method, params });
     const p = this.track(id, method) as Promise<T>;

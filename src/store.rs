@@ -137,6 +137,25 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN window_id INTEGER;
     UPDATE sessions SET window_id = (SELECT c.window_id FROM channels c WHERE c.id = sessions.channel_id);
     "#,
+    // v6: paired remote devices (docs/ANDROID.md) and the origins their pages are served from.
+    r#"
+    CREATE TABLE devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        scopes TEXT NOT NULL,
+        ts_login TEXT,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        last_source TEXT,
+        expires_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    CREATE TABLE remote_origins (
+        origin TEXT PRIMARY KEY,
+        added_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -206,6 +225,77 @@ impl Store {
             tx.pragma_update(None, "user_version", v)?;
             tx.commit()?;
         }
+        Ok(())
+    }
+
+    // ----- devices -----
+
+    pub fn load_devices(&self) -> anyhow::Result<Vec<crate::devices::Device>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT id, name, token_hash, scopes, ts_login, created_at, last_seen_at, last_source, expires_at,
+                    revoked_at FROM devices ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| {
+            let scopes: String = r.get(3)?;
+            Ok(crate::devices::Device {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                token_hash: r.get(2)?,
+                scopes: serde_json::from_str(&scopes).unwrap_or_default(),
+                ts_login: r.get(4)?,
+                created_at: r.get(5)?,
+                last_seen_at: r.get(6)?,
+                last_source: r.get(7)?,
+                expires_at: r.get(8)?,
+                revoked_at: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn insert_device(&self, d: &crate::devices::Device) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO devices (name, token_hash, scopes, ts_login, created_at, last_seen_at, last_source,
+                                  expires_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                d.name,
+                d.token_hash,
+                serde_json::to_string(&d.scopes)?,
+                d.ts_login,
+                d.created_at,
+                d.last_seen_at,
+                d.last_source,
+                d.expires_at,
+                d.revoked_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Persist the mutable fields (last seen, expiry, revocation).
+    pub fn update_device(&self, d: &crate::devices::Device) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE devices SET last_seen_at = ?2, last_source = ?3, expires_at = ?4, revoked_at = ?5 WHERE id = ?1",
+            params![d.id, d.last_seen_at, d.last_source, d.expires_at, d.revoked_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_remote_origins(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT origin FROM remote_origins")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn insert_remote_origin(&self, origin: &str, now: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO remote_origins (origin, added_at) VALUES (?1, ?2)",
+            params![origin, now],
+        )?;
         Ok(())
     }
 
@@ -430,6 +520,8 @@ impl Store {
                     rows: r.get::<_, i64>(13)?.clamp(1, u16::MAX as i64) as u16,
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     subagents: 0,
+                    size_owner: None,
+                    state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
                 },

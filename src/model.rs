@@ -275,6 +275,15 @@ pub struct SessionInfo {
     /// Client window this session is a tab in (None: adopted by the next `window.claim`).
     #[serde(default)]
     pub window_id: Option<WindowId>,
+    /// Changes whenever the state or its detail changes, and when a prompt is answered: an
+    /// approval carrying the `state_seq` the caller saw never answers a different prompt.
+    /// Runtime only (unique within one daemon run).
+    #[serde(default)]
+    pub state_seq: u64,
+    /// Who set the terminal size last: "local" (a client-token client) or "device:<id>".
+    /// Runtime only: None after a daemon restart.
+    #[serde(default)]
+    pub size_owner: Option<String>,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).

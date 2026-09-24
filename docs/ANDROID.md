@@ -1,8 +1,13 @@
 # Android remote support: implementation plan
 
-Status: planning only. Starts after the Linux desktop redesign (PLAN.md §0) stabilises. Method
-names follow docs/PROTOCOL.md; `session.wait/input/output` and `window.*` are being implemented
-in other worktrees and may not be in this checkout yet.
+Status: phases 0 and 1 are implemented, plus part of phase 3. That covers pairing, device
+cookie auth, the proxied-request policy, scopes, `/m/` (sessions list, approvals, read-only
+terminal with touch scroll, pinch zoom and select/copy, floating composer, `follow`/`keep` size),
+suspend on background, and a capped replay (`session.attach` `replay_bytes`) instead of the
+`screen`/`delta` replay kinds. Not done yet: Web Push (phase 2), `attach_info`/`delta` replays,
+the `manage` UI, and WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
+device tokens are hashed with a small in-crate SHA-256. The wire contract is in docs/PROTOCOL.md
+"Remote devices"; where this plan and PROTOCOL.md differ, PROTOCOL.md wins.
 
 ## Goals and non-goals
 

@@ -60,6 +60,28 @@ fn index(req: &HeaderMap) -> Response {
     })
 }
 
+/// The phone UI (docs/ANDROID.md) is its own app under `/m/`, served with a strict CSP (the
+/// desktop page keeps an inline theme script, so it doesn't get one).
+const MOBILE_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; \
+     img-src 'self' data:; manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+fn mobile(path: &str, req: &HeaderMap) -> Response {
+    let last = path.rsplit('/').next().unwrap_or("");
+    let mut r = match file(path, req) {
+        Some(r) => r,
+        None if last.contains('.') => StatusCode::NOT_FOUND.into_response(),
+        None => file("m/index.html", req).unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()),
+    };
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(MOBILE_CSP));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    if path == "m/sw.js" {
+        h.insert("service-worker-allowed", HeaderValue::from_static("/m/"));
+    }
+    r
+}
+
 pub async fn serve(uri: Uri, req: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     if path.is_empty() || path == "index.html" {
@@ -67,6 +89,12 @@ pub async fn serve(uri: Uri, req: HeaderMap) -> Response {
     }
     if path.split('/').any(|seg| seg == "..") {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if path == "m" {
+        return axum::response::Redirect::permanent("/m/").into_response();
+    }
+    if let Some(rest) = path.strip_prefix("m/") {
+        return mobile(if rest.is_empty() { "m/index.html" } else { path }, &req);
     }
     if let Some(r) = file(path, &req) {
         return r;

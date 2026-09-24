@@ -3,6 +3,7 @@ mod assets;
 mod cli;
 mod client;
 mod detect;
+mod devices;
 mod gui;
 mod hookcmd;
 mod hub;
@@ -233,11 +234,51 @@ Runs until Ctrl-C or the daemon stops (exit 0). Never starts the daemon (exit 1 
         #[arg(long, value_name = "NAME")]
         tab: Option<String>,
     },
+    /// Pair a phone: prints a QR code and a short code for the phone UI (over Tailscale).
+    #[command(after_help = "The phone opens https://<this machine>.<tailnet>.ts.net/m/ through `tailscale serve`\n\
+(the commands are printed when it isn't set up). Scan the QR code with the phone's camera, or open\n\
+that address and type the short code. The code works once, for --ttl seconds; three wrong codes burn it.\n\
+See docs/ANDROID.md.")]
+    Pair {
+        /// Device name (default: what the phone reports).
+        #[arg(long)]
+        name: Option<String>,
+        /// What the phone may do: view, interact (approve, prompt, keys), or manage (also open
+        /// and close tabs).
+        #[arg(long, default_value = "interact", value_parser = ["view", "interact", "manage"])]
+        scope: String,
+        /// Seconds the code stays valid.
+        #[arg(long, default_value_t = 120)]
+        ttl: u64,
+        /// Address the phone opens (default: https://<this machine's Tailscale name>).
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// List paired devices, or revoke one.
+    Devices {
+        #[command(subcommand)]
+        action: Option<DevicesCmd>,
+        /// Print Device[] as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
     NativeWindow {
         #[arg(long)]
         window: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevicesCmd {
+    /// Revoke a device (by id or name): its connections close and it must pair again.
+    Revoke {
+        /// Device id or exact name.
+        device: Option<String>,
+        /// Revoke every device.
+        #[arg(long, conflicts_with = "device")]
+        all: bool,
     },
 }
 
@@ -279,6 +320,13 @@ fn main() -> ExitCode {
             ensure_daemon().and_then(|d| gui::run_window(&d, window, || browser_url(&d, window)))
         }
         Some(Cmd::Ls { all, json }) => cli::ls(find_daemon().as_ref(), all, json),
+        Some(Cmd::Pair { name, scope, ttl, url }) => {
+            ensure_daemon().and_then(|d| cli::pair(&d, name.as_deref(), &scope, ttl, url.as_deref()))
+        }
+        Some(Cmd::Devices { action, json }) => running().and_then(|d| match action {
+            None => cli::devices(&d, json),
+            Some(DevicesCmd::Revoke { device, all }) => cli::revoke_device(&d, device.as_deref(), all),
+        }),
         Some(Cmd::Events { json, session, tab }) => {
             running().and_then(|d| cli::events(&d, json, session.as_deref(), tab.as_deref()))
         }

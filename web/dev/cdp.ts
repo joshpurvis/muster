@@ -5,7 +5,7 @@ export interface Browser {
   send<T = any>(method: string, params?: Record<string, unknown>): Promise<T>;
   eval<T = any>(expr: string): Promise<T>;
   goto(url: string): Promise<void>;
-  size(w: number, h: number): Promise<void>;
+  size(w: number, h: number, mobile?: boolean): Promise<void>;
   shot(path: string): Promise<void>;
   key(combo: string): Promise<void>;
   type(text: string): Promise<void>;
@@ -131,15 +131,16 @@ export async function launch(port = 9333, userDir = "/tmp/muster-cdp"): Promise<
       await send("Page.navigate", { url });
       await sleep(600);
     },
-    async size(w, h) {
+    async size(w, h, mobile = false) {
       W = w;
       H = h;
       await send("Emulation.setDeviceMetricsOverride", {
         width: w,
         height: h,
-        deviceScaleFactor: 1,
-        mobile: false,
+        deviceScaleFactor: mobile ? 2.625 : 1,
+        mobile,
       });
+      await send("Emulation.setTouchEmulationEnabled", { enabled: mobile, maxTouchPoints: mobile ? 2 : 1 });
     },
     async shot(path) {
       const r: any = await send("Page.captureScreenshot", {
@@ -258,4 +259,142 @@ export async function launch(port = 9333, userDir = "/tmp/muster-cdp"): Promise<
     },
   };
   return b;
+}
+
+// Mobile screenshot walkthrough, against the mock only:
+// deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-write=<shots> \
+//   dev/cdp.ts http://127.0.0.1:17744 <shots> <workspace path>
+if (import.meta.main) {
+  const [origin, shots, workspace] = Deno.args;
+  if (!origin || !shots || !workspace) {
+    throw new Error("usage: cdp.ts <mock origin> <shots dir> <workspace path>");
+  }
+  const health = await (await fetch(`${origin}/api/health`)).json();
+  if (health.version !== "mock") throw new Error("Mobile captures must run against the mock daemon");
+  await Deno.mkdir(shots, { recursive: true });
+  const admin = new WebSocket(`${origin.replace(/^http/, "ws")}/ws?token=dev`);
+  await new Promise((resolve, reject) => {
+    admin.onopen = resolve;
+    admin.onerror = reject;
+  });
+  let id = 0;
+  const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  admin.onmessage = (event) => {
+    if (typeof event.data !== "string") return;
+    const msg = JSON.parse(event.data);
+    const call = pending.get(msg.id);
+    if (!call) return;
+    pending.delete(msg.id);
+    if (msg.error) call.reject(new Error(msg.error.message));
+    else call.resolve(msg.result);
+  };
+  const rpc = (method: string, params: object = {}): Promise<any> =>
+    new Promise((resolve, reject) => {
+      const requestId = ++id;
+      pending.set(requestId, { resolve, reject });
+      admin.send(JSON.stringify({ id: requestId, method, params }));
+    });
+  let browser: Browser | null = null;
+  const created: number[] = [];
+  const ensure = (condition: unknown, message: string) => {
+    if (!condition) throw new Error(message);
+  };
+  try {
+    const project = await rpc("workspace.add", { path: workspace });
+    const channel = await rpc("channel.create", { workspace_id: project.id, name: "Android remote" });
+    created.push(channel.id);
+    const agent = await rpc("session.spawn", {
+      channel_id: channel.id,
+      kind: "codex",
+      name: "Mobile frontend",
+    });
+    const shell = await rpc("session.spawn", { channel_id: channel.id, kind: "shell", name: "Dev shell" });
+    browser = await launch(9344, `/tmp/muster-mobile-cdp-${Date.now()}`);
+    const b = browser;
+    await b.send("Emulation.setEmulatedMedia", {
+      features: [{ name: "prefers-color-scheme", value: "dark" }],
+    });
+    await b.size(412, 915, true);
+    await b.goto(`${origin}/m/`);
+    await b.wait("!!document.querySelector('#pair-code')");
+    const shot = async (name: string) => {
+      await b.sleep(300);
+      ensure(
+        await b.eval("document.documentElement.scrollWidth <= innerWidth"),
+        "Page overflowed horizontally",
+      );
+      await b.shot(`${shots}/${name}.png`);
+      console.log(`captured ${name}.png`);
+    };
+    await shot("pair");
+    await b.click("#pair-code");
+    await b.type("abc-def ghj");
+    await b.wait("!!document.querySelector('.pair-screen button[type=submit]:enabled')");
+    await b.click(".pair-screen button[type=submit]");
+    await b.wait("!!document.querySelector('.connected')");
+    await b.sleep(4000);
+    const before = await rpc("hello");
+    ensure(
+      before.channels.find((c: any) => c.id === channel.id).last_read_at === channel.last_read_at,
+      "Mobile hello marked a channel read",
+    );
+    await rpc("session.input", {
+      id: agent.id,
+      data:
+        "printf '\\033[2J\\033[H\\033[1;35mMuster / Android remote\\033[0m\\r\\n\\r\\nReading the existing terminal client…\\r\\n  web/src/rpc.ts\\r\\n  web/src/terms.ts\\r\\n\\r\\nPairing and session list are ready.\\r\\nChecking the mobile composer and replay…\\r\\n\\r\\nReady to run the workspace checks.\\r\\n'\r",
+      keys: true,
+    });
+    await rpc("session.send", { id: agent.id, text: "ask", mode: "interrupt" });
+    await b.wait(`!!document.querySelector('[data-session="${agent.id}"] .approve')`);
+    await shot("sessions");
+    await b.click(`[data-session="${shell.id}"] .session-open`);
+    await b.wait("!!document.querySelector('.xterm-rows')");
+    await b.sleep(300);
+    await shot("session-composer");
+    await b.click(".touch-surface");
+    ensure(
+      await b.eval("!document.activeElement.classList.contains('xterm-helper-textarea')"),
+      "Terminal tap focused the xterm textarea",
+    );
+    await b.click('[aria-label="Back to sessions"]');
+    await b.wait("!!document.querySelector('.session-list')");
+    await b.click(`[data-session="${agent.id}"] .session-open`);
+    await b.wait("!!document.querySelector('.approval-prompt')");
+    await shot("session-approval");
+    await b.click(".select-toggle");
+    await b.wait("!!document.querySelector('.selection-text')");
+    await shot("select-mode");
+    await b.click(".select-toggle");
+    await b.wait("!document.querySelector('.selection-text')");
+    await b.click(".input-row textarea");
+    await b.type("Check reconnect and preserve my draft.\nThen run the checks.");
+    await b.size(412, 500, true);
+    await shot("keyboard-open");
+    const composer = await b.rect(".composer-wrap");
+    ensure(
+      composer && composer.y >= 60 && composer.y + composer.h <= 500,
+      "Composer does not fit above keyboard",
+    );
+    await b.size(412, 915, true);
+    await b.wait("Math.abs(document.querySelector('.mobile-app').getBoundingClientRect().height - 915) < 1");
+    await b.click('[aria-label="Minimise composer"]');
+    await b.wait("!!document.querySelector('.composer-wrap.collapsed')");
+    await b.click('[aria-label="Expand composer"]');
+    await b.wait("!!document.querySelector('.composer-wrap:not(.collapsed) .input-row textarea')");
+    ensure(
+      await b.eval("document.querySelector('.input-row textarea').value.includes('preserve my draft')"),
+      "Composer lost its draft",
+    );
+    await b.eval("history.back()");
+    await b.wait("!!document.querySelector('.session-list')");
+    ensure(
+      !b.console.some((line) => line.startsWith("exception:") || /Content Security Policy/.test(line)),
+      b.console.join("\n"),
+    );
+    console.log("Mobile walkthrough passed");
+  } finally {
+    await browser?.close();
+    for (const channel of created) await rpc("channel.archive", { id: channel }).catch(() => {});
+    admin.close();
+  }
 }

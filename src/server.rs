@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -14,6 +15,7 @@ use serde_json::json;
 
 use tokio::sync::broadcast;
 
+use crate::devices::{self, Device, Principal};
 use crate::hub::{Hub, ServerEvent};
 
 pub fn router(hub: Arc<Hub>) -> Router {
@@ -23,11 +25,162 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/events", get(events_stream))
         .route("/api/launch-code", post(launch_code))
         .route("/api/exchange", post(exchange))
+        .route("/api/device/pair", post(device_pair))
+        .route("/api/device/me", get(device_me))
+        .route("/api/device/logout", post(device_logout))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
         .with_state(hub.clone())
-        .nest("/mcp", crate::mcp::router(hub))
+        .nest("/mcp", crate::mcp::router(hub.clone()))
         .fallback(crate::assets::serve)
+        .layer(axum::middleware::from_fn_with_state(hub, classify))
+}
+
+/// How a request reached the daemon (docs/ANDROID.md "Security model").
+#[derive(Debug, Clone)]
+pub struct Peer {
+    /// Came through a proxy (`tailscale serve`): the TCP peer is the proxy's uid, or it carries
+    /// forwarding headers (forging those locally only restricts a request further). Proxied
+    /// requests reach the phone routes only, and only with a device cookie.
+    pub proxied: bool,
+    /// For logs and pairing rate limits: the forwarded client IP when the proxy is trusted,
+    /// else "local".
+    pub source: String,
+    /// `Tailscale-User-Login`, only from a trusted proxy (headers from anyone else are ignored).
+    pub ts_login: Option<String>,
+}
+
+impl Peer {
+    fn local() -> Peer {
+        Peer {
+            proxied: false,
+            source: "local".into(),
+            ts_login: None,
+        }
+    }
+}
+
+/// Uid of the proxy whose identity headers are trusted (`MUSTER_PROXY_UID`, default 0: a
+/// system tailscaled).
+fn proxy_uid() -> u32 {
+    std::env::var("MUSTER_PROXY_UID")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Paths a proxied request may reach at all; everything else is 404 through the proxy.
+fn proxied_path_allowed(path: &str) -> bool {
+    path == "/m"
+        || path.starts_with("/m/")
+        || path.starts_with("/api/device/")
+        || path == "/ws"
+        || path == "/api/rpc"
+        || path == "/api/health"
+}
+
+fn has_forwarding_headers(h: &HeaderMap) -> bool {
+    h.keys().any(|k| {
+        let k = k.as_str();
+        k == "x-forwarded-for" || k == "forwarded" || k.starts_with("x-forwarded-") || k.starts_with("tailscale-")
+    })
+}
+
+/// Classify every request (`Peer` extension) and apply the proxied-request policy.
+async fn classify(State(hub): State<Arc<Hub>>, mut req: Request, next: Next) -> Response {
+    let h = req.headers();
+    if h.contains_key("tailscale-funnel-request") {
+        // Never reachable from the public internet.
+        return (StatusCode::FORBIDDEN, "not available through Funnel").into_response();
+    }
+    let forwarded = has_forwarding_headers(h);
+    let conn = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let proxy = proxy_uid();
+    let trusted = match conn {
+        // With the daemon itself running as the proxy's uid the socket owner proves nothing.
+        Some(peer) if proxy != me => {
+            let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), hub.port());
+            tokio::task::spawn_blocking(move || socket_owner(peer, server))
+                .await
+                .ok()
+                .flatten()
+                == Some(proxy)
+        }
+        _ => false,
+    };
+    let mut peer = Peer::local();
+    peer.proxied = forwarded || trusted;
+    if trusted {
+        let h = req.headers();
+        let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+        if let Some(ip) = get("x-forwarded-for").and_then(|v| v.split(',').next()) {
+            peer.source = ip.trim().chars().take(64).collect();
+        }
+        peer.ts_login = get("tailscale-user-login").map(str::to_string);
+    }
+    if peer.proxied && !proxied_path_allowed(req.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    req.extensions_mut().insert(peer);
+    next.run(req).await
+}
+
+fn cookie_value<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    h.get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| {
+            let (k, v) = kv.trim().split_once('=')?;
+            (k == name).then_some(v.trim())
+        })
+}
+
+fn device_cookie(token: &str, max_age_s: i64) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age_s}",
+        devices::COOKIE
+    ))
+    .expect("cookie is ASCII")
+}
+
+/// An `Origin` a device cookie is honoured from: present, not `null`, and the tailnet origin a
+/// pairing was issued for (or this daemon's own local origin).
+fn device_origin_ok(hub: &Hub, h: &HeaderMap) -> bool {
+    let Some(o) = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let port = hub.port();
+    o != "null"
+        && (hub.devices().origin_allowed(o)
+            || o == format!("http://127.0.0.1:{port}")
+            || o == format!("http://localhost:{port}"))
+}
+
+/// Resolve a device from its cookie. `require_origin`: every state-changing route and the
+/// WebSocket (the strict `Origin` check is the CSRF boundary: every host in a tailnet is
+/// same-site). A request from a trusted proxy carrying a different Tailscale login than the
+/// one seen at pairing is refused.
+fn device_from_cookie(hub: &Hub, peer: &Peer, h: &HeaderMap, require_origin: bool) -> Result<(Device, String), Response> {
+    let token = cookie_value(h, devices::COOKIE).ok_or_else(unauthorized)?;
+    let dev = hub.devices().authenticate(token).ok_or_else(unauthorized)?;
+    if (require_origin || h.contains_key(header::ORIGIN)) && !device_origin_ok(hub, h) {
+        tracing::warn!("device {} refused: origin not allowed ({})", dev.id, peer.source);
+        return Err(forbidden("origin not allowed"));
+    }
+    if let (Some(seen), Some(now)) = (&dev.ts_login, &peer.ts_login)
+        && seen != now
+    {
+        tracing::warn!("device {} refused: tailscale login {now} is not {seen}", dev.id);
+        return Err(unauthorized());
+    }
+    Ok((dev, token.to_string()))
+}
+
+fn has_x_muster(h: &HeaderMap) -> bool {
+    h.get("x-muster").is_some_and(|v| v == "1")
 }
 
 async fn health() -> impl IntoResponse {
@@ -75,27 +228,144 @@ struct WsQuery {
     token: String,
 }
 
+/// `/ws`: the client token (`?token=`, local only) or a device cookie.
 async fn ws_upgrade(
     State(hub): State<Arc<Hub>>,
+    Extension(peer): Extension<Peer>,
     Query(q): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !hub.check_client_token(&q.token) {
-        return unauthorized();
-    }
-    if !origin_allowed(&headers, hub.port()) {
-        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
-    }
+    let who = if !q.token.is_empty() || headers.contains_key(header::AUTHORIZATION) {
+        if peer.proxied || !hub.check_client_token(&q.token) {
+            return unauthorized();
+        }
+        if !origin_allowed(&headers, hub.port()) {
+            return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+        }
+        Principal::Local
+    } else {
+        match device_from_cookie(&hub, &peer, &headers, true) {
+            // The cookie's sliding renewal happens on `/api/device/me` (it can set the cookie).
+            Ok((d, _)) => Principal::Device { id: d.id },
+            Err(r) => return r,
+        }
+    };
     ws.max_message_size(16 * 1024 * 1024)
-        .on_upgrade(move |socket| crate::rpc::ws_session(socket, hub))
+        .on_upgrade(move |socket| crate::rpc::ws_session(socket, hub, who))
 }
 
-async fn rpc_http(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Response {
-    if !bearer(&headers).is_some_and(|t| hub.check_client_token(t)) {
-        return unauthorized();
+/// `POST /api/rpc`: bearer client token (local only) or a device cookie plus `X-Muster: 1`.
+async fn rpc_http(
+    State(hub): State<Arc<Hub>>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let who = if let Some(t) = bearer(&headers) {
+        if peer.proxied || !hub.check_client_token(t) {
+            return unauthorized();
+        }
+        Principal::Local
+    } else {
+        if !has_x_muster(&headers) {
+            return forbidden("missing X-Muster header");
+        }
+        match device_from_cookie(&hub, &peer, &headers, true) {
+            Ok((d, _)) => Principal::Device { id: d.id },
+            Err(r) => return r,
+        }
+    };
+    axum::Json(crate::rpc::http_call(&hub, &who, &body).await).into_response()
+}
+
+#[derive(Deserialize)]
+struct PairBody {
+    code: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn device_json(d: &Device) -> serde_json::Value {
+    json!({ "device": d })
+}
+
+/// `POST /api/device/pair` `{code, name?}` -> `{device}` + the device cookie. 403 on any
+/// failure (same body whatever went wrong), 429 when rate limited.
+async fn device_pair(
+    State(hub): State<Arc<Hub>>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    const REFUSED: &str = "invalid or expired pairing code";
+    if !has_x_muster(&headers) || !device_origin_ok(&hub, &headers) {
+        return forbidden(REFUSED);
     }
-    axum::Json(crate::rpc::http_call(&hub, &body).await).into_response()
+    let Ok(req) = serde_json::from_slice::<PairBody>(&body) else {
+        return forbidden(REFUSED);
+    };
+    match hub
+        .devices()
+        .redeem(hub.store(), &req.code, req.name, &peer.source, peer.ts_login.clone())
+    {
+        Ok((dev, token)) => {
+            let mut r = axum::Json(device_json(&dev)).into_response();
+            r.headers_mut()
+                .insert(header::SET_COOKIE, device_cookie(&token, devices::LIFETIME_MS / 1000));
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }
+        Err(devices::PairError::RateLimited) => {
+            tracing::warn!("pairing rate limited for {}", peer.source);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({ "error": { "message": "too many attempts; wait a minute" } })),
+            )
+                .into_response()
+        }
+        Err(devices::PairError::Invalid) => {
+            tracing::warn!("pairing refused for {}", peer.source);
+            forbidden(REFUSED)
+        }
+    }
+}
+
+/// `GET /api/device/me` -> `{device}` or 401. Renews the cookie when the expiry slid.
+async fn device_me(State(hub): State<Arc<Hub>>, Extension(peer): Extension<Peer>, headers: HeaderMap) -> Response {
+    let (dev, token) = match device_from_cookie(&hub, &peer, &headers, false) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let renewed = hub.devices().touch(hub.store(), dev.id, &peer.source);
+    let mut r = axum::Json(device_json(&dev)).into_response();
+    if renewed {
+        r.headers_mut()
+            .insert(header::SET_COOKIE, device_cookie(&token, devices::LIFETIME_MS / 1000));
+    }
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
+/// `POST /api/device/logout`: revoke this device and clear its cookie.
+async fn device_logout(
+    State(hub): State<Arc<Hub>>,
+    Extension(peer): Extension<Peer>,
+    headers: HeaderMap,
+) -> Response {
+    if !has_x_muster(&headers) {
+        return forbidden("missing X-Muster header");
+    }
+    let (dev, _) = match device_from_cookie(&hub, &peer, &headers, true) {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if let Err(e) = hub.devices().revoke(hub.store(), Some(dev.id)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+    }
+    let mut r = axum::Json(json!({})).into_response();
+    r.headers_mut().insert(header::SET_COOKIE, device_cookie("", 0));
+    r
 }
 
 /// Whether `GET /api/events` streams this event: tab, session and window changes only (no
@@ -324,6 +594,177 @@ mod tests {
             ));
         }
         assert_eq!(parse_proc_addr("zz:1"), None);
+    }
+
+    /// A raw HTTP/1.1 exchange: (status, head, body). Keeps the stream for upgrades.
+    fn raw(port: u16, req: &str) -> (u16, String, String, std::net::TcpStream) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Read the head (and whatever body arrives with it; bodies here are small).
+        loop {
+            let n = s.read(&mut chunk).unwrap_or(0);
+            buf.extend_from_slice(&chunk[..n]);
+            if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..p]).to_string();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    while buf.len() < p + 4 + len {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+        let status = head.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        (status, head.to_string(), body.to_string(), s)
+    }
+
+    fn http(port: u16, method: &str, path: &str, headers: &[&str], body: &str) -> (u16, String, String) {
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+        for h in headers {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        req.push_str("\r\n");
+        req.push_str(body);
+        let (st, head, body, _) = raw(port, &req);
+        (st, head, body)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_auth_end_to_end() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = crate::hub::HubConfig {
+            port,
+            client_token: "tok".into(),
+            muster_bin: std::path::PathBuf::from("/bin/true"),
+        };
+        let hub = Hub::new(cfg, crate::store::Store::open_memory().unwrap()).unwrap();
+        let app = router(hub.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap()
+        });
+        const ORIGIN: &str = "Origin: https://box.tail1.ts.net";
+        const FWD: &str = "X-Forwarded-For: 100.64.0.9";
+        let t = tokio::task::spawn_blocking(move || {
+            let hello = r#"{"id":1,"method":"hello","params":{}}"#;
+            // Local client token works; through the proxy it doesn't, and the rest is hidden.
+            assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok"], hello).0, 200);
+            assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok", FWD], hello).0, 401);
+            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x"] {
+                assert_eq!(http(port, "GET", path, &[FWD], "").0, 404, "{path}");
+            }
+            assert_eq!(http(port, "GET", "/m/", &["Tailscale-Funnel-Request: ?1"], "").0, 403);
+            let (st, head, _) = http(port, "GET", "/m/", &[FWD], "");
+            assert!(st == 200 || st == 404, "{st}");
+            assert!(head.to_ascii_lowercase().contains("content-security-policy"), "{head}");
+
+            // Pairing.
+            let (st, _, body) = http(
+                port,
+                "POST",
+                "/api/rpc",
+                &["Authorization: Bearer tok"],
+                r#"{"id":1,"method":"device.pair_code","params":{"url":"https://box.tail1.ts.net"}}"#,
+            );
+            assert_eq!(st, 200);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let code = v["result"]["code"].as_str().unwrap().to_string();
+            assert_eq!(v["result"]["url"].as_str().unwrap(), format!("https://box.tail1.ts.net/m/#pair={code}"));
+            let pair_body = format!(r#"{{"code":"{code}","name":"pixel"}}"#);
+            // Needs X-Muster and a known origin.
+            assert_eq!(http(port, "POST", "/api/device/pair", &[FWD, ORIGIN], &pair_body).0, 403);
+            assert_eq!(
+                http(port, "POST", "/api/device/pair", &[FWD, "X-Muster: 1", "Origin: https://evil.ts.net"], &pair_body).0,
+                403
+            );
+            let (st, head, body) = http(port, "POST", "/api/device/pair", &[FWD, ORIGIN, "X-Muster: 1"], &pair_body);
+            assert_eq!(st, 200, "{body}");
+            let cookie_line = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+                .unwrap()
+                .to_string();
+            assert!(cookie_line.contains("HttpOnly") && cookie_line.contains("Secure") && cookie_line.contains("SameSite=Strict"));
+            let kv = cookie_line.split_once(':').unwrap().1.trim().split(';').next().unwrap().to_string();
+            assert!(kv.starts_with("__Host-muster_device="));
+            let cookie = format!("Cookie: {kv}");
+            // Single use.
+            assert_eq!(http(port, "POST", "/api/device/pair", &[FWD, ORIGIN, "X-Muster: 1"], &pair_body).0, 403);
+
+            // The cookie authenticates `me`, RPC (with X-Muster and origin) and the socket.
+            assert_eq!(http(port, "GET", "/api/device/me", &[FWD, &cookie], "").0, 200);
+            assert_eq!(http(port, "GET", "/api/device/me", &[FWD], "").0, 401);
+            let (st, _, body) = http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN, "X-Muster: 1"], hello);
+            assert_eq!(st, 200);
+            assert!(body.contains("\"result\""), "{body}");
+            let (_, _, body) = http(
+                port,
+                "POST",
+                "/api/rpc",
+                &[FWD, &cookie, ORIGIN, "X-Muster: 1"],
+                r#"{"id":2,"method":"device.list","params":{}}"#,
+            );
+            assert!(body.contains("not available to devices"), "{body}");
+            let (_, _, body) = http(
+                port,
+                "POST",
+                "/api/rpc",
+                &[FWD, &cookie, ORIGIN, "X-Muster: 1"],
+                r#"{"id":3,"method":"session.approve","params":{"id":1,"decision":"approve"}}"#,
+            );
+            assert!(body.contains("state_seq is required"), "{body}");
+            assert_eq!(http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN], hello).0, 403);
+            assert_eq!(http(port, "POST", "/api/rpc", &[FWD, &cookie, "X-Muster: 1"], hello).0, 403);
+
+            let upgrade = |extra: &str| {
+                format!(
+                    "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+                     Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{FWD}\r\n{cookie}\r\n{extra}\r\n"
+                )
+            };
+            assert_eq!(raw(port, &upgrade("")).0, 403, "a cookie socket needs an Origin");
+            let (st, _, _, mut ws) = raw(port, &upgrade(&format!("{ORIGIN}\r\n")));
+            assert_eq!(st, 101);
+
+            // Revoke from the desktop: the socket closes, the cookie stops working.
+            let (_, _, body) = http(
+                port,
+                "POST",
+                "/api/rpc",
+                &["Authorization: Bearer tok"],
+                r#"{"id":1,"method":"device.revoke","params":{"all":true}}"#,
+            );
+            assert!(body.contains("\"revoked\":[1]"), "{body}");
+            use std::io::Read;
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match ws.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                    Err(e) => panic!("socket not closed after revoke: {e}"),
+                }
+            }
+            assert_eq!(http(port, "GET", "/api/device/me", &[FWD, &cookie], "").0, 401);
+        });
+        t.await.unwrap();
     }
 
     #[test]

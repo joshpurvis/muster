@@ -251,6 +251,10 @@ pub struct Hub {
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
+    /// Paired remote devices (docs/ANDROID.md).
+    devices: crate::devices::Registry,
+    /// Source of `SessionInfo.state_seq` values.
+    state_seq: AtomicU64,
     /// Serializes branch renames (git calls) so they see each other's results.
     branch_lock: tokio::sync::Mutex<()>,
     /// For work started from PTY threads (outside the runtime).
@@ -376,9 +380,12 @@ impl Hub {
                 },
             );
         }
+        let devices = crate::devices::Registry::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         Ok(Arc::new_cyclic(|weak| Hub {
             cfg,
+            devices,
+            state_seq: AtomicU64::new(1),
             store,
             tx,
             inner: Mutex::new(inner),
@@ -394,6 +401,15 @@ impl Hub {
     /// Base URL of this daemon, e.g. "http://127.0.0.1:7433".
     pub fn daemon_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.cfg.port)
+    }
+
+    pub fn devices(&self) -> &crate::devices::Registry {
+        &self.devices
+    }
+
+    /// The store, for registries that write through to it (devices).
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     pub fn port(&self) -> u16 {
@@ -601,9 +617,11 @@ impl Hub {
 
     /// Replay + live subscription for a client attach. For a session without a PTY the replay
     /// is rebuilt from output.log off the async workers, and cached while the log is unchanged.
-    pub async fn attach(&self, id: SessionId) -> anyhow::Result<Attach> {
+    /// `max_body`: replay at most the last this many bytes of output (phones, see
+    /// `session.attach`'s `replay_bytes`); None = the whole ring.
+    pub async fn attach(&self, id: SessionId, max_body: Option<usize>) -> anyhow::Result<Attach> {
         if let Some(p) = self.pty(id) {
-            let (replay, rx) = p.attach();
+            let (replay, rx) = p.attach(max_body);
             return Ok(Attach::Live(replay, rx, p.generation));
         }
         let info = self
@@ -614,6 +632,7 @@ impl Hub {
             .ok()
             .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
         if let Some((len, mtime)) = stamp
+            && max_body.is_none()
             && let Some((l, m, b)) = self.replay_cache.lock().get(&id)
             && *l == len
             && *m == mtime
@@ -622,7 +641,11 @@ impl Hub {
         }
         let (cols, rows) = (info.cols, info.rows);
         let p2 = path.clone();
-        let data = tokio::task::spawn_blocking(move || pty::log_replay(&p2, cols, rows)).await?;
+        let data = tokio::task::spawn_blocking(move || pty::log_replay(&p2, cols, rows, max_body)).await?;
+        if max_body.is_some() {
+            // Only whole replays are cached.
+            return Ok(Attach::Replay(data));
+        }
         if let Some((len, mtime)) = stamp {
             let mut c = self.replay_cache.lock();
             if c.len() >= REPLAY_CACHE_MAX && !c.contains_key(&id) {
@@ -683,6 +706,7 @@ impl Hub {
             if from != update.state {
                 e.info.state_since = now;
             }
+            e.info.state_seq = self.state_seq.fetch_add(1, Ordering::Relaxed);
             e.info.state = update.state;
             e.info.state_detail = update.detail.clone();
             if let Err(err) = self.store.update_session(&e.info) {
@@ -707,6 +731,29 @@ impl Hub {
             );
         }
         true
+    }
+
+    /// Take the right to answer the prompt a caller saw: refused unless the session's
+    /// `state_seq` (and `state_since`, when given) still match; on success `state_seq` moves on,
+    /// so a second answer to the same prompt is refused too. Checked and bumped under one lock.
+    pub fn claim_prompt(&self, id: SessionId, seq: Option<u64>, since: Option<i64>) -> anyhow::Result<()> {
+        let info = {
+            let mut g = self.inner.lock();
+            let e = g
+                .sessions
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+            if seq.is_some_and(|s| s != e.info.state_seq) || since.is_some_and(|s| s != e.info.state_since) {
+                anyhow::bail!("stale: session {id}'s prompt changed since you looked; check it again");
+            }
+            if seq.is_none() {
+                return Ok(());
+            }
+            e.info.state_seq = self.state_seq.fetch_add(1, Ordering::Relaxed);
+            e.info.clone()
+        };
+        self.emit(ServerEvent::SessionUpserted(info));
+        Ok(())
     }
 
     /// Unix ms of the last delivery out of a session's injection queue (for `session.wait`).
@@ -1859,6 +1906,8 @@ impl Hub {
                 rows,
                 queued: 0,
                 subagents: 0,
+                size_owner: None,
+                state_seq: 0,
                 created_at: now,
                 window_id: Some(window_id),
             };
@@ -2566,7 +2615,9 @@ impl Hub {
     }
 
     /// Last resizer wins.
-    pub fn resize_session(&self, id: SessionId, cols: u16, rows: u16) -> anyhow::Result<()> {
+    /// Resize a session's terminal. `owner` ("local" or "device:<id>") becomes its
+    /// `size_owner`; a change of owner alone is broadcast too (docs/ANDROID.md "Terminal width").
+    pub fn resize_session(&self, id: SessionId, cols: u16, rows: u16, owner: &str) -> anyhow::Result<()> {
         let (cols, rows) = pty::clamp_size(cols, rows);
         let cur = self
             .session(id)
@@ -2574,10 +2625,11 @@ impl Hub {
         if let Some(p) = self.pty(id) {
             p.resize(cols, rows)?;
         }
-        if cur.cols != cols || cur.rows != rows {
+        if cur.cols != cols || cur.rows != rows || cur.size_owner.as_deref() != Some(owner) {
             self.update_session_info(id, |i| {
                 i.cols = cols;
                 i.rows = rows;
+                i.size_owner = Some(owner.to_string());
             })?;
         }
         Ok(())
@@ -3070,6 +3122,20 @@ mod tests {
             muster_bin: PathBuf::from("/bin/true"),
         };
         Hub::new(cfg, store).unwrap()
+    }
+
+    #[test]
+    fn a_prompt_is_answered_once_and_only_as_seen() {
+        let hub = move_fixture();
+        let s = hub.session(1).unwrap();
+        assert!(hub.claim_prompt(1, None, Some(s.state_since + 1)).is_err(), "stale state_since");
+        assert!(hub.claim_prompt(1, Some(s.state_seq + 1), None).is_err(), "stale state_seq");
+        hub.claim_prompt(1, Some(s.state_seq), Some(s.state_since)).unwrap();
+        let after = hub.session(1).unwrap();
+        assert_ne!(after.state_seq, s.state_seq);
+        // The same view can't answer twice (a delayed duplicate would hit the next prompt).
+        assert!(hub.claim_prompt(1, Some(s.state_seq), None).unwrap_err().to_string().starts_with("stale"));
+        hub.claim_prompt(1, None, None).unwrap();
     }
 
     #[test]

@@ -478,6 +478,178 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 // ----- commands -----
 
+/// `muster pair`: start a pairing, print how to reach the daemon from the phone (the
+/// `tailscale serve` lines when it isn't set up), a QR code and the short code, then wait for
+/// the phone.
+pub fn pair(d: &Discovery, name: Option<&str>, scope: &str, ttl: u64, url: Option<&str>) -> anyhow::Result<()> {
+    let scopes: &[&str] = match scope {
+        "view" => &["view"],
+        "manage" => &["view", "interact", "manage"],
+        _ => &["view", "interact"],
+    };
+    let mut params = json!({ "ttl_s": ttl, "scopes": scopes });
+    if let Some(n) = name {
+        params["name"] = json!(n);
+    }
+    if let Some(u) = url {
+        params["url"] = json!(u);
+    }
+    let p = client::rpc(d, "device.pair_code", params)?;
+    let (link, short, id) = (
+        p["url"].as_str().unwrap_or_default().to_string(),
+        p["short_code"].as_str().unwrap_or_default().to_string(),
+        p["pairing_id"].as_u64().unwrap_or_default(),
+    );
+    let port = p["port"].as_u64().unwrap_or(d.port as u64);
+    if url.is_none() && !tailscale_serve_configured(port) {
+        println!("Publish muster on your tailnet first (only these paths; never Funnel):\n");
+        for path in ["/m", "/ws", "/api/device", "/api/rpc"] {
+            println!("  tailscale serve --bg --https=443 --set-path={path} http://127.0.0.1:{port}{path}");
+        }
+        println!(
+            "\n(`sudo tailscale set --operator=$USER` lets you run these without sudo; HTTPS certificates\n\
+             must be enabled for the tailnet. The port changes if 7433 is busy: set MUSTER_PORT=7433.)\n"
+        );
+    }
+    let qr = std::process::Command::new("qrencode")
+        .args(["-t", "UTF8", "-m", "2", &link])
+        .status();
+    if !qr.is_ok_and(|s| s.success()) {
+        println!("(install `qrencode` to get a QR code here)");
+    }
+    let pretty: String = short
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(3)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("-");
+    println!("\nScan it with the phone's camera, or open {} and type:  {pretty}", p["origin"].as_str().unwrap_or("").to_string() + "/m/");
+    println!("Scope: {scope}. The code works once and expires in {ttl} s.\n");
+    let deadline = Instant::now() + Duration::from_secs(ttl + 5);
+    loop {
+        std::thread::sleep(Duration::from_millis(700));
+        let st = client::rpc(d, "device.pair_status", json!({ "pairing_id": id }))?;
+        match st["state"].as_str().unwrap_or("") {
+            "pending" if Instant::now() < deadline => continue,
+            "paired" => {
+                let dev = &st["device"];
+                println!(
+                    "paired: {} (device {}); `muster devices revoke {}` to undo",
+                    dev["name"].as_str().unwrap_or("?"),
+                    dev["id"],
+                    dev["id"]
+                );
+                return Ok(());
+            }
+            "burnt" => anyhow::bail!("three wrong codes: this pairing is burnt; run `muster pair` again"),
+            "replaced" => anyhow::bail!("another `muster pair` replaced this one"),
+            _ => anyhow::bail!("the code expired; run `muster pair` again"),
+        }
+    }
+}
+
+/// Whether `tailscale serve` already proxies to this daemon's port (best effort).
+fn tailscale_serve_configured(port: u64) -> bool {
+    std::process::Command::new("tailscale")
+        .args(["serve", "status", "--json"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("127.0.0.1:{port}")))
+}
+
+#[derive(Deserialize)]
+struct DeviceRow {
+    id: i64,
+    name: String,
+    scopes: Vec<String>,
+    last_seen_at: i64,
+    last_source: Option<String>,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+}
+
+/// `muster devices`.
+pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
+    let v = client::rpc(d, "device.list", json!({}))?;
+    if as_json {
+        return print_json(&v);
+    }
+    let list: Vec<DeviceRow> = serde_json::from_value(v)?;
+    if list.is_empty() {
+        println!("no paired devices (`muster pair` pairs a phone)");
+        return Ok(());
+    }
+    let now = now_ms();
+    let ago = |t: i64| {
+        let s = ((now - t) / 1000).max(0);
+        match s {
+            0..60 => format!("{s}s ago"),
+            60..3600 => format!("{}m ago", s / 60),
+            3600..86400 => format!("{}h ago", s / 3600),
+            _ => format!("{}d ago", s / 86400),
+        }
+    };
+    let rows: Vec<Vec<Cell>> = list
+        .iter()
+        .map(|x| {
+            let status = match x.revoked_at {
+                Some(_) => "revoked".to_string(),
+                None if x.expires_at <= now => "expired".to_string(),
+                None => x.scopes.last().cloned().unwrap_or_default(),
+            };
+            vec![
+                Cell::plain(x.id.to_string()),
+                Cell::plain(x.name.clone()),
+                Cell::plain(status),
+                Cell::plain(format!(
+                    "seen {}{}",
+                    ago(x.last_seen_at),
+                    x.last_source.as_deref().map(|s| format!(" from {s}")).unwrap_or_default()
+                )),
+            ]
+        })
+        .collect();
+    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "LAST"]), &rows, None, false));
+    Ok(())
+}
+
+/// `muster devices revoke <id|name|--all>`.
+pub fn revoke_device(d: &Discovery, target: Option<&str>, all: bool) -> anyhow::Result<()> {
+    let params = if all {
+        json!({ "all": true })
+    } else {
+        let t = target.ok_or_else(|| anyhow::anyhow!("name a device (id or name), or pass --all"))?;
+        let list: Vec<DeviceRow> = serde_json::from_value(client::rpc(d, "device.list", json!({}))?)?;
+        let live = |x: &&DeviceRow| x.revoked_at.is_none();
+        let hits: Vec<&DeviceRow> = match t.parse::<i64>() {
+            Ok(id) => list.iter().filter(|x| x.id == id).collect(),
+            Err(_) => list.iter().filter(live).filter(|x| x.name == t).collect(),
+        };
+        match hits.as_slice() {
+            [one] => json!({ "id": one.id }),
+            [] => {
+                return Err(Exit {
+                    code: 2,
+                    msg: format!("no device {t:?} (see `muster devices`)"),
+                }
+                .into());
+            }
+            _ => {
+                return Err(Exit {
+                    code: 2,
+                    msg: format!("several devices are named {t:?}; use the id"),
+                }
+                .into());
+            }
+        }
+    };
+    let r = client::rpc(d, "device.revoke", params)?;
+    let n = r["revoked"].as_array().map_or(0, |a| a.len());
+    println!("revoked {n} device{}", if n == 1 { "" } else { "s" });
+    Ok(())
+}
+
 /// `muster ls`. Never starts the daemon.
 pub fn ls(d: Option<&Discovery>, all: bool, as_json: bool) -> anyhow::Result<()> {
     let Some(d) = d else {

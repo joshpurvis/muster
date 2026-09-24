@@ -18,6 +18,7 @@ import type {
 } from "./types.ts";
 import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
+import { sessionSizeChanged } from "./terms.ts";
 import { debounce, load, save } from "./util.ts";
 import {
   allSessions,
@@ -487,6 +488,7 @@ export function applyEvent(ev: ServerEvent) {
     case "session_upserted": {
       versions.bump(ev.data.id);
       upsertSession(ev.data);
+      sessionSizeChanged(ev.data);
       confirmClose.value = confirmAfterUpsert(confirmClose.peek(), ev.data, BUSY_STATES);
       break;
     }

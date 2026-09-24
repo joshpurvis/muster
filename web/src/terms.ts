@@ -9,6 +9,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import { effect } from "@preact/signals";
 import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
+import type { SessionInfo } from "./types.ts";
 
 const MAX_WEBGL = 10;
 const FONT_FAMILY =
@@ -45,6 +46,7 @@ interface Entry {
   resizeTimer: number;
   sentCols: number;
   sentRows: number;
+  sizeOwner?: string | null;
 }
 
 const entries = new Map<number, Entry>();
@@ -223,14 +225,25 @@ function create(sid: number): Entry {
   installQueryHandlers(term, () => entry.inReplay, (v) => (entry.inReplay = v));
 
   const enc = new TextEncoder();
-  term.onData((d) => rpc.sendInput(sid, enc.encode(d)));
+  let userInput = false;
+  // onData also carries query answers. Only a user's bytes should take the grid back.
+  // Private API: without it only focus takes the grid back.
+  (term as any)._core?.coreService?.onUserInput?.(() => userInput = true);
+  term.onData((d) => {
+    if (userInput) takeSizeBack(entry);
+    userInput = false;
+    rpc.sendInput(sid, enc.encode(d));
+  });
   term.onBinary((d) => {
     const b = new Uint8Array(d.length);
     for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 0xff;
     rpc.sendInput(sid, b);
   });
   term.onResize(({ cols, rows }) => sendResize(entry, cols, rows));
-  el.addEventListener("focusin", () => focusListener(sid));
+  el.addEventListener("focusin", () => {
+    takeSizeBack(entry);
+    focusListener(sid);
+  });
 
   const entry: Entry = {
     sid,
@@ -316,6 +329,27 @@ function sendResize(e: Entry, cols: number, rows: number, now = false) {
   };
   if (now) go();
   else e.resizeTimer = setTimeout(go, 60);
+}
+
+function takeSizeBack(e: Entry) {
+  if (!e.host || !e.sizeOwner || e.sizeOwner === "local") return;
+  fitNow(e);
+  e.sentCols = e.sentRows = 0;
+  sendResize(e, e.term.cols, e.term.rows, true);
+  e.sizeOwner = "local";
+}
+
+/** Follow a phone's grid until this pane is used or fitted again; never echo its resize. */
+export function sessionSizeChanged(info: SessionInfo) {
+  const e = entries.get(info.id);
+  if (!e) return;
+  e.sizeOwner = info.size_owner;
+  if (!e.host || !info.size_owner || info.size_owner === "local") return;
+  if (info.cols === e.term.cols && info.rows === e.term.rows) return;
+  clearTimeout(e.resizeTimer);
+  e.sentCols = info.cols;
+  e.sentRows = info.rows;
+  e.term.resize(info.cols, info.rows);
 }
 
 function enableWebgl(e: Entry) {
@@ -456,7 +490,9 @@ export function reattachAll() {
   for (const e of entries.values()) {
     if (!e.attached) continue;
     e.sentCols = e.sentRows = 0;
-    if (e.host) {
+    // A phone owns the size: keep its grid until this pane is used (see takeSizeBack), rather
+    // than re-sending it as ours, which would leave nothing to take back.
+    if (e.host && (!e.sizeOwner || e.sizeOwner === "local")) {
       e.sentCols = e.term.cols;
       e.sentRows = e.term.rows;
       rpc.call("session.resize", { id: e.sid, cols: e.term.cols, rows: e.term.rows }).catch(() => {});

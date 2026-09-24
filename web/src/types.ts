@@ -91,6 +91,10 @@ export interface SessionInfo {
   exit_code: number | null;
   cols: number;
   rows: number;
+  /** Last PTY resizer: "local" or "device:<id>". Missing on older daemons. */
+  size_owner?: string | null;
+  /** Changes with every state/detail change and answered prompt (stale-approval guard). */
+  state_seq?: number;
   queued: number;
   /** Built-in subagents the agent is running right now (runtime only). */
   subagents?: number;

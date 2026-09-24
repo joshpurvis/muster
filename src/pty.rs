@@ -406,19 +406,23 @@ impl PtySession {
     }
 
     /// Replay for a client: the terminal modes that the ring may no longer contain, then the
-    /// ring. Callers hold the parser lock and then the out lock.
-    fn client_replay(parser: &vt100::Parser<TitleCb>, out: &OutBuf) -> Vec<u8> {
-        let body = Self::snapshot_locked(out);
+    /// ring (its last `max_body` bytes when set). Callers hold the parser lock and then the out
+    /// lock.
+    fn client_replay(parser: &vt100::Parser<TitleCb>, out: &OutBuf, max_body: Option<usize>) -> Vec<u8> {
+        let mut body = Self::snapshot_locked(out);
+        if let Some(max) = max_body {
+            tail_from_line(&mut body, max);
+        }
         let mut v = replay_prefix(parser.screen(), &body);
         v.extend_from_slice(&body);
         v
     }
 
     /// Replay bytes + a live receiver, taken atomically (no lost or duplicated bytes).
-    pub fn attach(&self) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
+    pub fn attach(&self, max_body: Option<usize>) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
         let parser = self.parser.lock();
         let out = self.out.lock();
-        (Self::client_replay(&parser, &out), self.out_tx.subscribe())
+        (Self::client_replay(&parser, &out, max_body), self.out_tx.subscribe())
     }
 
     pub fn is_alive(&self) -> bool {
@@ -999,16 +1003,21 @@ pub fn read_log(path: &Path) -> Vec<u8> {
     data
 }
 
-/// Client replay of a persisted output.log: its last `RING_CAP` bytes, prefixed like a live
-/// replay with the terminal modes and alternate-screen state they leave behind.
-pub fn log_replay(path: &Path, cols: u16, rows: u16) -> Vec<u8> {
-    let data = read_log(path);
+/// Client replay of a persisted output.log: its last `RING_CAP` bytes (or `max_body`),
+/// prefixed like a live replay with the terminal modes and alternate-screen state they leave
+/// behind.
+pub fn log_replay(path: &Path, cols: u16, rows: u16, max_body: Option<usize>) -> Vec<u8> {
+    let mut data = read_log(path);
     if data.is_empty() {
         return data;
     }
     let (cols, rows) = clamp_size(cols, rows);
     let mut parser = vt100::Parser::new(rows, cols, 0);
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&data))).is_err() {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&data))).is_ok();
+    if let Some(max) = max_body {
+        tail_from_line(&mut data, max);
+    }
+    if !parsed {
         return data;
     }
     // A compacted log may start inside the alternate screen; `replay_prefix` detects that from
@@ -1016,6 +1025,19 @@ pub fn log_replay(path: &Path, cols: u16, rows: u16) -> Vec<u8> {
     let mut v = replay_prefix(parser.screen(), &data);
     v.extend_from_slice(&data);
     v
+}
+
+/// Keep at most the last `max` bytes, starting after a newline so the cut doesn't land inside
+/// an escape sequence or a UTF-8 character (if there is none in the first 64 KiB of the tail,
+/// the cut stays where it is).
+fn tail_from_line(v: &mut Vec<u8>, max: usize) {
+    if v.len() <= max {
+        return;
+    }
+    v.drain(..v.len() - max);
+    if let Some(pos) = v.iter().take(64 * 1024).position(|&c| c == b'\n') {
+        v.drain(..=pos);
+    }
 }
 
 /// Plain-text tail of a persisted output.log (for exited sessions from a previous daemon).
@@ -1330,6 +1352,18 @@ mod tests {
             r,
             ["\x1b[?1;2c", "\x1b[>0;276;0c", "\x1b[0n", "\x1b[1;3R", "\x1b[?1;3R"]
         );
+    }
+
+    #[test]
+    fn tail_from_line_cuts_at_a_newline() {
+        let mut v = b"aaaa\nbbbb\ncccc".to_vec();
+        tail_from_line(&mut v, 100);
+        assert_eq!(v, b"aaaa\nbbbb\ncccc");
+        tail_from_line(&mut v, 7);
+        assert_eq!(v, b"cccc");
+        let mut v = b"no newline here".to_vec();
+        tail_from_line(&mut v, 4);
+        assert_eq!(v, b"here");
     }
 
     #[test]

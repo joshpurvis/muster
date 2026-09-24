@@ -8,6 +8,11 @@ mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.
 |---|---|---|
 | `GET /` and static assets | none | Frontend (embedded `web/dist`). |
 | `GET /ws?token=<client token>` | client token | Client protocol below. |
+| `GET /ws` | device cookie | The same protocol for a paired phone (see "Remote devices"). |
+| `POST /api/device/pair` | pairing code | `{code, name?}` → `{device}` plus the device cookie. |
+| `GET /api/device/me` | device cookie | `{device}` or `401`. |
+| `POST /api/device/logout` | device cookie | Revokes the calling device, clears the cookie. |
+| `GET /m/…` | none | The phone UI (`web/dist/m`), with a strict CSP. `/m` redirects to `/m/`. |
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
@@ -123,9 +128,9 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
 | `channel.diff` | `{id}` | `{diff: string}` |
 | `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?}` | `SessionInfo`. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
-| `session.attach` | `{id}` | `{}` then a `0x03` replay frame, then live `0x01` frames |
+| `session.attach` | `{id, replay_bytes?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start (the phone asks for 256 KiB instead of the whole 2 MiB buffer); the replays that follow a restart or a lagging client use the same limit. |
 | `session.detach` | `{id}` | `{}` |
-| `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins) |
+| `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
 | `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
 | `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session closes the channel (see "Groups layout (v2)"). |
@@ -133,7 +138,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.move` | `{id, channel_id, from_channel_id?, close_empty_source? = false}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session whose process is being started or restarted right now (the start reads its channel), is an error; a session merely reporting the `starting` state (its process already launched) can move. With `from_channel_id`, the move is refused unless the session is still in that channel, so a client acting on a stale view can't move a session another client already moved. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to merge a tab into another (docs/UI.md); the emptied channel stays open until the client archives it. Refused while the source channel is being closed (archived), so a session can't slip out of an archive in progress. With `close_empty_source`, the source channel is then closed if this move emptied it (as `channel.close_if_empty`): the UI's tab merge uses this instead of archiving the source itself. The process keeps the port block it started with; that block stays reserved (not handed to a new channel) while the process runs. |
 | `session.set_window` | `{id, window_id, from_window_id?}` | `SessionInfo`. Shows the session (tab) in another window; see "Groups layout (v2)". |
 | `session.send` | `{id, text, mode?: "queue"\|"interrupt"}` | `{delivered, queued}`. For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
-| `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny"}` | `{}` |
+| `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny", state_seq?, state_since?}` | `{}`. With `state_seq` and/or `state_since` (from the `SessionInfo` the caller rendered), refused with an error starting `stale:` when they no longer match. `state_seq` changes on every state or detail change and whenever a prompt is answered with it, so an approval never answers a prompt the caller didn't see, and a delayed duplicate never answers the next one. The `approval` event records `from` (`"human"` or `"device:<id>"`). |
 | `session.interrupt` | `{id}` | `{}` |
 | `session.clear_queue` | `{id}` | `{}` |
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
@@ -350,3 +355,50 @@ of 10), `TERM=xterm-256color`, `COLORTERM=truecolor`.
 They are set when the process starts. After `session.move` the channel values (`MUSTER_CHANNEL_ID`,
 `PORT`, `MUSTER_PORT_BASE`) are stale until the session restarts; `MUSTER_SESSION_ID` stays
 right, so tools should look the channel up from the session (as `muster new` does).
+
+## Remote devices
+
+A phone reaches the daemon through `tailscale serve` (docs/ANDROID.md). The daemon still binds
+127.0.0.1 only.
+
+**Proxied requests.** A request is *proxied* when its TCP peer socket belongs to the proxy uid
+(`MUSTER_PROXY_UID`, default 0, i.e. a system tailscaled; ignored when the daemon runs as that
+uid) or when it carries any `X-Forwarded-*`, `Forwarded` or `Tailscale-*` header. Proxied
+requests reach only `/m/*`, `/api/device/*`, `/ws`, `/api/rpc` and `/api/health` (everything
+else is `404`), and a client token is refused there (`401`): through the proxy only a device
+cookie authenticates. `Tailscale-Funnel-Request` is always `403`. `X-Forwarded-For` (for logs and
+rate limits) and `Tailscale-User-Login` are read only from a trusted proxy (the uid check).
+
+**Pairing.** `device.pair_code` (client token only) starts a pairing; one is pending at a time
+(a new one replaces it), valid `ttl_s` (default 120, 10..600), single use, with a 64-hex `code`
+(the QR link `https://<host>/m/#pair=<code>`) and a 9-character `short_code` (base32 without
+I/O/0/1; case, spaces and dashes ignored). Three wrong codes burn it; 5 attempts per minute per
+source. Its URL's origin joins the persisted `remote_origins` list.
+
+**Device cookie.** `__Host-muster_device=<64 hex>; HttpOnly; Secure; SameSite=Strict; Path=/;
+Max-Age=2592000`, stored hashed (SHA-256). Honoured only without `?token=`/`Authorization`, and
+(on `/ws`, `POST /api/rpc`, `pair`, `logout`) only with an `Origin` that is in `remote_origins` or
+this daemon's local origin; cookie `POST`s also need `X-Muster: 1`. Devices expire after 30 days
+without use (the expiry slides, renewed at most daily by `/api/device/me`, which re-sends the
+cookie). A device's WebSocket closes at once on revoke, and within 30 s of expiry. A device
+paired through a trusted proxy with a `Tailscale-User-Login` is refused when a later request
+carries a different login.
+
+**Scopes.** Checked on every call (so a revoked or expired device fails on its next call, and
+its sockets close at once on revoke):
+
+| Scope | Methods |
+|---|---|
+| `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
+| `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
+| `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
+| never | `device.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
+
+Prompts a device sends are logged with `from: "device:<id>"`.
+
+| Method (client token only) | Params | Result |
+|---|---|---|
+| `device.pair_code` | `{ttl_s?, name?, scopes? = ["view","interact"], url?}` | `{pairing_id, code, short_code, url, origin, expires_at, port}`. `url` defaults to `https://<Self.DNSName from tailscale status --json>`. |
+| `device.pair_status` | `{pairing_id}` | `{state: "pending"}`, `{state: "paired", device}`, or `{state: "burnt"\|"expired"\|"replaced"}` |
+| `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at}` |
+| `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}` |

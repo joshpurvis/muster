@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::devices::{self, Principal, Scope};
 use crate::hub::{Attach, CreateChannel, Hub, ServerEvent, SpawnSession};
 use crate::inject::{self, SendMode};
 use crate::model::*;
@@ -30,6 +31,8 @@ const OUTBOX_CAP: usize = 256;
 /// `session.wait` limits.
 const WAIT_DEFAULT_MS: u64 = 600_000;
 const WAIT_MAX_MS: u64 = 3_600_000;
+/// `session.attach` `replay_bytes` bounds.
+const REPLAY_BYTES_MIN: usize = 4 * 1024;
 /// `session.output` limits.
 const OUTPUT_DEFAULT_LINES: usize = 200;
 const OUTPUT_MAX_LINES: usize = 10_000;
@@ -94,8 +97,30 @@ pub fn hello(hub: &Hub) -> Value {
     })
 }
 
+/// May `who` call `method` with `params`? Client-token callers may call anything; a device
+/// needs the method's scope (re-read now, so a revoked or expired device fails at once) and may
+/// never widen an agent's permissions (docs/ANDROID.md "Scopes").
+pub fn authorize(hub: &Hub, who: &Principal, method: &str, params: &Value) -> Result<(), RpcError> {
+    let Principal::Device { id } = who else {
+        return Ok(());
+    };
+    let have = hub
+        .devices()
+        .scope(*id)
+        .ok_or_else(|| RpcError("device revoked or expired".into()))?;
+    let need = devices::method_scope(method).ok_or_else(|| RpcError(format!("{method} is not available to devices")))?;
+    if have < need {
+        return Err(RpcError(format!("{method} needs the {need:?} scope").to_lowercase()));
+    }
+    if let Some(p) = devices::forbidden_param(params) {
+        return Err(RpcError(format!("devices may not set {p}")));
+    }
+    Ok(())
+}
+
 /// Every method except `session.attach` / `session.detach` (connection-scoped, WS only).
-pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult {
+/// Callers check `authorize` first.
+pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
     match method {
         "hello" => Ok(hello(hub)),
 
@@ -215,7 +240,7 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
                 rows: u16,
             }
             let p: P = parse(params)?;
-            hub.resize_session(p.id, p.cols, p.rows)?;
+            hub.resize_session(p.id, p.cols, p.rows, &who.size_owner())?;
             Ok(json!({}))
         }
         "session.kill" => {
@@ -287,16 +312,25 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             if hub.session(p.id).is_none() {
                 return Err(RpcError(format!("no such session: {}", p.id)));
             }
-            to_value(inject::send(hub, p.id, p.text, p.mode.unwrap_or_default(), "human".into()).await?)
+            to_value(inject::send(hub, p.id, p.text, p.mode.unwrap_or_default(), who.label()).await?)
         }
         "session.approve" => {
             #[derive(Deserialize)]
             struct P {
                 id: SessionId,
                 decision: Decision,
+                /// The `state_seq` / `state_since` of the prompt the caller saw (stale-view guard).
+                #[serde(default)]
+                state_seq: Option<u64>,
+                #[serde(default)]
+                state_since: Option<i64>,
             }
             let p: P = parse(params)?;
-            inject::approve(hub, p.id, p.decision)?;
+            // A device answers only the prompt it showed (the desktop and CLI answer what's there).
+            if matches!(who, Principal::Device { .. }) && p.state_seq.is_none() {
+                return Err(RpcError("state_seq is required".into()));
+            }
+            inject::approve(hub, p.id, p.decision, &who.label(), (p.state_seq, p.state_since))?;
             Ok(json!({}))
         }
         "session.interrupt" => {
@@ -506,6 +540,75 @@ pub async fn dispatch(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult 
             Ok(json!({ "entries": entries }))
         }
 
+        "device.pair_code" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                ttl_s: Option<u64>,
+                #[serde(default)]
+                name: Option<String>,
+                #[serde(default)]
+                scopes: Option<Vec<Scope>>,
+                #[serde(default)]
+                url: Option<String>,
+            }
+            let p: P = parse(params)?;
+            let base = match p.url {
+                Some(u) => u,
+                None => format!(
+                    "https://{}",
+                    tailscale_dns_name().await.map_err(|e| RpcError(format!(
+                        "{e:#}; pass the address the phone will use with --url https://<host>"
+                    )))?
+                ),
+            };
+            let origin = url_origin(&base).ok_or_else(|| RpcError(format!("not an https URL: {base}")))?;
+            hub.devices().add_origin(hub.store(), &origin)?;
+            let scopes = p.scopes.unwrap_or_else(|| vec![Scope::View, Scope::Interact]);
+            let np = hub.devices().begin_pairing(
+                p.ttl_s.unwrap_or(devices::PAIR_TTL_DEFAULT_S),
+                p.name.filter(|n| !n.trim().is_empty()),
+                scopes,
+            );
+            Ok(json!({
+                "pairing_id": np.id,
+                "code": np.code,
+                "short_code": np.short_code,
+                "url": format!("{origin}/m/#pair={}", np.code),
+                "origin": origin,
+                "expires_at": np.expires_at,
+                "port": hub.port(),
+            }))
+        }
+        "device.pair_status" => {
+            #[derive(Deserialize)]
+            struct P {
+                pairing_id: u64,
+            }
+            let p: P = parse(params)?;
+            to_value(
+                hub.devices()
+                    .pair_status(p.pairing_id)
+                    .ok_or_else(|| RpcError(format!("no such pairing: {}", p.pairing_id)))?,
+            )
+        }
+        "device.list" => to_value(hub.devices().list()),
+        "device.revoke" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                id: Option<i64>,
+                #[serde(default)]
+                all: bool,
+            }
+            let p: P = parse(params)?;
+            if p.id.is_none() && !p.all {
+                return Err(RpcError("pass id or all: true".into()));
+            }
+            let ids = hub.devices().revoke(hub.store(), if p.all { None } else { p.id })?;
+            Ok(json!({ "revoked": ids }))
+        }
+
         "session.attach" | "session.detach" | "window.claim" => {
             Err(RpcError(format!("{method} is only available over the WebSocket")))
         }
@@ -625,11 +728,47 @@ fn response(id: &Value, r: RpcResult) -> Value {
     }
 }
 
+/// `tailscale status --json` -> `Self.DNSName` without the trailing dot.
+async fn tailscale_dns_name() -> anyhow::Result<String> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("`tailscale status` timed out"))?
+    .map_err(|e| anyhow::anyhow!("running `tailscale status`: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("`tailscale status` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    let name = v["Self"]["DNSName"].as_str().unwrap_or("").trim_end_matches('.');
+    if name.is_empty() {
+        anyhow::bail!("tailscale reports no DNS name for this machine (is MagicDNS on?)");
+    }
+    Ok(name.to_string())
+}
+
+/// `https://host[:port]/...` -> `https://host[:port]` (lowercased host). None for anything else.
+pub fn url_origin(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let host = rest.split(['/', '?', '#']).next()?.to_ascii_lowercase();
+    let ok = !host.is_empty()
+        && !host.contains('@')
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    ok.then(|| format!("https://{host}"))
+}
+
 /// `POST /api/rpc` body handler: `{method, params, id?}` -> `{id, result}` / `{id, error}`.
-pub async fn http_call(hub: &Arc<Hub>, body: &[u8]) -> Value {
+pub async fn http_call(hub: &Arc<Hub>, who: &Principal, body: &[u8]) -> Value {
     match serde_json::from_slice::<Request>(body) {
         Ok(req) => {
-            let r = dispatch(hub, &req.method, req.params).await;
+            let r = match authorize(hub, who, &req.method, &req.params) {
+                Ok(()) => dispatch(hub, who, &req.method, req.params).await,
+                Err(e) => Err(e),
+            };
             response(&req.id, r)
         }
         Err(e) => response(&Value::Null, Err(RpcError(format!("invalid request: {e}")))),
@@ -638,8 +777,8 @@ pub async fn http_call(hub: &Arc<Hub>, body: &[u8]) -> Value {
 
 type Outbox = mpsc::Sender<Message>;
 
-/// One WebSocket client connection.
-pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
+/// One WebSocket client connection, authenticated as `who`.
+pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
@@ -709,9 +848,50 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     };
 
     let attachments: Arc<Mutex<HashMap<SessionId, JoinHandle<()>>>> = Arc::default();
+    let device_id = match who {
+        Principal::Device { id } => Some(id),
+        Principal::Local => None,
+    };
+    // A device's socket closes the moment it is revoked or expires, even while idle or while
+    // its reader has stopped reading (the watchdog kills the writer, which unblocks any send
+    // stuck on a full outbox). Subscribed before the first check, so a revocation between the
+    // cookie check and this point is not missed.
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let watchdog = device_id.map(|id| {
+        let (hub, closed) = (hub.clone(), closed.clone());
+        let writer = writer.abort_handle();
+        let events = events.abort_handle();
+        let mut revoked = hub.devices().subscribe_revoked();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                if hub.devices().scope(id).is_none() {
+                    break;
+                }
+                tokio::select! {
+                    r = revoked.recv() => if matches!(r, Err(broadcast::error::RecvError::Closed)) {
+                        break;
+                    },
+                    _ = tick.tick() => {}
+                }
+            }
+            writer.abort();
+            events.abort();
+            closed.notify_one();
+        })
+    });
 
-    while let Some(msg) = stream.next().await {
-        let Ok(msg) = msg else { break };
+    loop {
+        let msg = tokio::select! {
+            m = stream.next() => m,
+            _ = closed.notified() => break,
+        };
+        let Some(Ok(msg)) = msg else { break };
+        if let Some(id) = device_id
+            && hub.devices().scope(id).is_none()
+        {
+            break;
+        }
         match msg {
             Message::Text(text) => {
                 let req: Request = match serde_json::from_str(text.as_str()) {
@@ -722,9 +902,16 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         continue;
                     }
                 };
-                handle_request(&hub, conn, req, &out_tx, &resp_tx, &attachments).await;
+                if let Err(e) = authorize(&hub, &who, &req.method, &req.params) {
+                    let _ = out_tx.send(Message::Text(response(&req.id, Err(e)).to_string().into())).await;
+                    continue;
+                }
+                handle_request(&hub, &who, conn, req, &out_tx, &resp_tx, &attachments).await;
             }
             Message::Binary(data) => {
+                if device_id.is_some() && authorize(&hub, &who, "session.input", &Value::Null).is_err() {
+                    continue;
+                }
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     if let Err(e) = hub.write_input(id, &data[5..]) {
@@ -740,6 +927,9 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     for (_, h) in attachments.lock().drain() {
         h.abort();
     }
+    if let Some(w) = watchdog {
+        w.abort();
+    }
     hub.release_windows(conn);
     drop(resp_tx);
     events.abort();
@@ -749,6 +939,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
 
 async fn handle_request(
     hub: &Arc<Hub>,
+    who: &Principal,
     conn: u64,
     req: Request,
     out: &Outbox,
@@ -757,8 +948,16 @@ async fn handle_request(
 ) {
     match req.method.as_str() {
         "session.attach" => {
-            let id = match parse::<IdParam<SessionId>>(req.params) {
-                Ok(p) => p.id,
+            #[derive(Deserialize)]
+            struct P {
+                id: SessionId,
+                /// Replay at most the last this many bytes of output (phones; see
+                /// docs/PROTOCOL.md). Default: the whole buffer.
+                #[serde(default)]
+                replay_bytes: Option<usize>,
+            }
+            let (id, limit) = match parse::<P>(req.params) {
+                Ok(p) => (p.id, p.replay_bytes.map(|b| b.max(REPLAY_BYTES_MIN))),
                 Err(e) => {
                     let _ = out
                         .send(Message::Text(response(&req.id, Err(e)).to_string().into()))
@@ -775,7 +974,7 @@ async fn handle_request(
             }
             // Subscribe to the bus before snapshotting so a restart can't slip between.
             let bus = hub.subscribe();
-            match hub.attach(id).await {
+            match hub.attach(id, limit).await {
                 Ok(att) => {
                     // Result first, then the replay frame, then live frames (all through the
                     // same ordered outbox, all queued before this call returns).
@@ -787,7 +986,7 @@ async fn handle_request(
                         Attach::Replay(r) => (r, None, None),
                     };
                     let _ = out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay))).await;
-                    let task = tokio::spawn(forward_output(hub.clone(), id, generation, rx, bus, out.clone()));
+                    let task = tokio::spawn(forward_output(hub.clone(), id, limit, generation, rx, bus, out.clone()));
                     if let Some(other) = attachments.lock().insert(id, task) {
                         other.abort();
                     }
@@ -821,17 +1020,18 @@ async fn handle_request(
         _ => {
             // Run concurrently: some methods (send, diff, restart) take a while.
             let hub = hub.clone();
+            let who = who.clone();
             let resp = resp.clone();
             tokio::spawn(async move {
                 // A `session.wait` stops once the connection is gone. Other methods run to
                 // completion (cancelling one halfway could leave state behind).
                 let r = if req.method == "session.wait" {
                     tokio::select! {
-                        r = dispatch(&hub, &req.method, req.params) => r,
+                        r = dispatch(&hub, &who, &req.method, req.params) => r,
                         _ = resp.closed() => return,
                     }
                 } else {
-                    dispatch(&hub, &req.method, req.params).await
+                    dispatch(&hub, &who, &req.method, req.params).await
                 };
                 let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
@@ -844,6 +1044,7 @@ async fn handle_request(
 async fn forward_output(
     hub: Arc<Hub>,
     id: SessionId,
+    limit: Option<usize>,
     mut generation: Option<u64>,
     mut rx: Option<broadcast::Receiver<Bytes>>,
     mut bus: broadcast::Receiver<ServerEvent>,
@@ -864,7 +1065,7 @@ async fn forward_output(
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Slow client: start over from a fresh replay.
-                    if !resend_replay(&hub, id, &mut generation, &mut rx, &out).await {
+                    if !resend_replay(&hub, id, limit, &mut generation, &mut rx, &out).await {
                         return;
                     }
                 }
@@ -876,7 +1077,7 @@ async fn forward_output(
                 Ok(ServerEvent::SessionUpserted(info))
                     if info.id == id && hub.pty_generation(id).is_some_and(|g| Some(g) != generation) =>
                 {
-                    if !resend_replay(&hub, id, &mut generation, &mut rx, &out).await {
+                    if !resend_replay(&hub, id, limit, &mut generation, &mut rx, &out).await {
                         return;
                     }
                 }
@@ -891,11 +1092,12 @@ async fn forward_output(
 async fn resend_replay(
     hub: &Arc<Hub>,
     id: SessionId,
+    limit: Option<usize>,
     generation: &mut Option<u64>,
     rx: &mut Option<broadcast::Receiver<Bytes>>,
     out: &Outbox,
 ) -> bool {
-    let (replay, new_rx, new_gen) = match hub.attach(id).await {
+    let (replay, new_rx, new_gen) = match hub.attach(id, limit).await {
         Ok(Attach::Live(r, rx, g)) => (r, Some(rx), Some(g)),
         Ok(Attach::Replay(r)) => (r, None, None),
         Err(_) => return false,

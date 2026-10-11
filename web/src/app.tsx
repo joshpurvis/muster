@@ -6,6 +6,9 @@ import { effect } from "@preact/signals";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { connStatus, rpc } from "./rpc.ts";
 import {
+  agentMessages,
+  agents,
+  agentsPanelOpen,
   applyEvent,
   applyHello,
   focusedSession,
@@ -32,6 +35,7 @@ import { WindowControls } from "./components/WindowControls.tsx";
 import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
+import { AgentsPanel } from "./components/Agents.tsx";
 import { Kbd, TooltipHost } from "./components/common.tsx";
 import { FolderInput } from "./components/FolderInput.tsx";
 import { SplitView } from "./layout/SplitView.tsx";
@@ -121,6 +125,9 @@ rpc.start();
   windowSessions,
   windowId,
   focusedSession,
+  agents,
+  agentMessages,
+  agentsPanelOpen,
   termText: (sid: number) => {
     const t = terms.terminal(sid);
     if (!t) return null;
@@ -245,15 +252,18 @@ function App() {
   const l = layout.value;
   return (
     <div class="app">
-      <main class="content">
-        {l && windowSessions.value.length
-          ? (
-            <div class="panes">
-              <SplitView layout={l} />
-            </div>
-          )
-          : <EmptyWindow />}
-      </main>
+      <div class="app-body">
+        {agentsPanelOpen.value && <AgentsPanel />}
+        <main class="content">
+          {l && windowSessions.value.length
+            ? (
+              <div class="panes">
+                <SplitView layout={l} />
+              </div>
+            )
+            : <EmptyWindow />}
+        </main>
+      </div>
       {prefs.value.statusLine && <StatusLine />}
       <Overlays />
       <MenuHost />

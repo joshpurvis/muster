@@ -152,33 +152,53 @@ function Seg<T extends string>(
   );
 }
 
-/** The two segmented controls. */
+/** The two segmented controls (`only`: just the one that applies, for a named agent's tab). */
 export function PermissionFields(
-  { value, onChange }: { value: Permissions; onChange: (p: Permissions) => void },
+  { value, onChange, only }: {
+    value: Permissions;
+    onChange: (p: Permissions) => void;
+    only?: "codex" | "claude";
+  },
 ) {
   return (
     <div class="perm-fields">
-      <Seg
-        label="Codex sandbox"
-        icon={<IconCodex size={13} />}
-        opts={CODEX_OPTS}
-        value={value.codex_sandbox}
-        onChange={(v) => onChange({ ...value, codex_sandbox: v })}
-      />
-      <Seg
-        label="Claude permission mode"
-        icon={<IconSpark size={13} />}
-        opts={CLAUDE_OPTS}
-        value={value.claude_mode}
-        onChange={(v) => onChange({ ...value, claude_mode: v })}
-      />
+      {only !== "claude" && (
+        <Seg
+          label="Codex sandbox"
+          icon={<IconCodex size={13} />}
+          opts={CODEX_OPTS}
+          value={value.codex_sandbox}
+          onChange={(v) => onChange({ ...value, codex_sandbox: v })}
+        />
+      )}
+      {only !== "codex" && (
+        <Seg
+          label="Claude permission mode"
+          icon={<IconSpark size={13} />}
+          opts={CLAUDE_OPTS}
+          value={value.claude_mode}
+          onChange={(v) => onChange({ ...value, claude_mode: v })}
+        />
+      )}
     </div>
   );
 }
 
-/** Collapsible "Permissions" section for the New tab dialog. */
+/** "Claude: plan" / "Codex: read only": the half of the summary that applies to `kind`. */
+export function kindSummary(p: Permissions, kind: "codex" | "claude"): string {
+  return kind === "codex"
+    ? `Codex: ${codexOpt(p.codex_sandbox).short}`
+    : `Claude: ${claudeOpt(p.claude_mode).short}`;
+}
+
+/** Collapsible "Permissions" section for the New tab and New agent dialogs. */
 export function PermissionsSection(
-  { value, onChange }: { value: Permissions; onChange: (p: Permissions) => void },
+  { value, onChange, only, note }: {
+    value: Permissions;
+    onChange: (p: Permissions) => void;
+    only?: "codex" | "claude";
+    note?: string;
+  },
 ) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -200,15 +220,15 @@ export function PermissionsSection(
         <span class={cx("perm-summary", isDangerous(value) && "danger", isElevated(value) && "elevated")}>
           {isElevated(value) &&
             (isDangerous(value) ? <IconShieldAlert size={12} /> : <IconGlobe size={12} />)}
-          {summary(value)}
+          {only ? kindSummary(value, only) : summary(value)}
         </span>
       </button>
       {open && (
         <div class="perm-body">
-          <PermissionFields value={value} onChange={onChange} />
+          <PermissionFields value={value} onChange={onChange} only={only} />
           <span class="field-hint perm-note">
-            Applies to every agent in the tab, including ones other agents start. Agents can't change it
-            through muster's tools.
+            {note ??
+              "Applies to every agent in the tab, including ones other agents start. Agents can't change it through muster's tools."}
           </span>
         </div>
       )}

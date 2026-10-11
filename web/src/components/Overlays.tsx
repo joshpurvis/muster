@@ -1,8 +1,10 @@
 // Modal overlays: Jump / command palette, New tab, Rename window, shortcuts sheet, confirm
-// dialog. Plus toasts.
+// dialog, and the agent dialogs (Agents.tsx). Plus toasts.
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  agentBySession,
+  agents,
   channelById,
   channels,
   dismissToast,
@@ -26,6 +28,8 @@ import { IconBranch, IconCheck, IconCodex, IconFolder, IconSpark, IconTerminal, 
 import type { Permissions, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
+import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
 import { labelOf } from "../layout/Pane.tsx";
 import { basename, type JumpCandidate, jumpOrder, rankJump, tabText, windowLabel } from "../model.ts";
@@ -124,6 +128,10 @@ export function Overlays() {
       return <Confirm {...o} />;
     case "permissions":
       return <PermissionsDialog key={o.channelId} channelId={o.channelId} Modal={Modal} close={close} />;
+    case "agent":
+      return <AgentDialog key={o.name ?? "new"} name={o.name} tab={o.tab} Modal={Modal} close={close} />;
+    case "agent_message":
+      return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
   }
 }
 
@@ -189,9 +197,10 @@ function jumpEntries(): Entry[] {
     const w = id !== null ? windowById.value.get(id) : undefined;
     return w ? windowLabel(w) : "no window";
   };
+  // A named agent's session is listed once, as the agent (below).
   const live = [...sessions.value.values()].filter((s) => {
     const c = channelById.value.get(s.channel_id);
-    return !!c && !c.archived;
+    return !!c && !c.archived && !agentBySession.value.has(s.id);
   });
   for (const s of jumpOrder(live, layoutOrder.value, windowOfSession)) {
     const c = channelById.value.get(s.channel_id)!;
@@ -213,6 +222,31 @@ function jumpEntries(): Entry[] {
       run: () => {
         overlay.value = null;
         A.gotoSession(s.id);
+      },
+    });
+  }
+  // Every named agent, stopped ones too: choosing one starts it and pulls its tab here.
+  for (const a of agents.value) {
+    const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
+    const st = agentStatus(a, s);
+    const isHere = !!s && here.has(s.id);
+    out.push({
+      key: "a:" + a.id,
+      label: a.name,
+      hay: `${a.name} agent ${KIND_LABEL[a.kind]}`,
+      needs: !!s && needsHuman(s.state),
+      pri: s ? STATE_PRIORITY.indexOf(s.state) : STATE_PRIORITY.length,
+      since: st.since ?? 0,
+      here: isHere,
+      boost: 1,
+      sub: `agent · ${KIND_LABEL[a.kind]}${
+        s && !isHere && st.live ? ` · ${winName(windowOfSession(s))}` : ""
+      }`,
+      icon: <StateDot state={st.state} />,
+      right: <span class="sw-detail">{st.live ? s?.state_detail || st.label : "start"}</span>,
+      run: () => {
+        overlay.value = null;
+        A.openAgent(a.name);
       },
     });
   }
@@ -274,7 +308,7 @@ function Jump({ initial }: { initial: string }) {
     const cmds = rankJump(commandEntries(), query, [], 10).map((r) => ({ e: r.item, hits: r.hits }));
     return [...ranked, ...cmds];
     // Live: states and tabs change while Jump is open.
-  }, [q, sessions.value, channels.value, windows.value, layoutOrder.value]);
+  }, [q, sessions.value, channels.value, windows.value, layoutOrder.value, agents.value]);
 
   useEffect(() => setSel(0), [q]);
   useEffect(() => {
@@ -305,7 +339,7 @@ function Jump({ initial }: { initial: string }) {
           value={q}
           placeholder={cmdMode
             ? "Type a command…"
-            : "Jump to a tab or folder, in any window…   (> for commands)"}
+            : "Jump to a tab, agent or folder, in any window…   (> for commands)"}
           spellcheck={false}
           aria-label={cmdMode ? "Command" : "Jump to"}
           onInput={(e) => setQ((e.target as HTMLInputElement).value)}

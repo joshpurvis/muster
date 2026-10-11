@@ -28,6 +28,8 @@ export interface LayoutState {
   root: Layout;
   focus: string;
   zoom: string | null;
+  /** The window shows the agents panel (docs/UI.md "Agents panel"). Missing: closed. */
+  agents?: boolean;
 }
 
 export type Side = "left" | "right" | "top" | "bottom";
@@ -237,6 +239,7 @@ export function parseLayout(raw: unknown): LayoutState | null {
       root: normalizeKeeping(o.root, null),
       focus: typeof o.focus === "string" ? o.focus : "",
       zoom: typeof o.zoom === "string" ? o.zoom : null,
+      ...(o.agents === true ? { agents: true } : {}),
     });
   }
   if (validNode(raw)) {

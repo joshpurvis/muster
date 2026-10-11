@@ -3,6 +3,7 @@
 
 import * as A from "./actions.ts";
 import {
+  agentsSupported,
   altHeld,
   confirmClose,
   focusedSession,
@@ -328,6 +329,22 @@ export const commands: Command[] = [
     group: "Window",
     enabled: () => windowId.value !== null,
     run: () => (overlay.value = { kind: "rename_window" }),
+  },
+
+  // Agents
+  {
+    id: "agents-panel",
+    title: "Toggle agents panel",
+    group: "Agents",
+    keys: ["Alt+G"],
+    run: () => A.toggleAgentsPanel(),
+  },
+  {
+    id: "new-agent",
+    title: "New agent…",
+    group: "Agents",
+    enabled: () => agentsSupported.value,
+    run: () => A.newAgentDialog(),
   },
 
   // Groups

@@ -1,6 +1,7 @@
 // End-to-end UI walkthrough against the MOCK daemon (dev only). Two headless browsers act as two
 // client windows. Covers the v2 layout: a window split into groups, each with its own tab strip;
-// a tab is one session.
+// a tab is one session. Also the agents panel (Alt+G, start-and-pull, the message log, New
+// agent from a template, Edit ▸ Memory).
 //
 //   deno task build:dev && MOCK_PORT=17761 deno task mock &
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src \
@@ -363,6 +364,190 @@ try {
     ok("Jump pulled one tab of a two-tab task into window 2 (session.set_window); its sibling stayed");
   }
 
+  // ---- the agents panel (mock only: clicking an agent starts it)
+  if (!real) {
+    const menuItem = (b: Browser, label: string) =>
+      b.eval(`(() => { const it = [...document.querySelectorAll('.menu .menu-item')]
+        .find((e) => e.querySelector('.menu-label')?.textContent === ${JSON.stringify(label)});
+        if (!it) return false; it.click(); return true; })()`);
+    await a.click(`[data-tab-sid="${t2}"]`);
+    await a.key("Alt+G");
+    await a.wait(`!!document.querySelector('.agents-panel') && ${M}.layout.value.agents === true`, 3000);
+    await a.wait(`document.querySelectorAll('.ap-row').length === ${M}.agents.value.length`, 3000);
+    check(await a.eval(`${M}.agents.value.length`) >= 2, "the mock's agents are listed");
+    check(
+      await a.eval(`document.querySelector('[data-agent="orchestrator"] .ap-kind')?.textContent`) ===
+        "Claude",
+      "rows show the kind badge",
+    );
+    check(
+      await a.eval(
+        `document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      ),
+      "a stopped agent says so",
+    );
+    ok("Alt+G opened the agents panel (kept in the window's layout); rows show dot, name, kind, state");
+
+    // The message log: from → to, first line, origin and hop chips, refusals in red.
+    const entries = await a.eval(`document.querySelectorAll('.ap-msg').length`);
+    check(entries >= 3, `the log shows the mock's messages (${entries})`);
+    check(
+      await a.eval(
+        `document.querySelector('.ap-msg.refused .ap-msg-refused')?.textContent.includes('accepts only human')`,
+      ),
+      "a refused message shows its reason",
+    );
+    check(
+      await a.eval(
+        `[...document.querySelectorAll('.ap-msg .ap-chip')].some((c) => c.textContent === 'schedule')`,
+      ),
+      "origin chips",
+    );
+    await R(a, "mock.agent_message", {
+      to: "reviewer",
+      from: "orchestrator",
+      text: "Check the retry loop again",
+      hop: 1,
+    });
+    await a.wait(
+      `document.querySelector('.ap-msg .ap-msg-text')?.textContent === 'Check the retry loop again'`,
+      3000,
+    );
+    check(
+      await a.eval(
+        `document.querySelector('.ap-msg .ap-msg-route')?.textContent.replace(/\\s+/g, ' ').trim()`,
+      ) ===
+        "orchestrator → reviewer",
+      "newest first, from → to",
+    );
+    await shot(a, "09-agents-panel");
+    await a.click(`.ap-msg[data-msg]:not(.refused)`);
+    await a.wait(`!!document.querySelector('.msg-dlg .msg-pre')`, 2000);
+    check(
+      await a.eval(`document.querySelector('.msg-dlg .msg-pre').textContent`) ===
+        "Check the retry loop again",
+      "the overlay shows the full message",
+    );
+    await a.key("Escape");
+    await a.click(`.ap-msg.refused`);
+    await a.wait(`!!document.querySelector('.msg-dlg .msg-refused')`, 2000);
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.msg-dlg')`);
+    ok("the message log lists messages live; an entry opens its full text and reply; refusals show why");
+
+    // Click a stopped agent: it starts, and its tab opens in this window's focused group.
+    const before = await here(a);
+    await a.click(`[data-agent="reviewer"]`);
+    await a.wait(`${M}.focusedSession.value?.name === 'reviewer'`, 6000);
+    const rev: number = await a.eval(`${M}.focusedSession.value.id`);
+    check(!before.includes(rev) && (await here(a)).includes(rev), "a new tab for the agent, here");
+    await a.wait(
+      `!document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      4000,
+    );
+    check(
+      await a.eval(
+        `[...document.querySelectorAll('.ap-msg')].every((m) => m.querySelector('.ap-msg-route').textContent.includes('reviewer'))`,
+      ),
+      "selecting the agent filters the log to it",
+    );
+    check(!!(await a.eval(`document.querySelector('.ap-filter')`)), "the filter chip shows");
+    ok("clicking a stopped agent started it in a tab of the focused group and filtered the log");
+    await shot(a, "09b-agents-running");
+
+    // From window 2: clicking it pulls its tab over, as Jump does.
+    await b2.key("Alt+G");
+    await b2.wait(`!!document.querySelector('.agents-panel')`, 3000);
+    check(await a.eval(`!!document.querySelector('.agents-panel')`), "window 1 keeps its own panel");
+    await b2.click(`[data-agent="reviewer"]`);
+    await b2.wait(
+      `${M}.windowSessions.value.some((s) => s.id === ${rev}) && ${M}.focusedSession.value?.id === ${rev}`,
+      5000,
+    );
+    await a.wait(`!${M}.windowSessions.value.some((s) => s.id === ${rev})`, 5000);
+    check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "pulled, not restarted");
+    ok("clicking a running agent in window 2 pulled its tab into window 2's focused group");
+    await b2.key("Alt+G");
+    await b2.wait(`!document.querySelector('.agents-panel')`, 2000);
+
+    // Jump lists every agent; choosing a stopped one starts it.
+    await a.key("Ctrl+Space");
+    await a.wait(`!!document.querySelector('.switcher')`);
+    await a.type("orchestr");
+    await a.sleep(150);
+    check(
+      await a.eval(`document.querySelector('.sw-item.sel .sw-sub')?.textContent.startsWith('agent')`),
+      "Jump lists the agent",
+    );
+    await a.key("Enter");
+    await a.wait(`${M}.focusedSession.value?.name === 'orchestrator'`, 6000);
+    ok("Jump listed a stopped agent; choosing it started it and showed its tab here");
+
+    // New agent from a template (palette), with the unattended-use warning.
+    await a.key("Ctrl+Shift+P");
+    await a.wait(`!!document.querySelector('.switcher')`);
+    await a.type("new agent");
+    await a.sleep(150);
+    await a.key("Enter");
+    await a.wait(`!!document.querySelector('.agent-dlg [data-tpl="researcher"]')`, 3000);
+    await a.click(`.agent-dlg [data-tpl="researcher"]`);
+    await a.wait(`document.querySelector('.agent-dlg .field-row input').value === 'researcher'`, 2000);
+    check(
+      await a.eval(`document.querySelector('.agent-dlg .persona-input').value.includes('plan mode')`),
+      "the template prefilled the persona",
+    );
+    check(await a.eval(`!document.querySelector('.agent-warn')`), "no warning for human-only");
+    await a.eval(
+      `[...document.querySelectorAll('.agent-dlg .check')].find((l) => l.textContent.includes('Schedule')).querySelector('input').click()`,
+    );
+    await a.wait(`!!document.querySelector('.agent-warn')`, 1000);
+    check(
+      await a.eval(
+        `document.querySelector('.agent-warn').textContent.includes("consumer terms are unclear")`,
+      ),
+      "the warning names the reason",
+    );
+    await shot(a, "10-new-agent");
+    await a.eval(
+      `[...document.querySelectorAll('.agent-dlg .check')].find((l) => l.textContent.includes('Schedule')).querySelector('input').click()`,
+    );
+    await a.wait(`!document.querySelector('.agent-warn')`, 1000);
+    await a.key("Ctrl+Enter");
+    await a.wait(
+      `!document.querySelector('.agent-dlg') && !!document.querySelector('[data-agent="researcher"]')`,
+      3000,
+    );
+    const made: any = (await R(a, "agent.list", {})).find((x: any) => x.name === "researcher");
+    check(
+      made && made.permissions.claude_mode === "plan" && made.accepts_origins.join() === "human",
+      "created as the template says",
+    );
+    ok("New agent: the Researcher template prefilled the dialog; schedule on a Claude agent warns; created");
+
+    // Edit ▸ Memory: list, open, edit and save a file.
+    await a.click(`[data-agent="orchestrator"]`, { button: "right" });
+    await a.wait(`!!document.querySelector('.menu')`);
+    check(await menuItem(a, "Memory…"), "the row's menu has Memory…");
+    await a.wait(`document.querySelectorAll('.mem-file').length >= 2`, 3000);
+    await a.eval(
+      `[...document.querySelectorAll('.mem-file')].find((b) => b.textContent === 'notes.md').click()`,
+    );
+    await a.wait(`document.querySelector('.mem-text')?.value.startsWith('# Notes')`, 2000);
+    await a.click(".mem-text");
+    await a.key("Ctrl+a");
+    await a.type("# Notes\nsaved from the panel");
+    await a.wait(`!!document.querySelector('.mem-dirty')`, 1000);
+    await a.click(".mem-save");
+    await a.wait(`!document.querySelector('.mem-dirty')`, 2000);
+    const saved: any = await R(a, "agent.memory.read", { name: "orchestrator", path: "notes.md" });
+    check(saved.text === "# Notes\nsaved from the panel", `saved: ${JSON.stringify(saved.text)}`);
+    await shot(a, "11-agent-memory");
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
+    ok("Edit ▸ Memory listed memory/, opened a file and saved an edit");
+    await a.sleep(500); // the layout (with the panel flag) saves debounced
+  }
+
   // ---- reload keeps the window (and, on v2 daemons, its groups)
   await a.click(".pane .xterm");
   await a.key("Alt+Shift+D");
@@ -380,6 +565,10 @@ try {
     check(after === before, `the groups came back: ${before} → ${after}`);
   }
   ok(`reload reclaimed the same window${v2 ? " and its groups" : ""} (${await layoutSig(a)})`);
+  if (!real && v2) {
+    await a.wait(`!!document.querySelector('.agents-panel')`, 3000);
+    ok("the agents panel came back open with the window (per-window, in its layout)");
+  }
 
   // ---- light theme, shortcuts sheet
   await a.send("Emulation.setEmulatedMedia", {

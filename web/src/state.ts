@@ -4,6 +4,8 @@
 
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
+  Agent,
+  AgentMessage,
   AgentState,
   Channel,
   ChannelId,
@@ -20,6 +22,7 @@ import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
 import { debounce, load, save } from "./util.ts";
+import { upsertMessage } from "./agents.ts";
 import {
   allSessions,
   emptyLayout,
@@ -84,6 +87,41 @@ export const windowSessions = computed((): SessionInfo[] => {
 });
 
 export const hereIds = computed(() => new Set(windowSessions.value.map((s) => s.id)));
+
+// ---------------- named agents (docs/UI.md "Agents panel") ----------------
+
+/** Every named agent, by name. Loaded after each hello (`agent.list`), then kept by events. */
+export const agents = signal<Agent[]>([]);
+/** The daemon knows agents (false: an older daemon answered "unknown method"). */
+export const agentsSupported = signal(true);
+/** The message log, newest first (`agent.messages`, then `agent_message` events). */
+export const agentMessages = signal<AgentMessage[]>([]);
+/** The panel's selected agent: the log shows only messages to it. */
+export const agentFilter = signal<number | null>(null);
+
+export const agentBySession = computed(() => {
+  const m = new Map<SessionId, Agent>();
+  for (const a of agents.value) if (a.session_id !== null) m.set(a.session_id, a);
+  return m;
+});
+
+function sortAgents(list: Agent[]): Agent[] {
+  return [...list].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+}
+
+async function loadAgents() {
+  try {
+    const [list, log] = await Promise.all([
+      rpc.call<Agent[]>("agent.list"),
+      rpc.call<{ messages: AgentMessage[] }>("agent.messages", { limit: 100 }),
+    ]);
+    agentsSupported.value = true;
+    agents.value = sortAgents(list);
+    agentMessages.value = log.messages;
+  } catch (e) {
+    if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) agentsSupported.value = false;
+  }
+}
 
 /** The window a session is a tab in (null: none). Without window support: this one. */
 export function windowOfSession(s: SessionInfo): WindowId | null {
@@ -158,6 +196,8 @@ export interface Prefs {
   altToTerminal: boolean;
   /** Jump / Alt+J focus the other window (window.raise) instead of pulling its tab here. */
   jumpRaises: boolean;
+  /** The agents panel's message log is expanded. */
+  agentFeed: boolean;
 }
 
 const defaultPrefs: Prefs = {
@@ -169,6 +209,7 @@ const defaultPrefs: Prefs = {
   statusLine: true,
   altToTerminal: false,
   jumpRaises: false,
+  agentFeed: true,
 };
 
 function loadPrefs(): Prefs {
@@ -212,6 +253,9 @@ export type Overlay =
   | { kind: "shortcuts" }
   | { kind: "permissions"; channelId: number }
   | { kind: "rename_window" }
+  /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
+  | { kind: "agent"; name?: string; tab?: "settings" | "memory" }
+  | { kind: "agent_message"; id: number }
   | {
     kind: "confirm";
     title: string;
@@ -259,6 +303,9 @@ export const renaming = signal<{ kind: "channel" | "session"; id: number; sid: S
 export const layout = signal<LayoutState | null>(null);
 /** The window `layout` belongs to (undefined: none built yet; null: no window support). */
 let layoutOwner: WindowId | null | undefined = undefined;
+
+/** This window shows the agents panel (kept in its layout, like zoom). */
+export const agentsPanelOpen = computed(() => !!layout.value?.agents);
 
 export const focusedGroup = computed((): PaneNode | null => {
   const l = layout.value;
@@ -448,6 +495,7 @@ export function applyHello(h: HelloResult) {
     if (helloDone.peek()) holdArrivals(before);
     helloDone.value = true;
   });
+  loadAgents();
   // Seed unread state with a little history per task.
   for (const c of h.channels) {
     if (c.archived) continue;
@@ -518,7 +566,22 @@ export function applyEvent(ev: ServerEvent) {
     case "notice":
       toast(ev.data.level === "error" ? "error" : ev.data.level === "warn" ? "warn" : "info", ev.data.text);
       break;
+    case "agent_upserted":
+      agents.value = sortAgents([...agents.value.filter((a) => a.id !== ev.data.id), ev.data]);
+      break;
+    case "agent_removed":
+      agents.value = agents.value.filter((a) => a.id !== ev.data.id);
+      if (agentFilter.value === ev.data.id) agentFilter.value = null;
+      break;
+    case "agent_message":
+      agentMessages.value = upsertMessage(agentMessages.value, ev.data);
+      break;
   }
+}
+
+/** Record an agent from an RPC reply (its agent_upserted event may lag). */
+export function knowAgent(a: Agent) {
+  agents.value = sortAgents([...agents.value.filter((x) => x.id !== a.id), a]);
 }
 
 const versions = new SessionVersions();

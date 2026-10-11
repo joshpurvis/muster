@@ -392,6 +392,341 @@ function kill(sid: number) {
   }, 1500);
 }
 
+// ---------- named agents (docs/PROTOCOL.md "Agents"; src/agents.rs) ----------
+// Records, the message log and memory/ files live here; an agent's session is a fake agent like
+// any other, in its own tab of an "agents" workspace (the mock runs it in $HOME).
+
+interface MockAgent {
+  id: number;
+  name: string;
+  kind: "claude" | "codex";
+  model: string | null;
+  effort: string | null;
+  persona: string;
+  permissions: { codex_sandbox: string; claude_mode: string };
+  accepts_origins: string[];
+  autostart: boolean;
+  home_dir: string;
+  channel_id: number | null;
+  session_id: number | null;
+  resumable: boolean;
+  created_at: number;
+}
+
+const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
+const AGENT_TEMPLATES = [
+  {
+    id: "blank",
+    label: "Blank",
+    about: "Nothing filled in: a Claude agent that takes human-started work.",
+    name: "",
+    kind: "claude",
+    model: null,
+    effort: null,
+    persona: "",
+    permissions: DEFAULT_PERMS,
+    accepts: ["human"],
+    autostart: false,
+  },
+  {
+    id: "orchestrator",
+    label: "Orchestrator",
+    about: "Splits work across the other agents and sums up their replies for you.",
+    name: "orchestrator",
+    kind: "claude",
+    model: null,
+    effort: null,
+    persona:
+      "You coordinate the other muster agents for the human. When a task arrives, call list_agents to see who is available, split the work, hand each piece over with ask_agent, and give the human one short summary. Never do large work yourself. Keep notes in memory/.",
+    permissions: DEFAULT_PERMS,
+    accepts: ["human"],
+    autostart: false,
+  },
+  {
+    id: "researcher",
+    label: "Researcher",
+    about: "Reads and searches the web, answers with sources. Plan mode: it can't change files.",
+    name: "researcher",
+    kind: "claude",
+    model: null,
+    effort: null,
+    persona:
+      'You answer questions by reading files and searching the web. Every claim carries its source. You run in plan mode: end each answer with a short "For memory/" list.',
+    permissions: { codex_sandbox: "workspace_write", claude_mode: "plan" },
+    accepts: ["human"],
+    autostart: false,
+  },
+  {
+    id: "reviewer",
+    label: "Reviewer",
+    about: "Codex in a read-only sandbox: reviews the diffs or files you point it at.",
+    name: "reviewer",
+    kind: "codex",
+    model: null,
+    effort: null,
+    persona:
+      "You review the diffs or files you are asked about. Report findings ranked by severity (P1, P2, P3), each with the file and line and the smallest fix.",
+    permissions: { codex_sandbox: "read_only", claude_mode: "default" },
+    accepts: ["human"],
+    autostart: false,
+  },
+  {
+    id: "worker",
+    label: "Background worker",
+    about: "Codex for routine jobs, also on schedules and webhooks; starts with the daemon.",
+    name: "worker",
+    kind: "codex",
+    model: null,
+    effort: null,
+    persona:
+      "You run routine jobs when asked, by a person, a schedule or a webhook. Post a short result to your channel with post_to_channel and keep a log in memory/log.md.",
+    permissions: { codex_sandbox: "workspace_write", claude_mode: "default" },
+    accepts: ["human", "schedule", "webhook"],
+    autostart: true,
+  },
+];
+
+const agentList: MockAgent[] = [];
+const agentMsgs: any[] = [];
+const memory = new Map<string, Map<string, string>>();
+
+function newAgent(p: any): MockAgent {
+  const name = String(p.name ?? "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(name)) throw new Error(`bad agent name \`${name}\``);
+  if (agentList.some((a) => a.name.toLowerCase() === name.toLowerCase())) {
+    throw new Error(`an agent named ${name} already exists`);
+  }
+  const kind = p.kind === "codex" ? "codex" : "claude";
+  const a: MockAgent = {
+    id: seq++,
+    name,
+    kind,
+    model: p.model || null,
+    effort: p.effort || null,
+    persona: p.persona ?? "",
+    permissions: p.permissions ?? { ...DEFAULT_PERMS },
+    accepts_origins: p.accepts ?? (kind === "claude" ? ["human"] : ["human", "schedule", "webhook"]),
+    autostart: !!p.autostart,
+    home_dir: `${HOME}/.local/share/muster/agents/${name.toLowerCase()}`,
+    channel_id: null,
+    session_id: null,
+    resumable: false,
+    created_at: now(),
+  };
+  agentList.push(a);
+  memory.set(a.name, new Map());
+  return a;
+}
+
+function agentJson(a: MockAgent) {
+  const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
+  return { ...a, state: s?.state ?? null, detail: s?.state_detail ?? null };
+}
+
+function agentNamed(name: string): MockAgent {
+  const a = agentList.find((x) => x.name.toLowerCase() === String(name ?? "").trim().toLowerCase());
+  if (!a) throw new Error(`no agent named ${name}`);
+  return a;
+}
+
+function pushAgentMessage(m: any) {
+  const msg = {
+    id: seq++,
+    from_session: null,
+    to_session: null,
+    reply_to: null,
+    created_at: now(),
+    reply: null,
+    replied_at: null,
+    refused: null,
+    ...m,
+  };
+  agentMsgs.push(msg);
+  broadcast("agent_message", msg);
+  return msg;
+}
+
+// Seed: two agents and a short conversation, so the panel has something to show.
+{
+  const orch = newAgent({ ...AGENT_TEMPLATES[1], accepts: ["human"] });
+  const rev = newAgent({ ...AGENT_TEMPLATES[3] });
+  orch.created_at = rev.created_at = now() - 3 * 3600_000;
+  memory.get(orch.name)!.set(
+    "notes.md",
+    "# Notes\n\n- reviewer is good at Rust diffs\n- release notes due Friday\n",
+  );
+  memory.get(orch.name)!.set("people/josh.md", "Prefers short summaries.\n");
+  const t0 = now() - 40 * 60_000;
+  agentMsgs.push(
+    {
+      id: seq++,
+      from: "human",
+      from_session: null,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "human",
+      hop: 0,
+      reply_to: null,
+      created_at: t0,
+      text: "Plan the release notes for v0.4 and get the auth diff reviewed.",
+      reply: "Done: notes drafted in memory/release.md; reviewer found one P2 in the auth diff.",
+      replied_at: t0 + 9 * 60_000,
+      refused: null,
+    },
+    {
+      id: seq++,
+      from: orch.name,
+      from_session: null,
+      to: rev.name,
+      to_agent: rev.id,
+      to_session: null,
+      origin: "human",
+      hop: 1,
+      reply_to: null,
+      created_at: t0 + 2 * 60_000,
+      text: "Review the diff in fix-auth: is the token refresh safe?\nFocus on the retry loop.",
+      reply: "P2: the retry loop re-sends the old refresh token after a 401 (src/auth.rs:212).",
+      replied_at: t0 + 7 * 60_000,
+      refused: null,
+    },
+    {
+      id: seq++,
+      from: "session:41",
+      from_session: 41,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "schedule",
+      hop: 2,
+      reply_to: null,
+      created_at: t0 + 20 * 60_000,
+      text: "Nightly: summarise yesterday's merged PRs.",
+      reply: null,
+      replied_at: null,
+      refused:
+        "orchestrator accepts only human-started messages, and this one started from a schedule (origin=schedule)",
+    },
+  );
+}
+
+async function agentMethod(method: string, p: any): Promise<unknown> {
+  switch (method) {
+    case "agent.list":
+      return agentList.map(agentJson);
+    case "agent.templates":
+      return AGENT_TEMPLATES;
+    case "agent.create": {
+      const a = newAgent(p);
+      broadcast("agent_upserted", agentJson(a));
+      return agentJson(a);
+    }
+    case "agent.update": {
+      const a = agentNamed(p.name);
+      for (const k of ["model", "effort"] as const) if (k in p) a[k] = String(p[k]).trim() || null;
+      if ("persona" in p) a.persona = p.persona;
+      if ("autostart" in p) a.autostart = !!p.autostart;
+      if ("permissions" in p) a.permissions = p.permissions;
+      if ("accepts" in p) {
+        if (!p.accepts.length) {
+          throw new Error("accepts needs at least one origin (human, schedule, webhook)");
+        }
+        a.accepts_origins = p.accepts;
+      }
+      broadcast("agent_upserted", agentJson(a));
+      return agentJson(a);
+    }
+    case "agent.remove": {
+      const a = agentNamed(p.name);
+      if (a.session_id !== null && sessions.has(a.session_id)) {
+        await handle("session.remove", { id: a.session_id });
+      }
+      agentList.splice(agentList.indexOf(a), 1);
+      broadcast("agent_removed", { id: a.id, name: a.name });
+      return { removed: agentJson(a) };
+    }
+    case "agent.start": {
+      const a = agentNamed(p.name);
+      const cur = a.session_id !== null ? sessions.get(a.session_id) : undefined;
+      if (cur && cur.state !== "exited" && !p.fresh) {
+        return { agent: agentJson(a), session: cur, started: false };
+      }
+      if (cur) {
+        const s = await handle("session.restart", { id: cur.id });
+        broadcast("agent_upserted", agentJson(a));
+        return { agent: agentJson(a), session: s, started: true };
+      }
+      let ws = workspaces.find((w) => w.name === "agents" && w.path === HOME);
+      if (!ws) {
+        ws = { id: seq++, name: "agents", path: HOME, is_git: false, created_at: now() };
+        workspaces.push(ws);
+        broadcast("workspace_upserted", ws);
+      }
+      let c = channels.find((x) => x.id === a.channel_id && !x.archived);
+      if (!c) {
+        c = await handle("channel.create", {
+          workspace_id: ws.id,
+          name: a.name,
+          window_id: p.window_id,
+          permissions: a.permissions,
+        });
+        a.channel_id = c.id;
+      }
+      const s = spawn({ channel_id: c.id, kind: a.kind, name: a.name, window_id: p.window_id, cwd: HOME });
+      a.session_id = s.id;
+      broadcast("agent_upserted", agentJson(a));
+      return { agent: agentJson(a), session: s, started: true };
+    }
+    case "agent.messages": {
+      const to = p.agent ? agentNamed(p.agent).id : null;
+      const limit = Math.min(200, Math.max(1, p.limit ?? 50));
+      const all = agentMsgs
+        .filter((m) => (to === null || m.to_agent === to) && (p.before == null || m.id < p.before))
+        .sort((x, y) => y.id - x.id);
+      return { messages: all.slice(0, limit), more: all.length > limit };
+    }
+    case "agent.memory.list": {
+      const a = agentNamed(p.name);
+      const files = [...(memory.get(a.name) ?? new Map()).entries()]
+        .map(([path, text]) => ({ path, size: text.length, modified: now() }))
+        .sort((x, y) => x.path.localeCompare(y.path));
+      return { dir: `${a.home_dir}/memory`, files };
+    }
+    case "agent.memory.read":
+    case "agent.memory.write": {
+      const a = agentNamed(p.name);
+      const path = String(p.path ?? "").trim();
+      if (!path || path.startsWith("/") || path.split("/").some((x) => !x || x === "." || x === "..")) {
+        throw new Error(`memory paths can't contain \`..\`, \`.\` or empty parts (got \`${path}\`)`);
+      }
+      const files = memory.get(a.name) ?? new Map<string, string>();
+      memory.set(a.name, files);
+      if (method === "agent.memory.read") {
+        if (!files.has(path)) throw new Error(`reading memory/${path}: No such file or directory`);
+        return { path, text: files.get(path), size: files.get(path)!.length };
+      }
+      if (typeof p.text !== "string") throw new Error("text is required");
+      if (p.text.length > 256 * 1024) throw new Error("memory files are at most 256 KB");
+      files.set(path, p.text);
+      return { path, size: p.text.length };
+    }
+    // Dev only: a message arriving from an agent (e2e checks the log updates live).
+    case "mock.agent_message": {
+      const a = agentNamed(p.to);
+      return pushAgentMessage({
+        from: p.from ?? "human",
+        to: a.name,
+        to_agent: a.id,
+        origin: p.origin ?? "human",
+        hop: p.hop ?? 0,
+        text: p.text ?? "",
+        refused: p.refused ?? null,
+      });
+    }
+  }
+  throw new Error(`unknown method ${method}`);
+}
+
 function stripAnsi(s: string) {
   // deno-lint-ignore no-control-regex
   return s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*\x07/g, "").replace(/\r/g, "");
@@ -411,6 +746,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       "channel.mark_read",
     ].includes(method)
   ) throw new Error("This device does not have permission for " + method);
+  if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   switch (method) {
     case "hello":
       return {

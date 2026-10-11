@@ -141,6 +141,15 @@ export const IconGlobe = (p: P) => (
     <path d="M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5S9.7 5.9 12 3.5z" />
   </Svg>
 );
+/** Two heads: named agents (the agents panel). */
+export const IconAgents = (p: P) => (
+  <Svg {...p}>
+    <circle cx="9" cy="8" r="3.2" />
+    <path d="M3.5 19.5c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5" />
+    <circle cx="17" cy="9" r="2.4" />
+    <path d="M15.8 14.6c2.4-.3 4.3 1.2 4.8 4.4" />
+  </Svg>
+);
 
 import type { SessionKind } from "./types.ts";
 export function KindIcon({ kind, size = 14 }: { kind: SessionKind; size?: number }) {

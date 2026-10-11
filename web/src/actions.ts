@@ -4,6 +4,8 @@
 import { signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
 import {
+  agents,
+  agentsPanelOpen,
   BUSY_STATES,
   channelById,
   confirmClose,
@@ -13,6 +15,7 @@ import {
   focusedTask,
   hereIds,
   holdNewSessions,
+  knowAgent,
   knowChannel,
   knowSession,
   knowWindow,
@@ -39,6 +42,7 @@ import {
   workspaces,
 } from "./state.ts";
 import type {
+  Agent,
   Channel,
   ChannelId,
   Decision,
@@ -771,4 +775,86 @@ export function openFind() {
 
 export function openJump(initial = "") {
   overlay.value = { kind: "jump", initial };
+}
+
+// ---------- named agents (docs/UI.md "Agents panel") ----------
+
+/** Alt+G: show or hide this window's agents panel (kept in the window's layout). */
+export function toggleAgentsPanel() {
+  const open = !agentsPanelOpen.value;
+  updateLayout((l) => {
+    const { agents: _was, ...rest } = l;
+    return open ? { ...rest, agents: true } : rest;
+  });
+  if (!open) focusActiveTerminalSoon();
+}
+
+/** An agent's session is running (not exited). */
+export function agentLive(a: Agent): boolean {
+  const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
+  return !!s && s.state !== "exited";
+}
+
+/**
+ * Click an agent (panel row, Jump): start it if no process runs (a new tab opens in this
+ * window), then show its tab here exactly as Jump does (pulled into the focused group when it
+ * is in another window). `fresh`: a new conversation, restarting a running one.
+ */
+export async function openAgent(name: string, fresh = false) {
+  const a = agents.value.find((x) => x.name === name);
+  if (!a) return;
+  pushRecent("a:" + a.id);
+  if (!fresh && a.session_id !== null && agentLive(a)) return gotoSession(a.session_id);
+  try {
+    const mark = sessionMark();
+    const r = await rpc.call<{ agent: Agent; session: SessionInfo; started: boolean }>("agent.start", {
+      name: a.name,
+      fresh: fresh || undefined,
+      window_id: windowId.value ?? undefined,
+    });
+    knowAgent(r.agent);
+    knowSession(r.session, mark);
+    await gotoSession(r.session.id);
+  } catch (e) {
+    toast("error", `Couldn't start ${a.name}: ${errText(e)}`);
+  }
+}
+
+export function stopAgent(a: Agent) {
+  if (a.session_id !== null) killSession(a.session_id);
+}
+
+export function setAgentAutostart(a: Agent, on: boolean) {
+  rpc.call<Agent>("agent.update", { name: a.name, autostart: on }).then((r) => {
+    knowAgent(r);
+    toast(
+      "info",
+      on ? `${a.name} starts with the daemon` : `${a.name} no longer starts with the daemon`,
+      2500,
+    );
+  }).catch(fail("Couldn't change autostart")).catch(() => {});
+}
+
+/** Remove an agent (asks first, in the app's own dialog): its tab closes, its folder stays. */
+export function removeAgent(a: Agent) {
+  overlay.value = {
+    kind: "confirm",
+    title: `Remove ${a.name}?`,
+    body:
+      `Closes its tab and forgets the agent. Its folder (${a.home_dir}), with its persona and memory/, stays on disk.`,
+    confirmLabel: "Remove agent",
+    danger: true,
+    run: () =>
+      rpc.call("agent.remove", { name: a.name }).then(() => {
+        agents.value = agents.value.filter((x) => x.id !== a.id);
+      }).catch(fail("Remove failed")).catch(() => {}),
+  };
+}
+
+export function newAgentDialog() {
+  overlay.value = { kind: "agent" };
+}
+
+export function editAgent(name: string, tab: "settings" | "memory" = "settings") {
+  overlay.value = { kind: "agent", name, tab };
 }

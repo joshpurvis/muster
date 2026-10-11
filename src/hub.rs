@@ -93,6 +93,14 @@ pub struct CreateChannel {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+    /// The muster session a CLI call comes from (`$MUSTER_SESSION_ID`); rpc.rs applies its
+    /// provenance (and, for an agent, the Claude origin rule) and sets `prov`.
+    #[serde(default)]
+    pub from_session: Option<SessionId>,
+    /// Provenance the new session starts with (bots.rs): the spawning agent's, so a helper
+    /// keeps it until it gets another attributed prompt. None: human-rooted.
+    #[serde(skip)]
+    pub prov: Option<crate::bots::Prov>,
 }
 
 fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permissions>, D::Error> {
@@ -120,6 +128,14 @@ pub struct SpawnSession {
     /// the channel's, else where a new channel would go (see `session_window_locked`).
     #[serde(default)]
     pub window_id: Option<WindowId>,
+    /// The muster session a CLI call comes from (`$MUSTER_SESSION_ID`); rpc.rs applies its
+    /// provenance (and, for an agent, the Claude origin rule) and sets `prov`.
+    #[serde(default)]
+    pub from_session: Option<SessionId>,
+    /// Provenance the new session starts with (bots.rs): the spawning agent's, so a helper
+    /// keeps it until it gets another attributed prompt. None: human-rooted.
+    #[serde(skip)]
+    pub prov: Option<crate::bots::Prov>,
 }
 
 pub fn default_cols() -> u16 {
@@ -253,8 +269,11 @@ pub struct Hub {
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
-    /// Bots (PLAN.md §10): records, current inbound messages, last replies.
+    /// Bots (PLAN.md §10): records, and every session's provenance and active bot message.
     bots: crate::bots::Registry,
+    /// The MCP server (weak: it holds the hub), set by `mcp::router`.
+    #[allow(clippy::type_complexity)]
+    mcp: Mutex<Option<Weak<crate::mcp::McpState<crate::mcp::backend::HubBackend>>>>,
     /// Source of `SessionInfo.state_seq` values.
     state_seq: AtomicU64,
     /// Serializes branch renames (git calls) so they see each other's results.
@@ -389,6 +408,7 @@ impl Hub {
             cfg,
             devices,
             bots,
+            mcp: Mutex::new(None),
             state_seq: AtomicU64::new(1),
             store,
             tx,
@@ -413,6 +433,15 @@ impl Hub {
 
     pub fn bots(&self) -> &crate::bots::Registry {
         &self.bots
+    }
+
+    /// The MCP server's state, so CLI calls of agent sessions run through the same tools.
+    pub fn set_mcp(&self, st: Weak<crate::mcp::McpState<crate::mcp::backend::HubBackend>>) {
+        *self.mcp.lock() = Some(st);
+    }
+
+    pub fn mcp(&self) -> Option<Arc<crate::mcp::McpState<crate::mcp::backend::HubBackend>>> {
+        self.mcp.lock().as_ref().and_then(Weak::upgrade)
     }
 
     /// The store, for registries that write through to it (devices).
@@ -1178,6 +1207,8 @@ impl Hub {
                 parent_id: None,
                 // The channel's window (just placed above).
                 window_id: None,
+                from_session: None,
+                prov: req.prov,
             };
             if let Err(e) = self.spawn_session(spawn).await {
                 let text = format!("Could not start {}: {e:#}", kind.as_str());
@@ -1948,6 +1979,7 @@ impl Hub {
         for ev in events {
             self.emit(ev);
         }
+        self.bots.set_prov(id, req.prov);
         let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
         let started = self.start_process(id, prompt.clone());
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
@@ -1977,7 +2009,11 @@ impl Hub {
                     self.pty_exited(id, generation, code);
                 } else if let Some(text) = prompt {
                     self.note_prompt(id, &text);
-                    self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id);
+                    let source = match req.prov {
+                        Some(p) => crate::bots::Source::Chain(p),
+                        None => crate::bots::Source::Human,
+                    };
+                    self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id, source);
                 }
                 Ok(self.session(id).unwrap_or(info))
             }
@@ -2026,6 +2062,7 @@ impl Hub {
         text: String,
         consumed: bool,
         parent: Option<SessionId>,
+        source: crate::bots::Source,
     ) {
         let from = match parent {
             Some(p) => format!("session:{p}"),
@@ -2042,7 +2079,7 @@ impl Hub {
         }
         let hub = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::inject::send(&hub, id, text, crate::inject::SendMode::Queue, from).await {
+            if let Err(e) = crate::inject::send(&hub, id, text, crate::inject::SendMode::Queue, from, source).await {
                 hub.notice(
                     "error",
                     format!("Could not deliver the initial prompt to session {id}: {e:#}"),
@@ -2665,6 +2702,9 @@ impl Hub {
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         let update = adapter_for(info.kind).on_hook(event, &payload);
+        // Before the state update is published: a waiting ask that sees the bot go idle must
+        // also see its reply.
+        self.bots.on_hook(&self.store, &info, event, &payload);
         self.log_event(
             Some(info.channel_id),
             Some(id),
@@ -2674,7 +2714,6 @@ impl Hub {
         if let Some(u) = update {
             self.set_state(id, u, StateSource::Hook);
         }
-        self.bots.on_hook(&self.store, &info, event, &payload);
         if let Some(delta) = subagent_delta(event, &payload) {
             self.adjust_subagents(id, delta);
         }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::bots::{Bot, Delivery, Inbound, Outgoing};
+use crate::bots::{Bot, Delivery, MsgStatus, Outgoing, Prov, Source};
 use crate::hub::{CreateChannel, Hub, ServerEvent, SpawnSession};
 use crate::inject::{self, SendMode, SendOutcome};
 use crate::model::*;
@@ -39,12 +39,14 @@ pub trait Backend: Send + Sync + 'static {
         &self,
         req: SpawnSession,
     ) -> impl Future<Output = anyhow::Result<SessionInfo>> + Send;
+    /// `source`: the provenance the target takes on when the prompt is submitted.
     fn send(
         &self,
         id: SessionId,
         text: String,
         mode: SendMode,
         from: String,
+        source: Source,
     ) -> impl Future<Output = anyhow::Result<SendOutcome>> + Send;
     fn diff(
         &self,
@@ -60,14 +62,14 @@ pub trait Backend: Send + Sync + 'static {
 
     // ----- bots (src/bots.rs) -----
     fn bots(&self) -> Vec<Bot>;
-    /// The inbound message `caller`'s messages inherit their origin from (None: human-rooted).
-    fn effective_inbound(&self, caller: SessionId) -> Option<Inbound>;
+    /// The caller's provenance (None: human-rooted).
+    fn prov(&self, caller: SessionId) -> Option<Prov>;
     /// Messages delivered to the bot at or after `since` (unix ms).
     fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize;
     /// Start the bot if needed, record and send the message (`bots::deliver`).
     fn bot_deliver(&self, out: Outgoing) -> impl Future<Output = anyhow::Result<Delivery>> + Send;
-    /// The reply to `msg_id`, else the session's last reply since `after_ms`.
-    fn bot_reply(&self, msg_id: i64, session: SessionId, after_ms: i64) -> Option<String>;
+    /// Where a bot message stands: delivered, running, its reply.
+    fn bot_message_status(&self, msg_id: i64) -> MsgStatus;
 }
 
 #[derive(Clone)]
@@ -129,8 +131,9 @@ impl Backend for HubBackend {
         text: String,
         mode: SendMode,
         from: String,
+        source: Source,
     ) -> anyhow::Result<SendOutcome> {
-        inject::send(&self.0, id, text, mode, from).await
+        inject::send(&self.0, id, text, mode, from, source).await
     }
     async fn diff(&self, cwd: String, base: Option<String>) -> anyhow::Result<String> {
         crate::worktree::diff(Path::new(&cwd), base.as_deref()).await
@@ -141,8 +144,8 @@ impl Backend for HubBackend {
     fn bots(&self) -> Vec<Bot> {
         self.0.bots().list()
     }
-    fn effective_inbound(&self, caller: SessionId) -> Option<Inbound> {
-        self.0.bots().effective_inbound(&self.0.sessions(), caller)
+    fn prov(&self, caller: SessionId) -> Option<Prov> {
+        self.0.bots().prov(caller)
     }
     fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize {
         // Unreadable: count as full (refuse) rather than unlimited.
@@ -154,8 +157,8 @@ impl Backend for HubBackend {
     async fn bot_deliver(&self, out: Outgoing) -> anyhow::Result<Delivery> {
         crate::bots::deliver(&self.0, out).await
     }
-    fn bot_reply(&self, msg_id: i64, session: SessionId, after_ms: i64) -> Option<String> {
-        crate::bots::reply_for(&self.0, msg_id, session, after_ms)
+    fn bot_message_status(&self, msg_id: i64) -> MsgStatus {
+        self.0.bots().msg_status(self.0.store(), msg_id)
     }
 }
 

@@ -154,19 +154,21 @@ replies from. Code: `src/bots.rs`; tools: docs/MCP.md "Bots"; commands: docs/CLI
 |---|---|
 | Record | `bots` table: name (unique, case-insensitive), kind (`claude` \| `codex`), model, effort, persona, home dir, permission profile, accepted origins, current session, conversation id. |
 | Home | `<data>/bots/<name>/` with `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) written from the persona, and `memory/` for durable notes the persona tells the bot to keep. |
-| Session | At most one at a time: the agent runs in its home dir, in a tab named after the bot in the "bots" workspace (`<data>/bots`). `muster bot start`, or any message, starts it, restarts it if it exited, or reuses it. |
+| Session | At most one at a time: the agent runs in its home dir, in its own tab (named after it, stored on the bot) in the "bots" workspace (`<data>/bots`). `muster bot start`, or any message, starts it, restarts it if it exited, or reuses it. |
 | Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
 | Asking | MCP `ask_bot` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
 | Messages | Each delivery gets a `bot_messages` row (from, to, origin, hop, reply_to, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. |
 
 **Origin rule.** Every message carries the origin of the chain it belongs to: `human`,
-`schedule` or `webhook`. A message a session sends while handling message M inherits M's origin
-at hop+1 (the "current inbound message", set from the UserPromptSubmit hook's envelope, and
-inherited down `parent_id`, so a helper a bot spawned carries it too). A prompt the human types,
-or sends from the UI or CLI outside a muster session, is `human`, hop 0. Delivery is refused
-when the bot doesn't accept the origin, past hop 4, or past 200 messages to the bot in 24 hours
-(constants in `src/mcp/guard.rs`). Non-bot Claude agents follow the Claude default: no
-`send_message` or `spawn_agent` of a Claude agent from a non-human chain.
+`schedule` or `webhook`. Every session has a provenance: the origin and hop of the message it
+is handling, set when muster submits an attributed prompt to it (any agent's send, spawn prompt
+or bot message, the agent's CLI calls included), and copied into sessions it spawns, which keep
+it until they get another attributed prompt. What a session sends carries its origin at hop+1.
+Only the human, through a client connection, makes a session human-rooted again; a hook can't.
+Delivery is refused when the bot doesn't accept the origin, past hop 4, or past 200 messages to
+the bot in 24 hours (constants in `src/mcp/guard.rs`). Non-bot Claude agents follow the Claude
+default: no message, keys or spawn of a Claude agent from a non-human chain. Details and the
+limits that remain (the client token, runtime-only provenance): docs/MCP.md "Bots".
 
 Defaults: Claude bots accept `human` only; Codex bots accept `human`, `schedule` and `webhook`,
 so scheduled and triggered work routes to Codex. Why: Anthropic's consumer terms are unclear
@@ -180,8 +182,8 @@ default stays human-only.
 **Deferred** (don't design them out):
 
 - Hibernate and wake: stop an idle bot's process, resume it on the next message.
-- Schedules and webhooks: the origins and the policy exist; the triggers don't (an internal
-  `origin` parameter on `bot.ask` stands in for tests). Rules for when they're built: a Claude
+- Schedules and webhooks: the origins and the policy exist; the triggers don't (the daemon-internal
+  `bots::ask` takes an origin; no client can set one). Rules for when they're built: a Claude
   bot's schedules mirror Anthropic's bounds (at least a 1-minute interval, a recurring schedule
   expires after 7 days unless renewed, quiet hours supported); webhook triggers are never
   exposed to anyone but the user.

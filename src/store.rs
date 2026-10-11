@@ -189,6 +189,10 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX bot_messages_to ON bot_messages(to_bot, created_at);
     "#,
+    // v8: each bot's own tab (never one found by name, which could have a wider profile).
+    r#"
+    ALTER TABLE bots ADD COLUMN channel_id INTEGER;
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -338,7 +342,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at FROM bots ORDER BY id",
+                    resume_id, created_at, channel_id FROM bots ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -358,6 +362,7 @@ impl Store {
                 session_id: r.get::<_, Option<i64>>(9)?.map(|v| v as SessionId),
                 resume_id: r.get(10)?,
                 created_at: r.get(11)?,
+                channel_id: r.get(12)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -369,8 +374,8 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO bots (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                               session_id, resume_id, created_at, channel_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -382,23 +387,25 @@ impl Store {
                 serde_json::to_string(&b.accepts_origins)?,
                 b.session_id,
                 b.resume_id,
-                b.created_at
+                b.created_at,
+                b.channel_id
             ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn set_bot_session(&self, id: i64, session_id: Option<SessionId>) -> anyhow::Result<()> {
-        self.conn
-            .lock()
-            .execute("UPDATE bots SET session_id = ?2 WHERE id = ?1", params![id, session_id])?;
-        Ok(())
-    }
-
-    pub fn set_bot_resume(&self, id: i64, resume_id: Option<&str>) -> anyhow::Result<()> {
-        self.conn
-            .lock()
-            .execute("UPDATE bots SET resume_id = ?2 WHERE id = ?1", params![id, resume_id])?;
+    /// The fields that change after creation: the bot's tab, session and conversation id.
+    pub fn update_bot_runtime(
+        &self,
+        id: i64,
+        channel_id: Option<ChannelId>,
+        session_id: Option<SessionId>,
+        resume_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE bots SET channel_id = ?2, session_id = ?3, resume_id = ?4 WHERE id = ?1",
+            params![id, channel_id, session_id, resume_id],
+        )?;
         Ok(())
     }
 
@@ -408,6 +415,7 @@ impl Store {
     }
 
     /// Records a message muster is about to deliver to a bot; returns its id.
+    #[cfg(test)]
     pub fn insert_bot_message(&self, m: &crate::bots::BotMessage) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
         conn.execute(
@@ -452,6 +460,36 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// `insert_bot_message`, unless the bot already got `cap` messages at or after `since`:
+    /// then `Err(count)`. Counted and inserted in one transaction under the store's lock, so
+    /// concurrent asks (MCP or RPC) can't overshoot the cap.
+    pub fn insert_bot_message_capped(
+        &self,
+        m: &crate::bots::BotMessage,
+        since: i64,
+        cap: usize,
+    ) -> anyhow::Result<Result<i64, usize>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM bot_messages WHERE to_bot = ?1 AND created_at >= ?2",
+            params![m.to_bot, since],
+            |r| r.get(0),
+        )?;
+        let n = n.max(0) as usize;
+        if n >= cap {
+            return Ok(Err(n));
+        }
+        tx.execute(
+            "INSERT INTO bot_messages (from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![m.from, m.from_session, m.to_bot, m.to_session, m.origin.as_str(), m.hop, m.reply_to, m.created_at],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Ok(id))
     }
 
     /// A message that was never delivered (the send failed): it must not count toward the cap.
@@ -1066,7 +1104,7 @@ mod tests {
             c.pragma_update(None, "user_version", 6).unwrap();
         }
         s.migrate().unwrap();
-        assert_eq!(count(&s, "PRAGMA user_version"), 7);
+        assert_eq!(count(&s, "PRAGMA user_version"), MIGRATIONS.len() as i64);
         assert!(s.load_bots().unwrap().is_empty());
         let mut b = Bot {
             id: 0,
@@ -1078,6 +1116,7 @@ mod tests {
             home_dir: "/data/bots/scout".into(),
             permissions: Permissions::default(),
             accepts_origins: vec![Origin::Human, Origin::Schedule],
+            channel_id: None,
             session_id: None,
             resume_id: None,
             created_at: 5,
@@ -1087,10 +1126,9 @@ mod tests {
         let mut dup = b.clone();
         dup.name = "scout".into();
         assert!(s.insert_bot(&dup).is_err());
-        s.set_bot_session(b.id, Some(42)).unwrap();
-        s.set_bot_resume(b.id, Some("abc-123")).unwrap();
+        s.update_bot_runtime(b.id, Some(8), Some(42), Some("abc-123")).unwrap();
         let back = &s.load_bots().unwrap()[0];
-        assert_eq!((back.session_id, back.resume_id.as_deref()), (Some(42), Some("abc-123")));
+        assert_eq!((back.channel_id, back.session_id, back.resume_id.as_deref()), (Some(8), Some(42), Some("abc-123")));
         assert_eq!(back.accepts_origins, vec![Origin::Human, Origin::Schedule]);
         assert_eq!(back.model.as_deref(), Some("gpt-6-sol"));
 
@@ -1116,8 +1154,44 @@ mod tests {
         assert_eq!(got.reply.as_deref(), Some("done"));
         s.delete_bot_message(id).unwrap();
         assert!(s.bot_message(id).unwrap().is_none());
+        // The cap is checked with the insert.
+        let fresh = BotMessage { created_at: 5_000, ..m.clone() };
+        assert_eq!(s.insert_bot_message_capped(&fresh, 4_000, 1).unwrap().map(|_| ()), Ok(()));
+        assert_eq!(s.insert_bot_message_capped(&fresh, 4_000, 1).unwrap(), Err(1));
+        assert_eq!(s.count_bot_messages_since(b.id, 4_000).unwrap(), 1);
         s.delete_bot(b.id).unwrap();
         assert!(s.load_bots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_capped_inserts_never_overshoot() {
+        let s = Store::open_memory().unwrap();
+        let m = crate::bots::BotMessage {
+            id: 0,
+            from: "human".into(),
+            from_session: None,
+            to_bot: 1,
+            to_session: Some(1),
+            origin: crate::bots::Origin::Human,
+            hop: 0,
+            reply_to: None,
+            created_at: 100,
+            reply: None,
+        };
+        let ok = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..16 {
+                sc.spawn(|| {
+                    for _ in 0..5 {
+                        if s.insert_bot_message_capped(&m, 0, 7).unwrap().is_ok() {
+                            ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(ok.into_inner(), 7);
+        assert_eq!(s.count_bot_messages_since(1, 0).unwrap(), 7);
     }
 
     #[test]

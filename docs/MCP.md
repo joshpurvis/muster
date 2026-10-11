@@ -95,21 +95,45 @@ and targets in them are refused.
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
-| `list_bots` | — | `{bots: [{id, name, kind, model, effort, accepts_origins, home_dir, session_id, state, detail, resumable, created_at, is_me}], your_origin: {origin, hop}}`. All bots, whatever the caller's workspace. |
-| `ask_bot` | `bot` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{bot, msg_id, session_id, reply, reply_source, state, detail, timed_out, ended, origin, hop, started, waited_ms, note?}`. Starts the bot if it has no live session, sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits as `wait_for_state` with `after_ms = sent_at`. `reply`: the turn's final message from the Stop hook (Codex: notify), `reply_source: "stop_hook"`; with none and the bot idle, its last 60 terminal lines, `reply_source: "terminal_output"` and a `note`; null when it stopped on a prompt, question or error (see `state`). See "Bots" below. |
+| `list_bots` | — | `{bots: [{id, name, kind, model, effort, accepts_origins, home_dir, channel_id, session_id, state, detail, resumable, created_at, is_me}], your_origin: {origin, hop}}`. All bots, whatever the caller's workspace. |
+| `ask_bot` | `bot` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{bot, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, waited_ms, note?, unattributed_output?}`. Starts the bot if it has no live session, sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the bot reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the bot goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. See "Bots" below. |
 
 `whoami` also returns `bot` (the caller's bot name, or null) and `origin: {origin, hop}`.
 
 ### Bots
 
-A bot (PLAN.md §10) is a persistent named agent with a home dir and a resumed conversation. The
-sender label in the envelope is the caller's bot name, else `session:<id>`. A message's origin
-is the origin of the message the caller is handling (its own current inbound message, else its
-nearest `parent_id` ancestor's) at hop+1; with none it is `human`, hop 0. The current inbound
-message is set from the envelope in the UserPromptSubmit hook's prompt (a prompt without one, the
-human typing, resets it to human). While a message waits in the queue, the session is assumed to
-handle the stricter of it and the current one (a non-human origin and the higher hop win) until
-the hook says which prompt ran.
+A bot (PLAN.md §10) is a persistent named agent with a home dir, its own tab and a resumed
+conversation. The envelope's sender label is the caller's bot name, else `session:<id>`.
+
+**Provenance.** Every session has the origin and hop of the message it is handling
+(`src/bots.rs`, runtime only). Anything it sends or spawns carries that origin one hop on (no
+provenance: `human`, hop 0):
+
+| Event | Effect on the target's provenance |
+|---|---|
+| A prompt from an agent is submitted (`send_message`, a `spawn_agent` prompt, `ask_bot`, or the agent's `muster send/ask`) | Set to the sender's origin and hop, when the injector actually presses Enter, so a queued message never relabels the turn that is still running. |
+| `spawn_agent` (or `muster new` run by an agent) | The new session starts with the spawner's provenance and keeps it until it receives another attributed prompt (a parent moving on to human work doesn't make its helper human-rooted). |
+| A prompt from the human through a client (UI, phone, `muster send` outside a session) is submitted | Cleared (human-rooted). |
+| UserPromptSubmit without an envelope | Cleared only if the daemon saw human input for that session through a client connection (keystrokes, paste, `session.input` without `from_session`) since its last attributed delivery; otherwise kept. A hook never lowers provenance on its own. |
+| UserPromptSubmit with an envelope | Counts only for an unanswered message muster delivered to that session; unknown, foreign or answered ids are ignored. |
+
+A bot's reply is attributed per message: the message whose prompt was submitted (confirmed by the
+envelope in UserPromptSubmit) owns the next final message; a prompt without an envelope in between
+takes the turn, and its final message belongs to no bot message.
+
+**CLI calls.** `muster send/keys/ask/new` pass `$MUSTER_SESSION_ID` as `from_session`. For an
+agent session, `muster ask` runs this server's `ask_bot` and `muster send` its `send_message` as
+that session (same guards, rate limits and audit event, with `via: "cli"` in the args); `muster
+keys` and `muster new` carry its provenance and the Claude origin rule. A shell session is a human
+typing in a shell tab, with that shell's provenance if an agent ever typed into it.
+
+**Limits** (not closed): an agent that drops `MUSTER_SESSION_ID` and calls the API with the client
+token is the human as far as the daemon can tell (the documented client-token limit, PROTOCOL.md
+"Limits"). Provenance lives in memory: after a daemon restart every session is human-rooted
+again (their processes were stopped; a restarted bot resumes its conversation but has no pending
+message). Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
+prompt typed in their terminal never clears provenance (stricter, never looser). Replies need the
+Stop hook or Codex notify; without them `ask_bot` returns the unattributed terminal tail.
 
 Reach: bots live in their own "bots" workspace (`<data>/bots`). `list_bots` and `ask_bot` work
 from every workspace: a bot is a shared service, asking runs no command anywhere, and the origin
@@ -185,8 +209,8 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Self-messaging | Refused (`session_id` == caller; `ask_bot` of the caller's own bot) |
 | Bot origins | `ask_bot` is refused unless the bot's `accepts_origins` contains the message's origin. Defaults: Claude bots `human`; Codex bots `human`, `schedule`, `webhook`. A non-bot Claude agent takes `human` only: `send_message` to one, or `spawn_agent` of `kind: claude`, from a non-human chain is refused. |
 | Bot hops | Max hop **4** (`guard::MAX_BOT_HOPS`); a message from the human or a trigger is hop 0. |
-| Bot daily cap | **200** messages delivered to one bot per rolling 24 hours, any origin (`guard::BOT_DAILY_PROMPT_CAP`; counted from `bot_messages`, so it survives restarts). |
-| Bot messages | Only through `ask_bot`: `send_message` to a bot's session is refused. `ask_bot` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check (against the bot's tab, or its profile before it has one). |
+| Bot daily cap | **200** messages delivered to one bot per rolling 24 hours, any origin (`guard::BOT_DAILY_PROMPT_CAP`; counted from `bot_messages`, so it survives restarts, and re-checked in the same transaction as the insert, so concurrent asks over MCP and the CLI can't overshoot). |
+| Bot messages | Only through `ask_bot`: `send_message` to a bot's session is refused. `ask_bot` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check, against the widest of the bot session's current tab and the bot's own tab (its profile before it has one). A bot only ever runs in its own tab (stored on the bot), never a same-named one. |
 | Message size | 100 000 chars (`send_message`), 20 000 chars (`post_to_channel`) |
 | Permission prompts | There is **no approve tool**. `send_message` with `interrupt: true` is refused while the target is `needs_approval`. Plain sends are queued and delivered only once the agent is ready. A marked extension point (`guard::AGENTS_MAY_APPROVE`, see `src/mcp/guard.rs`) exists for a future human-enabled setting. |
 | Audit | Every `tools/call` (including refused ones, unknown tools, and calls without a name) logs an `mcp_call` event in the caller's channel: `{session_id, tool, args, ok}`, plus `cancelled: true` if the client disconnected mid-call. Strings in args over 500 bytes are shortened; args over 4 KB total are replaced by a truncated string. Protocol-level rejections (bad auth, bad headers) are not tool calls and aren't logged. |

@@ -534,10 +534,13 @@ fn check_perms_not_wider<B: Backend>(
 
 /// Origin and hop of a message the caller sends now (None inbound: human-rooted, hop 0).
 fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::bots::Origin, u32) {
-    match st.backend.effective_inbound(caller) {
-        Some(m) => (m.origin, m.hop.saturating_add(1)),
-        None => (crate::bots::Origin::Human, 0),
-    }
+    let r = caller_route(st, caller);
+    (r.origin, r.hop)
+}
+
+/// The route of anything the caller sends or spawns now: its provenance, one hop on.
+fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::bots::Route {
+    crate::bots::outgoing(st.backend.prov(caller))
 }
 
 /// The caller's workspace (None if its channel is gone).
@@ -803,6 +806,8 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
                 prefer_window: me.window_id.or(my_ch.window_id),
                 cols: crate::hub::default_cols(),
                 rows: crate::hub::default_rows(),
+                from_session: None,
+                prov: None,
             })
         })();
         let req = parsed.inspect_err(|_| refund())?;
@@ -831,6 +836,9 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         parent_id: Some(caller),
         // The caller's window (as the parent): a new tab next to the caller's.
         window_id: None,
+        from_session: None,
+        // The child starts with the caller's provenance and keeps it (bots.rs).
+        prov: Some(caller_route(st, caller).prov(None)),
     };
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,
@@ -939,7 +947,13 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     };
     let out = match st
         .backend
-        .send(target, text, mode, format!("session:{caller}"))
+        .send(
+            target,
+            text,
+            mode,
+            format!("session:{caller}"),
+            crate::bots::Source::Chain(caller_route(st, caller).prov(None)),
+        )
         .await
     {
         Ok(out) => out,
@@ -1136,17 +1150,16 @@ async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
     }
     check_no_shell_escape(st, bot.kind, &text)?;
     let me = caller_session(st, caller)?;
-    // The bot's tab profile (its current one if it has a session), as for send_message.
-    let target = bot.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
-    match &target {
-        Some(ch) => check_not_more_permissive(st, &me, ch, bot.kind)?,
-        None => check_perms_not_wider(st, &me, None, &bot.permissions, bot.kind, &format!("bot {}", bot.name))?,
-    }
-    let inbound = st.backend.effective_inbound(caller);
+    // The widest profile the message could reach: the bot session's current tab and the bot's
+    // own tab (what its next restart gets), else the profile its tab will get.
+    let session_ch = bot.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
+    let own_ch = bot.channel_id.and_then(|c| st.backend.channel(c));
+    let (ch_id, perms) = crate::bots::reach_profile(&bot, session_ch.as_ref(), own_ch.as_ref());
+    check_perms_not_wider(st, &me, ch_id, &perms, bot.kind, &format!("bot {}'s tab", bot.name))?;
     let recent = st
         .backend
         .bot_messages_since(bot.id, now_ms() - guard::BOT_CAP_WINDOW_MS);
-    let route = crate::bots::route(&bot, inbound, None, recent)?;
+    let route = crate::bots::route(&bot, st.backend.prov(caller), None, recent)?;
     if let Err(wait_s) = st.guard.lock().sends.check_and_record(
         caller,
         now_ms(),
@@ -1180,49 +1193,24 @@ async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
             g.note_queued(d.session_id, d.queued);
         }
     }
-    let (info, verdict, waited_ms) =
-        wait_loop(st, d.session_id, &wait::DEFAULT_STATES, timeout_s, Some(d.sent_at_ms)).await?;
-    let reached = verdict == Verdict::Reached;
-    let (reply, source) = match st.backend.bot_reply(d.msg_id, d.session_id, d.sent_at_ms) {
-        Some(r) => (Some(r), Some("stop_hook")),
-        // No final message from a hook (e.g. Codex with hooks off and no notify): the end of
-        // its terminal output instead.
-        None if reached && info.state == AgentState::Idle => (
-            st.backend.recent_output(d.session_id, BOT_FALLBACK_LINES),
-            Some("terminal_output"),
-        ),
-        None => (None, None),
-    };
-    let mut out = json!({
-        "bot": bot.name,
-        "msg_id": d.msg_id,
-        "session_id": d.session_id,
-        "reply": reply,
-        "reply_source": source,
-        "state": info.state,
-        "detail": info.state_detail,
-        "timed_out": verdict == Verdict::Wait,
-        "ended": (verdict == Verdict::Ended).then_some("exited"),
-        "origin": route.origin,
-        "hop": route.hop,
-        "started": d.started,
-        "waited_ms": waited_ms,
-    });
-    if source == Some("terminal_output") {
-        out["note"] = json!(format!(
-            "no final message was reported for this turn; reply is the last {BOT_FALLBACK_LINES} lines of the bot's terminal"
-        ));
-    } else if reply.is_none() && reached {
-        out["note"] = json!(format!(
-            "the bot stopped in state {} before answering; only the human can answer prompts. Check again later with wait_for_state(session_id={}) or post_to_channel to ask the human.",
-            info.state.as_str(),
-            d.session_id
-        ));
-    }
-    Ok(pretty(&out))
+    // Wait for this message's own turn (not whatever runs before it in the queue).
+    let mut rx = st.backend.subscribe();
+    let (info, verdict, waited_ms) = crate::bots::wait_for_reply(
+        &mut rx,
+        d.session_id,
+        Duration::from_secs(timeout_s),
+        || st.backend.session(d.session_id),
+        || st.backend.bot_message_status(d.msg_id),
+    )
+    .await?;
+    let tail = (verdict == crate::bots::AskVerdict::Unattributed)
+        .then(|| st.backend.recent_output(d.session_id, BOT_FALLBACK_LINES))
+        .flatten();
+    Ok(pretty(&crate::bots::ask_result(&bot.name, &d, route, &info, &verdict, waited_ms, tail)))
 }
 
-/// ask_bot's default wait, and how much terminal output stands in for a missing reply.
+/// ask_bot's default wait, and how much terminal output stands in for a reply no hook
+/// attributed to the message.
 const BOT_ASK_DEFAULT_S: i64 = 600;
 const BOT_FALLBACK_LINES: usize = 60;
 

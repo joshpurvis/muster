@@ -34,11 +34,14 @@ struct Data {
     /// What the mock's send reports: (delivered, queued).
     send_outcome: Option<(bool, u32)>,
     bots: Vec<crate::bots::Bot>,
-    inbound: HashMap<SessionId, crate::bots::Inbound>,
+    /// Provenance per session, as the real injector sets it on delivery.
+    prov: HashMap<SessionId, crate::bots::Prov>,
+    /// Source of every send, in order.
+    sources: Vec<crate::bots::Source>,
     /// Messages delivered per bot (for the daily cap).
     bot_counts: HashMap<i64, usize>,
     deliveries: Vec<crate::bots::Outgoing>,
-    /// Session -> reply the mock's bot_reply returns.
+    /// Bot session -> the reply its turns report.
     replies: HashMap<SessionId, String>,
 }
 
@@ -189,6 +192,9 @@ impl Backend for Arc<Mock> {
         d.next_session += 1;
         d.last_args = req.extra_args.clone();
         let mut s = session(d.next_session, req.channel_id, req.kind, req.parent_id);
+        if let Some(p) = req.prov {
+            d.prov.insert(s.id, p);
+        }
         s.state = AgentState::Starting;
         if let Some(n) = req.name {
             s.name = n;
@@ -203,12 +209,18 @@ impl Backend for Arc<Mock> {
         text: String,
         mode: SendMode,
         from: String,
+        source: crate::bots::Source,
     ) -> anyhow::Result<SendOutcome> {
         let mut d = self.d.lock();
         if d.fail_send {
             anyhow::bail!("pty gone");
         }
         d.sends.push((id, text, mode, from));
+        d.sources.push(source);
+        match source {
+            crate::bots::Source::Chain(p) => d.prov.insert(id, p),
+            crate::bots::Source::Human => d.prov.remove(&id),
+        };
         let (delivered, queued) = d.send_outcome.unwrap_or((true, 0));
         Ok(SendOutcome { delivered, queued })
     }
@@ -222,10 +234,8 @@ impl Backend for Arc<Mock> {
     fn bots(&self) -> Vec<crate::bots::Bot> {
         self.d.lock().bots.clone()
     }
-    fn effective_inbound(&self, caller: SessionId) -> Option<crate::bots::Inbound> {
-        let d = self.d.lock();
-        let sessions: Vec<SessionInfo> = d.sessions.values().cloned().collect();
-        crate::bots::effective_inbound(&sessions, &d.inbound, caller)
+    fn prov(&self, caller: SessionId) -> Option<crate::bots::Prov> {
+        self.d.lock().prov.get(&caller).copied()
     }
     fn bot_messages_since(&self, bot_id: i64, _since: i64) -> usize {
         self.d.lock().bot_counts.get(&bot_id).copied().unwrap_or(0)
@@ -248,8 +258,15 @@ impl Backend for Arc<Mock> {
             started: false,
         })
     }
-    fn bot_reply(&self, _msg_id: i64, session: SessionId, _after_ms: i64) -> Option<String> {
-        self.d.lock().replies.get(&session).cloned()
+    fn bot_message_status(&self, msg_id: i64) -> crate::bots::MsgStatus {
+        let d = self.d.lock();
+        let out = &d.deliveries[msg_id as usize - 1];
+        let sid = d.bots.iter().find(|b| b.name == out.bot).and_then(|b| b.session_id).unwrap();
+        crate::bots::MsgStatus {
+            delivered_at: Some(0),
+            active: true,
+            reply: d.replies.get(&sid).cloned(),
+        }
     }
 }
 
@@ -1569,6 +1586,7 @@ fn with_bots(m: &Mock) {
             home_dir: format!("/data/bots/{name}"),
             permissions: Permissions::default(),
             accepts_origins: default_accepts(kind),
+            channel_id: Some(20),
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
@@ -1578,7 +1596,7 @@ fn with_bots(m: &Mock) {
 }
 
 fn inbound(m: &Mock, sid: SessionId, origin: crate::bots::Origin, hop: u32) {
-    m.d.lock().inbound.insert(sid, crate::bots::Inbound { msg_id: 77, origin, hop });
+    m.d.lock().prov.insert(sid, crate::bots::Prov { msg_id: Some(77), origin, hop });
 }
 
 #[tokio::test]
@@ -1593,7 +1611,7 @@ async fn ask_bot_from_a_human_rooted_session() {
     assert!(!err, "{t}");
     let v = parse(&t);
     assert_eq!(v["reply"], "ada says hi");
-    assert_eq!(v["reply_source"], "stop_hook");
+    assert!(v.get("unattributed_output").is_none());
     assert_eq!((v["origin"].as_str(), v["hop"].as_u64()), (Some("human"), Some(0)));
     let d = m.d.lock();
     let out = &d.deliveries[0];
@@ -1621,22 +1639,21 @@ async fn ask_bot_origin_rule_hops_and_cap() {
     assert!(err && t.contains("origin=schedule"), "{t}");
     let (t, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "claude"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
-    let (_, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"})).await;
-    assert!(!err);
-    // A helper spawned under it inherits the origin through parent_id.
-    {
-        let mut d = m.d.lock();
-        d.sessions.insert(9, session(9, 10, SessionKind::Codex, Some(2)));
-        d.live.insert(9);
-        d.tokens.insert("tok9".into(), 9);
-    }
-    let (t, err) = call_as(&st, "tok9", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"})).await;
+    assert!(!err, "{t}");
+    // A helper spawned under it starts with that provenance and keeps it, even when its
+    // parent moves on to human-rooted work.
+    let child = parse(&t)["session"]["id"].as_u64().unwrap() as SessionId;
+    m.d.lock().tokens.insert("tokc".into(), child);
+    m.d.lock().prov.remove(&2);
+    let (t, err) = call_as(&st, "tokc", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
+    assert!(call_as(&st, "tok2", "ask_bot", json!({"bot": "ada", "text": "x"})).await.1 == false);
     // Hop limit.
     inbound(&m, 1, Origin::Human, crate::mcp::guard::MAX_BOT_HOPS);
     let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
     assert!(err && t.contains("too deep"), "{t}");
-    m.d.lock().inbound.clear();
+    m.d.lock().prov.clear();
     // Daily cap.
     m.d.lock().bot_counts.insert(3, crate::mcp::guard::BOT_DAILY_PROMPT_CAP);
     let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
@@ -1667,13 +1684,57 @@ async fn ask_bot_guards() {
     let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
     assert!(err && t.contains("more than your channel"), "{t}");
     m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Default;
-    // No final message: the end of the terminal stands in, and says so.
+    // ...and so is one whose own tab (its next restart's profile) is wider.
+    {
+        let mut d = m.d.lock();
+        let mut wide = channel(21, "ada-own");
+        wide.workspace_id = 2;
+        wide.permissions.claude_mode = ClaudeMode::Bypass;
+        d.channels.insert(21, wide);
+        d.bots[0].channel_id = Some(21);
+    }
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("more than your channel"), "{t}");
+    m.d.lock().bots[0].channel_id = Some(20);
+    // No final message attributed to this message: the terminal tail, labelled as such.
     m.d.lock().replies.clear();
     let v = parse(&call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await.0);
-    assert_eq!(v["reply_source"], "terminal_output");
-    assert!(v["note"].as_str().unwrap().contains("terminal"));
+    assert!(v["reply"].is_null());
+    assert_eq!(v["unattributed_output"], "last 60 lines of 3");
+    assert!(v["note"].as_str().unwrap().contains("may belong to another prompt"));
     // A failed delivery gives the rate-limit slot back and reports the error.
     m.d.lock().fail_send = true;
     let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
     assert!(err && t.contains("could not deliver"), "{t}");
+}
+
+#[tokio::test]
+async fn provenance_survives_plain_sends() {
+    use crate::bots::{Origin, Prov, Source};
+    let (m, st) = state();
+    with_bots(&m);
+    // An ordinary Codex helper (session 5, tok5).
+    {
+        let mut d = m.d.lock();
+        d.sessions.insert(5, session(5, 10, SessionKind::Codex, None));
+        d.live.insert(5);
+        d.tokens.insert("tok5".into(), 5);
+    }
+    // Session 2 handles a scheduled message and passes work to the helper with a plain send...
+    inbound(&m, 2, Origin::Schedule, 1);
+    let (t, err) = call_as(&st, "tok2", "send_message", json!({"session_id": 5, "text": "do it"})).await;
+    assert!(!err, "{t}");
+    let sent = *m.d.lock().sources.last().unwrap();
+    assert_eq!(sent, Source::Chain(Prov { origin: Origin::Schedule, hop: 2, msg_id: None }));
+    // ...so the helper can't launder it into Claude work.
+    let (t, err) = call_as(&st, "tok5", "send_message", json!({"session_id": 1, "text": "x"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    let (t, err) = call_as(&st, "tok5", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    let (t, err) = call_as(&st, "tok5", "spawn_agent", json!({"kind": "claude", "prompt": "x"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    // A human-rooted sender's plain send is human-rooted too.
+    let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(*m.d.lock().sources.last().unwrap(), Source::Chain(Prov { origin: Origin::Human, hop: 0, msg_id: None }));
 }

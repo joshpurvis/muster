@@ -49,9 +49,15 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster bot new <name> [--kind claude\|codex] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS]` | Create a bot (PLAN.md §10, `bot.create`): its home dir `<data>/bots/<name>/` with `CLAUDE.md` / `AGENTS.md` from the persona and `memory/`. Default kind claude. `--accepts` is a comma list of `human`, `schedule`, `webhook` (default: `human` for claude, all three for codex). Prints `bot NAME (KIND, accepts …): home DIR`. |
 | `muster bot ls [--json]` (alias `list`) | `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`. `--json` prints `bot.list`. |
 | `muster bot rm <name>` | Remove the bot and its session; the home dir (persona, memory) stays. |
-| `muster bot start <name> [--fresh]` | Start the bot's session (cwd = its home dir, in a tab named after it in the "bots" workspace), restart it if it exited, or report the running one. Claude bots resume their last conversation; `--fresh` starts a new one. Prints the session id (`… (already running)`). |
-| `muster ask <bot> [TEXT...] [--timeout SECS] [--json]` | Ask a bot and print its reply (`bot.ask`): starts it if needed, delivers with an envelope, waits for its turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the message carries that session's origin and hop, as `ask_bot` would; outside one it is `human`, hop 0. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the bot stopped without a reply (a prompt for the human, an error). `--json` prints the `bot.ask` reply. |
+| `muster bot start <name> [--fresh]` | Start the bot's session (cwd = its home dir, in the bot's own tab in the "bots" workspace), restart it if it exited, or report the running one. Claude bots resume their last conversation; `--fresh` starts a new one (restarting a running bot). Prints the session id (`… (already running)`). |
+| `muster ask <bot> [TEXT...] [--timeout SECS] [--json]` | Ask a bot and print its reply (`bot.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_bot` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the bot stopped without a reply (a prompt for the human, an error). If the bot reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `bot.ask` reply. |
 | `muster status` / `stop` / `url` / `daemon` / `hook` | As before. |
+
+Inside a muster session, `send`, `keys`, `ask` and `new` pass `$MUSTER_SESSION_ID` to the daemon
+as `from_session`, so what an agent does through the CLI is attributed to it: `send` and `ask` run
+as its MCP `send_message` / `ask_bot` (same guards and rate limits), and `keys` and `new` carry its
+provenance (docs/MCP.md "Bots"). From a shell tab they carry that shell's provenance, which is the
+human's unless an agent typed into it.
 
 Output: human tables go to stdout, errors to stderr as `muster: <message>`. Exit codes: 0 ok,
 1 error (including a `wait`/`send --wait` whose session exited before reaching the state),

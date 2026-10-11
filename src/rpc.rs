@@ -143,7 +143,8 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
 
         "channel.create" => {
-            let p: CreateChannel = parse(params)?;
+            let mut p: CreateChannel = parse(params)?;
+            p.prov = spawn_prov(hub, p.from_session, p.agent)?;
             to_value(hub.create_channel(p).await?)
         }
         "channel.rename" => {
@@ -232,7 +233,8 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
 
         "session.spawn" => {
-            let p: SpawnSession = parse(params)?;
+            let mut p: SpawnSession = parse(params)?;
+            p.prov = spawn_prov(hub, p.from_session, Some(p.kind))?;
             to_value(hub.spawn_session(p).await?)
         }
         "session.resize" => {
@@ -310,12 +312,35 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 text: String,
                 #[serde(default)]
                 mode: Option<SendMode>,
+                /// The session running `muster send` (`$MUSTER_SESSION_ID`).
+                #[serde(default)]
+                from_session: Option<SessionId>,
             }
             let p: P = parse(params)?;
-            if hub.session(p.id).is_none() {
+            let Some(target) = hub.session(p.id) else {
                 return Err(RpcError(format!("no such session: {}", p.id)));
+            };
+            let mode = p.mode.unwrap_or_default();
+            match caller(hub, p.from_session)? {
+                // An agent's CLI send is its send_message: same guards, same provenance.
+                Caller::Agent(s) => {
+                    let args = json!({"session_id": p.id, "text": p.text, "interrupt": mode == SendMode::Interrupt});
+                    mcp_json(crate::mcp::call_as(hub, s, "send_message", args).await)
+                }
+                Caller::Shell(s) => {
+                    let source = shell_source(hub, s);
+                    if let crate::bots::Source::Chain(prov) = source {
+                        crate::mcp::guard::check_claude_origin(target.kind, prov.origin).map_err(RpcError)?;
+                        if let Some(b) = hub.bots().by_session(p.id) {
+                            return Err(RpcError(format!("session {} is the bot {}: use `muster ask {}`", p.id, b.name, b.name)));
+                        }
+                    }
+                    to_value(inject::send(hub, p.id, p.text, mode, format!("session:{s}"), source).await?)
+                }
+                Caller::Human => to_value(
+                    inject::send(hub, p.id, p.text, mode, who.label(), crate::bots::Source::Human).await?,
+                ),
             }
-            to_value(inject::send(hub, p.id, p.text, p.mode.unwrap_or_default(), who.label()).await?)
         }
         "session.approve" => {
             #[derive(Deserialize)]
@@ -503,8 +528,24 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 /// cursor mode (SS3 in application mode), as a keyboard would.
                 #[serde(default)]
                 keys: bool,
+                /// The session running `muster keys` (`$MUSTER_SESSION_ID`).
+                #[serde(default)]
+                from_session: Option<SessionId>,
             }
             let p: P = parse(params)?;
+            let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
+            // Keys typed for an agent on a non-human chain can't drive a Claude agent, and never
+            // count as the human's input; keys from the human (or a human-rooted shell) do.
+            let caller = caller(hub, p.from_session)?;
+            let chain = match caller {
+                Caller::Agent(s) => Some(crate::bots::outgoing(hub.bots().prov(s))),
+                Caller::Shell(s) => hub.bots().prov(s).map(|pv| crate::bots::outgoing(Some(pv))),
+                Caller::Human => None,
+            };
+            match chain {
+                Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
+                None => hub.bots().note_human_input(p.id),
+            }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
             } else {
@@ -657,27 +698,26 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 text: String,
                 #[serde(default)]
                 timeout_ms: Option<u64>,
-                #[serde(default = "yes")]
-                wait: bool,
-                /// The muster session running `muster ask` (its inbound message sets the origin).
+                /// The session running `muster ask` (`$MUSTER_SESSION_ID`).
                 #[serde(default)]
                 from_session: Option<SessionId>,
-                /// Internal: start a chain with this origin (tests, until schedules exist).
-                #[serde(default)]
-                origin: Option<crate::bots::Origin>,
-            }
-            fn yes() -> bool {
-                true
             }
             let p: P = parse(params)?;
-            let wait = p
-                .wait
-                .then(|| Duration::from_millis(p.timeout_ms.unwrap_or(BOT_ASK_DEFAULT_MS).min(BOT_ASK_MAX_MS)));
-            let who = crate::bots::Asker {
-                from_session: p.from_session,
-                forced: p.origin,
-            };
-            Ok(crate::bots::ask(hub, &p.bot, p.text, who, wait).await?)
+            let timeout_ms = p.timeout_ms.unwrap_or(BOT_ASK_DEFAULT_MS).clamp(1000, BOT_ASK_MAX_MS);
+            match caller(hub, p.from_session)? {
+                // An agent's CLI ask is its ask_bot: the same origin rule, permission check,
+                // rate limit and cap as the MCP tool.
+                Caller::Agent(s) => {
+                    let args = json!({"bot": p.bot, "text": p.text, "timeout_seconds": timeout_ms / 1000});
+                    mcp_json(crate::mcp::call_as(hub, s, "ask_bot", args).await)
+                }
+                Caller::Shell(s) => {
+                    Ok(crate::bots::ask(hub, &p.bot, p.text, Some(s), None, Duration::from_millis(timeout_ms)).await?)
+                }
+                Caller::Human => {
+                    Ok(crate::bots::ask(hub, &p.bot, p.text, None, None, Duration::from_millis(timeout_ms)).await?)
+                }
+            }
         }
 
         "session.attach" | "session.detach" | "window.claim" => {
@@ -685,6 +725,62 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
     }
+}
+
+/// Who a client call acts for. The CLI passes `$MUSTER_SESSION_ID` as `from_session`, so a
+/// call an agent makes through `muster send/keys/ask/new` is that agent's: its provenance, and
+/// for `send` and `ask` the MCP guards. A shell session is a human typing in a shell tab (with
+/// that shell's provenance, if an agent ever typed into it). Without `from_session` the caller
+/// is the human. Limit: an agent that drops the variable and calls the API with the client
+/// token directly is the human as far as the daemon can tell (docs/PROTOCOL.md "Limits").
+enum Caller {
+    Human,
+    Shell(SessionId),
+    Agent(SessionId),
+}
+
+fn caller(hub: &Hub, from: Option<SessionId>) -> Result<Caller, RpcError> {
+    let Some(s) = from else { return Ok(Caller::Human) };
+    match hub.session(s) {
+        None => Err(RpcError(format!("no such session: {s} (from_session)"))),
+        Some(i) if i.kind == SessionKind::Shell => Ok(Caller::Shell(s)),
+        Some(_) => Ok(Caller::Agent(s)),
+    }
+}
+
+/// What a shell session's prompt carries: its provenance one hop on, else the human's.
+fn shell_source(hub: &Hub, s: SessionId) -> crate::bots::Source {
+    match hub.bots().prov(s) {
+        Some(p) => crate::bots::Source::Chain(crate::bots::outgoing(Some(p)).prov(None)),
+        None => crate::bots::Source::Human,
+    }
+}
+
+/// Provenance for a session a CLI call starts (`muster new` inside a session): the calling
+/// session's, one hop on, with the Claude origin rule. None: the human's.
+fn spawn_prov(
+    hub: &Hub,
+    from: Option<SessionId>,
+    kind: Option<SessionKind>,
+) -> Result<Option<crate::bots::Prov>, RpcError> {
+    let route = match caller(hub, from)? {
+        Caller::Human => return Ok(None),
+        Caller::Shell(s) => match hub.bots().prov(s) {
+            None => return Ok(None),
+            p => crate::bots::outgoing(p),
+        },
+        Caller::Agent(s) => crate::bots::outgoing(hub.bots().prov(s)),
+    };
+    if let Some(k) = kind {
+        crate::mcp::guard::check_claude_origin(k, route.origin).map_err(RpcError)?;
+    }
+    Ok(Some(route.prov(None)))
+}
+
+/// An MCP tool's text result as the RPC result (JSON when it is JSON).
+fn mcp_json(r: Result<String, String>) -> RpcResult {
+    let text = r.map_err(RpcError)?;
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
 }
 
 /// `until` names -> states. `needs_human` is every state that needs the human; `done` is an
@@ -985,6 +1081,8 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 }
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+                    // Keystrokes from a client window or a paired phone: the human's input.
+                    hub.bots().note_human_input(id);
                     if let Err(e) = hub.write_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");
                     }
@@ -1178,4 +1276,112 @@ async fn resend_replay(
     out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay)))
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bots::{NewBot, Origin, Prov};
+    use crate::mcp::McpState;
+    use crate::mcp::backend::HubBackend;
+    use crate::store::{Store, StoredSession};
+
+    /// A hub with workspace 1, channel 1 and exited sessions 1 (shell), 2 (claude), 3 (codex),
+    /// with the MCP server state attached. Nothing here starts a process: every call below is
+    /// refused before delivery.
+    fn fixture() -> (Arc<Hub>, Arc<McpState<HubBackend>>) {
+        let store = Store::open_memory().unwrap();
+        let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
+        let mut ch = crate::mcp::guard::test_channel(0);
+        ch.workspace_id = ws;
+        ch.window_id = Some(1);
+        store.insert_channel(&ch).unwrap();
+        store.upsert_window(1, "1", 0, 0).unwrap();
+        for kind in [SessionKind::Shell, SessionKind::Claude, SessionKind::Codex] {
+            let mut info = crate::mcp::guard::test_session(0, None);
+            info.kind = kind;
+            info.window_id = Some(1);
+            store.insert_session(&StoredSession { info, extra_args: vec![] }).unwrap();
+        }
+        let cfg = crate::hub::HubConfig {
+            port: 0,
+            client_token: "t".into(),
+            muster_bin: std::path::PathBuf::from("/bin/true"),
+        };
+        let hub = Hub::new(cfg, store).unwrap();
+        let st = Arc::new(McpState::new(HubBackend(hub.clone())));
+        hub.set_mcp(Arc::downgrade(&st));
+        (hub, st)
+    }
+
+    fn bot(hub: &Hub, name: &str) {
+        crate::bots::create(
+            hub,
+            NewBot { name: name.into(), kind: None, model: None, effort: None, persona: None, accepts: None },
+        )
+        .unwrap();
+    }
+
+    async fn call(hub: &Arc<Hub>, method: &str, params: Value) -> Result<Value, String> {
+        dispatch(hub, &Principal::Local, method, params).await.map_err(|e| e.0)
+    }
+
+    const SCHED: Prov = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+
+    #[tokio::test]
+    async fn cli_ask_from_an_agent_is_that_agents_ask_bot() {
+        let (hub, st) = fixture();
+        bot(&hub, "rpc-ada");
+        // The codex session handles a scheduled message: its `muster ask` carries that, and no
+        // parameter can claim otherwise.
+        hub.bots().set_prov(3, Some(SCHED));
+        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 3, "origin": "human"}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("accepts only human"), "{e}");
+        // Human-rooted again: the MCP send rate limit applies to its CLI asks...
+        hub.bots().set_prov(3, None);
+        for _ in 0..20 {
+            st.guard.lock().sends.check_and_record(3, now_ms(), 20, 60_000).unwrap();
+        }
+        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("rate limit"), "{e}");
+        // ...and so does the permission check (the caller's tab is narrower than the bot's).
+        st.guard.lock().sends.forget(2);
+        let plan = Permissions { claude_mode: ClaudeMode::Plan, ..Default::default() };
+        hub.set_permissions(1, plan).unwrap();
+        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 2})).await.unwrap_err();
+        assert!(e.contains("more than your channel"), "{e}");
+        // The call is audited like an MCP call.
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["args"]["via"] == "cli"));
+    }
+
+    #[tokio::test]
+    async fn cli_sends_keys_and_spawns_carry_provenance() {
+        let (hub, _st) = fixture();
+        // An agent's `muster send` is its send_message (guards included: no shell targets).
+        let e = call(&hub, "session.send", json!({"id": 1, "text": "ls", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("is a shell"), "{e}");
+        // Keys from a session on a scheduled chain can't drive a Claude agent.
+        hub.bots().set_prov(1, Some(SCHED));
+        let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 1})).await.unwrap_err();
+        assert!(e.contains("origin=schedule"), "{e}");
+        // Nor can `muster new` / session.spawn start one.
+        hub.bots().set_prov(3, Some(SCHED));
+        let e = call(&hub, "session.spawn", json!({"channel_id": 1, "kind": "claude", "from_session": 3}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("origin=schedule"), "{e}");
+        let e = call(&hub, "channel.create", json!({"workspace_id": 1, "agent": "claude", "from_session": 3}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("origin=schedule"), "{e}");
+        // The human's keystrokes (no from_session) make the next plain prompt the human's.
+        hub.bots().set_prov(2, Some(SCHED));
+        let _ = call(&hub, "session.input", json!({"id": 2, "data": "x"})).await;
+        let info = hub.session(2).unwrap();
+        hub.bots().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"}));
+        assert_eq!(hub.bots().prov(2), None);
+    }
 }

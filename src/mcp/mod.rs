@@ -101,11 +101,23 @@ pub fn router(hub: Arc<Hub>) -> Router {
             guard::ENV_CROSS_WORKSPACE
         );
     }
-    let st = Arc::new(McpState::with_limits(HubBackend(hub), limits));
+    let st = Arc::new(McpState::with_limits(HubBackend(hub.clone()), limits));
+    hub.set_mcp(Arc::downgrade(&st));
     spawn_tracker(&st);
     Router::new()
         .route("/", post(handle_post).get(not_allowed).delete(not_allowed))
         .with_state(st)
+}
+
+/// Run tool `name` as session `caller`, for a call that session made through the CLI (rpc.rs):
+/// the same guards and rate limits as over MCP. Ok(text) or Err(the tool's error text).
+pub async fn call_as(hub: &Hub, caller: crate::model::SessionId, name: &str, args: serde_json::Value) -> Result<String, String> {
+    let st = hub.mcp().ok_or("the MCP server isn't running")?;
+    match protocol::call_audited(&st, caller, name, args).await {
+        Ok(o) if !o.is_error => Ok(o.text),
+        Ok(o) => Err(o.text),
+        Err(()) => Err(format!("unknown tool {name}")),
+    }
 }
 
 fn header_str(h: &HeaderMap, name: &str) -> Option<String> {

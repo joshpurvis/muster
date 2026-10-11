@@ -58,6 +58,8 @@ struct Item {
     attempts: u8,
     /// The human was told this prompt waits behind their unsent draft.
     draft_noticed: bool,
+    /// Who it comes from: becomes the session's provenance when it is submitted (bots.rs).
+    source: crate::bots::Source,
 }
 
 #[derive(Default)]
@@ -109,13 +111,16 @@ fn ready(hub: &Hub, id: SessionId) -> bool {
         .is_some_and(|s| adapter_for(s.kind).is_ready(s.state))
 }
 
-/// Send a prompt. `from` is "human" or "session:<id>" (for the timeline).
+/// Send a prompt. `from` is "human" or "session:<id>" (for the timeline). `source` is its
+/// provenance, applied to the session when the prompt is actually submitted (so a queued
+/// prompt doesn't relabel the turn that is still running).
 pub async fn send(
     hub: &Arc<Hub>,
     id: SessionId,
     text: String,
     mode: SendMode,
     from: String,
+    source: crate::bots::Source,
 ) -> anyhow::Result<SendOutcome> {
     let info = hub
         .session(id)
@@ -134,6 +139,7 @@ pub async fn send(
         clear_first: mode == SendMode::Interrupt,
         attempts: 0,
         draft_noticed: false,
+        source,
     };
 
     if mode == SendMode::Interrupt {
@@ -406,6 +412,8 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         }
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
+    // The prompt runs from here on: the session now handles a message from `source`.
+    hub.bots().on_delivered(id, item.source, crate::model::now_ms());
     let seq_before = hub.output_seq(id);
     hub.write_input(id, &adapter.submit_bytes())?;
 
@@ -615,6 +623,7 @@ mod tests {
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
+            source: crate::bots::Source::Human,
         };
         QUEUES
             .lock()

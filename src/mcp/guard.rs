@@ -372,6 +372,29 @@ pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionI
 }
 
 #[cfg(test)]
+pub(crate) fn test_channel(id: ChannelId) -> crate::model::Channel {
+    crate::model::Channel {
+        id,
+        workspace_id: 1,
+        name: format!("c{id}"),
+        cwd: "/tmp".into(),
+        branch: None,
+        base_branch: None,
+        owns_worktree: false,
+        port_base: 20000,
+        archived: false,
+        layout: None,
+        created_at: 0,
+        last_read_at: 0,
+        sort_order: 0,
+        permissions: Default::default(),
+        window_id: None,
+        auto_named: false,
+        first_prompt: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

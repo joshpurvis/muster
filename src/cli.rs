@@ -471,6 +471,13 @@ fn state_line(snap: &Snapshot, s: &Sess) -> String {
     line
 }
 
+/// `$MUSTER_SESSION_ID`: the session this command runs in. Sent as `from_session` by `send`,
+/// `keys`, `ask` and `new`, so what an agent does through the CLI carries its provenance (and
+/// for `send`/`ask` its MCP guards); see docs/CLI.md.
+fn env_session() -> Option<u32> {
+    std::env::var("MUSTER_SESSION_ID").ok().and_then(|v| v.trim().parse().ok())
+}
+
 fn print_json(v: &Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
@@ -781,7 +788,11 @@ pub fn send(d: &Discovery, t: &str, words: &[String], o: SendOpts) -> anyhow::Re
     let deadline = deadline_in(o.timeout);
     let sent_at = now_ms();
     let mode = if o.interrupt { "interrupt" } else { "queue" };
-    let r = client::rpc(d, "session.send", json!({ "id": s.id, "text": text, "mode": mode }))?;
+    let r = client::rpc(
+        d,
+        "session.send",
+        json!({ "id": s.id, "text": text, "mode": mode, "from_session": env_session() }),
+    )?;
     let queued = r["queued"].as_u64().unwrap_or(0);
     let wait = o.wait || !o.until.is_empty();
     if !wait {
@@ -1030,7 +1041,11 @@ pub fn keys(d: &Discovery, t: &str, keys: &[String]) -> anyhow::Result<()> {
     let data = keys.iter().map(|k| parse_key(k)).collect::<anyhow::Result<String>>()?;
     let (_, s) = target(d, t)?;
     // `keys`: cursor keys follow the terminal's cursor mode, as a keyboard's would.
-    client::rpc(d, "session.input", json!({ "id": s.id, "data": data, "keys": true }))?;
+    client::rpc(
+        d,
+        "session.input",
+        json!({ "id": s.id, "data": data, "keys": true, "from_session": env_session() }),
+    )?;
     Ok(())
 }
 
@@ -1146,6 +1161,9 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     }
     if !o.agent_args.is_empty() {
         set(&mut p, "extra_args", json!(o.agent_args));
+    }
+    if let Some(s) = env_session() {
+        set(&mut p, "from_session", json!(s));
     }
     let ch = client::rpc(d, "channel.create", p)?;
     let ch_id = ch["id"].as_i64().context("channel.create returned no id")?;
@@ -1521,7 +1539,7 @@ pub fn bot_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
 
 /// `muster ask`: `bot.ask` (waits for the reply), prints the reply. Exit 124 on timeout; 1
 /// when the bot stopped without answering (a prompt for the human, an error) or exited.
-pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bool, origin: Option<&str>) -> anyhow::Result<()> {
+pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bool) -> anyhow::Result<()> {
     let text = send_text(words, || {
         let stdin = std::io::stdin();
         if stdin.is_terminal() {
@@ -1532,8 +1550,7 @@ pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bo
         Ok(s)
     })?;
     let timeout = timeout.min(1800);
-    // Inside a muster session the message carries that session's origin, as an MCP call would.
-    let from_session: Option<u32> = std::env::var("MUSTER_SESSION_ID").ok().and_then(|v| v.trim().parse().ok());
+    // Inside a muster session the ask is that session's (an agent's goes through ask_bot).
     let r = client::rpc_with_timeout(
         d,
         "bot.ask",
@@ -1541,8 +1558,7 @@ pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bo
             "bot": bot,
             "text": text,
             "timeout_ms": timeout * 1000,
-            "from_session": if origin.is_some() { None } else { from_session },
-            "origin": origin,
+            "from_session": env_session(),
         }),
         Duration::from_secs(timeout + 30),
     )?;
@@ -1550,6 +1566,10 @@ pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bo
         print_json(&r)?;
     } else if let Some(reply) = r["reply"].as_str() {
         println!("{reply}");
+    } else if let Some(tail) = r["unattributed_output"].as_str() {
+        eprintln!("muster: {bot} reported no reply for this message; the end of its terminal (may belong to another prompt):");
+        println!("{tail}");
+        return Ok(());
     }
     if r["timed_out"] == true {
         return Err(exit(124, format!("no reply from {bot} within {timeout}s (msg {})", r["msg_id"])));

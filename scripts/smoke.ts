@@ -199,7 +199,9 @@ async function main() {
   ok((st.mode! & 0o777) === 0o600, "daemon.json is mode 0600");
 
   // auth
-  ok((await fetch(`http://127.0.0.1:${PORT}/api/rpc`, { method: "POST", body: "{}" })).status === 401, "rpc without token -> 401");
+  // Without a token the request is taken as a device-cookie call, which needs `X-Muster: 1`.
+  const noTok = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, { method: "POST", body: "{}" });
+  ok(noTok.status === 403 && (await noTok.text()).includes("missing X-Muster header"), "rpc without token -> 403");
   ok(
     (await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, { method: "POST", headers: { Authorization: "Bearer nope" }, body: "{}" })).status === 401,
     "hook with bad session token -> 401",
@@ -736,9 +738,14 @@ async function main() {
     () => ok(false, "bot names are unique case-insensitively"),
     (e) => ok(String(e).includes("already exists"), "bot names are unique case-insensitively"),
   );
-  await c.call("bot.ask", { bot: "ada", text: "hi", origin: "schedule" }).then(
-    () => ok(false, "bot.ask: a claude bot refuses a scheduled message"),
-    (e) => ok(String(e).includes("accepts only human"), "bot.ask: a claude bot refuses a scheduled message"),
+  // (Asking a real bot would start its agent CLI: only the refusal paths run here.)
+  await c.call("bot.ask", { bot: "nobody", text: "hi" }).then(
+    () => ok(false, "bot.ask: unknown bot"),
+    (e) => ok(String(e).includes("no bot named nobody"), "bot.ask: unknown bot"),
+  );
+  await c.call("bot.ask", { bot: "ada", text: "hi", from_session: 999999 }).then(
+    () => ok(false, "bot.ask: unknown from_session refused"),
+    (e) => ok(String(e).includes("no such session"), "bot.ask: unknown from_session refused"),
   );
   ok((await c.call("bot.list")).length === 2, "bot.list");
   await c.call("bot.remove", { name: "ada" });

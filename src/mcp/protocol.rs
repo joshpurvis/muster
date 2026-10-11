@@ -512,6 +512,29 @@ impl<B: Backend> Drop for Audit<'_, B> {
     }
 }
 
+/// A tool call made for a session outside the MCP transport (its `muster send`/`ask` through
+/// the CLI, rpc.rs): the same tool code and the same McpCall audit event (`via: "cli"`).
+pub async fn call_audited<B: Backend>(
+    st: &McpState<B>,
+    caller: SessionId,
+    name: &str,
+    mut args: Value,
+) -> Result<tools::ToolOutput, ()> {
+    let out = tools::call_tool(st, caller, name, &args).await;
+    if let Value::Object(m) = &mut args {
+        m.insert("via".into(), json!("cli"));
+    }
+    let mut audit = Audit {
+        st,
+        caller,
+        tool: name.to_string(),
+        args,
+        done: false,
+    };
+    audit.write(matches!(&out, Ok(o) if !o.is_error), false);
+    out
+}
+
 /// tools/call: run the tool, log an McpCall event in the caller's channel.
 async fn call<B: Backend>(
     st: &McpState<B>,

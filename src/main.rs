@@ -283,9 +283,6 @@ carries that session's origin (docs/MCP.md, \"Bots\").")]
         /// Print the bot.ask reply as JSON.
         #[arg(long)]
         json: bool,
-        /// Internal: start the chain with this origin (tests, until schedules exist).
-        #[arg(long, hide = true, value_parser = ["human", "schedule", "webhook"])]
-        origin: Option<String>,
     },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
@@ -497,8 +494,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             text,
             timeout,
             json,
-            origin,
-        } => cli::ask(d, &bot, &text, timeout, json, origin.as_deref()),
+        } => cli::ask(d, &bot, &text, timeout, json),
         _ => unreachable!("dispatched in main"),
     }
 }
@@ -875,6 +871,14 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cmd, clap::Error> {
         Cli::try_parse_from(std::iter::once("muster").chain(args.iter().copied())).map(|c| c.cmd.expect("a command"))
+    }
+
+    #[test]
+    fn ask_has_no_origin_override() {
+        assert!(parse(&["ask", "ada", "hi"]).is_ok());
+        // Provenance comes from the calling session, never from a flag.
+        assert!(parse(&["ask", "ada", "hi", "--origin", "human"]).is_err());
+        assert!(matches!(parse(&["bot", "start", "ada", "--fresh"]), Ok(Cmd::Bot { .. })));
     }
 
     fn agent_args(args: &[&str]) -> (Option<PathBuf>, Option<String>, Vec<String>) {

@@ -3,8 +3,8 @@
 Goal: a great tiling terminal for agents, in the spirit of VS Code editor groups, kitty and
 wezterm. A window is split into **groups**, and each group has its own **tab strip**. A tab is
 one terminal. Tabs drag freely between groups, onto a group's edge (a new split), and to other
-windows. One fuzzy Jump covers everything. There is no sidebar, inbox, timeline, composer, diff
-panel or global tab bar. Attention comes from state dots, the approval banner, desktop
+windows. One fuzzy Jump covers everything. There is no inbox, timeline, composer, diff panel or global
+tab bar; the only sidebar is the optional agents panel (Alt+G). Attention comes from state dots, the approval banner, desktop
 notifications and a "next that needs me" key.
 
 Several windows may be open at once (one muster client each), so the window manager can tile
@@ -120,7 +120,9 @@ a connection dot.
 ### Overlays
 - **Jump** (Ctrl+Space or Ctrl+Shift+K anywhere, Ctrl+K outside terminals; Ctrl+Space again closes it): fuzzy search over every tab and
   session in **all windows**, and folders for "new tab here" (recent folders and known
-  workspaces; choosing one opens a tab there with the last agent kind). Rows show the state dot,
+  workspaces; choosing one opens a tab there with the last agent kind), and every named agent,
+  stopped ones too (choosing one starts it and pulls its tab here; its session isn't listed a
+  second time). Rows show the state dot,
   label, window (for other windows), folder and state detail; one row per tab (session).
   Sessions that need you come first, then recent ones, then this window's tabs in order. Plain queries also match commands (ranked
   last). `>` switches to commands (Ctrl+Shift+P opens with `>`), and every command lists its
@@ -137,8 +139,47 @@ a connection dot.
   Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees).
 - **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
 - **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).
+- **New agent / Edit agent** and the **message** overlay: see "Agents panel".
 - **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
   bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
+
+## Agents panel
+
+Named agents (PLAN.md §10) get a left dock, about 220px wide, in any window. **Alt+G** (or
+"Toggle agents panel" in Jump and the palette) shows and hides it; each window remembers its own
+state in its layout (`Window.layout.agents`, saved like zoom). You talk to an agent in its own
+terminal tab; there is no chat view.
+
+| Part | What |
+|---|---|
+| Header | "Agents", the count, `×` hides the panel. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. Hover: the persona's first line. |
+| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere. Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
+| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog; its folder stays). |
+| + New agent | Under the list: the New agent dialog. |
+| Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
+
+Live updates come from `agent_upserted`, `agent_removed` and `agent_message` (the agent list and
+the last 100 messages are loaded after each `hello`); states come from the agents' sessions.
+Daemons without agents (`agent.list` is an unknown method) show a one-line note instead.
+
+**New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
+
+- New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, Background worker, from
+  `agent.templates`) with the template's one-line description; picking one fills every field
+  (a name you typed is kept). Name and kind (Claude · Codex).
+- Model and effort (optional, effort suggests the CLI's levels), persona (monospace textarea,
+  written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook checkboxes,
+  at least one), the Permissions section showing only the control for the agent's kind, and an
+  Autostart toggle.
+- Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are
+  unclear about unattended use; scheduled work is safer on a Codex agent."
+- Edit shows the kind badge, name and home folder, and a second tab, **Memory**: the files in
+  the agent's `memory/` on the left (plus a field to create one by name), a plain-text editor
+  on the right with Save (Ctrl+S). Switching files or closing with unsaved changes asks first
+  (closing: a second Esc discards). Edit saves only changed fields (`agent.update`); model,
+  effort and permissions apply from the agent's next start, which the toast says when it runs.
+- Ctrl+Enter creates or saves. Creating opens the panel if it was closed.
 
 ## Naming (no names up front)
 
@@ -171,7 +212,7 @@ on each explicit rename, as long as muster created the branch and it has no upst
   this title.
 - Closing a window leaves its tabs (sessions) and layout attached to it. A released window with
   no sessions is deleted by the daemon.
-- Sessions created outside a window (CLI `muster new`, MCP `spawn_agent`) go to the spawning
+- Sessions created outside a window (CLI `muster new`, MCP `spawn_session`) go to the spawning
   session's window, else the task's window, else the most recently focused window, and join
   that window's focused group.
 
@@ -201,6 +242,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+←↑→↓ | Focus the group in that direction |
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
+| Alt+G | Show / hide the agents panel (per window) |
 | F2 (in a focused strip) | Rename the tab (the task on its main tab) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
@@ -233,7 +275,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
   folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other
-  window", and the active tab per window.
+  window", the agents panel's message log expanded or not, and the active tab per window.
 - `window.focused` is called on window focus and right after a claim when the page has focus.
 - Performance: batch output per animation frame per terminal. Never re-render the Preact tree on
   output bytes.

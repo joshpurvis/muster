@@ -36,7 +36,7 @@ Each `muster` opens its own window and returns at once.
 ```sh
 muster ls                                # ID  WIN  TAB  NAME  KIND  STATE  FOR  DETAIL
 muster new ~/src/app --prompt "fix the flaky test"   # prints the new session id
-muster new . --agent codex -- -m gpt-6-sol           # args after -- go to the agent CLI
+muster new . --kind codex -- -m gpt-6-sol            # args after -- go to the agent CLI
 muster send fix-auth "run the tests" --wait          # prompt, then wait until it settles
 muster read fix-auth -n 100              # last 100 lines of output, plain text
 muster wait 12 --until needs_human       # block until it needs you (exit 124 on timeout)
@@ -45,9 +45,11 @@ muster keys 12 esc text:/compact enter
 muster events --tab fix-auth             # one line per state change, until Ctrl-C (--json: every event)
 ```
 
-Bots are persistent named agents with their own folder, memory and resumed conversation
-(PLAN.md §10): `muster bot new reviewer --persona "Reviews diffs"`, then
-`muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_bot` MCP tool from an agent).
+Named agents are persistent agent sessions with their own folder, memory and resumed
+conversation (PLAN.md §10): `muster agent new reviewer --persona "Reviews diffs"`, then
+`muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_agent` MCP tool from an agent).
+In the UI, Alt+G opens the agents panel: start an agent with a click, create one from a
+template, edit its persona and memory, and watch the messages agents send each other.
 
 A target is a session id, `.` (the session you're in), a session or tab name, a unique
 prefix, or `tab/name`. Exit codes: 0 ok, 1 error, 2 bad or ambiguous target, 124 timeout.
@@ -61,7 +63,7 @@ is found it falls back to `xdg-open`.
 
 | What | Default | Override |
 |---|---|---|
-| Database, session logs, worktrees, bot homes (`bots/`) | `$XDG_DATA_HOME/muster` | `MUSTER_DATA_DIR` |
+| Database, session logs, worktrees, agent homes (`agents/`) | `$XDG_DATA_HOME/muster` | `MUSTER_DATA_DIR` |
 | `daemon.json`, lock, `daemon.log` | `$XDG_RUNTIME_DIR/muster` | `MUSTER_RUNTIME_DIR` |
 | Port | 7433 (a free port if busy) | `MUSTER_PORT` |
 

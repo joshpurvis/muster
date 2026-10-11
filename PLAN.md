@@ -106,7 +106,7 @@ The daemon exposes an MCP server (localhost HTTP) that agents in any session can
 
 Initial tools:
 - `list_sessions` / `list_channels`: what's running and in which state.
-- `spawn_agent(channel, kind, prompt)`: start a new agent, optionally in a new worktree/channel.
+- `spawn_session(channel, kind, prompt)` (first called `spawn_agent`, still accepted): start a new agent, optionally in a new worktree/channel.
 - `send_message(session, text)`: goes through the Phase 3 injection queue.
 - `read_screen(session)` / `get_recent_output(session, n)`: current screen or tail as plain text.
 - `wait_for_state(session, state, timeout)`: block until an agent finishes or needs help.
@@ -145,47 +145,71 @@ Phase 0 → 1 → 2 → 3 → 4, but build the Phase 3 adapter trait early (Phas
 - How "catch me up" summaries get generated (e.g., the user's own `claude -p` in a session vs. an API key).
 - Product name.
 
-## 10. Bots (first pass, 2026-10-11)
+## 10. Agents (first pass and panel v1, 2026-10-11)
 
-A **bot** is a persistent, named agent that other bots (or the human) can ask things and get
-replies from. Code: `src/bots.rs`; tools: docs/MCP.md "Bots"; commands: docs/CLI.md.
+A **named agent** is a persistent agent session that other agents (or the human) can ask
+things and get replies from. It was called a "bot" in the first pass; everything (CLI, MCP,
+RPC, tables, folders) now says agent. Code: `src/agents.rs` (the CLI adapters moved to
+`src/adapters/`); tools: docs/MCP.md "Agents"; commands: docs/CLI.md; UI: docs/UI.md "Agents
+panel".
 
 | Part | What |
 |---|---|
-| Record | `bots` table: name (unique, case-insensitive), kind (`claude` \| `codex`), model, effort, persona, home dir, permission profile, accepted origins, current session, conversation id. |
-| Home | `<data>/bots/<name>/` with `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) written from the persona, and `memory/` for durable notes the persona tells the bot to keep. |
-| Session | At most one at a time: the agent runs in its home dir, in its own tab (named after it, stored on the bot) in the "bots" workspace (`<data>/bots`). `muster bot start`, or any message, starts it, restarts it if it exited, or reuses it. |
+| Record | `agents` table: name (unique, case-insensitive), kind (`claude` \| `codex`), model, effort, persona, home dir, permission profile, accepted origins, autostart, its tab, current session, conversation id. |
+| Home | `<data>/agents/<name>/` with `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) written from the persona, and `memory/` for durable notes the persona tells the agent to keep. |
+| Session | At most one at a time: the agent runs in its home dir, in its own tab (named after it, stored on the agent) in the "agents" workspace (`<data>/agents`). `muster agent start`, a click in the panel, or any message starts it, restarts it if it exited, or reuses it. Autostart agents start with the daemon. |
 | Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
-| Asking | MCP `ask_bot` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
-| Messages | Each delivery gets a `bot_messages` row (from, to, origin, hop, reply_to, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. |
+| Asking | MCP `ask_agent` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
+| Messages | Each delivery gets an `agent_messages` row (from, to, origin, hop, reply_to, text, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. A message the agent's policy refuses is kept too, with the reason (never delivered, not counted toward the cap). |
+| Editing | `agent.update` / `muster agent edit` / the panel's Edit dialog: persona (rewrites the persona file), model, effort, accepted origins, autostart, permissions (also set on its tab). Model, effort and permissions apply from the next start. |
 
 **Origin rule.** Every message carries the origin of the chain it belongs to: `human`,
 `schedule` or `webhook`. Every session has a provenance: the origin and hop of the message it
 is handling, set when muster submits an attributed prompt to it (any agent's send, spawn prompt
-or bot message, the agent's CLI calls included), and copied into sessions it spawns, which keep
+or agent message, the agent's CLI calls included), and copied into sessions it spawns, which keep
 it until they get another attributed prompt. What a session sends carries its origin at hop+1.
 Only the human, through a client connection, makes a session human-rooted again; a hook can't.
-Delivery is refused when the bot doesn't accept the origin, past hop 4, or past 200 messages to
-the bot in 24 hours (constants in `src/mcp/guard.rs`). Non-bot Claude agents follow the Claude
-default: no message, keys or spawn of a Claude agent from a non-human chain. Details and the
-limits that remain (the client token, runtime-only provenance): docs/MCP.md "Bots".
+Delivery is refused when the agent doesn't accept the origin, past hop 4, or past 200 messages
+to the agent in 24 hours (constants in `src/mcp/guard.rs`). Claude sessions that aren't named
+agents follow the Claude default: no message, keys or spawn of a Claude agent from a non-human
+chain. Details and the limits that remain (the client token, runtime-only provenance):
+docs/MCP.md "Agents".
 
-Defaults: Claude bots accept `human` only; Codex bots accept `human`, `schedule` and `webhook`,
-so scheduled and triggered work routes to Codex. Why: Anthropic's consumer terms are unclear
-about unattended use of a subscription (§3: limits assume "ordinary, individual usage"). They
-don't forbid scheduling as such: Claude Code itself has `/loop` and `CronCreate` (at least a
-1-minute interval; recurring loops expire after 7 days; code.claude.com/docs/en/scheduled-tasks),
+Defaults: Claude agents accept `human` only; Codex agents accept `human`, `schedule` and
+`webhook`, so scheduled and triggered work routes to Codex. Why: Anthropic's consumer terms are
+unclear about unattended use of a subscription (§3: limits assume "ordinary, individual usage").
+They don't forbid scheduling as such: Claude Code itself has `/loop` and `CronCreate` (at least
+a 1-minute interval; recurring loops expire after 7 days; code.claude.com/docs/en/scheduled-tasks),
 and the stated risk is round-the-clock background use, which is what the weekly caps are for. So
-a Claude bot may opt in to `schedule` per bot (`muster bot new --accepts human,schedule`); the
-default stays human-only.
+a Claude agent may opt in to `schedule` per agent (`muster agent new --accepts human,schedule`;
+the New agent dialog warns); the default stays human-only.
+
+**The bots → agents move** (store migration v9, then `agents::relocate_homes` at daemon start,
+before the hub loads): tables, columns and the index are renamed; `<data>/bots` becomes
+`<data>/agents` (one rename, or per folder when `<data>/agents` already exists; a name taken on
+both sides stays where it is with a warning in the daemon log; links are refused). A record whose
+old folder is gone is re-pointed and forgets its conversation id (Claude keeps conversations per
+folder, so `--resume` can't find it from the new one); its sessions' cwd and the agents
+workspace follow. Safe to run again.
+
+**Panel v1 (shipped).** A left dock per window (Alt+G): agents with their state, click to start
+and pull the tab here, a context menu (Edit, Start fresh, Stop, Autostart, Remove), and a live
+message log (refusals in red; an entry opens the full message and reply). Jump lists every
+agent. A New / Edit dialog with templates (Blank, Orchestrator, Researcher, Reviewer, Background
+worker; defined in Rust, `agent.templates`) and a memory/ editor. Talking to an agent stays in
+its terminal tab. Templates: the Researcher's "read-only plus web" is Claude **plan** mode, the
+only read-only Claude profile (it can't write memory/, so its persona asks it to list findings
+for memory/ until the human widens its mode).
 
 **Deferred** (don't design them out):
 
-- Hibernate and wake: stop an idle bot's process, resume it on the next message.
-- Schedules and webhooks: the origins and the policy exist; the triggers don't (the daemon-internal
-  `bots::ask` takes an origin; no client can set one). Rules for when they're built: a Claude
-  bot's schedules mirror Anthropic's bounds (at least a 1-minute interval, a recurring schedule
-  expires after 7 days unless renewed, quiet hours supported); webhook triggers are never
-  exposed to anyone but the user.
-- A phone chat view per bot.
-- An async `reply(msg_id)` tool, so a bot can answer later instead of in the same turn.
+- A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
+  `agent.*` method and no agent events).
+- Sleep and wake: stop an idle agent's process, resume it on the next message.
+- Schedules and webhooks: the origins, the policy and the Background worker template exist; the
+  triggers don't (the daemon-internal `agents::ask` takes an origin; no client can set one).
+  Rules for when they're built: a Claude agent's schedules mirror Anthropic's bounds (at least a
+  1-minute interval, a recurring schedule expires after 7 days unless renewed, quiet hours
+  supported); webhook triggers are never exposed to anyone but the user.
+- Codex resume (`codex resume <id>`; the thread id is already captured).
+- An async `reply(msg_id)` tool, so an agent can answer later instead of in the same turn.

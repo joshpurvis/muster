@@ -206,9 +206,9 @@ maths do not double-offset):
    row (Approve / Always / Deny → `session.approve` with `state_since`, hidden otherwise), the
    chip row (Esc, Enter, Tab, Shift+Tab, ← ↑ ↓ →, Ctrl-C, 1 2 3 → `session.keys`; plus
    **Stop** → `session.interrupt`, which sends Esc to agents and Ctrl-C to shells,
-   src/agents/claude.rs:456, src/agents/shell.rs:97), and a textarea with
+   src/adapters/claude.rs:456, src/adapters/shell.rs:97), and a textarea with
    autocorrect/dictation/paste whose Send goes through `session.send` (bracketed paste, then
-   Enter, src/agents/mod.rs:91-102; queued while busy, src/inject.rs:1-10). A queued reply shows
+   Enter, src/adapters/mod.rs:91-102; queued while busy, src/inject.rs:1-10). A queued reply shows
    "queued (n)" from `SendOutcome` (src/inject.rs:39-45). Long-press Send offers "Interrupt
    and send". A settings sheet holds `termSize` and notification opt-in.
 

@@ -26,7 +26,8 @@ mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.
 `200`, `Content-Type: application/x-ndjson`, chunked, never ends while the daemon runs. Each
 line is one event exactly as the WebSocket sends it (`{"event": "...", "data": {...}}`), for
 `session_upserted`, `session_removed`, `channel_upserted`, `channel_removed`,
-`window_upserted` and `window_removed` only: no event-log entries (`event`), notices,
+`window_upserted`, `window_removed`, `agent_upserted`, `agent_removed` and `agent_message`
+only: no event-log entries (`event`), notices,
 workspace events, method results or terminal output (nothing needs attaching). The daemon
 subscribes before it sends the response headers, so a client that reads the headers and then
 calls `hello` misses nothing in between. A reader that falls more than the bus's buffer behind
@@ -116,7 +117,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell}` |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Bots"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running or starting session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. From that re-check until the delete finishes, the directory is reserved: starting or restarting a session whose cwd is inside it fails. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
@@ -137,7 +138,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.rename` | `{id, name}` | `SessionInfo` |
 | `session.move` | `{id, channel_id, from_channel_id?, close_empty_source? = false}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session whose process is being started or restarted right now (the start reads its channel), is an error; a session merely reporting the `starting` state (its process already launched) can move. With `from_channel_id`, the move is refused unless the session is still in that channel, so a client acting on a stale view can't move a session another client already moved. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to merge a tab into another (docs/UI.md); the emptied channel stays open until the client archives it. Refused while the source channel is being closed (archived), so a session can't slip out of an archive in progress. With `close_empty_source`, the source channel is then closed if this move emptied it (as `channel.close_if_empty`): the UI's tab merge uses this instead of archiving the source itself. The process keeps the port block it started with; that block stays reserved (not handed to a new channel) while the process runs. |
 | `session.set_window` | `{id, window_id, from_window_id?}` | `SessionInfo`. Shows the session (tab) in another window; see "Groups layout (v2)". |
-| `session.send` | `{id, text, mode?: "queue"\|"interrupt", from_session?}` | `{delivered, queued}`. `from_session` (`muster send` passes `$MUSTER_SESSION_ID`): an agent session's send runs MCP `send_message` as that session (guards, provenance; the reply then also has `sent_at_ms`); a shell session's carries that shell's provenance (docs/MCP.md "Bots"). For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
+| `session.send` | `{id, text, mode?: "queue"\|"interrupt", from_session?}` | `{delivered, queued}`. `from_session` (`muster send` passes `$MUSTER_SESSION_ID`): an agent session's send runs MCP `send_message` as that session (guards, provenance; the reply then also has `sent_at_ms`); a shell session's carries that shell's provenance (docs/MCP.md "Agents"). For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
 | `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny", state_seq?, state_since?}` | `{}`. With `state_seq` and/or `state_since` (from the `SessionInfo` the caller rendered), refused with an error starting `stale:` when they no longer match. `state_seq` changes on every state or detail change and whenever a prompt is answered with it, so an approval never answers a prompt the caller didn't see, and a delayed duplicate never answers the next one. The `approval` event records `from` (`"human"` or `"device:<id>"`). |
 | `session.interrupt` | `{id}` | `{}` |
 | `session.clear_queue` | `{id}` | `{}` |
@@ -154,19 +155,43 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. |
-| `bot.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[]}` | `Bot` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/bots/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. The bot's tab gets the default permission profile. |
-| `bot.list` | `{}` | `Bot[]` |
-| `bot.remove` | `{name}` | `{removed: Bot}`. Removes its session too; the home dir stays. |
-| `bot.start` | `{name, fresh? = false}` | `{bot: Bot, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the bot's own channel (created once, named after the bot, in the "bots" workspace `<data>/bots`, and stored as the bot's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. Starts are serialized. |
-| `bot.ask` | `{bot, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_bot` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_bot` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedules and webhooks will call the daemon-internal `bots::ask` with one. Refused (error) by the origin rule, hop limit or daily cap. |
+| `agent.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). Emits `agent_upserted`. |
+| `agent.update` | `{name, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Model, effort and permissions apply from its next start. Emits `agent_upserted`. |
+| `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, Background worker, for the New agent dialog. |
+| `agent.messages` | `{agent?, before?, limit? = 50 (max 200)}` | `{messages: AgentMessage[], more: bool}`, newest first: messages to `agent` (else every agent) with id below `before`. |
+| `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
+| `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`: no absolute path, no `..`, `.` or empty parts; a link anywhere on the way is refused and the file is opened with `O_NOFOLLOW`. At most 256 KB, UTF-8 only. |
+| `agent.memory.write` | `{name, path, text}` | `{path, size}`. Same path rules; creates missing folders; writes a temporary file and renames it into place (a link at the path is replaced, never followed). At most 256 KB. |
+| `agent.list` | `{}` | `Agent[]` |
+| `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
+| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). Starts are serialized. Emits `agent_upserted`. |
+| `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedules and webhooks will call the daemon-internal `agents::ask` with one. Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 ```ts
-type Bot = { id: number; name: string; kind: "claude" | "codex"; model: string | null; effort: string | null;
-             accepts_origins: ("human" | "schedule" | "webhook")[]; home_dir: string; session_id: number | null;
+type Origin = "human" | "schedule" | "webhook";
+type Agent = { id: number; name: string; kind: "claude" | "codex"; model: string | null; effort: string | null;
+             persona: string; permissions: Permissions /* its tab's, when muster creates it */;
+             accepts_origins: Origin[]; autostart: boolean; home_dir: string; session_id: number | null;
              channel_id: number | null /* its own tab */; state: AgentState | null /* its session's */; detail: string | null;
              resumable: boolean; created_at: number };
+type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "human" */; from_session: number | null;
+             to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
+             origin: Origin; hop: number; reply_to: number | null; created_at: number;
+             text: string | null /* null: sent before text was kept */; reply: string | null; replied_at: number | null;
+             refused: string | null /* why the policy refused it: never delivered */ };
+type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
+             model: string | null; effort: string | null; persona: string; permissions: Permissions;
+             accepts: Origin[]; autostart: boolean };
 ```
+
+Agent events (also on `GET /api/events`; never sent to paired devices):
+`{"event":"agent_upserted","data":Agent}` when an agent is created or its record changes (edit,
+start, its tab, its conversation id), `{"event":"agent_removed","data":{"id","name"}}`, and
+`{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused or gets its
+reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
+Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`) need the
+client token; no `agent.*` method has a device scope.
 
 Exited sessions keep their scrollback (persisted under `$XDG_DATA_HOME/muster/sessions/<id>/output.log`)
 so they can be attached (replay only) and restarted after a daemon restart. The file is
@@ -211,7 +236,7 @@ channels get `auto_named: false`. Channels and sessions whose `window_id` is nul
 a deleted window are adopted by the next `window.claim` (with `channel_upserted` /
 `session_upserted`).
 
-Where new channels go: `window_id` if given; for MCP `spawn_agent` creating a channel, the
+Where new channels go: `window_id` if given; for MCP `spawn_session` creating a channel, the
 caller's channel's window; else the open window with the latest `last_focused_at`, else the
 lowest-id window, else a new window `1`.
 
@@ -259,10 +284,10 @@ window (for new sessions) and what `Window.channel_ids` lists.
 - `SessionInfo.window_id: number | null`: the window the session is a tab in. Store migration
   v5: every existing session gets its channel's `window_id`; windows gain a `layout` column.
 - Where a new session goes (`session.spawn`): `window_id` if given (must exist); else the
-  parent session's window (`parent_id`: MCP `spawn_agent` sets it to the caller, so an agent's
+  parent session's window (`parent_id`: MCP `spawn_session` sets it to the caller, so an agent's
   new sessions land in the caller's window); else the channel's window; else where a new
   channel would go ("Where new channels go", which may create window 1). `channel.create`'s
-  first session gets the channel's window. MCP `spawn_agent` with `new_channel` puts the new
+  first session gets the channel's window. MCP `spawn_session` with `new_channel` puts the new
   channel in the caller's window (its own, else its channel's).
 - `Window.layout: object | null`: opaque JSON owned by the frontend (the split tree of groups),
   in `hello` `windows[]` and every `window_upserted`. `window.set_layout {id, layout}` → `{}`
@@ -319,7 +344,7 @@ Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
 `default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
 there; the other Claude profiles pass `--permission-mode`. Approval policies are not touched.
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
-MCP `spawn_agent` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
+MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
 later flag win they are checked against an **allowlist** (also again on every restart):
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
@@ -355,10 +380,10 @@ session start/exit and system notices are never pruned. `session.remove` deletes
 the session's `hook` and `state_change` events. A `hook` event stores only a summary:
 `{session_id, event, summary: {hook_event_name?, tool_name?, notification_type?, matcher?,
 source?, reason?, type?}}` (string fields, 120 chars max), never the full payload.
-For bots (PLAN.md §10) the daemon also reads, before summarizing: SessionStart's `session_id`
-and Codex notify's `thread-id` (the bot's conversation id), UserPromptSubmit's `prompt` (only its
+For agents (PLAN.md §10) the daemon also reads, before summarizing: SessionStart's `session_id`
+and Codex notify's `thread-id` (the agent's conversation id), UserPromptSubmit's `prompt` (only its
 `[muster msg …]` envelope) and the turn's final message (Stop `last_assistant_message`, Codex
-notify `last-assistant-message`), which is stored as the reply in `bot_messages`. `muster hook`
+notify `last-assistant-message`), which is stored as the reply in `agent_messages`. `muster hook`
 cuts payload strings at 4000 bytes, those final-message fields at 64 KiB.
 
 ## Session environment
@@ -409,7 +434,7 @@ its sockets close at once on revoke):
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
-| never | `device.*`, `bot.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
+| never | `device.*`, `agent.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
 Prompts a device sends are logged with `from: "device:<id>"`.
 

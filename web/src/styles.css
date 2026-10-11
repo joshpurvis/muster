@@ -3344,3 +3344,12 @@ textarea {
   word-break: break-word;
   user-select: text;
 }
+
+/* Hidden tabs of the agent dialog stay mounted (their drafts survive), out of sight. */
+.agent-dlg [hidden] {
+  display: none !important;
+}
+
+.mem-discard {
+  color: var(--st-attn);
+}

@@ -704,6 +704,26 @@ async fn send_rate_limit() {
 }
 
 #[tokio::test]
+async fn ask_bot_and_list_bots_are_unlisted_aliases() {
+    let (m, st) = state();
+    with_agents(&m);
+    // Older persona files name the first pass's tools (and `bot` as the argument).
+    let (t, err) = call(&st, "list_bots", json!({})).await;
+    assert!(!err && parse(&t)["agents"].as_array().unwrap().len() >= 2, "{t}");
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "hi"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(parse(&t)["reply"], "ada says hi");
+    // The same guards apply: asking yourself is refused under either name.
+    let (t, err) = call_as(&st, "tok3", "ask_bot", json!({"agent": "ada", "text": "hi"})).await;
+    assert!(err && t.contains("yourself"), "{t}");
+    let names: Vec<String> = crate::mcp::tools::tool_definitions()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!names.iter().any(|n| n == "ask_bot" || n == "list_bots"));
+}
+
+#[tokio::test]
 async fn spawn_agent_is_an_unlisted_alias_of_spawn_session() {
     let (m, st) = state();
     // The old name still works (agents written against it keep working)...

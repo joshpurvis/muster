@@ -160,8 +160,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, Background worker, for the New agent dialog. |
 | `agent.messages` | `{agent?, before?, limit? = 50 (max 200)}` | `{messages: AgentMessage[], more: bool}`, newest first: messages to `agent` (else every agent) with id below `before`. |
 | `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
-| `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`: no absolute path, no `..`, `.` or empty parts; a link anywhere on the way is refused and the file is opened with `O_NOFOLLOW`. At most 256 KB, UTF-8 only. |
-| `agent.memory.write` | `{name, path, text}` | `{path, size}`. Same path rules; creates missing folders; writes a temporary file and renames it into place (a link at the path is replaced, never followed). At most 256 KB. |
+| `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`: no absolute path, no `..`, `.` or empty parts. Every component is opened from the one before it (`openat` with `O_NOFOLLOW`, from the home folder's fd), so a link anywhere, also one swapped in during the call, is refused. At most 256 KB, UTF-8 only. |
+| `agent.memory.write` | `{name, path, text}` | `{path, size}`. Same path rules and walk; creates missing folders (`mkdirat`); refuses a link at the path; writes a temporary file of its own (random name, `O_EXCL`) and renames it into place (`renameat`). At most 256 KB. |
 | `agent.list` | `{}` | `Agent[]` |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
 | `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). Starts are serialized. Emits `agent_upserted`. |
@@ -190,6 +190,9 @@ Agent events (also on `GET /api/events`; never sent to paired devices):
 start, its tab, its conversation id), `{"event":"agent_removed","data":{"id","name"}}`, and
 `{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused or gets its
 reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
+A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
+with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
+current conversation id.
 Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`) need the
 client token; no `agent.*` method has a device scope.
 

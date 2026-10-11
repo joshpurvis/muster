@@ -421,8 +421,10 @@ pub async fn call_tool<B: Backend>(
         "wait_for_state" => wait_for_state(st, caller, &a).await,
         "post_to_channel" => post_to_channel(st, caller, &a),
         "get_diff" => get_diff(st, caller, &a).await,
-        "list_agents" => list_agents(st, caller),
-        "ask_agent" => ask_agent(st, caller, &a).await,
+        // `list_bots` / `ask_bot`: the first pass's names, which older persona files still use;
+        // accepted (same guards), not listed.
+        "list_agents" | "list_bots" => list_agents(st, caller),
+        "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
         _ => return Err(()),
     };
     Ok(match res {
@@ -1118,7 +1120,11 @@ fn list_agents<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
 /// command anywhere, and the origin rule, hop limit, daily cap and permission check apply).
 /// Driving an agent's terminal with the other tools stays under the workspace rule.
 async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
-    let name = a.req_str("agent")?;
+    // `bot`: the argument's name under the old `ask_bot`.
+    let name = match a.req_str("agent") {
+        Ok(n) => n,
+        Err(e) => a.req_str("bot").map_err(|_| e)?,
+    };
     let text = a.req_str("text")?;
     let timeout_s = a
         .int("timeout_seconds")?

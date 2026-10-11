@@ -537,6 +537,21 @@ try {
     await a.key("Ctrl+a");
     await a.type("# Notes\nsaved from the panel");
     await a.wait(`!!document.querySelector('.mem-dirty')`, 1000);
+    // The draft survives a trip to the Settings tab, and closing asks before discarding it.
+    await a.eval(
+      `[...document.querySelectorAll('.dlg-tab')].find((t) => t.textContent === 'Settings').click()`,
+    );
+    await a.wait(`document.querySelector('.persona-input')?.offsetParent !== null`, 1000);
+    await a.eval(
+      `[...document.querySelectorAll('.dlg-tab')].find((t) => t.textContent === 'Memory').click()`,
+    );
+    await a.wait(`document.querySelector('.mem-text')?.value.endsWith('saved from the panel')`, 1000);
+    await a.key("Escape");
+    await a.wait(`!!document.querySelector('.mem-discard') && !!document.querySelector('.agent-dlg')`, 1000);
+    await a.eval(
+      `[...document.querySelectorAll('.dlg-foot .btn')].find((b) => b.textContent === 'Keep editing').click()`,
+    );
+    await a.wait(`!document.querySelector('.mem-discard')`, 1000);
     await a.click(".mem-save");
     await a.wait(`!document.querySelector('.mem-dirty')`, 2000);
     const saved: any = await R(a, "agent.memory.read", { name: "orchestrator", path: "notes.md" });
@@ -544,7 +559,7 @@ try {
     await shot(a, "11-agent-memory");
     await a.key("Escape");
     await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
-    ok("Edit ▸ Memory listed memory/, opened a file and saved an edit");
+    ok("Edit ▸ Memory listed memory/, kept a draft across tabs, asked before discarding it, and saved");
     await a.sleep(500); // the layout (with the panel flag) saves debounced
   }
 

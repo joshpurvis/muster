@@ -187,10 +187,14 @@ the New agent dialog warns); the default stays human-only.
 **The bots → agents move** (store migration v9, then `agents::relocate_homes` at daemon start,
 before the hub loads): tables, columns and the index are renamed; `<data>/bots` becomes
 `<data>/agents` (one rename, or per folder when `<data>/agents` already exists; a name taken on
-both sides stays where it is with a warning in the daemon log; links are refused). A record whose
-old folder is gone is re-pointed and forgets its conversation id (Claude keeps conversations per
-folder, so `--resume` can't find it from the new one); its sessions' cwd and the agents
-workspace follow. Safe to run again.
+both sides stays where it is with a warning in the daemon log; links are refused; a folder that
+can't be read is never taken for missing and stops the move, or keeps that entry). A record is
+re-pointed only when its move is verified (old folder gone, `<data>/agents/<folder>` a real
+folder); anything else leaves it on the old path with a warning. A re-pointed agent forgets its
+conversation id (Claude keeps conversations per folder, so `--resume` can't find it from the new
+one), its session's stored arguments lose `--resume`, its sessions' cwd and the agents workspace
+follow, and its persona files have the old tool names (`ask_bot`, `list_bots`) replaced. Restarts
+of an agent's session rebuild its arguments from the record. Safe to run again.
 
 **Panel v1 (shipped).** A left dock per window (Alt+G): agents with their state, click to start
 and pull the tab here, a context menu (Edit, Start fresh, Stop, Autostart, Remove), and a live

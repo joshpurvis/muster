@@ -130,7 +130,15 @@ typing in a shell tab, with that shell's provenance if an agent ever typed into 
 **Refusals are logged.** A message refused by the agent's policy (`ask_agent`'s permission
 check, origin rule, hop limit or daily cap, and the same checks behind `muster ask`) is kept in
 `agent_messages` with the reason and shown in the agents panel's log (`agent.messages`,
-`agent_message` events). It is never delivered and never counts toward the cap.
+`agent_message` events). It is never delivered and never counts toward the cap. Bounded: per
+sender at most 10 refusals per 10 minutes are stored (more are only counted, and the next stored
+one says how many), the text is cut to 2 KB, and refused rows are pruned to the last 30 days and
+the newest 1000.
+
+**Old names.** `ask_bot` (argument `bot` or `agent`) and `list_bots`, the first pass's names
+that older persona files still use, are accepted with the same guards but not listed. The
+bots → agents move also rewrites exact occurrences of those names (and
+`mcp__muster__ask_bot` / `mcp__muster__list_bots`) in agents' `CLAUDE.md` / `AGENTS.md`.
 
 **Limits** (not closed): an agent that drops `MUSTER_SESSION_ID` and calls the API with the client
 token is the human as far as the daemon can tell (the documented client-token limit, PROTOCOL.md

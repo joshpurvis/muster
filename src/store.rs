@@ -625,6 +625,16 @@ impl Store {
         Ok(Ok(id))
     }
 
+    /// Retention for refused messages: drop those created before `before`, and all but the
+    /// newest `keep`. Delivered messages are never pruned. Returns the rows deleted.
+    pub fn prune_refused_agent_messages(&self, before: i64, keep: usize) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().execute(
+            "DELETE FROM agent_messages WHERE refused IS NOT NULL AND (created_at < ?1 OR id NOT IN (
+                SELECT id FROM agent_messages WHERE refused IS NOT NULL ORDER BY id DESC LIMIT ?2))",
+            params![before, keep as i64],
+        )?)
+    }
+
     /// A message that was never delivered (the send failed): it must not count toward the cap.
     pub fn delete_agent_message(&self, id: i64) -> anyhow::Result<()> {
         self.conn.lock().execute("DELETE FROM agent_messages WHERE id = ?1", [id])?;
@@ -1367,6 +1377,36 @@ mod tests {
         // Nothing left to do on the next open.
         s.migrate().unwrap();
         assert_eq!(s.load_agents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refused_messages_are_pruned_by_age_and_count() {
+        let s = Store::open_memory().unwrap();
+        let m = crate::agents::AgentMessage {
+            id: 0,
+            from: "human".into(),
+            from_session: None,
+            to_agent: 1,
+            to_session: None,
+            origin: crate::agents::Origin::Human,
+            hop: 0,
+            reply_to: None,
+            created_at: 100,
+            reply: None,
+            replied_at: None,
+            text: Some("x".into()),
+            refused: None,
+            to_name: None,
+        };
+        let delivered = s.insert_agent_message(&m).unwrap();
+        for at in [100, 200, 300, 400, 500] {
+            s.insert_refused_agent_message(&crate::agents::AgentMessage { created_at: at, ..m.clone() }, "no").unwrap();
+        }
+        // Older than 250 goes; of the rest, only the newest 2 stay. Delivered rows never go.
+        assert_eq!(s.prune_refused_agent_messages(250, 2).unwrap(), 3);
+        let left: Vec<i64> = s.agent_messages(None, None, 10).unwrap().iter().map(|m| m.created_at).collect();
+        assert_eq!(left, vec![500, 400, 100]);
+        assert!(s.agent_message(delivered).unwrap().is_some());
     }
 
     #[test]

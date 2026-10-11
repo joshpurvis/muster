@@ -381,7 +381,11 @@ export function AgentDialog(
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const memDirty = useRef(false);
-  const escArmed = useRef(false);
+  /** The Memory tab was opened: it stays mounted (hidden) from then on, so its draft survives
+   * switching tabs. */
+  const [memSeen, setMemSeen] = useState(tab === "memory");
+  /** Closing with unsaved memory edits asks first (a bar in the footer). */
+  const [askDiscard, setAskDiscard] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -459,11 +463,13 @@ export function AgentDialog(
     }
   };
 
-  // Unsaved memory edits survive one Esc (a toast says why); a second one discards them.
+  // Unsaved memory edits are never dropped silently: closing asks first (Esc on the question
+  // keeps editing).
   const onClose = () => {
-    if (memDirty.current && !escArmed.current) {
-      escArmed.current = true;
-      toast("warn", "Unsaved changes in memory/. Save, or close again to discard them.");
+    if (askDiscard) return setAskDiscard(false);
+    if (memDirty.current) {
+      setTab("memory");
+      setAskDiscard(true);
       return;
     }
     close();
@@ -508,7 +514,10 @@ export function AgentDialog(
                   role="tab"
                   aria-selected={tab === t}
                   class={cx("dlg-tab", tab === t && "on")}
-                  onClick={() => setTab(t)}
+                  onClick={() => {
+                    setTab(t);
+                    if (t === "memory") setMemSeen(true);
+                  }}
                 >
                   {t === "settings" ? "Settings" : "Memory"}
                 </button>
@@ -516,8 +525,9 @@ export function AgentDialog(
             </div>
           )}
         </div>
-        {tab === "memory" && agent ? <MemoryTab agent={agent} dirty={memDirty} /> : (
-          <div class="dlg-body">
+        {agent && memSeen && <MemoryTab agent={agent} dirty={memDirty} hidden={tab !== "memory"} />}
+        {
+          <div class="dlg-body" hidden={tab !== "settings"}>
             {!agent && templates.length > 0 && (
               <div class="field">
                 <span class="field-label">Start from</span>
@@ -664,9 +674,17 @@ export function AgentDialog(
             </label>
             {err && <div class="form-error">{err}</div>}
           </div>
-        )}
+        }
         <div class="dlg-foot">
-          {tab === "settings"
+          {askDiscard
+            ? (
+              <>
+                <span class="dlg-foot-hint mem-discard">Discard your unsaved memory/ edits?</span>
+                <button type="button" class="btn" onClick={() => setAskDiscard(false)}>Keep editing</button>
+                <button type="button" class="btn btn-danger" onClick={close}>Discard</button>
+              </>
+            )
+            : tab === "settings"
             ? (
               <>
                 <span class="muted dlg-foot-hint">
@@ -691,7 +709,9 @@ interface MemFile {
   modified: number | null;
 }
 
-function MemoryTab({ agent, dirty }: { agent: Agent; dirty: { current: boolean } }) {
+function MemoryTab(
+  { agent, dirty, hidden }: { agent: Agent; dirty: { current: boolean }; hidden: boolean },
+) {
   const [files, setFiles] = useState<MemFile[] | null>(null);
   const [sel, setSel] = useState<string | null>(null);
   const [text, setText] = useState("");
@@ -767,7 +787,7 @@ function MemoryTab({ agent, dirty }: { agent: Agent; dirty: { current: boolean }
   }, [files, sel, orig]);
 
   return (
-    <div class="dlg-body mem">
+    <div class="dlg-body mem" hidden={hidden}>
       <div class="mem-side">
         <div class="mem-files" role="listbox" aria-label="memory/ files">
           {files === null && <span class="muted mem-note">Loading…</span>}

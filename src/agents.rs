@@ -238,25 +238,48 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     )
 }
 
-/// Agent homes are written by the daemon: refuse a symbolic link anywhere we write, so an agent (or
-/// anything else) can't point its home or persona file at another file and have muster write
-/// or truncate it.
-fn refuse_symlink(p: &Path) -> anyhow::Result<()> {
-    if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
-        anyhow::bail!("{} is a symbolic link; muster doesn't write through links in agent homes", p.display());
+/// `symlink_metadata`, where only a missing path is `None`: any other error (permissions, I/O)
+/// is an error, never taken for "not there".
+fn lstat(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(())
 }
 
-/// The agent's home and `memory/` (0700), refusing links.
+/// Agent homes are written by the daemon: refuse a symbolic link anywhere we write, so an agent (or
+/// anything else) can't point its home or persona file at another file and have muster write
+/// or truncate it. A path that can't be checked is refused too.
+fn refuse_symlink(p: &Path) -> anyhow::Result<()> {
+    match lstat(p) {
+        Ok(Some(m)) if m.file_type().is_symlink() => {
+            anyhow::bail!("{} is a symbolic link; muster doesn't write through links in agent homes", p.display())
+        }
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!("can't check {}: {e}", p.display()),
+    }
+}
+
+/// A folder of an agent home: created (0700) when missing; refused when it is a link, not a
+/// folder, or can't be read (never replaced by a fresh empty one).
+fn ensure_home_dir(p: &Path) -> anyhow::Result<()> {
+    match lstat(p) {
+        Ok(Some(m)) if m.file_type().is_symlink() => {
+            anyhow::bail!("{} is a symbolic link; muster doesn't write through links in agent homes", p.display())
+        }
+        Ok(Some(m)) if !m.is_dir() => anyhow::bail!("{} is not a folder", p.display()),
+        Ok(_) => {}
+        Err(e) => anyhow::bail!("can't read {}: {e}; not creating a new one in its place", p.display()),
+    }
+    paths::ensure_private_dir(p).map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))
+}
+
+/// The agent's home and `memory/` (0700), refusing links and folders it can't read.
 fn ensure_home(home: &Path) -> anyhow::Result<()> {
-    refuse_symlink(&paths::agents_dir())?;
-    paths::ensure_private_dir(&paths::agents_dir())?;
-    refuse_symlink(home)?;
-    paths::ensure_private_dir(home)?;
-    let mem = home.join("memory");
-    refuse_symlink(&mem)?;
-    paths::ensure_private_dir(&mem)?;
+    ensure_home_dir(&paths::agents_dir())?;
+    ensure_home_dir(home)?;
+    ensure_home_dir(&home.join("memory"))?;
     Ok(())
 }
 
@@ -285,75 +308,148 @@ fn write_persona(path: &Path, text: &str) -> anyhow::Result<()> {
 pub struct HomesMove {
     /// Folder names now under `<data>/agents` (everything, when the whole dir was renamed).
     pub moved: Vec<String>,
-    /// Folder names left in `<data>/bots`, with the reason (a conflict, a link).
+    /// Folder names left in `<data>/bots`, with the reason (a conflict, a link, an error).
     pub kept: Vec<(String, String)>,
-    /// The whole move was refused (a link or a non-directory where a folder should be).
+    /// The whole move was refused (a link, a non-directory, or a folder that can't be read).
     pub refused: Option<String>,
 }
 
+#[cfg(test)]
 fn is_link(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn dir_names(dir: &Path) -> std::io::Result<Vec<String>> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        v.push(e?.file_name().to_string_lossy().into_owned());
+    }
+    v.sort();
+    Ok(v)
 }
 
 /// Move `old` (`<data>/bots`) to `new` (`<data>/agents`). When `new` doesn't exist, one rename;
 /// otherwise each entry of `old` moves unless `new` already has one of that name (a conflict:
 /// both stay, nothing is merged inside a folder). Links are refused, like everywhere in agent
-/// homes: `old` or `new` being one stops the move, an entry being one stays put. `old` is
+/// homes: `old` or `new` being one stops the move, an entry being one stays put. A path that
+/// can't be read is never taken for missing: it stops the move (or keeps that entry). `old` is
 /// removed once empty. Safe to run again: a missing `old` is "already moved".
 pub fn move_homes(old: &Path, new: &Path) -> HomesMove {
     let mut out = HomesMove::default();
-    let Ok(meta) = std::fs::symlink_metadata(old) else { return out };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        out.refused = Some(format!("{} is a symbolic link or not a folder", old.display()));
-        return out;
+    match lstat(old) {
+        Ok(None) => return out,
+        Ok(Some(m)) if m.file_type().is_symlink() || !m.is_dir() => {
+            out.refused = Some(format!("{} is a symbolic link or not a folder", old.display()));
+            return out;
+        }
+        Ok(Some(_)) => {}
+        Err(e) => {
+            out.refused = Some(format!("can't read {}: {e}", old.display()));
+            return out;
+        }
     }
-    let names = |dir: &Path| -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(dir)
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
-            .unwrap_or_default();
-        v.sort();
-        v
+    let names = match dir_names(old) {
+        Ok(n) => n,
+        Err(e) => {
+            out.refused = Some(format!("can't list {}: {e}", old.display()));
+            return out;
+        }
     };
-    match std::fs::symlink_metadata(new) {
-        Err(_) => {
-            let all = names(old);
+    match lstat(new) {
+        Ok(None) => {
             match std::fs::rename(old, new) {
-                Ok(()) => out.moved = all,
+                Ok(()) => out.moved = names,
                 Err(e) => out.refused = Some(format!("renaming {} to {}: {e}", old.display(), new.display())),
             }
             return out;
         }
-        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+        Ok(Some(m)) if m.file_type().is_symlink() || !m.is_dir() => {
             out.refused = Some(format!("{} is a symbolic link or not a folder", new.display()));
             return out;
         }
-        Ok(_) => {}
-    }
-    for name in names(old) {
-        let (from, to) = (old.join(&name), new.join(&name));
-        if is_link(&from) {
-            out.kept.push((name, "it is a symbolic link".into()));
-        } else if std::fs::symlink_metadata(&to).is_ok() {
-            out.kept.push((name, format!("{} already exists", to.display())));
-        } else if let Err(e) = std::fs::rename(&from, &to) {
-            out.kept.push((name, e.to_string()));
-        } else {
-            out.moved.push(name);
+        Ok(Some(_)) => {}
+        Err(e) => {
+            out.refused = Some(format!("can't read {}: {e}", new.display()));
+            return out;
         }
     }
-    if names(old).is_empty() {
+    for name in names {
+        let (from, to) = (old.join(&name), new.join(&name));
+        let kept = match (lstat(&from), lstat(&to)) {
+            (Err(e), _) | (_, Err(e)) => Some(format!("can't check it: {e}")),
+            (Ok(None), _) => continue,
+            (Ok(Some(m)), _) if m.file_type().is_symlink() => Some("it is a symbolic link".into()),
+            (_, Ok(Some(_))) => Some(format!("{} already exists", to.display())),
+            (Ok(Some(_)), Ok(None)) => std::fs::rename(&from, &to).err().map(|e| e.to_string()),
+        };
+        match kept {
+            Some(why) => out.kept.push((name, why)),
+            None => out.moved.push(name),
+        }
+    }
+    if dir_names(old).is_ok_and(|n| n.is_empty()) {
         let _ = std::fs::remove_dir(old);
     }
     out
 }
 
+/// Tool names an older persona file may still use (the first pass called agents bots).
+const OLD_TOOL_NAMES: [(&str, &str); 4] = [
+    ("mcp__muster__ask_bot", "mcp__muster__ask_agent"),
+    ("mcp__muster__list_bots", "mcp__muster__list_agents"),
+    ("ask_bot", "ask_agent"),
+    ("list_bots", "list_agents"),
+];
+
+/// `text` with exact occurrences of the old tool names replaced (a whole identifier: never part
+/// of a longer word); everything else untouched. None when nothing changed.
+pub fn rename_old_tools(text: &str) -> Option<String> {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut out = text.to_string();
+    for (old, new) in OLD_TOOL_NAMES {
+        let mut res = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(old) {
+            let before = rest[..i].chars().next_back().or_else(|| res.chars().next_back());
+            let after = rest[i + old.len()..].chars().next();
+            res.push_str(&rest[..i]);
+            res.push_str(if word(before) || word(after) { old } else { new });
+            rest = &rest[i + old.len()..];
+        }
+        res.push_str(rest);
+        out = res;
+    }
+    (out != text).then_some(out)
+}
+
+/// The persona files in `home` name the current tools (`rename_old_tools`). Best effort.
+fn rename_tools_in_persona(home: &Path) {
+    for f in ["CLAUDE.md", "AGENTS.md"] {
+        let p = home.join(f);
+        let Ok(Some(m)) = lstat(&p) else { continue };
+        if !m.is_file() {
+            continue;
+        }
+        match std::fs::read_to_string(&p).map(|t| rename_old_tools(&t)) {
+            Ok(Some(t)) => {
+                if let Err(e) = write_persona(&p, &t) {
+                    tracing::warn!("updating tool names in {}: {e:#}", p.display());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("reading {}: {e}", p.display()),
+        }
+    }
+}
+
 /// At daemon start, before the hub loads anything: move `<data>/bots` to `<data>/agents`
-/// (`move_homes`) and re-point what the store says lived there. An agent whose old home is gone
-/// (moved now, moved by an earlier start, or deleted) gets `<data>/agents/<folder>` and forgets
-/// its conversation id: Claude keeps conversations per cwd, so `--resume` can't find it from the
-/// new folder. Sessions that ran in the old folder follow it. An agent whose old home is still
-/// there (a conflict or a link) keeps it, and a warning says why. The agents workspace and its
-/// tabs move to `<data>/agents`. Idempotent: nothing under `<data>/bots` means nothing to do.
+/// (`move_homes`) and re-point what the store says lived there. An agent is re-pointed only when
+/// its move is verified: the old folder is gone and `<data>/agents/<folder>` is a real folder.
+/// It then forgets its conversation id (Claude keeps conversations per cwd, so `--resume` can't
+/// find it from the new folder): its session's stored arguments lose `--resume`, sessions that
+/// ran in the old folder follow it, and its persona files name the current tools. Anything else
+/// (the old home still there, unreadable, or missing on both sides) leaves the record on the old
+/// path with a warning. The agents workspace and its tabs move to `<data>/agents`. Idempotent.
 pub fn relocate_homes(store: &Store, data: &Path) -> anyhow::Result<()> {
     let (old, new) = (data.join("bots"), data.join("agents"));
     // Stored paths are as written (`<data>/bots/<name>`) or canonical (workspaces): match both.
@@ -380,13 +476,29 @@ pub fn relocate_homes(store: &Store, data: &Path) -> anyhow::Result<()> {
         if folder.components().count() != 1 {
             continue;
         }
-        if std::fs::symlink_metadata(&home).is_ok() {
-            tracing::warn!(agent = a.name, "home {} was not moved; the agent keeps it", home.display());
+        let to = new.join(&folder);
+        let verified = match (lstat(&home), lstat(&to)) {
+            (Ok(None), Ok(Some(m))) if m.is_dir() && !m.file_type().is_symlink() => Ok(()),
+            (Ok(Some(_)), _) => Err("its old home is still there".to_string()),
+            (Err(e), _) => Err(format!("can't check its old home: {e}")),
+            (_, Err(e)) => Err(format!("can't check {}: {e}", to.display())),
+            (Ok(None), Ok(Some(_))) => Err(format!("{} is not a folder", to.display())),
+            (Ok(None), Ok(None)) => Err(format!("its home is in neither {} nor {}", home.display(), to.display())),
+        };
+        if let Err(why) = verified {
+            tracing::warn!(agent = a.name, "keeping home {} ({why})", home.display());
             continue;
         }
-        let to = new.join(&folder);
         let from: Vec<String> = olds.iter().map(|o| o.join(&folder).to_string_lossy().into_owned()).collect();
         store.relocate_agent_home(a.id, &from, &to.to_string_lossy())?;
+        // Its session's stored arguments still carry the old `--resume`.
+        if let Some(sid) = a.session_id {
+            match agent_args(a.kind, a.model.as_deref(), a.effort.as_deref(), None) {
+                Ok(args) => store.set_session_extra_args(sid, &args)?,
+                Err(e) => tracing::warn!(agent = a.name, "regenerating its arguments: {e:#}"),
+            }
+        }
+        rename_tools_in_persona(&to);
         tracing::info!(agent = a.name, "home is now {}; its next conversation starts fresh", to.display());
     }
     // The workspace's path is canonical (`add_workspace`): so is its new one.
@@ -619,7 +731,18 @@ struct RegInner {
     delivered: HashMap<i64, (SessionId, i64)>,
     /// Sessions that got human input through a client since their last attributed delivery.
     human_seen: HashSet<SessionId>,
+    /// Refusals per sender label: (window start, stored in it, not stored since the last stored).
+    refusals: HashMap<String, (i64, u32, u32)>,
 }
+
+/// Refused messages kept per sender per window; past that they are only counted.
+pub const REFUSALS_PER_WINDOW: u32 = 10;
+pub const REFUSAL_WINDOW_MS: i64 = 10 * 60_000;
+/// A refused message's text is kept up to this many bytes.
+pub const REFUSAL_TEXT_MAX: usize = 2048;
+/// Refused rows older than this, or past the newest `REFUSED_KEEP`, are pruned.
+pub const REFUSED_MAX_AGE_MS: i64 = 30 * 86_400_000;
+pub const REFUSED_KEEP: usize = 1000;
 
 pub struct Registry {
     inner: Mutex<RegInner>,
@@ -739,6 +862,31 @@ impl Registry {
                     }
                 }
             }
+        }
+    }
+
+    /// May a refusal from `sender` be stored now? `Some(n)`: yes, and `n` earlier ones were
+    /// only counted (over the budget). `None`: over `REFUSALS_PER_WINDOW` in this window: counted,
+    /// not stored.
+    pub fn refusal_budget(&self, sender: &str, now: i64) -> Option<u32> {
+        let mut g = self.inner.lock();
+        if g.refusals.len() > 1000 {
+            g.refusals.retain(|_, (start, _, skipped)| now - *start < REFUSAL_WINDOW_MS || *skipped > 0);
+        }
+        let e = g.refusals.entry(sender.to_string()).or_insert((now, 0, 0));
+        if now - e.0 >= REFUSAL_WINDOW_MS {
+            e.0 = now;
+            e.1 = 0;
+        }
+        if e.1 < REFUSALS_PER_WINDOW {
+            e.1 += 1;
+            Some(std::mem::take(&mut e.2))
+        } else {
+            e.2 += 1;
+            if e.2 == 1 {
+                tracing::warn!("{sender}: more than {REFUSALS_PER_WINDOW} refused messages in 10 minutes; counting, not storing");
+            }
+            None
         }
     }
 
@@ -1077,10 +1225,12 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
     let home = PathBuf::from(&agent.home_dir);
     ensure_home(&home)?;
     let persona = home.join(persona_file(agent.kind));
-    if std::fs::symlink_metadata(&persona).is_err() {
-        write_persona(&persona, &persona_text(&agent.name, agent.kind, &agent.persona))?;
+    // Only a missing persona file is (re)written; one that can't be read is an error.
+    match lstat(&persona) {
+        Ok(None) => write_persona(&persona, &persona_text(&agent.name, agent.kind, &agent.persona))?,
+        Ok(Some(_)) => refuse_symlink(&persona)?,
+        Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
-    refuse_symlink(&persona)?;
     if let Some(sid) = agent.session_id
         && let Some(info) = hub.session(sid)
         && hub.channel(info.channel_id).is_some_and(|c| !c.archived)
@@ -1145,6 +1295,14 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
     Ok(AgentSession { agent, session, started: true })
 }
 
+/// The CLI arguments a restart of session `sid` must use when it is a named agent's: rebuilt
+/// from the agent's record (model, effort, and `--resume` only with its current conversation
+/// id), so no restart replays an argument the record no longer has. None: not an agent's.
+pub fn restart_args(reg: &Registry, sid: SessionId) -> Option<anyhow::Result<Vec<String>>> {
+    let a = reg.by_session(sid)?;
+    Some(agent_args(a.kind, a.model.as_deref(), a.effort.as_deref(), a.resume_id.as_deref()))
+}
+
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
 pub async fn autostart(hub: &Arc<Hub>) {
     for a in hub.agents().list().into_iter().filter(|a| a.autostart) {
@@ -1199,11 +1357,38 @@ pub fn message_record(agent: &Agent, from: &str, from_session: Option<SessionId>
     }
 }
 
+/// `s` cut to at most `max` bytes (on a character boundary), marked with `…` when cut.
+pub fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Keep a refused message for the log (`agent.messages`) and tell clients. Never delivered.
+/// Bounded: per sender at most `REFUSALS_PER_WINDOW` per 10 minutes are stored (the rest are
+/// counted, and the next stored one says how many), text cut to `REFUSAL_TEXT_MAX`, and refused
+/// rows pruned to the last 30 days and the newest `REFUSED_KEEP`.
 pub fn record_refused(hub: &Hub, m: &AgentMessage, why: &str) {
-    match hub.store().insert_refused_agent_message(m, why) {
+    let now = now_ms();
+    let Some(skipped) = hub.agents().refusal_budget(&m.from, now) else { return };
+    let mut m = m.clone();
+    m.text = m.text.map(|t| truncate_bytes(&t, REFUSAL_TEXT_MAX));
+    let why = if skipped > 0 {
+        format!("{why} (+{skipped} earlier refused messages from {} counted, not stored)", m.from)
+    } else {
+        why.to_string()
+    };
+    match hub.store().insert_refused_agent_message(&m, &truncate_bytes(&why, REFUSAL_TEXT_MAX)) {
         Ok(id) => publish_message(hub, id),
         Err(e) => tracing::warn!("recording a refused message: {e}"),
+    }
+    if let Err(e) = hub.store().prune_refused_agent_messages(now - REFUSED_MAX_AGE_MS, REFUSED_KEEP) {
+        tracing::warn!("pruning refused messages: {e}");
     }
 }
 
@@ -1560,63 +1745,212 @@ pub fn memory_rel(path: &str) -> anyhow::Result<PathBuf> {
     Ok(pb.to_path_buf())
 }
 
-/// The agent's memory/ dir, refusing links on the way to it.
-fn memory_dir(a: &Agent) -> anyhow::Result<PathBuf> {
-    let home = PathBuf::from(&a.home_dir);
-    refuse_symlink(&home)?;
-    let mem = home.join("memory");
-    refuse_symlink(&mem)?;
-    Ok(mem)
-}
+/// Directory walking relative to an open directory (`openat` with `O_NOFOLLOW`), so a link
+/// swapped into memory/ between a check and a use can't redirect a read or a write: every
+/// component is opened from the one before it, and none may be a link.
+mod at {
+    use std::ffi::CString;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::path::Path;
 
-/// Every component of `rel` under `base` that exists must not be a link.
-fn refuse_links_along(base: &Path, rel: &Path) -> anyhow::Result<()> {
-    let mut cur = base.to_path_buf();
-    for c in rel.components() {
-        cur.push(c);
-        refuse_symlink(&cur)?;
+    fn cstr(s: &str) -> io::Result<CString> {
+        CString::new(s).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     }
-    Ok(())
+
+    fn check(r: libc::c_int) -> io::Result<libc::c_int> {
+        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(r) }
+    }
+
+    /// `ELOOP` / `ENOTDIR` on an `O_NOFOLLOW` open of a link: say so plainly.
+    fn link_error(e: io::Error, name: &str) -> io::Error {
+        match e.raw_os_error() {
+            Some(libc::ELOOP) | Some(libc::EMLINK) => {
+                io::Error::other(format!("{name} is a symbolic link; muster doesn't follow links in memory/"))
+            }
+            _ => e,
+        }
+    }
+
+    /// Open a directory by path, the last component without following a link.
+    pub fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+        let c = cstr(&path.to_string_lossy())?;
+        // SAFETY: a valid C string; the returned fd is owned below.
+        let fd = check(unsafe {
+            libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        })
+        .map_err(|e| link_error(e, &path.display().to_string()))?;
+        // SAFETY: fd was just opened and is owned by nobody else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Open the directory `name` under `dir` (no link), creating it (0700) when `create`.
+    pub fn sub_dir(dir: &OwnedFd, name: &str, create: bool) -> io::Result<OwnedFd> {
+        let c = cstr(name)?;
+        if create {
+            // SAFETY: valid fd and C string.
+            let r = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) };
+            if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        // SAFETY: valid fd and C string; the returned fd is owned below.
+        let fd = check(unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })
+        .map_err(|e| match e.raw_os_error() {
+            // O_DIRECTORY|O_NOFOLLOW on a link fails with ENOTDIR or ELOOP.
+            Some(libc::ENOTDIR) if stat(dir, name).is_ok_and(|s| is_link(&s)) => link_error(io::Error::from_raw_os_error(libc::ELOOP), name),
+            _ => link_error(e, name),
+        })?;
+        // SAFETY: fd was just opened and is owned by nobody else.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Open the file `name` under `dir` with `flags` (plus `O_NOFOLLOW | O_CLOEXEC`).
+    pub fn file(dir: &OwnedFd, name: &str, flags: libc::c_int, mode: libc::mode_t) -> io::Result<std::fs::File> {
+        let c = cstr(name)?;
+        // SAFETY: valid fd and C string; the returned fd is owned below.
+        let fd = check(unsafe {
+            libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode as libc::c_uint)
+        })
+        .map_err(|e| link_error(e, name))?;
+        // SAFETY: fd was just opened and is owned by nobody else.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// `fstatat(..., AT_SYMLINK_NOFOLLOW)`.
+    pub fn stat(dir: &OwnedFd, name: &str) -> io::Result<libc::stat> {
+        let c = cstr(name)?;
+        // SAFETY: zeroed stat is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: valid fd, C string and out-pointer.
+        check(unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) })?;
+        Ok(st)
+    }
+
+    pub fn is_link(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    }
+    pub fn is_dir(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFDIR
+    }
+    pub fn is_file(st: &libc::stat) -> bool {
+        st.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
+
+    pub fn rename(dir: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+        let (a, b) = (cstr(from)?, cstr(to)?);
+        // SAFETY: valid fds and C strings.
+        check(unsafe { libc::renameat(dir.as_raw_fd(), a.as_ptr(), dir.as_raw_fd(), b.as_ptr()) })?;
+        Ok(())
+    }
+
+    pub fn unlink(dir: &OwnedFd, name: &str) {
+        if let Ok(c) = cstr(name) {
+            // SAFETY: valid fd and C string.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) };
+        }
+    }
+
+    /// Entry names of an open directory (without `.` and `..`).
+    pub fn names(dir: &OwnedFd) -> io::Result<Vec<String>> {
+        // SAFETY: dup of a valid fd; fdopendir takes ownership of the duplicate.
+        let dup: RawFd = check(unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+        // SAFETY: dup is a valid directory fd.
+        let d = unsafe { libc::fdopendir(dup) };
+        if d.is_null() {
+            let e = io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so dup is still ours to close.
+            unsafe { libc::close(dup) };
+            return Err(e);
+        }
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: d is a valid DIR*.
+            let ent = unsafe { libc::readdir(d) };
+            if ent.is_null() {
+                break;
+            }
+            // SAFETY: readdir returned a valid dirent with a NUL-terminated name.
+            let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_string_lossy().into_owned();
+            if name != "." && name != ".." {
+                out.push(name);
+            }
+        }
+        // SAFETY: d is valid and closed once (this also closes dup).
+        unsafe { libc::closedir(d) };
+        Ok(out)
+    }
 }
 
-/// `agent.memory.list`: files under memory/ (links skipped), as `/`-separated relative paths.
+/// The agent's memory/ dir, opened without following links (home and memory/ themselves).
+/// Not closed: the folders above the home (`<data>/agents`) are reached by path; they are the
+/// daemon's own 0700 folders, which agents run inside of but don't own the parent of.
+fn open_memory(a: &Agent, create: bool) -> anyhow::Result<std::os::fd::OwnedFd> {
+    let home = PathBuf::from(&a.home_dir);
+    if create {
+        ensure_home(&home)?;
+    }
+    let h = at::open_dir(&home).map_err(|e| anyhow::anyhow!("{}: {e}", home.display()))?;
+    at::sub_dir(&h, "memory", false).map_err(|e| anyhow::anyhow!("memory/: {e}"))
+}
+
+/// Open the folders of `rel` (all but its last part) from memory/, refusing links; `create`
+/// makes missing ones. Returns the innermost folder and the file name.
+fn walk_memory(
+    mem: std::os::fd::OwnedFd,
+    rel: &Path,
+    create: bool,
+) -> anyhow::Result<(std::os::fd::OwnedFd, String)> {
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let (name, dirs) = parts.split_last().ok_or_else(|| anyhow::anyhow!("empty memory path"))?;
+    let mut cur = mem;
+    for d in dirs {
+        cur = at::sub_dir(&cur, d, create).map_err(|e| anyhow::anyhow!("memory/{}: {e}", rel.display()))?;
+    }
+    Ok((cur, name.clone()))
+}
+
+fn mtime_ms(st: &libc::stat) -> i64 {
+    st.st_mtime * 1000 + st.st_mtime_nsec / 1_000_000
+}
+
+/// `agent.memory.list`: files under memory/ (links skipped, never followed), as `/`-separated
+/// relative paths.
 pub fn memory_list(a: &Agent) -> anyhow::Result<Value> {
-    let mem = memory_dir(a)?;
+    let mem = open_memory(a, false)?;
     let mut files: Vec<Value> = Vec::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(mem.join(&rel)) else { continue };
-        for e in rd.filter_map(|e| e.ok()) {
-            let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
-            let r = rel.join(e.file_name());
-            if meta.is_dir() {
-                stack.push(r);
-            } else if meta.is_file() && files.len() < MEMORY_LIST_MAX {
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64);
-                files.push(json!({ "path": r.to_string_lossy(), "size": meta.len(), "modified": modified }));
+    let mut stack = vec![(mem, String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(names) = at::names(&dir) else { continue };
+        for n in names {
+            let Ok(st) = at::stat(&dir, &n) else { continue };
+            let rel = if prefix.is_empty() { n.clone() } else { format!("{prefix}/{n}") };
+            if at::is_dir(&st) {
+                if let Ok(sub) = at::sub_dir(&dir, &n, false) {
+                    stack.push((sub, rel));
+                }
+            } else if at::is_file(&st) && files.len() < MEMORY_LIST_MAX {
+                files.push(json!({ "path": rel, "size": st.st_size, "modified": mtime_ms(&st) }));
             }
         }
     }
     files.sort_by(|x, y| x["path"].as_str().cmp(&y["path"].as_str()));
-    Ok(json!({ "dir": mem.to_string_lossy(), "files": files }))
+    let dir = Path::new(&a.home_dir).join("memory");
+    Ok(json!({ "dir": dir.to_string_lossy(), "files": files }))
 }
 
 /// `agent.memory.read`: a UTF-8 file of at most `MEMORY_FILE_MAX` bytes, never through a link.
 pub fn memory_read(a: &Agent, path: &str) -> anyhow::Result<Value> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
     let rel = memory_rel(path)?;
-    let mem = memory_dir(a)?;
-    refuse_links_along(&mem, &rel)?;
-    let p = mem.join(&rel);
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&p)
+    let (dir, name) = walk_memory(open_memory(a, false)?, &rel, false)?;
+    let f = at::file(&dir, &name, libc::O_RDONLY, 0)
         .map_err(|e| anyhow::anyhow!("reading memory/{}: {e}", rel.display()))?;
     let meta = f.metadata()?;
     if !meta.is_file() {
@@ -1632,46 +1966,33 @@ pub fn memory_read(a: &Agent, path: &str) -> anyhow::Result<Value> {
 }
 
 /// `agent.memory.write`: create or replace a file (and missing folders) under memory/. Written
-/// to a temporary file and renamed into place, so a link at the path is replaced, never
-/// written through (links on the way are refused first).
+/// to a temporary file of its own (random name, `O_EXCL`) and renamed into place in the same
+/// folder; a link at the path or on the way is refused (and a link raced in after that check
+/// is replaced by the rename, never written through). Concurrent writes never share a
+/// temporary file.
 pub fn memory_write(a: &Agent, path: &str, text: &str) -> anyhow::Result<Value> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     if text.len() > MEMORY_FILE_MAX {
         anyhow::bail!("memory files are at most {} KB", MEMORY_FILE_MAX / 1024);
     }
     let rel = memory_rel(path)?;
-    ensure_home(Path::new(&a.home_dir))?;
-    let mem = memory_dir(a)?;
-    refuse_links_along(&mem, &rel)?;
-    let p = mem.join(&rel);
-    if let Some(parent) = p.parent() {
-        paths::ensure_private_dir(parent)?;
-        // A folder created just now can't be a link, but one raced in can: check again.
-        refuse_links_along(&mem, &rel)?;
+    let (dir, name) = walk_memory(open_memory(a, true)?, &rel, true)?;
+    match at::stat(&dir, &name) {
+        Ok(s) if at::is_dir(&s) => anyhow::bail!("memory/{} is a folder", rel.display()),
+        Ok(s) if at::is_link(&s) => {
+            anyhow::bail!("memory/{} is a symbolic link; muster doesn't write through links", rel.display())
+        }
+        _ => {}
     }
-    if p.is_dir() {
-        anyhow::bail!("memory/{} is a folder", rel.display());
+    let tmp = format!(".{name}.muster-tmp-{}", &paths::random_token()[..16]);
+    let mut f = at::file(&dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)
+        .map_err(|e| anyhow::anyhow!("writing memory/{}: {e}", rel.display()))?;
+    let written = f.write_all(text.as_bytes()).and_then(|_| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|_| at::rename(&dir, &tmp, &name)) {
+        at::unlink(&dir, &tmp);
+        anyhow::bail!("writing memory/{}: {e}", rel.display());
     }
-    let tmp = p.with_file_name(format!(
-        ".{}.muster-tmp{}",
-        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&tmp);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)
-            .map_err(|e| anyhow::anyhow!("writing memory/{}: {e}", rel.display()))?;
-        f.write_all(text.as_bytes())?;
-    }
-    std::fs::rename(&tmp, &p).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
     Ok(json!({ "path": rel.to_string_lossy(), "size": text.len() }))
 }
 
@@ -2010,8 +2331,12 @@ mod tests {
         let store = old_layout(&data);
         relocate_homes(&store, &data).unwrap();
         let new = |n: &str| data.join("agents").join(n).to_string_lossy().into_owned();
-        // cody's home is gone everywhere: it gets the new place too (start recreates it).
-        assert_eq!(homes(&store), vec![("ada".into(), new("ada"), None), ("cody".into(), new("cody"), None)]);
+        // cody's home is in neither place: nothing verifies a move, so its record stays.
+        let old_cody = data.join("bots/cody").to_string_lossy().into_owned();
+        assert_eq!(
+            homes(&store),
+            vec![("ada".into(), new("ada"), None), ("cody".into(), old_cody, Some("conv-cody".into()))]
+        );
         assert!(!data.join("bots").exists());
         std::fs::remove_dir_all(&data).ok();
     }
@@ -2134,5 +2459,140 @@ mod tests {
         assert_eq!(w.permissions.codex_sandbox, CodexSandbox::WorkspaceWrite);
         // Claude templates take human-started work only.
         assert!(ts.iter().filter(|t| t.kind == SessionKind::Claude).all(|t| t.accepts == vec![Origin::Human]));
+    }
+
+    #[test]
+    fn relocate_strips_resume_and_renames_old_tools() {
+        let data = scratch("tools");
+        std::fs::create_dir_all(data.join("bots/ada/memory")).unwrap();
+        std::fs::create_dir_all(data.join("bots/cody")).unwrap();
+        let old_persona = "Use `list_bots` and ask_bot (mcp__muster__ask_bot). Keep my_ask_bot_notes and ask_bots.\n";
+        std::fs::write(data.join("bots/ada/CLAUDE.md"), old_persona).unwrap();
+        let store = old_layout(&data);
+        store.set_session_extra_args(1, &["--resume".to_string(), "conv-ada".to_string()]).unwrap();
+        relocate_homes(&store, &data).unwrap();
+        assert!(store.load_sessions().unwrap()[0].extra_args.is_empty(), "the stale --resume is gone");
+        assert_eq!(
+            std::fs::read_to_string(data.join("agents/ada/CLAUDE.md")).unwrap(),
+            "Use `list_agents` and ask_agent (mcp__muster__ask_agent). Keep my_ask_bot_notes and ask_bots.\n"
+        );
+        std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn old_tool_names_are_renamed_exactly() {
+        assert_eq!(rename_old_tools("nothing here"), None);
+        assert_eq!(rename_old_tools("ask_bot").as_deref(), Some("ask_agent"));
+        assert_eq!(rename_old_tools("mcp__muster__list_bots, list_bots.").as_deref(), Some("mcp__muster__list_agents, list_agents."));
+        assert_eq!(rename_old_tools("xask_bot list_botsy"), None);
+    }
+
+    #[test]
+    fn unreadable_homes_are_never_taken_for_missing() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let data = scratch("eacces");
+        std::fs::create_dir_all(data.join("bots/ada/memory")).unwrap();
+        std::fs::create_dir_all(data.join("agents")).unwrap();
+        let store = old_layout(&data);
+        // <data>/bots can't be listed: the move is refused, nothing is re-pointed.
+        std::fs::set_permissions(data.join("bots"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = move_homes(&data.join("bots"), &data.join("agents"));
+        assert!(r.refused.as_deref().is_some_and(|w| w.contains("can't")), "{r:?}");
+        relocate_homes(&store, &data).unwrap();
+        assert_eq!(homes(&store)[0].1, data.join("bots/ada").to_string_lossy());
+        // A home that exists but can't be read is refused, never replaced by an empty one.
+        let e = ensure_home_dir(&data.join("bots/ada")).unwrap_err().to_string();
+        assert!(e.contains("can't read"), "{e}");
+        std::fs::set_permissions(data.join("bots"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(data.join("bots/ada/memory").is_dir());
+        std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn memory_never_follows_a_linked_folder() {
+        let home = scratch("memlink");
+        let outside = scratch("memlink-outside");
+        std::fs::write(outside.join("secret.md"), "secret").unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        memory_write(&a, "notes.md", "x").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("memory/sub")).unwrap();
+        let e = memory_read(&a, "sub/secret.md").unwrap_err().to_string();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert!(memory_write(&a, "sub/new.md", "x").is_err());
+        assert!(!outside.join("new.md").exists());
+        let l = memory_list(&a).unwrap();
+        assert_eq!(l["files"].as_array().unwrap().len(), 1, "the linked folder isn't listed");
+        // memory/ itself being a link: refused too.
+        std::fs::remove_dir_all(home.join("memory")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("memory")).unwrap();
+        assert!(memory_read(&a, "secret.md").is_err());
+        assert!(memory_list(&a).is_err());
+        assert!(memory_write(&a, "x.md", "x").is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn memory_writes_use_their_own_temp_files() {
+        let home = scratch("memtmp");
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        memory_write(&a, "notes.md", "first").unwrap();
+        // Someone else's temp file (an old name scheme) is left alone.
+        let stale = home.join(format!("memory/.notes.md.muster-tmp{}", std::process::id()));
+        std::fs::write(&stale, "not mine").unwrap();
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let a = &a;
+                s.spawn(move || memory_write(a, "notes.md", &format!("writer {i}")).unwrap());
+            }
+        });
+        let text = memory_read(&a, "notes.md").unwrap()["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("writer "), "{text}");
+        let left: Vec<String> = std::fs::read_dir(home.join("memory"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2, "notes.md and the stale file only: {left:?}");
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "not mine");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn restarts_rebuild_args_from_the_record() {
+        let store = Store::open_memory().unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let mut b = agent(SessionKind::Claude);
+        b.model = Some("opus".into());
+        b.resume_id = Some("conv-1".into());
+        let b = reg.insert(&store, b).unwrap();
+        assert!(restart_args(&reg, 99).is_none(), "not an agent's session");
+        assert_eq!(restart_args(&reg, 9).unwrap().unwrap(), vec!["--model", "opus", "--resume", "conv-1"]);
+        reg.update(&store, b.id, |x| x.resume_id = None).unwrap();
+        assert_eq!(restart_args(&reg, 9).unwrap().unwrap(), vec!["--model", "opus"]);
+    }
+
+    #[test]
+    fn refusals_are_budgeted_and_capped() {
+        let store = Store::open_memory().unwrap();
+        let reg = Registry::load(&store).unwrap();
+        for _ in 0..REFUSALS_PER_WINDOW {
+            assert_eq!(reg.refusal_budget("session:4", 1_000), Some(0));
+        }
+        assert_eq!(reg.refusal_budget("session:4", 1_001), None);
+        assert_eq!(reg.refusal_budget("session:4", 1_002), None);
+        // Another sender has its own budget; the next window reports what was only counted.
+        assert_eq!(reg.refusal_budget("session:5", 1_002), Some(0));
+        assert_eq!(reg.refusal_budget("session:4", 1_000 + REFUSAL_WINDOW_MS), Some(2));
+        assert_eq!(reg.refusal_budget("session:4", 1_001 + REFUSAL_WINDOW_MS), Some(0));
+        let long = "é".repeat(REFUSAL_TEXT_MAX);
+        let cut = truncate_bytes(&long, REFUSAL_TEXT_MAX);
+        assert!(cut.len() <= REFUSAL_TEXT_MAX + "…".len() && cut.ends_with('…'));
+        assert_eq!(truncate_bytes("short", 10), "short");
     }
 }

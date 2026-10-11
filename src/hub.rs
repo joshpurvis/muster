@@ -498,6 +498,10 @@ impl Hub {
             Ok(_) => {}
             Err(e) => tracing::warn!("pruning events: {e}"),
         }
+        let refused_before = now_ms() - crate::agents::REFUSED_MAX_AGE_MS;
+        if let Err(e) = self.store.prune_refused_agent_messages(refused_before, crate::agents::REFUSED_KEEP) {
+            tracing::warn!("pruning refused agent messages: {e}");
+        }
     }
 
     // ----- event bus -----
@@ -2268,6 +2272,10 @@ impl Hub {
             }
         }
         let _done = Done(self, id);
+        // A named agent restarts with arguments rebuilt from its record (never a stale `--resume`).
+        if let Some(args) = crate::agents::restart_args(&self.agents, id) {
+            self.set_session_extra_args(id, args?)?;
+        }
         self.restart_inner(id).await
     }
 

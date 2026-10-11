@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::bots::{Bot, Delivery, MsgStatus, Outgoing, Prov, Source};
+use crate::agents::{Agent, AgentMessage, Delivery, MsgStatus, Outgoing, Prov, Source};
 use crate::hub::{CreateChannel, Hub, ServerEvent, SpawnSession};
 use crate::inject::{self, SendMode, SendOutcome};
 use crate::model::*;
@@ -53,23 +53,25 @@ pub trait Backend: Send + Sync + 'static {
         cwd: String,
         base: Option<String>,
     ) -> impl Future<Output = anyhow::Result<String>> + Send;
-    /// Used to roll back a channel spawn_agent created when the spawn itself fails.
+    /// Used to roll back a channel spawn_session created when the spawn itself fails.
     fn archive_channel(
         &self,
         id: ChannelId,
         remove_worktree: bool,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
 
-    // ----- bots (src/bots.rs) -----
-    fn bots(&self) -> Vec<Bot>;
+    // ----- agents (src/agents.rs) -----
+    fn agents(&self) -> Vec<Agent>;
     /// The caller's provenance (None: human-rooted).
     fn prov(&self, caller: SessionId) -> Option<Prov>;
-    /// Messages delivered to the bot at or after `since` (unix ms).
-    fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize;
-    /// Start the bot if needed, record and send the message (`bots::deliver`).
-    fn bot_deliver(&self, out: Outgoing) -> impl Future<Output = anyhow::Result<Delivery>> + Send;
-    /// Where a bot message stands: delivered, running, its reply.
-    fn bot_message_status(&self, msg_id: i64) -> MsgStatus;
+    /// Messages delivered to the agent at or after `since` (unix ms).
+    fn agent_messages_since(&self, agent_id: i64, since: i64) -> usize;
+    /// Start the agent if needed, record and send the message (`agents::deliver`).
+    fn agent_deliver(&self, out: Outgoing) -> impl Future<Output = anyhow::Result<Delivery>> + Send;
+    /// Where an agent message stands: delivered, running, its reply.
+    fn agent_message_status(&self, msg_id: i64) -> MsgStatus;
+    /// Keep a message the agent's policy refused, for the log (`agents::record_refused`).
+    fn agent_refused(&self, m: AgentMessage, why: &str);
 }
 
 #[derive(Clone)]
@@ -141,24 +143,27 @@ impl Backend for HubBackend {
     async fn archive_channel(&self, id: ChannelId, remove_worktree: bool) -> anyhow::Result<()> {
         self.0.archive_channel(id, remove_worktree).await
     }
-    fn bots(&self) -> Vec<Bot> {
-        self.0.bots().list()
+    fn agents(&self) -> Vec<Agent> {
+        self.0.agents().list()
     }
     fn prov(&self, caller: SessionId) -> Option<Prov> {
-        self.0.bots().prov(caller)
+        self.0.agents().prov(caller)
     }
-    fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize {
+    fn agent_messages_since(&self, agent_id: i64, since: i64) -> usize {
         // Unreadable: count as full (refuse) rather than unlimited.
         self.0
             .store()
-            .count_bot_messages_since(bot_id, since)
+            .count_agent_messages_since(agent_id, since)
             .unwrap_or(usize::MAX)
     }
-    async fn bot_deliver(&self, out: Outgoing) -> anyhow::Result<Delivery> {
-        crate::bots::deliver(&self.0, out).await
+    async fn agent_deliver(&self, out: Outgoing) -> anyhow::Result<Delivery> {
+        crate::agents::deliver(&self.0, out).await
     }
-    fn bot_message_status(&self, msg_id: i64) -> MsgStatus {
-        self.0.bots().msg_status(self.0.store(), msg_id)
+    fn agent_message_status(&self, msg_id: i64) -> MsgStatus {
+        self.0.agents().msg_status(self.0.store(), msg_id)
+    }
+    fn agent_refused(&self, m: AgentMessage, why: &str) {
+        crate::agents::record_refused(&self.0, &m, why)
     }
 }
 

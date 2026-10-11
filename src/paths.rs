@@ -73,9 +73,9 @@ pub fn session_dir(id: crate::model::SessionId) -> PathBuf {
 pub fn worktrees_dir() -> PathBuf {
     data_dir().join("worktrees")
 }
-/// Bot home directories (`bots/<name>/`), also the "bots" workspace (PLAN.md §10).
-pub fn bots_dir() -> PathBuf {
-    data_dir().join("bots")
+/// Agent home directories (`agents/<name>/`), also the "agents" workspace (PLAN.md §10).
+pub fn agents_dir() -> PathBuf {
+    data_dir().join("agents")
 }
 pub fn browser_profile_dir() -> PathBuf {
     data_dir().join("browser-profile")

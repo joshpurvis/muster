@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agents::{ScreenSnapshot, adapter_for, tui};
+use crate::adapters::{ScreenSnapshot, adapter_for, tui};
 use crate::hub::Hub;
 use crate::model::{
     AgentState, SessionId, SessionInfo, SessionKind, StateSource, StateUpdate, now_ms,
@@ -173,7 +173,7 @@ fn evaluate_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::tui::testutil::snap;
+    use crate::adapters::tui::testutil::snap;
 
     fn info(kind: SessionKind, state: AgentState, since: i64) -> SessionInfo {
         SessionInfo {
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn screen_changes_state_and_same_state_keeps_detail() {
-        let idle = snap(include_str!("agents/fixtures/claude_idle_done.txt"));
+        let idle = snap(include_str!("adapters/fixtures/claude_idle_done.txt"));
         let mut t = Track::default();
         let r = evaluate_inner(
             &info(SessionKind::Claude, AgentState::Starting, 0),
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn idle_needs_quiet_output() {
-        let mut idle = snap(include_str!("agents/fixtures/claude_idle_done.txt"));
+        let mut idle = snap(include_str!("adapters/fixtures/claude_idle_done.txt"));
         let w = info(SessionKind::Claude, AgentState::Working, 0);
         let mut t = Track::default();
         idle.last_output_at = 10_000;
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn stuck_after_quiet_working_and_back_on_change() {
-        let working = snap(include_str!("agents/fixtures/claude_running_tool.txt"));
+        let working = snap(include_str!("adapters/fixtures/claude_running_tool.txt"));
         let mut t = Track::default();
         let w = info(SessionKind::Claude, AgentState::Working, 0);
         assert!(evaluate_inner(&w, &working, &mut t, 1_000).is_none());
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn stuck_returns_to_idle_once_output_settles() {
-        let working = snap(include_str!("agents/fixtures/claude_running_tool.txt"));
+        let working = snap(include_str!("adapters/fixtures/claude_running_tool.txt"));
         let mut t = Track::default();
         let w = info(SessionKind::Claude, AgentState::Working, 0);
         assert!(matches!(
@@ -297,7 +297,7 @@ mod tests {
         );
         let s = info(SessionKind::Claude, AgentState::Stuck, at);
         // The agent finishes: the screen turns idle with fresh output, which isn't trusted yet.
-        let mut idle = snap(include_str!("agents/fixtures/claude_idle_done.txt"));
+        let mut idle = snap(include_str!("adapters/fixtures/claude_idle_done.txt"));
         idle.last_output_at = at + 1_000;
         assert!(matches!(
             evaluate(&s, &idle, &mut t, at + 1_100),

@@ -2,7 +2,7 @@
 //! shell. State comes from the PTY's foreground process group: Working while a job owns the
 //! terminal, Idle otherwise.
 
-use crate::agents::*;
+use crate::adapters::*;
 use crate::model::*;
 
 pub struct ShellAdapter;

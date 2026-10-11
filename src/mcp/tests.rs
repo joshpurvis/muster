@@ -33,16 +33,18 @@ struct Data {
     last_args: Vec<String>,
     /// What the mock's send reports: (delivered, queued).
     send_outcome: Option<(bool, u32)>,
-    bots: Vec<crate::bots::Bot>,
+    agents: Vec<crate::agents::Agent>,
     /// Provenance per session, as the real injector sets it on delivery.
-    prov: HashMap<SessionId, crate::bots::Prov>,
+    prov: HashMap<SessionId, crate::agents::Prov>,
     /// Source of every send, in order.
-    sources: Vec<crate::bots::Source>,
-    /// Messages delivered per bot (for the daily cap).
-    bot_counts: HashMap<i64, usize>,
-    deliveries: Vec<crate::bots::Outgoing>,
-    /// Bot session -> the reply its turns report.
+    sources: Vec<crate::agents::Source>,
+    /// Messages delivered per agent (for the daily cap).
+    agent_counts: HashMap<i64, usize>,
+    deliveries: Vec<crate::agents::Outgoing>,
+    /// Agent session -> the reply its turns report.
     replies: HashMap<SessionId, String>,
+    /// Refused messages kept for the log: (to agent, reason).
+    refused: Vec<(i64, String)>,
 }
 
 struct Mock {
@@ -209,7 +211,7 @@ impl Backend for Arc<Mock> {
         text: String,
         mode: SendMode,
         from: String,
-        source: crate::bots::Source,
+        source: crate::agents::Source,
     ) -> anyhow::Result<SendOutcome> {
         let mut d = self.d.lock();
         if d.fail_send {
@@ -218,8 +220,8 @@ impl Backend for Arc<Mock> {
         d.sends.push((id, text, mode, from));
         d.sources.push(source);
         match source {
-            crate::bots::Source::Chain(p) => d.prov.insert(id, p),
-            crate::bots::Source::Human => d.prov.remove(&id),
+            crate::agents::Source::Chain(p) => d.prov.insert(id, p),
+            crate::agents::Source::Human => d.prov.remove(&id),
         };
         let (delivered, queued) = d.send_outcome.unwrap_or((true, 0));
         Ok(SendOutcome { delivered, queued })
@@ -231,25 +233,25 @@ impl Backend for Arc<Mock> {
         self.d.lock().channels.get_mut(&id).unwrap().archived = true;
         Ok(())
     }
-    fn bots(&self) -> Vec<crate::bots::Bot> {
-        self.d.lock().bots.clone()
+    fn agents(&self) -> Vec<crate::agents::Agent> {
+        self.d.lock().agents.clone()
     }
-    fn prov(&self, caller: SessionId) -> Option<crate::bots::Prov> {
+    fn prov(&self, caller: SessionId) -> Option<crate::agents::Prov> {
         self.d.lock().prov.get(&caller).copied()
     }
-    fn bot_messages_since(&self, bot_id: i64, _since: i64) -> usize {
-        self.d.lock().bot_counts.get(&bot_id).copied().unwrap_or(0)
+    fn agent_messages_since(&self, agent_id: i64, _since: i64) -> usize {
+        self.d.lock().agent_counts.get(&agent_id).copied().unwrap_or(0)
     }
-    async fn bot_deliver(&self, out: crate::bots::Outgoing) -> anyhow::Result<crate::bots::Delivery> {
+    async fn agent_deliver(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::Delivery> {
         let mut d = self.d.lock();
         if d.fail_send {
             anyhow::bail!("pty gone");
         }
-        let bot = d.bots.iter().find(|b| b.name == out.bot).unwrap().clone();
-        let sid = bot.session_id.unwrap();
-        *d.bot_counts.entry(bot.id).or_default() += 1;
+        let agent = d.agents.iter().find(|b| b.name == out.agent).unwrap().clone();
+        let sid = agent.session_id.unwrap();
+        *d.agent_counts.entry(agent.id).or_default() += 1;
         d.deliveries.push(out);
-        Ok(crate::bots::Delivery {
+        Ok(crate::agents::Delivery {
             msg_id: d.deliveries.len() as i64,
             session_id: sid,
             sent_at_ms: 0,
@@ -258,11 +260,14 @@ impl Backend for Arc<Mock> {
             started: false,
         })
     }
-    fn bot_message_status(&self, msg_id: i64) -> crate::bots::MsgStatus {
+    fn agent_refused(&self, m: crate::agents::AgentMessage, why: &str) {
+        self.d.lock().refused.push((m.to_agent, why.to_string()));
+    }
+    fn agent_message_status(&self, msg_id: i64) -> crate::agents::MsgStatus {
         let d = self.d.lock();
         let out = &d.deliveries[msg_id as usize - 1];
-        let sid = d.bots.iter().find(|b| b.name == out.bot).and_then(|b| b.session_id).unwrap();
-        crate::bots::MsgStatus {
+        let sid = d.agents.iter().find(|b| b.name == out.agent).and_then(|b| b.session_id).unwrap();
+        crate::agents::MsgStatus {
             delivered_at: Some(0),
             active: true,
             reply: d.replies.get(&sid).cloned(),
@@ -699,14 +704,29 @@ async fn send_rate_limit() {
 }
 
 #[tokio::test]
-async fn spawn_agent_model_effort_and_args() {
+async fn spawn_agent_is_an_unlisted_alias_of_spawn_session() {
     let (m, st) = state();
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "claude", "model": "sonnet", "effort": "high"})).await;
+    // The old name still works (agents written against it keep working)...
+    let (t, err) = call(&st, "spawn_agent", json!({"kind": "claude", "model": "sonnet"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().last_args, ["--model", "sonnet"]);
+    // ...but only spawn_session is listed.
+    let names: Vec<String> = crate::mcp::tools::tool_definitions()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"spawn_session".to_string()) && !names.contains(&"spawn_agent".to_string()));
+}
+
+#[tokio::test]
+async fn spawn_session_model_effort_and_args() {
+    let (m, st) = state();
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "claude", "model": "sonnet", "effort": "high"})).await;
     assert!(!err, "{t}");
     assert_eq!(m.d.lock().last_args, ["--model", "sonnet", "--effort", "high"]);
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "model": "gpt-6-sol", "effort": "xhigh", "args": ["--no-alt-screen"]}),
     )
     .await;
@@ -720,17 +740,17 @@ async fn spawn_agent_model_effort_and_args() {
         json!({"kind": "shell", "model": "sonnet"}),
         json!({"kind": "shell", "args": ["-c", "printf MARKER"]}),
     ] {
-        let (t, err) = call(&st, "spawn_agent", bad.clone()).await;
+        let (t, err) = call(&st, "spawn_session", bad.clone()).await;
         assert!(err, "{bad}: {t}");
     }
 }
 
 #[tokio::test]
-async fn spawn_agent_defaults_and_new_channel() {
+async fn spawn_session_defaults_and_new_channel() {
     let (m, st) = state();
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "prompt": "do it", "name": "helper"}),
     )
     .await;
@@ -743,7 +763,7 @@ async fn spawn_agent_defaults_and_new_channel() {
 
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "shell", "new_channel": {"name": "side", "worktree": false}}),
     )
     .await;
@@ -756,16 +776,16 @@ async fn spawn_agent_defaults_and_new_channel() {
 
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "shell", "channel_id": 10, "new_channel": {"name": "x"}}),
     )
     .await;
     assert!(err && t.contains("either"), "{t}");
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "vim"})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "vim"})).await;
     assert!(err && t.contains("unknown kind"), "{t}");
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "shell", "channel_id": 777}),
     )
     .await;
@@ -781,7 +801,7 @@ async fn spawn_agent_defaults_and_new_channel() {
         d.live.extend([201, 202]);
         d.tokens.insert("tok202".into(), 202);
     }
-    let (t, err) = call_as(&st, "tok202", "spawn_agent", json!({"kind": "shell"})).await;
+    let (t, err) = call_as(&st, "tok202", "spawn_session", json!({"kind": "shell"})).await;
     assert!(err && t.contains("depth"), "{t}");
 }
 
@@ -828,7 +848,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     // A new channel gets the caller's profile, whatever the agent asks for.
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "net-child"}}),
     )
     .await;
@@ -852,7 +872,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let (t, err) = call_as(
         &st,
         "tok30",
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "sneaky", "permissions": {"codex_sandbox": "full_access"}}}),
     )
     .await;
@@ -864,7 +884,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let (t, err) = call_as(
         &st,
         "tok30",
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "permissions": {"codex_sandbox": "full_access"}, "new_channel": {"name": "sneaky2"}}),
     )
     .await;
@@ -876,7 +896,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let (t, err) = call_as(
         &st,
         "tok30",
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "ok"}}),
     )
     .await;
@@ -889,7 +909,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
         let (t, err) = call_as(
             &st,
             "tok30",
-            "spawn_agent",
+            "spawn_session",
             json!({"kind": kind, "channel_id": 10}),
         )
         .await;
@@ -901,7 +921,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let (t, err) = call_as(
         &st,
         "tok30",
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "shell", "channel_id": 10}),
     )
     .await;
@@ -917,7 +937,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     // Downwards is fine: the elevated caller may spawn into / message the default channel.
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "channel_id": 11}),
     )
     .await;
@@ -933,10 +953,10 @@ async fn permissions_are_shown_and_inherited_never_raised() {
 async fn spawn_children_limit() {
     let (_, st) = state();
     for _ in 0..8 {
-        let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell"})).await;
+        let (t, err) = call(&st, "spawn_session", json!({"kind": "shell"})).await;
         assert!(!err, "{t}");
     }
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell"})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "shell"})).await;
     assert!(err && t.contains("child"), "{t}");
 }
 
@@ -1174,7 +1194,7 @@ async fn new_channel_is_a_tab_next_to_the_caller_and_may_be_unnamed() {
     m.d.lock().channels.get_mut(&10).unwrap().window_id = Some(4);
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "prompt": "fix it", "new_channel": {}}),
     )
     .await;
@@ -1188,7 +1208,7 @@ async fn new_channel_is_a_tab_next_to_the_caller_and_may_be_unnamed() {
     // A blank name is the same as none.
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "  "}}),
     )
     .await;
@@ -1198,7 +1218,7 @@ async fn new_channel_is_a_tab_next_to_the_caller_and_may_be_unnamed() {
     // A caller shown in another window than its task's: the new task goes to the caller's
     // window (and the hub puts the new session there too, as the caller is its parent).
     m.d.lock().sessions.get_mut(&1).unwrap().window_id = Some(6);
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex", "new_channel": {}})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "new_channel": {}})).await;
     assert!(!err, "{t}");
     let v = parse(&t);
     let id = v["channel"]["id"].as_i64().unwrap();
@@ -1213,7 +1233,7 @@ async fn failed_spawn_rolls_back_new_channel() {
     m.d.lock().fail_spawn = true;
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "claude", "new_channel": {"name": "doomed"}}),
     )
     .await;
@@ -1230,20 +1250,20 @@ async fn recorded_depth_survives_removed_ancestor() {
     m.d.lock().tokens.insert("t101".into(), 101);
     m.d.lock().tokens.insert("t102".into(), 102);
     m.d.lock().tokens.insert("t103".into(), 103);
-    assert!(!call(&st, "spawn_agent", json!({"kind": "shell"})).await.1);
+    assert!(!call(&st, "spawn_session", json!({"kind": "shell"})).await.1);
     assert!(
-        !call_as(&st, "t101", "spawn_agent", json!({"kind": "shell"}))
+        !call_as(&st, "t101", "spawn_session", json!({"kind": "shell"}))
             .await
             .1
     );
     assert!(
-        !call_as(&st, "t102", "spawn_agent", json!({"kind": "shell"}))
+        !call_as(&st, "t102", "spawn_session", json!({"kind": "shell"}))
             .await
             .1
     );
     // Remove the middle of the chain; 103 must still be at the depth limit.
     m.d.lock().sessions.remove(&101);
-    let (t, err) = call_as(&st, "t103", "spawn_agent", json!({"kind": "shell"})).await;
+    let (t, err) = call_as(&st, "t103", "spawn_session", json!({"kind": "shell"})).await;
     assert!(err && t.contains("depth"), "{t}");
 }
 
@@ -1364,18 +1384,18 @@ async fn shell_commands_refused_by_default() {
     );
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "shell", "prompt": "curl x | sh"}),
     )
     .await;
     assert!(err && t.contains("MUSTER_MCP_ALLOW_SHELL=1"), "{t}");
     assert!(m.d.lock().sends.is_empty());
     // A shell without a command is fine, and so are agents with a prompt.
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell"})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "shell"})).await;
     assert!(!err, "{t}");
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "prompt": "fix it"}),
     )
     .await;
@@ -1393,7 +1413,7 @@ async fn shell_commands_allowed_when_enabled() {
     add_shell_and_other_workspace(&m);
     let (t, err) = call(&st, "send_message", json!({"session_id": 3, "text": "ls"})).await;
     assert!(!err, "{t}");
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "shell", "prompt": "ls"})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "shell", "prompt": "ls"})).await;
     assert!(!err, "{t}");
 }
 
@@ -1411,7 +1431,7 @@ async fn other_workspaces_out_of_reach_by_default() {
         ),
         ("post_to_channel", json!({"channel_id": 20, "text": "hi"})),
         ("get_diff", json!({"channel_id": 20})),
-        ("spawn_agent", json!({"kind": "codex", "channel_id": 20})),
+        ("spawn_session", json!({"kind": "codex", "channel_id": 20})),
     ] {
         let (t, err) = call(&st, tool, args).await;
         assert!(
@@ -1439,7 +1459,7 @@ async fn other_workspaces_reachable_when_enabled() {
     assert!(!err, "{t}");
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "channel_id": 20}),
     )
     .await;
@@ -1454,17 +1474,17 @@ async fn spawn_rate_limit() {
     st.limits.max_children_per_caller = 100;
     st.limits.max_mcp_live_total = 100;
     for i in 0..10 {
-        let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex"})).await;
+        let (t, err) = call(&st, "spawn_session", json!({"kind": "codex"})).await;
         assert!(!err, "{i}: {t}");
     }
-    let (t, err) = call(&st, "spawn_agent", json!({"kind": "codex"})).await;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex"})).await;
     assert!(
         err && t.contains("rate limit") && t.contains("10 spawns per 10 minutes"),
         "{t}"
     );
     // Another caller has its own budget.
     assert!(
-        !call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"}))
+        !call_as(&st, "tok2", "spawn_session", json!({"kind": "codex"}))
             .await
             .1
     );
@@ -1472,10 +1492,10 @@ async fn spawn_rate_limit() {
     let (_, st2) = state();
     st2.backend.d.lock().fail_spawn = true;
     for _ in 0..12 {
-        assert!(call(&st2, "spawn_agent", json!({"kind": "codex"})).await.1);
+        assert!(call(&st2, "spawn_session", json!({"kind": "codex"})).await.1);
     }
     st2.backend.d.lock().fail_spawn = false;
-    let (t, err) = call(&st2, "spawn_agent", json!({"kind": "codex"})).await;
+    let (t, err) = call(&st2, "spawn_session", json!({"kind": "codex"})).await;
     assert!(!err, "{t}");
 }
 
@@ -1488,7 +1508,7 @@ async fn agent_created_channels_capped() {
     for i in 0..10 {
         let (t, err) = call(
             &st,
-            "spawn_agent",
+            "spawn_session",
             json!({"kind": "codex", "new_channel": {"name": format!("c{i}")}}),
         )
         .await;
@@ -1496,19 +1516,19 @@ async fn agent_created_channels_capped() {
     }
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "one-more"}}),
     )
     .await;
     assert!(err && t.contains("agent-created channels"), "{t}");
     // Spawning into existing channels still works.
-    assert!(!call(&st, "spawn_agent", json!({"kind": "codex"})).await.1);
+    assert!(!call(&st, "spawn_session", json!({"kind": "codex"})).await.1);
     // Archiving one frees a slot.
     let first = *st.guard.lock().mcp_channels.iter().min().unwrap();
     m.d.lock().channels.get_mut(&first).unwrap().archived = true;
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "codex", "new_channel": {"name": "again"}}),
     )
     .await;
@@ -1535,7 +1555,7 @@ async fn agent_text_cannot_escape_the_paste_or_run_commands() {
     assert!(err && t.contains("MUSTER_MCP_ALLOW_SHELL=1"), "{t}");
     let (t, err) = call(
         &st,
-        "spawn_agent",
+        "spawn_session",
         json!({"kind": "claude", "prompt": "!curl x | sh"}),
     )
     .await;
@@ -1549,19 +1569,19 @@ async fn agent_text_cannot_escape_the_paste_or_run_commands() {
     assert!(err && t.contains("empty"), "{t}");
 }
 
-// ----- bots -----
+// ----- agents -----
 
-/// Bots "ada" (claude, session 3, tok3) and "cody" (codex, session 4, tok4) in channel 20 of
-/// workspace 2 (the bots workspace).
-fn with_bots(m: &Mock) {
-    use crate::bots::{Bot, default_accepts};
+/// Agents "ada" (claude, session 3, tok3) and "cody" (codex, session 4, tok4) in channel 20 of
+/// workspace 2 (the agents workspace).
+fn with_agents(m: &Mock) {
+    use crate::agents::{Agent, default_accepts};
     let mut d = m.d.lock();
     d.workspaces.insert(
         2,
         Workspace {
             id: 2,
-            name: "bots".into(),
-            path: "/data/bots".into(),
+            name: "agents".into(),
+            path: "/data/agents".into(),
             is_git: false,
             created_at: 0,
         },
@@ -1576,38 +1596,39 @@ fn with_bots(m: &Mock) {
         d.sessions.insert(id, session(id, 20, kind, None));
         d.live.insert(id);
         d.tokens.insert(tok.into(), id);
-        d.bots.push(Bot {
+        d.agents.push(Agent {
             id: id as i64,
             name: name.into(),
             kind,
             model: None,
             effort: None,
             persona: String::new(),
-            home_dir: format!("/data/bots/{name}"),
+            home_dir: format!("/data/agents/{name}"),
             permissions: Permissions::default(),
             accepts_origins: default_accepts(kind),
             channel_id: Some(20),
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
+            autostart: false,
         });
         d.replies.insert(id, format!("{name} says hi"));
     }
 }
 
-fn inbound(m: &Mock, sid: SessionId, origin: crate::bots::Origin, hop: u32) {
-    m.d.lock().prov.insert(sid, crate::bots::Prov { msg_id: Some(77), origin, hop });
+fn inbound(m: &Mock, sid: SessionId, origin: crate::agents::Origin, hop: u32) {
+    m.d.lock().prov.insert(sid, crate::agents::Prov { msg_id: Some(77), origin, hop });
 }
 
 #[tokio::test]
-async fn ask_bot_from_a_human_rooted_session() {
+async fn ask_agent_from_a_human_rooted_session() {
     let (m, st) = state();
-    with_bots(&m);
-    let v = parse(&call(&st, "list_bots", json!({})).await.0);
-    assert_eq!(v["bots"].as_array().unwrap().len(), 2);
+    with_agents(&m);
+    let v = parse(&call(&st, "list_agents", json!({})).await.0);
+    assert_eq!(v["agents"].as_array().unwrap().len(), 2);
     assert_eq!(v["your_origin"], json!({"origin": "human", "hop": 0}));
-    // Session 1 is in another workspace: bots are reachable anyway.
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ADA", "text": "what's new?"})).await;
+    // Session 1 is in another workspace: agents are reachable anyway.
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ADA", "text": "what's new?"})).await;
     assert!(!err, "{t}");
     let v = parse(&t);
     assert_eq!(v["reply"], "ada says hi");
@@ -1615,73 +1636,77 @@ async fn ask_bot_from_a_human_rooted_session() {
     assert_eq!((v["origin"].as_str(), v["hop"].as_u64()), (Some("human"), Some(0)));
     let d = m.d.lock();
     let out = &d.deliveries[0];
-    assert_eq!((out.bot.as_str(), out.from.as_str(), out.from_session), ("ada", "session:1", Some(1)));
+    assert_eq!((out.agent.as_str(), out.from.as_str(), out.from_session), ("ada", "session:1", Some(1)));
     assert_eq!(out.route.reply_to, None);
 }
 
 #[tokio::test]
-async fn ask_bot_origin_rule_hops_and_cap() {
-    use crate::bots::Origin;
+async fn ask_agent_origin_rule_hops_and_cap() {
+    use crate::agents::Origin;
     let (m, st) = state();
-    with_bots(&m);
-    // Session 2 is handling a scheduled message: a Codex bot takes it one hop on...
+    with_agents(&m);
+    // Session 2 is handling a scheduled message: a Codex agent takes it one hop on...
     inbound(&m, 2, Origin::Schedule, 1);
-    let (t, err) = call_as(&st, "tok2", "ask_bot", json!({"bot": "cody", "text": "x"})).await;
+    let (t, err) = call_as(&st, "tok2", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
     assert!(!err, "{t}");
     let v = parse(&t);
     assert_eq!((v["origin"].as_str(), v["hop"].as_u64()), (Some("schedule"), Some(2)));
     assert_eq!(m.d.lock().deliveries[0].route.reply_to, Some(77));
-    // ...a Claude bot refuses it.
-    let (t, err) = call_as(&st, "tok2", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    // ...a Claude agent refuses it.
+    let (t, err) = call_as(&st, "tok2", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("accepts only human"), "{t}");
     // So does any Claude agent: no message, no spawn.
     let (t, err) = call_as(&st, "tok2", "send_message", json!({"session_id": 1, "text": "x"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
-    let (t, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "claude"})).await;
+    let (t, err) = call_as(&st, "tok2", "spawn_session", json!({"kind": "claude"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
-    let (t, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"})).await;
+    let (t, err) = call_as(&st, "tok2", "spawn_session", json!({"kind": "codex"})).await;
     assert!(!err, "{t}");
     // A helper spawned under it starts with that provenance and keeps it, even when its
     // parent moves on to human-rooted work.
     let child = parse(&t)["session"]["id"].as_u64().unwrap() as SessionId;
     m.d.lock().tokens.insert("tokc".into(), child);
     m.d.lock().prov.remove(&2);
-    let (t, err) = call_as(&st, "tokc", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call_as(&st, "tokc", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
-    assert!(call_as(&st, "tok2", "ask_bot", json!({"bot": "ada", "text": "x"})).await.1 == false);
+    assert!(call_as(&st, "tok2", "ask_agent", json!({"agent": "ada", "text": "x"})).await.1 == false);
     // Hop limit.
-    inbound(&m, 1, Origin::Human, crate::mcp::guard::MAX_BOT_HOPS);
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    inbound(&m, 1, Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS);
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("too deep"), "{t}");
     m.d.lock().prov.clear();
     // Daily cap.
-    m.d.lock().bot_counts.insert(3, crate::mcp::guard::BOT_DAILY_PROMPT_CAP);
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    m.d.lock().agent_counts.insert(3, crate::mcp::guard::AGENT_DAILY_PROMPT_CAP);
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("last 24 hours"), "{t}");
+    // Each policy refusal was kept for the agents panel's log (origin x2, hops, cap).
+    let refused = m.d.lock().refused.clone();
+    assert_eq!(refused.len(), 4, "{refused:?}");
+    assert!(refused[0].1.contains("accepts only human") && refused[3].1.contains("last 24 hours"));
 }
 
 #[tokio::test]
-async fn ask_bot_guards() {
+async fn ask_agent_guards() {
     let (m, st) = state();
-    with_bots(&m);
-    let (t, err) = call_as(&st, "tok3", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    with_agents(&m);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("yourself"), "{t}");
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "nobody", "text": "x"})).await;
-    assert!(err && t.contains("bots: ada, cody"), "{t}");
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "!ls"})).await;
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "nobody", "text": "x"})).await;
+    assert!(err && t.contains("agents: ada, cody"), "{t}");
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "!ls"})).await;
     assert!(err && t.contains("`!`"), "{t}");
-    // Bots take messages through ask_bot only.
+    // Agents take messages through ask_agent only.
     let (t, err) = call_as(&st, "tok4", "send_message", json!({"session_id": 3, "text": "x"})).await;
-    assert!(err && t.contains("use ask_bot(bot=\"ada\")"), "{t}");
-    // The envelope sender is the bot's name.
-    let (t, err) = call_as(&st, "tok4", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("use ask_agent(agent=\"ada\")"), "{t}");
+    // The envelope sender is the agent's name.
+    let (t, err) = call_as(&st, "tok4", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(!err, "{t}");
     assert_eq!(m.d.lock().deliveries[0].from, "cody");
     let v = parse(&call_as(&st, "tok4", "whoami", json!({})).await.0);
-    assert_eq!(v["bot"], "cody");
-    // A bot in a wider tab than the caller's is refused, as for send_message.
+    assert_eq!(v["agent"], "cody");
+    // An agent in a wider tab than the caller's is refused, as for send_message.
     m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Bypass;
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("more than your channel"), "{t}");
     m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Default;
     // ...and so is one whose own tab (its next restart's profile) is wider.
@@ -1691,28 +1716,28 @@ async fn ask_bot_guards() {
         wide.workspace_id = 2;
         wide.permissions.claude_mode = ClaudeMode::Bypass;
         d.channels.insert(21, wide);
-        d.bots[0].channel_id = Some(21);
+        d.agents[0].channel_id = Some(21);
     }
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("more than your channel"), "{t}");
-    m.d.lock().bots[0].channel_id = Some(20);
+    m.d.lock().agents[0].channel_id = Some(20);
     // No final message attributed to this message: the terminal tail, labelled as such.
     m.d.lock().replies.clear();
-    let v = parse(&call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await.0);
+    let v = parse(&call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await.0);
     assert!(v["reply"].is_null());
     assert_eq!(v["unattributed_output"], "last 60 lines of 3");
     assert!(v["note"].as_str().unwrap().contains("may belong to another prompt"));
     // A failed delivery gives the rate-limit slot back and reports the error.
     m.d.lock().fail_send = true;
-    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("could not deliver"), "{t}");
 }
 
 #[tokio::test]
 async fn provenance_survives_plain_sends() {
-    use crate::bots::{Origin, Prov, Source};
+    use crate::agents::{Origin, Prov, Source};
     let (m, st) = state();
-    with_bots(&m);
+    with_agents(&m);
     // An ordinary Codex helper (session 5, tok5).
     {
         let mut d = m.d.lock();
@@ -1729,9 +1754,9 @@ async fn provenance_survives_plain_sends() {
     // ...so the helper can't launder it into Claude work.
     let (t, err) = call_as(&st, "tok5", "send_message", json!({"session_id": 1, "text": "x"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
-    let (t, err) = call_as(&st, "tok5", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    let (t, err) = call_as(&st, "tok5", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("accepts only human"), "{t}");
-    let (t, err) = call_as(&st, "tok5", "spawn_agent", json!({"kind": "claude", "prompt": "x"})).await;
+    let (t, err) = call_as(&st, "tok5", "spawn_session", json!({"kind": "claude", "prompt": "x"})).await;
     assert!(err && t.contains("origin=schedule"), "{t}");
     // A human-rooted sender's plain send is human-rooted too.
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;

@@ -36,7 +36,7 @@ pub const UNSUPPORTED_VERSION: i64 = -32022;
 
 const INSTRUCTIONS: &str = "muster runs many coding agents and shells side by side, grouped into channels \
 (one task each, usually its own git worktree). You are one of those sessions. Use whoami to orient, \
-list_channels/list_sessions to see what's running, spawn_agent to delegate, send_message + wait_for_state \
+list_channels/list_sessions to see what's running, spawn_session to delegate, send_message + wait_for_state \
 to drive another agent, read_screen/get_recent_output to inspect it, post_to_channel to tell the human \
 something, and get_diff to review work. You cannot approve permission prompts; the human does that.";
 

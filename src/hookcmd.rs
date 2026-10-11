@@ -120,7 +120,7 @@ fn truncate_strings_max(v: &mut serde_json::Value, max: usize) {
         serde_json::Value::Array(a) => a.iter_mut().for_each(truncate_strings),
         serde_json::Value::Object(o) => {
             for (k, v) in o.iter_mut() {
-                // A turn's final message is a bot's reply (bots.rs): keep much more of it.
+                // A turn's final message is an agent's reply (agents.rs): keep much more of it.
                 let max = if REPLY_KEYS.contains(&k.as_str()) { MAX_REPLY } else { MAX_STRING };
                 truncate_strings_max(v, max);
             }

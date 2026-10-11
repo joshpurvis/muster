@@ -25,15 +25,15 @@ pub const TOOL_NAMES: [&str; 12] = [
     "whoami",
     "list_channels",
     "list_sessions",
-    "spawn_agent",
+    "spawn_session",
     "send_message",
     "read_screen",
     "get_recent_output",
     "wait_for_state",
     "post_to_channel",
     "get_diff",
-    "list_bots",
-    "ask_bot",
+    "list_agents",
+    "ask_agent",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -97,8 +97,8 @@ pub fn tool_definitions() -> Vec<Value> {
             true,
         ),
         tool(
-            "spawn_agent",
-            "Spawn agent",
+            "spawn_session",
+            "Spawn session",
             "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
@@ -216,24 +216,24 @@ pub fn tool_definitions() -> Vec<Value> {
             true,
         ),
         tool(
-            "list_bots",
-            "List bots",
-            "List the bots: persistent named agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_bot. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state. Also returns your_origin: the origin and hop a message you send now would carry.",
+            "list_agents",
+            "List agents",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state. Also returns your_origin: the origin and hop a message you send now would carry.",
             empty_schema(),
             true,
         ),
         tool(
-            "ask_bot",
-            "Ask bot",
-            "Ask a bot something and wait for its answer. Starts the bot if it isn't running, delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the bot's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the bot doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude bot by default), when the chain is more than 4 hops deep, or past the bot's 200 messages a day. Rate limited with send_message (20 per minute).",
+            "ask_agent",
+            "Ask agent",
+            "Ask an agent something and wait for its answer. Starts the agent if it isn't running, delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
-                    "bot": {"type": "string", "description": "Bot name (see list_bots), case-insensitive."},
+                    "agent": {"type": "string", "description": "Agent name (see list_agents), case-insensitive."},
                     "text": {"type": "string", "description": "The question or task; multi-line is fine."},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 600, "description": "How long to wait for the reply."}
                 },
-                "required": ["bot", "text"],
+                "required": ["agent", "text"],
                 "additionalProperties": false
             }),
             false,
@@ -341,12 +341,12 @@ fn channel_json(c: &Channel, ws: Option<&Workspace>) -> Value {
 /// The channel's agent permission profile, with the CLI flags it maps to, so agents know what
 /// they and their children may do. Only the human can change it.
 fn permissions_json(p: &Permissions) -> Value {
-    let codex = crate::agents::codex::sandbox_args(p.codex_sandbox);
+    let codex = crate::adapters::codex::sandbox_args(p.codex_sandbox);
     json!({
         "codex_sandbox": p.codex_sandbox,
         "claude_mode": p.claude_mode,
         "codex_flags": codex.join(" "),
-        "claude_permission_mode": crate::agents::claude::permission_mode(p.claude_mode).unwrap_or("user default"),
+        "claude_permission_mode": crate::adapters::claude::permission_mode(p.claude_mode).unwrap_or("user default"),
         "set_by": "human (muster UI); agents can't change it",
     })
 }
@@ -413,15 +413,16 @@ pub async fn call_tool<B: Backend>(
         "whoami" => whoami(st, caller),
         "list_channels" => list_channels(st, caller),
         "list_sessions" => list_sessions(st, caller, &a),
-        "spawn_agent" => spawn_agent(st, caller, &a).await,
+        // `spawn_agent`: the tool's name before named agents existed; still accepted, not listed.
+        "spawn_session" | "spawn_agent" => spawn_session(st, caller, &a).await,
         "send_message" => send_message(st, caller, &a).await,
         "read_screen" => read_screen(st, caller, &a),
         "get_recent_output" => get_recent_output(st, caller, &a),
         "wait_for_state" => wait_for_state(st, caller, &a).await,
         "post_to_channel" => post_to_channel(st, caller, &a),
         "get_diff" => get_diff(st, caller, &a).await,
-        "list_bots" => list_bots(st, caller),
-        "ask_bot" => ask_bot(st, caller, &a).await,
+        "list_agents" => list_agents(st, caller),
+        "ask_agent" => ask_agent(st, caller, &a).await,
         _ => return Err(()),
     };
     Ok(match res {
@@ -504,8 +505,8 @@ fn check_not_more_permissive<B: Backend>(
     check_perms_not_wider(st, me, Some(target.id), &target.permissions, kind, &format!("channel {}", target.id))
 }
 
-/// `check_not_more_permissive` for a profile that may not have a channel yet (a bot that
-/// isn't running: its tab will get the bot's profile).
+/// `check_not_more_permissive` for a profile that may not have a channel yet (an agent that
+/// isn't running: its tab will get the agent's profile).
 fn check_perms_not_wider<B: Backend>(
     st: &McpState<B>,
     me: &SessionInfo,
@@ -533,14 +534,14 @@ fn check_perms_not_wider<B: Backend>(
 }
 
 /// Origin and hop of a message the caller sends now (None inbound: human-rooted, hop 0).
-fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::bots::Origin, u32) {
+fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::agents::Origin, u32) {
     let r = caller_route(st, caller);
     (r.origin, r.hop)
 }
 
 /// The route of anything the caller sends or spawns now: its provenance, one hop on.
-fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::bots::Route {
-    crate::bots::outgoing(st.backend.prov(caller))
+fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::agents::Route {
+    crate::agents::outgoing(st.backend.prov(caller))
 }
 
 /// The caller's workspace (None if its channel is gone).
@@ -618,7 +619,7 @@ fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
         "workspace": ws.as_ref().map(|w| json!({"id": w.id, "name": w.name, "path": w.path, "is_git": w.is_git})),
         "spawn_budget": budget(st, caller),
         "agents_may_approve_prompts": guard::AGENTS_MAY_APPROVE,
-        "bot": st.backend.bots().into_iter().find(|b| b.session_id == Some(caller)).map(|b| b.name),
+        "agent": st.backend.agents().into_iter().find(|b| b.session_id == Some(caller)).map(|b| b.name),
         "origin": origin_json,
         "policy": {
             "shell_commands": st.limits.allow_shell,
@@ -662,7 +663,7 @@ fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
     Ok(pretty(&Value::Array(out)))
 }
 
-/// `spawn_agent`'s `model`, `effort` and `args` as CLI arguments, checked against the agent
+/// `spawn_session`'s `model`, `effort` and `args` as CLI arguments, checked against the agent
 /// argument allowlist (so they can't widen the channel's permission profile).
 fn agent_args(kind: SessionKind, a: &Args<'_>) -> Result<Vec<String>, String> {
     let model = a.str("model")?.map(str::trim).filter(|m| !m.is_empty());
@@ -697,11 +698,11 @@ fn agent_args(kind: SessionKind, a: &Args<'_>) -> Result<Vec<String>, String> {
         }
         Some(_) => return Err("`args` must be an array of strings".into()),
     }
-    crate::agents::check_extra_args(kind, &out).map_err(|e| format!("{e:#}"))?;
+    crate::adapters::check_extra_args(kind, &out).map_err(|e| format!("{e:#}"))?;
     Ok(out)
 }
 
-async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let kind_s = a.req_str("kind")?;
     let kind = SessionKind::parse(kind_s)
         .ok_or_else(|| format!("unknown kind `{kind_s}` (expected claude, codex or shell)"))?;
@@ -837,7 +838,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
         // The caller's window (as the parent): a new tab next to the caller's.
         window_id: None,
         from_session: None,
-        // The child starts with the caller's provenance and keeps it (bots.rs).
+        // The child starts with the caller's provenance and keeps it (agents.rs).
         prov: Some(caller_route(st, caller).prov(None)),
     };
     let info = match st.backend.spawn_session(req).await {
@@ -891,10 +892,10 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let info = reachable_session(st, caller, target)?;
-    // A bot only takes messages through ask_bot, which applies its origin rules.
-    if let Some(b) = st.backend.bots().into_iter().find(|b| b.session_id == Some(target)) {
+    // An agent only takes messages through ask_agent, which applies its origin rules.
+    if let Some(b) = st.backend.agents().into_iter().find(|b| b.session_id == Some(target)) {
         return Err(format!(
-            "session {target} is the bot {}: use ask_bot(bot=\"{}\") so its origin rules apply and you get its reply",
+            "session {target} is the agent {}: use ask_agent(agent=\"{}\") so its origin rules apply and you get its reply",
             b.name, b.name
         ));
     }
@@ -952,7 +953,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
             text,
             mode,
             format!("session:{caller}"),
-            crate::bots::Source::Chain(caller_route(st, caller).prov(None)),
+            crate::agents::Source::Chain(caller_route(st, caller).prov(None)),
         )
         .await
     {
@@ -1094,48 +1095,48 @@ async fn wait_loop<B: Backend>(
     }
 }
 
-fn list_bots<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
-    let bots: Vec<Value> = st
+fn list_agents<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
+    let agents: Vec<Value> = st
         .backend
-        .bots()
+        .agents()
         .iter()
         .map(|b| {
             let s = b.session_id.and_then(|s| st.backend.session(s));
-            let mut v = crate::bots::bot_json(b, s.as_ref());
+            let mut v = crate::agents::agent_json(b, s.as_ref());
             v["is_me"] = json!(b.session_id == Some(caller));
             v
         })
         .collect();
     let (origin, hop) = caller_origin(st, caller);
     Ok(pretty(&json!({
-        "bots": bots,
+        "agents": agents,
         "your_origin": {"origin": origin, "hop": hop},
     })))
 }
 
-/// Bots are a shared service: any session may ask one, whatever its workspace (asking runs no
+/// Agents are a shared service: any session may ask one, whatever its workspace (asking runs no
 /// command anywhere, and the origin rule, hop limit, daily cap and permission check apply).
-/// Driving a bot's terminal with the other tools stays under the workspace rule.
-async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
-    let name = a.req_str("bot")?;
+/// Driving an agent's terminal with the other tools stays under the workspace rule.
+async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let name = a.req_str("agent")?;
     let text = a.req_str("text")?;
     let timeout_s = a
         .int("timeout_seconds")?
-        .unwrap_or(BOT_ASK_DEFAULT_S)
+        .unwrap_or(AGENT_ASK_DEFAULT_S)
         .clamp(1, st.limits.wait_max_s as i64) as u64;
-    let bot = st
+    let agent = st
         .backend
-        .bots()
+        .agents()
         .into_iter()
         .find(|b| b.name.eq_ignore_ascii_case(name.trim()))
         .ok_or_else(|| {
-            let names: Vec<String> = st.backend.bots().into_iter().map(|b| b.name).collect();
+            let names: Vec<String> = st.backend.agents().into_iter().map(|b| b.name).collect();
             format!(
-                "no bot named {name} ({})",
-                if names.is_empty() { "there are none; the human creates them with `muster bot new`".to_string() } else { format!("bots: {}", names.join(", ")) }
+                "no agent named {name} ({})",
+                if names.is_empty() { "there are none; the human creates them with `muster agent new`".to_string() } else { format!("agents: {}", names.join(", ")) }
             )
         })?;
-    if bot.session_id == Some(caller) {
+    if agent.session_id == Some(caller) {
         return Err("you cannot ask yourself".into());
     }
     if text.trim().is_empty() {
@@ -1148,18 +1149,26 @@ async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
     if text.trim().is_empty() {
         return Err("text must not be empty".into());
     }
-    check_no_shell_escape(st, bot.kind, &text)?;
+    check_no_shell_escape(st, agent.kind, &text)?;
     let me = caller_session(st, caller)?;
-    // The widest profile the message could reach: the bot session's current tab and the bot's
+    let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
+    // Policy refusals (permissions, origin, hops, cap) are kept for the agents panel's log.
+    let refused = |why: String| {
+        let proposed = crate::agents::proposed_route(st.backend.prov(caller), None);
+        st.backend
+            .agent_refused(crate::agents::message_record(&agent, &from, Some(caller), proposed, &text), &why);
+        why
+    };
+    // The widest profile the message could reach: the agent session's current tab and the agent's
     // own tab (what its next restart gets), else the profile its tab will get.
-    let session_ch = bot.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
-    let own_ch = bot.channel_id.and_then(|c| st.backend.channel(c));
-    let (ch_id, perms) = crate::bots::reach_profile(&bot, session_ch.as_ref(), own_ch.as_ref());
-    check_perms_not_wider(st, &me, ch_id, &perms, bot.kind, &format!("bot {}'s tab", bot.name))?;
+    let session_ch = agent.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
+    let own_ch = agent.channel_id.and_then(|c| st.backend.channel(c));
+    let (ch_id, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
+    check_perms_not_wider(st, &me, ch_id, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
     let recent = st
         .backend
-        .bot_messages_since(bot.id, now_ms() - guard::BOT_CAP_WINDOW_MS);
-    let route = crate::bots::route(&bot, st.backend.prov(caller), None, recent)?;
+        .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);
+    let route = crate::agents::route(&agent, st.backend.prov(caller), None, recent).map_err(refused)?;
     if let Err(wait_s) = st.guard.lock().sends.check_and_record(
         caller,
         now_ms(),
@@ -1171,19 +1180,18 @@ async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
             st.limits.send_per_window
         ));
     }
-    let from = crate::bots::sender_label(st.backend.bots().iter().find(|b| b.session_id == Some(caller)), caller);
-    let out = crate::bots::Outgoing {
-        bot: bot.name.clone(),
+    let out = crate::agents::Outgoing {
+        agent: agent.name.clone(),
         text,
         from,
         from_session: Some(caller),
         route,
     };
-    let d = match st.backend.bot_deliver(out).await {
+    let d = match st.backend.agent_deliver(out).await {
         Ok(d) => d,
         Err(e) => {
             st.guard.lock().sends.refund(caller);
-            return Err(format!("could not deliver to bot {}: {e:#}", bot.name));
+            return Err(format!("could not deliver to agent {}: {e:#}", agent.name));
         }
     };
     {
@@ -1195,24 +1203,24 @@ async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
     }
     // Wait for this message's own turn (not whatever runs before it in the queue).
     let mut rx = st.backend.subscribe();
-    let (info, verdict, waited_ms) = crate::bots::wait_for_reply(
+    let (info, verdict, waited_ms) = crate::agents::wait_for_reply(
         &mut rx,
         d.session_id,
         Duration::from_secs(timeout_s),
         || st.backend.session(d.session_id),
-        || st.backend.bot_message_status(d.msg_id),
+        || st.backend.agent_message_status(d.msg_id),
     )
     .await?;
-    let tail = (verdict == crate::bots::AskVerdict::Unattributed)
-        .then(|| st.backend.recent_output(d.session_id, BOT_FALLBACK_LINES))
+    let tail = (verdict == crate::agents::AskVerdict::Unattributed)
+        .then(|| st.backend.recent_output(d.session_id, AGENT_FALLBACK_LINES))
         .flatten();
-    Ok(pretty(&crate::bots::ask_result(&bot.name, &d, route, &info, &verdict, waited_ms, tail)))
+    Ok(pretty(&crate::agents::ask_result(&agent.name, &d, route, &info, &verdict, waited_ms, tail)))
 }
 
-/// ask_bot's default wait, and how much terminal output stands in for a reply no hook
+/// ask_agent's default wait, and how much terminal output stands in for a reply no hook
 /// attributed to the message.
-const BOT_ASK_DEFAULT_S: i64 = 600;
-const BOT_FALLBACK_LINES: usize = 60;
+const AGENT_ASK_DEFAULT_S: i64 = 600;
+const AGENT_FALLBACK_LINES: usize = 60;
 
 fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let text = a.req_str("text")?;

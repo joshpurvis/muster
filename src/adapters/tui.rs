@@ -173,7 +173,7 @@ pub fn normalized_for_change(lines: &[String]) -> String {
 
 #[cfg(test)]
 pub mod testutil {
-    use crate::agents::ScreenSnapshot;
+    use crate::adapters::ScreenSnapshot;
 
     pub fn snap(text: &str) -> ScreenSnapshot {
         let lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();

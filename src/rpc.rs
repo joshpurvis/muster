@@ -31,9 +31,9 @@ const OUTBOX_CAP: usize = 256;
 /// `session.wait` limits.
 const WAIT_DEFAULT_MS: u64 = 600_000;
 const WAIT_MAX_MS: u64 = 3_600_000;
-/// `bot.ask`: how long to wait for the bot's reply (as MCP `ask_bot`).
-const BOT_ASK_DEFAULT_MS: u64 = 600_000;
-const BOT_ASK_MAX_MS: u64 = 1_800_000;
+/// `agent.ask`: how long to wait for the agent's reply (as MCP `ask_agent`).
+const AGENT_ASK_DEFAULT_MS: u64 = 600_000;
+const AGENT_ASK_MAX_MS: u64 = 1_800_000;
 /// `session.attach` `replay_bytes` bounds.
 const REPLAY_BYTES_MIN: usize = 4 * 1024;
 /// `session.output` limits.
@@ -329,16 +329,16 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 }
                 Caller::Shell(s) => {
                     let source = shell_source(hub, s);
-                    if let crate::bots::Source::Chain(prov) = source {
+                    if let crate::agents::Source::Chain(prov) = source {
                         crate::mcp::guard::check_claude_origin(target.kind, prov.origin).map_err(RpcError)?;
-                        if let Some(b) = hub.bots().by_session(p.id) {
-                            return Err(RpcError(format!("session {} is the bot {}: use `muster ask {}`", p.id, b.name, b.name)));
+                        if let Some(b) = hub.agents().by_session(p.id) {
+                            return Err(RpcError(format!("session {} is the agent {}: use `muster ask {}`", p.id, b.name, b.name)));
                         }
                     }
                     to_value(inject::send(hub, p.id, p.text, mode, format!("session:{s}"), source).await?)
                 }
                 Caller::Human => to_value(
-                    inject::send(hub, p.id, p.text, mode, who.label(), crate::bots::Source::Human).await?,
+                    inject::send(hub, p.id, p.text, mode, who.label(), crate::agents::Source::Human).await?,
                 ),
             }
         }
@@ -538,13 +538,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             // count as the human's input; keys from the human (or a human-rooted shell) do.
             let caller = caller(hub, p.from_session)?;
             let chain = match caller {
-                Caller::Agent(s) => Some(crate::bots::outgoing(hub.bots().prov(s))),
-                Caller::Shell(s) => hub.bots().prov(s).map(|pv| crate::bots::outgoing(Some(pv))),
+                Caller::Agent(s) => Some(crate::agents::outgoing(hub.agents().prov(s))),
+                Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
             match chain {
                 Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => hub.bots().note_human_input(p.id),
+                None => hub.agents().note_human_input(p.id),
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -653,48 +653,95 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             Ok(json!({ "revoked": ids }))
         }
 
-        "bot.create" => {
-            let p: crate::bots::NewBot = parse(params)?;
-            let b = crate::bots::create(hub, p)?;
-            Ok(crate::bots::bot_json(&b, None))
+        "agent.create" => {
+            require_local(who, method)?;
+            let p: crate::agents::NewAgent = parse(params)?;
+            let b = crate::agents::create(hub, p)?;
+            Ok(crate::agents::agent_json(&b, None))
         }
-        "bot.list" => {
+        "agent.update" => {
+            require_local(who, method)?;
+            let p: crate::agents::AgentUpdate = parse(params)?;
+            let b = crate::agents::update(hub, p)?;
+            Ok(crate::agents::agent_json(&b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+        }
+        "agent.list" => {
             let out: Vec<Value> = hub
-                .bots()
+                .agents()
                 .list()
                 .iter()
-                .map(|b| crate::bots::bot_json(b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+                .map(|b| crate::agents::agent_json(b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
                 .collect();
             Ok(Value::Array(out))
         }
-        "bot.remove" => {
+        "agent.templates" => to_value(crate::agents::templates()),
+        "agent.remove" => {
+            require_local(who, method)?;
             #[derive(Deserialize)]
             struct P {
                 name: String,
             }
             let p: P = parse(params)?;
-            let b = crate::bots::remove(hub, &p.name)?;
-            Ok(json!({ "removed": crate::bots::bot_json(&b, None) }))
+            let b = crate::agents::remove(hub, &p.name)?;
+            Ok(json!({ "removed": crate::agents::agent_json(&b, None) }))
         }
-        "bot.start" => {
+        "agent.start" => {
             #[derive(Deserialize)]
             struct P {
                 name: String,
                 #[serde(default)]
                 fresh: bool,
+                /// Where a new tab goes (the panel's window). Default: the usual placement.
+                #[serde(default)]
+                window_id: Option<WindowId>,
             }
             let p: P = parse(params)?;
-            let bs = crate::bots::start(hub, &p.name, p.fresh).await?;
+            let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
             Ok(json!({
-                "bot": crate::bots::bot_json(&bs.bot, Some(&bs.session)),
+                "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
                 "session": bs.session,
                 "started": bs.started,
             }))
         }
-        "bot.ask" => {
+        "agent.messages" => {
             #[derive(Deserialize)]
             struct P {
-                bot: String,
+                #[serde(default)]
+                agent: Option<String>,
+                #[serde(default)]
+                before: Option<i64>,
+                #[serde(default)]
+                limit: Option<usize>,
+            }
+            let p: P = parse(params)?;
+            Ok(crate::agents::messages(hub, p.agent.as_deref(), p.before, p.limit)?)
+        }
+        "agent.memory.list" | "agent.memory.read" | "agent.memory.write" => {
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+                #[serde(default)]
+                path: Option<String>,
+                #[serde(default)]
+                text: Option<String>,
+            }
+            let p: P = parse(params)?;
+            let a = hub.agents().get(&p.name).ok_or_else(|| crate::agents::no_agent(hub, &p.name))?;
+            let path = || p.path.as_deref().ok_or_else(|| RpcError("path is required".into()));
+            match method {
+                "agent.memory.list" => Ok(crate::agents::memory_list(&a)?),
+                "agent.memory.read" => Ok(crate::agents::memory_read(&a, path()?)?),
+                _ => {
+                    require_local(who, method)?;
+                    let text = p.text.as_deref().ok_or_else(|| RpcError("text is required".into()))?;
+                    Ok(crate::agents::memory_write(&a, path()?, text)?)
+                }
+            }
+        }
+        "agent.ask" => {
+            #[derive(Deserialize)]
+            struct P {
+                agent: String,
                 text: String,
                 #[serde(default)]
                 timeout_ms: Option<u64>,
@@ -703,19 +750,19 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 from_session: Option<SessionId>,
             }
             let p: P = parse(params)?;
-            let timeout_ms = p.timeout_ms.unwrap_or(BOT_ASK_DEFAULT_MS).clamp(1000, BOT_ASK_MAX_MS);
+            let timeout_ms = p.timeout_ms.unwrap_or(AGENT_ASK_DEFAULT_MS).clamp(1000, AGENT_ASK_MAX_MS);
             match caller(hub, p.from_session)? {
-                // An agent's CLI ask is its ask_bot: the same origin rule, permission check,
+                // An agent's CLI ask is its ask_agent: the same origin rule, permission check,
                 // rate limit and cap as the MCP tool.
                 Caller::Agent(s) => {
-                    let args = json!({"bot": p.bot, "text": p.text, "timeout_seconds": timeout_ms / 1000});
-                    mcp_json(crate::mcp::call_as(hub, s, "ask_bot", args).await)
+                    let args = json!({"agent": p.agent, "text": p.text, "timeout_seconds": timeout_ms / 1000});
+                    mcp_json(crate::mcp::call_as(hub, s, "ask_agent", args).await)
                 }
                 Caller::Shell(s) => {
-                    Ok(crate::bots::ask(hub, &p.bot, p.text, Some(s), None, Duration::from_millis(timeout_ms)).await?)
+                    Ok(crate::agents::ask(hub, &p.agent, p.text, Some(s), None, Duration::from_millis(timeout_ms)).await?)
                 }
                 Caller::Human => {
-                    Ok(crate::bots::ask(hub, &p.bot, p.text, None, None, Duration::from_millis(timeout_ms)).await?)
+                    Ok(crate::agents::ask(hub, &p.agent, p.text, None, None, Duration::from_millis(timeout_ms)).await?)
                 }
             }
         }
@@ -724,6 +771,15 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             Err(RpcError(format!("{method} is only available over the WebSocket")))
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
+    }
+}
+
+/// Agent writes (create, update, remove, memory) are for the client token only: never a paired
+/// device, whatever scopes it holds (`devices::method_scope` lists no agent method either).
+fn require_local(who: &Principal, method: &str) -> Result<(), RpcError> {
+    match who {
+        Principal::Local => Ok(()),
+        Principal::Device { .. } => Err(RpcError(format!("{method} needs the desktop client"))),
     }
 }
 
@@ -749,10 +805,10 @@ fn caller(hub: &Hub, from: Option<SessionId>) -> Result<Caller, RpcError> {
 }
 
 /// What a shell session's prompt carries: its provenance one hop on, else the human's.
-fn shell_source(hub: &Hub, s: SessionId) -> crate::bots::Source {
-    match hub.bots().prov(s) {
-        Some(p) => crate::bots::Source::Chain(crate::bots::outgoing(Some(p)).prov(None)),
-        None => crate::bots::Source::Human,
+fn shell_source(hub: &Hub, s: SessionId) -> crate::agents::Source {
+    match hub.agents().prov(s) {
+        Some(p) => crate::agents::Source::Chain(crate::agents::outgoing(Some(p)).prov(None)),
+        None => crate::agents::Source::Human,
     }
 }
 
@@ -762,14 +818,14 @@ fn spawn_prov(
     hub: &Hub,
     from: Option<SessionId>,
     kind: Option<SessionKind>,
-) -> Result<Option<crate::bots::Prov>, RpcError> {
+) -> Result<Option<crate::agents::Prov>, RpcError> {
     let route = match caller(hub, from)? {
         Caller::Human => return Ok(None),
-        Caller::Shell(s) => match hub.bots().prov(s) {
+        Caller::Shell(s) => match hub.agents().prov(s) {
             None => return Ok(None),
-            p => crate::bots::outgoing(p),
+            p => crate::agents::outgoing(p),
         },
-        Caller::Agent(s) => crate::bots::outgoing(hub.bots().prov(s)),
+        Caller::Agent(s) => crate::agents::outgoing(hub.agents().prov(s)),
     };
     if let Some(k) = kind {
         crate::mcp::guard::check_claude_origin(k, route.origin).map_err(RpcError)?;
@@ -966,11 +1022,23 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     // `workspace.add` result). If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
     let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
+    let is_device = matches!(who, Principal::Device { .. });
     let events = {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
-            let forward = |ev: ServerEvent| serde_json::to_string(&ev).ok().map(|t| Message::Text(t.into()));
+            // Named agents aren't on the phone (no agent.* method is either; docs/ANDROID.md).
+            let forward = |ev: ServerEvent| {
+                if is_device
+                    && matches!(
+                        ev,
+                        ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
+                    )
+                {
+                    return None;
+                }
+                serde_json::to_string(&ev).ok().map(|t| Message::Text(t.into()))
+            };
             loop {
                 tokio::select! {
                     ev = rx.recv() => match ev {
@@ -1082,7 +1150,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
-                    hub.bots().note_human_input(id);
+                    hub.agents().note_human_input(id);
                     if let Err(e) = hub.write_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");
                     }
@@ -1281,7 +1349,7 @@ async fn resend_replay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bots::{NewBot, Origin, Prov};
+    use crate::agents::{NewAgent, Origin, Prov};
     use crate::mcp::McpState;
     use crate::mcp::backend::HubBackend;
     use crate::store::{Store, StoredSession};
@@ -1314,10 +1382,19 @@ mod tests {
         (hub, st)
     }
 
-    fn bot(hub: &Hub, name: &str) {
-        crate::bots::create(
+    fn agent(hub: &Hub, name: &str) {
+        crate::agents::create(
             hub,
-            NewBot { name: name.into(), kind: None, model: None, effort: None, persona: None, accepts: None },
+            NewAgent {
+                name: name.into(),
+                kind: None,
+                model: None,
+                effort: None,
+                persona: None,
+                accepts: None,
+                permissions: None,
+                autostart: false,
+            },
         )
         .unwrap();
     }
@@ -1329,28 +1406,28 @@ mod tests {
     const SCHED: Prov = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
 
     #[tokio::test]
-    async fn cli_ask_from_an_agent_is_that_agents_ask_bot() {
+    async fn cli_ask_from_an_agent_is_that_agents_ask_agent() {
         let (hub, st) = fixture();
-        bot(&hub, "rpc-ada");
+        agent(&hub, "rpc-ada");
         // The codex session handles a scheduled message: its `muster ask` carries that, and no
         // parameter can claim otherwise.
-        hub.bots().set_prov(3, Some(SCHED));
-        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 3, "origin": "human"}))
+        hub.agents().set_prov(3, Some(SCHED));
+        let e = call(&hub, "agent.ask", json!({"agent": "rpc-ada", "text": "hi", "from_session": 3, "origin": "human"}))
             .await
             .unwrap_err();
         assert!(e.contains("accepts only human"), "{e}");
         // Human-rooted again: the MCP send rate limit applies to its CLI asks...
-        hub.bots().set_prov(3, None);
+        hub.agents().set_prov(3, None);
         for _ in 0..20 {
             st.guard.lock().sends.check_and_record(3, now_ms(), 20, 60_000).unwrap();
         }
-        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 3})).await.unwrap_err();
+        let e = call(&hub, "agent.ask", json!({"agent": "rpc-ada", "text": "hi", "from_session": 3})).await.unwrap_err();
         assert!(e.contains("rate limit"), "{e}");
-        // ...and so does the permission check (the caller's tab is narrower than the bot's).
+        // ...and so does the permission check (the caller's tab is narrower than the agent's).
         st.guard.lock().sends.forget(2);
         let plan = Permissions { claude_mode: ClaudeMode::Plan, ..Default::default() };
         hub.set_permissions(1, plan).unwrap();
-        let e = call(&hub, "bot.ask", json!({"bot": "rpc-ada", "text": "hi", "from_session": 2})).await.unwrap_err();
+        let e = call(&hub, "agent.ask", json!({"agent": "rpc-ada", "text": "hi", "from_session": 2})).await.unwrap_err();
         assert!(e.contains("more than your channel"), "{e}");
         // The call is audited like an MCP call.
         let tl = hub.timeline(1, None, 100);
@@ -1364,11 +1441,11 @@ mod tests {
         let e = call(&hub, "session.send", json!({"id": 1, "text": "ls", "from_session": 3})).await.unwrap_err();
         assert!(e.contains("is a shell"), "{e}");
         // Keys from a session on a scheduled chain can't drive a Claude agent.
-        hub.bots().set_prov(1, Some(SCHED));
+        hub.agents().set_prov(1, Some(SCHED));
         let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 1})).await.unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // Nor can `muster new` / session.spawn start one.
-        hub.bots().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED));
         let e = call(&hub, "session.spawn", json!({"channel_id": 1, "kind": "claude", "from_session": 3}))
             .await
             .unwrap_err();
@@ -1378,10 +1455,118 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // The human's keystrokes (no from_session) make the next plain prompt the human's.
-        hub.bots().set_prov(2, Some(SCHED));
+        hub.agents().set_prov(2, Some(SCHED));
         let _ = call(&hub, "session.input", json!({"id": 2, "data": "x"})).await;
         let info = hub.session(2).unwrap();
-        hub.bots().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"}));
-        assert_eq!(hub.bots().prov(2), None);
+        hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"}));
+        assert_eq!(hub.agents().prov(2), None);
+    }
+
+    /// Every event of kind `kind` (`agent_upserted`, ...) received so far, as JSON.
+    fn drain(rx: &mut broadcast::Receiver<ServerEvent>, kind: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            let v = serde_json::to_value(&ev).unwrap();
+            if v["event"] == kind {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn agent_update_edits_the_record_persona_and_tab_profile() {
+        let (hub, _st) = fixture();
+        let mut rx = hub.subscribe();
+        agent(&hub, "rpc-eve");
+        assert_eq!(drain(&mut rx, "agent_upserted").len(), 1);
+        let r = call(
+            &hub,
+            "agent.update",
+            json!({"name": "RPC-EVE", "persona": "Writes docs.", "autostart": true, "model": "opus",
+                   "accepts": ["human", "schedule"],
+                   "permissions": {"claude_mode": "plan", "codex_sandbox": "read_only"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!((r["autostart"].clone(), r["model"].clone()), (json!(true), json!("opus")));
+        assert_eq!(r["permissions"]["claude_mode"], "plan");
+        assert_eq!(r["accepts_origins"], json!(["human", "schedule"]));
+        let persona = std::fs::read_to_string(std::path::Path::new(r["home_dir"].as_str().unwrap()).join("CLAUDE.md")).unwrap();
+        assert!(persona.contains("Writes docs."));
+        assert_eq!(drain(&mut rx, "agent_upserted").len(), 1);
+        // Absent fields stay; an empty model clears it; the kind can't change; bad values refused.
+        let r = call(&hub, "agent.update", json!({"name": "rpc-eve", "model": ""})).await.unwrap();
+        assert!(r["model"].is_null() && r["autostart"] == true && r["persona"] == "Writes docs.");
+        assert!(call(&hub, "agent.update", json!({"name": "rpc-eve", "kind": "codex"})).await.is_err());
+        assert!(call(&hub, "agent.update", json!({"name": "rpc-eve", "accepts": []})).await.is_err());
+        assert!(call(&hub, "agent.update", json!({"name": "rpc-eve", "effort": "--evil"})).await.is_err());
+        assert!(call(&hub, "agent.update", json!({"name": "nobody"})).await.unwrap_err().contains("no agent named"));
+        let t = call(&hub, "agent.templates", json!({})).await.unwrap();
+        assert_eq!(t.as_array().unwrap().len(), 5);
+        call(&hub, "agent.remove", json!({"name": "rpc-eve"})).await.unwrap();
+        assert_eq!(drain(&mut rx, "agent_removed")[0]["name"], "rpc-eve");
+    }
+
+    #[tokio::test]
+    async fn refused_asks_are_logged_and_listed() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-ivy");
+        let mut rx = hub.subscribe();
+        // An agent session on a scheduled chain asks a Claude agent: refused, and kept.
+        hub.agents().set_prov(3, Some(SCHED));
+        let e = call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "nightly report\nmore", "from_session": 3}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("accepts only human"), "{e}");
+        // The human's CLI path too (forced origins are daemon-internal; a shell on that chain).
+        hub.agents().set_prov(1, Some(SCHED));
+        assert!(call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "from a shell", "from_session": 1})).await.is_err());
+        let ev = drain(&mut rx, "agent_message");
+        assert_eq!(ev.len(), 2);
+        let r = call(&hub, "agent.messages", json!({"agent": "rpc-ivy"})).await.unwrap();
+        let ms = r["messages"].as_array().unwrap();
+        assert_eq!(ms.len(), 2);
+        assert_eq!((ms[0]["text"].as_str(), ms[0]["from"].as_str()), (Some("from a shell"), Some("session:1")));
+        assert_eq!((ms[1]["to"].as_str(), ms[1]["origin"].as_str(), ms[1]["hop"].as_u64()), (Some("rpc-ivy"), Some("schedule"), Some(2)));
+        assert!(ms[1]["refused"].as_str().unwrap().contains("accepts only human"));
+        // Paged, newest first.
+        let r = call(&hub, "agent.messages", json!({"limit": 1})).await.unwrap();
+        assert_eq!((r["messages"].as_array().unwrap().len(), r["more"].clone()), (1, json!(true)));
+        let before = r["messages"][0]["id"].as_i64().unwrap();
+        let r = call(&hub, "agent.messages", json!({"before": before})).await.unwrap();
+        assert_eq!((r["messages"].as_array().unwrap().len(), r["more"].clone()), (1, json!(false)));
+        // Refusals don't use up the daily cap.
+        let id = hub.agents().get("rpc-ivy").unwrap().id;
+        assert_eq!(hub.store().count_agent_messages_since(id, 0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_memory_over_rpc_and_device_scope() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-max");
+        call(&hub, "agent.memory.write", json!({"name": "rpc-max", "path": "people/ada.md", "text": "likes tests"}))
+            .await
+            .unwrap();
+        let r = call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "people/ada.md"})).await.unwrap();
+        assert_eq!(r["text"], "likes tests");
+        let r = call(&hub, "agent.memory.list", json!({"name": "rpc-max"})).await.unwrap();
+        assert!(r["files"].as_array().unwrap().iter().any(|f| f["path"] == "people/ada.md"));
+        assert!(call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "../CLAUDE.md"})).await.is_err());
+        assert!(call(&hub, "agent.memory.write", json!({"name": "rpc-max", "path": "x.md"})).await.is_err());
+        // No agent method is ever a device's, and writes need the desktop client token.
+        for m in [
+            "agent.create", "agent.update", "agent.list", "agent.remove", "agent.start", "agent.ask",
+            "agent.templates", "agent.messages", "agent.memory.list", "agent.memory.read", "agent.memory.write",
+        ] {
+            assert!(devices::method_scope(m).is_none(), "{m}");
+        }
+        let phone = Principal::Device { id: 1 };
+        assert!(authorize(&hub, &phone, "agent.list", &json!({})).is_err());
+        assert!(require_local(&phone, "agent.update").is_err());
+        let e = dispatch(&hub, &phone, "agent.memory.write", json!({"name": "rpc-max", "path": "y.md", "text": "x"}))
+            .await
+            .unwrap_err();
+        assert!(e.0.contains("desktop client"), "{}", e.0);
     }
 }

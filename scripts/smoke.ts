@@ -193,8 +193,16 @@ async function main() {
   await git(REPO, "add", ".");
   await git(REPO, "commit", "-q", "-m", "init");
 
+  // A home left in the old bots folder moves to <data>/agents when the daemon starts.
+  await Deno.mkdir(`${DATA}/bots/stray/memory`, { recursive: true });
+  await Deno.writeTextFile(`${DATA}/bots/stray/memory/note.md`, "kept\n");
+
   console.log("start daemon");
   let d = await startDaemon();
+  ok(
+    !(await exists(`${DATA}/bots`)) && (await Deno.readTextFile(`${DATA}/agents/stray/memory/note.md`)) === "kept\n",
+    "daemon start moves <data>/bots to <data>/agents",
+  );
   const st = await Deno.stat(`${RUNTIME}/daemon.json`);
   ok((st.mode! & 0o777) === 0o600, "daemon.json is mode 0600");
 
@@ -411,12 +419,12 @@ async function main() {
   ok(extraRan, "the arguments after -- reached the agent command");
   const extraCh = (await c.call("hello")).sessions.find((x: Json) => x.id === extraSid).channel_id;
   const noneOut = await new Deno.Command(BIN, {
-    args: ["new", REPO, "--agent", "none", "--", "-x"],
+    args: ["new", REPO, "--kind", "none", "--", "-x"],
     env: cliEnv,
     stdout: "null",
     stderr: "piped",
   }).output();
-  ok(!noneOut.success && dec.decode(noneOut.stderr).includes("need an agent"), "muster new --agent none -- ARGS is refused");
+  ok(!noneOut.success && dec.decode(noneOut.stderr).includes("need an agent"), "muster new --kind none -- ARGS is refused");
   await c.call("channel.archive", { id: extraCh, remove_worktree: false });
 
   // session.output / session.input / session.wait (the CLI's primitives)
@@ -727,30 +735,53 @@ async function main() {
   h = await c.call("hello");
   ok(h.workspaces.length === 0 && h.channels.length === 0, "workspace.remove");
 
-  // bots: records, home dirs and the origin rule (no agent is started)
-  const ada = await c.call("bot.create", { name: "Ada", kind: "claude", persona: "Reviews diffs." });
-  ok(ada.accepts_origins.join() === "human" && ada.home_dir === `${DATA}/bots/ada`, "bot.create: a claude bot accepts human only");
-  ok(await exists(`${DATA}/bots/ada/CLAUDE.md`) && await exists(`${DATA}/bots/ada/memory`), "bot home: CLAUDE.md and memory/");
-  ok((await Deno.readTextFile(`${DATA}/bots/ada/CLAUDE.md`)).includes("Reviews diffs."), "persona written to CLAUDE.md");
-  const cody = await c.call("bot.create", { name: "cody", kind: "codex" });
-  ok(cody.accepts_origins.join() === "human,schedule,webhook" && await exists(`${DATA}/bots/cody/AGENTS.md`), "a codex bot accepts every origin, AGENTS.md");
-  await c.call("bot.create", { name: "ADA" }).then(
-    () => ok(false, "bot names are unique case-insensitively"),
-    (e) => ok(String(e).includes("already exists"), "bot names are unique case-insensitively"),
+  // agents: records, home dirs and the origin rule (no agent is started)
+  const ada = await c.call("agent.create", { name: "Ada", kind: "claude", persona: "Reviews diffs." });
+  ok(ada.accepts_origins.join() === "human" && ada.home_dir === `${DATA}/agents/ada`, "agent.create: a claude agent accepts human only");
+  ok(await exists(`${DATA}/agents/ada/CLAUDE.md`) && await exists(`${DATA}/agents/ada/memory`), "agent home: CLAUDE.md and memory/");
+  ok((await Deno.readTextFile(`${DATA}/agents/ada/CLAUDE.md`)).includes("Reviews diffs."), "persona written to CLAUDE.md");
+  const cody = await c.call("agent.create", { name: "cody", kind: "codex" });
+  ok(cody.accepts_origins.join() === "human,schedule,webhook" && await exists(`${DATA}/agents/cody/AGENTS.md`), "a codex agent accepts every origin, AGENTS.md");
+  await c.call("agent.create", { name: "ADA" }).then(
+    () => ok(false, "agent names are unique case-insensitively"),
+    (e) => ok(String(e).includes("already exists"), "agent names are unique case-insensitively"),
   );
-  // (Asking a real bot would start its agent CLI: only the refusal paths run here.)
-  await c.call("bot.ask", { bot: "nobody", text: "hi" }).then(
-    () => ok(false, "bot.ask: unknown bot"),
-    (e) => ok(String(e).includes("no bot named nobody"), "bot.ask: unknown bot"),
+  // (Asking a real agent would start its agent CLI: only the refusal paths run here.)
+  await c.call("agent.ask", { agent: "nobody", text: "hi" }).then(
+    () => ok(false, "agent.ask: unknown agent"),
+    (e) => ok(String(e).includes("no agent named nobody"), "agent.ask: unknown agent"),
   );
-  await c.call("bot.ask", { bot: "ada", text: "hi", from_session: 999999 }).then(
-    () => ok(false, "bot.ask: unknown from_session refused"),
-    (e) => ok(String(e).includes("no such session"), "bot.ask: unknown from_session refused"),
+  await c.call("agent.ask", { agent: "ada", text: "hi", from_session: 999999 }).then(
+    () => ok(false, "agent.ask: unknown from_session refused"),
+    (e) => ok(String(e).includes("no such session"), "agent.ask: unknown from_session refused"),
   );
-  ok((await c.call("bot.list")).length === 2, "bot.list");
-  await c.call("bot.remove", { name: "ada" });
-  await c.call("bot.remove", { name: "cody" });
-  ok((await c.call("bot.list")).length === 0 && await exists(`${DATA}/bots/ada/CLAUDE.md`), "bot.remove keeps the home dir");
+  ok((await c.call("agent.list")).length === 2, "agent.list");
+  // Panel backend: edit, templates, memory, the message log and live events.
+  const ed = await c.call("agent.update", {
+    name: "ada",
+    persona: "Reviews diffs, briefly.",
+    autostart: true,
+    permissions: { claude_mode: "plan", codex_sandbox: "workspace_write" },
+  });
+  ok(ed.autostart === true && ed.permissions.claude_mode === "plan", "agent.update: autostart and permissions");
+  ok((await Deno.readTextFile(`${DATA}/agents/ada/CLAUDE.md`)).includes("Reviews diffs, briefly."), "agent.update rewrites the persona file");
+  await c.waitFor("agent_upserted event", () => c.events.some((e) => e.event === "agent_upserted" && e.data.name === "Ada" && e.data.autostart));
+  ok(true, "agent_upserted reaches clients");
+  const tpl = await c.call("agent.templates");
+  ok(tpl.map((t: Json) => t.id).join() === "blank,orchestrator,researcher,reviewer,worker", "agent.templates");
+  await c.call("agent.memory.write", { name: "ada", path: "people/me.md", text: "likes short reviews" });
+  ok((await Deno.readTextFile(`${DATA}/agents/ada/memory/people/me.md`)) === "likes short reviews", "agent.memory.write");
+  ok((await c.call("agent.memory.read", { name: "ada", path: "people/me.md" })).text === "likes short reviews", "agent.memory.read");
+  ok((await c.call("agent.memory.list", { name: "ada" })).files.some((f: Json) => f.path === "people/me.md"), "agent.memory.list");
+  await c.call("agent.memory.read", { name: "ada", path: "../CLAUDE.md" }).then(
+    () => ok(false, "agent.memory.read refuses paths outside memory/"),
+    (e) => ok(String(e).includes(".."), "agent.memory.read refuses paths outside memory/"),
+  );
+  const log = await c.call("agent.messages", { limit: 10 });
+  ok(Array.isArray(log.messages) && log.more === false, "agent.messages");
+  await c.call("agent.remove", { name: "ada" });
+  await c.call("agent.remove", { name: "cody" });
+  ok((await c.call("agent.list")).length === 0 && await exists(`${DATA}/agents/ada/CLAUDE.md`), "agent.remove keeps the home dir");
 
   c.close();
   await stopDaemon(d, "SIGTERM");

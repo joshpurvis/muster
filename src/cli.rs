@@ -1101,7 +1101,7 @@ pub fn rename(d: &Discovery, t: &str, name: &str, tab: bool) -> anyhow::Result<(
 
 pub struct NewOpts {
     pub path: std::path::PathBuf,
-    pub agent: String,
+    pub kind: String,
     pub worktree: bool,
     pub base: Option<String>,
     pub name: Option<String>,
@@ -1115,11 +1115,11 @@ pub struct NewOpts {
 /// `muster new`: `workspace.add`, `channel.create`, then `hello` for the new session.
 pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     let abs = std::fs::canonicalize(&o.path).with_context(|| format!("{}", o.path.display()))?;
-    if o.agent == "none" && o.prompt.is_some() {
-        anyhow::bail!("--prompt needs an agent (not --agent none)");
+    if o.kind == "none" && o.prompt.is_some() {
+        anyhow::bail!("--prompt needs an agent (not --kind none)");
     }
-    if o.agent == "none" && !o.agent_args.is_empty() {
-        anyhow::bail!("arguments after `--` need an agent (not --agent none)");
+    if o.kind == "none" && !o.agent_args.is_empty() {
+        anyhow::bail!("arguments after `--` need an agent (not --kind none)");
     }
     let ws = client::rpc(d, "workspace.add", json!({ "path": abs }))?;
     let ws_id = ws["id"].as_i64().context("workspace.add returned no id")?;
@@ -1150,8 +1150,8 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
     if let Some(b) = o.base {
         set(&mut p, "base", json!(b));
     }
-    if o.agent != "none" {
-        set(&mut p, "agent", json!(o.agent));
+    if o.kind != "none" {
+        set(&mut p, "agent", json!(o.kind));
     }
     if let Some(pr) = o.prompt {
         set(&mut p, "prompt", json!(pr));
@@ -1173,14 +1173,14 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
         print_json(&json!({ "channel": ch, "session": sess.map(|s| snap.session_json(s)) }))?;
     } else if let Some(s) = sess {
         println!("{}", s.id);
-    } else if o.agent == "none" {
+    } else if o.kind == "none" {
         eprintln!(
             "muster: created tab {ch_id} ({}) with no session; no window shows it until one starts in it",
             ch["name"].as_str().unwrap_or("?")
         );
     }
-    if o.agent != "none" && sess.is_none() {
-        anyhow::bail!("tab {ch_id} was created but {} did not start (see the tab's timeline)", o.agent);
+    if o.kind != "none" && sess.is_none() {
+        anyhow::bail!("tab {ch_id} was created but {} did not start (see the tab's timeline)", o.kind);
     }
     Ok(())
 }
@@ -1358,12 +1358,48 @@ impl EventTracker {
                     || self.focus_tab().is_some_and(|c| tabs.contains(&c))
                     || self.session_window().is_some_and(|w| Some(w) == id)
             }
+            // Named agents: their record (by its session or tab) and messages to them (by the
+            // receiving session). A message line shows in the human stream too.
+            "agent_upserted" | "agent_removed" => {
+                self.unfiltered()
+                    || data["session_id"].as_u64().is_some_and(|s| self.filter.session == Some(s as u32))
+                    || data["channel_id"].as_i64().is_some_and(|c| self.focus_tab() == Some(c))
+            }
+            "agent_message" => {
+                let to = data["to_session"].as_u64().map(|s| s as u32);
+                let pass = self.unfiltered()
+                    || (to.is_some() && to == self.filter.session)
+                    || to
+                        .and_then(|s| self.sessions.get(&s))
+                        .is_some_and(|s| self.filter.channel == Some(s.channel_id));
+                change = Some((now_ms(), agent_message_line(data)));
+                pass
+            }
             "lagged" => true,
             _ => self.unfiltered(),
         };
         let change = change.filter(|_| pass);
         Seen { pass, change }
     }
+}
+
+/// `msg 12  human -> ada  origin=human hop=0  first line` (with `refused: why` or `replied`).
+pub fn agent_message_line(m: &Value) -> String {
+    let first = m["text"].as_str().and_then(|t| t.lines().find(|l| !l.trim().is_empty())).unwrap_or("");
+    let first: String = first.chars().take(80).collect();
+    let status = match (m["refused"].as_str(), m["reply"].is_string()) {
+        (Some(why), _) => format!("  refused: {why}"),
+        (None, true) => "  replied".to_string(),
+        _ => String::new(),
+    };
+    format!(
+        "msg {}  {} -> {}  origin={} hop={}  {first}{status}",
+        m["id"],
+        m["from"].as_str().unwrap_or("?"),
+        m["to"].as_str().unwrap_or("?"),
+        m["origin"].as_str().unwrap_or("?"),
+        m["hop"],
+    )
 }
 
 /// `HH:MM:SS` in local time.
@@ -1439,46 +1475,106 @@ pub fn events(d: &Discovery, as_json: bool, session: Option<&str>, tab: Option<&
     Ok(())
 }
 
-// ----- bots (PLAN.md §10) -----
+// ----- agents (PLAN.md §10) -----
 
-/// `muster bot new`.
-pub fn bot_new(
-    d: &Discovery,
-    name: &str,
-    kind: &str,
-    model: Option<String>,
-    effort: Option<String>,
-    persona: Option<String>,
-    accepts: Option<&str>,
-) -> anyhow::Result<()> {
-    let accepts = accepts.map(crate::bots::parse_accepts).transpose()?;
-    let b = client::rpc(
-        d,
-        "bot.create",
-        json!({ "name": name, "kind": kind, "model": model, "effort": effort, "persona": persona, "accepts": accepts }),
-    )?;
+/// `muster agent new` / `edit` options.
+pub struct AgentOpts {
+    pub name: String,
+    pub kind: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub persona: Option<String>,
+    pub accepts: Option<String>,
+    pub autostart: Option<bool>,
+    pub claude_mode: Option<String>,
+    pub codex_sandbox: Option<String>,
+}
+
+impl AgentOpts {
+    /// The request fields both RPCs share (absent ones left out). `base` is the profile a
+    /// half-given `--claude-mode` / `--codex-sandbox` completes (both halves are required).
+    fn params(&self, base: &Value) -> anyhow::Result<Value> {
+        let mut p = json!({ "name": self.name });
+        let mut set = |k: &str, v: Value| {
+            p[k] = v;
+        };
+        if let Some(k) = &self.kind {
+            set("kind", json!(k));
+        }
+        if let Some(m) = &self.model {
+            set("model", json!(m));
+        }
+        if let Some(e) = &self.effort {
+            set("effort", json!(e));
+        }
+        if let Some(t) = &self.persona {
+            set("persona", json!(t));
+        }
+        if let Some(a) = &self.accepts {
+            set("accepts", json!(crate::agents::parse_accepts(a)?));
+        }
+        if let Some(a) = self.autostart {
+            set("autostart", json!(a));
+        }
+        if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
+            set(
+                "permissions",
+                json!({
+                    "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("default"),
+                    "codex_sandbox": self.codex_sandbox.as_deref().or(base["codex_sandbox"].as_str()).unwrap_or("workspace_write"),
+                }),
+            );
+        }
+        Ok(p)
+    }
+}
+
+fn print_agent(verb: &str, b: &Value, name: &str) {
     println!(
-        "bot {} ({}, accepts {}): home {}",
+        "{verb} {} ({}, accepts {}{}): home {}",
         b["name"].as_str().unwrap_or(name),
-        b["kind"].as_str().unwrap_or(kind),
+        b["kind"].as_str().unwrap_or("?"),
         b["accepts_origins"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
             .unwrap_or_default(),
+        if b["autostart"] == true { ", autostart" } else { "" },
         b["home_dir"].as_str().unwrap_or("?")
     );
+}
+
+/// `muster agent new`.
+pub fn agent_new(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
+    let b = client::rpc(d, "agent.create", o.params(&Value::Null)?)?;
+    print_agent("agent", &b, &o.name);
     Ok(())
 }
 
-/// `muster bot ls`: `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`.
-pub fn bot_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
-    let v = client::rpc(d, "bot.list", json!({}))?;
+/// `muster agent edit`.
+pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
+    let base = if o.claude_mode.is_some() != o.codex_sandbox.is_some() {
+        let list = client::rpc(d, "agent.list", json!({}))?;
+        list.as_array()
+            .and_then(|l| l.iter().find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&o.name))))
+            .map(|a| a["permissions"].clone())
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let b = client::rpc(d, "agent.update", o.params(&base)?)?;
+    print_agent("updated", &b, &o.name);
+    Ok(())
+}
+
+/// `muster agent ls`: `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`.
+pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
+    let v = client::rpc(d, "agent.list", json!({}))?;
     if as_json {
         return print_json(&v);
     }
     let list = v.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
-        println!("no bots (`muster bot new <name>` creates one)");
+        println!("no agents (`muster agent new <name>` creates one)");
         return Ok(());
     }
     let s = |b: &Value, k: &str| b[k].as_str().unwrap_or("-").to_string();
@@ -1515,19 +1611,19 @@ pub fn bot_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn bot_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
-    let r = client::rpc(d, "bot.remove", json!({ "name": name }))?;
+pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
+    let r = client::rpc(d, "agent.remove", json!({ "name": name }))?;
     println!(
-        "removed bot {} (its home folder {} is kept)",
+        "removed agent {} (its home folder {} is kept)",
         r["removed"]["name"].as_str().unwrap_or(name),
         r["removed"]["home_dir"].as_str().unwrap_or("?")
     );
     Ok(())
 }
 
-/// `muster bot start`: prints the session id (like `muster new`).
-pub fn bot_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
-    let r = client::rpc_with_timeout(d, "bot.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
+/// `muster agent start`: prints the session id (like `muster new`).
+pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
+    let r = client::rpc_with_timeout(d, "agent.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
     let id = r["session"]["id"].as_u64().unwrap_or(0);
     if r["started"] == true {
         println!("{id}");
@@ -1537,9 +1633,9 @@ pub fn bot_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `muster ask`: `bot.ask` (waits for the reply), prints the reply. Exit 124 on timeout; 1
-/// when the bot stopped without answering (a prompt for the human, an error) or exited.
-pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bool) -> anyhow::Result<()> {
+/// `muster ask`: `agent.ask` (waits for the reply), prints the reply. Exit 124 on timeout; 1
+/// when the agent stopped without answering (a prompt for the human, an error) or exited.
+pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: bool) -> anyhow::Result<()> {
     let text = send_text(words, || {
         let stdin = std::io::stdin();
         if stdin.is_terminal() {
@@ -1550,12 +1646,12 @@ pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bo
         Ok(s)
     })?;
     let timeout = timeout.min(1800);
-    // Inside a muster session the ask is that session's (an agent's goes through ask_bot).
+    // Inside a muster session the ask is that session's (an agent's goes through ask_agent).
     let r = client::rpc_with_timeout(
         d,
-        "bot.ask",
+        "agent.ask",
         json!({
-            "bot": bot,
+            "agent": agent,
             "text": text,
             "timeout_ms": timeout * 1000,
             "from_session": env_session(),
@@ -1567,18 +1663,18 @@ pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bo
     } else if let Some(reply) = r["reply"].as_str() {
         println!("{reply}");
     } else if let Some(tail) = r["unattributed_output"].as_str() {
-        eprintln!("muster: {bot} reported no reply for this message; the end of its terminal (may belong to another prompt):");
+        eprintln!("muster: {agent} reported no reply for this message; the end of its terminal (may belong to another prompt):");
         println!("{tail}");
         return Ok(());
     }
     if r["timed_out"] == true {
-        return Err(exit(124, format!("no reply from {bot} within {timeout}s (msg {})", r["msg_id"])));
+        return Err(exit(124, format!("no reply from {agent} within {timeout}s (msg {})", r["msg_id"])));
     }
     if r["reply"].is_null() {
         return Err(exit(
             1,
             format!(
-                "{bot} stopped without a reply: {}{}",
+                "{agent} stopped without a reply: {}{}",
                 r["state"].as_str().unwrap_or("?"),
                 r["detail"].as_str().map(|d| format!(" ({d})")).unwrap_or_default()
             ),

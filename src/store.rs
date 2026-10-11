@@ -193,6 +193,21 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE bots ADD COLUMN channel_id INTEGER;
     "#,
+    // v9: bots are now "agents" (tables, columns and index renamed), with an autostart flag;
+    // messages keep their text and, for a refused one, the reason (the agents panel's log).
+    // Home dirs and the agents workspace move from `<data>/bots` to `<data>/agents` at daemon
+    // start, together with the folders (`agents::relocate_homes`), so a record never points at a
+    // folder that didn't move.
+    r#"
+    ALTER TABLE bots RENAME TO agents;
+    ALTER TABLE bot_messages RENAME TO agent_messages;
+    ALTER TABLE agent_messages RENAME COLUMN to_bot TO to_agent;
+    DROP INDEX IF EXISTS bot_messages_to;
+    CREATE INDEX agent_messages_to ON agent_messages(to_agent, created_at);
+    ALTER TABLE agents ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agent_messages ADD COLUMN text TEXT;
+    ALTER TABLE agent_messages ADD COLUMN refused TEXT;
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -213,6 +228,11 @@ fn enum_to_str<T: serde::Serialize>(v: &T) -> String {
         _ => String::new(),
     }
 }
+
+/// `row_agent_message`'s columns (the recipient's name, while the agent exists).
+const AGENT_MESSAGE_SELECT: &str = "SELECT m.id, m.from_label, m.from_session, m.to_agent, m.to_session, m.origin,
+    m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name
+    FROM agent_messages m LEFT JOIN agents a ON a.id = m.to_agent";
 
 fn perms_json(p: &Permissions) -> String {
     serde_json::to_string(p).unwrap_or_else(|_| "{}".into())
@@ -336,19 +356,19 @@ impl Store {
         Ok(())
     }
 
-    // ----- bots -----
+    // ----- agents -----
 
-    pub fn load_bots(&self) -> anyhow::Result<Vec<crate::bots::Bot>> {
+    pub fn load_agents(&self) -> anyhow::Result<Vec<crate::agents::Agent>> {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id FROM bots ORDER BY id",
+                    resume_id, created_at, channel_id, autostart FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
             let perms: String = r.get(7)?;
             let accepts: String = r.get(8)?;
-            Ok(crate::bots::Bot {
+            Ok(crate::agents::Agent {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 kind: SessionKind::parse(&kind).unwrap_or(SessionKind::Codex),
@@ -358,24 +378,25 @@ impl Store {
                 home_dir: r.get(6)?,
                 permissions: serde_json::from_str(&perms).unwrap_or_default(),
                 // Unreadable: the strictest set (human only).
-                accepts_origins: serde_json::from_str(&accepts).unwrap_or_else(|_| vec![crate::bots::Origin::Human]),
+                accepts_origins: serde_json::from_str(&accepts).unwrap_or_else(|_| vec![crate::agents::Origin::Human]),
                 session_id: r.get::<_, Option<i64>>(9)?.map(|v| v as SessionId),
                 resume_id: r.get(10)?,
                 created_at: r.get(11)?,
                 channel_id: r.get(12)?,
+                autostart: r.get::<_, i64>(13)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Inserts the bot (its `id` is ignored) and returns the new id. A name taken
+    /// Inserts the agent (its `id` is ignored) and returns the new id. A name taken
     /// (case-insensitively) is an error.
-    pub fn insert_bot(&self, b: &crate::bots::Bot) -> anyhow::Result<i64> {
+    pub fn insert_agent(&self, b: &crate::agents::Agent) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO bots (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
+                               session_id, resume_id, created_at, channel_id, autostart)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -388,14 +409,15 @@ impl Store {
                 b.session_id,
                 b.resume_id,
                 b.created_at,
-                b.channel_id
+                b.channel_id,
+                b.autostart as i64
             ],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
-    /// The fields that change after creation: the bot's tab, session and conversation id.
-    pub fn update_bot_runtime(
+    /// The fields that change after creation: the agent's tab, session and conversation id.
+    pub fn update_agent_runtime(
         &self,
         id: i64,
         channel_id: Option<ChannelId>,
@@ -403,114 +425,225 @@ impl Store {
         resume_id: Option<&str>,
     ) -> anyhow::Result<()> {
         self.conn.lock().execute(
-            "UPDATE bots SET channel_id = ?2, session_id = ?3, resume_id = ?4 WHERE id = ?1",
+            "UPDATE agents SET channel_id = ?2, session_id = ?3, resume_id = ?4 WHERE id = ?1",
             params![id, channel_id, session_id, resume_id],
         )?;
         Ok(())
     }
 
-    pub fn delete_bot(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM bots WHERE id = ?1", [id])?;
+    /// The fields `agent.update` changes (`agents::update`).
+    pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
+                    autostart = ?7 WHERE id = ?1",
+            params![
+                b.id,
+                b.model,
+                b.effort,
+                b.persona,
+                perms_json(&b.permissions),
+                serde_json::to_string(&b.accepts_origins)?,
+                b.autostart as i64
+            ],
+        )?;
         Ok(())
     }
 
-    /// Records a message muster is about to deliver to a bot; returns its id.
-    #[cfg(test)]
-    pub fn insert_bot_message(&self, m: &crate::bots::BotMessage) -> anyhow::Result<i64> {
+    /// The bots -> agents move (`agents::relocate_homes`): agent `id`'s home moved from one of
+    /// `olds` (spellings of the same folder) to `new`. Its record points at the new folder and
+    /// forgets its conversation id; sessions that ran in the old folder, or below it, follow.
+    pub fn relocate_agent_home(&self, id: i64, olds: &[String], new: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE agents SET home_dir = ?2, resume_id = NULL WHERE id = ?1", params![id, new])?;
+        for old in olds {
+            tx.execute(
+                "UPDATE sessions SET cwd = ?2 || substr(cwd, length(?1) + 1)
+                 WHERE cwd = ?1 OR substr(cwd, 1, length(?1) + 1) = ?1 || '/'",
+                params![old, new],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn has_workspace_at(&self, paths: &[String]) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
+        for p in paths {
+            if conn
+                .query_row("SELECT 1 FROM workspaces WHERE path = ?1", [p], |_| Ok(()))
+                .optional()?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The agents workspace moved from one of `olds` to `new` (renamed `name`), with its tabs'
+    /// cwd. If a workspace is already at `new`, the old one's tabs join it and the old row goes.
+    pub fn relocate_agents_workspace(&self, olds: &[String], new: &str, name: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for old in olds {
+            let existing: Option<WorkspaceId> =
+                tx.query_row("SELECT id FROM workspaces WHERE path = ?1", [new], |r| r.get(0)).optional()?;
+            let Some(id) = tx
+                .query_row("SELECT id FROM workspaces WHERE path = ?1", [old], |r| r.get::<_, WorkspaceId>(0))
+                .optional()?
+            else {
+                continue;
+            };
+            tx.execute("UPDATE channels SET cwd = ?2 WHERE workspace_id = ?1 AND cwd = ?3", params![id, new, old])?;
+            match existing {
+                Some(to) if to != id => {
+                    tx.execute("UPDATE channels SET workspace_id = ?2 WHERE workspace_id = ?1", params![id, to])?;
+                    tx.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
+                }
+                _ => {
+                    tx.execute("UPDATE workspaces SET path = ?2, name = ?3 WHERE id = ?1", params![id, new, name])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_agent(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    fn row_agent_message(r: &Row) -> rusqlite::Result<crate::agents::AgentMessage> {
+        let origin: String = r.get(5)?;
+        Ok(crate::agents::AgentMessage {
+            id: r.get(0)?,
+            from: r.get(1)?,
+            from_session: r.get::<_, Option<i64>>(2)?.map(|v| v as SessionId),
+            to_agent: r.get(3)?,
+            to_session: r.get::<_, Option<i64>>(4)?.map(|v| v as SessionId),
+            // Unreadable: treat as the strictest origin an agent may refuse.
+            origin: crate::agents::Origin::parse(&origin).unwrap_or(crate::agents::Origin::Webhook),
+            hop: r.get::<_, i64>(6)?.clamp(0, u32::MAX as i64) as u32,
+            reply_to: r.get(7)?,
+            created_at: r.get(8)?,
+            reply: r.get(9)?,
+            replied_at: r.get(10)?,
+            text: r.get(11)?,
+            refused: r.get(12)?,
+            to_name: r.get(13)?,
+        })
+    }
+
+    /// Records a message muster is about to deliver to an agent; returns its id.
+    #[cfg(test)]
+    pub fn insert_agent_message(&self, m: &crate::agents::AgentMessage) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        Self::insert_agent_message_on(&conn, m, None)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn insert_agent_message_on(
+        conn: &Connection,
+        m: &crate::agents::AgentMessage,
+        refused: Option<&str>,
+    ) -> rusqlite::Result<usize> {
         conn.execute(
-            "INSERT INTO bot_messages (from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agent_messages (from_label, from_session, to_agent, to_session, origin, hop, reply_to,
+                                         created_at, text, refused)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 m.from,
                 m.from_session,
-                m.to_bot,
+                m.to_agent,
                 m.to_session,
                 m.origin.as_str(),
                 m.hop,
                 m.reply_to,
-                m.created_at
+                m.created_at,
+                m.text,
+                refused
             ],
-        )?;
+        )
+    }
+
+    /// A message an agent's policy refused (origin, hop limit, daily cap, permissions): kept for
+    /// the agents panel's log, never counted toward the cap.
+    pub fn insert_refused_agent_message(&self, m: &crate::agents::AgentMessage, why: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        Self::insert_agent_message_on(&conn, m, Some(why))?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn bot_message(&self, id: i64) -> anyhow::Result<Option<crate::bots::BotMessage>> {
+    pub fn agent_message(&self, id: i64) -> anyhow::Result<Option<crate::agents::AgentMessage>> {
         let conn = self.conn.lock();
         Ok(conn
-            .query_row(
-                "SELECT id, from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at, reply
-                 FROM bot_messages WHERE id = ?1",
-                [id],
-                |r| {
-                    let origin: String = r.get(5)?;
-                    Ok(crate::bots::BotMessage {
-                        id: r.get(0)?,
-                        from: r.get(1)?,
-                        from_session: r.get::<_, Option<i64>>(2)?.map(|v| v as SessionId),
-                        to_bot: r.get(3)?,
-                        to_session: r.get::<_, Option<i64>>(4)?.map(|v| v as SessionId),
-                        // Unreadable: treat as the strictest origin a bot may refuse.
-                        origin: crate::bots::Origin::parse(&origin).unwrap_or(crate::bots::Origin::Webhook),
-                        hop: r.get::<_, i64>(6)?.clamp(0, u32::MAX as i64) as u32,
-                        reply_to: r.get(7)?,
-                        created_at: r.get(8)?,
-                        reply: r.get(9)?,
-                    })
-                },
-            )
+            .query_row(&format!("{AGENT_MESSAGE_SELECT} WHERE m.id = ?1"), [id], Self::row_agent_message)
             .optional()?)
     }
 
-    /// `insert_bot_message`, unless the bot already got `cap` messages at or after `since`:
-    /// then `Err(count)`. Counted and inserted in one transaction under the store's lock, so
-    /// concurrent asks (MCP or RPC) can't overshoot the cap.
-    pub fn insert_bot_message_capped(
+    /// Newest first: messages to `agent` (else all), with id below `before`, at most `limit`.
+    pub fn agent_messages(
         &self,
-        m: &crate::bots::BotMessage,
+        agent: Option<i64>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::agents::AgentMessage>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(&format!(
+            "{AGENT_MESSAGE_SELECT} WHERE (?1 IS NULL OR m.to_agent = ?1) AND (?2 IS NULL OR m.id < ?2)
+             ORDER BY m.id DESC LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![agent, before, limit as i64], Self::row_agent_message)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `insert_agent_message`, unless the agent already got `cap` messages at or after `since`:
+    /// then `Err(count)`. Counted and inserted in one transaction under the store's lock, so
+    /// concurrent asks (MCP or RPC) can't overshoot the cap. Refused messages don't count.
+    pub fn insert_agent_message_capped(
+        &self,
+        m: &crate::agents::AgentMessage,
         since: i64,
         cap: usize,
     ) -> anyhow::Result<Result<i64, usize>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let n: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM bot_messages WHERE to_bot = ?1 AND created_at >= ?2",
-            params![m.to_bot, since],
+            "SELECT COUNT(*) FROM agent_messages WHERE to_agent = ?1 AND created_at >= ?2 AND refused IS NULL",
+            params![m.to_agent, since],
             |r| r.get(0),
         )?;
         let n = n.max(0) as usize;
         if n >= cap {
             return Ok(Err(n));
         }
-        tx.execute(
-            "INSERT INTO bot_messages (from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![m.from, m.from_session, m.to_bot, m.to_session, m.origin.as_str(), m.hop, m.reply_to, m.created_at],
-        )?;
+        Self::insert_agent_message_on(&tx, m, None)?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(Ok(id))
     }
 
     /// A message that was never delivered (the send failed): it must not count toward the cap.
-    pub fn delete_bot_message(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM bot_messages WHERE id = ?1", [id])?;
+    pub fn delete_agent_message(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM agent_messages WHERE id = ?1", [id])?;
         Ok(())
     }
 
-    pub fn set_bot_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
+    pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
         self.conn.lock().execute(
-            "UPDATE bot_messages SET reply = ?2, replied_at = ?3 WHERE id = ?1",
+            "UPDATE agent_messages SET reply = ?2, replied_at = ?3 WHERE id = ?1",
             params![id, reply, at],
         )?;
         Ok(())
     }
 
-    /// Messages delivered to bot `bot_id` at or after `since` (unix ms): the daily cap.
-    pub fn count_bot_messages_since(&self, bot_id: i64, since: i64) -> anyhow::Result<usize> {
+    /// Messages delivered to agent `agent_id` at or after `since` (unix ms): the daily cap.
+    pub fn count_agent_messages_since(&self, agent_id: i64, since: i64) -> anyhow::Result<usize> {
         let n: i64 = self.conn.lock().query_row(
-            "SELECT COUNT(*) FROM bot_messages WHERE to_bot = ?1 AND created_at >= ?2",
-            params![bot_id, since],
+            "SELECT COUNT(*) FROM agent_messages WHERE to_agent = ?1 AND created_at >= ?2 AND refused IS NULL",
+            params![agent_id, since],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
@@ -1092,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn migration_v7_creates_bot_tables() {
-        use crate::bots::{Bot, BotMessage, Origin};
+    fn migration_v7_creates_agent_tables() {
+        use crate::agents::{Agent, AgentMessage, Origin};
         let conn = Connection::open_in_memory().unwrap();
         let s = Store { conn: Mutex::new(conn) };
         {
@@ -1105,85 +1238,162 @@ mod tests {
         }
         s.migrate().unwrap();
         assert_eq!(count(&s, "PRAGMA user_version"), MIGRATIONS.len() as i64);
-        assert!(s.load_bots().unwrap().is_empty());
-        let mut b = Bot {
+        assert!(s.load_agents().unwrap().is_empty());
+        let mut b = Agent {
             id: 0,
             name: "Scout".into(),
             kind: SessionKind::Codex,
             model: Some("gpt-6-sol".into()),
             effort: None,
             persona: "Finds things.".into(),
-            home_dir: "/data/bots/scout".into(),
+            home_dir: "/data/agents/scout".into(),
             permissions: Permissions::default(),
             accepts_origins: vec![Origin::Human, Origin::Schedule],
             channel_id: None,
             session_id: None,
             resume_id: None,
             created_at: 5,
+            autostart: false,
         };
-        b.id = s.insert_bot(&b).unwrap();
+        b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.
         let mut dup = b.clone();
         dup.name = "scout".into();
-        assert!(s.insert_bot(&dup).is_err());
-        s.update_bot_runtime(b.id, Some(8), Some(42), Some("abc-123")).unwrap();
-        let back = &s.load_bots().unwrap()[0];
+        assert!(s.insert_agent(&dup).is_err());
+        s.update_agent_runtime(b.id, Some(8), Some(42), Some("abc-123")).unwrap();
+        let back = &s.load_agents().unwrap()[0];
         assert_eq!((back.channel_id, back.session_id, back.resume_id.as_deref()), (Some(8), Some(42), Some("abc-123")));
         assert_eq!(back.accepts_origins, vec![Origin::Human, Origin::Schedule]);
         assert_eq!(back.model.as_deref(), Some("gpt-6-sol"));
 
-        let m = BotMessage {
+        let m = AgentMessage {
             id: 0,
             from: "human".into(),
             from_session: None,
-            to_bot: b.id,
+            to_agent: b.id,
             to_session: Some(42),
             origin: Origin::Schedule,
             hop: 2,
             reply_to: Some(9),
             created_at: 1_000,
             reply: None,
+            replied_at: None,
+            text: None,
+            refused: None,
+            to_name: None,
         };
-        let id = s.insert_bot_message(&m).unwrap();
-        s.insert_bot_message(&BotMessage { created_at: 10, ..m.clone() }).unwrap();
-        assert_eq!(s.count_bot_messages_since(b.id, 500).unwrap(), 1);
-        assert_eq!(s.count_bot_messages_since(b.id, 0).unwrap(), 2);
-        s.set_bot_message_reply(id, "done", 2_000).unwrap();
-        let got = s.bot_message(id).unwrap().unwrap();
+        let id = s.insert_agent_message(&m).unwrap();
+        s.insert_agent_message(&AgentMessage { created_at: 10, ..m.clone() }).unwrap();
+        assert_eq!(s.count_agent_messages_since(b.id, 500).unwrap(), 1);
+        assert_eq!(s.count_agent_messages_since(b.id, 0).unwrap(), 2);
+        s.set_agent_message_reply(id, "done", 2_000).unwrap();
+        let got = s.agent_message(id).unwrap().unwrap();
         assert_eq!((got.origin, got.hop, got.reply_to), (Origin::Schedule, 2, Some(9)));
         assert_eq!(got.reply.as_deref(), Some("done"));
-        s.delete_bot_message(id).unwrap();
-        assert!(s.bot_message(id).unwrap().is_none());
+        s.delete_agent_message(id).unwrap();
+        assert!(s.agent_message(id).unwrap().is_none());
         // The cap is checked with the insert.
-        let fresh = BotMessage { created_at: 5_000, ..m.clone() };
-        assert_eq!(s.insert_bot_message_capped(&fresh, 4_000, 1).unwrap().map(|_| ()), Ok(()));
-        assert_eq!(s.insert_bot_message_capped(&fresh, 4_000, 1).unwrap(), Err(1));
-        assert_eq!(s.count_bot_messages_since(b.id, 4_000).unwrap(), 1);
-        s.delete_bot(b.id).unwrap();
-        assert!(s.load_bots().unwrap().is_empty());
+        let fresh = AgentMessage { created_at: 5_000, ..m.clone() };
+        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1).unwrap().map(|_| ()), Ok(()));
+        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1).unwrap(), Err(1));
+        assert_eq!(s.count_agent_messages_since(b.id, 4_000).unwrap(), 1);
+        s.delete_agent(b.id).unwrap();
+        assert!(s.load_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_v9_renames_bots_to_agents_on_a_populated_db() {
+        use crate::agents::Origin;
+        let conn = Connection::open_in_memory().unwrap();
+        let s = Store { conn: Mutex::new(conn) };
+        {
+            let c = s.conn.lock();
+            for sql in &MIGRATIONS[..8] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 8).unwrap();
+            c.execute(
+                "INSERT INTO bots (id, name, kind, model, persona, home_dir, permissions, accepts_origins, session_id,
+                                   resume_id, created_at, channel_id)
+                 VALUES (3, 'Ada', 'claude', 'opus', 'Reviews.', '/d/bots/ada', '{\"claude_mode\":\"plan\"}',
+                         '[\"human\"]', 7, 'conv-1', 5, 4)",
+                [],
+            )
+            .unwrap();
+            for (id, at, reply) in [(1, 100, Some("ok")), (2, 200, None)] {
+                c.execute(
+                    "INSERT INTO bot_messages (id, from_label, to_bot, to_session, origin, hop, created_at, reply)
+                     VALUES (?1, 'human', 3, 7, 'human', 0, ?2, ?3)",
+                    params![id, at, reply],
+                )
+                .unwrap();
+            }
+        }
+        s.migrate().unwrap();
+        assert_eq!(count(&s, "PRAGMA user_version"), MIGRATIONS.len() as i64);
+        assert_eq!(count(&s, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('bots', 'bot_messages', 'bot_messages_to')"), 0);
+        assert_eq!(count(&s, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'agent_messages_to'"), 1);
+        // Every field survives; new ones get their defaults.
+        let a = &s.load_agents().unwrap()[0];
+        assert_eq!((a.id, a.name.as_str(), a.model.as_deref(), a.home_dir.as_str()), (3, "Ada", Some("opus"), "/d/bots/ada"));
+        assert_eq!((a.session_id, a.channel_id, a.resume_id.as_deref()), (Some(7), Some(4), Some("conv-1")));
+        assert_eq!(a.permissions.claude_mode, ClaudeMode::Plan);
+        assert!(!a.autostart);
+        let m = s.agent_message(1).unwrap().unwrap();
+        assert_eq!((m.to_agent, m.reply.as_deref(), m.text.as_deref(), m.refused.as_deref()), (3, Some("ok"), None, None));
+        assert_eq!(m.to_name.as_deref(), Some("Ada"));
+        assert_eq!(s.count_agent_messages_since(3, 0).unwrap(), 2);
+        // Refused messages are kept for the log but never count toward the cap.
+        let mut r = m.clone();
+        r.text = Some("from a cron".into());
+        r.origin = Origin::Schedule;
+        r.created_at = 300;
+        let rid = s.insert_refused_agent_message(&r, "Ada accepts only human").unwrap();
+        assert_eq!(s.count_agent_messages_since(3, 0).unwrap(), 2);
+        assert_eq!(s.insert_agent_message_capped(&r, 0, 2).unwrap(), Err(2));
+        // Newest first, filtered, paged.
+        let ids = |v: Vec<crate::agents::AgentMessage>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.agent_messages(None, None, 10).unwrap()), vec![rid, 2, 1]);
+        assert_eq!(ids(s.agent_messages(Some(3), Some(rid), 1).unwrap()), vec![2]);
+        assert!(s.agent_messages(Some(99), None, 10).unwrap().is_empty());
+        assert_eq!(s.agent_message(rid).unwrap().unwrap().refused.as_deref(), Some("Ada accepts only human"));
+        // Config round trip.
+        let mut a = a.clone();
+        a.autostart = true;
+        a.persona = "New.".into();
+        s.update_agent_config(&a).unwrap();
+        let back = &s.load_agents().unwrap()[0];
+        assert!(back.autostart && back.persona == "New." && back.session_id == Some(7));
+        // Nothing left to do on the next open.
+        s.migrate().unwrap();
+        assert_eq!(s.load_agents().unwrap().len(), 1);
     }
 
     #[test]
     fn concurrent_capped_inserts_never_overshoot() {
         let s = Store::open_memory().unwrap();
-        let m = crate::bots::BotMessage {
+        let m = crate::agents::AgentMessage {
             id: 0,
             from: "human".into(),
             from_session: None,
-            to_bot: 1,
+            to_agent: 1,
             to_session: Some(1),
-            origin: crate::bots::Origin::Human,
+            origin: crate::agents::Origin::Human,
             hop: 0,
             reply_to: None,
             created_at: 100,
             reply: None,
+            replied_at: None,
+            text: None,
+            refused: None,
+            to_name: None,
         };
         let ok = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {
             for _ in 0..16 {
                 sc.spawn(|| {
                     for _ in 0..5 {
-                        if s.insert_bot_message_capped(&m, 0, 7).unwrap().is_ok() {
+                        if s.insert_agent_message_capped(&m, 0, 7).unwrap().is_ok() {
                             ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
@@ -1191,7 +1401,7 @@ mod tests {
             }
         });
         assert_eq!(ok.into_inner(), 7);
-        assert_eq!(s.count_bot_messages_since(1, 0).unwrap(), 7);
+        assert_eq!(s.count_agent_messages_since(1, 0).unwrap(), 7);
     }
 
     #[test]

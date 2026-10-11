@@ -26,9 +26,9 @@
 
 use serde_json::Value;
 
-use crate::agents::claude::{sh_quote, tool_detail};
-use crate::agents::tui::{self, clip};
-use crate::agents::*;
+use crate::adapters::claude::{sh_quote, tool_detail};
+use crate::adapters::tui::{self, clip};
+use crate::adapters::*;
 use crate::model::*;
 
 pub struct CodexAdapter;
@@ -368,7 +368,7 @@ impl Adapter for CodexAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::tui::testutil::snap;
+    use crate::adapters::tui::testutil::snap;
     use serde_json::json;
 
     macro_rules! fx {

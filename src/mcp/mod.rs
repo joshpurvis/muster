@@ -36,7 +36,7 @@ pub struct McpState<B> {
     pub backend: B,
     pub limits: guard::Limits,
     pub guard: parking_lot::Mutex<guard::GuardState>,
-    /// Serializes spawn_agent so concurrent calls can't overshoot the spawn limits.
+    /// Serializes spawn_session so concurrent calls can't overshoot the spawn limits.
     pub spawn_lock: tokio::sync::Mutex<()>,
 }
 

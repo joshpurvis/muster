@@ -23,8 +23,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::agents::tui::{self, clip};
-use crate::agents::*;
+use crate::adapters::tui::{self, clip};
+use crate::adapters::*;
 use crate::model::*;
 
 pub struct ClaudeAdapter;
@@ -492,7 +492,7 @@ impl Adapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::tui::testutil::snap;
+    use crate::adapters::tui::testutil::snap;
 
     macro_rules! fx {
         ($name:literal) => {

@@ -1,6 +1,6 @@
+mod adapters;
 mod agents;
 mod assets;
-mod bots;
 mod cli;
 mod client;
 mod detect;
@@ -162,14 +162,14 @@ Example: muster keys 12 esc text:/compact enter")]
     },
     /// Open a new tab and start an agent in it; prints the new session id.
     #[command(after_help = "Arguments after `--` go to the agent CLI, after muster's permission flags:\n  \
-muster new . --agent codex --prompt \"hi\" -- -m gpt-6-sol -c model_reasoning_effort=xhigh\n  \
-muster new --agent claude -- --model haiku")]
+muster new . --kind codex --prompt \"hi\" -- -m gpt-6-sol -c model_reasoning_effort=xhigh\n  \
+muster new --kind claude -- --model haiku")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,
-        /// What to start in the tab (none: an empty tab).
-        #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "shell", "none"])]
-        agent: String,
+        /// What to start in the tab (none: an empty tab). `--agent` is an older alias.
+        #[arg(long, alias = "agent", default_value = "claude", value_parser = ["claude", "codex", "shell", "none"])]
+        kind: String,
         /// Work in a new worktree on branch muster/<tab>.
         #[arg(long)]
         worktree: bool,
@@ -188,7 +188,7 @@ muster new --agent claude -- --model haiku")]
         /// Print {channel, session} as JSON.
         #[arg(long)]
         json: bool,
-        /// Extra arguments for the agent CLI (not with --agent none).
+        /// Extra arguments for the agent CLI (not with --kind none).
         #[arg(last = true, value_name = "AGENT_ARGS")]
         agent_args: Vec<String>,
     },
@@ -263,24 +263,25 @@ See docs/ANDROID.md.")]
         #[arg(long)]
         json: bool,
     },
-    /// Manage bots: persistent named agents other bots can ask things (see `muster ask`).
-    Bot {
+    /// Manage named agents: persistent agents with a home folder that others can ask things
+    /// (see `muster ask`).
+    Agent {
         #[command(subcommand)]
-        action: BotCmd,
+        action: AgentCmd,
     },
-    /// Ask a bot something and print its reply (starts the bot if needed).
+    /// Ask an agent something and print its reply (starts the agent if needed).
     #[command(after_help = "Examples:\n  muster ask reviewer is the diff in fix-auth safe to merge?\n  git log -5 | muster ask scout -\n\n\
 Exit codes: 0 replied, 1 error or refused, 124 timeout. Inside a muster session the message\n\
-carries that session's origin (docs/MCP.md, \"Bots\").")]
+carries that session's origin (docs/MCP.md, \"Agents\").")]
     Ask {
-        /// Bot name (case-insensitive).
-        bot: String,
+        /// Agent name (case-insensitive).
+        agent: String,
         /// Words, joined by spaces. None or `-`: read stdin.
         text: Vec<String>,
         /// Give up waiting after SECS (exit 124; the message stays delivered).
         #[arg(long, value_name = "SECS", default_value_t = 600)]
         timeout: u64,
-        /// Print the bot.ask reply as JSON.
+        /// Print the agent.ask reply as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -305,10 +306,10 @@ enum DevicesCmd {
 }
 
 #[derive(Subcommand)]
-enum BotCmd {
-    /// Create a bot: its home folder (persona file, memory/) under the data dir.
+enum AgentCmd {
+    /// Create an agent: its home folder (persona file, memory/) under the data dir.
     New {
-        /// Bot name: letters, digits, `-`, `_` (unique, case-insensitive).
+        /// Agent name: letters, digits, `-`, `_` (unique, case-insensitive).
         name: String,
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
         kind: String,
@@ -318,7 +319,7 @@ enum BotCmd {
         /// Reasoning effort (claude --effort, codex model_reasoning_effort).
         #[arg(long, value_name = "E")]
         effort: Option<String>,
-        /// Who the bot is and what it does (written to its CLAUDE.md / AGENTS.md).
+        /// Who the agent is and what it does (written to its CLAUDE.md / AGENTS.md).
         #[arg(long, value_name = "TEXT", conflicts_with = "persona_file")]
         persona: Option<String>,
         /// Read the persona from a file.
@@ -327,23 +328,71 @@ enum BotCmd {
         /// Message origins it accepts (default: human for claude, human,schedule,webhook for codex).
         #[arg(long, value_name = "ORIGINS")]
         accepts: Option<String>,
+        /// Start it whenever the daemon starts.
+        #[arg(long)]
+        autostart: bool,
+        #[command(flatten)]
+        perms: AgentPerms,
     },
-    /// List bots.
+    /// Change an agent: persona, model, effort, accepted origins, autostart, permissions
+    /// (model, effort and permissions apply from its next start).
+    Edit {
+        name: String,
+        /// Model for the agent CLI (empty: the CLI's default).
+        #[arg(long, value_name = "M")]
+        model: Option<String>,
+        /// Reasoning effort (empty: the CLI's default).
+        #[arg(long, value_name = "E")]
+        effort: Option<String>,
+        /// New persona (rewrites its CLAUDE.md / AGENTS.md; memory/ is untouched).
+        #[arg(long, value_name = "TEXT", conflicts_with = "persona_file")]
+        persona: Option<String>,
+        /// Read the new persona from a file.
+        #[arg(long, value_name = "F")]
+        persona_file: Option<PathBuf>,
+        /// Message origins it accepts, e.g. human,schedule.
+        #[arg(long, value_name = "ORIGINS")]
+        accepts: Option<String>,
+        /// Start it whenever the daemon starts.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        autostart: Option<String>,
+        #[command(flatten)]
+        perms: AgentPerms,
+    },
+    /// List agents.
     #[command(visible_alias = "list")]
     Ls {
-        /// Print the bots as JSON.
+        /// Print the agents as JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Remove a bot and its session (its home folder stays on disk).
+    /// Remove an agent and its session (its home folder stays on disk).
     Rm { name: String },
-    /// Start the bot's session (or report the running one); prints its session id.
+    /// Start the agent's session (or report the running one); prints its session id.
     Start {
         name: String,
         /// Start a new conversation instead of resuming the last one.
         #[arg(long)]
         fresh: bool,
     },
+}
+
+/// An agent's tab profile (docs/PROTOCOL.md "Permissions").
+#[derive(clap::Args)]
+struct AgentPerms {
+    /// Claude permission mode of its tab.
+    #[arg(long, value_name = "MODE", value_parser = ["plan", "default", "accept_edits", "bypass"])]
+    claude_mode: Option<String>,
+    /// Codex sandbox of its tab.
+    #[arg(long, value_name = "SANDBOX", value_parser = ["read_only", "workspace_write", "workspace_write_network", "full_access"])]
+    codex_sandbox: Option<String>,
+}
+
+fn read_persona(persona: Option<String>, file: Option<PathBuf>) -> anyhow::Result<Option<String>> {
+    match file {
+        Some(f) => Ok(Some(std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?)),
+        None => Ok(persona),
+    }
 }
 
 const TARGET_HELP: &str = "Session: id, `.` (this session), session or tab name, unique prefix, or tab/name";
@@ -447,7 +496,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Move { target, window } => cli::move_to_window(d, &target, window),
         Cmd::New {
             path,
-            agent,
+            kind,
             worktree,
             base,
             name,
@@ -459,7 +508,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             d,
             cli::NewOpts {
                 path: path.unwrap_or_else(|| PathBuf::from(".")),
-                agent,
+                kind,
                 worktree,
                 base,
                 name,
@@ -469,8 +518,8 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 agent_args,
             },
         ),
-        Cmd::Bot { action } => match action {
-            BotCmd::New {
+        Cmd::Agent { action } => match action {
+            AgentCmd::New {
                 name,
                 kind,
                 model,
@@ -478,23 +527,55 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 persona,
                 persona_file,
                 accepts,
-            } => {
-                let persona = match persona_file {
-                    Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?),
-                    None => persona,
-                };
-                cli::bot_new(d, &name, &kind, model, effort, persona, accepts.as_deref())
-            }
-            BotCmd::Ls { json } => cli::bot_ls(d, json),
-            BotCmd::Rm { name } => cli::bot_rm(d, &name),
-            BotCmd::Start { name, fresh } => cli::bot_start(d, &name, fresh),
+                autostart,
+                perms,
+            } => cli::agent_new(
+                d,
+                cli::AgentOpts {
+                    name,
+                    kind: Some(kind),
+                    model,
+                    effort,
+                    persona: read_persona(persona, persona_file)?,
+                    accepts,
+                    autostart: Some(autostart),
+                    claude_mode: perms.claude_mode,
+                    codex_sandbox: perms.codex_sandbox,
+                },
+            ),
+            AgentCmd::Edit {
+                name,
+                model,
+                effort,
+                persona,
+                persona_file,
+                accepts,
+                autostart,
+                perms,
+            } => cli::agent_edit(
+                d,
+                cli::AgentOpts {
+                    name,
+                    kind: None,
+                    model,
+                    effort,
+                    persona: read_persona(persona, persona_file)?,
+                    accepts,
+                    autostart: autostart.map(|a| a == "on"),
+                    claude_mode: perms.claude_mode,
+                    codex_sandbox: perms.codex_sandbox,
+                },
+            ),
+            AgentCmd::Ls { json } => cli::agent_ls(d, json),
+            AgentCmd::Rm { name } => cli::agent_rm(d, &name),
+            AgentCmd::Start { name, fresh } => cli::agent_start(d, &name, fresh),
         },
         Cmd::Ask {
-            bot,
+            agent,
             text,
             timeout,
             json,
-        } => cli::ask(d, &bot, &text, timeout, json),
+        } => cli::ask(d, &agent, &text, timeout, json),
         _ => unreachable!("dispatched in main"),
     }
 }
@@ -775,6 +856,10 @@ async fn daemon_main() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
+    // Before the hub loads the records and anything starts in those folders.
+    if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
+        tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
+    }
     let muster_bin = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -791,6 +876,11 @@ async fn daemon_main() -> anyhow::Result<()> {
     inject::spawn_tasks(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
+    // Agents with autostart on (their homes were moved above, before anything could start).
+    {
+        let hub = hub.clone();
+        tokio::spawn(async move { agents::autostart(&hub).await });
+    }
 
     // Event log retention (also applied at startup).
     {
@@ -878,7 +968,23 @@ mod tests {
         assert!(parse(&["ask", "ada", "hi"]).is_ok());
         // Provenance comes from the calling session, never from a flag.
         assert!(parse(&["ask", "ada", "hi", "--origin", "human"]).is_err());
-        assert!(matches!(parse(&["bot", "start", "ada", "--fresh"]), Ok(Cmd::Bot { .. })));
+        assert!(matches!(parse(&["agent", "start", "ada", "--fresh"]), Ok(Cmd::Agent { .. })));
+    }
+
+    #[test]
+    fn agent_commands_and_kind_flag() {
+        assert!(parse(&["agent", "new", "ada", "--kind", "codex", "--autostart", "--codex-sandbox", "read_only"]).is_ok());
+        assert!(parse(&["agent", "edit", "ada", "--persona", "x", "--autostart", "off", "--claude-mode", "plan"]).is_ok());
+        assert!(parse(&["agent", "edit", "ada", "--autostart", "maybe"]).is_err());
+        assert!(parse(&["agent", "edit", "ada", "--claude-mode", "yolo"]).is_err());
+        assert!(parse(&["bot", "ls"]).is_err());
+        // `muster new --kind`, with `--agent` still accepted.
+        for flag in ["--kind", "--agent"] {
+            match parse(&["new", ".", flag, "codex"]).unwrap() {
+                Cmd::New { kind, .. } => assert_eq!(kind, "codex"),
+                _ => panic!("not `new`"),
+            }
+        }
     }
 
     fn agent_args(args: &[&str]) -> (Option<PathBuf>, Option<String>, Vec<String>) {
@@ -896,7 +1002,7 @@ mod tests {
     #[test]
     fn new_passes_args_after_double_dash() {
         let (path, prompt, args) = agent_args(&[
-            "new", ".", "--agent", "codex", "--prompt", "hi", "--", "-m", "gpt-6-sol", "-c",
+            "new", ".", "--kind", "codex", "--prompt", "hi", "--", "-m", "gpt-6-sol", "-c",
             "model_reasoning_effort=xhigh",
         ]);
         assert_eq!(path, Some(PathBuf::from(".")));

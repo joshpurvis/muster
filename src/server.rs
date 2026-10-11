@@ -368,8 +368,9 @@ async fn device_logout(
     r
 }
 
-/// Whether `GET /api/events` streams this event: tab, session and window changes only (no
-/// event-log entries, notices or workspaces, and never terminal output).
+/// Whether `GET /api/events` streams this event: tab, session, window and named-agent changes
+/// (records and messages) only (no event-log entries, notices or workspaces, and never terminal
+/// output).
 fn streamed(ev: &ServerEvent) -> bool {
     matches!(
         ev,
@@ -379,6 +380,9 @@ fn streamed(ev: &ServerEvent) -> bool {
             | ServerEvent::ChannelRemoved { .. }
             | ServerEvent::WindowUpserted(_)
             | ServerEvent::WindowRemoved { .. }
+            | ServerEvent::AgentUpserted(_)
+            | ServerEvent::AgentRemoved { .. }
+            | ServerEvent::AgentMessage(_)
     )
 }
 

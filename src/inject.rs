@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::agents::{Adapter, adapter_for};
+use crate::adapters::{Adapter, adapter_for};
 use crate::hub::{Hub, ServerEvent};
 use crate::model::{AgentState, Decision, EventKind, SessionId};
 
@@ -58,8 +58,8 @@ struct Item {
     attempts: u8,
     /// The human was told this prompt waits behind their unsent draft.
     draft_noticed: bool,
-    /// Who it comes from: becomes the session's provenance when it is submitted (bots.rs).
-    source: crate::bots::Source,
+    /// Who it comes from: becomes the session's provenance when it is submitted (agents.rs).
+    source: crate::agents::Source,
 }
 
 #[derive(Default)]
@@ -120,7 +120,7 @@ pub async fn send(
     text: String,
     mode: SendMode,
     from: String,
-    source: crate::bots::Source,
+    source: crate::agents::Source,
 ) -> anyhow::Result<SendOutcome> {
     let info = hub
         .session(id)
@@ -413,7 +413,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
     // The prompt runs from here on: the session now handles a message from `source`.
-    hub.bots().on_delivered(id, item.source, crate::model::now_ms());
+    hub.agents().on_delivered(id, item.source, crate::model::now_ms());
     let seq_before = hub.output_seq(id);
     hub.write_input(id, &adapter.submit_bytes())?;
 
@@ -623,7 +623,7 @@ mod tests {
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
-            source: crate::bots::Source::Human,
+            source: crate::agents::Source::Human,
         };
         QUEUES
             .lock()

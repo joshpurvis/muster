@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::agents::{ScreenSnapshot, SpawnCtx, adapter_for};
+use crate::adapters::{ScreenSnapshot, SpawnCtx, adapter_for};
 use crate::model::*;
 use crate::paths;
 use crate::pty::{self, PtySession};
@@ -57,6 +57,14 @@ pub enum ServerEvent {
         level: String,
         text: String,
     },
+    /// A named agent was created or its record changed (`agents::agent_json`).
+    AgentUpserted(serde_json::Value),
+    AgentRemoved {
+        id: i64,
+        name: String,
+    },
+    /// A message to an agent was recorded, refused or replied to (`agents::message_json`).
+    AgentMessage(serde_json::Value),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,10 +105,10 @@ pub struct CreateChannel {
     /// provenance (and, for an agent, the Claude origin rule) and sets `prov`.
     #[serde(default)]
     pub from_session: Option<SessionId>,
-    /// Provenance the new session starts with (bots.rs): the spawning agent's, so a helper
+    /// Provenance the new session starts with (agents.rs): the spawning agent's, so a helper
     /// keeps it until it gets another attributed prompt. None: human-rooted.
     #[serde(skip)]
-    pub prov: Option<crate::bots::Prov>,
+    pub prov: Option<crate::agents::Prov>,
 }
 
 fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permissions>, D::Error> {
@@ -132,10 +140,10 @@ pub struct SpawnSession {
     /// provenance (and, for an agent, the Claude origin rule) and sets `prov`.
     #[serde(default)]
     pub from_session: Option<SessionId>,
-    /// Provenance the new session starts with (bots.rs): the spawning agent's, so a helper
+    /// Provenance the new session starts with (agents.rs): the spawning agent's, so a helper
     /// keeps it until it gets another attributed prompt. None: human-rooted.
     #[serde(skip)]
-    pub prov: Option<crate::bots::Prov>,
+    pub prov: Option<crate::agents::Prov>,
 }
 
 pub fn default_cols() -> u16 {
@@ -269,8 +277,8 @@ pub struct Hub {
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
-    /// Bots (PLAN.md §10): records, and every session's provenance and active bot message.
-    bots: crate::bots::Registry,
+    /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
+    agents: crate::agents::Registry,
     /// The MCP server (weak: it holds the hub), set by `mcp::router`.
     #[allow(clippy::type_complexity)]
     mcp: Mutex<Option<Weak<crate::mcp::McpState<crate::mcp::backend::HubBackend>>>>,
@@ -402,12 +410,12 @@ impl Hub {
             );
         }
         let devices = crate::devices::Registry::load(&store)?;
-        let bots = crate::bots::Registry::load(&store)?;
+        let agents = crate::agents::Registry::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         Ok(Arc::new_cyclic(|weak| Hub {
             cfg,
             devices,
-            bots,
+            agents,
             mcp: Mutex::new(None),
             state_seq: AtomicU64::new(1),
             store,
@@ -431,8 +439,8 @@ impl Hub {
         &self.devices
     }
 
-    pub fn bots(&self) -> &crate::bots::Registry {
-        &self.bots
+    pub fn agents(&self) -> &crate::agents::Registry {
+        &self.agents
     }
 
     /// The MCP server's state, so CLI calls of agent sessions run through the same tools.
@@ -1075,7 +1083,7 @@ impl Hub {
         }
         match req.agent {
             None if !req.extra_args.is_empty() => anyhow::bail!("extra_args needs an agent"),
-            Some(kind) => crate::agents::check_extra_args(kind, &req.extra_args)?,
+            Some(kind) => crate::adapters::check_extra_args(kind, &req.extra_args)?,
             None => {}
         }
         let explicit = req
@@ -1877,7 +1885,7 @@ impl Hub {
         let ch = self
             .channel(req.channel_id)
             .ok_or_else(|| anyhow::anyhow!("no such channel: {}", req.channel_id))?;
-        crate::agents::check_extra_args(req.kind, &req.extra_args)?;
+        crate::adapters::check_extra_args(req.kind, &req.extra_args)?;
         if ch.archived {
             anyhow::bail!("channel {} is archived", ch.id);
         }
@@ -1979,7 +1987,7 @@ impl Hub {
         for ev in events {
             self.emit(ev);
         }
-        self.bots.set_prov(id, req.prov);
+        self.agents.set_prov(id, req.prov);
         let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
         let started = self.start_process(id, prompt.clone());
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
@@ -2010,8 +2018,8 @@ impl Hub {
                 } else if let Some(text) = prompt {
                     self.note_prompt(id, &text);
                     let source = match req.prov {
-                        Some(p) => crate::bots::Source::Chain(p),
-                        None => crate::bots::Source::Human,
+                        Some(p) => crate::agents::Source::Chain(p),
+                        None => crate::agents::Source::Human,
                     };
                     self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id, source);
                 }
@@ -2062,7 +2070,7 @@ impl Hub {
         text: String,
         consumed: bool,
         parent: Option<SessionId>,
-        source: crate::bots::Source,
+        source: crate::agents::Source,
     ) {
         let from = match parent {
             Some(p) => format!("session:{p}"),
@@ -2110,7 +2118,7 @@ impl Hub {
             e.early_exit = None;
             let (info, extra) = (e.info.clone(), e.extra_args.clone());
             // Also on restarts: args stored before the allowlist existed are replayed here.
-            crate::agents::check_extra_args(info.kind, &extra)?;
+            crate::adapters::check_extra_args(info.kind, &extra)?;
             let ch = g.channels.get(&info.channel_id);
             let port_base = ch.map(|c| c.port_base).unwrap_or(20000);
             let permissions = ch.map(|c| c.permissions).unwrap_or_default();
@@ -2220,12 +2228,12 @@ impl Hub {
         })
     }
 
-    /// Replace a session's agent arguments for its next (re)start (a bot's `--resume`). Checked
+    /// Replace a session's agent arguments for its next (re)start (an agent's `--resume`). Checked
     /// against the allowlist like any extra args.
     pub fn set_session_extra_args(&self, id: SessionId, args: Vec<String>) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        crate::agents::check_extra_args(e.info.kind, &args)?;
+        crate::adapters::check_extra_args(e.info.kind, &args)?;
         self.store.set_session_extra_args(id, &args)?;
         e.extra_args = args;
         Ok(())
@@ -2427,7 +2435,7 @@ impl Hub {
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
-        self.bots.forget_session(id);
+        self.agents.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;
         // A task closes with its last session (worktree kept). Checked and closed under one
@@ -2702,9 +2710,15 @@ impl Hub {
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         let update = adapter_for(info.kind).on_hook(event, &payload);
-        // Before the state update is published: a waiting ask that sees the bot go idle must
+        // Before the state update is published: a waiting ask that sees the agent go idle must
         // also see its reply.
-        self.bots.on_hook(&self.store, &info, event, &payload);
+        let fx = self.agents.on_hook(&self.store, &info, event, &payload);
+        if let Some(m) = fx.replied {
+            crate::agents::publish_message(self, m);
+        }
+        if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) {
+            crate::agents::publish(self, &a);
+        }
         self.log_event(
             Some(info.channel_id),
             Some(id),

@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::broadcast;
 
-use crate::agents::ScreenSnapshot;
+use crate::adapters::ScreenSnapshot;
 use crate::hub::Hub;
 use crate::model::{SessionId, now_ms};
 

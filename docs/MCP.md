@@ -95,6 +95,27 @@ and targets in them are refused.
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
+| `list_bots` | — | `{bots: [{id, name, kind, model, effort, accepts_origins, home_dir, session_id, state, detail, resumable, created_at, is_me}], your_origin: {origin, hop}}`. All bots, whatever the caller's workspace. |
+| `ask_bot` | `bot` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{bot, msg_id, session_id, reply, reply_source, state, detail, timed_out, ended, origin, hop, started, waited_ms, note?}`. Starts the bot if it has no live session, sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits as `wait_for_state` with `after_ms = sent_at`. `reply`: the turn's final message from the Stop hook (Codex: notify), `reply_source: "stop_hook"`; with none and the bot idle, its last 60 terminal lines, `reply_source: "terminal_output"` and a `note`; null when it stopped on a prompt, question or error (see `state`). See "Bots" below. |
+
+`whoami` also returns `bot` (the caller's bot name, or null) and `origin: {origin, hop}`.
+
+### Bots
+
+A bot (PLAN.md §10) is a persistent named agent with a home dir and a resumed conversation. The
+sender label in the envelope is the caller's bot name, else `session:<id>`. A message's origin
+is the origin of the message the caller is handling (its own current inbound message, else its
+nearest `parent_id` ancestor's) at hop+1; with none it is `human`, hop 0. The current inbound
+message is set from the envelope in the UserPromptSubmit hook's prompt (a prompt without one, the
+human typing, resets it to human). While a message waits in the queue, the session is assumed to
+handle the stricter of it and the current one (a non-human origin and the higher hop win) until
+the hook says which prompt ran.
+
+Reach: bots live in their own "bots" workspace (`<data>/bots`). `list_bots` and `ask_bot` work
+from every workspace: a bot is a shared service, asking runs no command anywhere, and the origin
+rule, hop limit, daily cap and permission check apply. Every other tool keeps the workspace rule,
+so bots can read each other's terminals but not reach the user's project workspaces (unless
+`MUSTER_MCP_CROSS_WORKSPACE=1`), and project agents don't drive a bot's terminal directly.
 
 ### Permissions
 
@@ -161,7 +182,11 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Shell commands | Off by default, see below. |
 | Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
-| Self-messaging | Refused (`session_id` == caller) |
+| Self-messaging | Refused (`session_id` == caller; `ask_bot` of the caller's own bot) |
+| Bot origins | `ask_bot` is refused unless the bot's `accepts_origins` contains the message's origin. Defaults: Claude bots `human`; Codex bots `human`, `schedule`, `webhook`. A non-bot Claude agent takes `human` only: `send_message` to one, or `spawn_agent` of `kind: claude`, from a non-human chain is refused. |
+| Bot hops | Max hop **4** (`guard::MAX_BOT_HOPS`); a message from the human or a trigger is hop 0. |
+| Bot daily cap | **200** messages delivered to one bot per rolling 24 hours, any origin (`guard::BOT_DAILY_PROMPT_CAP`; counted from `bot_messages`, so it survives restarts). |
+| Bot messages | Only through `ask_bot`: `send_message` to a bot's session is refused. `ask_bot` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check (against the bot's tab, or its profile before it has one). |
 | Message size | 100 000 chars (`send_message`), 20 000 chars (`post_to_channel`) |
 | Permission prompts | There is **no approve tool**. `send_message` with `interrupt: true` is refused while the target is `needs_approval`. Plain sends are queued and delivered only once the agent is ready. A marked extension point (`guard::AGENTS_MAY_APPROVE`, see `src/mcp/guard.rs`) exists for a future human-enabled setting. |
 | Audit | Every `tools/call` (including refused ones, unknown tools, and calls without a name) logs an `mcp_call` event in the caller's channel: `{session_id, tool, args, ok}`, plus `cancelled: true` if the client disconnected mid-call. Strings in args over 500 bytes are shortened; args over 4 KB total are replaced by a truncated string. Protocol-level rejections (bad auth, bad headers) are not tool calls and aren't logged. |

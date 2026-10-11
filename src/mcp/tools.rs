@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 12] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -32,6 +32,8 @@ pub const TOOL_NAMES: [&str; 10] = [
     "wait_for_state",
     "post_to_channel",
     "get_diff",
+    "list_bots",
+    "ask_bot",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -212,6 +214,29 @@ pub fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             }),
             true,
+        ),
+        tool(
+            "list_bots",
+            "List bots",
+            "List the bots: persistent named agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_bot. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state. Also returns your_origin: the origin and hop a message you send now would carry.",
+            empty_schema(),
+            true,
+        ),
+        tool(
+            "ask_bot",
+            "Ask bot",
+            "Ask a bot something and wait for its answer. Starts the bot if it isn't running, delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the bot's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the bot doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude bot by default), when the chain is more than 4 hops deep, or past the bot's 200 messages a day. Rate limited with send_message (20 per minute).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "bot": {"type": "string", "description": "Bot name (see list_bots), case-insensitive."},
+                    "text": {"type": "string", "description": "The question or task; multi-line is fine."},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 600, "description": "How long to wait for the reply."}
+                },
+                "required": ["bot", "text"],
+                "additionalProperties": false
+            }),
+            false,
         ),
     ]
 }
@@ -395,6 +420,8 @@ pub async fn call_tool<B: Backend>(
         "wait_for_state" => wait_for_state(st, caller, &a).await,
         "post_to_channel" => post_to_channel(st, caller, &a),
         "get_diff" => get_diff(st, caller, &a).await,
+        "list_bots" => list_bots(st, caller),
+        "ask_bot" => ask_bot(st, caller, &a).await,
         _ => return Err(()),
     };
     Ok(match res {
@@ -474,29 +501,43 @@ fn check_not_more_permissive<B: Backend>(
     target: &Channel,
     kind: SessionKind,
 ) -> Result<(), String> {
+    check_perms_not_wider(st, me, Some(target.id), &target.permissions, kind, &format!("channel {}", target.id))
+}
+
+/// `check_not_more_permissive` for a profile that may not have a channel yet (a bot that
+/// isn't running: its tab will get the bot's profile).
+fn check_perms_not_wider<B: Backend>(
+    st: &McpState<B>,
+    me: &SessionInfo,
+    target_channel: Option<ChannelId>,
+    target: &Permissions,
+    kind: SessionKind,
+    what: &str,
+) -> Result<(), String> {
     let mine = st
         .backend
         .channel(me.channel_id)
         .map(|c| c.permissions)
         .ok_or("your channel no longer exists")?;
-    if target.id != me.channel_id && target.permissions.exceeds_for(&mine, kind) {
+    if target_channel != Some(me.channel_id) && target.exceeds_for(&mine, kind) {
         return Err(format!(
-            "channel {} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
-            target.id,
+            "{what} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
             kind.as_str(),
             match kind {
-                SessionKind::Codex => format!(
-                    "sandbox {:?} vs {:?}",
-                    target.permissions.codex_sandbox, mine.codex_sandbox
-                ),
-                _ => format!(
-                    "mode {:?} vs {:?}",
-                    target.permissions.claude_mode, mine.claude_mode
-                ),
+                SessionKind::Codex => format!("sandbox {:?} vs {:?}", target.codex_sandbox, mine.codex_sandbox),
+                _ => format!("mode {:?} vs {:?}", target.claude_mode, mine.claude_mode),
             }
         ));
     }
     Ok(())
+}
+
+/// Origin and hop of a message the caller sends now (None inbound: human-rooted, hop 0).
+fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::bots::Origin, u32) {
+    match st.backend.effective_inbound(caller) {
+        Some(m) => (m.origin, m.hop.saturating_add(1)),
+        None => (crate::bots::Origin::Human, 0),
+    }
 }
 
 /// The caller's workspace (None if its channel is gone).
@@ -561,6 +602,8 @@ fn budget<B: Backend>(st: &McpState<B>, caller: SessionId) -> guard::SpawnBudget
 
 fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
     let me = caller_session(st, caller)?;
+    let (origin, hop) = caller_origin(st, caller);
+    let origin_json = json!({"origin": origin, "hop": hop});
     let ch = st.backend.channel(me.channel_id);
     let ws = ch
         .as_ref()
@@ -572,6 +615,8 @@ fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
         "workspace": ws.as_ref().map(|w| json!({"id": w.id, "name": w.name, "path": w.path, "is_git": w.is_git})),
         "spawn_budget": budget(st, caller),
         "agents_may_approve_prompts": guard::AGENTS_MAY_APPROVE,
+        "bot": st.backend.bots().into_iter().find(|b| b.session_id == Some(caller)).map(|b| b.name),
+        "origin": origin_json,
         "policy": {
             "shell_commands": st.limits.allow_shell,
             "other_workspaces": st.limits.cross_workspace,
@@ -689,6 +734,7 @@ async fn spawn_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'
     if let Some(p) = &prompt {
         check_no_shell_escape(st, kind, p)?;
     }
+    guard::check_claude_origin(kind, caller_origin(st, caller).0)?;
     let me = caller_session(st, caller)?;
     let target_channel = match new_channel {
         Some(_) => None,
@@ -837,6 +883,14 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let info = reachable_session(st, caller, target)?;
+    // A bot only takes messages through ask_bot, which applies its origin rules.
+    if let Some(b) = st.backend.bots().into_iter().find(|b| b.session_id == Some(target)) {
+        return Err(format!(
+            "session {target} is the bot {}: use ask_bot(bot=\"{}\") so its origin rules apply and you get its reply",
+            b.name, b.name
+        ));
+    }
+    guard::check_claude_origin(info.kind, caller_origin(st, caller).0)?;
     if let (Some(me), Some(ch)) = (
         st.backend.session(caller),
         st.backend.channel(info.channel_id),
@@ -966,7 +1020,30 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
         .clamp(0, st.limits.wait_max_s as i64) as u64;
     let after_ms = a.int("after_ms")?;
     reachable_session(st, caller, id)?;
+    let (info, verdict, waited_ms) = wait_loop(st, id, &states, timeout_s, after_ms).await?;
+    Ok(pretty(&json!({
+        "session_id": id,
+        "state": info.state,
+        "detail": info.state_detail,
+        "state_since_ms": info.state_since,
+        "queued": info.queued,
+        "reached": verdict == Verdict::Reached,
+        "timed_out": verdict == Verdict::Wait,
+        "ended": (verdict == Verdict::Ended).then_some("exited"),
+        "waited_ms": waited_ms,
+    })))
+}
 
+/// The wait_for_state loop: until `id` is in one of `states` (staleness rules in mcp::wait),
+/// exits, or `timeout_s` passes. Returns the last info, the verdict (`Wait` = timed out) and
+/// the time waited.
+async fn wait_loop<B: Backend>(
+    st: &McpState<B>,
+    id: SessionId,
+    states: &[AgentState],
+    timeout_s: u64,
+    after_ms: Option<i64>,
+) -> Result<(SessionInfo, Verdict, u64), String> {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_s);
     let mut rx = st.backend.subscribe();
@@ -992,27 +1069,162 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
             settle_grace_ms: st.limits.settle_grace_ms,
             now_ms: now_unix,
         };
-        let verdict = wait::evaluate(&info, &states, &ctx);
+        let verdict = wait::evaluate(&info, states, &ctx);
         let now = Instant::now();
         if verdict != Verdict::Wait || now >= deadline {
-            let reached = verdict == Verdict::Reached;
-            return Ok(pretty(&json!({
-                "session_id": id,
-                "state": info.state,
-                "detail": info.state_detail,
-                "state_since_ms": info.state_since,
-                "queued": info.queued,
-                "reached": reached,
-                "timed_out": verdict == Verdict::Wait,
-                "ended": (verdict == Verdict::Ended).then_some("exited"),
-                "waited_ms": started.elapsed().as_millis() as u64,
-            })));
+            return Ok((info, verdict, started.elapsed().as_millis() as u64));
         }
         // Re-check at least every second (grace expiry, missed events).
         let tick = (deadline - now).min(Duration::from_secs(1));
         wait::next_change(&mut rx, id, tick).await;
     }
 }
+
+fn list_bots<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
+    let bots: Vec<Value> = st
+        .backend
+        .bots()
+        .iter()
+        .map(|b| {
+            let s = b.session_id.and_then(|s| st.backend.session(s));
+            let mut v = crate::bots::bot_json(b, s.as_ref());
+            v["is_me"] = json!(b.session_id == Some(caller));
+            v
+        })
+        .collect();
+    let (origin, hop) = caller_origin(st, caller);
+    Ok(pretty(&json!({
+        "bots": bots,
+        "your_origin": {"origin": origin, "hop": hop},
+    })))
+}
+
+/// Bots are a shared service: any session may ask one, whatever its workspace (asking runs no
+/// command anywhere, and the origin rule, hop limit, daily cap and permission check apply).
+/// Driving a bot's terminal with the other tools stays under the workspace rule.
+async fn ask_bot<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let name = a.req_str("bot")?;
+    let text = a.req_str("text")?;
+    let timeout_s = a
+        .int("timeout_seconds")?
+        .unwrap_or(BOT_ASK_DEFAULT_S)
+        .clamp(1, st.limits.wait_max_s as i64) as u64;
+    let bot = st
+        .backend
+        .bots()
+        .into_iter()
+        .find(|b| b.name.eq_ignore_ascii_case(name.trim()))
+        .ok_or_else(|| {
+            let names: Vec<String> = st.backend.bots().into_iter().map(|b| b.name).collect();
+            format!(
+                "no bot named {name} ({})",
+                if names.is_empty() { "there are none; the human creates them with `muster bot new`".to_string() } else { format!("bots: {}", names.join(", ")) }
+            )
+        })?;
+    if bot.session_id == Some(caller) {
+        return Err("you cannot ask yourself".into());
+    }
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    if text.chars().count() > st.limits.max_message_chars {
+        return Err(format!("text too long (max {} characters)", st.limits.max_message_chars));
+    }
+    let text = clean_text(text);
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    check_no_shell_escape(st, bot.kind, &text)?;
+    let me = caller_session(st, caller)?;
+    // The bot's tab profile (its current one if it has a session), as for send_message.
+    let target = bot.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
+    match &target {
+        Some(ch) => check_not_more_permissive(st, &me, ch, bot.kind)?,
+        None => check_perms_not_wider(st, &me, None, &bot.permissions, bot.kind, &format!("bot {}", bot.name))?,
+    }
+    let inbound = st.backend.effective_inbound(caller);
+    let recent = st
+        .backend
+        .bot_messages_since(bot.id, now_ms() - guard::BOT_CAP_WINDOW_MS);
+    let route = crate::bots::route(&bot, inbound, None, recent)?;
+    if let Err(wait_s) = st.guard.lock().sends.check_and_record(
+        caller,
+        now_ms(),
+        st.limits.send_per_window,
+        st.limits.send_window_ms,
+    ) {
+        return Err(format!(
+            "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
+            st.limits.send_per_window
+        ));
+    }
+    let from = crate::bots::sender_label(st.backend.bots().iter().find(|b| b.session_id == Some(caller)), caller);
+    let out = crate::bots::Outgoing {
+        bot: bot.name.clone(),
+        text,
+        from,
+        from_session: Some(caller),
+        route,
+    };
+    let d = match st.backend.bot_deliver(out).await {
+        Ok(d) => d,
+        Err(e) => {
+            st.guard.lock().sends.refund(caller);
+            return Err(format!("could not deliver to bot {}: {e:#}", bot.name));
+        }
+    };
+    {
+        let mut g = st.guard.lock();
+        g.last_send.insert(d.session_id, d.sent_at_ms);
+        if !d.delivered {
+            g.note_queued(d.session_id, d.queued);
+        }
+    }
+    let (info, verdict, waited_ms) =
+        wait_loop(st, d.session_id, &wait::DEFAULT_STATES, timeout_s, Some(d.sent_at_ms)).await?;
+    let reached = verdict == Verdict::Reached;
+    let (reply, source) = match st.backend.bot_reply(d.msg_id, d.session_id, d.sent_at_ms) {
+        Some(r) => (Some(r), Some("stop_hook")),
+        // No final message from a hook (e.g. Codex with hooks off and no notify): the end of
+        // its terminal output instead.
+        None if reached && info.state == AgentState::Idle => (
+            st.backend.recent_output(d.session_id, BOT_FALLBACK_LINES),
+            Some("terminal_output"),
+        ),
+        None => (None, None),
+    };
+    let mut out = json!({
+        "bot": bot.name,
+        "msg_id": d.msg_id,
+        "session_id": d.session_id,
+        "reply": reply,
+        "reply_source": source,
+        "state": info.state,
+        "detail": info.state_detail,
+        "timed_out": verdict == Verdict::Wait,
+        "ended": (verdict == Verdict::Ended).then_some("exited"),
+        "origin": route.origin,
+        "hop": route.hop,
+        "started": d.started,
+        "waited_ms": waited_ms,
+    });
+    if source == Some("terminal_output") {
+        out["note"] = json!(format!(
+            "no final message was reported for this turn; reply is the last {BOT_FALLBACK_LINES} lines of the bot's terminal"
+        ));
+    } else if reply.is_none() && reached {
+        out["note"] = json!(format!(
+            "the bot stopped in state {} before answering; only the human can answer prompts. Check again later with wait_for_state(session_id={}) or post_to_channel to ask the human.",
+            info.state.as_str(),
+            d.session_id
+        ));
+    }
+    Ok(pretty(&out))
+}
+
+/// ask_bot's default wait, and how much terminal output stands in for a missing reply.
+const BOT_ASK_DEFAULT_S: i64 = 600;
+const BOT_FALLBACK_LINES: usize = 60;
 
 fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let text = a.req_str("text")?;

@@ -156,6 +156,39 @@ const MIGRATIONS: &[&str] = &[
         added_at INTEGER NOT NULL
     );
     "#,
+    // v7: bots (PLAN.md §10) and the messages muster delivered to them (origin rule, hop
+    // limit, daily cap, replies). Messages live in their own table rather than the event log:
+    // retention never prunes them, and the daily cap and reply lookups are indexed queries.
+    r#"
+    CREATE TABLE bots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        kind TEXT NOT NULL,
+        model TEXT,
+        effort TEXT,
+        persona TEXT NOT NULL DEFAULT '',
+        home_dir TEXT NOT NULL,
+        permissions TEXT NOT NULL DEFAULT '{}',
+        accepts_origins TEXT NOT NULL DEFAULT '["human"]',
+        session_id INTEGER,
+        resume_id TEXT,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE bot_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_label TEXT NOT NULL,
+        from_session INTEGER,
+        to_bot INTEGER NOT NULL,
+        to_session INTEGER,
+        origin TEXT NOT NULL,
+        hop INTEGER NOT NULL,
+        reply_to INTEGER,
+        created_at INTEGER NOT NULL,
+        reply TEXT,
+        replied_at INTEGER
+    );
+    CREATE INDEX bot_messages_to ON bot_messages(to_bot, created_at);
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -297,6 +330,152 @@ impl Store {
             params![origin, now],
         )?;
         Ok(())
+    }
+
+    // ----- bots -----
+
+    pub fn load_bots(&self) -> anyhow::Result<Vec<crate::bots::Bot>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
+                    resume_id, created_at FROM bots ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| {
+            let kind: String = r.get(2)?;
+            let perms: String = r.get(7)?;
+            let accepts: String = r.get(8)?;
+            Ok(crate::bots::Bot {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                kind: SessionKind::parse(&kind).unwrap_or(SessionKind::Codex),
+                model: r.get(3)?,
+                effort: r.get(4)?,
+                persona: r.get(5)?,
+                home_dir: r.get(6)?,
+                permissions: serde_json::from_str(&perms).unwrap_or_default(),
+                // Unreadable: the strictest set (human only).
+                accepts_origins: serde_json::from_str(&accepts).unwrap_or_else(|_| vec![crate::bots::Origin::Human]),
+                session_id: r.get::<_, Option<i64>>(9)?.map(|v| v as SessionId),
+                resume_id: r.get(10)?,
+                created_at: r.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Inserts the bot (its `id` is ignored) and returns the new id. A name taken
+    /// (case-insensitively) is an error.
+    pub fn insert_bot(&self, b: &crate::bots::Bot) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO bots (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
+                               session_id, resume_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                b.name,
+                b.kind.as_str(),
+                b.model,
+                b.effort,
+                b.persona,
+                b.home_dir,
+                perms_json(&b.permissions),
+                serde_json::to_string(&b.accepts_origins)?,
+                b.session_id,
+                b.resume_id,
+                b.created_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn set_bot_session(&self, id: i64, session_id: Option<SessionId>) -> anyhow::Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE bots SET session_id = ?2 WHERE id = ?1", params![id, session_id])?;
+        Ok(())
+    }
+
+    pub fn set_bot_resume(&self, id: i64, resume_id: Option<&str>) -> anyhow::Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE bots SET resume_id = ?2 WHERE id = ?1", params![id, resume_id])?;
+        Ok(())
+    }
+
+    pub fn delete_bot(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM bots WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Records a message muster is about to deliver to a bot; returns its id.
+    pub fn insert_bot_message(&self, m: &crate::bots::BotMessage) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO bot_messages (from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                m.from,
+                m.from_session,
+                m.to_bot,
+                m.to_session,
+                m.origin.as_str(),
+                m.hop,
+                m.reply_to,
+                m.created_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn bot_message(&self, id: i64) -> anyhow::Result<Option<crate::bots::BotMessage>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, from_label, from_session, to_bot, to_session, origin, hop, reply_to, created_at, reply
+                 FROM bot_messages WHERE id = ?1",
+                [id],
+                |r| {
+                    let origin: String = r.get(5)?;
+                    Ok(crate::bots::BotMessage {
+                        id: r.get(0)?,
+                        from: r.get(1)?,
+                        from_session: r.get::<_, Option<i64>>(2)?.map(|v| v as SessionId),
+                        to_bot: r.get(3)?,
+                        to_session: r.get::<_, Option<i64>>(4)?.map(|v| v as SessionId),
+                        // Unreadable: treat as the strictest origin a bot may refuse.
+                        origin: crate::bots::Origin::parse(&origin).unwrap_or(crate::bots::Origin::Webhook),
+                        hop: r.get::<_, i64>(6)?.clamp(0, u32::MAX as i64) as u32,
+                        reply_to: r.get(7)?,
+                        created_at: r.get(8)?,
+                        reply: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// A message that was never delivered (the send failed): it must not count toward the cap.
+    pub fn delete_bot_message(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM bot_messages WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn set_bot_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE bot_messages SET reply = ?2, replied_at = ?3 WHERE id = ?1",
+            params![id, reply, at],
+        )?;
+        Ok(())
+    }
+
+    /// Messages delivered to bot `bot_id` at or after `since` (unix ms): the daily cap.
+    pub fn count_bot_messages_since(&self, bot_id: i64, since: i64) -> anyhow::Result<usize> {
+        let n: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM bot_messages WHERE to_bot = ?1 AND created_at >= ?2",
+            params![bot_id, since],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
     }
 
     // ----- workspaces -----
@@ -587,6 +766,15 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a session's stored agent arguments (used on its next start and restarts).
+    pub fn set_session_extra_args(&self, id: SessionId, args: &[String]) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sessions SET extra_args = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(args)?],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, id: SessionId) -> anyhow::Result<()> {
         self.conn.lock().execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         Ok(())
@@ -863,6 +1051,73 @@ mod tests {
         new.info.window_id = Some(7);
         let id = s.insert_session(&new).unwrap();
         assert_eq!(s.load_sessions().unwrap().iter().find(|x| x.info.id == id).unwrap().info.window_id, Some(7));
+    }
+
+    #[test]
+    fn migration_v7_creates_bot_tables() {
+        use crate::bots::{Bot, BotMessage, Origin};
+        let conn = Connection::open_in_memory().unwrap();
+        let s = Store { conn: Mutex::new(conn) };
+        {
+            let c = s.conn.lock();
+            for sql in &MIGRATIONS[..6] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.pragma_update(None, "user_version", 6).unwrap();
+        }
+        s.migrate().unwrap();
+        assert_eq!(count(&s, "PRAGMA user_version"), 7);
+        assert!(s.load_bots().unwrap().is_empty());
+        let mut b = Bot {
+            id: 0,
+            name: "Scout".into(),
+            kind: SessionKind::Codex,
+            model: Some("gpt-6-sol".into()),
+            effort: None,
+            persona: "Finds things.".into(),
+            home_dir: "/data/bots/scout".into(),
+            permissions: Permissions::default(),
+            accepts_origins: vec![Origin::Human, Origin::Schedule],
+            session_id: None,
+            resume_id: None,
+            created_at: 5,
+        };
+        b.id = s.insert_bot(&b).unwrap();
+        // Names are unique case-insensitively.
+        let mut dup = b.clone();
+        dup.name = "scout".into();
+        assert!(s.insert_bot(&dup).is_err());
+        s.set_bot_session(b.id, Some(42)).unwrap();
+        s.set_bot_resume(b.id, Some("abc-123")).unwrap();
+        let back = &s.load_bots().unwrap()[0];
+        assert_eq!((back.session_id, back.resume_id.as_deref()), (Some(42), Some("abc-123")));
+        assert_eq!(back.accepts_origins, vec![Origin::Human, Origin::Schedule]);
+        assert_eq!(back.model.as_deref(), Some("gpt-6-sol"));
+
+        let m = BotMessage {
+            id: 0,
+            from: "human".into(),
+            from_session: None,
+            to_bot: b.id,
+            to_session: Some(42),
+            origin: Origin::Schedule,
+            hop: 2,
+            reply_to: Some(9),
+            created_at: 1_000,
+            reply: None,
+        };
+        let id = s.insert_bot_message(&m).unwrap();
+        s.insert_bot_message(&BotMessage { created_at: 10, ..m.clone() }).unwrap();
+        assert_eq!(s.count_bot_messages_since(b.id, 500).unwrap(), 1);
+        assert_eq!(s.count_bot_messages_since(b.id, 0).unwrap(), 2);
+        s.set_bot_message_reply(id, "done", 2_000).unwrap();
+        let got = s.bot_message(id).unwrap().unwrap();
+        assert_eq!((got.origin, got.hop, got.reply_to), (Origin::Schedule, 2, Some(9)));
+        assert_eq!(got.reply.as_deref(), Some("done"));
+        s.delete_bot_message(id).unwrap();
+        assert!(s.bot_message(id).unwrap().is_none());
+        s.delete_bot(b.id).unwrap();
+        assert!(s.load_bots().unwrap().is_empty());
     }
 
     #[test]

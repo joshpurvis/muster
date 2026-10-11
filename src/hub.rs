@@ -253,6 +253,8 @@ pub struct Hub {
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
+    /// Bots (PLAN.md §10): records, current inbound messages, last replies.
+    bots: crate::bots::Registry,
     /// Source of `SessionInfo.state_seq` values.
     state_seq: AtomicU64,
     /// Serializes branch renames (git calls) so they see each other's results.
@@ -381,10 +383,12 @@ impl Hub {
             );
         }
         let devices = crate::devices::Registry::load(&store)?;
+        let bots = crate::bots::Registry::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         Ok(Arc::new_cyclic(|weak| Hub {
             cfg,
             devices,
+            bots,
             state_seq: AtomicU64::new(1),
             store,
             tx,
@@ -405,6 +409,10 @@ impl Hub {
 
     pub fn devices(&self) -> &crate::devices::Registry {
         &self.devices
+    }
+
+    pub fn bots(&self) -> &crate::bots::Registry {
+        &self.bots
     }
 
     /// The store, for registries that write through to it (devices).
@@ -2175,6 +2183,17 @@ impl Hub {
         })
     }
 
+    /// Replace a session's agent arguments for its next (re)start (a bot's `--resume`). Checked
+    /// against the allowlist like any extra args.
+    pub fn set_session_extra_args(&self, id: SessionId, args: Vec<String>) -> anyhow::Result<()> {
+        let mut g = self.inner.lock();
+        let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        crate::agents::check_extra_args(e.info.kind, &args)?;
+        self.store.set_session_extra_args(id, &args)?;
+        e.extra_args = args;
+        Ok(())
+    }
+
     /// Re-spawn a session's process (same id, kind, cwd, name). Kills it first if running.
     /// The replay buffer is cleared.
     pub async fn restart_session(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
@@ -2371,6 +2390,7 @@ impl Hub {
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
+        self.bots.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;
         // A task closes with its last session (worktree kept). Checked and closed under one
@@ -2654,6 +2674,7 @@ impl Hub {
         if let Some(u) = update {
             self.set_state(id, u, StateSource::Hook);
         }
+        self.bots.on_hook(&self.store, &info, event, &payload);
         if let Some(delta) = subagent_delta(event, &payload) {
             self.adjust_subagents(id, delta);
         }

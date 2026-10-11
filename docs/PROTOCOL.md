@@ -154,7 +154,18 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. |
+| `bot.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[]}` | `Bot` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/bots/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona. `model`/`effort` go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. The bot's tab gets the default permission profile. |
+| `bot.list` | `{}` | `Bot[]` |
+| `bot.remove` | `{name}` | `{removed: Bot}`. Removes its session too; the home dir stays. |
+| `bot.start` | `{name, fresh? = false}` | `{bot: Bot, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in a channel named after the bot in the "bots" workspace (`<data>/bots`, added on first use). `fresh` forgets the conversation id first. Starts are serialized. |
+| `bot.ask` | `{bot, text, timeout_ms? = 600000 (max 1800000), wait? = true, from_session?, origin?}` | `{bot, msg_id, session_id, origin, hop, sent_at_ms, started}` plus, when waiting, `{reply, reply_source, state, detail, timed_out}` (see MCP `ask_bot`; without `wait`, `queued`). `from_session`: the session sending it (`muster ask` passes `$MUSTER_SESSION_ID`), whose inbound message sets origin and hop; without it the origin is `human`. `origin` is internal (tests, until schedules and webhooks exist): it starts a new chain at hop 0 and can't be combined with `from_session`. Refused (error) by the origin rule, hop limit or daily cap (docs/MCP.md, Guardrails). |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
+
+```ts
+type Bot = { id: number; name: string; kind: "claude" | "codex"; model: string | null; effort: string | null;
+             accepts_origins: ("human" | "schedule" | "webhook")[]; home_dir: string; session_id: number | null;
+             state: AgentState | null /* its session's */; detail: string | null; resumable: boolean; created_at: number };
+```
 
 Exited sessions keep their scrollback (persisted under `$XDG_DATA_HOME/muster/sessions/<id>/output.log`)
 so they can be attached (replay only) and restarted after a daemon restart. The file is
@@ -343,6 +354,11 @@ session start/exit and system notices are never pruned. `session.remove` deletes
 the session's `hook` and `state_change` events. A `hook` event stores only a summary:
 `{session_id, event, summary: {hook_event_name?, tool_name?, notification_type?, matcher?,
 source?, reason?, type?}}` (string fields, 120 chars max), never the full payload.
+For bots (PLAN.md §10) the daemon also reads, before summarizing: SessionStart's `session_id`
+and Codex notify's `thread-id` (the bot's conversation id), UserPromptSubmit's `prompt` (only its
+`[muster msg …]` envelope) and the turn's final message (Stop `last_assistant_message`, Codex
+notify `last-assistant-message`), which is stored as the reply in `bot_messages`. `muster hook`
+cuts payload strings at 4000 bytes, those final-message fields at 64 KiB.
 
 ## Session environment
 
@@ -392,7 +408,7 @@ its sockets close at once on revoke):
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
-| never | `device.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
+| never | `device.*`, `bot.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
 Prompts a device sends are logged with `from: "device:<id>"`.
 

@@ -26,6 +26,9 @@ const OVERALL: Duration = Duration::from_millis(2000);
 const STDIN_WAIT: Duration = Duration::from_millis(1000);
 const MAX_STDIN: usize = 8 << 20;
 const MAX_STRING: usize = 4000;
+/// Payload keys holding a turn's final message (Claude Stop, Codex notify), and their limit.
+const REPLY_KEYS: &[&str] = &["last_assistant_message", "last-assistant-message"];
+const MAX_REPLY: usize = 64 * 1024;
 
 /// Returns the process exit code (always 0 unless the adapter wants to block the hook).
 pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
@@ -100,9 +103,13 @@ pub(crate) fn shrink_payload(raw: &[u8]) -> Vec<u8> {
 }
 
 fn truncate_strings(v: &mut serde_json::Value) {
+    truncate_strings_max(v, MAX_STRING);
+}
+
+fn truncate_strings_max(v: &mut serde_json::Value, max: usize) {
     match v {
-        serde_json::Value::String(s) if s.len() > MAX_STRING => {
-            let mut cut = MAX_STRING;
+        serde_json::Value::String(s) if s.len() > max => {
+            let mut cut = max;
             while !s.is_char_boundary(cut) {
                 cut -= 1;
             }
@@ -111,7 +118,13 @@ fn truncate_strings(v: &mut serde_json::Value) {
             s.push_str(&format!("…[{dropped} bytes truncated]"));
         }
         serde_json::Value::Array(a) => a.iter_mut().for_each(truncate_strings),
-        serde_json::Value::Object(o) => o.values_mut().for_each(truncate_strings),
+        serde_json::Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                // A turn's final message is a bot's reply (bots.rs): keep much more of it.
+                let max = if REPLY_KEYS.contains(&k.as_str()) { MAX_REPLY } else { MAX_STRING };
+                truncate_strings_max(v, max);
+            }
+        }
         _ => {}
     }
 }

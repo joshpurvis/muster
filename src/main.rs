@@ -1,5 +1,6 @@
 mod agents;
 mod assets;
+mod bots;
 mod cli;
 mod client;
 mod detect;
@@ -262,6 +263,30 @@ See docs/ANDROID.md.")]
         #[arg(long)]
         json: bool,
     },
+    /// Manage bots: persistent named agents other bots can ask things (see `muster ask`).
+    Bot {
+        #[command(subcommand)]
+        action: BotCmd,
+    },
+    /// Ask a bot something and print its reply (starts the bot if needed).
+    #[command(after_help = "Examples:\n  muster ask reviewer is the diff in fix-auth safe to merge?\n  git log -5 | muster ask scout -\n\n\
+Exit codes: 0 replied, 1 error or refused, 124 timeout. Inside a muster session the message\n\
+carries that session's origin (docs/MCP.md, \"Bots\").")]
+    Ask {
+        /// Bot name (case-insensitive).
+        bot: String,
+        /// Words, joined by spaces. None or `-`: read stdin.
+        text: Vec<String>,
+        /// Give up waiting after SECS (exit 124; the message stays delivered).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        timeout: u64,
+        /// Print the bot.ask reply as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Internal: start the chain with this origin (tests, until schedules exist).
+        #[arg(long, hide = true, value_parser = ["human", "schedule", "webhook"])]
+        origin: Option<String>,
+    },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
     NativeWindow {
@@ -279,6 +304,48 @@ enum DevicesCmd {
         /// Revoke every device.
         #[arg(long, conflicts_with = "device")]
         all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotCmd {
+    /// Create a bot: its home folder (persona file, memory/) under the data dir.
+    New {
+        /// Bot name: letters, digits, `-`, `_` (unique, case-insensitive).
+        name: String,
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
+        kind: String,
+        /// Model for the agent CLI.
+        #[arg(long, value_name = "M")]
+        model: Option<String>,
+        /// Reasoning effort (claude --effort, codex model_reasoning_effort).
+        #[arg(long, value_name = "E")]
+        effort: Option<String>,
+        /// Who the bot is and what it does (written to its CLAUDE.md / AGENTS.md).
+        #[arg(long, value_name = "TEXT", conflicts_with = "persona_file")]
+        persona: Option<String>,
+        /// Read the persona from a file.
+        #[arg(long, value_name = "F")]
+        persona_file: Option<PathBuf>,
+        /// Message origins it accepts (default: human for claude, human,schedule,webhook for codex).
+        #[arg(long, value_name = "ORIGINS")]
+        accepts: Option<String>,
+    },
+    /// List bots.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Print the bots as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a bot and its session (its home folder stays on disk).
+    Rm { name: String },
+    /// Start the bot's session (or report the running one); prints its session id.
+    Start {
+        name: String,
+        /// Start a new conversation instead of resuming the last one.
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -405,6 +472,33 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 agent_args,
             },
         ),
+        Cmd::Bot { action } => match action {
+            BotCmd::New {
+                name,
+                kind,
+                model,
+                effort,
+                persona,
+                persona_file,
+                accepts,
+            } => {
+                let persona = match persona_file {
+                    Some(f) => Some(std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?),
+                    None => persona,
+                };
+                cli::bot_new(d, &name, &kind, model, effort, persona, accepts.as_deref())
+            }
+            BotCmd::Ls { json } => cli::bot_ls(d, json),
+            BotCmd::Rm { name } => cli::bot_rm(d, &name),
+            BotCmd::Start { name, fresh } => cli::bot_start(d, &name, fresh),
+        },
+        Cmd::Ask {
+            bot,
+            text,
+            timeout,
+            json,
+            origin,
+        } => cli::ask(d, &bot, &text, timeout, json, origin.as_deref()),
         _ => unreachable!("dispatched in main"),
     }
 }

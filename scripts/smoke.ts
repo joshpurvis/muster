@@ -725,6 +725,26 @@ async function main() {
   h = await c.call("hello");
   ok(h.workspaces.length === 0 && h.channels.length === 0, "workspace.remove");
 
+  // bots: records, home dirs and the origin rule (no agent is started)
+  const ada = await c.call("bot.create", { name: "Ada", kind: "claude", persona: "Reviews diffs." });
+  ok(ada.accepts_origins.join() === "human" && ada.home_dir === `${DATA}/bots/ada`, "bot.create: a claude bot accepts human only");
+  ok(await exists(`${DATA}/bots/ada/CLAUDE.md`) && await exists(`${DATA}/bots/ada/memory`), "bot home: CLAUDE.md and memory/");
+  ok((await Deno.readTextFile(`${DATA}/bots/ada/CLAUDE.md`)).includes("Reviews diffs."), "persona written to CLAUDE.md");
+  const cody = await c.call("bot.create", { name: "cody", kind: "codex" });
+  ok(cody.accepts_origins.join() === "human,schedule,webhook" && await exists(`${DATA}/bots/cody/AGENTS.md`), "a codex bot accepts every origin, AGENTS.md");
+  await c.call("bot.create", { name: "ADA" }).then(
+    () => ok(false, "bot names are unique case-insensitively"),
+    (e) => ok(String(e).includes("already exists"), "bot names are unique case-insensitively"),
+  );
+  await c.call("bot.ask", { bot: "ada", text: "hi", origin: "schedule" }).then(
+    () => ok(false, "bot.ask: a claude bot refuses a scheduled message"),
+    (e) => ok(String(e).includes("accepts only human"), "bot.ask: a claude bot refuses a scheduled message"),
+  );
+  ok((await c.call("bot.list")).length === 2, "bot.list");
+  await c.call("bot.remove", { name: "ada" });
+  await c.call("bot.remove", { name: "cody" });
+  ok((await c.call("bot.list")).length === 0 && await exists(`${DATA}/bots/ada/CLAUDE.md`), "bot.remove keeps the home dir");
+
   c.close();
   await stopDaemon(d, "SIGTERM");
   console.log(`\nPASS (${passed} checks)`);

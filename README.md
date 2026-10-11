@@ -45,6 +45,10 @@ muster keys 12 esc text:/compact enter
 muster events --tab fix-auth             # one line per state change, until Ctrl-C (--json: every event)
 ```
 
+Bots are persistent named agents with their own folder, memory and resumed conversation
+(PLAN.md §10): `muster bot new reviewer --persona "Reviews diffs"`, then
+`muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_bot` MCP tool from an agent).
+
 A target is a session id, `.` (the session you're in), a session or tab name, a unique
 prefix, or `tab/name`. Exit codes: 0 ok, 1 error, 2 bad or ambiguous target, 124 timeout.
 See [docs/CLI.md](docs/CLI.md) for every command.
@@ -57,7 +61,7 @@ is found it falls back to `xdg-open`.
 
 | What | Default | Override |
 |---|---|---|
-| Database, session logs, worktrees | `$XDG_DATA_HOME/muster` | `MUSTER_DATA_DIR` |
+| Database, session logs, worktrees, bot homes (`bots/`) | `$XDG_DATA_HOME/muster` | `MUSTER_DATA_DIR` |
 | `daemon.json`, lock, `daemon.log` | `$XDG_RUNTIME_DIR/muster` | `MUSTER_RUNTIME_DIR` |
 | Port | 7433 (a free port if busy) | `MUSTER_PORT` |
 

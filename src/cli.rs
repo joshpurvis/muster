@@ -1421,6 +1421,152 @@ pub fn events(d: &Discovery, as_json: bool, session: Option<&str>, tab: Option<&
     Ok(())
 }
 
+// ----- bots (PLAN.md §10) -----
+
+/// `muster bot new`.
+pub fn bot_new(
+    d: &Discovery,
+    name: &str,
+    kind: &str,
+    model: Option<String>,
+    effort: Option<String>,
+    persona: Option<String>,
+    accepts: Option<&str>,
+) -> anyhow::Result<()> {
+    let accepts = accepts.map(crate::bots::parse_accepts).transpose()?;
+    let b = client::rpc(
+        d,
+        "bot.create",
+        json!({ "name": name, "kind": kind, "model": model, "effort": effort, "persona": persona, "accepts": accepts }),
+    )?;
+    println!(
+        "bot {} ({}, accepts {}): home {}",
+        b["name"].as_str().unwrap_or(name),
+        b["kind"].as_str().unwrap_or(kind),
+        b["accepts_origins"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+            .unwrap_or_default(),
+        b["home_dir"].as_str().unwrap_or("?")
+    );
+    Ok(())
+}
+
+/// `muster bot ls`: `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`.
+pub fn bot_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
+    let v = client::rpc(d, "bot.list", json!({}))?;
+    if as_json {
+        return print_json(&v);
+    }
+    let list = v.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no bots (`muster bot new <name>` creates one)");
+        return Ok(());
+    }
+    let s = |b: &Value, k: &str| b[k].as_str().unwrap_or("-").to_string();
+    let rows: Vec<Vec<Cell>> = list
+        .iter()
+        .map(|b| {
+            let accepts = b["accepts_origins"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
+            let state = s(b, "state");
+            vec![
+                Cell::plain(s(b, "name")),
+                Cell::plain(s(b, "kind")),
+                Cell::plain(s(b, "model")),
+                Cell::plain(accepts),
+                Cell::plain(b["session_id"].as_u64().map_or("-".into(), |i| i.to_string())),
+                Cell {
+                    color: state_color(&state),
+                    text: state,
+                },
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render_table(
+            Some(&["NAME", "KIND", "MODEL", "ACCEPTS", "SESSION", "STATE"]),
+            &rows,
+            term_width(),
+            use_color()
+        )
+    );
+    Ok(())
+}
+
+pub fn bot_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
+    let r = client::rpc(d, "bot.remove", json!({ "name": name }))?;
+    println!(
+        "removed bot {} (its home folder {} is kept)",
+        r["removed"]["name"].as_str().unwrap_or(name),
+        r["removed"]["home_dir"].as_str().unwrap_or("?")
+    );
+    Ok(())
+}
+
+/// `muster bot start`: prints the session id (like `muster new`).
+pub fn bot_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
+    let r = client::rpc_with_timeout(d, "bot.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
+    let id = r["session"]["id"].as_u64().unwrap_or(0);
+    if r["started"] == true {
+        println!("{id}");
+    } else {
+        println!("{id} (already running)");
+    }
+    Ok(())
+}
+
+/// `muster ask`: `bot.ask` (waits for the reply), prints the reply. Exit 124 on timeout; 1
+/// when the bot stopped without answering (a prompt for the human, an error) or exited.
+pub fn ask(d: &Discovery, bot: &str, words: &[String], timeout: u64, as_json: bool, origin: Option<&str>) -> anyhow::Result<()> {
+    let text = send_text(words, || {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprintln!("muster: reading the question from stdin (end with Ctrl-D)");
+        }
+        let mut s = String::new();
+        stdin.lock().read_to_string(&mut s)?;
+        Ok(s)
+    })?;
+    let timeout = timeout.min(1800);
+    // Inside a muster session the message carries that session's origin, as an MCP call would.
+    let from_session: Option<u32> = std::env::var("MUSTER_SESSION_ID").ok().and_then(|v| v.trim().parse().ok());
+    let r = client::rpc_with_timeout(
+        d,
+        "bot.ask",
+        json!({
+            "bot": bot,
+            "text": text,
+            "timeout_ms": timeout * 1000,
+            "from_session": if origin.is_some() { None } else { from_session },
+            "origin": origin,
+        }),
+        Duration::from_secs(timeout + 30),
+    )?;
+    if as_json {
+        print_json(&r)?;
+    } else if let Some(reply) = r["reply"].as_str() {
+        println!("{reply}");
+    }
+    if r["timed_out"] == true {
+        return Err(exit(124, format!("no reply from {bot} within {timeout}s (msg {})", r["msg_id"])));
+    }
+    if r["reply"].is_null() {
+        return Err(exit(
+            1,
+            format!(
+                "{bot} stopped without a reply: {}{}",
+                r["state"].as_str().unwrap_or("?"),
+                r["detail"].as_str().map(|d| format!(" ({d})")).unwrap_or_default()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

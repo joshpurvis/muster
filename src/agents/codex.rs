@@ -115,7 +115,7 @@ fn first_line(v: Option<&Value>, max: usize) -> Option<String> {
 }
 
 /// Codex fires notify for its internal "generate a title" request too.
-fn is_title_generation(payload: &Value) -> bool {
+pub(crate) fn is_title_generation(payload: &Value) -> bool {
     payload
         .get("input-messages")
         .and_then(|v| v.as_array())

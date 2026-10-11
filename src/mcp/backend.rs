@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::bots::{Bot, Delivery, Inbound, Outgoing};
 use crate::hub::{CreateChannel, Hub, ServerEvent, SpawnSession};
 use crate::inject::{self, SendMode, SendOutcome};
 use crate::model::*;
@@ -56,6 +57,17 @@ pub trait Backend: Send + Sync + 'static {
         id: ChannelId,
         remove_worktree: bool,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+
+    // ----- bots (src/bots.rs) -----
+    fn bots(&self) -> Vec<Bot>;
+    /// The inbound message `caller`'s messages inherit their origin from (None: human-rooted).
+    fn effective_inbound(&self, caller: SessionId) -> Option<Inbound>;
+    /// Messages delivered to the bot at or after `since` (unix ms).
+    fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize;
+    /// Start the bot if needed, record and send the message (`bots::deliver`).
+    fn bot_deliver(&self, out: Outgoing) -> impl Future<Output = anyhow::Result<Delivery>> + Send;
+    /// The reply to `msg_id`, else the session's last reply since `after_ms`.
+    fn bot_reply(&self, msg_id: i64, session: SessionId, after_ms: i64) -> Option<String>;
 }
 
 #[derive(Clone)]
@@ -125,6 +137,25 @@ impl Backend for HubBackend {
     }
     async fn archive_channel(&self, id: ChannelId, remove_worktree: bool) -> anyhow::Result<()> {
         self.0.archive_channel(id, remove_worktree).await
+    }
+    fn bots(&self) -> Vec<Bot> {
+        self.0.bots().list()
+    }
+    fn effective_inbound(&self, caller: SessionId) -> Option<Inbound> {
+        self.0.bots().effective_inbound(&self.0.sessions(), caller)
+    }
+    fn bot_messages_since(&self, bot_id: i64, since: i64) -> usize {
+        // Unreadable: count as full (refuse) rather than unlimited.
+        self.0
+            .store()
+            .count_bot_messages_since(bot_id, since)
+            .unwrap_or(usize::MAX)
+    }
+    async fn bot_deliver(&self, out: Outgoing) -> anyhow::Result<Delivery> {
+        crate::bots::deliver(&self.0, out).await
+    }
+    fn bot_reply(&self, msg_id: i64, session: SessionId, after_ms: i64) -> Option<String> {
+        crate::bots::reply_for(&self.0, msg_id, session, after_ms)
     }
 }
 

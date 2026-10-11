@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::model::{AgentState, ChannelId, SessionId, SessionInfo};
+use crate::bots::Origin;
+use crate::model::{AgentState, ChannelId, SessionId, SessionInfo, SessionKind};
 
 /// Env var (on the daemon) that lets agents run shell commands through MCP.
 pub const ENV_ALLOW_SHELL: &str = "MUSTER_MCP_ALLOW_SHELL";
@@ -101,6 +102,55 @@ impl Default for Limits {
 //   3. Keep logging it as McpCall plus an Approval event with `from: "session:<id>"`.
 // ---------------------------------------------------------------------------------------------
 pub const AGENTS_MAY_APPROVE: bool = false;
+
+// ----- bots (PLAN.md §10) -----
+
+/// Max hop of a bot message: a message from the human or a trigger is hop 0, a message a bot
+/// sends while handling a hop-N message is hop N+1. Deeper chains are refused.
+pub const MAX_BOT_HOPS: u32 = 4;
+/// Messages muster delivers to one bot per rolling 24 hours (any origin, the human's included).
+pub const BOT_DAILY_PROMPT_CAP: usize = 200;
+pub const BOT_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// May a message with `origin` at `hop` be delivered to bot `bot` (which accepts `accepts`
+/// and was sent `recent` messages in the last 24 hours)?
+pub fn check_bot_delivery(bot: &str, accepts: &[Origin], origin: Origin, hop: u32, recent: usize) -> Result<(), String> {
+    if !accepts.contains(&origin) {
+        let list: Vec<&str> = accepts.iter().map(|o| o.as_str()).collect();
+        return Err(format!(
+            "bot {bot} accepts only {} messages, and this one is origin={} (the chain it belongs to was started by a {}, not the human). \
+             Claude bots take human-started work only by default; route scheduled or triggered work to a Codex bot, or ask the human \
+             to run it (or to recreate the bot with --accepts).",
+            if list.is_empty() { "no".to_string() } else { list.join("/") },
+            origin.as_str(),
+            origin.as_str()
+        ));
+    }
+    if hop > MAX_BOT_HOPS {
+        return Err(format!(
+            "bot message chain too deep: this would be hop {hop} and the maximum is {MAX_BOT_HOPS}. Answer with what you have, or ask the human."
+        ));
+    }
+    if recent >= BOT_DAILY_PROMPT_CAP {
+        return Err(format!(
+            "bot {bot} already got {recent} messages in the last 24 hours (cap {BOT_DAILY_PROMPT_CAP}). Try again later or ask the human."
+        ));
+    }
+    Ok(())
+}
+
+/// Claude agents that aren't bots (no accepts list of their own) take human-rooted work only,
+/// like a Claude bot by default: no messages or spawns from a scheduled or triggered chain.
+pub fn check_claude_origin(kind: SessionKind, origin: Origin) -> Result<(), String> {
+    if kind == SessionKind::Claude && origin != Origin::Human {
+        return Err(format!(
+            "you are handling an origin={} message, and Claude agents only take work the human started. Use a Codex agent or bot \
+             for it, or ask the human.",
+            origin.as_str()
+        ));
+    }
+    Ok(())
+}
 
 /// Number of ancestors of `id` (0 for a human-started session). Cycle-safe.
 ///
@@ -434,6 +484,34 @@ mod tests {
         t.queued = 0;
         g.observe_session(&t, 300);
         assert_eq!(g.last_delivery.get(&6), Some(&300));
+    }
+
+    #[test]
+    fn bot_origin_rule() {
+        use Origin::*;
+        let claude = [Human];
+        let codex = [Human, Schedule, Webhook];
+        assert!(check_bot_delivery("a", &claude, Human, 0, 0).is_ok());
+        let e = check_bot_delivery("a", &claude, Schedule, 1, 0).unwrap_err();
+        assert!(e.contains("accepts only human") && e.contains("origin=schedule"), "{e}");
+        assert!(check_bot_delivery("a", &claude, Webhook, 0, 0).is_err());
+        assert!(check_bot_delivery("b", &codex, Schedule, 0, 0).is_ok());
+        assert!(check_bot_delivery("b", &[], Human, 0, 0).unwrap_err().contains("accepts only no"));
+        // Non-bot Claude agents: human-rooted work only; Codex and shells aren't limited.
+        assert!(check_claude_origin(SessionKind::Claude, Human).is_ok());
+        assert!(check_claude_origin(SessionKind::Claude, Webhook).is_err());
+        assert!(check_claude_origin(SessionKind::Codex, Schedule).is_ok());
+    }
+
+    #[test]
+    fn bot_hop_limit_and_daily_cap() {
+        let all = [Origin::Human];
+        assert!(check_bot_delivery("a", &all, Origin::Human, MAX_BOT_HOPS, 0).is_ok());
+        let e = check_bot_delivery("a", &all, Origin::Human, MAX_BOT_HOPS + 1, 0).unwrap_err();
+        assert!(e.contains("too deep"), "{e}");
+        assert!(check_bot_delivery("a", &all, Origin::Human, 0, BOT_DAILY_PROMPT_CAP - 1).is_ok());
+        let e = check_bot_delivery("a", &all, Origin::Human, 0, BOT_DAILY_PROMPT_CAP).unwrap_err();
+        assert!(e.contains("cap 200"), "{e}");
     }
 
     #[test]

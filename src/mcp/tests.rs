@@ -33,6 +33,13 @@ struct Data {
     last_args: Vec<String>,
     /// What the mock's send reports: (delivered, queued).
     send_outcome: Option<(bool, u32)>,
+    bots: Vec<crate::bots::Bot>,
+    inbound: HashMap<SessionId, crate::bots::Inbound>,
+    /// Messages delivered per bot (for the daily cap).
+    bot_counts: HashMap<i64, usize>,
+    deliveries: Vec<crate::bots::Outgoing>,
+    /// Session -> reply the mock's bot_reply returns.
+    replies: HashMap<SessionId, String>,
 }
 
 struct Mock {
@@ -212,6 +219,38 @@ impl Backend for Arc<Mock> {
         self.d.lock().channels.get_mut(&id).unwrap().archived = true;
         Ok(())
     }
+    fn bots(&self) -> Vec<crate::bots::Bot> {
+        self.d.lock().bots.clone()
+    }
+    fn effective_inbound(&self, caller: SessionId) -> Option<crate::bots::Inbound> {
+        let d = self.d.lock();
+        let sessions: Vec<SessionInfo> = d.sessions.values().cloned().collect();
+        crate::bots::effective_inbound(&sessions, &d.inbound, caller)
+    }
+    fn bot_messages_since(&self, bot_id: i64, _since: i64) -> usize {
+        self.d.lock().bot_counts.get(&bot_id).copied().unwrap_or(0)
+    }
+    async fn bot_deliver(&self, out: crate::bots::Outgoing) -> anyhow::Result<crate::bots::Delivery> {
+        let mut d = self.d.lock();
+        if d.fail_send {
+            anyhow::bail!("pty gone");
+        }
+        let bot = d.bots.iter().find(|b| b.name == out.bot).unwrap().clone();
+        let sid = bot.session_id.unwrap();
+        *d.bot_counts.entry(bot.id).or_default() += 1;
+        d.deliveries.push(out);
+        Ok(crate::bots::Delivery {
+            msg_id: d.deliveries.len() as i64,
+            session_id: sid,
+            sent_at_ms: 0,
+            delivered: true,
+            queued: 0,
+            started: false,
+        })
+    }
+    fn bot_reply(&self, _msg_id: i64, session: SessionId, _after_ms: i64) -> Option<String> {
+        self.d.lock().replies.get(&session).cloned()
+    }
 }
 
 fn state() -> (Arc<Mock>, McpState<Arc<Mock>>) {
@@ -311,7 +350,7 @@ async fn legacy_handshake() {
 
     assert_eq!(legacy(&st, "ping", json!(null)).await["result"], json!({}));
     let tools = legacy(&st, "tools/list", json!({})).await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 12);
     assert!(tools["result"].get("resultType").is_none());
 
     let r = legacy(&st, "resources/list", json!({})).await;
@@ -418,7 +457,7 @@ async fn modern_era() {
     let res = &r.body.as_ref().unwrap()["result"];
     assert_eq!(res["cacheScope"], "private");
     assert!(res["ttlMs"].is_number());
-    assert_eq!(res["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(res["tools"].as_array().unwrap().len(), 12);
 
     // Missing headers -> HeaderMismatch.
     let r = post(&st, &auth("tok1"), modern_body("tools/list", json!({}))).await;
@@ -1491,4 +1530,150 @@ async fn agent_text_cannot_escape_the_paste_or_run_commands() {
     )
     .await;
     assert!(err && t.contains("empty"), "{t}");
+}
+
+// ----- bots -----
+
+/// Bots "ada" (claude, session 3, tok3) and "cody" (codex, session 4, tok4) in channel 20 of
+/// workspace 2 (the bots workspace).
+fn with_bots(m: &Mock) {
+    use crate::bots::{Bot, default_accepts};
+    let mut d = m.d.lock();
+    d.workspaces.insert(
+        2,
+        Workspace {
+            id: 2,
+            name: "bots".into(),
+            path: "/data/bots".into(),
+            is_git: false,
+            created_at: 0,
+        },
+    );
+    let mut ch = channel(20, "ada");
+    ch.workspace_id = 2;
+    d.channels.insert(20, ch);
+    for (id, kind, tok, name) in [
+        (3, SessionKind::Claude, "tok3", "ada"),
+        (4, SessionKind::Codex, "tok4", "cody"),
+    ] {
+        d.sessions.insert(id, session(id, 20, kind, None));
+        d.live.insert(id);
+        d.tokens.insert(tok.into(), id);
+        d.bots.push(Bot {
+            id: id as i64,
+            name: name.into(),
+            kind,
+            model: None,
+            effort: None,
+            persona: String::new(),
+            home_dir: format!("/data/bots/{name}"),
+            permissions: Permissions::default(),
+            accepts_origins: default_accepts(kind),
+            session_id: Some(id),
+            resume_id: None,
+            created_at: 0,
+        });
+        d.replies.insert(id, format!("{name} says hi"));
+    }
+}
+
+fn inbound(m: &Mock, sid: SessionId, origin: crate::bots::Origin, hop: u32) {
+    m.d.lock().inbound.insert(sid, crate::bots::Inbound { msg_id: 77, origin, hop });
+}
+
+#[tokio::test]
+async fn ask_bot_from_a_human_rooted_session() {
+    let (m, st) = state();
+    with_bots(&m);
+    let v = parse(&call(&st, "list_bots", json!({})).await.0);
+    assert_eq!(v["bots"].as_array().unwrap().len(), 2);
+    assert_eq!(v["your_origin"], json!({"origin": "human", "hop": 0}));
+    // Session 1 is in another workspace: bots are reachable anyway.
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ADA", "text": "what's new?"})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!(v["reply"], "ada says hi");
+    assert_eq!(v["reply_source"], "stop_hook");
+    assert_eq!((v["origin"].as_str(), v["hop"].as_u64()), (Some("human"), Some(0)));
+    let d = m.d.lock();
+    let out = &d.deliveries[0];
+    assert_eq!((out.bot.as_str(), out.from.as_str(), out.from_session), ("ada", "session:1", Some(1)));
+    assert_eq!(out.route.reply_to, None);
+}
+
+#[tokio::test]
+async fn ask_bot_origin_rule_hops_and_cap() {
+    use crate::bots::Origin;
+    let (m, st) = state();
+    with_bots(&m);
+    // Session 2 is handling a scheduled message: a Codex bot takes it one hop on...
+    inbound(&m, 2, Origin::Schedule, 1);
+    let (t, err) = call_as(&st, "tok2", "ask_bot", json!({"bot": "cody", "text": "x"})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!((v["origin"].as_str(), v["hop"].as_u64()), (Some("schedule"), Some(2)));
+    assert_eq!(m.d.lock().deliveries[0].route.reply_to, Some(77));
+    // ...a Claude bot refuses it.
+    let (t, err) = call_as(&st, "tok2", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    // So does any Claude agent: no message, no spawn.
+    let (t, err) = call_as(&st, "tok2", "send_message", json!({"session_id": 1, "text": "x"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    let (t, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "claude"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    let (_, err) = call_as(&st, "tok2", "spawn_agent", json!({"kind": "codex"})).await;
+    assert!(!err);
+    // A helper spawned under it inherits the origin through parent_id.
+    {
+        let mut d = m.d.lock();
+        d.sessions.insert(9, session(9, 10, SessionKind::Codex, Some(2)));
+        d.live.insert(9);
+        d.tokens.insert("tok9".into(), 9);
+    }
+    let (t, err) = call_as(&st, "tok9", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    // Hop limit.
+    inbound(&m, 1, Origin::Human, crate::mcp::guard::MAX_BOT_HOPS);
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("too deep"), "{t}");
+    m.d.lock().inbound.clear();
+    // Daily cap.
+    m.d.lock().bot_counts.insert(3, crate::mcp::guard::BOT_DAILY_PROMPT_CAP);
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("last 24 hours"), "{t}");
+}
+
+#[tokio::test]
+async fn ask_bot_guards() {
+    let (m, st) = state();
+    with_bots(&m);
+    let (t, err) = call_as(&st, "tok3", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("yourself"), "{t}");
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "nobody", "text": "x"})).await;
+    assert!(err && t.contains("bots: ada, cody"), "{t}");
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "!ls"})).await;
+    assert!(err && t.contains("`!`"), "{t}");
+    // Bots take messages through ask_bot only.
+    let (t, err) = call_as(&st, "tok4", "send_message", json!({"session_id": 3, "text": "x"})).await;
+    assert!(err && t.contains("use ask_bot(bot=\"ada\")"), "{t}");
+    // The envelope sender is the bot's name.
+    let (t, err) = call_as(&st, "tok4", "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().deliveries[0].from, "cody");
+    let v = parse(&call_as(&st, "tok4", "whoami", json!({})).await.0);
+    assert_eq!(v["bot"], "cody");
+    // A bot in a wider tab than the caller's is refused, as for send_message.
+    m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Bypass;
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("more than your channel"), "{t}");
+    m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Default;
+    // No final message: the end of the terminal stands in, and says so.
+    m.d.lock().replies.clear();
+    let v = parse(&call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await.0);
+    assert_eq!(v["reply_source"], "terminal_output");
+    assert!(v["note"].as_str().unwrap().contains("terminal"));
+    // A failed delivery gives the rate-limit slot back and reports the error.
+    m.d.lock().fail_send = true;
+    let (t, err) = call(&st, "ask_bot", json!({"bot": "ada", "text": "x"})).await;
+    assert!(err && t.contains("could not deliver"), "{t}");
 }

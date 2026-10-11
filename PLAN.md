@@ -144,3 +144,46 @@ Phase 0 → 1 → 2 → 3 → 4, but build the Phase 3 adapter trait early (Phas
 - Frontend framework.
 - How "catch me up" summaries get generated (e.g., the user's own `claude -p` in a session vs. an API key).
 - Product name.
+
+## 10. Bots (first pass, 2026-10-11)
+
+A **bot** is a persistent, named agent that other bots (or the human) can ask things and get
+replies from. Code: `src/bots.rs`; tools: docs/MCP.md "Bots"; commands: docs/CLI.md.
+
+| Part | What |
+|---|---|
+| Record | `bots` table: name (unique, case-insensitive), kind (`claude` \| `codex`), model, effort, persona, home dir, permission profile, accepted origins, current session, conversation id. |
+| Home | `<data>/bots/<name>/` with `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) written from the persona, and `memory/` for durable notes the persona tells the bot to keep. |
+| Session | At most one at a time: the agent runs in its home dir, in a tab named after the bot in the "bots" workspace (`<data>/bots`). `muster bot start`, or any message, starts it, restarts it if it exited, or reuses it. |
+| Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
+| Asking | MCP `ask_bot` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
+| Messages | Each delivery gets a `bot_messages` row (from, to, origin, hop, reply_to, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. |
+
+**Origin rule.** Every message carries the origin of the chain it belongs to: `human`,
+`schedule` or `webhook`. A message a session sends while handling message M inherits M's origin
+at hop+1 (the "current inbound message", set from the UserPromptSubmit hook's envelope, and
+inherited down `parent_id`, so a helper a bot spawned carries it too). A prompt the human types,
+or sends from the UI or CLI outside a muster session, is `human`, hop 0. Delivery is refused
+when the bot doesn't accept the origin, past hop 4, or past 200 messages to the bot in 24 hours
+(constants in `src/mcp/guard.rs`). Non-bot Claude agents follow the Claude default: no
+`send_message` or `spawn_agent` of a Claude agent from a non-human chain.
+
+Defaults: Claude bots accept `human` only; Codex bots accept `human`, `schedule` and `webhook`,
+so scheduled and triggered work routes to Codex. Why: Anthropic's consumer terms are unclear
+about unattended use of a subscription (§3: limits assume "ordinary, individual usage"). They
+don't forbid scheduling as such: Claude Code itself has `/loop` and `CronCreate` (at least a
+1-minute interval; recurring loops expire after 7 days; code.claude.com/docs/en/scheduled-tasks),
+and the stated risk is round-the-clock background use, which is what the weekly caps are for. So
+a Claude bot may opt in to `schedule` per bot (`muster bot new --accepts human,schedule`); the
+default stays human-only.
+
+**Deferred** (don't design them out):
+
+- Hibernate and wake: stop an idle bot's process, resume it on the next message.
+- Schedules and webhooks: the origins and the policy exist; the triggers don't (an internal
+  `origin` parameter on `bot.ask` stands in for tests). Rules for when they're built: a Claude
+  bot's schedules mirror Anthropic's bounds (at least a 1-minute interval, a recurring schedule
+  expires after 7 days unless renewed, quiet hours supported); webhook triggers are never
+  exposed to anyone but the user.
+- A phone chat view per bot.
+- An async `reply(msg_id)` tool, so a bot can answer later instead of in the same turn.

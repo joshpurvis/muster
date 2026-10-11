@@ -31,6 +31,9 @@ const OUTBOX_CAP: usize = 256;
 /// `session.wait` limits.
 const WAIT_DEFAULT_MS: u64 = 600_000;
 const WAIT_MAX_MS: u64 = 3_600_000;
+/// `bot.ask`: how long to wait for the bot's reply (as MCP `ask_bot`).
+const BOT_ASK_DEFAULT_MS: u64 = 600_000;
+const BOT_ASK_MAX_MS: u64 = 1_800_000;
 /// `session.attach` `replay_bytes` bounds.
 const REPLAY_BYTES_MIN: usize = 4 * 1024;
 /// `session.output` limits.
@@ -607,6 +610,74 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
             let ids = hub.devices().revoke(hub.store(), if p.all { None } else { p.id })?;
             Ok(json!({ "revoked": ids }))
+        }
+
+        "bot.create" => {
+            let p: crate::bots::NewBot = parse(params)?;
+            let b = crate::bots::create(hub, p)?;
+            Ok(crate::bots::bot_json(&b, None))
+        }
+        "bot.list" => {
+            let out: Vec<Value> = hub
+                .bots()
+                .list()
+                .iter()
+                .map(|b| crate::bots::bot_json(b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+                .collect();
+            Ok(Value::Array(out))
+        }
+        "bot.remove" => {
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+            }
+            let p: P = parse(params)?;
+            let b = crate::bots::remove(hub, &p.name)?;
+            Ok(json!({ "removed": crate::bots::bot_json(&b, None) }))
+        }
+        "bot.start" => {
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+                #[serde(default)]
+                fresh: bool,
+            }
+            let p: P = parse(params)?;
+            let bs = crate::bots::start(hub, &p.name, p.fresh).await?;
+            Ok(json!({
+                "bot": crate::bots::bot_json(&bs.bot, Some(&bs.session)),
+                "session": bs.session,
+                "started": bs.started,
+            }))
+        }
+        "bot.ask" => {
+            #[derive(Deserialize)]
+            struct P {
+                bot: String,
+                text: String,
+                #[serde(default)]
+                timeout_ms: Option<u64>,
+                #[serde(default = "yes")]
+                wait: bool,
+                /// The muster session running `muster ask` (its inbound message sets the origin).
+                #[serde(default)]
+                from_session: Option<SessionId>,
+                /// Internal: start a chain with this origin (tests, until schedules exist).
+                #[serde(default)]
+                origin: Option<crate::bots::Origin>,
+            }
+            fn yes() -> bool {
+                true
+            }
+            let p: P = parse(params)?;
+            let wait = p
+                .wait
+                .then(|| Duration::from_millis(p.timeout_ms.unwrap_or(BOT_ASK_DEFAULT_MS).min(BOT_ASK_MAX_MS)));
+            let who = crate::bots::Asker {
+                from_session: p.from_session,
+                forced: p.origin,
+            };
+            Ok(crate::bots::ask(hub, &p.bot, p.text, who, wait).await?)
         }
 
         "session.attach" | "session.detach" | "window.claim" => {

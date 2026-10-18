@@ -10,6 +10,7 @@ bytes = "1"
 libc = "0.2"
 parking_lot = "0.12"
 portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 vt100 = "0.16"

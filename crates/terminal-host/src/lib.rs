@@ -1,5 +1,6 @@
 //! A private local service for generic terminal operations only.
-use std::collections::{BTreeMap, BTreeSet};
+mod archive;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,20 +20,44 @@ use muster_terminal_protocol::{
     wire::{self, Frame},
 };
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, broadcast};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Entry {
-    spec: SpawnSpec,
-    pty: Arc<PtySession>,
+    spec_hash: [u8; 32],
+    cwd: PathBuf,
+    terminal: Terminal,
+}
+
+#[derive(Clone)]
+enum Terminal {
+    Live(Arc<PtySession>),
+    Archived(Arc<archive::Archive>),
+}
+
+impl Terminal {
+    fn has_processes(&self) -> bool {
+        match self {
+            Self::Live(p) => p.has_processes(),
+            Self::Archived(_) => false,
+        }
+    }
+}
+
+struct Attachment {
+    replay: Vec<u8>,
+    receiver: Option<broadcast::Receiver<bytes::Bytes>>,
+    offset: u64,
 }
 
 struct Host {
     hello: Hello,
     entries: Mutex<BTreeMap<RunId, Entry>>,
-    forgotten: Mutex<BTreeSet<RunId>>,
+    // One generation watermark per session, rather than one tombstone per restart.
+    forgotten: Mutex<BTreeMap<u32, u64>>,
     // Serializes process creation, forgetting and shutdown. Never held by PTY callbacks.
     lifecycle: Mutex<()>,
     events: broadcast::Sender<TerminalEvent>,
@@ -41,11 +66,11 @@ struct Host {
 }
 
 impl Host {
-    fn get(&self, run: RunId) -> anyhow::Result<Arc<PtySession>> {
+    fn get(&self, run: RunId) -> anyhow::Result<Terminal> {
         self.entries
             .lock()
             .get(&run)
-            .map(|e| e.pty.clone())
+            .map(|e| e.terminal.clone())
             .ok_or_else(|| anyhow::anyhow!("unknown terminal run {run:?}"))
     }
 
@@ -53,7 +78,11 @@ impl Host {
         let (p, cwd) = {
             let entries = self.entries.lock();
             let e = entries.get(&run).context("unknown terminal run")?;
-            (e.pty.clone(), e.spec.cwd.clone())
+            (e.terminal.clone(), e.cwd.clone())
+        };
+        let p = match p {
+            Terminal::Archived(archive) => return Ok(archive.status.clone()),
+            Terminal::Live(p) => p,
         };
         let screen = p.screen();
         Ok(TerminalStatus {
@@ -85,11 +114,12 @@ impl Host {
             "run identity must be nonzero"
         );
         anyhow::ensure!(spec.cwd.is_absolute(), "launch cwd must be absolute");
+        let spec_hash: [u8; 32] = Sha256::digest(serde_json::to_vec(&spec)?).into();
         {
             let entries = self.entries.lock();
             if let Some(e) = entries.get(&spec.run) {
                 anyhow::ensure!(
-                    e.spec == spec,
+                    e.spec_hash == spec_hash,
                     "run identity was already used with a different launch specification"
                 );
                 drop(entries);
@@ -98,9 +128,8 @@ impl Host {
             anyhow::ensure!(
                 self.forgotten
                     .lock()
-                    .iter()
-                    .filter(|run| run.id == spec.run.id)
-                    .all(|run| spec.run.generation > run.generation),
+                    .get(&spec.run.id)
+                    .is_none_or(|generation| spec.run.generation > *generation),
                 "run identity was already retired or superseded"
             );
             for (run, entry) in entries.iter().filter(|(run, _)| run.id == spec.run.id) {
@@ -109,7 +138,7 @@ impl Host {
                     "stale process generation"
                 );
                 anyhow::ensure!(
-                    !entry.pty.has_processes(),
+                    !entry.terminal.has_processes(),
                     "previous terminal run still owns processes"
                 );
             }
@@ -159,7 +188,14 @@ impl Host {
             return Err(error.into());
         }
         let run = spec.run;
-        self.entries.lock().insert(run, Entry { spec, pty });
+        self.entries.lock().insert(
+            run,
+            Entry {
+                spec_hash,
+                cwd: spec.cwd,
+                terminal: Terminal::Live(pty),
+            },
+        );
         Ok(Response::Status(self.status(run)?))
     }
 
@@ -185,40 +221,63 @@ impl Host {
             Command::Status { run } => Ok(Response::Status(self.status(run)?)),
             Command::Input { run, data } => {
                 anyhow::ensure!(data.len() <= MAX_INPUT, "input exceeds {MAX_INPUT} bytes");
-                self.get(run)?.write(&data)?;
+                match self.get(run)? {
+                    Terminal::Live(p) => p.write(&data)?,
+                    Terminal::Archived(_) => anyhow::bail!("terminal run has exited"),
+                }
                 Ok(Response::Ok)
             }
             Command::Resize { run, cols, rows } => {
-                self.get(run)?.resize(cols, rows)?;
+                let _guard = self.lifecycle.lock();
+                if let Terminal::Live(p) = self.get(run)? {
+                    p.resize(cols, rows)?;
+                }
                 Ok(Response::Ok)
             }
-            Command::Screen { run } => Ok(Response::Screen(self.get(run)?.screen())),
-            Command::RecentText { run, lines } => {
-                Ok(Response::Text(self.get(run)?.recent_text(lines.min(10000))))
-            }
+            Command::Screen { run } => Ok(Response::Screen(match self.get(run)? {
+                Terminal::Live(p) => p.screen(),
+                Terminal::Archived(archive) => archive.screen()?,
+            })),
+            Command::RecentText { run, lines } => Ok(Response::Text(match self.get(run)? {
+                Terminal::Live(p) => p.recent_text(lines.min(10000)),
+                Terminal::Archived(archive) => archive.recent_text(lines.min(10000))?,
+            })),
             Command::Terminate { run, force } => {
-                let p = self.get(run)?;
-                if force {
-                    p.kill_now();
-                } else {
-                    p.kill();
+                if let Terminal::Live(p) = self.get(run)? {
+                    if force {
+                        p.kill_now();
+                    } else {
+                        p.kill();
+                    }
                 }
                 Ok(Response::Ok)
             }
             Command::Forget { run } => {
                 let _guard = self.lifecycle.lock();
-                if self.forgotten.lock().contains(&run) {
+                if !self.entries.lock().contains_key(&run)
+                    && self
+                        .forgotten
+                        .lock()
+                        .get(&run.id)
+                        .is_some_and(|generation| run.generation <= *generation)
+                {
                     return Ok(Response::Ok);
                 }
                 let p = self.get(run)?;
-                anyhow::ensure!(
-                    !p.has_processes() && p.is_drained(),
-                    "terminal still owns processes or pending output"
-                );
-                p.discard();
+                if let Terminal::Live(p) = p {
+                    anyhow::ensure!(
+                        !p.has_processes() && p.is_drained(),
+                        "terminal still owns processes or pending output"
+                    );
+                    p.discard();
+                }
                 std::fs::remove_dir_all(self.run_dir(run))?;
                 self.entries.lock().remove(&run);
-                self.forgotten.lock().insert(run);
+                self.forgotten
+                    .lock()
+                    .entry(run.id)
+                    .and_modify(|g| *g = (*g).max(run.generation))
+                    .or_insert(run.generation);
                 Ok(Response::Ok)
             }
             Command::Flush => {
@@ -238,8 +297,67 @@ impl Host {
         self.entries
             .lock()
             .values()
-            .map(|e| e.pty.clone())
+            .filter_map(|e| match &e.terminal {
+                Terminal::Live(p) => Some(p.clone()),
+                Terminal::Archived(_) => None,
+            })
             .collect()
+    }
+
+    fn attach(&self, run: RunId, limit: Option<usize>) -> anyhow::Result<Attachment> {
+        match self.get(run)? {
+            Terminal::Live(p) => {
+                let (replay, receiver, offset) = p.attach_sequenced(limit);
+                Ok(Attachment {
+                    replay,
+                    receiver: Some(receiver),
+                    offset,
+                })
+            }
+            Terminal::Archived(archive) => {
+                let (replay, offset) = archive.replay(limit)?;
+                Ok(Attachment {
+                    replay,
+                    receiver: None,
+                    offset,
+                })
+            }
+        }
+    }
+
+    fn flush_and_archive(&self) {
+        let runs: Vec<_> = self
+            .entries
+            .lock()
+            .iter()
+            .filter_map(|(run, e)| matches!(e.terminal, Terminal::Live(_)).then_some(*run))
+            .collect();
+        for run in runs {
+            // Serialize the final checkpoint with resize, Forget and shutdown.
+            // Streams hold receivers, never a strong reference to the PTY object.
+            let _guard = self.lifecycle.lock();
+            let Ok(Terminal::Live(p)) = self.get(run) else {
+                continue;
+            };
+            p.flush_log();
+            if p.is_alive() || !p.is_drained() || p.has_processes() {
+                continue;
+            }
+            let result = self
+                .status(run)
+                .and_then(|status| archive::Archive::save(self.run_dir(run), status, &p));
+            match result {
+                Ok(archive) => {
+                    if let Some(e) = self.entries.lock().get_mut(&run) {
+                        e.terminal = Terminal::Archived(Arc::new(archive));
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    ?run,
+                    "retaining terminal until its final snapshot is saved: {error:#}"
+                ),
+            }
+        }
     }
 
     fn shutdown(&self) {
@@ -359,7 +477,7 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
     let host = Arc::new(Host {
         hello,
         entries: Mutex::new(BTreeMap::new()),
-        forgotten: Mutex::new(BTreeSet::new()),
+        forgotten: Mutex::new(BTreeMap::new()),
         lifecycle: Mutex::new(()),
         events,
         stopping: AtomicBool::new(false),
@@ -372,9 +490,7 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
             interval.tick().await;
             let host = flush_host.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                for p in host.ptys() {
-                    p.flush_log();
-                }
+                host.flush_and_archive();
             })
             .await;
         }
@@ -456,12 +572,18 @@ async fn connection(mut stream: UnixStream, host: Arc<Host>) -> anyhow::Result<(
             Ok(())
         }
         Command::Attach { run, replay_bytes } => {
-            let pty = match host.get(run) {
-                Ok(pty) => pty,
-                Err(error) => return send_error(&mut stream, error).await,
-            };
             let limit = replay_bytes.map(|n| n.clamp(4096, pty::RING_CAP));
-            let (replay, mut rx, mut offset) = pty.attach_sequenced(limit);
+            let reader = host.clone();
+            let attachment =
+                match tokio::task::spawn_blocking(move || reader.attach(run, limit)).await? {
+                    Ok(attachment) => attachment,
+                    Err(error) => return send_error(&mut stream, error).await,
+                };
+            let Attachment {
+                replay,
+                receiver: mut rx,
+                mut offset,
+            } = attachment;
             send(&mut stream, Frame::json(&Response::Attached)?).await?;
             send(
                 &mut stream,
@@ -474,21 +596,32 @@ async fn connection(mut stream: UnixStream, host: Arc<Host>) -> anyhow::Result<(
             let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
-                    output = rx.recv() => match output {
+                    output = async {
+                        match &mut rx {
+                            Some(receiver) => receiver.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => match output {
                         Ok(bytes) => {
                             let next = offset + bytes.len() as u64;
                             send(&mut stream, Frame::Output { offset, data: bytes.to_vec() }).await?;
                             offset = next;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let (replay, new_rx, next) = pty.attach_sequenced(limit);
-                            rx = new_rx;
-                            offset = next;
-                            send(&mut stream, Frame::Replay { next_offset: offset, data: replay }).await?;
+                            let reader = host.clone();
+                            let attachment = tokio::task::spawn_blocking(move || reader.attach(run, limit)).await??;
+                            rx = attachment.receiver;
+                            offset = attachment.offset;
+                            send(&mut stream, Frame::Replay { next_offset: offset, data: attachment.replay }).await?;
                         }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                        // All final bytes have arrived. The PTY owner can now be
+                        // released without repeatedly disconnecting exited tabs.
+                        Err(broadcast::error::RecvError::Closed) => rx = None,
                     },
-                    _ = heartbeat.tick() => send(&mut stream, Frame::Ping).await?,
+                    _ = heartbeat.tick() => {
+                        if !host.entries.lock().contains_key(&run) { return Ok(()); }
+                        send(&mut stream, Frame::Ping).await?;
+                    },
                     read = stream.readable() => {
                         read?;
                         let mut byte = [0];
@@ -545,4 +678,150 @@ async fn send_error(stream: &mut UnixStream, error: anyhow::Error) -> anyhow::Re
         })?,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(Host);
+    impl Fixture {
+        fn new() -> Self {
+            let data = std::env::temp_dir().join(format!(
+                "muster-archive-test-{:032x}",
+                rand::random::<u128>()
+            ));
+            private_fs::ensure_private_dir(&data).unwrap();
+            Self(Host {
+                hello: Hello {
+                    protocol: VERSION,
+                    instance: format!("{:032x}", rand::random::<u128>()),
+                    pid: std::process::id(),
+                    data_dir: data,
+                },
+                entries: Mutex::new(BTreeMap::new()),
+                forgotten: Mutex::new(BTreeMap::new()),
+                lifecycle: Mutex::new(()),
+                events: broadcast::channel(4096).0,
+                stopping: AtomicBool::new(false),
+                stop: Notify::new(),
+            })
+        }
+
+        fn spec(&self, generation: u64) -> SpawnSpec {
+            SpawnSpec {
+                run: RunId { id: 1, generation },
+                program: "/bin/bash".into(),
+                args: vec![
+                    "--noprofile".into(),
+                    "--norc".into(),
+                    "-c".into(),
+                    r"printf '\033[?2004h\033[?1hfirst\nsecond\n'; exit 7".into(),
+                ],
+                env: BTreeMap::new(),
+                cwd: self.0.hello.data_dir.clone(),
+                cols: 80,
+                rows: 24,
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.0.shutdown();
+            let _ = std::fs::remove_dir_all(&self.0.hello.data_dir);
+        }
+    }
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "terminal did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn archived_terminal_releases_pty_with_subscribers_and_retries_failed_checkpoint() {
+        let fixture = Fixture::new();
+        let host = &fixture.0;
+        let spec = fixture.spec(1);
+        let run = spec.run;
+        host.spawn(spec.clone()).unwrap();
+        let Terminal::Live(pty) = host.get(run).unwrap() else {
+            panic!("expected live owner")
+        };
+        let weak = Arc::downgrade(&pty);
+        let subscriber = pty.attach_sequenced(None).1;
+        until(|| !pty.is_alive() && pty.is_drained() && !pty.has_processes());
+        let replay = pty.attach_sequenced(None).0;
+        let short_replay = pty.attach_sequenced(Some(8)).0;
+        let screen = serde_json::to_value(pty.screen()).unwrap();
+        let text = pty.recent_text(10000);
+        let final_line = pty.recent_text(1);
+        drop(pty);
+
+        // Force a checkpoint write failure. The complete PTY state must remain
+        // available until saving all of the final state succeeds.
+        let blocked_file = host.run_dir(run).join("screen.json");
+        std::fs::create_dir(&blocked_file).unwrap();
+        host.flush_and_archive();
+        assert!(matches!(host.get(run).unwrap(), Terminal::Live(_)));
+        assert!(weak.upgrade().is_some());
+        std::fs::remove_dir(&blocked_file).unwrap();
+        host.flush_and_archive();
+        until(|| weak.upgrade().is_none());
+        assert!(matches!(host.get(run).unwrap(), Terminal::Archived(_)));
+        // Keeping an output receiver cannot pin the old PTY/parser/ring.
+        drop(subscriber);
+        let attachment = host.attach(run, None).unwrap();
+        assert!(attachment.receiver.is_none());
+        assert_eq!(attachment.replay, replay);
+        assert_eq!(host.attach(run, Some(8)).unwrap().replay, short_replay);
+        let Terminal::Archived(archive) = host.get(run).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            serde_json::to_value(archive.screen().unwrap()).unwrap(),
+            screen
+        );
+        assert_eq!(archive.recent_text(10000).unwrap(), text);
+        assert_eq!(archive.recent_text(1).unwrap(), final_line);
+        assert!(archive.recent_text(0).unwrap().is_empty());
+        assert_eq!(host.status(run).unwrap().exit_code, Some(7));
+        assert!(host.status(run).unwrap().log_persisted);
+        assert!(
+            host.execute(Command::Input {
+                run,
+                data: b"no".to_vec()
+            })
+            .is_err()
+        );
+        host.execute(Command::Resize {
+            run,
+            cols: 120,
+            rows: 40,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(archive.screen().unwrap()).unwrap(),
+            screen,
+            "final snapshot is immutable"
+        );
+        host.spawn(spec.clone()).unwrap(); // Retry returns the same exited run.
+        let mut different = spec.clone();
+        different.args.push("different".into());
+        assert!(host.spawn(different).is_err());
+
+        host.execute(Command::Forget { run }).unwrap();
+        assert!(!host.run_dir(run).exists());
+        assert!(host.spawn(spec).is_err());
+        let next = fixture.spec(2);
+        host.spawn(next.clone()).unwrap();
+        until(|| {
+            let s = host.status(next.run).unwrap();
+            s.drained && !s.has_processes
+        });
+        host.execute(Command::Forget { run: next.run }).unwrap();
+        host.execute(Command::Forget { run }).unwrap();
+        assert_eq!(*host.forgotten.lock(), BTreeMap::from([(1, 2)]));
+    }
 }

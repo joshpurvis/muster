@@ -1922,6 +1922,7 @@ dependencies = [
  "muster-terminal-protocol",
  "parking_lot",
  "portable-pty",
+ "serde",
  "tokio",
  "tracing",
  "vt100",
@@ -1932,6 +1933,7 @@ name = "muster-terminal-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "libc",
  "muster-terminal-core",
  "muster-terminal-protocol",
@@ -1939,6 +1941,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -309,6 +309,10 @@ fn records_exits_and_keeps_background_children_under_host_control() {
         (fixture.status(background.run).exit_code == Some(0)).then_some(())
     });
     assert!(fixture.status(background.run).has_processes);
+    // A completed leader does not permit archiving while its descendants still
+    // exist, even if they are not producing output.
+    std::thread::sleep(Duration::from_millis(3300));
+    assert!(!fixture.root.join("data/runs/2-1/archive.json").exists());
     assert!(
         fixture
             .client
@@ -325,6 +329,98 @@ fn records_exits_and_keeps_background_children_under_host_control() {
     until("descendant cleanup", || {
         (!fixture.status(background.run).has_processes).then_some(())
     });
+}
+
+#[test]
+fn exited_terminals_archive_without_losing_replay_or_disconnecting_existing_streams() {
+    let fixture = Fixture::new();
+    let spec = fixture.spec(
+        1,
+        1,
+        r"printf '\033[?2004h\033[?1hbefore-exit\n'; sleep 0.2; printf 'last-output\n'; exit 7",
+    );
+    let started = fixture.spawn(spec.clone());
+    let mut stream = fixture
+        .client
+        .subscribe(Command::Attach {
+            run: started.run,
+            replay_bytes: None,
+        })
+        .unwrap();
+    let (mut offset, mut output) = match wire::read(&mut stream).unwrap() {
+        Frame::Replay { next_offset, data } => (next_offset, data),
+        other => panic!("{other:?}"),
+    };
+    while !String::from_utf8_lossy(&output).contains("last-output") {
+        match wire::read(&mut stream).unwrap() {
+            Frame::Output {
+                offset: start,
+                data,
+            } => {
+                assert_eq!(start, offset);
+                offset += data.len() as u64;
+                output.extend(data);
+            }
+            Frame::Ping => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    until("final replay archived", || {
+        fixture
+            .root
+            .join("data/runs/1-1/archive.json")
+            .exists()
+            .then_some(())
+    });
+    assert_eq!(fixture.status(started.run).exit_code, Some(7));
+    assert_eq!(fixture.text(started.run), "before-exit\nlast-output");
+    let final_screen = fixture
+        .client
+        .call(Command::Screen { run: started.run })
+        .unwrap();
+    match final_screen {
+        Response::Screen(screen) => {
+            assert!(screen.lines.iter().any(|line| line == "last-output"));
+            assert!(!screen.foreground_busy);
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut restored = fixture
+        .client
+        .subscribe(Command::Attach {
+            run: started.run,
+            replay_bytes: None,
+        })
+        .unwrap();
+    match wire::read(&mut restored).unwrap() {
+        Frame::Replay { next_offset, data } => {
+            assert_eq!(next_offset, offset);
+            assert!(String::from_utf8_lossy(&data).contains("before-exit"));
+            assert!(data.ends_with(b"last-output\r\n"));
+            assert!(data.windows(8).any(|s| s == b"\x1b[?2004h"));
+        }
+        other => panic!("{other:?}"),
+    }
+    // This stream was attached before exit and remains usable after the owner
+    // has been released; the client does not enter an endless reconnect loop.
+    assert!(matches!(wire::read(&mut stream).unwrap(), Frame::Ping));
+    let retry = fixture.spawn(spec);
+    assert_eq!(retry.pid, started.pid);
+    assert_eq!(retry.exit_code, Some(7));
+    assert!(
+        fixture
+            .client
+            .call(Command::Input {
+                run: started.run,
+                data: b"no".to_vec()
+            })
+            .is_err()
+    );
+    fixture
+        .client
+        .call(Command::Forget { run: started.run })
+        .unwrap();
+    assert!(!fixture.root.join("data/runs/1-1").exists());
 }
 
 #[test]

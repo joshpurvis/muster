@@ -66,6 +66,16 @@ Inventory retains exited runs until explicitly forgotten, including exit codes
 and access to replay. Original process exit and terminal drain are separate facts:
 background children can remain after the leader exits.
 
+After exit, drain and descendant cleanup, the host saves an immutable final replay,
+screen and plain-text scrollback checkpoint. It releases the PTY/parser/ring only
+after the log and checkpoint are durably written. A write failure retains the live
+object for a later retry. Attached streams do not pin that object; they receive
+the remaining output and then heartbeats. New readers load the final state from
+disk. Resizing an archived run is acknowledged without changing its final snapshot;
+input is refused. `forget` removes its checkpoint and log as well as inventory.
+Small lifecycle metadata and a launch-specification digest remain until forgetting;
+retired generations use one watermark per terminal ID.
+
 ## Failure domains
 
 The host flushes output periodically without an application connection. It records

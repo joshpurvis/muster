@@ -28,6 +28,26 @@ pub const RING_CAP: usize = 2 * 1024 * 1024;
 const SCROLLBACK_LINES: usize = 5000;
 const OUTPUT_BROADCAST_CAP: usize = 1024;
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// An immutable replay checkpoint. The owner stores the body separately from
+/// the small mode/offset metadata, avoiding JSON expansion of terminal bytes.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ReplaySnapshot {
+    #[serde(skip)]
+    pub body: Vec<u8>,
+    input_modes: Vec<u8>,
+    alternate_screen: bool,
+    pub offset: u64,
+}
+
+impl ReplaySnapshot {
+    pub fn replay(mut self, max_body: Option<usize>) -> Vec<u8> {
+        if let Some(max) = max_body { tail_from_line(&mut self.body, max); }
+        let mut replay = replay_prefix_parts(self.alternate_screen, &self.input_modes, &self.body);
+        replay.extend_from_slice(&self.body);
+        replay
+    }
+}
 /// Input queued for a program that isn't reading its terminal is capped at this.
 const MAX_PENDING_INPUT: usize = 8 * 1024 * 1024;
 
@@ -433,6 +453,18 @@ impl PtySession {
         (Self::client_replay(&parser, &out, max_body), self.out_tx.subscribe(), out.total)
     }
 
+    /// Capture replay state without retaining a PTY, parser, or output channel.
+    pub fn replay_snapshot(&self) -> ReplaySnapshot {
+        let parser = self.parser.lock();
+        let out = self.out.lock();
+        ReplaySnapshot {
+            body: Self::snapshot_locked(&out),
+            input_modes: parser.screen().input_mode_formatted(),
+            alternate_screen: parser.screen().alternate_screen(),
+            offset: out.total,
+        }
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         *self.exit_code.lock()
     }
@@ -606,6 +638,13 @@ impl PtySession {
     /// True when output.log is up to date with the ring buffer.
     pub fn log_persisted(&self) -> bool {
         !self.dirty.load(Ordering::SeqCst) && !self.discarded.load(Ordering::SeqCst) && !self.log.lock().rewrite
+    }
+
+    /// Safe to release the in-memory replay only after the final fsync succeeds.
+    pub fn log_durable(&self) -> bool {
+        let log = self.log.lock();
+        !self.dirty.load(Ordering::SeqCst) && !self.discarded.load(Ordering::SeqCst)
+            && !log.rewrite && !log.unsynced
     }
 
     /// Stop persisting output (the session is being removed or restarted).
@@ -888,16 +927,20 @@ fn sync_file(p: &Path) -> std::io::Result<()> {
 /// inside the alternate screen, a switch to it. Setting a mode the replay sets again later
 /// is harmless, so this is also correct for an unwrapped ring.
 fn replay_prefix(screen: &vt100::Screen, body: &[u8]) -> Vec<u8> {
+    replay_prefix_parts(screen.alternate_screen(), &screen.input_mode_formatted(), body)
+}
+
+fn replay_prefix_parts(alternate_screen: bool, input_modes: &[u8], body: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     let starts_in_alt = match first_alt_switch(body) {
         // The first switch leaves the alternate screen: everything before it was drawn there.
         Some(enter) => !enter,
-        None => screen.alternate_screen(),
+        None => alternate_screen,
     };
     if starts_in_alt {
         v.extend_from_slice(b"\x1b[?1049h");
     }
-    v.extend_from_slice(&screen.input_mode_formatted());
+    v.extend_from_slice(input_modes);
     v
 }
 

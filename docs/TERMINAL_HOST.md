@@ -84,8 +84,8 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: additional crash-window tests and code review, including retired-run cleanup
-and bounded host resource retention. Existing
+Remaining before completion: additional crash-window tests and code review, including retired-run cleanup.
+Existing
 live terminals and the installed binary have not been changed or migrated.
 
 ### Restart safety checkpoint
@@ -157,3 +157,18 @@ Validation: two executable-publication unit tests and all 34 focused process che
 The process fixture now deletes its original build directory, then invokes its saved CLI,
 delivers hooks during downtime and performs subsequent backend restarts/reload from the
 stable path. Its terminal PID and host identity survive. No live files were changed.
+
+### Exited terminal resource checkpoint
+
+The host now archives a run after exit, terminal drain and descendant cleanup. It
+persists exact replay modes/bytes, final screen and text before releasing the PTY,
+VT parser and ring buffer. Attached streams hold receivers rather than PTY owners,
+so an open exited tab cannot keep those resources alive. Archived reads load from
+disk; small lifecycle metadata and a launch digest remain in memory until Forget.
+Forgotten generations use one watermark per session instead of one entry per run.
+
+Validation: all 241 Rust tests pass. New checks prove that PTY strong references
+reach zero with a subscriber still present, failed checkpoint writes retain state
+for retry, replay and screen survive archival, background descendants prevent
+archival, and a pre-exit stream keeps receiving heartbeats after archival. All 154
+full application smoke checks and all 34 focused backend checks also pass with this change.

@@ -680,6 +680,16 @@ impl Hub {
         self.inner.lock().sessions.get(&id).and_then(|e| e.pty.clone())
     }
 
+    /// Capture application state and its exact terminal together. A detector can
+    /// query this handle without accidentally reading a replacement run's screen.
+    pub(crate) fn detection_terminal(&self, id: SessionId) -> Option<(SessionInfo, Arc<PtySession>)> {
+        let g = self.inner.lock();
+        let entry = g.sessions.get(&id)?;
+        let terminal = entry.pty.as_ref()?;
+        (terminal.generation == entry.generation && terminal.is_alive())
+            .then(|| (entry.info.clone(), terminal.clone()))
+    }
+
     // ----- session I/O -----
 
     fn input_boundary<T>(&self, action: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
@@ -817,13 +827,8 @@ impl Hub {
     /// - No-op if state and detail are unchanged.
     /// On change: updates SessionInfo, broadcasts SessionUpserted, logs a StateChange event.
     /// Returns true if the state changed.
-    pub fn set_state(&self, id: SessionId, update: StateUpdate, source: StateSource) -> bool {
-        self.set_state_checked(id, update, source, None)
-    }
-
-    /// `set_state`, optionally only if the session's process generation still matches
-    /// (checked under the same lock as the mutation).
-    fn set_state_checked(
+    /// Optionally require the process generation under the same lock as the mutation.
+    pub(crate) fn set_state_checked(
         &self,
         id: SessionId,
         update: StateUpdate,
@@ -3238,6 +3243,22 @@ mod tests {
         assert!(!is_initial_branch("muster/7-x", 7));
         assert!(!is_initial_branch("muster/7-", 7));
         assert!(!is_initial_branch("muster/fix-auth", 7));
+    }
+
+    #[test]
+    fn detector_verdict_cannot_update_a_replacement_terminal() {
+        let hub = move_fixture();
+        {
+            let mut g = hub.inner.lock();
+            let entry = g.sessions.get_mut(&2).unwrap();
+            entry.info.state = AgentState::Working;
+            entry.info.state_detail = None;
+            entry.generation = 8;
+        }
+        assert!(!hub.set_state_checked(2, StateUpdate::new(AgentState::Stuck), StateSource::Timer, Some(7)));
+        assert_eq!(hub.session(2).unwrap().state, AgentState::Working);
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Stuck), StateSource::Timer, Some(8)));
+        assert_eq!(hub.session(2).unwrap().state, AgentState::Stuck);
     }
 
     /// A hub over an in-memory store: workspace `/w/repo`, auto-named channels 1 and 2 (window

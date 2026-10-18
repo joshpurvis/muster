@@ -13,9 +13,10 @@
 //! output to settle is applied on a later tick.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::adapters::{ScreenSnapshot, adapter_for, tui};
 use crate::hub::Hub;
@@ -30,58 +31,92 @@ const FORCE_EVERY_MS: i64 = 2000;
 const IDLE_SETTLE_MS: i64 = 1200;
 pub const STUCK_AFTER_MS: i64 = 10 * 60 * 1000;
 
-#[derive(Default)]
+const CHECKPOINT: &str = "detector-progress-v1";
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Track {
+    generation: u64,
+    #[serde(skip)]
     seq: u64,
+    #[serde(skip)]
     last_eval: i64,
-    screen_hash: u64,
+    screen_hash: [u8; 32],
     /// Last meaningful screen change (or entry into Working).
     changed_at: i64,
     prev_state: Option<AgentState>,
 }
 
+impl Track {
+    fn for_generation(&mut self, generation: u64, now: i64) {
+        if self.generation != generation {
+            *self = Self { generation, changed_at: now, ..Self::default() };
+        }
+    }
+
+    fn progress(&self) -> (u64, [u8; 32], i64, Option<AgentState>) {
+        (self.generation, self.screen_hash, self.changed_at, self.prev_state)
+    }
+}
+
 /// Called once at daemon start.
 pub fn spawn(hub: Arc<Hub>) {
     tokio::spawn(async move {
-        let mut tracks: HashMap<SessionId, Track> = HashMap::new();
+        let mut tracks: HashMap<SessionId, Track> = match hub.store().load_runtime(CHECKPOINT) {
+            Ok(saved) => saved.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!("restoring detector progress: {error:#}");
+                HashMap::new()
+            }
+        };
+        let mut dirty = false;
         let mut iv = tokio::time::interval(TICK);
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             iv.tick().await;
             let ids = hub.live_session_ids();
+            let previous_len = tracks.len();
             tracks.retain(|id, _| ids.contains(id));
+            dirty |= previous_len != tracks.len();
             for id in ids {
                 let now = now_ms();
-                let seq = hub.output_seq(id);
-                let t = tracks.entry(id).or_insert_with(|| Track {
-                    changed_at: now,
-                    ..Default::default()
-                });
+                let Some((info, terminal)) = hub.detection_terminal(id) else { continue };
+                let seq = terminal.seq();
+                let t = tracks.entry(id).or_default();
+                let before = t.progress();
+                t.for_generation(terminal.generation, now);
+                dirty |= t.progress() != before;
                 if seq == t.seq && now - t.last_eval < FORCE_EVERY_MS {
                     continue;
                 }
                 t.seq = seq;
                 t.last_eval = now;
-                let (Some(info), Some(screen)) = (hub.session(id), hub.screen(id)) else {
-                    continue;
-                };
+                let Some(screen) = terminal.screen() else { continue };
+                let before = t.progress();
                 match evaluate(&info, &screen, t, now) {
                     Verdict::Set(update, source) => {
-                        hub.set_state(id, update, source);
+                        hub.set_state_checked(id, update, source, Some(terminal.generation));
                     }
                     // Re-check on the next tick instead of waiting for the forced interval.
                     Verdict::Recheck => t.last_eval = 0,
                     Verdict::Keep => {}
+                }
+                dirty |= t.progress() != before;
+            }
+            // Poll counters are deliberately excluded. Persist only meaningful
+            // progress so animation and unchanged screens do not cause disk writes.
+            if dirty {
+                match hub.store().save_runtime(CHECKPOINT, &tracks) {
+                    Ok(()) => dirty = false,
+                    Err(error) => tracing::warn!("saving detector progress: {error:#}"),
                 }
             }
         }
     });
 }
 
-fn hash_screen(screen: &ScreenSnapshot) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    tui::normalized_for_change(&screen.lines).hash(&mut h);
-    h.finish()
+fn hash_screen(screen: &ScreenSnapshot) -> [u8; 32] {
+    // Unlike DefaultHasher, this digest is stable across backend builds.
+    Sha256::digest(tui::normalized_for_change(&screen.lines).as_bytes()).into()
 }
 
 #[derive(Debug)]
@@ -318,6 +353,37 @@ mod tests {
             ),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn progress_survives_store_reopen_but_not_a_terminal_generation_change() {
+        let directory = std::env::temp_dir().join(format!("muster-detector-{}", crate::paths::random_token()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("application.db");
+        let working = snap(include_str!("adapters/fixtures/claude_running_tool.txt"));
+        let info = info(SessionKind::Claude, AgentState::Working, 0);
+        {
+            let store = crate::store::Store::open(&path).unwrap();
+            let mut track = Track::default();
+            track.for_generation(7, 1_000);
+            assert!(evaluate_inner(&info, &working, &mut track, 1_000).is_none());
+            track.seq = 42;
+            track.last_eval = 1_000;
+            store.save_runtime(CHECKPOINT, &HashMap::from([(info.id, track)])).unwrap();
+        }
+        let store = crate::store::Store::open(&path).unwrap();
+        let mut tracks = store.load_runtime::<HashMap<SessionId, Track>>(CHECKPOINT).unwrap().unwrap();
+        let track = tracks.get_mut(&info.id).unwrap();
+        assert_eq!((track.seq, track.last_eval), (0, 0), "poll counters must restart");
+        track.for_generation(7, STUCK_AFTER_MS);
+        let update = evaluate_inner(&info, &working, track, 1_000 + STUCK_AFTER_MS).unwrap();
+        assert_eq!(update.0.state, AgentState::Stuck, "replacement keeps the progress clock");
+        // The same screen in a new terminal must not inherit an old stuck timer.
+        track.for_generation(8, 2_000 + STUCK_AFTER_MS);
+        assert!(evaluate_inner(&info, &working, track, 2_000 + STUCK_AFTER_MS).is_none());
+        assert_eq!(track.changed_at, 2_000 + STUCK_AFTER_MS);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

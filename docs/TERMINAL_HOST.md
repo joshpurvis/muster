@@ -237,3 +237,17 @@ the deleted-launch-files retry regression. All 154 full application smoke checks
 and all 40 focused backend survival checks passed. Process tests cover parent death
 before ownership publication, PID preservation, vanished cwd, and host replacement.
 Detector/subagent recovery and final UI recovery verification remain under review.
+
+### Detector recovery checkpoint
+
+The application saves meaningful screen hashes, progress timestamps and observed
+states for each terminal generation. Backend replacement restores that progress
+clock; transient poll counters restart. Stable SHA-256 hashes permit comparison
+across backend builds. A new terminal generation gets a fresh clock, and detector
+verdicts are applied only to the exact terminal generation whose screen was read.
+Unchanged screens and spinner-only animation do not trigger checkpoint writes.
+
+Validation: all 253 Rust tests pass, including application database reopen with a
+preserved stuck timer, a fresh timer for a replacement generation, and refusal of
+an old generation's detector verdict. Subagent/hook state recovery and final UI
+recovery verification remain open.

@@ -1,7 +1,9 @@
 # Terminal host separation
 
-Work in progress on `refactor/terminal-host`. The live installation is not part of
-this migration or its tests. Builds use this worktree's `target/` directory.
+Implemented on `refactor/terminal-host` in `/tmp/muster-terminal-host`. The live
+installation is not part of this migration or its tests. Builds use this worktree's
+`target/` directory. The chronological checkpoints below describe intermediate
+states; the completion audit at the end records the final verification.
 
 ## Ownership
 
@@ -270,10 +272,16 @@ The optional `scripts/backend-smoke.py --browser` mode uses a fresh Chromium pro
 and captures screenshots under its private fixture directory. Its rendered desktop
 check confirms that an open page reconnects after backend SIGKILL, replays captured
 output, and accepts keyboard input into the original terminal PID. The screenshots
-have been inspected and all 44 checks in the browser-enabled suite passed. Mobile
-recovery and the final requirement audit remain open.
+have been inspected and all 44 checks in the desktop browser-enabled suite passed.
 
-## Completion audit (in progress)
+The browser fixture also exercises the mobile UI with a private paired device.
+During backend downtime it verifies that sending is disabled; after replacement it
+verifies that pairing and the unsent draft survive, captured output is replayed, and
+the same terminal PID remains. Offline/reconnected screenshots have been inspected.
+All 45 checks in the extended browser fixture passed, including its owned-process
+cleanup. No browser console exceptions were reported.
+
+## Completion audit
 
 The scope is independent terminal lifetime during application/UI iteration. Host
 replacement, machine reboot and migration of legacy daemon-owned PTYs are not
@@ -285,10 +293,24 @@ while the application reconnects; the host keeps processes and output capture al
 | Small host independent of application policy | Host/core/protocol Cargo manifests contain no application, database, agent or MCP dependency. Generic PTY ownership lives in the host/core crates. | Implemented; dependency boundary inspected |
 | Backend crash/reload preserves terminal identity and output | Host survival tests; backend smoke checks for SIGKILL, SIGTERM, reload, delayed spawn acknowledgement and output during downtime. | Verified |
 | Reconnect cannot accidentally duplicate or kill a run | Instance/protocol checks, monotonic generations, retry-safe Spawn, durable retirement and delayed-ack fault proxy cases. | Verified |
-| Prompt and agent recovery is explicit and safe | Durable waiting/uncertain queues, generation-bound input, atomic hook attribution/state/count/cursor, MCP reservations and detector progress checkpoints. | Rust and process checks pass; final cross-feature review remains |
+| Prompt and agent recovery is explicit and safe | Durable waiting/uncertain queues, generation-bound input, atomic hook attribution/state/count/cursor, MCP reservations and detector progress checkpoints. Recovery runs before queue workers and autostart. | Verified by Rust/process checks and lifecycle review |
 | Upper-layer executable updates preserve helper availability | Immutable copied executable releases and stable command link; fixture deletes its original build before hook/reload checks. | Verified |
 | UI releases activate independently | Staged compatible releases, pinned asset URLs and retained old bundles; fixture verifies unchanged backend/terminal PIDs during UI installation. Complete staged assets are checked before publication. | Verified with asset and process tests |
-| Actual UI reconnects to the surviving terminal | Desktop Chromium test verifies rendered replay and post-reconnect keyboard input; screenshots inspected. | Desktop verified; mobile browser check remains |
+| Actual UI reconnects to the surviving terminal | Desktop verifies replay and post-reconnect keyboard input; mobile verifies pairing, draft retention, offline input disabling and replay. Screenshots inspected. | Verified; all 45 extended fixture checks passed |
 | Host behaves correctly without clients | Query replies, periodic log flush, flood bounds, exited-run archival and background descendant tests. | Verified |
 | Work remains isolated from the live instance | Separate `/tmp/muster-terminal-host` worktree; explicit private runtime/data/port on all fixtures; original checkout remains at `9e67a6d`. No installation or migration performed. | Verified development boundary |
-| Reviewable delivery and rollout guidance | Committed branch, README build/reload/UI commands, private protocol specification and this design/checkpoint document. | Final clean-tree and requirement review remain |
+| Reviewable delivery and rollout guidance | Committed branch, README build/reload/UI commands, private protocol specification and this design/checkpoint document. | Requirements and rollout guidance reviewed; no live rollout performed |
+
+Final validation: 255 Rust tests, 154 full application smoke checks, 45 backend/browser
+survival checks, 82 frontend tests, frontend type/lint checks, the workspace build,
+the staged UI asset regression and `cargo check --workspace --features gui --offline`.
+The native GUI feature was compile-checked; the interactive recovery checks used
+Chromium against the actual desktop and mobile bundles.
+
+Lifecycle review confirmed that application shutdown only settles its queues;
+terminal ownership has no backend-drop cleanup path. Host startup is attempted only
+when the private endpoint is absent/refused, and compatibility errors preserve the
+existing host. Executable publication follows successful application recovery, while
+surviving terminals retain their stable helper path. The original checkout remains
+at `9e67a6d` with its pre-existing `.claude/` entry. Installing this branch and retiring
+legacy sessions remain separate user-controlled rollout actions.

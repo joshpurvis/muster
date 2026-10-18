@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backend/host fault tests. Only fixture-owned processes and private temp paths.
 Run: bash scripts/isolated.sh python3 scripts/backend-smoke.py
-Add --browser for rendered desktop reconnect/input checks (requires Chromium and web/dist).
+Add --browser for rendered desktop/mobile recovery checks (requires Chromium and web/dist).
 Requires cargo build --workspace first. No installed Muster executable is used.
 """
 from http.client import HTTPConnection
@@ -252,12 +252,15 @@ try:
     if browser is not None:
         check(browser_phase("after")["pid"] == pid,
               "rendered UI reconnects, replays downtime output and accepts keyboard input with the same PID")
-        close_browser()
     with sqlite3.connect(DATA / "muster.db") as database:
         record = json.loads(database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (sid,)).fetchone()[0])
     check(http("/hook/Stop", {"hook_event_name": "Stop"}, record["token"])[0] == 200,
           "session hook credentials survive backend restart")
+    browser_phase("mobile")
     stop_backend()
+    if browser is not None:
+        host_call("input", {"run": record["spec"]["run"], "data": list(b"printf 'MOBILE-DOWNTIME-OK\\n'\r")})
+        browser_phase("mobile_offline")
     check(next(item for item in host_call("inventory") if item["run"]["id"] == sid)["alive"],
           "graceful backend shutdown preserves the terminal")
     hook_env = ENV | {"MUSTER_URL": f"http://127.0.0.1:{PORT}", "MUSTER_TOKEN": record["token"],
@@ -278,6 +281,10 @@ try:
     start_backend()
     check(callback_count() == 1, "replacement backend drains the durable callback before serving clients")
     check(session(sid)["subagents"] == 1, "replacement backend restores a queued subagent-start callback")
+    if browser is not None:
+        check(browser_phase("mobile_after")["pid"] == pid,
+              "mobile UI preserves pairing and draft, disables offline send and replays downtime output")
+        close_browser()
     # Simulate an acknowledgement lost after application commit: restore the same inbox row.
     stop_backend(hard=True)
     with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:

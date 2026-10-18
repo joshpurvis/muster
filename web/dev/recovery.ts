@@ -54,6 +54,42 @@ try {
       if (exceptions.length) throw new Error(exceptions.join("\n"));
       console.log(JSON.stringify({ phase, pid: session.pid }));
       continue;
+    } else if (phase === "mobile") {
+      const pairing = await browser.eval(`${M}.rpc.call("device.pair_code", {
+        url: "https://muster-fixture.invalid", name: "Recovery fixture", scopes: ["view", "interact"]
+      })`);
+      await browser.size(412, 915, true);
+      await browser.goto(`${new URL(url).origin}/m/#pair=${pairing.code}`);
+      await browser.wait(`!!document.querySelector('[data-session="${sid}"] .session-open')`, 15000);
+      await browser.click(`[data-session="${sid}"] .session-open`);
+      await browser.wait("!!document.querySelector('.input-row textarea')");
+      await browser.click(".input-row textarea");
+      await browser.type("Keep this unsent draft across backend replacement");
+      await browser.shot(`${base}/shots/mobile-before-backend-replacement.png`);
+    } else if (phase === "mobile_offline") {
+      await browser.wait("!!document.querySelector('.connection-banner')", 10000);
+      if (!await browser.eval("document.querySelector('.send-button').disabled")) {
+        throw new Error("mobile send remained enabled during the backend outage");
+      }
+      await browser.shot(`${base}/shots/mobile-backend-offline.png`);
+    } else if (phase === "mobile_after") {
+      await browser.wait("!document.querySelector('.connection-banner') && !!document.querySelector('.send-button:not(:disabled)')", 15000);
+      if (!await browser.eval("document.querySelector('.input-row textarea').value === 'Keep this unsent draft across backend replacement'")) {
+        throw new Error("mobile composer lost its unsent draft");
+      }
+      await browser.click(".select-toggle");
+      await browser.wait("document.querySelector('.selection-text')?.textContent.includes('MOBILE-DOWNTIME-OK')", 10000);
+      await browser.shot(`${base}/shots/mobile-reconnected-output.png`);
+      await browser.click(".select-toggle");
+      await browser.shot(`${base}/shots/mobile-reconnected-draft.png`);
+      const response = await browser.eval(`fetch('/api/rpc', {method:'POST',
+        headers: {'Content-Type':'application/json','X-Muster':'1'},
+        body: JSON.stringify({id:1,method:'hello',params:{}})}).then(r => r.json())`);
+      const session = response.result.sessions.find((item: { id: number }) => item.id === sid);
+      const exceptions = browser.console.filter((line) => line.startsWith("exception:"));
+      if (exceptions.length) throw new Error(exceptions.join("\n"));
+      console.log(JSON.stringify({ phase, pid: session.pid }));
+      continue;
     } else {
       throw new Error(`unknown recovery phase: ${phase}`);
     }

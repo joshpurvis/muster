@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod detect;
 mod devices;
+mod executables;
 mod gui;
 mod hookcmd;
 mod hook_inbox;
@@ -943,17 +944,15 @@ async fn daemon_main() -> anyhow::Result<()> {
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
     let hook_inbox = hook_inbox::Inbox::open(&hook_inbox::path())?;
-    let terminal_host = terminal::ensure_host()?;
+    let release = executables::prepare(&paths::data_dir(), &std::env::current_exe()?)?;
+    let terminal_host = terminal::ensure_host(&release.host())?;
     // Never move a directory beneath a surviving process during a backend update.
     if !terminal_host.inventory()?.iter().any(|run| run.has_processes) {
         if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
             tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
         }
     }
-    let muster_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .unwrap_or_else(|| PathBuf::from("muster"));
+    let muster_bin = release.command();
     let hub = hub::Hub::new(
         hub::HubConfig {
             port,
@@ -966,6 +965,9 @@ async fn daemon_main() -> anyhow::Result<()> {
 
     hook_inbox::spawn(&hub, hook_inbox)?;
     let app = server::router(hub.clone())?;
+    // Publish the helper only after application recovery succeeds. Existing
+    // terminals keep this path even when the original build directory is removed.
+    release.activate()?;
     inject::spawn_tasks(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());

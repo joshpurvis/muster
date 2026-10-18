@@ -58,6 +58,13 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster stop` | Explicitly stop both backend and terminal host, terminating sessions. |
 | `muster status` / `url` / `daemon` / `hook` | As before. |
 
+New sessions receive `$MUSTER_BIN` pointing to `<data>/bin/muster`; agent hooks use the
+same stable executable path. Successful backend startup atomically switches it to a
+private copy of that build, so callers survive deletion of the original checkout.
+The first startup requires both executables side by side; backend-only updates can
+reuse the saved host binary. This never restarts a running host. Executable snapshots
+under `<data>/application-releases` are retained rather than pruned during updates.
+
 Inside a muster session, `send`, `keys`, `ask` and `new` pass `$MUSTER_SESSION_ID` to the daemon
 as `from_session`, so what an agent does through the CLI is attributed to it: `send` and `ask` run
 as its MCP `send_message` / `ask_agent` (same guards and rate limits), and `keys` and `new` carry its

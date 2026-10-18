@@ -285,7 +285,7 @@ impl Terminal {
 
 /// Start a host only if its endpoint is absent/refused. Version errors or a live
 /// host using another data directory are hard errors, never reasons to replace it.
-pub fn ensure_host() -> anyhow::Result<Arc<TerminalService>> {
+pub fn ensure_host(executable: &Path) -> anyhow::Result<Arc<TerminalService>> {
     let runtime = crate::paths::runtime_dir();
     let data = crate::paths::data_dir().join("terminal");
     let socket = runtime.join("terminal.sock");
@@ -297,7 +297,6 @@ pub fn ensure_host() -> anyhow::Result<Arc<TerminalService>> {
         },
     }
     crate::paths::ensure_private_dir(&runtime)?;
-    let executable = std::env::current_exe()?.with_file_name("muster-terminal-host");
     anyhow::ensure!(executable.is_file(), "terminal host executable is missing: {}; build with cargo build --workspace", executable.display());
     use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(runtime.join("terminal.log"))?;

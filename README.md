@@ -32,6 +32,12 @@ windows. `MUSTER_WEB_DIR` can point directly to a built UI for development. An i
 UI is refused. Backend reload verifies host ownership and refuses legacy monolithic daemons;
 existing terminals in those daemons need to finish before migrating.
 
+On startup, the backend snapshots its executables under the data directory and publishes
+`bin/muster` atomically. Agent hooks and `$MUSTER_BIN` use that stable path, so removing
+an old build directory does not strand running sessions. Later backend-only builds can
+reuse the saved host executable. Publishing a build never replaces a running host;
+old executable releases are retained for rollback.
+
 ## Run
 
 ```sh

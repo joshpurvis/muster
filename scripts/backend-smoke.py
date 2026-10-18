@@ -6,6 +6,7 @@ Requires cargo build --workspace first. No installed Muster executable is used.
 from http.client import HTTPConnection
 import json
 import re
+import shutil
 from pathlib import Path
 import socket
 import sqlite3
@@ -20,6 +21,11 @@ BIN = PROJECT / "target/debug/muster"
 assert BIN.is_file() and BIN.with_name("muster-terminal-host").is_file(), "cargo build --workspace first"
 BASE = Path(tempfile.mkdtemp(prefix="muster-backend-smoke-"))
 print(f"Isolated backend smoke files: {BASE}", flush=True)
+BUILD = BASE / "disposable-build"
+BUILD.mkdir(mode=0o700)
+shutil.copy2(BIN, BUILD / "muster")
+shutil.copy2(BIN.with_name("muster-terminal-host"), BUILD / "muster-terminal-host")
+BIN = BUILD / "muster"
 RUNTIME, DATA, HOME = (BASE / name for name in ("run", "data", "home"))
 for path in (RUNTIME, DATA, HOME):
     path.mkdir(mode=0o700)
@@ -156,6 +162,17 @@ try:
     sid, pid = first["id"], first["pid"]
     with sqlite3.connect(DATA / "muster.db") as database:
         record = json.loads(database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (sid,)).fetchone()[0])
+    stable_bin = Path(record["spec"]["env"]["MUSTER_BIN"])
+    check(stable_bin == DATA / "bin/muster" and stable_bin.is_file(),
+          "terminals receive a stable application command path")
+    # Remove only this fixture's build, never the worktree or installed executables.
+    # Subsequent callbacks, backend restarts and reloads run through the saved path.
+    shutil.rmtree(BUILD)
+    BIN = stable_bin
+    helper = subprocess.run([str(BIN), "ls", "--json"], env=ENV,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    check(helper.returncode == 0 and any(item["id"] == sid for item in json.loads(helper.stdout)),
+          "saved command works after its original build directory is deleted")
     def mcp_post():
         status, response = http("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "post_to_channel", "arguments": {"text": "MCP restart-limit fixture"}}}, record["token"])

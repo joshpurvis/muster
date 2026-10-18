@@ -84,8 +84,7 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: stable helper executable paths;
-additional crash-window tests and code review, including retired-run cleanup
+Remaining before completion: additional crash-window tests and code review, including retired-run cleanup
 and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.
 
@@ -144,3 +143,17 @@ Validation: 237 Rust tests, including replacement with exhausted rate limits, a 
 parent and lost child acknowledgement, persistence failure, and pending-delivery errors.
 The focused process-boundary suite also passes all 32 checks, including a real backend
 crash with an exhausted MCP rate window. The original live installation remains untouched.
+
+### Stable executable checkpoint
+
+Backend startup copies complete application/host executables into private content-addressed
+releases, then atomically publishes `<data>/bin/muster` after application recovery succeeds.
+Hooks and `$MUSTER_BIN` use this path. Copies are independent of build-output inodes;
+corrupt or incomplete releases are refused. A backend-only build can reuse the saved host
+binary, and no executable publication signals or replaces a running terminal host.
+Old executable releases remain available for rollback.
+
+Validation: two executable-publication unit tests and all 34 focused process checks pass.
+The process fixture now deletes its original build directory, then invokes its saved CLI,
+delivers hooks during downtime and performs subsequent backend restarts/reload from the
+stable path. Its terminal PID and host identity survive. No live files were changed.

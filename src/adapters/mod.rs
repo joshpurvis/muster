@@ -161,30 +161,7 @@ pub struct CommandSpec {
     pub consumed_initial_prompt: bool,
 }
 
-/// Plain-text view of the terminal for pattern matching.
-#[derive(Debug, Clone, Default)]
-pub struct ScreenSnapshot {
-    /// Visible rows, trailing whitespace trimmed.
-    pub lines: Vec<String>,
-    pub cursor_row: u16,
-    pub cursor_col: u16,
-    pub cols: u16,
-    pub rows: u16,
-    /// Unix ms of the last PTY output.
-    pub last_output_at: i64,
-    /// True if a foreground process other than the session's own process owns the TTY
-    /// (only meaningful for shells).
-    pub foreground_busy: bool,
-}
-
-impl ScreenSnapshot {
-    pub fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-    pub fn contains(&self, needle: &str) -> bool {
-        self.lines.iter().any(|l| l.contains(needle))
-    }
-}
+pub use muster_terminal_core::ScreenSnapshot;
 
 pub trait Adapter: Send + Sync {
     fn kind(&self) -> SessionKind;

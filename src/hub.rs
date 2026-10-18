@@ -2175,7 +2175,18 @@ impl Hub {
                 rows: info.rows,
                 log_path: session_dir.join("output.log"),
             },
-            self.weak.clone(),
+            {
+                let weak = self.weak.clone();
+                Arc::new(move |event| {
+                    let Some(hub) = weak.upgrade() else { return };
+                    use muster_terminal_core::TerminalEvent;
+                    match event {
+                        TerminalEvent::Title { id, generation, title } => hub.pty_title_changed(id, generation, title),
+                        TerminalEvent::Exited { id, generation, code } => hub.pty_exited(id, generation, code),
+                        TerminalEvent::Drained { id, generation } => hub.pty_drained(id, generation),
+                    }
+                })
+            },
         )?;
         let (info, early, kill) = {
             let mut g = self.inner.lock();

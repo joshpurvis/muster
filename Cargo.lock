@@ -1895,9 +1895,9 @@ dependencies = [
  "futures",
  "libc",
  "mime_guess",
+ "muster-terminal-core",
  "notify-rust",
  "parking_lot",
- "portable-pty",
  "rand 0.9.5",
  "rusqlite",
  "rust-embed",
@@ -1907,8 +1907,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "vt100",
  "wry",
+]
+
+[[package]]
+name = "muster-terminal-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "libc",
+ "parking_lot",
+ "portable-pty",
+ "serde",
+ "tokio",
+ "tracing",
+ "vt100",
 ]
 
 [[package]]

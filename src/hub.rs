@@ -2168,6 +2168,7 @@ impl Hub {
                 program: spec.program.clone(),
                 args: spec.args.clone(),
                 env,
+                clear_env: false,
                 // Don't leak "you are inside another agent" markers from the daemon's own env.
                 env_remove: INHERITED_SESSION_MARKERS.iter().map(|s| s.to_string()).collect(),
                 cwd: PathBuf::from(&info.cwd),

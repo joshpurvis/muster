@@ -47,3 +47,16 @@ Existing terminals in the original daemon require a scheduled migration after
 they finish, or an explicitly authorized restart. They are not adopted by the new
 host. Host compatibility is negotiated separately from application releases;
 application updates must never automatically replace an incompatible live host.
+
+## Verified checkpoints
+
+- Extracted the existing PTY implementation into `muster-terminal-core`, removing
+  its Hub and adapter dependencies. All original 212 Rust tests passed.
+- Added a standalone `muster-terminal-host` and terminal-only protocol/client
+  crate. Nine isolated process-boundary tests and two framing tests pass: client
+  disconnect/replay, retry-safe spawn, generation fencing, descendant cleanup,
+  singleton locks, protocol/instance rejection, explicit shutdown, autonomous
+  terminal queries/log flushing, output floods, and host crash/restart.
+- Application integration, persistent application recovery, update commands and
+  end-to-end backend restart tests are still pending. The application currently
+  uses the extracted core in-process; it is not yet restart-safe.

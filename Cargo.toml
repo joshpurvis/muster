@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/terminal-core"]
+members = ["crates/terminal-core", "crates/terminal-protocol", "crates/terminal-host"]
 resolver = "3"
 
 [package]

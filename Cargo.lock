@@ -1917,12 +1917,39 @@ dependencies = [
  "anyhow",
  "bytes",
  "libc",
+ "muster-terminal-protocol",
  "parking_lot",
  "portable-pty",
- "serde",
  "tokio",
  "tracing",
  "vt100",
+]
+
+[[package]]
+name = "muster-terminal-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "muster-terminal-core",
+ "muster-terminal-protocol",
+ "parking_lot",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "muster-terminal-protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

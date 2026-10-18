@@ -115,6 +115,8 @@ pub struct SpawnParams {
     pub program: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// The host receives a complete launch environment from the application.
+    pub clear_env: bool,
     pub env_remove: Vec<String>,
     pub cwd: PathBuf,
     pub cols: u16,
@@ -137,6 +139,7 @@ pub struct PtySession {
     seq: AtomicU64,
     last_output_at: AtomicI64,
     alive: AtomicBool,
+    exit_code: Mutex<Option<i32>>,
     /// `wait()` returned: the leader's pid may be reused from now on, so it and its process
     /// group are no longer signalled directly (only verified session members are).
     reaped: AtomicBool,
@@ -189,6 +192,9 @@ pub fn spawn(p: SpawnParams, events: EventSink) -> anyhow::Result<Arc<PtySession
         .context("openpty")?;
 
     let mut cmd = CommandBuilder::new(&p.program);
+    if p.clear_env {
+        cmd.env_clear();
+    }
     cmd.args(&p.args);
     cmd.cwd(&p.cwd);
     for k in &p.env_remove {
@@ -245,6 +251,7 @@ pub fn spawn(p: SpawnParams, events: EventSink) -> anyhow::Result<Arc<PtySession
         seq: AtomicU64::new(0),
         last_output_at: AtomicI64::new(0),
         alive: AtomicBool::new(true),
+        exit_code: Mutex::new(None),
         reaped: AtomicBool::new(false),
         reader_done: AtomicBool::new(false),
         dirty: AtomicBool::new(false),
@@ -321,6 +328,7 @@ pub fn spawn(p: SpawnParams, events: EventSink) -> anyhow::Result<Arc<PtySession
                 // Let the reader drain what the process wrote last (it may never see EOF if a
                 // grandchild keeps the tty open).
                 let _ = eof_rx.recv_timeout(Duration::from_millis(500));
+                *sess.exit_code.lock() = Some(code);
                 sess.alive.store(false, Ordering::SeqCst);
                 sess.input_tx.lock().take();
                 sess.flush_log_final();
@@ -412,9 +420,25 @@ impl PtySession {
 
     /// Replay bytes + a live receiver, taken atomically (no lost or duplicated bytes).
     pub fn attach(&self, max_body: Option<usize>) -> (Vec<u8>, broadcast::Receiver<Bytes>) {
+        let (replay, receiver, _) = self.attach_sequenced(max_body);
+        (replay, receiver)
+    }
+
+    /// The offset is the first live byte after this replay, captured under the
+    /// same locks as the snapshot and subscription. Synthetic mode prefixes do
+    /// not advance the raw output offset.
+    pub fn attach_sequenced(&self, max_body: Option<usize>) -> (Vec<u8>, broadcast::Receiver<Bytes>, u64) {
         let parser = self.parser.lock();
         let out = self.out.lock();
-        (Self::client_replay(&parser, &out, max_body), self.out_tx.subscribe())
+        (Self::client_replay(&parser, &out, max_body), self.out_tx.subscribe(), out.total)
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        *self.exit_code.lock()
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.parser.lock().callbacks().title.clone()
     }
 
     pub fn is_alive(&self) -> bool {
@@ -438,10 +462,13 @@ impl PtySession {
         if !self.is_alive() {
             anyhow::bail!("session {} is not running", self.id);
         }
-        if self.input_pending.load(Ordering::SeqCst) + bytes.len() > MAX_PENDING_INPUT {
+        // Check and reserve under the same lock: simultaneous writers must not
+        // each observe spare capacity and collectively exceed the bound.
+        let input = self.input_tx.lock();
+        if bytes.len() > MAX_PENDING_INPUT.saturating_sub(self.input_pending.load(Ordering::SeqCst)) {
             anyhow::bail!("session {} is not reading its input (input buffer full)", self.id);
         }
-        match self.input_tx.lock().as_ref() {
+        match input.as_ref() {
             Some(tx) => {
                 self.input_pending.fetch_add(bytes.len(), Ordering::SeqCst);
                 tx.send(bytes.to_vec()).map_err(|_| {
@@ -1122,6 +1149,7 @@ mod tests {
                     Err(_) => vec!["--noprofile".into(), "--norc".into(), "-i".into()],
                 },
                 env: BTreeMap::new(),
+                clear_env: false,
                 env_remove: vec![],
                 cwd: std::env::temp_dir(),
                 cols: 80,
@@ -1155,6 +1183,7 @@ mod tests {
                 program: "bash".into(),
                 args: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
                 env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                clear_env: false,
                 env_remove: vec![],
                 cwd: std::env::temp_dir(),
                 cols: 80,

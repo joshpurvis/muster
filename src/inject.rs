@@ -60,6 +60,9 @@ const SUBMIT_DELAY_MIN: Duration = Duration::from_millis(120);
 const VERIFY_FOR: Duration = Duration::from_millis(3000);
 const VERIFY_RETRY_FOR: Duration = Duration::from_millis(1500);
 const MAX_ATTEMPTS: u8 = 3;
+/// After a prompt could not be typed (a human draft, a dialog, a screen that isn't ready),
+/// wait this long before trying again instead of looping on our own queue updates.
+const REQUEUE_BACKOFF: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Item {
@@ -96,6 +99,8 @@ struct SessQ {
 pub struct Queues {
     inner: Mutex<HashMap<SessionId, SessQ>>,
     store: crate::store::Store,
+    /// In memory only: no delivery attempt before this time (see REQUEUE_BACKOFF).
+    retry_at: Mutex<HashMap<SessionId, tokio::time::Instant>>,
 }
 
 impl Queues {
@@ -115,7 +120,7 @@ impl Queues {
             queue.busy = false;
         }
         store.save_runtime("prompt-queues", &queues)?;
-        Ok(Self { inner: Mutex::new(queues), store: store.clone() })
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()) })
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
@@ -124,9 +129,12 @@ impl Queues {
         let mut queue = previous.clone();
         let result = change(&mut queue);
         if queue != previous {
+            // `busy` is not persisted: flipping it alone needs no database write.
+            let durable = |q: &SessQ| SessQ { busy: false, ..q.clone() };
+            let persist = durable(&queue) != durable(&previous);
             let mut next = guard.clone();
             next.insert(id, queue);
-            self.store.save_runtime("prompt-queues", &next)?;
+            if persist { self.store.save_runtime("prompt-queues", &next)?; }
             *guard = next;
         }
         Ok(result)
@@ -143,6 +151,19 @@ impl Queues {
         Ok(existed)
     }
 
+    fn back_off(&self, id: SessionId) {
+        self.retry_at.lock().insert(id, tokio::time::Instant::now() + REQUEUE_BACKOFF);
+    }
+
+    fn backing_off(&self, id: SessionId) -> bool {
+        let mut retry = self.retry_at.lock();
+        match retry.get(&id) {
+            Some(at) if *at > tokio::time::Instant::now() => true,
+            Some(_) => { retry.remove(&id); false }
+            None => false,
+        }
+    }
+
     fn requeue(&self, id: SessionId, item: Item) -> anyhow::Result<()> {
         self.edit(id, |queue| {
             if queue.generation != item.generation { return }
@@ -152,10 +173,14 @@ impl Queues {
     }
 }
 
+/// Waiting prompts plus the one being delivered (or paused for review). Counting the
+/// active one keeps the number steady while an attempt pops and requeues it.
 fn queue_len(hub: &Hub, id: SessionId) -> u32 {
-    hub.injection.inner.lock().get(&id)
-        .map(|q| q.items.len() as u32 + u32::from(q.blocked && q.active.is_some()))
-        .unwrap_or(0)
+    hub.injection.inner.lock().get(&id).map(waiting).unwrap_or(0)
+}
+
+fn waiting(q: &SessQ) -> u32 {
+    q.items.len() as u32 + u32::from(q.active.is_some())
 }
 
 fn sync_queued(hub: &Hub, id: SessionId) {
@@ -344,13 +369,31 @@ fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyho
     kick(hub.clone(), id);
 }
 
+/// Save a spawn's initial prompt for run `generation` before the launch is sent.
+pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: String,
+    source: crate::agents::Source) -> anyhow::Result<()> {
+    let item = Item { generation: Some(generation), text, clear_first: false, attempts: 0,
+        draft_noticed: false, source };
+    hub.injection.edit(id, |q| {
+        if q.generation != Some(generation) { *q = SessQ { generation: Some(generation), ..SessQ::default() }; }
+        q.items.push_back(item);
+    })
+}
+
+/// The launch carrying a prepared initial prompt was acknowledged.
+pub(crate) fn kick_initial(hub: &Arc<Hub>, id: SessionId) {
+    sync_queued(hub, id);
+    kick(hub.clone(), id);
+}
+
 fn kick(hub: Arc<Hub>, id: SessionId) {
     if hub.is_shutting_down() { return }
     if !is_live(&hub, id) {
-        drop_queue(&hub, id);
+        // A prepared launch (its acknowledgement may still be on the way) keeps its queue.
+        if !hub.may_deliver(id) { drop_queue(&hub, id); }
         return;
     }
-    if !ready(&hub, id) { return }
+    if !ready(&hub, id) || hub.injection.backing_off(id) { return }
     let generation = hub.pty_generation(id);
     let should_start = hub.injection.edit(id, |q| {
         if q.generation != generation || q.busy || q.blocked || q.items.is_empty() { return false }
@@ -364,7 +407,7 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     }
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
-        let is_ready = ready(&hub, id) && !hub.is_shutting_down();
+        let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
         let selected = hub.injection.edit(id, |q| {
             if q.generation != generation { return None }
             let item = if is_ready { q.items.pop_front() } else { None };
@@ -381,6 +424,7 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
                 if let Err(error) = &result {
                     hub.notice("error", format!("Prompt delivery for session {id} needs review: {error:#}"));
                 }
+                if matches!(result, Ok(false)) { hub.injection.back_off(id); }
                 finish(&hub, id, generation, &result);
             }
             Ok(None) => {},
@@ -395,6 +439,43 @@ pub(crate) fn drop_queue(hub: &Hub, id: SessionId) {
         Ok(false) => {},
         Err(error) => hub.notice("error", format!("Could not clear prompt queue: {error:#}")),
     }
+}
+
+/// Would the next delivery be put straight back (a dialog, an unreadable screen, or the
+/// human's unsent draft)? Checked before taking the prompt off the queue, so waiting costs
+/// no queue writes and no queue-count updates. Tells the human once about a draft.
+fn deferred(hub: &Hub, id: SessionId, generation: Option<u64>) -> bool {
+    let Some(info) = hub.session(id) else { return false };
+    let adapter = adapter_for(info.kind);
+    let head = hub.injection.inner.lock().get(&id)
+        .filter(|q| q.generation == generation)
+        .and_then(|q| q.items.front().map(|item| (item.clear_first, item.draft_noticed)));
+    let Some((clear_first, noticed)) = head else { return false };
+    let blocked = if unsafe_to_type(hub, id, adapter, generation).is_some() {
+        true
+    } else if let Some(current) = composer(hub, id, adapter).filter(|c| !c.trim().is_empty()) {
+        let ours = hub.injection.inner.lock().get(&id)
+            .and_then(|q| q.last_sent.clone())
+            .is_some_and(|last| box_holds(&current, &last));
+        let draft = adapter.clear_input_bytes().is_none() || !(ours || clear_first);
+        if draft && !noticed {
+            let marked = hub.injection.edit(id, |q| {
+                if q.generation != generation { return false }
+                q.items.front_mut().map(|item| item.draft_noticed = true).is_some()
+            });
+            if matches!(marked, Ok(true)) {
+                hub.notice(
+                    "info",
+                    format!("Session {id} has unsent text in its input box; the queued prompt waits until it's sent or cleared."),
+                );
+            }
+        }
+        draft
+    } else {
+        false
+    };
+    if blocked { hub.injection.back_off(id); }
+    blocked
 }
 
 fn composer(hub: &Hub, id: SessionId, adapter: &dyn Adapter) -> Option<String> {
@@ -706,6 +787,21 @@ pub fn clear_queue(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The human reviewed an uncertain delivery: forget that record and resume the prompts
+/// waiting behind it. Never resends the uncertain prompt or undoes typed input.
+pub fn resume_queue(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
+    let resumed = hub.injection.edit(id, |q| {
+        if !q.blocked || q.busy { return false }
+        q.active = None;
+        q.blocked = false;
+        true
+    })?;
+    anyhow::ensure!(resumed, "session {id} has no paused delivery to resume");
+    sync_queued(hub, id);
+    kick(hub.clone(), id);
+    Ok(())
+}
+
 /// Background tasks (queue draining). Called once at daemon start.
 pub fn spawn_tasks(hub: Arc<Hub>) {
     let mut rx = hub.subscribe();
@@ -836,6 +932,28 @@ mod tests {
             clear_first: false, attempts: 1, draft_noticed: false,
             source: crate::agents::Source::Human }).unwrap();
         assert!(queues.inner.lock().is_empty(), "late tasks cannot recreate deleted queues");
+    }
+
+    #[test]
+    fn an_attempt_neither_changes_the_count_nor_writes_for_busy_alone() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let queues = Queues::load(&store).unwrap();
+        let item = Item { generation: Some(1), text: "later".into(), clear_first: false, attempts: 0,
+            draft_noticed: false, source: crate::agents::Source::Human };
+        queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(item.clone()); }).unwrap();
+        let count = || waiting(&queues.inner.lock()[&1]);
+        assert_eq!(count(), 1);
+        // Taking the prompt for an attempt, then putting it back (a draft or dialog), keeps
+        // the count steady, so the tab's queued badge doesn't flicker.
+        queues.edit(1, |q| { let item = q.items.pop_front().unwrap(); q.active = Some(Active { item, stage: Stage::Selected }); }).unwrap();
+        assert_eq!(count(), 1);
+        queues.requeue(1, item).unwrap();
+        assert_eq!(count(), 1);
+        // `busy` is in memory only: flipping it never needs the database.
+        store.fail_runtime_writes_for_test();
+        queues.edit(1, |q| q.busy = true).unwrap();
+        queues.edit(1, |q| q.busy = false).unwrap();
+        assert!(queues.edit(1, |q| q.last_sent = Some("x".into())).is_err());
     }
 
     #[test]

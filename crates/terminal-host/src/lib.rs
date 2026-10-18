@@ -90,7 +90,7 @@ impl Host {
             Terminal::Archived(archive) => return Ok(archive.status.clone()),
             Terminal::Live(p) => p,
         };
-        let screen = p.screen();
+        let (cols, rows) = p.size();
         Ok(TerminalStatus {
             run,
             pid: p.pid,
@@ -99,8 +99,8 @@ impl Host {
             has_processes: p.has_processes(),
             exit_code: p.exit_code(),
             title: p.title(),
-            cols: screen.cols,
-            rows: screen.rows,
+            cols,
+            rows,
             output_seq: p.seq(),
             last_output_at: p.last_output_at(),
             application_cursor: p.application_cursor(),
@@ -476,6 +476,30 @@ impl Drop for Lock {
     }
 }
 
+/// Hold an advisory lock on `path` for the rest of this process's life, retrying while
+/// another process holds it. The application names the file; the host attaches no meaning
+/// to it. (Muster uses it to keep older, monolithic daemon builds from starting beside
+/// terminals this host owns.) The descriptor is close-on-exec, so children never inherit it.
+pub fn hold_fence_lock(path: PathBuf) {
+    let _ = std::thread::Builder::new().name("fence-lock".into()).spawn(move || {
+        let mut warned = false;
+        loop {
+            match Lock::acquire(&path) {
+                Ok(lock) => {
+                    std::mem::forget(lock);
+                    return;
+                }
+                Err(error) if !warned => {
+                    tracing::warn!("fence lock {} not held yet: {error:#}", path.display());
+                    warned = true;
+                }
+                Err(_) => {}
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
     private_fs::ensure_private_dir(&runtime)?;
     private_fs::ensure_private_dir(&data)?;
@@ -528,7 +552,11 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let connections = Arc::new(tokio::sync::Semaphore::new(256));
+    // Output and event streams hold their connection for their whole lifetime, so they
+    // get their own admission limit. Short control requests (Input, Inventory, Terminate,
+    // Forget, Hello) keep the remaining capacity even when every stream slot is taken.
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let streams = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS));
     let result: anyhow::Result<()> = loop {
         tokio::select! {
             _ = host.stop.notified() => break Ok(()),
@@ -539,9 +567,10 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
                 Ok((stream, _)) => {
                     let Ok(permit) = connections.clone().try_acquire_owned() else { continue };
                     let host = host.clone();
+                    let streams = streams.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = connection(stream, host).await {
+                        if let Err(error) = connection(stream, host, streams).await {
                         tracing::debug!("host connection closed: {error:#}");
                     }});
                 }
@@ -563,7 +592,10 @@ async fn send(stream: &mut UnixStream, frame: Frame) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn connection(mut stream: UnixStream, host: Arc<Host>) -> anyhow::Result<()> {
+const MAX_CONNECTIONS: usize = 512;
+const MAX_STREAMS: usize = 256;
+
+async fn connection(mut stream: UnixStream, host: Arc<Host>, streams: Arc<tokio::sync::Semaphore>) -> anyhow::Result<()> {
     // SAFETY: geteuid is a side-effect-free query. Filesystem permissions also restrict access.
     anyhow::ensure!(
         stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
@@ -594,6 +626,17 @@ async fn connection(mut stream: UnixStream, host: Arc<Host>) -> anyhow::Result<(
         )
         .await;
     }
+    // Classify the bounded first request before a stream can hold a slot.
+    let _stream_permit = match request.command {
+        Command::Attach { .. } | Command::Events => match streams.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return send(&mut stream, Frame::json(&Response::Error {
+                code: "busy".into(),
+                message: "too many terminal output subscriptions".into(),
+            })?).await,
+        },
+        _ => None,
+    };
     match request.command {
         Command::Shutdown => {
             send(&mut stream, Frame::json(&Response::Ok)?).await?;
@@ -713,6 +756,24 @@ async fn send_error(stream: &mut UnixStream, error: anyhow::Error) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fence_lock_is_held_for_the_host_lifetime() {
+        let directory = std::env::temp_dir().join(format!("muster-fence-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("daemon.lock");
+        // Another holder first: the host waits for it, then takes the lock.
+        let earlier = Lock::acquire(&path).unwrap();
+        hold_fence_lock(path.clone());
+        std::thread::sleep(Duration::from_millis(100));
+        drop(earlier);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Lock::acquire(&path).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the host never took the fence lock");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     struct Fixture(Host);
     impl Fixture {

@@ -50,6 +50,9 @@ impl ReplaySnapshot {
 }
 /// Input queued for a program that isn't reading its terminal is capped at this.
 const MAX_PENDING_INPUT: usize = 8 * 1024 * 1024;
+/// Window titles are kept to this many bytes. A program can emit an OSC title of any
+/// length, and the title travels in every host status frame, which has a size limit.
+pub const MAX_TITLE_BYTES: usize = 1024;
 
 pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(2, 1000), rows.clamp(2, 500))
@@ -67,7 +70,11 @@ struct TitleCb {
 
 impl vt100::Callbacks for TitleCb {
     fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
-        let t = String::from_utf8_lossy(title).trim().to_string();
+        // Decode at most a few bytes past the cap, then cut on a character boundary.
+        let raw = &title[..title.len().min(MAX_TITLE_BYTES + 4)];
+        let decoded = String::from_utf8_lossy(raw);
+        let t = decoded.trim();
+        let t = t[..t.floor_char_boundary(MAX_TITLE_BYTES)].trim_end().to_string();
         let t = if t.is_empty() { None } else { Some(t) };
         if t != self.title {
             self.title = t;
@@ -531,6 +538,12 @@ impl PtySession {
 
     fn foreground_pgrp(&self) -> Option<i32> {
         self.master.lock().as_ref()?.process_group_leader()
+    }
+
+    /// Current (cols, rows), without rendering a screen snapshot.
+    pub fn size(&self) -> (u16, u16) {
+        let (rows, cols) = self.parser.lock().screen().size();
+        (cols, rows)
     }
 
     /// Application cursor mode (DECCKM) is on.
@@ -1458,5 +1471,13 @@ mod tests {
     fn title_callback() {
         let mut p = parser_with(b"\x1b]0;hello\x07", 5);
         assert_eq!(p.callbacks_mut().title.as_deref(), Some("hello"));
+        // An oversized title is capped on a UTF-8 boundary, never stored whole.
+        let mut long = b"\x1b]2;".to_vec();
+        long.extend("\u{e9}".repeat(MAX_TITLE_BYTES).as_bytes());
+        long.push(7);
+        let mut p = parser_with(&long, 5);
+        let title = p.callbacks_mut().title.clone().unwrap();
+        assert!(title.len() <= MAX_TITLE_BYTES && title.len() >= MAX_TITLE_BYTES - 1);
+        assert!(title.chars().all(|c| c == '\u{e9}'));
     }
 }

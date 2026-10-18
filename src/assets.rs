@@ -149,21 +149,44 @@ pub fn install(source: &Path, data: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn copy_release(source: &Path, target: &Path, depth: usize) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(source)?;
+    copy_release_dir(&root, source, target, depth)
+}
+
+/// Walks held directory descriptors and opens every entry relative to its parent with
+/// O_NOFOLLOW, then checks the type of what was actually opened. A source entry swapped for
+/// a symlink after it was listed can't redirect the copy outside the source tree.
+fn copy_release_dir(dir: &std::fs::File, shown: &Path, target: &Path, depth: usize) -> anyhow::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     anyhow::ensure!(depth < 16, "UI directory nesting is too deep");
-    for entry in std::fs::read_dir(source)? {
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
         let entry = entry?;
-        let kind = entry.file_type()?;
-        let output = target.join(entry.file_name());
+        let name = entry.file_name();
+        let path = shown.join(&name);
+        let output = target.join(&name);
+        let c_name = std::ffi::CString::new(name.as_bytes())?;
+        // SAFETY: openat with a valid directory descriptor and a NUL-terminated name;
+        // a successful result is a fresh descriptor owned by the File below.
+        let fd = unsafe {
+            libc::openat(dir.as_raw_fd(), c_name.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        };
+        anyhow::ensure!(fd >= 0, "UI release contains a symlink or unreadable entry: {}: {}",
+            path.display(), std::io::Error::last_os_error());
+        // SAFETY: fd was just returned by openat and is owned by nothing else.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let kind = file.metadata()?.file_type();
         if kind.is_dir() {
             crate::paths::ensure_private_dir(&output)?;
-            copy_release(&entry.path(), &output, depth + 1)?;
+            copy_release_dir(&file, &path, &output, depth + 1)?;
         } else {
-            anyhow::ensure!(
-                kind.is_file(),
-                "UI release contains a symlink or special file: {}",
-                entry.path().display()
-            );
-            std::fs::copy(entry.path(), &output)?;
+            anyhow::ensure!(kind.is_file(), "UI release contains a symlink or special file: {}", path.display());
+            let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&output)?;
+            std::io::copy(&mut file, &mut out)?;
             crate::paths::make_private_file(&output);
         }
     }

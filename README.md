@@ -38,6 +38,13 @@ an old build directory does not strand running sessions. Later backend-only buil
 reuse the saved host executable. Publishing a build never replaces a running host;
 old executable releases are retained for rollback.
 
+Downgrading to a monolithic build (one without `muster-terminal-host`) is an offline step:
+run `muster stop` with this build first. That ends every terminal. An older daemon knows
+nothing about host-owned terminals, so started beside them it would mark them exited and
+autostart duplicate agents next to the originals. To prevent that, the terminal host holds
+`daemon.lock` in the runtime directory while it lives, and an older daemon refuses to start
+until the host is gone ("another muster daemon is already running").
+
 ## Run
 
 ```sh

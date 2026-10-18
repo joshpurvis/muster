@@ -379,6 +379,11 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             inject::clear_queue(hub, p.id)?;
             Ok(json!({}))
         }
+        "session.resume_queue" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            inject::resume_queue(hub, p.id)?;
+            Ok(json!({}))
+        }
         "session.screen" => {
             let p: IdParam<SessionId> = parse(params)?;
             if hub.session(p.id).is_none() {
@@ -552,7 +557,10 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             };
             match chain {
                 Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => hub.note_human_input(p.id)?,
+                None => if let Err(error) = hub.note_human_input(p.id) {
+                    // As for keystrokes: the input still goes through with the stricter provenance.
+                    tracing::warn!(session = p.id, "input attribution not saved: {error:#}");
+                },
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -1158,9 +1166,10 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
+                    // Attribution is bookkeeping: if it can't be saved, the session keeps its
+                    // current (agent) provenance, which is the stricter one. Never drop keys.
                     if let Err(error) = hub.note_human_input(id) {
-                        hub.notice("error", format!("Could not persist input attribution: {error:#}"));
-                        continue;
+                        tracing::warn!(session = id, "input attribution not saved: {error:#}");
                     }
                     if let Err(e) = hub.write_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");

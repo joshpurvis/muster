@@ -164,6 +164,12 @@ impl Terminal {
     pub fn application_cursor(&self) -> bool { self.status.lock().application_cursor }
     pub fn exit_code(&self) -> Option<i32> { self.status.lock().exit_code }
     pub fn title(&self) -> Option<String> { self.status.lock().title.clone() }
+    /// The run is alive or left processes behind, per the last host facts. An archived
+    /// run kept only as a replay handle owns nothing.
+    pub fn owns_processes(&self) -> bool {
+        let status = self.status.lock();
+        status.alive || status.has_processes
+    }
 
     fn observe(&self, status: TerminalStatus, events: &EventSink) {
         let previous = std::mem::replace(&mut *self.status.lock(), status.clone());
@@ -289,6 +295,8 @@ pub fn ensure_host(executable: &Path) -> anyhow::Result<Arc<TerminalService>> {
     let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(runtime.join("terminal.log"))?;
     let mut command = std::process::Command::new(&executable);
     command.arg("--runtime-dir").arg(&runtime).arg("--data-dir").arg(&data)
+        // Keeps the monolithic daemon of older builds from starting while this host lives.
+        .env("MUSTER_TERMINAL_FENCE_LOCK", crate::paths::lock_path())
         .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
     // SAFETY: setsid is async-signal-safe and runs before exec, as in the daemon launcher.
     unsafe { command.pre_exec(|| {

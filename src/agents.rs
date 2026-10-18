@@ -846,6 +846,12 @@ impl Registry {
         Ok(())
     }
 
+    /// Link a named agent to the session being started for it. spawn_session saves this
+    /// before the process can start, so a crash can't leave a running agent unlinked.
+    pub(crate) fn link_session(&self, store: &Store, agent: i64, session: Option<SessionId>) -> anyhow::Result<()> {
+        self.update(store, agent, |b| b.session_id = session)
+    }
+
     /// The session's provenance (None: human-rooted).
     pub fn prov(&self, id: SessionId) -> Option<Prov> {
         self.inner.lock().runtime.prov.get(&id).copied()
@@ -1296,9 +1302,10 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
             window_id: window,
             from_session: None,
             prov: None,
+            // Linked before the process starts (see link_session).
+            agent_id: Some(agent.id),
         })
         .await?;
-    hub.agents().update(hub.store(), agent.id, |b| b.session_id = Some(session.id))?;
     agent.session_id = Some(session.id);
     Ok(AgentSession { agent, session, started: true })
 }

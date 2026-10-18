@@ -730,7 +730,14 @@ function Shortcuts() {
 // ---------------- confirm ----------------
 
 function Confirm(
-  props: { title: string; body: string; confirmLabel: string; danger?: boolean; run: () => void },
+  props: {
+    title: string;
+    body: string;
+    confirmLabel: string;
+    danger?: boolean;
+    run: () => void;
+    secondary?: { label: string; run: () => void };
+  },
 ) {
   const ok = useRef<HTMLButtonElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
@@ -746,6 +753,18 @@ function Confirm(
       </div>
       <div class="dlg-foot">
         <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
+        {props.secondary && (
+          <button
+            type="button"
+            class="btn"
+            onClick={() => {
+              overlay.value = null;
+              props.secondary!.run();
+            }}
+          >
+            {props.secondary.label}
+          </button>
+        )}
         <button
           ref={ok}
           type="button"

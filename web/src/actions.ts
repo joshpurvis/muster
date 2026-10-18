@@ -869,10 +869,18 @@ export async function reviewQueue(id: SessionId) {
     overlay.value = {
       kind: "confirm",
       title: queue.paused ? "Review interrupted delivery" : "Queued prompts",
-      body: `${text}${queue.queued.length} prompt(s) waiting. ${queue.queued.slice(0, 3).map(preview).join(" · ")} Clearing discards the queue records. Already typed text and executed commands remain.`,
+      body: `${text}${queue.queued.length} prompt(s) waiting. ${queue.queued.slice(0, 3).map(preview).join(" · ")} ${
+        queue.paused ? "Resume keeps the waiting prompts and forgets only the interrupted one. " : ""
+      }Clearing discards the queue records. Already typed text and executed commands remain.`,
       confirmLabel: "Clear queue",
       danger: true,
       run: () => rpc.call("session.clear_queue", { id }).catch(fail("Could not clear queue")).catch(() => {}),
+      secondary: queue.paused
+        ? {
+          label: "Resume queue",
+          run: () => rpc.call("session.resume_queue", { id }).catch(fail("Could not resume queue")).catch(() => {}),
+        }
+        : undefined,
     };
   } catch (error) {
     toast("error", `Could not read queue: ${errText(error)}`);

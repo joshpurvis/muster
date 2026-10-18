@@ -122,8 +122,20 @@ export function Composer(
             {queue && (
               <div class="approval-prompt">
                 {queue.uncertain && <p>Delivery interrupted: {queue.uncertain.slice(0, 300)}. Check the terminal before resending.</p>}
-                <p>{queue.queued.length} prompts waiting. Clearing removes queue records; typed text and executed commands remain.</p>
+                <p>
+                  {queue.queued.length} prompts waiting. {queue.paused && "Resume keeps them and forgets only the interrupted one. "}
+                  Clearing removes queue records; typed text and executed commands remain.
+                </p>
                 <div class="approval-actions">
+                  {queue.paused && (
+                    <button type="button" disabled={disabled} onClick={async () => {
+                      try {
+                        await rpc.call("session.resume_queue", { id: s.id });
+                        setQueue(null);
+                        notify("Queue resumed");
+                      } catch (error) { notify(errorText(error)); }
+                    }}>Resume queue</button>
+                  )}
                   <button type="button" disabled={disabled} onClick={async () => {
                     try {
                       await rpc.call("session.clear_queue", { id: s.id });

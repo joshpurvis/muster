@@ -147,6 +147,20 @@ pub struct SpawnSession {
     /// keeps it until it gets another attributed prompt. None: human-rooted.
     #[serde(skip)]
     pub prov: Option<crate::agents::Prov>,
+    /// The named agent this session is started for (agents.rs), linked before launch.
+    #[serde(skip)]
+    pub agent_id: Option<i64>,
+}
+
+/// `spawn_session` failed with an unconfirmed launch outcome. The session and its prepared
+/// launch are kept and reconciled in the background; callers must neither clean up its
+/// channel or worktree nor retry the spawn (that could run the task twice).
+#[derive(Debug)]
+pub struct SpawnRetained(pub SessionId);
+impl std::fmt::Display for SpawnRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session {} was kept; its launch is being confirmed", self.0)
+    }
 }
 
 pub fn default_cols() -> u16 {
@@ -359,8 +373,17 @@ impl Hub {
             for record in terminal_records.values_mut() {
                 if record.host_instance != host.client.hello.instance { continue }
                 if !record.retired && record.pending {
-                    host.spawn(record.spec.clone())?;
-                    record.pending = false;
+                    match host.spawn(record.spec.clone()) {
+                        Ok(_) => record.pending = false,
+                        // A definite per-run rejection (its program or cwd vanished during
+                        // the outage) retires only that launch; the others still recover.
+                        // Transport and identity uncertainty still stops startup.
+                        Err(error) if is_definite_spawn_failure(&error) => {
+                            tracing::warn!(run = ?record.spec.run, "prepared launch was rejected: {error:#}");
+                            record.retired = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     store.save_terminal(record.spec.run.id, record)?;
                 }
             }
@@ -394,23 +417,7 @@ impl Hub {
             let generation = record.map_or(0, |r| r.spec.run.generation);
             let token = record.filter(|_| status.is_some_and(|s| s.alive)).map(|r| r.token.clone());
             let port_base = record.map_or(0, |r| r.port_base);
-            if let Some(status) = status {
-                info.pid = status.alive.then_some(status.pid).flatten();
-                info.exit_code = status.exit_code;
-                info.cols = status.cols;
-                info.rows = status.rows;
-                info.title = status.title.clone();
-                if !status.alive {
-                    info.state = AgentState::Exited;
-                    info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
-                    info.queued = 0;
-                }
-            } else if info.state != AgentState::Exited {
-                info.state = AgentState::Exited;
-                info.state_detail = Some(if record.is_some() { "terminal host restarted or run was lost" } else { "legacy daemon restarted" }.into());
-                info.pid = None;
-                info.queued = 0;
-            }
+            recover_session_state(&mut info, status, record.is_some(), now_ms());
             let hook = store.load_hook_session(info.id, generation)?
                 .filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
@@ -678,6 +685,18 @@ impl Hub {
             .filter(|e| e.pty.as_ref().is_some_and(|p| p.is_alive()))
             .map(|e| e.info.id)
             .collect()
+    }
+
+    /// A prompt queue for this session can still be delivered: its run is alive, or its
+    /// launch is prepared and not yet acknowledged (one lock, so an acknowledgement in
+    /// between can't make a live run look gone).
+    pub(crate) fn may_deliver(&self, id: SessionId) -> bool {
+        let g = self.inner.lock();
+        let Some(e) = g.sessions.get(&id) else { return false };
+        if e.info.state == AgentState::Exited { return false }
+        if e.pty.as_ref().is_some_and(|p| p.is_alive()) { return true }
+        self.terminal_records.lock().get(&id)
+            .is_some_and(|r| r.pending && !r.retired && r.spec.run.generation == e.generation)
     }
 
     fn pty(&self, id: SessionId) -> Option<Arc<PtySession>> {
@@ -1264,7 +1283,15 @@ impl Hub {
                 .values()
                 .filter(|c| !c.archived)
                 .map(|c| c.port_base)
-                .chain(g.sessions.values().filter(|e| e.pty.is_some() && e.port_base != 0).map(|e| e.port_base))
+                .chain({
+                    let records = self.terminal_records.lock();
+                    let used: Vec<u16> = g.sessions.values().filter(|e| e.port_base != 0 && occupies(e, &records))
+                        .map(|e| e.port_base)
+                        // A removed session's run may still be exiting.
+                        .chain(records.values().filter(|r| r.retired && r.port_base != 0).map(|r| r.port_base))
+                        .collect();
+                    used
+                })
                 .collect();
             let pref = port_base_for(ch.id);
             ch.port_base = (0..1000u16)
@@ -1310,6 +1337,7 @@ impl Hub {
                 window_id: None,
                 from_session: None,
                 prov: req.prov,
+                agent_id: None,
             };
             if let Err(e) = self.spawn_session(spawn).await {
                 let text = format!("Could not start {}: {e:#}", kind.as_str());
@@ -1837,8 +1865,16 @@ impl Hub {
             .filter(|e| e.info.channel_id == id)
             .map(|e| e.info.id)
             .collect();
+        let mut failed = None;
         for sid in &sids {
-            let _ = self.remove_session(*sid);
+            if let Err(error) = self.remove_session(*sid) {
+                failed = Some(error.context(format!("removing session {sid}")));
+            }
+        }
+        if let Some(error) = failed {
+            // A session that could not be retired may still run: keep its tab and worktree.
+            let _ = self.update_channel(id, true, |c| c.archived = false);
+            return Err(error.context(format!("channel {id} was not archived")));
         }
         self.emit(ServerEvent::ChannelRemoved { id });
         if let Some(wid) = ch.window_id {
@@ -1855,9 +1891,15 @@ impl Hub {
         if remove_worktree && ch.owns_worktree {
             let repo = self.workspace(ch.workspace_id).map(|w| PathBuf::from(w.path));
             if let Some(repo) = repo {
-                // Give killed processes a moment to leave the directory.
-                if !sids.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                // Wait until the host confirms that the removed runs (and anything they left
+                // behind) have exited; their retirement records go away only then.
+                let deadline = tokio::time::Instant::now() + pty::KILL_GRACE + Duration::from_secs(5);
+                loop {
+                    let exiting = { let records = self.terminal_records.lock(); sids.iter().any(|sid| records.get(sid).is_some_and(|r| r.retired)) };
+                    if !exiting || tokio::time::Instant::now() > deadline { break }
+                    let hub = self.clone();
+                    let _ = tokio::task::spawn_blocking(move || hub.reconcile_retired()).await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 // Re-checked, and reserved until the delete is done: a session may have moved out
                 // (or be starting) since the check above.
@@ -1890,7 +1932,9 @@ impl Hub {
     /// A running session outside `ch` whose cwd is inside `ch`'s worktree (it moved out of `ch`,
     /// or was started there by hand), if any.
     fn worktree_user(&self, ch: &Channel) -> Option<SessionId> {
-        dir_user(ch, self.inner.lock().sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy)))
+        let g = self.inner.lock();
+        let records = self.terminal_records.lock();
+        dir_user(ch, g.sessions.values().map(|e| (&e.info, occupies(e, &records))))
     }
 
     /// Mark `ch`'s worktree as being deleted, unless a session outside `ch` runs (or is
@@ -1898,8 +1942,16 @@ impl Hub {
     /// inside a marked directory, so nothing can start there until `release_worktree`.
     fn reserve_worktree_removal(self: &Arc<Self>, ch: &Channel) -> Result<WorktreeReservation, SessionId> {
         let mut g = self.inner.lock();
-        if let Some(user) = dir_user(ch, g.sessions.values().map(|e| (&e.info, e.pty.is_some() || e.busy))) {
-            return Err(user);
+        {
+            let records = self.terminal_records.lock();
+            if let Some(user) = dir_user(ch, g.sessions.values().map(|e| (&e.info, occupies(e, &records)))) {
+                return Err(user);
+            }
+            // A removed session's run that is still exiting (its retirement is pending).
+            let root = Path::new(&ch.cwd);
+            if let Some((user, _)) = records.iter().find(|(_, r)| r.retired && r.spec.cwd.starts_with(root)) {
+                return Err(*user);
+            }
         }
         let path = PathBuf::from(&ch.cwd);
         *g.removing_worktrees.entry(path.clone()).or_insert(0) += 1;
@@ -2082,7 +2134,14 @@ impl Hub {
         }
         self.agents.set_prov(id, req.prov)?;
         let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
-        let started = self.start_process(id, prompt.clone());
+        let source = match req.prov {
+            Some(p) => crate::agents::Source::Chain(p),
+            None => crate::agents::Source::Human,
+        };
+        let started = match req.agent_id {
+            Some(agent) => self.agents.link_session(&self.store, agent, Some(id)),
+            None => Ok(()),
+        }.and_then(|()| self.start_process(id, prompt.clone(), Some(source)));
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
             e.busy = false;
             e.kill_requested = false;
@@ -2110,19 +2169,20 @@ impl Hub {
                     self.pty_exited(id, generation, code);
                 } else if let Some(text) = prompt {
                     self.note_prompt(id, &text);
-                    let source = match req.prov {
-                        Some(p) => crate::agents::Source::Chain(p),
-                        None => crate::agents::Source::Human,
-                    };
-                    self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id, source);
+                    self.deliver_initial_prompt(id, ch.id, text, consumed, req.parent_id);
                 }
                 Ok(self.session(id).unwrap_or(info))
             }
             Err(e) if e.downcast_ref::<crate::terminal::SpawnUncertain>().is_some() => {
+                // The process may be running. Keep the session, its launch record and any
+                // queued initial prompt; reconcile_pending adopts or retires the launch.
                 let _ = self.update_session_info(id, |info| info.state_detail = Some(e.to_string()));
-                Err(e)
+                Err(e.context(SpawnRetained(id)))
             }
             Err(e) => {
+                if let Some(agent) = req.agent_id.filter(|_| self.agents.by_session(id).is_some()) {
+                    let _ = self.agents.link_session(&self.store, agent, None);
+                }
                 self.inner.lock().sessions.remove(&id);
                 let _ = self.store.delete_session(id);
                 let _ = std::fs::remove_dir_all(paths::session_dir(id));
@@ -2167,43 +2227,38 @@ impl Hub {
         text: String,
         consumed: bool,
         parent: Option<SessionId>,
-        source: crate::agents::Source,
     ) {
         let from = match parent {
             Some(p) => format!("session:{p}"),
             None => "human".to_string(),
         };
-        if consumed {
-            self.log_event(
-                Some(channel_id),
-                Some(id),
-                EventKind::Prompt,
-                serde_json::json!({"text": text, "session_id": id, "from": from, "queued": false}),
-            );
-            return;
+        // An unconsumed prompt was saved in the durable queue before the launch
+        // (start_process), so a backend crash after this point can't lose it.
+        self.log_event(
+            Some(channel_id),
+            Some(id),
+            EventKind::Prompt,
+            serde_json::json!({"text": text, "session_id": id, "from": from, "queued": !consumed}),
+        );
+        if !consumed {
+            crate::inject::kick_initial(self, id);
         }
-        let hub = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::inject::send(&hub, id, text, crate::inject::SendMode::Queue, from, source).await {
-                hub.notice(
-                    "error",
-                    format!("Could not deliver the initial prompt to session {id}: {e:#}"),
-                );
-            }
-        });
     }
 
     /// Start a process for an existing session entry. Returns the updated info and whether
     /// the adapter consumed the initial prompt.
     /// The caller logs SessionStarted, then reports `early_exit` via `pty_exited`.
-    fn start_process(self: &Arc<Self>, id: SessionId, prompt: Option<String>) -> anyhow::Result<Started> {
+    /// `source`: when set and the adapter doesn't take `prompt` on its command line, the
+    /// prompt is saved in the durable queue for the new run before the launch is sent.
+    fn start_process(self: &Arc<Self>, id: SessionId, prompt: Option<String>,
+        source: Option<crate::agents::Source>) -> anyhow::Result<Started> {
         let retiring = self.terminal_records.lock().get(&id).is_some_and(|r| r.retired);
         if retiring { self.reconcile_retired()?; }
         {
             let records = self.terminal_records.lock();
             if let Some(record) = records.get(&id) {
                 anyhow::ensure!(!record.retired, "session {id}'s previous terminal is still being retired; retry after cleanup");
-                anyhow::ensure!(!record.pending, "session {id}'s previous launch is unconfirmed; reload the backend to reconcile it before restarting");
+                anyhow::ensure!(!record.pending, "session {id}'s previous launch is unconfirmed; retry after it is reconciled");
             }
         }
         let generation = self.store.next_terminal_generation(self.generation_floor)?;
@@ -2244,10 +2299,11 @@ impl Hub {
             session_token: token.clone(),
             session_dir: session_dir.clone(),
             extra_args,
-            initial_prompt: prompt,
+            initial_prompt: prompt.clone(),
             permissions,
         };
         let spec = adapter_for(info.kind).command(&ctx)?;
+        let queued_prompt = prompt.filter(|_| !spec.consumed_initial_prompt).zip(source);
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         env.insert("MUSTER".into(), "1".into());
         env.insert("MUSTER_SESSION_ID".into(), id.to_string());
@@ -2276,18 +2332,63 @@ impl Hub {
             host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
             spec: launch.clone(), pending: true, retired: false,
         };
-        {
-            let g = self.inner.lock();
-            anyhow::ensure!(g.sessions.get(&id).is_some_and(|e| e.generation == generation),
-                "session {id} was removed or replaced before its launch was prepared");
+        let previous = {
+            let mut g = self.inner.lock();
+            let e = g.sessions.get_mut(&id).filter(|e| e.generation == generation)
+                .with_context(|| format!("session {id} was removed or replaced before its launch was prepared"))?;
+            // Install this generation's initial state before the host can start it. A crash
+            // after the host starts it, or a callback arriving before the acknowledgement,
+            // then never sees the previous run's state (e.g. Exited) for the new run.
+            let previous = e.info.clone();
+            let mut info = previous.clone();
+            info.state = AgentState::Starting;
+            info.state_detail = None;
+            info.state_since = now_ms();
+            info.pid = None;
+            info.exit_code = None;
+            info.subagents = 0;
+            info.title = None;
+            info.queued = 0;
+            self.store.update_session(&info)?;
+            // Queue first: a crash before the launch record leaves only a queue for a run
+            // that never started, which recovery discards.
+            if let Some((text, source)) = queued_prompt.clone() {
+                if let Err(error) = crate::inject::prepare_initial(self, id, generation, text, source) {
+                    let _ = self.store.update_session(&previous);
+                    return Err(error);
+                }
+            }
             let mut records = self.terminal_records.lock();
-            self.store.save_terminal(id, &record)?;
+            if let Err(error) = self.store.save_terminal(id, &record) {
+                let _ = self.store.update_session(&previous);
+                return Err(error);
+            }
             records.insert(id, record.clone());
-        }
+            e.info = info;
+            e.last_hook_at = 0;
+            previous
+        };
+        // Clients first hear of the new run with its acknowledgement (pid included).
         let pty = match host.spawn(launch) {
             Ok(pty) => pty,
             Err(error) => {
                 if error.downcast_ref::<crate::terminal::SpawnUncertain>().is_none() {
+                    // Nothing started: restore the previous run's state (clients never saw
+                    // the prepared one).
+                    if let Some(e) = self.inner.lock().sessions.get_mut(&id).filter(|e| e.generation == generation) {
+                        let info = &mut e.info;
+                        info.state = previous.state;
+                        info.state_detail = previous.state_detail.clone();
+                        info.state_since = previous.state_since;
+                        info.pid = previous.pid;
+                        info.exit_code = previous.exit_code;
+                        info.subagents = previous.subagents;
+                        info.title = previous.title.clone();
+                        info.queued = previous.queued;
+                        if let Err(err) = self.store.update_session(info) {
+                            tracing::warn!(session = id, "persisting session: {err}");
+                        }
+                    }
                     record.retired = true;
                     let mut records = self.terminal_records.lock();
                     if records.get(&id).is_none_or(|r| r.spec.run == record.spec.run) {
@@ -2328,14 +2429,9 @@ impl Hub {
             };
             let old = e.token.replace(token.clone());
             e.pty = Some(pty.clone());
-            e.last_hook_at = 0;
+            // The initial state was installed before Spawn. Callbacks that arrived since
+            // may already have advanced it; keep their state, count and grace time.
             e.info.pid = pty.pid;
-            e.info.state = AgentState::Starting;
-            e.info.state_detail = None;
-            e.info.state_since = now_ms();
-            e.info.exit_code = None;
-            e.info.queued = 0;
-            e.info.subagents = 0;
             e.info.title = pty.title();
             let early = e.early_exit.take().or_else(|| pty.exit_code());
             let kill = std::mem::take(&mut e.kill_requested);
@@ -2460,7 +2556,7 @@ impl Hub {
                 if e.generation == p.generation { e.pty = None; }
             }
         }
-        match self.start_process(id, None) {
+        match self.start_process(id, None, None) {
             Ok(Started {
                 info,
                 generation,
@@ -2808,12 +2904,12 @@ impl Hub {
         // its final reply. Accept only the recorded current run, never a previous generation.
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
             .find(|(_, record)| !record.retired && record.token == token)
-            .map(|(id, record)| (*id, record.spec.run.generation, record.pending)));
+            .map(|(id, record)| (*id, record.spec.run.generation)));
         let (info, from, changed, fx) = {
             let mut g = self.inner.lock();
             let id = if cursor.is_some() {
-                recorded.filter(|(id, generation, _)| g.sessions.get(id).is_some_and(|entry| entry.generation == *generation))
-                    .map(|(id, _, _)| id)
+                recorded.filter(|(id, generation)| g.sessions.get(id).is_some_and(|entry| entry.generation == *generation))
+                    .map(|(id, _)| id)
             } else { g.tokens.get(token).copied() };
             let entry = id.and_then(|id| g.sessions.get_mut(&id));
             let Some(entry) = entry else {
@@ -2825,11 +2921,10 @@ impl Hub {
                 }
                 anyhow::bail!("unknown session token");
             };
-            // A target can enqueue hooks before its spawn acknowledgement returns.
-            // Keep them in the inbox until start_process has installed its initial
-            // state, otherwise that initialization could overwrite a consumed hook.
-            anyhow::ensure!(!recorded.is_some_and(|(_, _, pending)| pending),
-                "terminal launch is still being acknowledged; callback retained");
+            // A target can enqueue hooks before its spawn acknowledgement returns. That is
+            // safe to apply: start_process installs the run's initial state together with
+            // its launch record and never resets it on acknowledgement. Waiting here would
+            // stall every other session's callbacks behind an unconfirmed launch.
             let mut info = entry.info.clone();
             let from = info.state;
             let mut last_hook_at = entry.last_hook_at;
@@ -2920,6 +3015,69 @@ impl Hub {
             }
         }
         match failure { Some(error) => Err(error), None => Ok(()) }
+    }
+
+    /// Resolve launches whose spawn acknowledgement was lost, without waiting for a backend
+    /// restart. Spawn is retry-safe: the host returns the original process for the same run.
+    pub fn reconcile_pending(&self) -> anyhow::Result<()> {
+        let Some(host) = &self.cfg.terminal_host else { return Ok(()) };
+        let pending: Vec<_> = self.terminal_records.lock().iter()
+            .filter(|(_, r)| r.pending && !r.retired && r.host_instance == host.client.hello.instance)
+            .map(|(id, r)| (*id, r.clone())).collect();
+        for (id, mut record) in pending {
+            let run = record.spec.run;
+            // A start still in progress handles its own acknowledgement.
+            let idle = self.inner.lock().sessions.get(&id).is_some_and(|e| !e.busy && e.generation == run.generation);
+            if !idle { continue }
+            let result = host.spawn(record.spec.clone());
+            let mut g = self.inner.lock();
+            let mut records = self.terminal_records.lock();
+            if !records.get(&id).is_some_and(|r| r.spec.run == run && r.pending && !r.retired) { continue }
+            let Some(e) = g.sessions.get_mut(&id).filter(|e| !e.busy && e.generation == run.generation) else { continue };
+            match result {
+                Ok(pty) => {
+                    record.pending = false;
+                    self.store.save_terminal(id, &record)?;
+                    records.insert(id, record.clone());
+                    drop(records);
+                    let old = e.token.replace(record.token.clone());
+                    e.pty = Some(pty.clone());
+                    e.info.pid = pty.pid;
+                    e.info.title = pty.title();
+                    e.info.state_detail = None;
+                    let early = e.early_exit.take().or_else(|| pty.exit_code());
+                    let info = e.info.clone();
+                    if let Err(err) = self.store.update_session(&info) {
+                        tracing::warn!(session = id, "persisting session: {err}");
+                    }
+                    if let Some(old) = old { g.tokens.remove(&old); }
+                    g.tokens.insert(record.token.clone(), id);
+                    drop(g);
+                    tracing::info!(session = id, ?run, "adopted a launch whose acknowledgement was lost");
+                    self.emit(ServerEvent::SessionUpserted(info));
+                    if let Some(code) = early { self.pty_exited(id, run.generation, code); }
+                }
+                Err(error) if is_definite_spawn_failure(&error) => {
+                    record.retired = true;
+                    self.store.save_terminal(id, &record)?;
+                    records.insert(id, record);
+                    drop(records);
+                    e.info.state = AgentState::Exited;
+                    e.info.state_detail = Some(format!("launch failed: {error:#}"));
+                    e.info.state_since = now_ms();
+                    e.info.pid = None;
+                    let info = e.info.clone();
+                    if let Err(err) = self.store.update_session(&info) {
+                        tracing::warn!(session = id, "persisting session: {err}");
+                    }
+                    drop(g);
+                    crate::inject::drop_queue(self, id);
+                    self.emit(ServerEvent::SessionUpserted(info));
+                }
+                Err(error) => tracing::debug!(session = id, ?run, "launch still unconfirmed: {error:#}"),
+            }
+        }
+        Ok(())
     }
 
     /// Stop accepting application work. The independently owned terminals continue.
@@ -3156,6 +3314,54 @@ impl Drop for WorktreeReservation {
 }
 
 /// The first running session (`(info, running)`) outside `ch` whose cwd is inside `ch.cwd`.
+/// Whether a session's run may still own processes in its folder and port range: starting,
+/// alive, leaving background processes behind, or launched without confirmation. An exited,
+/// archived run kept only as a replay handle does not count.
+fn occupies(e: &SessEntry, records: &BTreeMap<SessionId, StoredTerminal>) -> bool {
+    e.busy || e.pty.as_ref().is_some_and(|p| p.owns_processes())
+        || records.get(&e.info.id).is_some_and(|r| r.pending && !r.retired)
+}
+
+/// Reconcile a saved session with the host's facts for its run after a backend restart.
+fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal_protocol::TerminalStatus>,
+    has_record: bool, now: i64) {
+    if let Some(status) = status {
+        info.pid = status.alive.then_some(status.pid).flatten();
+        info.exit_code = status.exit_code;
+        info.cols = status.cols;
+        info.rows = status.rows;
+        info.title = status.title.clone();
+        if !status.alive {
+            info.state = AgentState::Exited;
+            info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+            info.queued = 0;
+        } else if info.state == AgentState::Exited {
+            // The saved Exited belongs to an earlier run (a restart that crashed before
+            // its new state was saved, by an older build). The live run is authoritative.
+            info.state = AgentState::Starting;
+            info.state_detail = None;
+            info.state_since = now;
+        } else if matches!(info.state, AgentState::NeedsApproval | AgentState::AskingQuestion) {
+            // The saved dialog may have been answered and replaced by another one during the
+            // outage. Never pair its description with a fresh, answerable state_seq: let the
+            // detector read the dialog that is on screen now (it overrides hook precedence).
+            info.state = AgentState::Working;
+            info.state_detail = Some("Checking the terminal after a backend restart".into());
+            info.state_since = now;
+        }
+    } else if info.state != AgentState::Exited {
+        info.state = AgentState::Exited;
+        info.state_detail = Some(if has_record { "terminal host restarted or run was lost" } else { "legacy daemon restarted" }.into());
+        info.pid = None;
+        info.queued = 0;
+    }
+}
+
+/// Only a host's explicit per-run rejection proves that a launch did not start.
+fn is_definite_spawn_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<crate::terminal::SpawnUncertain>().is_none()
+}
+
 fn dir_user<'a>(ch: &Channel, sessions: impl Iterator<Item = (&'a SessionInfo, bool)>) -> Option<SessionId> {
     let root = Path::new(&ch.cwd);
     sessions
@@ -3358,7 +3564,7 @@ mod tests {
     fn starting_again_cannot_overwrite_an_unconfirmed_launch() {
         let hub = move_fixture();
         remember_launch(&hub, true);
-        assert!(hub.start_process(1, None).err().unwrap().to_string().contains("unconfirmed"));
+        assert!(hub.start_process(1, None, None).err().unwrap().to_string().contains("unconfirmed"));
         let saved = hub.store.load_terminals().unwrap().remove(&1).unwrap();
         assert_eq!(saved.spec.run.generation, 42);
         assert!(saved.pending && !saved.retired);
@@ -3367,6 +3573,30 @@ mod tests {
         assert!(hub.session(1).is_none());
         assert!(hub.store.load_sessions().unwrap().iter().all(|s| s.info.id != 1));
         assert!(hub.store.load_terminals().unwrap()[&1].retired);
+    }
+
+    #[test]
+    fn an_initial_prompt_queued_before_launch_survives_until_the_launch_resolves() {
+        let hub = move_fixture();
+        remember_launch(&hub, true);
+        {
+            let mut g = hub.inner.lock();
+            let entry = g.sessions.get_mut(&1).unwrap();
+            entry.generation = 42;
+            entry.info.state = AgentState::Starting;
+        }
+        crate::inject::prepare_initial(&hub, 1, 42, "make test".into(), crate::agents::Source::Human).unwrap();
+        // Not live yet (no acknowledgement): the prepared launch keeps its queue.
+        crate::inject::kick_initial(&hub, 1);
+        assert_eq!(crate::inject::inspect(&hub, 1)["queued"][0], "make test");
+        assert_eq!(hub.session(1).unwrap().queued, 1);
+        let saved: std::collections::HashMap<SessionId, serde_json::Value> =
+            hub.store.load_runtime("prompt-queues").unwrap().unwrap();
+        assert!(saved[&1].to_string().contains("make test"), "saved before the launch is sent");
+        // Once the launch is known not to run, the queue goes.
+        hub.terminal_records.lock().get_mut(&1).unwrap().retired = true;
+        crate::inject::kick_initial(&hub, 1);
+        assert!(crate::inject::inspect(&hub, 1)["queued"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -3385,12 +3615,12 @@ mod tests {
         }
         let mut cursor = crate::store::HookCursor { instance: "fixture".into(), sequence: 1 };
         let payload = serde_json::json!({"tool_name":"Agent"});
+        // A callback that arrives before the launch is acknowledged is applied, not held at
+        // the head of the inbox (that stalled every other session's callbacks and input).
+        // start_process installed the initial state with the launch record and leaves it.
         hub.terminal_records.lock().get_mut(&2).unwrap().pending = true;
-        assert!(hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor).is_err());
-        assert!(hub.store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor").unwrap().is_none());
-        assert_eq!(hub.session(2).unwrap().subagents, 0);
-        hub.terminal_records.lock().get_mut(&2).unwrap().pending = false;
         hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor).unwrap();
+        hub.terminal_records.lock().get_mut(&2).unwrap().pending = false;
         let info = hub.session(2).unwrap();
         assert_eq!((info.state, info.subagents), (AgentState::Working, 1));
         let checkpoint = hub.store.load_hook_session(2, 42).unwrap().unwrap();
@@ -3483,6 +3713,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unconfirmed_launch_never_blocks_other_sessions_input() {
+        let hub = move_fixture();
+        let directory = std::env::temp_dir().join(format!("muster-pending-callback-{}", paths::random_token()));
+        let mut inbox = crate::hook_inbox::Inbox::open(&directory.join("hooks.sqlite")).unwrap();
+        // Session 1's launch is still unconfirmed and its agent already called back.
+        remember_launch(&hub, true);
+        {
+            let mut g = hub.inner.lock();
+            let entry = g.sessions.get_mut(&1).unwrap();
+            entry.generation = 42;
+            entry.info.state = AgentState::Starting;
+        }
+        inbox.enqueue("run-token", "PreToolUse", br#"{"tool_name":"Agent"}"#).unwrap();
+        *hub.callback_inbox.lock() = Some(inbox);
+        // Human input to another session establishes its boundary without waiting.
+        hub.note_human_input(2).unwrap();
+        assert_eq!(hub.session(1).unwrap().subagents, 1, "the early callback was applied");
+        drop(hub);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn a_prompt_is_answered_once_and_only_as_seen() {
         let hub = move_fixture();
         let s = hub.session(1).unwrap();
@@ -3507,6 +3759,41 @@ mod tests {
         assert_ne!(old.state_seq, current.state_seq);
         assert!(replacement.claim_prompt(1, Some(old.state_seq), None).is_err());
         replacement.claim_prompt(1, Some(current.state_seq), None).unwrap();
+    }
+
+    #[test]
+    fn recovery_trusts_a_live_run_over_stale_saved_state() {
+        let status = |alive: bool| muster_terminal_protocol::TerminalStatus {
+            run: RunId { id: 1, generation: 2 }, pid: Some(42), alive, drained: !alive,
+            has_processes: alive, exit_code: (!alive).then_some(0), title: None, cols: 80, rows: 24,
+            output_seq: 0, last_output_at: 0, application_cursor: false, log_persisted: true,
+            cwd: PathBuf::from("/"),
+        };
+        // A restart crashed after the host started the new run, before its state was saved.
+        let mut info = crate::mcp::guard::test_session(1, None);
+        info.state = AgentState::Exited;
+        info.state_detail = Some("exit code 0".into());
+        recover_session_state(&mut info, Some(&status(true)), true, 7);
+        assert_eq!(info.state, AgentState::Starting);
+        assert_eq!((info.pid, info.state_detail.as_deref(), info.state_since), (Some(42), None, 7));
+        // A saved dialog is never offered again with a fresh identity: the screen decides.
+        for dialog in [AgentState::NeedsApproval, AgentState::AskingQuestion] {
+            let mut info = crate::mcp::guard::test_session(1, None);
+            info.state = dialog;
+            info.state_detail = Some("Bash: command A".into());
+            recover_session_state(&mut info, Some(&status(true)), true, 7);
+            assert_eq!(info.state, AgentState::Working);
+            assert!(!info.state_detail.unwrap().contains("command A"));
+        }
+        // An exited run and a lost run still end Exited.
+        let mut info = crate::mcp::guard::test_session(1, None);
+        info.state = AgentState::Working;
+        recover_session_state(&mut info, Some(&status(false)), true, 7);
+        assert_eq!(info.state, AgentState::Exited);
+        let mut info = crate::mcp::guard::test_session(1, None);
+        info.state = AgentState::NeedsApproval;
+        recover_session_state(&mut info, None, true, 7);
+        assert_eq!(info.state, AgentState::Exited);
     }
 
     #[test]

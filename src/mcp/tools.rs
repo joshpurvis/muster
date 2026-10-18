@@ -843,9 +843,21 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         from_session: None,
         // The child starts with the caller's provenance and keeps it (agents.rs).
         prov: Some(caller_route(st, caller).prov(None)),
+        agent_id: None,
     };
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,
+        Err(ref e) if let Some(&crate::hub::SpawnRetained(id)) = e.downcast_ref::<crate::hub::SpawnRetained>() => {
+            // The agent may be running its task already. Keep the reservation, the channel
+            // and its worktree; cleaning up could kill it and delete its work.
+            if let Err(error) = st.edit_guard(|g| g.spawned_depth.insert(id, b.caller_depth + 1)) {
+                tracing::warn!(session = id, "unconfirmed spawn; guard snapshot pending: {error}");
+            }
+            return Err(format!(
+                "spawn outcome unconfirmed: session {id} in channel {} was kept and is being confirmed. Do not spawn again; use wait_for_state(session_id={id}).",
+                channel.id
+            ));
+        }
         Err(e) => {
             refund();
             // Don't leave an empty channel/worktree behind for a failed spawn.

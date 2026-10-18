@@ -22,6 +22,12 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("muster_terminal_host=info")
         .init();
+    // Optional: an application-named file to keep locked while this host lives.
+    if let Some(path) = std::env::var_os("MUSTER_TERMINAL_FENCE_LOCK") {
+        // SAFETY: no other thread exists yet; children get explicit launch environments.
+        unsafe { std::env::remove_var("MUSTER_TERMINAL_FENCE_LOCK") };
+        muster_terminal_host::hold_fence_lock(PathBuf::from(path));
+    }
     let mut args = std::env::args_os().skip(1);
     let (mut runtime, mut data) = (None, None);
     while let Some(arg) = args.next() {

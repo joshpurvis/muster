@@ -1064,9 +1064,10 @@ pub fn approve(d: &Discovery, t: &str, always: bool, deny: bool) -> anyhow::Resu
 }
 
 /// Inspect delivery recovery without implicitly replaying uncertain input.
-pub fn queue(d: &Discovery, t: &str, clear: bool) -> anyhow::Result<()> {
+pub fn queue(d: &Discovery, t: &str, clear: bool, resume: bool) -> anyhow::Result<()> {
     let (_, session) = target(d, t)?;
     if clear { client::rpc(d, "session.clear_queue", json!({"id": session.id}))?; }
+    if resume { client::rpc(d, "session.resume_queue", json!({"id": session.id}))?; }
     print_json(&client::rpc(d, "session.queue", json!({"id": session.id}))?)
 }
 

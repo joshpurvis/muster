@@ -133,8 +133,12 @@ enum Cmd {
         #[arg(help = TARGET_HELP)]
         target: String,
         /// Discard waiting/uncertain delivery records after inspecting the terminal.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "resume")]
         clear: bool,
+        /// Mark the uncertain delivery as reviewed and resume the prompts waiting behind it
+        /// (the uncertain prompt is not resent).
+        #[arg(long)]
+        resume: bool,
     },
     /// Block until a session reaches a state (exit 124 on timeout).
     Wait {
@@ -513,7 +517,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::wait(d, &target, until, timeout, json),
-        Cmd::Queue { target, clear } => cli::queue(d, &target, clear),
+        Cmd::Queue { target, clear, resume } => cli::queue(d, &target, clear, resume),
         Cmd::Keys { target, keys } => cli::keys(d, &target, &keys),
         Cmd::Approve { target, always, deny } => cli::approve(d, &target, always, deny),
         Cmd::Interrupt { target } => cli::by_id(d, &target, "session.interrupt"),
@@ -867,7 +871,7 @@ fn acquire_lock() -> anyhow::Result<DaemonLock> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(paths::lock_path())?;
+        .open(paths::backend_lock_path())?;
     // SAFETY: flock on an fd we own.
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if r != 0 {
@@ -991,7 +995,8 @@ async fn daemon_main() -> anyhow::Result<()> {
         });
     }
 
-    // Retry application-owned removal intents after process exit and drain.
+    // Retry application-owned removal intents after process exit and drain, and adopt
+    // launches whose acknowledgement was lost.
     // Terminal logs are flushed autonomously by the host.
     {
         let hub = hub.clone();
@@ -1001,6 +1006,9 @@ async fn daemon_main() -> anyhow::Result<()> {
                 t.tick().await;
                 let h = hub.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = h.reconcile_pending() {
+                        tracing::warn!("reconciling unconfirmed launches: {error:#}");
+                    }
                     if let Err(error) = h.reconcile_retired() {
                         tracing::warn!("completing terminal retirement: {error:#}");
                     }

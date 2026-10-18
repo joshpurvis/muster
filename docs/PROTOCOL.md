@@ -143,6 +143,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.interrupt` | `{id}` | `{}` |
 | `session.queue` | `{id}` | `{queued: string[], uncertain: string\|null, stage: "selected"\|"typing"\|"submitting"\|null, paused: boolean}`. Waiting prompts survive backend replacement. A crash during typing/submission pauses delivery for human review; uncertain input is never automatically replayed. |
 | `session.clear_queue` | `{id}` | `{}`. Discards waiting and paused delivery records. Does not undo input already sent, or cancel delivery currently in progress. |
+| `session.resume_queue` | `{id}` | `{}`. Forgets the paused (uncertain) delivery record and resumes the prompts waiting behind it. The uncertain prompt is not resent. Error when no delivery is paused. |
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
 | `fs.complete` | `{prefix}` | `{entries: string[]}` directory completions for the "add workspace" path box |
 | `channel.move` | `{id, window_id, index?}` | `Channel` (moves the task and all its sessions to another window, at `index` among the window's `channel_ids` or the end; emits `channel_upserted`, `session_upserted` for each session that changed window, and `window_upserted` for both windows, or `window_removed` for a window left unheld without tabs or tasks) |
@@ -439,7 +440,7 @@ its sockets close at once on revoke):
 | Scope | Methods |
 |---|---|
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
-| `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
+| `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
 | never | `device.*`, `agent.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 

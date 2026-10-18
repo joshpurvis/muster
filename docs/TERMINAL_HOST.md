@@ -50,6 +50,14 @@ they finish, or an explicitly authorized restart. They are not adopted by the ne
 host. Host compatibility is negotiated separately from application releases;
 application updates must never automatically replace an incompatible live host.
 
+Downgrade boundary: a monolithic (pre-host) build cannot see host-owned terminals.
+Rolling back requires `muster stop` on this build first, which ends every terminal;
+the application database stays readable by the older build. As a guard, the backend
+starts the host with `MUSTER_TERMINAL_FENCE_LOCK=<runtime>/daemon.lock`, and the host
+keeps that lock for its whole life. Older daemons take the same lock to start, so they
+refuse to run while a host owns terminals instead of autostarting duplicates. This
+build's backend uses `backend.lock` for its own single-instance check.
+
 ## Verified checkpoints
 
 - Extracted the existing PTY implementation into `muster-terminal-core`, removing
@@ -260,8 +268,9 @@ Hook-derived session state, subagent counts and the hook-precedence timestamp no
 commit in the same transaction as attribution and the inbox cursor. Memory is
 published only after that commit. Startup restores the count and grace timestamp
 for the surviving generation; new or exited runs begin with zero subagents.
-Callbacks arriving before a launch acknowledgement remain queued until initial
-session state is installed. Removal deletes the saved hook runtime with the session.
+A run's initial session state is saved with its launch record, before Spawn, so
+callbacks arriving before the acknowledgement are applied at once (later revised:
+they used to wait at the head of the inbox, which stalled every other session). Removal deletes the saved hook runtime with the session.
 
 Validation: all 255 Rust tests, all 154 full smoke checks and all 43 focused backend
 checks pass. The tests include transaction rollback, duplicate count prevention,
@@ -280,6 +289,43 @@ verifies that pairing and the unsent draft survive, captured output is replayed,
 the same terminal PID remains. Offline/reconnected screenshots have been inspected.
 All 45 checks in the extended browser fixture passed, including its owned-process
 cleanup. No browser console exceptions were reported.
+
+## Review fix round
+
+- A launch's initial state (Starting, no pid, zero subagents) and any unconsumed
+  initial prompt are saved before Spawn; the acknowledgement only adds pid and title.
+  Recovery treats a live run as authoritative over a saved Exited, and turns a saved
+  approval or question into Working so the detector re-reads the dialog on screen.
+- A launch whose acknowledgement was lost is adopted (or, if the host rejects it,
+  retired) by the running backend every 3 s. A definite rejection at startup retires
+  only that launch. `spawn_session` reports `SpawnRetained`; MCP keeps the channel,
+  worktree and rate reservation, and named agents are linked before Spawn.
+- Keystrokes are written even when input attribution cannot be saved.
+- Worktree and port users count only runs that are starting, alive, leaving
+  processes behind or unconfirmed, not archived replay handles. Channel archival
+  stops on a failed session retirement and waits for retired runs to exit before
+  deleting the worktree.
+- `session.resume_queue` (`muster queue --resume`, desktop and mobile review) clears
+  only the uncertain record. Queue counts include the prompt being delivered, `busy`
+  changes are not written, and a draft or dialog backs delivery off for 1 s.
+- Titles are capped at 1 KiB; the host has separate admission for streams (256) and
+  status reads no longer render a screen.
+
+Open after the fix round (not yet fixed):
+
+- The backend now locks `backend.lock` and the host holds `daemon.lock` as a rollback
+  fence, so a legacy monolithic daemon no longer excludes a new backend by flock. Only
+  the `find_daemon()` discovery check stops a new backend starting beside it; a missing
+  or racing `daemon.json` lets both run on one database. The backend should refuse when
+  `daemon.lock` is held and no compatible host answers.
+- A dialog answered by keyboard and replaced before the detector sees the change can
+  pair the new dialog with the old description (also on master). Bind approvals to a
+  dialog fingerprint.
+- vte buffers an oversized OSC title before the 1 KiB cap; a huge `session.output`
+  `lines` request can exceed the frame limit (fails only that request).
+- A host started before this build does not hold the fence lock.
+- The desktop/mobile Resume buttons are type- and lint-checked but not yet rendered in
+  the browser fixture.
 
 ## Completion audit
 

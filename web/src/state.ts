@@ -263,6 +263,8 @@ export type Overlay =
     confirmLabel: string;
     danger?: boolean;
     run: () => void;
+    /** A second, non-destructive action shown before the confirm button. */
+    secondary?: { label: string; run: () => void };
   }
   | null;
 export const overlay = signal<Overlay>(null);

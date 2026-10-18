@@ -28,6 +28,8 @@ struct Data {
     next_channel: ChannelId,
     diff: String,
     fail_spawn: bool,
+    /// The host may have started the process, but its acknowledgement was lost.
+    uncertain_spawn: bool,
     fail_send: bool,
     pending_send: bool,
     /// extra_args of the last spawn_session call.
@@ -207,6 +209,10 @@ impl Backend for Arc<Mock> {
         }
         d.sessions.insert(s.id, s.clone());
         d.live.insert(s.id);
+        if d.uncertain_spawn {
+            return Err(anyhow::Error::new(crate::terminal::SpawnUncertain("lost".into()))
+                .context(crate::hub::SpawnRetained(s.id)));
+        }
         Ok(s)
     }
     async fn send(
@@ -1267,6 +1273,27 @@ async fn failed_spawn_rolls_back_new_channel() {
     let d = m.d.lock();
     let ch = d.channels.values().find(|c| c.name == "doomed").unwrap();
     assert!(ch.archived);
+}
+
+#[tokio::test]
+async fn uncertain_spawn_keeps_its_channel_and_reservation() {
+    let (m, st) = state();
+    m.d.lock().uncertain_spawn = true;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "claude", "new_channel": {"name": "maybe-running"}})).await;
+    assert!(err && t.contains("unconfirmed") && t.contains("Do not spawn again"), "{t}");
+    let d = m.d.lock();
+    let ch = d.channels.values().find(|c| c.name == "maybe-running").unwrap();
+    // Archiving would retire the run (killing the agent) and could delete its worktree.
+    assert!(!ch.archived, "the channel of a possibly running agent is kept");
+    let sid = d.next_session;
+    assert!(d.sessions.contains_key(&sid));
+    drop(d);
+    st.edit_guard(|g| {
+        assert!(g.spawned_depth.contains_key(&sid), "the retained child's depth is recorded");
+        // With one slot per window, the kept reservation leaves none.
+        assert!(g.spawns.check_and_record(1, crate::model::now_ms(), 1, 3_600_000).is_err(),
+            "the spawn reservation was not refunded");
+    }).unwrap();
 }
 
 #[tokio::test]

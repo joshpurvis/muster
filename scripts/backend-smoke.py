@@ -5,6 +5,7 @@ Add --browser for rendered desktop/mobile recovery checks (requires Chromium and
 Requires cargo build --workspace first. No installed Muster executable is used.
 """
 from http.client import HTTPConnection
+import fcntl
 import json
 import re
 import selectors
@@ -37,7 +38,12 @@ for path in (RUNTIME, DATA, HOME):
 with socket.socket() as reserve:
     reserve.bind(("127.0.0.1", 0))
     PORT = reserve.getsockname()[1]
-ENV = {"PATH": "/usr/bin:/bin", "HOME": str(HOME), "SHELL": "/bin/bash", "LANG": "C.UTF-8",
+# A stand-in `claude` so a named agent can be started without the real CLI.
+FAKEBIN = BASE / "fakebin"
+FAKEBIN.mkdir(mode=0o700)
+(FAKEBIN / "claude").write_text("#!/bin/sh\nexec sleep 600\n")
+(FAKEBIN / "claude").chmod(0o700)
+ENV = {"PATH": f"{FAKEBIN}:/usr/bin:/bin", "HOME": str(HOME), "SHELL": "/bin/bash", "LANG": "C.UTF-8",
        "MUSTER_RUNTIME_DIR": str(RUNTIME), "MUSTER_DATA_DIR": str(DATA), "MUSTER_PORT": str(PORT)}
 current = None
 logs = []
@@ -263,6 +269,16 @@ try:
         browser_phase("mobile_offline")
     check(next(item for item in host_call("inventory") if item["run"]["id"] == sid)["alive"],
           "graceful backend shutdown preserves the terminal")
+    def legacy_daemon_lock_free():
+        # What an older, monolithic daemon takes to start (released immediately here).
+        with open(RUNTIME / "daemon.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return True
+    check(not legacy_daemon_lock_free(), "a live terminal host keeps older daemons from starting beside it")
     hook_env = ENV | {"MUSTER_URL": f"http://127.0.0.1:{PORT}", "MUSTER_TOKEN": record["token"],
                       "MUSTER_HOOK_DB": str(DATA / "hook-inbox.sqlite")}
     callback = subprocess.run([str(BIN), "hook", "shell", "SmokeDurableCallback", '{"saved":"during outage"}'],
@@ -396,6 +412,99 @@ try:
           and rpc("hello")["terminal_host"]["instance"] == host_instance,
           "delayed launch and removal faults preserve unrelated terminals and the host")
 
+    def call_through_gate(method, params):
+        result = []
+        def request():
+            try:
+                result.append(http("/api/rpc", {"id": 1, "method": method, "params": params}, timeout=25))
+            except (ConnectionError, OSError) as error:
+                result.append(error)
+        sender = threading.Thread(target=request)
+        sender.start()
+        return sender, result
+
+    def launch_record(session_id):
+        with sqlite3.connect(DATA / "muster.db") as database:
+            row = database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (session_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def crash_before_acknowledgement(method, params):
+        """Hold the Spawn response, SIGKILL the backend, then start a replacement."""
+        with SpawnGate(RUNTIME, "after") as gate:
+            sender, _ = call_through_gate(method, params)
+            try:
+                assert gate.entered.wait(10), f"spawn acknowledgement was not captured: {gate.errors}"
+                assert gate.response["type"] == "status", gate.response
+                held = (gate.request["run"], gate.response["data"]["pid"])
+                stop_backend(hard=True)
+            finally:
+                gate.release.set()
+                sender.join(timeout=30)
+        start_backend()
+        return held
+
+    # A callback from a launch whose acknowledgement is still outstanding must not hold
+    # up other sessions' callbacks or keystrokes.
+    with SpawnGate(RUNTIME, "after") as gate:
+        sender, result = call_through_gate("session.spawn", {"channel_id": channel["id"], "kind": "shell"})
+        try:
+            assert gate.entered.wait(10), f"spawn acknowledgement was not captured: {gate.errors}"
+            held_run = gate.request["run"]
+            pending = launch_record(held_run["id"])
+            assert pending and pending["pending"], pending
+            for hook_token, event, payload in ((pending["token"], "PreToolUse", '{"tool_name":"Agent"}'),
+                                               (launch_record(sid)["token"], "SmokeDurableCallback", "{}")):
+                callback = subprocess.run([str(BIN), "hook", "shell", event, payload],
+                    env=hook_env | {"MUSTER_TOKEN": hook_token}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+                assert callback.returncode == 0, callback.stderr
+            until("other session's callback processed during the held launch", lambda: callback_count() == 2)
+            rpc("session.input", {"id": sid, "data": "printf 'INPUT-DURING-PENDING\\n'\r"})
+            until("keystrokes reach another terminal", lambda: "INPUT-DURING-PENDING" in output(sid))
+            check(True, "an unacknowledged launch's callback blocks neither other callbacks nor keystrokes")
+        finally:
+            gate.release.set()
+            sender.join(timeout=30)
+    assert len(result) == 1 and isinstance(result[0], tuple) and "result" in result[0][1], result
+    check(session(held_run["id"])["subagents"] == 1,
+          "a callback applied before the spawn acknowledgement is not reset by it")
+    rpc("session.remove", {"id": held_run["id"]})
+
+    # Restart: the backend dies after the host starts the replacement but before the
+    # acknowledgement. The survivor must come back running, not marked exited.
+    restarting = rpc("session.spawn", {"channel_id": channel["id"], "kind": "shell"})
+    until("restart fixture running", lambda: session(restarting["id"])["state"] != "starting")
+    run, new_pid = crash_before_acknowledgement("session.restart", {"id": restarting["id"]})
+    check(session(restarting["id"])["pid"] == new_pid and session(restarting["id"])["state"] != "exited"
+          and sum(item["run"] == run for item in host_call("inventory")) == 1,
+          "a restart interrupted before its acknowledgement recovers the live replacement")
+    rpc("session.input", {"id": restarting["id"], "data": "printf 'RESTART-SURVIVOR\\n'\r"})
+    until("recovered replacement accepts input", lambda: "RESTART-SURVIVOR" in output(restarting["id"]))
+    rpc("session.remove", {"id": restarting["id"]})
+
+    # A shell's initial command is saved before its launch, so a crash before the
+    # acknowledgement neither loses it nor runs it twice.
+    initial = BASE / "initial-command-runs"
+    run, _ = crash_before_acknowledgement("session.spawn", {"channel_id": channel["id"], "kind": "shell",
+        "prompt": f"printf 'once\\n' >> {initial}"})
+    until("initial command delivered after recovery", lambda: initial.exists() and initial.read_text() == "once\n")
+    stop_backend(hard=True)
+    start_backend()
+    time.sleep(1.5)
+    check(initial.read_text() == "once\n", "a shell's initial command survives a crash before acknowledgement, once")
+    rpc("session.remove", {"id": run["id"]})
+
+    # A named agent is linked to its session before the process starts.
+    rpc("agent.create", {"name": "smoke-agent", "kind": "claude"})
+    run, agent_pid = crash_before_acknowledgement("agent.start", {"name": "smoke-agent"})
+    agent = next(item for item in rpc("agent.list") if item["name"] == "smoke-agent")
+    check(agent["session_id"] == run["id"], "a named agent keeps its session across a crash before acknowledgement")
+    again = rpc("agent.start", {"name": "smoke-agent"})
+    agent_runs = [item for item in host_call("inventory") if item["alive"] and item["run"]["id"] == run["id"]]
+    check(not again["started"] and again["session"]["id"] == run["id"] and len(agent_runs) == 1
+          and agent_runs[0]["pid"] == agent_pid, "starting the agent again reuses the survivor instead of a duplicate")
+    rpc("session.remove", {"id": run["id"]})
+    rpc("agent.remove", {"name": "smoke-agent"})
+
     # A prompt accepted into a busy terminal's queue must survive application replacement.
     waiting = BASE / "queued-command-runs"
     rpc("session.input", {"id": sid, "data": "sleep 4\r"})
@@ -442,8 +551,14 @@ try:
     check((uncertain.read_text() if uncertain.exists() else "") == before,
           "ambiguous input is never automatically replayed")
     check(sid in rpc("hello")["paused_deliveries"], "reconnecting UI is told about paused delivery")
-    rpc("session.clear_queue", {"id": sid})
-    check(not rpc("session.queue", {"id": sid})["paused"], "explicit queue clearing resolves recovery pause")
+    resumed = BASE / "resumed-after-review"
+    rpc("session.send", {"id": sid, "text": f"printf 'kept\\n' >> {resumed}"})
+    rpc("session.resume_queue", {"id": sid})
+    review = rpc("session.queue", {"id": sid})
+    check(not review["paused"] and not review["uncertain"], "resuming forgets only the reviewed uncertain record")
+    until("waiting prompt delivered after review", lambda: resumed.exists() and resumed.read_text() == "kept\n")
+    check((uncertain.read_text() if uncertain.exists() else "") == before,
+          "resuming never resends the uncertain prompt")
     rpc("session.input", {"id": sid, "data": "\x03"})
 
     # UI installation changes only release files. Old HTML keeps loading its own bundle.
@@ -492,6 +607,7 @@ try:
     stdout, stderr = full_stop.communicate(timeout=15)
     check(full_stop.returncode == 0, f"explicit full stop succeeds: {stderr.decode().strip()}")
     check(not (RUNTIME / "terminal.sock").exists(), "full stop terminates the terminal host")
+    check(until("host released the fence lock", legacy_daemon_lock_free), "after a full stop an older daemon may start")
     print(f"Passed {passed} backend survival checks.", flush=True)
 finally:
     try:

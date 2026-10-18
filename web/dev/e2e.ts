@@ -272,6 +272,8 @@ try {
     4000,
   );
   ok("double-click renamed the tab's task");
+  await a.wait(`document.querySelector('.sl-task')?.textContent === 'renamed task'`, 3000);
+  ok("the status line names the focused tab's task");
 
   // ---- a task with two sessions: Rename edits `[task] · [session]` from any of its tabs
   const extra: any = await R(a, "session.spawn", {
@@ -312,9 +314,11 @@ try {
   const ra = await a.rect(`[data-tab-sid="${agent}"] .tab-name`);
   await a.clickAt(ra!.x + 10, ra!.y + ra!.h / 2, { count: 2 });
   await fields(2);
+  const tags = await a.eval(`[...document.querySelectorAll('.tab .inline-edit-tag')].map((e) => e.textContent).join()`);
+  check(tags === "Task,Tab", `each field is labelled: ${tags}`);
   check(await fieldFocus() === "Task name", "the main tab starts in the task field");
   await a.key("Tab");
-  check(await fieldFocus() === "Session name", "Tab moves to the session field");
+  check(await fieldFocus() === "Tab name", "Tab moves to the session field");
   await a.key("Shift+Tab");
   check(await fieldFocus() === "Task name", "Shift+Tab moves back");
   await a.type("ignored");
@@ -331,7 +335,7 @@ try {
   await a.eval(`document.querySelector('[data-tab-sid="${sh}"]').focus()`);
   await a.key("F2");
   await fields(2);
-  check(await fieldFocus() === "Session name", "a secondary tab starts in the session field");
+  check(await fieldFocus() === "Tab name", "a secondary tab starts in the session field");
   await a.key("Ctrl+a");
   await a.type("tests");
   await a.key("Enter");
@@ -726,6 +730,71 @@ try {
   if (!real && v2) {
     await a.wait(`!!document.querySelector('.agents-panel')`, 3000);
     ok("the agents panel came back open with the window (per-window, in its layout)");
+  }
+
+  // ---- the update banner, the shutdown dialog, Ctrl+Shift+R (mock only: mock.updates)
+  if (!real) {
+    const banner = (kind: string) => a.wait(`!!document.querySelector('.update-banner.update-${kind}')`, 4000);
+    await R(a, "mock.updates", { backend: "abc123def456", ui_release: "1-ff", host: null });
+    await banner("backend");
+    await shot(a, "12-update-backend");
+    // Dismissing the backend update shows the next one (the UI); a different build shows again.
+    await a.click(".update-banner .toast-x");
+    await banner("ui");
+    await shot(a, "12b-update-ui");
+    await R(a, "mock.updates", { backend: "fedcba654321" });
+    await banner("backend");
+    ok("the update banner offers the backend first, then the UI; dismissing hides one build only");
+    // A stale build id is refused (the backend restarts only the offered build).
+    check(
+      /changed since/.test(await a.eval(`${M}.rpc.call("daemon.reload", { expect: "abc123def456" }).then(() => "", (e) => e.message)`)),
+      "daemon.reload refuses a build other than the one offered",
+    );
+    // Restart backend: every connection drops (as a real reload does) and the window reconnects.
+    await a.click(".update-backend .btn-primary");
+    await banner("ui");
+    check(await a.eval(`!${M}.focusedSession.value || document.querySelectorAll('.tab').length > 0`), "tabs survived");
+    ok("Restart backend reconnected the window and the banner moved on to the UI update");
+    await a.click(".update-banner .toast-x");
+    await R(a, "mock.updates", { host: "0123456789ab" });
+    await banner("host");
+    await shot(a, "12c-update-host");
+    await a.click(".update-host .link-btn");
+    await a.wait(`!!document.querySelector('.modal[aria-label="Shut down Muster"]')`, 2000);
+    check(await a.eval(`!document.querySelector('.update-banner')`), "no banner above an open dialog");
+    check(
+      await a.eval(`document.activeElement?.textContent === 'Cancel'`),
+      "Cancel is the default in the shutdown dialog",
+    );
+    const text: string = await a.eval(`document.querySelector('.modal .dlg-body').textContent`);
+    check(/sessions? (is|are) running|No sessions/.test(text), `the dialog counts sessions: ${text}`);
+    await shot(a, "13-shutdown-dialog");
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.modal')`, 2000);
+    await a.click(".update-banner .toast-x");
+    ok("the terminal host banner opens the shutdown dialog (Cancel focused); nothing was stopped");
+    // The ⋯ menu carries the window items.
+    await a.click(".win-more");
+    await a.wait(`!!document.querySelector('.menu')`, 2000);
+    const items: string = await a.eval(`[...document.querySelectorAll('.menu .menu-label')].map((e) => e.textContent).join("|")`);
+    for (const want of ["Reload window", "Shut down Muster…"]) {
+      check(items.includes(want), `⋯ has ${want}: ${items}`);
+    }
+    // A browser lets a page close its window only when a script opened it or it has one history
+    // entry (this test navigated, so it may have more).
+    const closable = await a.eval(`history.length <= 1 || !!opener`);
+    check(items.includes("Close window") === closable, `Close window only when it can work: ${items}`);
+    check(!items.includes("System title bar"), "no title bar switch in a browser");
+    await shot(a, "14-more-menu");
+    await a.key("Escape");
+    ok("⋯ has Reload window and Shut down Muster… (Close window when allowed), no title bar switch in a browser");
+    // Ctrl+Shift+R reloads the page (a marker set now is gone afterwards).
+    await a.eval(`globalThis.__beforeReload = true`);
+    await a.click(".pane .xterm");
+    await a.key("Ctrl+Shift+R");
+    await a.wait(`!globalThis.__beforeReload && !!document.querySelector('.app')`, 8000);
+    await guard(a);
+    ok("Ctrl+Shift+R reloaded the window");
   }
 
   // ---- light theme, shortcuts sheet

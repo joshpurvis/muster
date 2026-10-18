@@ -16,6 +16,7 @@ import type {
   TimelineEvent,
   Win,
   WindowId,
+  WindowPrefs,
   Workspace,
 } from "./types.ts";
 import { needsHuman } from "./types.ts";
@@ -23,6 +24,7 @@ import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
+import { type Dismissed, releaseOfScript, type UpdateStatus } from "./updates.ts";
 import {
   allSessions,
   emptyLayout,
@@ -37,6 +39,7 @@ import {
   confirmAfterUpsert,
   documentTitle,
   needsYouOrder,
+  newerPrefs,
   pushFront,
   type RenameFields,
   renameOutlived,
@@ -89,6 +92,22 @@ export const windowSessions = computed((): SessionInfo[] => {
 });
 
 export const hereIds = computed(() => new Set(windowSessions.value.map((s) => s.id)));
+
+// ---------------- updates, shared window prefs, shutdown ----------------
+
+/** Waiting updates (`hello.updates`, `updates_changed`); null from backends without them. */
+export const updateStatus = signal<UpdateStatus | null>(null);
+/** The UI release this page was loaded from (null: embedded or directly served assets). */
+export const loadedRelease = releaseOfScript(
+  document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src ?? "",
+);
+/** Updates this viewer dismissed (per kind, the last one), until a different one arrives. */
+export const dismissedUpdates = signal<Dismissed>(load<Dismissed>("dismissedUpdates", {}));
+effect(() => save("dismissedUpdates", dismissedUpdates.value));
+/** Preferences every window shares (`prefs.get`); null from backends without them. */
+export const windowPrefs = signal<WindowPrefs | null>(null);
+/** The backend announced a full shutdown (`daemon_stopping`): this page stops reconnecting. */
+export const daemonStopped = signal(false);
 
 // ---------------- named agents (docs/UI.md "Agents panel") ----------------
 
@@ -255,6 +274,8 @@ export type Overlay =
   | { kind: "shortcuts" }
   | { kind: "permissions"; channelId: number }
   | { kind: "rename_window" }
+  /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
+  | { kind: "shutdown" }
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
   | { kind: "agent"; name?: string; tab?: "settings" | "memory" }
   | { kind: "agent_message"; id: number }
@@ -437,23 +458,41 @@ effect(() => {
 let saveTimer = 0;
 let lastSaved = "";
 let setLayoutMissing = false;
+/** The `window.set_layout` call still on its way, if any (`lastSaved` is set when it starts). */
+let saving: Promise<unknown> | null = null;
+
+function saveLayout(id: WindowId): Promise<unknown> {
+  const cur = layout.peek();
+  if (!cur || windowId.peek() !== id || layoutOwner !== id) return saving ?? Promise.resolve();
+  const json = JSON.stringify(cur);
+  // Already sent: done once that call is.
+  if (json === lastSaved) return saving ?? Promise.resolve();
+  lastSaved = json;
+  const p: Promise<unknown> = rpc.call("window.set_layout", { id, layout: cur }).catch((e) => {
+    lastSaved = "";
+    if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) setLayoutMissing = true;
+  }).finally(() => {
+    if (saving === p) saving = null;
+  });
+  saving = p;
+  return p;
+}
+
 effect(() => {
   const l = layout.value;
   const id = windowId.value;
   if (!l || id === null || !windowsSupported.value || setLayoutMissing || layoutOwner !== id) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    const cur = layout.peek();
-    if (!cur || windowId.peek() !== id || layoutOwner !== id) return;
-    const json = JSON.stringify(cur);
-    if (json === lastSaved) return;
-    lastSaved = json;
-    rpc.call("window.set_layout", { id, layout: cur }).catch((e) => {
-      lastSaved = "";
-      if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) setLayoutMissing = true;
-    });
-  }, 400);
+  saveTimer = setTimeout(() => saveLayout(id), 400);
 });
+
+/** Save a layout change still waiting for its debounce (before the page goes away). */
+export function saveLayoutNow(): Promise<unknown> {
+  const id = windowId.peek();
+  clearTimeout(saveTimer);
+  if (id === null || !windowsSupported.peek() || setLayoutMissing) return saving ?? Promise.resolve();
+  return saveLayout(id);
+}
 
 // ---------------- server event handling ----------------
 
@@ -507,6 +546,8 @@ export function applyHello(h: HelloResult) {
   batch(() => {
     const before = hereIds.peek();
     meta.value = { version: h.version, home: h.home, default_shell: h.default_shell };
+    updateStatus.value = h.updates ?? null;
+    windowPrefs.value = h.prefs ?? null;
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     channels.value = h.channels.filter((c) => !c.archived);
     windowsSupported.value = Array.isArray(h.windows);
@@ -600,6 +641,15 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "agent_message":
       agentMessages.value = upsertMessage(agentMessages.value, ev.data);
+      break;
+    case "updates_changed":
+      updateStatus.value = ev.data;
+      break;
+    case "prefs_changed":
+      if (newerPrefs(windowPrefs.value, ev.data)) windowPrefs.value = ev.data;
+      break;
+    case "daemon_stopping":
+      daemonStopped.value = true;
       break;
   }
 }

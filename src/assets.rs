@@ -76,6 +76,17 @@ impl Source {
     }
 }
 
+/// The installed UI release new pages load (`<data>/ui/current` names it), or None while the
+/// backend serves embedded assets or a `MUSTER_WEB_DIR` override. A page compares it with the
+/// release it was loaded from (its `/_ui/<id>/` script path) to offer a reload.
+pub fn active_release(data: &Path) -> Option<String> {
+    if std::env::var_os("MUSTER_WEB_DIR").is_some() {
+        return None;
+    }
+    let target = std::fs::read_link(data.join("ui/current")).ok()?;
+    Some(target.file_name()?.to_str()?.to_string())
+}
+
 fn validate_complete_release(source: &Path) -> anyhow::Result<()> {
     Source::directory(source)?;
     for required in ["index.html", "app.js", "app.css"] {
@@ -436,6 +447,14 @@ mod tests {
                 .0,
             b"two"
         );
+        if std::env::var_os("MUSTER_WEB_DIR").is_none() {
+            assert_eq!(
+                active_release(&install_data).as_deref(),
+                installed.file_name().and_then(|n| n.to_str()),
+                "pages compare their release with the one ui/current names"
+            );
+        }
+        assert!(active_release(&root).is_none(), "nothing installed: embedded assets");
         assert!(
             install(&root.join("one"), &install_data).is_err(),
             "reject symlinked content before activation"

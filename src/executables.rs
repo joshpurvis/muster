@@ -12,11 +12,12 @@ use anyhow::Context;
 use sha2::{Digest, Sha256};
 
 const APP: &str = "muster";
-const HOST: &str = "muster-terminal-host";
+pub const HOST: &str = "muster-terminal-host";
 
 pub struct Release {
     directory: PathBuf,
     command: PathBuf,
+    app_hash: String,
 }
 
 impl Release {
@@ -26,6 +27,11 @@ impl Release {
 
     pub fn host(&self) -> PathBuf {
         self.directory.join(HOST)
+    }
+
+    /// SHA-256 of the application executable this release holds (the running backend's).
+    pub fn app_hash(&self) -> &str {
+        &self.app_hash
     }
 
     pub fn activate(&self) -> anyhow::Result<()> {
@@ -42,11 +48,19 @@ impl Release {
 /// Copy complete binaries before publishing any path. They are separate files,
 /// never hard links to a build output that an updater could truncate in place.
 /// A backend-only distribution may reuse the previously snapshotted host binary.
+#[cfg(test)]
 pub fn prepare(data: &Path, executable: &Path) -> anyhow::Result<Release> {
+    prepare_running(data, executable, executable)
+}
+
+/// `prepare` for the running backend: the application snapshot is copied from `running`
+/// (`/proc/self/exe`: what actually executes, even if `launch` was replaced since it was
+/// started), the host from beside `launch`, the path it was started from.
+pub fn prepare_running(data: &Path, launch: &Path, running: &Path) -> anyhow::Result<Release> {
     crate::paths::ensure_private_dir(data)?;
     let data = fs::canonicalize(data)?;
     let command = data.join("bin").join(APP);
-    let sibling_host = executable.with_file_name(HOST);
+    let sibling_host = launch.with_file_name(HOST);
     let host = match fs::metadata(&sibling_host) {
         Ok(_) => sibling_host,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -61,7 +75,7 @@ pub fn prepare(data: &Path, executable: &Path) -> anyhow::Result<Release> {
     let stage = RemoveOnDrop(releases.join(format!(".stage-{}", crate::paths::random_token())));
     fs::create_dir(&stage.0)?;
     fs::set_permissions(&stage.0, fs::Permissions::from_mode(0o700))?;
-    let app_hash = snapshot(executable, &stage.0.join(APP))?;
+    let app_hash = snapshot(running, &stage.0.join(APP))?;
     let host_hash = snapshot(&host, &stage.0.join(HOST))?;
     File::open(&stage.0)?.sync_all()?;
     let directory = releases.join(format!("{app_hash}-{host_hash}"));
@@ -76,7 +90,13 @@ pub fn prepare(data: &Path, executable: &Path) -> anyhow::Result<Release> {
         fs::rename(&stage.0, &directory)?;
         File::open(&releases)?.sync_all()?;
     }
-    Ok(Release { directory, command })
+    Ok(Release { directory, command, app_hash })
+}
+
+/// SHA-256 of a file's content, as release names use it.
+pub fn hash_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    hash_and_copy(&mut file, &mut std::io::sink())
 }
 
 fn executable_file(path: &Path) -> anyhow::Result<File> {
@@ -216,6 +236,22 @@ mod tests {
                     .to_string_lossy()
                     .starts_with('.'))
         );
+    }
+
+    #[test]
+    fn the_running_build_is_snapshotted_not_the_launch_path() {
+        let root = RemoveOnDrop(std::env::temp_dir().join(format!(
+            "muster-executables-{}",
+            crate::paths::random_token()
+        )));
+        fs::create_dir(&root.0).unwrap();
+        binary(&root.0.join(APP), b"rebuilt since launch");
+        binary(&root.0.join(HOST), b"host");
+        binary(&root.0.join("running"), b"what executes");
+        let release = prepare_running(&root.0.join("data"), &root.0.join(APP), &root.0.join("running")).unwrap();
+        assert_eq!(fs::read(release.directory.join(APP)).unwrap(), b"what executes");
+        assert_eq!(release.app_hash(), hash_file(&root.0.join("running")).unwrap());
+        assert_eq!(fs::read(release.host()).unwrap(), b"host", "the host comes from beside the launch path");
     }
 
     #[test]

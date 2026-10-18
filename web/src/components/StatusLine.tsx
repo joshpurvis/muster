@@ -1,10 +1,11 @@
-// Optional bottom line: the focused tab's task folder and branch (click copies), the number of
-// tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
-import { focusedTask, meta, needsYou, windowSessions } from "../state.ts";
+// Optional bottom line: the focused tab's task name, folder and branch (click copies), the number
+// of tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
+import { focusedTask, meta, needsYou, windowSessions, workspaceById } from "../state.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { IconBranch, IconFolder } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
+import { taskLabel } from "../model.ts";
 
 const CONN_LABEL = {
   open: "connected",
@@ -20,8 +21,20 @@ export function StatusLine() {
   const status = connStatus.value;
   const count = windowSessions.value.length;
   const cwd = c?.cwd ?? "";
+  // Only a real name: until one is derived the task is named after its folder, shown next to it.
+  const name = c ? taskLabel(c, workspaceById.value.get(c.workspace_id)) : null;
   return (
     <footer class="statusline">
+      {c && name && !name.muted && (
+        <button
+          type="button"
+          class="sl-item sl-task"
+          data-tip={`Copy task name · ${name.text}`}
+          onClick={() => A.copy(name.text, "Task name copied")}
+        >
+          <span>{name.text}</span>
+        </button>
+      )}
       {c && (
         <button
           type="button"

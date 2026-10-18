@@ -2,7 +2,17 @@
 // the window chip (2+ windows), Jump and the ⋯ menu, plus a "Reconnecting…" pill. While a tab is
 // dragged, the focused strip shows "→ Window N / → New window" drop targets (MoveTargets).
 import { useRef } from "preact/hooks";
-import { focusedSession, overlay, prefs, setPref, windowId, windows, windowsSupported } from "../state.ts";
+import {
+  focusedSession,
+  overlay,
+  prefs,
+  setPref,
+  windowId,
+  windowPrefs,
+  windows,
+  windowsSupported,
+} from "../state.ts";
+import { canCloseWindow, isNative } from "../native.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { Kbd } from "./common.tsx";
@@ -15,6 +25,7 @@ const THEME_NAME = { system: "Match system", dark: "Dark", light: "Light" } as c
 
 function moreMenu(): MenuItem[] {
   const p = prefs.value;
+  const shared = windowPrefs.value;
   return [
     ...(windowId.value !== null
       ? [{ label: "Rename window…", run: () => (overlay.value = { kind: "rename_window" }) }, "sep" as const]
@@ -41,9 +52,21 @@ function moreMenu(): MenuItem[] {
         run: () => setPref("jumpRaises", !p.jumpRaises),
       }]
       : []),
+    // Native windows only (the browser draws its own frame); shared by every window.
+    ...(isNative && shared
+      ? [{
+        label: "System title bar",
+        checked: shared.decorations,
+        run: () => A.setDecorations(!shared.decorations),
+      }]
+      : []),
     "sep",
     { label: "Command palette", keys: "Ctrl+Shift+P", run: () => A.openJump(">") },
     { label: "Keyboard shortcuts", keys: "Alt+/", run: () => (overlay.value = { kind: "shortcuts" }) },
+    "sep",
+    { label: "Reload window", keys: "Ctrl+Shift+R", run: () => A.reloadWindow() },
+    ...(canCloseWindow() ? [{ label: "Close window", run: () => A.closeWindow() }] : []),
+    { label: "Shut down Muster…", danger: true, run: () => (overlay.value = { kind: "shutdown" }) },
   ];
 }
 

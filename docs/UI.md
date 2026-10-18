@@ -63,7 +63,11 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   muted. Unread activity shows a bold label.
 - Double-click renames exactly what the tab shows. A tab showing one name edits that name: the
   task's, or the session's when its task is unknown. A tab showing `task · session` edits both,
-  as two fields `[task] · [session]`, from any of the task's tabs. The cursor starts in the task
+  as two fields `[task] · [session]`, from any of the task's tabs. Each field has a small muted
+  label before it, "Task" or "Tab" (a session is a tab), also with one field; in a very narrow
+  strip (300px or less) the labels shrink but stay. The inputs are named "Task name" and "Tab
+  name". The
+  cursor starts in the task
   field on the task's main tab (its first agent session, else its first session), in the session
   field otherwise. Tab / Shift+Tab move between the fields, Enter renames whatever changed, Esc
   cancels, clicking away commits. Blank or unchanged fields are left alone. After Enter or Esc
@@ -75,7 +79,8 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 - The **top-right group's** strip ends with the window controls: Split right `◫`, Split down
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
-  Alt keys, Jump focuses the other window, Command palette, Keyboard shortcuts), plus a
+  Alt keys, Jump focuses the other window, System title bar (native window only), Command
+  palette, Keyboard shortcuts, then Reload window, Close window, Shut down Muster…), plus a
   "Reconnecting…" pill when disconnected. The top-right group is the one touching the window's
   right edge highest up; a zoomed group carries the controls; narrow strips keep only Jump and
   `⋯`.
@@ -120,9 +125,45 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   terminal, split) are held out of the layout until their call returns and places them.
 
 ### Status line (optional, on by default, toggle in the palette)
-22px, muted: the focused tab's task folder (truncated from the left, click copies), branch
-(click copies) and the number of tabs in the window. Right: "needs you: N" (same as Alt+J) and
-a connection dot.
+22px, muted: the focused tab's task name (only once it has a real name, not just its folder's;
+truncated with an ellipsis, the full name in the tooltip, click copies), its folder (truncated
+from the left, click copies), branch (click copies) and the number of tabs in the window. Right:
+"needs you: N" (same as Alt+J) and a connection dot.
+
+### Updates
+A banner in the toast stack (bottom right, above the toasts; it stays until acted on or
+dismissed) offers one waiting update at a time (`hello.updates`, `updates_changed`; see
+docs/PROTOCOL.md "Updates and window preferences"), in this order:
+1. **Backend update ready**: the executable the backend was started from holds a new build.
+   "Restart backend" (`daemon.reload` with the offered build's id, so a file rewritten since is
+   refused; disabled while disconnected, never queued): terminals keep running and the window
+   reconnects.
+2. **UI update ready**: the installed UI release differs from the one this page loaded (after
+   `muster ui-install`). "Reload" (Ctrl+Shift+R).
+3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. No button:
+   installing it needs a full restart, which ends all sessions; a "Shut down Muster…" link opens
+   the shutdown dialog.
+
+When the backend and the UI both changed, the backend banner comes first and the UI banner shows
+after the restart. The banner is hidden while a dialog is open, and has its own polite live
+region (apart from the toasts' status region) that announces each update once. `×` dismisses that update (per viewer, in localStorage) until a different one
+of the same kind arrives; the next waiting update shows meanwhile.
+
+### Window and shutdown
+- **Reload window** (Ctrl+Shift+R, palette, `⋯`): saves a pending layout change, then reloads.
+  Plain Ctrl+R stays with the terminal.
+- **Close window** (palette, `⋯`): closes this window only; its tabs stay in it for the next
+  `muster`. The native window closes itself; a browser closes only windows it allows a page to
+  close (one opened by a script or with a single history entry, as Muster's `--app` windows
+  are), else the item is hidden and a refused close says so in a toast.
+- **System title bar** (`⋯`, palette; native windows only): shows or hides the window
+  decorations of every native window. Kept by the backend (`prefs.set`), so new windows are built
+  with it; open windows switch at once. Windows opened by an older build don't have the switch.
+- **Shut down Muster…** (`⋯`, palette, the terminal host banner): a dialog warning that it stops
+  the backend and the terminal host and ends every session and agent, with how many sessions are
+  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
+  "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
+  `daemon_stopping` or the call's reply does that; a dropped connection just reconnects.
 
 ### Overlays
 - **Jump** (Ctrl+Space or Ctrl+Shift+K anywhere, Ctrl+K outside terminals; Ctrl+Space again closes it): fuzzy search over every tab and
@@ -256,6 +297,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Terminal font size |
 | Alt+/ or F1 | Shortcuts sheet |
+| Ctrl+Shift+R | Reload the window (plain Ctrl+R goes to the terminal) |
 
 ## Behavior details
 - Reconnect: an unobtrusive "Reconnecting…" pill with exponential backoff to 5s. On reconnect,
@@ -282,7 +324,8 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
   folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other
-  window", the agents panel's message log expanded or not, and the active tab per window.
+  window", the agents panel's message log expanded or not, the active tab per window, and the
+  dismissed updates. The system title bar is shared by every window and kept by the backend.
 - `window.focused` is called on window focus and right after a claim when the page has focus.
 - Performance: batch output per animation frame per terminal. Never re-render the Preact tree on
   output bytes.

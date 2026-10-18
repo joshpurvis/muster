@@ -20,6 +20,7 @@ mod rpc;
 mod server;
 mod store;
 mod terminal;
+mod updates;
 mod wm;
 mod worktree;
 
@@ -454,7 +455,7 @@ fn main() -> ExitCode {
             if std::env::var_os("MUSTER_WEB_DIR").is_some() {
                 Err(anyhow::anyhow!("MUSTER_WEB_DIR overrides installed UI releases; update that directory or unset the override on the backend"))
             } else {
-                assets::install(&path, &paths::data_dir()).map(|release| println!("UI activated at {}; refresh the window", release.display()))
+                assets::install(&path, &paths::data_dir()).map(|release| println!("UI activated at {}; reload the window (open windows offer it)", release.display()))
             }
         },
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
@@ -955,8 +956,14 @@ async fn daemon_main() -> anyhow::Result<()> {
 
     // The terminal host and its rollback fence first: an older, monolithic daemon holding
     // daemon.lock must stop this backend before it opens the shared database.
-    let release = executables::prepare(&paths::data_dir(), &std::env::current_exe()?)?;
+    let launch_exe = std::env::current_exe()?;
+    // Snapshot (and so hash) the build that is executing, not whatever the launch path holds
+    // by now: a rebuild in between must still show as an update.
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    let running = if proc_exe.exists() { proc_exe } else { launch_exe.as_path() };
+    let release = executables::prepare_running(&paths::data_dir(), &launch_exe, running)?;
     let terminal_host = terminal::ensure_host(&release.host())?;
+    let host_pid = terminal_host.client.hello.pid;
     let listener = bind().await?;
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
@@ -979,6 +986,12 @@ async fn daemon_main() -> anyhow::Result<()> {
         store,
     )?;
 
+    // Before the server answers any hello, so the first one names the active UI release.
+    updates::spawn(&hub, updates::Launch {
+        exe: launch_exe,
+        app_hash: release.app_hash().to_string(),
+        host_pid: Some(host_pid),
+    });
     hook_inbox::spawn(&hub, hook_inbox)?;
     hub::spawn_input_attribution(&hub)?;
     let app = server::router(hub.clone())?;

@@ -29,6 +29,7 @@ import type { Permissions, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { UpdateBanner } from "./UpdateBanner.tsx";
 import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
 import { labelOf } from "../layout/Pane.tsx";
@@ -122,6 +123,8 @@ export function Overlays() {
       return <NewTab worktree={o.worktree} cwd={o.cwd} />;
     case "rename_window":
       return <RenameWindow />;
+    case "shutdown":
+      return <Shutdown />;
     case "shortcuts":
       return <Shortcuts />;
     case "confirm":
@@ -783,21 +786,77 @@ function Confirm(
   );
 }
 
+// ---------------- shut down ----------------
+
+/** "Shut down Muster…": what `muster stop` does, from the window. Cancel is the default. */
+function Shutdown() {
+  const cancel = useRef<HTMLButtonElement>(null);
+  const [busy, setBusy] = useState(false);
+  useLayoutEffect(() => cancel.current?.focus(), []);
+  const running = [...sessions.value.values()].filter((s) => s.state !== "exited");
+  const agentCount = running.filter((s) => s.kind !== "shell").length;
+  const n = running.length;
+  return (
+    <Modal class="dialog confirm-dlg" label="Shut down Muster">
+      <div class="dlg-head">
+        <h2>Shut down Muster?</h2>
+      </div>
+      <div class="dlg-body">
+        <p>
+          This stops the Muster backend and its terminal host, in every window. Every terminal closes and every
+          agent in them stops.
+        </p>
+        <p>
+          {n === 0 ? "No sessions are running." : (
+            <>
+              <strong>{n === 1 ? "1 session is running" : `${n} sessions are running`}</strong>
+              {agentCount === 0
+                ? "."
+                : agentCount === n
+                ? (n === 1 ? " (an agent)." : " (all agents).")
+                : ` (${agentCount} ${agentCount === 1 ? "agent" : "agents"}).`}
+            </>
+          )}
+        </p>
+        <p class="muted">Run <code>muster</code> to start it again.</p>
+      </div>
+      <div class="dlg-foot">
+        <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
+        <button
+          type="button"
+          class="btn btn-danger"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            A.shutDown().finally(() => (overlay.value = null));
+          }}
+        >
+          {busy && <Spinner size={12} />}
+          Shut down
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 // ---------------- toasts ----------------
 
 export function Toasts() {
   const list = toasts.value;
   return (
-    <div class="toasts" role="status" aria-live="polite">
-      {list.map((t) => (
-        <div key={t.id} class={cx("toast", "toast-" + t.level)}>
-          {t.level === "success" ? <IconCheck size={14} /> : <span class="toast-dot" />}
-          <span class="toast-text">{t.text}</span>
-          <button type="button" class="toast-x" aria-label="Dismiss" onClick={() => dismissToast(t.id)}>
-            <IconX size={12} />
-          </button>
-        </div>
-      ))}
+    <div class="toasts">
+      <UpdateBanner />
+      <div class="toast-list" role="status" aria-live="polite">
+        {list.map((t) => (
+          <div key={t.id} class={cx("toast", "toast-" + t.level)}>
+            {t.level === "success" ? <IconCheck size={14} /> : <span class="toast-dot" />}
+            <span class="toast-text">{t.text}</span>
+            <button type="button" class="toast-x" aria-label="Dismiss" onClick={() => dismissToast(t.id)}>
+              <IconX size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

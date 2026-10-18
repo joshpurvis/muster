@@ -109,10 +109,11 @@ function tipDelay(_t: HTMLElement) {
  * Esc / leaving without a change cancels, leaving commits. Tab / Shift+Tab move between the fields
  * (and only blur when there is one). `onCommit` gets every field's trimmed value; `byKey` says it
  * closed with Enter / Esc (the caller puts the focus back), not by focus leaving. Removed before it
- * closed (its tab went away), it cancels. */
+ * closed (its tab went away), it cancels. A field's `tag` is a short visible label before it (its
+ * accessible name is `label`); clicking it focuses the field. */
 export function InlineEdit(
   props: {
-    fields: { value: string; label: string }[];
+    fields: { value: string; label: string; tag?: string }[];
     /** The field that starts focused. */
     focus?: number;
     onCommit: (values: string[], byKey: boolean) => void;
@@ -135,8 +136,9 @@ export function InlineEdit(
     const el = refs.current[props.focus ?? 0];
     el?.focus({ preventScroll: true });
     el?.select();
-    // All of the fields in view (a crowded strip scrolls to them).
-    wrap.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // All of the fields in view (a crowded strip scrolls to them), with the tab around them.
+    const box = wrap.current?.closest<HTMLElement>(".tab") ?? wrap.current;
+    box?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, []);
   // Cleanups run before the inputs leave the DOM, so the blur that removal may fire is ignored.
   useEffect(() => () => {
@@ -183,9 +185,10 @@ export function InlineEdit(
       // A press on the gap or the separator keeps the focus where it is.
       onMouseDown={(e) => !(e.target instanceof HTMLInputElement) && e.preventDefault()}
     >
-      {props.fields.map((_, i) => (
+      {props.fields.map((f, i) => (
         <Fragment key={i}>
           {i > 0 && <span class="inline-edit-sep">·</span>}
+          {f.tag && <span class="inline-edit-tag" aria-hidden="true" onClick={() => focusField(i)}>{f.tag}</span>}
           {input(i)}
         </Fragment>
       ))}

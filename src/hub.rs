@@ -68,6 +68,15 @@ pub enum ServerEvent {
     },
     /// A message to an agent was recorded, refused or replied to (`agents::message_json`).
     AgentMessage(serde_json::Value),
+    /// What `hello.updates` says changed (`updates::Status`).
+    UpdatesChanged(crate::updates::Status),
+    /// The shared window preferences changed (`prefs.set`).
+    PrefsChanged(UiPrefs),
+    /// The backend and terminal host are about to stop (`daemon.shutdown`); clients should not
+    /// reconnect on their own.
+    DaemonStopping {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +432,10 @@ pub struct Hub {
     branch_lock: tokio::sync::Mutex<()>,
     /// For work started from PTY threads (outside the runtime).
     rt: Option<tokio::runtime::Handle>,
+    /// Waiting UI, backend and terminal host updates (`updates::spawn` fills it).
+    updates: crate::updates::Updates,
+    /// Serializes `set_ui_prefs`.
+    prefs_lock: Mutex<()>,
     weak: Weak<Hub>,
 }
 
@@ -461,6 +474,36 @@ impl Hub {
     /// The muster binary the daemon runs as (for launching client windows).
     pub fn muster_bin(&self) -> &Path {
         &self.cfg.muster_bin
+    }
+
+    pub fn updates(&self) -> &crate::updates::Updates {
+        &self.updates
+    }
+
+    /// Window preferences shared by every window (`prefs.get`).
+    pub fn ui_prefs(&self) -> UiPrefs {
+        match self.store.load_runtime::<UiPrefs>(UI_PREFS_KEY) {
+            Ok(p) => p.unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!("reading window preferences: {error:#}");
+                UiPrefs::default()
+            }
+        }
+    }
+
+    /// Change the given window preferences, save them and tell every client. Writes are
+    /// serialized from read to broadcast, so the last write is what is stored and what every
+    /// client hears last.
+    pub fn set_ui_prefs(&self, change: UiPrefsChange) -> anyhow::Result<UiPrefs> {
+        let _one_at_a_time = self.prefs_lock.lock();
+        let mut p = self.ui_prefs();
+        if let Some(d) = change.decorations {
+            p.decorations = d;
+        }
+        p.revision += 1;
+        self.store.save_runtime(UI_PREFS_KEY, &p)?;
+        self.emit(ServerEvent::PrefsChanged(p.clone()));
+        Ok(p)
     }
 
     pub fn terminal_host_info(&self) -> Option<muster_terminal_protocol::Hello> {
@@ -612,6 +655,8 @@ impl Hub {
             replay_cache: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
             rt: tokio::runtime::Handle::try_current().ok(),
+            updates: Default::default(),
+            prefs_lock: Mutex::new(()),
             weak: weak.clone(),
         });
         if let Some(host) = &hub.cfg.terminal_host {

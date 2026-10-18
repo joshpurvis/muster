@@ -36,6 +36,10 @@ interface Session {
 
 const now = () => Date.now();
 let seq = 1;
+/** `hello.updates` (docs/PROTOCOL.md "Updates"); `mock.updates` changes it. */
+const updates = { ui_release: null as string | null, backend: null as string | null, host: null as string | null };
+/** Shared window preferences (`prefs.get` / `prefs.set`). */
+const windowPrefs = { decorations: true, revision: 0 };
 const workspaces: any[] = [];
 const channels: any[] = [];
 const sessions = new Map<number, Session>();
@@ -746,6 +750,12 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       "channel.mark_read",
     ].includes(method)
   ) throw new Error("This device does not have permission for " + method);
+  if (method === "mock.updates") {
+    // Pretend a build or UI release is waiting: {ui_release?, backend?, host?}.
+    Object.assign(updates, p);
+    broadcast("updates_changed", updates);
+    return updates;
+  }
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   switch (method) {
     case "hello":
@@ -757,7 +767,30 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         windows,
         home: HOME,
         default_shell: "/bin/bash",
+        updates,
+        prefs: windowPrefs,
       };
+    case "prefs.get":
+      return windowPrefs;
+    case "prefs.set":
+      if (typeof p.decorations === "boolean") windowPrefs.decorations = p.decorations;
+      windowPrefs.revision++;
+      broadcast("prefs_changed", windowPrefs);
+      return windowPrefs;
+    case "daemon.reload":
+      // Only the offered build, as the backend checks.
+      if (!updates.backend) throw new Error("the backend already runs the build at /mock/target/release/muster");
+      if (p.expect !== updates.backend) throw new Error("the build changed since the update was offered");
+      // A new backend: every connection drops and reconnects (terminals keep running).
+      updates.backend = null;
+      setTimeout(() => {
+        for (const c of clients) c.close();
+      }, 150);
+      return { exe: "/mock/target/release/muster" };
+    case "daemon.shutdown":
+      broadcast("daemon_stopping", { reason: "shutdown" });
+      for (const s of sessions.values()) if (s.state !== "exited") kill(s.id);
+      return {};
     case "window.claim": {
       if (!ws) throw new Error("window.claim is WebSocket only");
       return claim(ws, typeof p.id === "number" ? p.id : undefined);

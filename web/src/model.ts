@@ -119,6 +119,14 @@ export function documentTitle(win: Pick<Win, "id" | "name"> | null, needsYou: nu
   return needsYou > 0 ? `(${needsYou}) ${base}` : base;
 }
 
+// ---------------- shared window prefs ----------------
+
+/** Take `next` (a `prefs.set` reply or a `prefs_changed` event) over `cur` unless it is older:
+ * a reply can arrive after the event of a later change by another window. */
+export function newerPrefs<T extends { revision?: number }>(cur: T | null, next: T): boolean {
+  return !cur || (next.revision ?? 0) >= (cur.revision ?? 0);
+}
+
 // ---------------- names ----------------
 
 export function basename(path: string): string {

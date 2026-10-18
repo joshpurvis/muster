@@ -1,5 +1,7 @@
 // Wire types mirroring src/model.rs and src/hub.rs (snake_case JSON).
 
+import type { UpdateStatus } from "./updates.ts";
+
 export type WorkspaceId = number;
 export type ChannelId = number;
 export type SessionId = number;
@@ -201,7 +203,18 @@ export type ServerEvent =
   | { event: "window_removed"; data: { id: WindowId } }
   | { event: "agent_upserted"; data: Agent }
   | { event: "agent_removed"; data: { id: number; name: string } }
-  | { event: "agent_message"; data: AgentMessage };
+  | { event: "agent_message"; data: AgentMessage }
+  | { event: "updates_changed"; data: UpdateStatus }
+  | { event: "prefs_changed"; data: WindowPrefs }
+  | { event: "daemon_stopping"; data: { reason: string } };
+
+/** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
+export interface WindowPrefs {
+  /** Native windows show the system title bar. */
+  decorations: boolean;
+  /** Raised by every `prefs.set` (missing from the first builds that had prefs). */
+  revision?: number;
+}
 
 export interface HelloResult {
   ui_protocol?: number;
@@ -214,6 +227,10 @@ export interface HelloResult {
   windows?: Win[];
   home: string;
   default_shell: string;
+  /** Missing from backends that don't watch for updates. */
+  updates?: UpdateStatus;
+  /** Missing from backends without shared window preferences. */
+  prefs?: WindowPrefs;
 }
 
 export type Decision = "approve" | "approve_always" | "deny";

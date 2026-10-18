@@ -114,7 +114,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell}` |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -443,7 +443,7 @@ its sockets close at once on revoke):
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
-| never | `device.*`, `agent.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
+| never | `device.*`, `agent.*`, `window.*`, `daemon.*`, `prefs.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
 Prompts a device sends are logged with `from: "device:<id>"`.
 
@@ -478,6 +478,43 @@ only when no external release is configured. Invalid configured releases produce
 without changing running sessions or API availability. Installed HTML pins JS/CSS to
 `/_ui/<id>/...` (desktop) or `/m/_ui/<id>/...` (phone), so old pages cannot mix bundles
 with a later release. Phone release assets retain the phone CSP and proxy restrictions.
+
+### Updates and window preferences
+
+`hello.updates` (and the `updates_changed` event, sent whenever it changes) says what is
+waiting: `{ui_release, backend, host}`.
+
+- `ui_release`: the installed UI release new pages load (the `<id>` that `ui/current` names), or
+  null while the backend serves embedded assets or `MUSTER_WEB_DIR`. A page compares it with
+  the release in its own script path (`/_ui/<id>/app.js`); a difference means `ui-install`
+  activated a newer UI, and reloading the page loads it.
+- `backend`: a content id (the first 12 hex digits of a SHA-256) when the executable this
+  backend was started from (its original path, such as `target/release/muster`, not the
+  snapshot under the data dir) now holds a different build; null otherwise.
+- `host`: a content id when the `muster-terminal-host` beside that executable differs from the
+  running host (compared with the host's `/proc/<pid>/exe`); null otherwise, or when the
+  running host's executable can't be read.
+
+The backend checks every 2 s with `stat` only, and hashes a file once its size, mtime and
+inode have held still for one check, so a build still being written is never hashed. No file
+watcher and no polling by clients.
+
+| Method | Params | Result |
+|---|---|---|
+| `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
+| `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
+| `prefs.get` | `{}` | `{decorations, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `revision` rises with every `prefs.set`. |
+| `prefs.set` | `{decorations?}` | The new preferences; fields left out stay, unknown fields are refused. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
+
+What "human only" means for `daemon.reload`, `daemon.shutdown` (and `prefs.set`, which needs
+the client token too): they are refused to paired devices (no device scope), to MCP (no tool)
+and hooks (session tokens can't reach this API), and `daemon.*` to calls carrying a
+`from_session` param (the CLI inside a session sends one). That is all. Any process running as
+the user that holds the client token (the discovery file and `<data>/client_token` are readable
+by the user's agents), or that can run `muster stop` / `muster reload` itself, can still restart
+or stop Muster, as with `channel.set_permissions` (see "Channel permissions", Limits). Binding
+a restart to the offered build (`expect`) does not change that either: a process of the user
+can replace the launch file between the check and the start.
 
 ### Callback recovery
 

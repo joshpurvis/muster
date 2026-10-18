@@ -446,12 +446,25 @@ button.sl-item:hover {
 
 .sl-path {
   flex: 0 1 auto;
-  max-width: 45%;
+  max-width: 40%;
 }
 
 .sl-branch {
   flex: 0 1 auto;
   max-width: 30%;
+}
+
+/* The focused tab's task name: shrinks first, the full name is in the tooltip. */
+.sl-task {
+  flex: 0 1 auto;
+  max-width: 28%;
+  color: var(--text-muted);
+  font-weight: 550;
+}
+
+.sl-task span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sl-branch span {
@@ -918,13 +931,13 @@ button.sl-item:hover {
    Two fields (`[task] · [session]`) get more room. */
 .tab.renaming {
   flex: none;
-  width: clamp(120px, 100cqw - 96px, 210px);
+  width: clamp(120px, 100cqw - 96px, 240px);
   min-width: 0;
   max-width: none;
 }
 
 .tab.renaming-two {
-  width: clamp(150px, 100cqw - 96px, 340px);
+  width: clamp(150px, 100cqw - 96px, 400px);
 }
 
 .tab.renaming > .icon,
@@ -944,6 +957,27 @@ button.sl-item:hover {
   .tab.renaming,
   .tab.renaming-two {
     width: calc(100cqw - 8px);
+  }
+}
+
+/* A very narrow strip: the labels stay (which field renames the task and which only this tab
+   matters most here), just smaller and closer. */
+@container (max-width: 300px) {
+  .tab.renaming .inline-edit-tag {
+    font-size: 9.5px;
+    letter-spacing: 0;
+  }
+
+  .tab.renaming .inline-edit-fields {
+    gap: 3px;
+  }
+
+  .tab.renaming {
+    padding-left: 6px;
+  }
+
+  .tab.renaming .inline-edit {
+    padding: 0 3px !important;
   }
 }
 
@@ -1647,6 +1681,16 @@ textarea {
 .inline-edit-sep {
   flex: none;
   color: var(--text-faint);
+}
+
+/* "Task" / "Tab" before each rename field. */
+.inline-edit-tag {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  cursor: default;
 }
 
 /* With two fields, only the one being typed in is highlighted. */
@@ -2389,6 +2433,26 @@ textarea {
   pointer-events: none;
 }
 
+.toast-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+/* Read by screen readers only. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .toast {
   pointer-events: auto;
   display: flex;
@@ -2455,6 +2519,65 @@ textarea {
 .toast-x:hover {
   background: var(--hover-strong);
   color: var(--text);
+}
+
+/* The update banner (UpdateBanner.tsx): a toast that stays until it is acted on or dismissed. */
+.update-banner {
+  align-items: flex-start;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.update-banner .toast-dot {
+  margin-top: 4px;
+  background: var(--accent);
+}
+
+.update-banner.update-host .toast-dot {
+  background: var(--st-attn);
+}
+
+.update-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  line-height: 1.4;
+}
+
+.update-text strong {
+  font-weight: 650;
+}
+
+.update-text > span {
+  color: var(--text-muted);
+}
+
+.update-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 5px;
+}
+
+.update-actions .btn-primary kbd {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: transparent;
+  color: inherit;
+}
+
+.welcome-card[role="alertdialog"]:focus {
+  outline: none;
+}
+
+.splash-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
 }
 
 /* ---------------- empty window ---------------- */

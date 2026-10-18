@@ -29,6 +29,7 @@ import {
   windowParam,
 } from "./model.ts";
 import type { AgentState, Channel, SessionInfo, Win } from "./types.ts";
+import { newerPrefs } from "./model.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual);
@@ -492,4 +493,12 @@ Deno.test("confirmAfterUpsert disarms only when that session stops being busy", 
   assertEquals(confirmAfterUpsert(4, { id: 4, state: "idle" }, busy), null, "went idle");
   assertEquals(confirmAfterUpsert(4, { id: 5, state: "idle" }, busy), 4, "another session");
   assertEquals(confirmAfterUpsert(null, { id: 4, state: "idle" }, busy), null);
+});
+
+Deno.test("newerPrefs: a reply never undoes a later change", () => {
+  assertEquals(newerPrefs(null, { revision: 1 }), true);
+  assertEquals(newerPrefs({ revision: 2 }, { revision: 3 }), true);
+  assertEquals(newerPrefs({ revision: 3 }, { revision: 3 }), true, "the event of the same write");
+  assertEquals(newerPrefs({ revision: 4 }, { revision: 3 }), false, "older than an event seen");
+  assertEquals(newerPrefs({}, {}), true, "backends without revisions");
 });

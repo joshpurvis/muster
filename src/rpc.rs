@@ -100,7 +100,24 @@ pub fn hello(hub: &Hub) -> Value {
         "default_shell": default_shell(),
         "paused_deliveries": inject::paused(hub),
         "terminal_host": hub.terminal_host_info(),
+        "updates": hub.updates().status(),
+        "prefs": hub.ui_prefs(),
     })
+}
+
+/// Methods that restart or stop Muster: refused to paired devices and to calls made on a
+/// session's behalf (`from_session`, as the CLI sends inside a session); the MCP server has no
+/// tool for them and session tokens (MCP, hooks) can't reach this API. That is the whole
+/// guarantee: any process of this user that holds the client token (or runs `muster stop`
+/// itself) can still restart or stop Muster, as with `channel.set_permissions`.
+fn human_only(who: &Principal, method: &str, params: &Value) -> Result<(), RpcError> {
+    if !matches!(who, Principal::Local) {
+        return Err(RpcError(format!("{method} is only available on this computer")));
+    }
+    if params.get("from_session").is_some_and(|v| !v.is_null()) {
+        return Err(RpcError(format!("{method} can't be called from a session")));
+    }
+    Ok(())
 }
 
 /// May `who` call `method` with `params`? Client-token callers may call anything; a device
@@ -129,6 +146,28 @@ pub fn authorize(hub: &Hub, who: &Principal, method: &str, params: &Value) -> Re
 pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
     match method {
         "hello" => Ok(hello(hub)),
+
+        "daemon.reload" => {
+            human_only(who, method, &params)?;
+            #[derive(Deserialize)]
+            struct P {
+                /// The `updates.backend` id the human was offered.
+                expect: String,
+            }
+            let p: P = parse(params)?;
+            let exe = crate::updates::reload(hub, &p.expect).await?;
+            Ok(json!({ "exe": exe.to_string_lossy() }))
+        }
+        "daemon.shutdown" => {
+            human_only(who, method, &params)?;
+            crate::updates::shutdown(hub)?;
+            Ok(json!({}))
+        }
+        "prefs.get" => to_value(hub.ui_prefs()),
+        "prefs.set" => {
+            let p: UiPrefsChange = parse(params)?;
+            to_value(hub.set_ui_prefs(p)?)
+        }
 
         "workspace.add" => {
             #[derive(Deserialize)]
@@ -1606,5 +1645,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.0.contains("desktop client"), "{}", e.0);
+    }
+    #[tokio::test]
+    async fn restart_and_shutdown_are_human_only() {
+        let (hub, _st) = fixture();
+        let device = Principal::Device { id: 1 };
+        for method in ["daemon.reload", "daemon.shutdown"] {
+            assert!(crate::devices::method_scope(method).is_none(), "{method}");
+            let e = dispatch(&hub, &device, method, json!({})).await.unwrap_err();
+            assert!(e.0.contains("only available on this computer"), "{}", e.0);
+            let e = call(&hub, method, json!({"from_session": 2})).await.unwrap_err();
+            assert!(e.contains("can't be called from a session"), "{e}");
+        }
+        // Without the offered build, or a known launch path, nothing is started.
+        let e = call(&hub, "daemon.reload", json!({})).await.unwrap_err();
+        assert!(e.contains("invalid params"), "{e}");
+        let e = call(&hub, "daemon.reload", json!({"expect": "abcdefabcdef"})).await.unwrap_err();
+        assert!(e.contains("where it was launched from"), "{e}");
+        let h = call(&hub, "hello", json!({})).await.unwrap();
+        assert_eq!(h["updates"], json!({"ui_release": null, "backend": null, "host": null}));
+    }
+
+    #[tokio::test]
+    async fn window_prefs_persist_and_broadcast() {
+        let (hub, _st) = fixture();
+        let mut rx = hub.subscribe();
+        assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap(), json!({"decorations": true, "revision": 0}));
+        let set = json!({"decorations": false, "revision": 1});
+        assert_eq!(call(&hub, "prefs.set", json!({"decorations": false})).await.unwrap(), set);
+        assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["prefs"], set);
+        let ev = serde_json::to_value(rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ev, json!({"event": "prefs_changed", "data": set}));
+        // Fields not given stay (each write still counts); unknown ones are refused.
+        assert_eq!(call(&hub, "prefs.set", json!({})).await.unwrap(), json!({"decorations": false, "revision": 2}));
+        assert!(call(&hub, "prefs.set", json!({"theme": "dark"})).await.is_err());
     }
 }

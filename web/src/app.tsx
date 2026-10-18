@@ -11,6 +11,7 @@ import {
   agentsPanelOpen,
   applyEvent,
   applyHello,
+  daemonStopped,
   focusedSession,
   focusedSessionId,
   helloDone,
@@ -24,10 +25,12 @@ import {
   updateLayout,
   windowId,
   windowLostListeners,
+  windowPrefs,
   windowSessions,
   windowsSupported,
   workspaces,
 } from "./state.ts";
+import { canCloseWindow, isNative, setNativeDecorations } from "./native.ts";
 import * as terms from "./terms.ts";
 import * as A from "./actions.ts";
 import { installKeys } from "./keys.ts";
@@ -79,11 +82,25 @@ terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
   A.deliveriesNeedReview(h.paused_deliveries ?? []);
+  if (reconnect) A.backendRestarted();
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
   if (reconnect) terms.reattachAll();
 };
 rpc.onEvent = applyEvent;
+
+// Muster is shutting down (this window's "Shut down Muster", or another's): don't reconnect;
+// the stopped screen says how to start it again.
+effect(() => {
+  if (daemonStopped.value) rpc.suspend();
+});
+
+// The system title bar follows the shared preference in every native window (new windows are
+// built with it already).
+effect(() => {
+  const p = windowPrefs.value;
+  if (p && isNative) setNativeDecorations(p.decorations);
+});
 
 windowLostListeners.push(() => A.claimWindow());
 addEventListener("focus", () => A.windowFocused());
@@ -216,8 +233,37 @@ function EmptyWindow() {
   );
 }
 
+/** After `daemon_stopping`: replaces whatever had focus (maybe a terminal), so it takes the
+ * focus and is announced as an alert dialog. */
+function Stopped() {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => ref.current?.focus(), []);
+  return (
+    <div class="splash">
+      <div
+        ref={ref}
+        class="welcome-card"
+        role="alertdialog"
+        aria-labelledby="stopped-title"
+        aria-describedby="stopped-text"
+        tabIndex={-1}
+      >
+        <h1 id="stopped-title">Muster is shut down</h1>
+        <p id="stopped-text">
+          Every session has ended. Run <code>muster</code> to start it again, then reconnect.
+        </p>
+        <div class="splash-actions">
+          {canCloseWindow() && <button type="button" class="btn" onClick={() => A.closeWindow()}>Close window</button>}
+          <button type="button" class="btn btn-primary" onClick={() => location.reload()}>Reconnect</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Splash() {
   const s = connStatus.value;
+  if (daemonStopped.value) return <Stopped />;
   if (s === "incompatible") {
     return <div class="splash"><div class="welcome-card"><h1>UI update required</h1>
       <p>Install a UI compatible with this backend, then refresh. Your terminals remain running.</p>
@@ -250,7 +296,7 @@ function Splash() {
 
 function App() {
   const ready = helloDone.value && (!windowsSupported.value || windowId.value !== null);
-  if (!ready || connStatus.value === "incompatible") {
+  if (!ready || connStatus.value === "incompatible" || daemonStopped.value) {
     return (
       <>
         <Splash />

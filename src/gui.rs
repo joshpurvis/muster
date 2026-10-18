@@ -36,12 +36,41 @@ pub fn run_window(
     browser_url: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
-    native::run(&d.base_url(), &d.token, window, browser_url);
+    native::run(&d.base_url(), &d.token, window, decorations(d), browser_url);
     #[cfg(not(feature = "gui"))]
     {
         let _ = (d, window);
         open_browser(&browser_url()?)
     }
+}
+
+/// The shared "system title bar" preference (`prefs.get`), read before the window is built so
+/// it never appears with the wrong frame. An older daemon without it: shown.
+#[cfg(feature = "gui")]
+fn decorations(d: &crate::paths::Discovery) -> bool {
+    crate::client::rpc_with_timeout(d, "prefs.get", serde_json::json!({}), std::time::Duration::from_secs(3))
+        .ok()
+        .and_then(|p| p["decorations"].as_bool())
+        .unwrap_or(true)
+}
+
+/// A message the page sends the native window (`window.ipc.postMessage`, JSON).
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+pub enum IpcMessage {
+    /// Show or hide the system title bar (`{"decorations": bool}`).
+    Decorations(bool),
+    /// Close this window (`{"close": true}`).
+    Close,
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn parse_ipc(body: &str) -> Option<IpcMessage> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if let Some(d) = v.get("decorations").and_then(|d| d.as_bool()) {
+        return Some(IpcMessage::Decorations(d));
+    }
+    (v.get("close") == Some(&serde_json::Value::Bool(true))).then_some(IpcMessage::Close)
 }
 
 /// Re-exec `muster native-window [--window N]` in its own session. Its stderr goes to the
@@ -64,8 +93,9 @@ fn spawn_window_process(window: Option<i64>) -> anyhow::Result<()> {
 
 /// Script run before the page's own scripts on every load of the native window: puts the
 /// client token where the frontend keeps it (rpc.ts reads `sessionStorage["muster.token"]`)
-/// and the window to claim in `sessionStorage["muster.window"]`, only on the daemon's own
-/// origin.
+/// and the window to claim in `sessionStorage["muster.window"]`, and tells the page which
+/// `window.ipc` messages this window understands (`__musterNative.ipc`, see `parse_ipc`), only
+/// on the daemon's own origin.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn init_script(origin: &str, token: &str, window: Option<i64>) -> String {
     let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
@@ -73,7 +103,7 @@ pub fn init_script(origin: &str, token: &str, window: Option<i64>) -> String {
         format!("sessionStorage.setItem(\"muster.window\",{});", q(&w.to_string()))
     });
     format!(
-        "(function(){{try{{if(location.origin==={o}){{sessionStorage.setItem(\"muster.token\",{t});{win}}}}}catch(e){{}}}})();",
+        "(function(){{try{{if(location.origin==={o}){{window.__musterNative={{ipc:1}};sessionStorage.setItem(\"muster.token\",{t});{win}}}}}catch(e){{}}}})();",
         o = q(origin),
         t = q(token)
     )
@@ -150,13 +180,23 @@ mod native {
     use tao::window::WindowBuilder;
     use wry::{NewWindowResponse, WebViewBuilder};
 
+    use super::IpcMessage;
+
+    /// What reaches the event loop from the webview's handlers.
+    enum UserEvent {
+        Title(String),
+        Ipc(IpcMessage),
+    }
+
     /// Runs the native window; never returns (tao's event loop exits the process). The window
     /// title follows the page's `document.title` (`muster · <window name>`), which is how the
-    /// window-manager helpers behind `window.raise` find it.
+    /// window-manager helpers behind `window.raise` find it. `decorations`: start with the
+    /// system title bar; the page toggles it later (and closes the window) over `window.ipc`.
     pub fn run(
         base_url: &str,
         token: &str,
         window_id: Option<i64>,
+        decorations: bool,
         browser_url: impl FnOnce() -> anyhow::Result<String>,
     ) -> ! {
         let origin = base_url.trim_end_matches('/').to_string();
@@ -184,12 +224,15 @@ mod native {
             // SAFETY: called before the event loop or any other thread of this process starts.
             unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
         }
-        // User events carry document title changes into the event loop.
-        let event_loop = EventLoopBuilder::<String>::with_user_event().build();
+        // User events carry document title changes and the page's messages into the event loop.
+        let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
         let proxy = event_loop.create_proxy();
+        let ipc_proxy = event_loop.create_proxy();
+        let ipc_origin = origin.clone();
         let window = match WindowBuilder::new()
             .with_title("muster")
             .with_inner_size(LogicalSize::new(1400.0, 900.0))
+            .with_decorations(decorations)
             .build(&event_loop)
         {
             Ok(w) => w,
@@ -200,7 +243,19 @@ mod native {
             .with_url(&url)
             .with_devtools(cfg!(debug_assertions))
             .with_document_title_changed_handler(move |title| {
-                let _ = proxy.send_event(title);
+                let _ = proxy.send_event(UserEvent::Title(title));
+            })
+            // Only the daemon's own pages may steer the window. WebKitGTK reports the top-level
+            // page's URI here, not the sending frame's: the UI has no iframes, but one added
+            // later would need a per-frame capability before these messages could be trusted.
+            .with_ipc_handler(move |req| {
+                let from = req.uri().to_string();
+                if from != ipc_origin && !from.starts_with(&format!("{ipc_origin}/")) {
+                    return;
+                }
+                if let Some(m) = super::parse_ipc(req.body()) {
+                    let _ = ipc_proxy.send_event(UserEvent::Ipc(m));
+                }
             })
             // Links that try to open a new window go to the system browser.
             .with_new_window_req_handler(|target, _features| {
@@ -238,7 +293,9 @@ mod native {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => *control_flow = ControlFlow::Exit,
-                Event::UserEvent(title) if !title.trim().is_empty() => window.set_title(&title),
+                Event::UserEvent(UserEvent::Title(title)) if !title.trim().is_empty() => window.set_title(&title),
+                Event::UserEvent(UserEvent::Ipc(IpcMessage::Decorations(on))) => window.set_decorations(on),
+                Event::UserEvent(UserEvent::Ipc(IpcMessage::Close)) => *control_flow = ControlFlow::Exit,
                 _ => {}
             }
         })
@@ -253,7 +310,19 @@ mod tests {
         assert!(s.contains(r#"location.origin==="http://127.0.0.1:7433""#), "{s}");
         assert!(s.contains(r#"sessionStorage.setItem("muster.token","ab\"c")"#), "{s}");
         assert!(!s.contains("muster.window"), "{s}");
+        assert!(s.contains("window.__musterNative={ipc:1};"), "{s}");
         let s = super::init_script("http://127.0.0.1:7433", "t", Some(3));
         assert!(s.contains(r#"sessionStorage.setItem("muster.window","3");"#), "{s}");
+    }
+
+    #[test]
+    fn ipc_messages() {
+        use super::{IpcMessage, parse_ipc};
+        assert_eq!(parse_ipc(r#"{"decorations":false}"#), Some(IpcMessage::Decorations(false)));
+        assert_eq!(parse_ipc(r#"{"decorations":true}"#), Some(IpcMessage::Decorations(true)));
+        assert_eq!(parse_ipc(r#"{"close":true}"#), Some(IpcMessage::Close));
+        for junk in [r#"{"close":1}"#, r#"{"decorations":"no"}"#, "close", "{}", ""] {
+            assert_eq!(parse_ipc(junk), None, "{junk}");
+        }
     }
 }

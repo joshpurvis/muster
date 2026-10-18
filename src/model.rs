@@ -349,6 +349,33 @@ pub struct InboxItem {
     pub since: i64,
 }
 
+/// Where `UiPrefs` are kept (`runtime_state`).
+pub const UI_PREFS_KEY: &str = "ui-prefs";
+
+/// Preferences every window shares, kept by the backend so a new native window knows them
+/// before it is built (`prefs.get` / `prefs.set`). Per-viewer prefs stay in localStorage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// Native windows show the system title bar.
+    pub decorations: bool,
+    /// Raised by every `prefs.set`, so a client can tell a stale reply from a newer change.
+    pub revision: u64,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self { decorations: true, revision: 0 }
+    }
+}
+
+/// `prefs.set`: only the fields given change.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiPrefsChange {
+    pub decorations: Option<bool>,
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

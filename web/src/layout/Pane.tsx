@@ -565,7 +565,9 @@ function GroupTab(
           <InlineEdit
             fields={edit.map((f) => ({
               value: f.value,
-              label: f.key === "task" ? "Task name" : "Session name",
+              // In the UI a session is a tab.
+              label: f.key === "task" ? "Task name" : "Tab name",
+              tag: f.key === "task" ? "Task" : "Tab",
             }))}
             focus={Math.max(0, edit.findIndex((f) => f.key === r!.fields.focus))}
             class="tab-edit"

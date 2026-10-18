@@ -14,9 +14,11 @@ import {
   setPref,
   toast,
   windowId,
+  windowPrefs,
   windowsSupported,
 } from "./state.ts";
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
+import { canCloseWindow, isNative } from "./native.ts";
 import { isMac } from "./util.ts";
 
 export interface KeySpec {
@@ -319,6 +321,36 @@ export const commands: Command[] = [
     group: "Window",
     enabled: () => windowId.value !== null,
     run: () => (overlay.value = { kind: "rename_window" }),
+  },
+  {
+    id: "reload-window",
+    title: "Reload window",
+    group: "Window",
+    // Plain Ctrl+R stays with the terminal (shell history search).
+    keys: ["Ctrl+Shift+R"],
+    run: () => A.reloadWindow(),
+  },
+  {
+    id: "close-window",
+    title: "Close window",
+    group: "Window",
+    enabled: canCloseWindow,
+    run: () => A.closeWindow(),
+  },
+  {
+    id: "title-bar",
+    get title() {
+      return `System title bar: ${windowPrefs.value?.decorations !== false ? "on (turn off)" : "off (turn on)"}`;
+    },
+    group: "Window",
+    enabled: () => isNative && windowPrefs.value !== null,
+    run: () => A.setDecorations(windowPrefs.value?.decorations === false),
+  },
+  {
+    id: "shutdown",
+    title: "Shut down Muster…",
+    group: "Window",
+    run: () => (overlay.value = { kind: "shutdown" }),
   },
 
   // Agents

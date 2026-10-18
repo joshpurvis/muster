@@ -32,16 +32,20 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
+  daemonStopped,
   dismissToastKey,
+  saveLayoutNow,
   toast,
   updateLayout,
   windowId,
   windowOfSession,
   windows,
+  windowPrefs,
   windowsSupported,
   workspaceById,
   workspaces,
 } from "./state.ts";
+import * as native from "./native.ts";
 import type {
   Agent,
   Channel,
@@ -53,6 +57,7 @@ import type {
   SessionKind,
   Win,
   WindowId,
+  WindowPrefs,
   Workspace,
 } from "./types.ts";
 import {
@@ -87,6 +92,7 @@ import {
   basename,
   mainSession,
   moveChannelLocally,
+  newerPrefs,
   nextInCycle,
   renameChanges,
   renameFields,
@@ -813,6 +819,100 @@ export function openFind() {
 
 export function openJump(initial = "") {
   overlay.value = { kind: "jump", initial };
+}
+
+// ---------- window and Muster lifecycle ----------
+
+/** Save a layout change that is still waiting, but never hold the page up for long. */
+function settleLayout(): Promise<unknown> {
+  return Promise.race([saveLayoutNow(), new Promise((r) => setTimeout(r, 500))]);
+}
+
+/** Ctrl+Shift+R: reload this window, which also loads the active UI release. */
+export function reloadWindow() {
+  settleLayout().finally(() => location.reload());
+}
+
+/** Close this window only; its tabs stay in it for the next `muster`. */
+export async function closeWindow() {
+  await settleLayout();
+  if (!(await native.closeWindow())) toast("warn", "This browser won't let Muster close the window. Close it yourself.");
+}
+
+/** Show or hide the native windows' system title bar (every window, and new ones). Shown at
+ * once here; the backend's answer (and its `prefs_changed`) is the last word, unless another
+ * window changed it since (a higher revision). */
+export function setDecorations(on: boolean) {
+  const prev = windowPrefs.value;
+  const mine = prev ? { ...prev, decorations: on } : null;
+  if (mine) windowPrefs.value = mine;
+  rpc.call<WindowPrefs>("prefs.set", { decorations: on })
+    .then((p) => {
+      if (newerPrefs(windowPrefs.value, p)) windowPrefs.value = p;
+    })
+    .catch((e) => {
+      // Undo only our own guess, never a change that arrived meanwhile.
+      if (windowPrefs.value === mine) windowPrefs.value = prev;
+      toast("error", `Couldn't change the title bar: ${errText(e)}`);
+    });
+}
+
+/** A backend restart is under way (from the update banner), until the new backend answers. */
+export const restartingBackend = signal(false);
+let restartTimer = 0;
+
+/** Lifecycle requests are never queued for a later connection: by then they may mean
+ * something else (another backend, another build). */
+function connectedFor(what: string): boolean {
+  if (rpc.isOpen) return true;
+  toast("warn", `Not connected to Muster; ${what} once the window has reconnected.`);
+  return false;
+}
+
+/** Restart the backend into build `expect` (the `updates.backend` id the banner offered;
+ * `daemon.reload`): terminals keep running and this page reconnects. The backend refuses a
+ * build other than the offered one, or the one it already runs; a restart the CLI refuses comes
+ * back as a notice. */
+export async function restartBackend(expect: string) {
+  if (restartingBackend.value || !connectedFor("restart the backend")) return;
+  restartingBackend.value = true;
+  clearTimeout(restartTimer);
+  // A restart that never happens (refused, see the notice) frees the button again.
+  restartTimer = setTimeout(() => (restartingBackend.value = false), 30000);
+  try {
+    await rpc.call("daemon.reload", { expect });
+  } catch (e) {
+    // The old backend may go away before it answers: that is the restart working.
+    if (/connection lost/i.test(errText(e))) return;
+    restartingBackend.value = false;
+    toast("error", `Couldn't restart the backend: ${errText(e)}`);
+  }
+}
+
+/** A new backend answered (after a restart). */
+export function backendRestarted() {
+  clearTimeout(restartTimer);
+  restartingBackend.value = false;
+}
+
+/** "Shut down Muster": stop the backend and the terminal host, ending every session. Only the
+ * backend's answer or its `daemon_stopping` says it is happening; a dropped connection is not
+ * taken as a shutdown (the window keeps reconnecting). */
+export async function shutDown() {
+  if (!connectedFor("shut down")) return;
+  try {
+    await rpc.call("daemon.shutdown");
+    daemonStopped.value = true;
+  } catch (e) {
+    // `daemon_stopping` (which suspends this page's connection) usually arrives before the reply.
+    if (daemonStopped.value) return;
+    toast(
+      "error",
+      /connection lost/i.test(errText(e))
+        ? "The connection dropped before Muster answered; it may not have shut down."
+        : `Couldn't shut down Muster: ${errText(e)}`,
+    );
+  }
 }
 
 // ---------- named agents (docs/UI.md "Agents panel") ----------

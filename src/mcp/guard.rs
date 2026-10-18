@@ -347,6 +347,7 @@ pub fn aggregate_state<I: IntoIterator<Item = AgentState>>(states: I) -> &'stati
 #[cfg(test)]
 pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionInfo {
     SessionInfo {
+        account_profile_id: None,
         id,
         channel_id: 1,
         kind: crate::model::SessionKind::Shell,

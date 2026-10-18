@@ -8,7 +8,7 @@
     "build": "rm -rf dist && deno bundle --platform=browser --minify --outdir=dist src/app.tsx && cp index.html muster-ui.json dist/ && deno bundle --platform=browser --minify --output=dist/m/app.js src/m/main.tsx && cp m/index.html m/manifest.webmanifest m/sw.js m/*.png m/icon.svg dist/m/",
     "build:dev": "rm -rf dist && deno bundle --platform=browser --sourcemap=linked --outdir=dist src/app.tsx && cp index.html muster-ui.json dist/ && deno bundle --platform=browser --sourcemap=linked --output=dist/m/app.js src/m/main.tsx && cp m/index.html m/manifest.webmanifest m/sw.js m/*.png m/icon.svg dist/m/",
     "watch": "deno bundle --platform=browser --sourcemap=linked --watch --outdir=dist src/app.tsx",
-    "check": "deno check src/app.tsx src/m/main.tsx src/layout/tree_test.ts src/model_test.ts src/agents_test.ts src/updates_test.ts dev/mock.ts dev/e2e.ts dev/recovery.ts && deno lint",
+    "check": "deno check src/app.tsx src/m/main.tsx src/layout/tree_test.ts src/model_test.ts src/agents_test.ts src/updates_test.ts src/account_profiles_test.ts dev/mock.ts dev/e2e.ts dev/recovery.ts dev/account_profiles.ts && deno lint",
     "test": "deno test src/",
     "mock": "deno run --allow-net=127.0.0.1 --allow-read=.,/tmp,$HOME --allow-run=script,git --allow-env=HOME,PATH,LANG,MOCK_PORT dev/mock.ts"
   },

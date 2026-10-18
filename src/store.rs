@@ -286,6 +286,19 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // v12: record MCP-created channels atomically with their creation.
     "CREATE TABLE mcp_channels(channel_id INTEGER PRIMARY KEY);",
+    // v13: local Claude configuration references, never provider credentials.
+    r#"
+    CREATE TABLE account_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        config_dir TEXT NOT NULL UNIQUE,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE workspaces ADD COLUMN account_profile_id INTEGER;
+    ALTER TABLE sessions ADD COLUMN account_profile_id INTEGER;
+    ALTER TABLE agents ADD COLUMN account_profile_id INTEGER;
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -440,7 +453,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -462,6 +475,7 @@ impl Store {
                 created_at: r.get(11)?,
                 channel_id: r.get(12)?,
                 autostart: r.get::<_, i64>(13)? != 0,
+                account_profile_id: r.get(14)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -473,8 +487,8 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -488,7 +502,8 @@ impl Store {
                 b.resume_id,
                 b.created_at,
                 b.channel_id,
-                b.autostart as i64
+                b.autostart as i64,
+                b.account_profile_id
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -779,11 +794,46 @@ impl Store {
         Ok(n.max(0) as usize)
     }
 
+    // ----- Claude account profile references -----
+
+    pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
+        let rows = statement.query_map([], |r| Ok(crate::account_profiles::AccountProfile {
+            id: r.get(0)?, name: r.get(1)?, config_dir: r.get(2)?,
+            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?,
+        }))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn insert_account_profile(&self, name: &str, config_dir: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute("INSERT INTO account_profiles(name, config_dir, created_at) VALUES (?1, ?2, ?3)",
+            params![name, config_dir, now_ms()])
+            .context("profile name or directory is already registered")?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_account_profile(&self, id: i64, name: Option<&str>, enabled: Option<bool>) -> anyhow::Result<()> {
+        let changed = self.conn.lock().execute(
+            "UPDATE account_profiles SET name=COALESCE(?2, name), enabled=COALESCE(?3, enabled) WHERE id=?1",
+            params![id, name, enabled.map(i64::from)],
+        )?;
+        anyhow::ensure!(changed == 1, "no such account profile: {id}");
+        Ok(())
+    }
+
+    pub fn set_workspace_account_profile(&self, id: WorkspaceId, profile: Option<i64>) -> anyhow::Result<()> {
+        let changed = self.conn.lock().execute("UPDATE workspaces SET account_profile_id=?2 WHERE id=?1", params![id, profile])?;
+        anyhow::ensure!(changed == 1, "no such workspace: {id}");
+        Ok(())
+    }
+
     // ----- workspaces -----
 
     pub fn load_workspaces(&self) -> anyhow::Result<Vec<Workspace>> {
         let conn = self.conn.lock();
-        let mut st = conn.prepare("SELECT id, name, path, is_git, created_at FROM workspaces ORDER BY id")?;
+        let mut st = conn.prepare("SELECT id, name, path, is_git, created_at, account_profile_id FROM workspaces ORDER BY id")?;
         let rows = st.query_map([], |r| {
             Ok(Workspace {
                 id: r.get(0)?,
@@ -791,6 +841,7 @@ impl Store {
                 path: r.get(2)?,
                 is_git: r.get::<_, i64>(3)? != 0,
                 created_at: r.get(4)?,
+                account_profile_id: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -991,7 +1042,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
-                    exit_code, cols, rows, queued, extra_args, created_at, window_id FROM sessions ORDER BY id",
+                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -1020,6 +1071,7 @@ impl Store {
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
+                    account_profile_id: r.get(18)?,
                 },
                 extra_args: serde_json::from_str(&extra).unwrap_or_default(),
             })
@@ -1033,8 +1085,8 @@ impl Store {
         let i = &s.info;
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
-                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -1052,7 +1104,8 @@ impl Store {
                 i.queued,
                 serde_json::to_string(&s.extra_args).unwrap_or_else(|_| "[]".into()),
                 i.created_at,
-                i.window_id
+                i.window_id,
+                i.account_profile_id
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -1369,6 +1422,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_references_survive_session_updates_and_workspace_default_changes() {
+        let store = Store::open_memory().unwrap();
+        let a = store.insert_account_profile("Personal", "/fixture/personal").unwrap();
+        let b = store.insert_account_profile("Work", "/fixture/work").unwrap();
+        assert!(store.insert_account_profile("personal", "/fixture/another").is_err());
+        assert!(store.insert_account_profile("Alias", "/fixture/personal").is_err());
+        let ws = store.insert_workspace("repo", "/fixture/repo", false, 1).unwrap();
+        assert_eq!(store.load_workspaces().unwrap()[0].account_profile_id, None);
+        store.set_workspace_account_profile(ws, Some(a)).unwrap();
+        let mut info = crate::mcp::guard::test_session(0, None);
+        info.kind = SessionKind::Claude;
+        info.account_profile_id = Some(a);
+        info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
+        store.set_workspace_account_profile(ws, Some(b)).unwrap();
+        info.name = "renamed session".into();
+        store.update_session(&info).unwrap();
+        store.update_account_profile(a, Some("Renamed personal"), Some(false)).unwrap();
+        assert_eq!(store.load_sessions().unwrap()[0].info.account_profile_id, Some(a));
+        assert_eq!(store.load_workspaces().unwrap()[0].account_profile_id, Some(b));
+        let profile = store.account_profiles().unwrap().into_iter().find(|p| p.id == a).unwrap();
+        assert_eq!(profile.config_dir, "/fixture/personal");
+        assert!(!profile.enabled);
+    }
+
+    #[test]
+    fn profile_migration_keeps_legacy_sessions_on_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..12] { conn.execute_batch(sql).unwrap(); }
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn.execute_batch("INSERT INTO sessions(id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
+            VALUES (1, 1, 'claude', 'old', '/fixture', 'exited', 0, 80, 24, 0);").unwrap();
+        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        store.migrate().unwrap();
+        assert_eq!(store.load_sessions().unwrap()[0].info.account_profile_id, None);
+        assert!(store.account_profiles().unwrap().is_empty());
+        store.migrate().unwrap();
+        assert_eq!(store.load_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
     fn hook_session_state_and_cursor_commit_or_roll_back_together() {
         let store = Store::open_memory().unwrap();
         let mut info = crate::mcp::guard::test_session(0, None);
@@ -1544,6 +1637,7 @@ mod tests {
         assert_eq!(count(&s, "PRAGMA user_version"), MIGRATIONS.len() as i64);
         assert!(s.load_agents().unwrap().is_empty());
         let mut b = Agent {
+            account_profile_id: None,
             id: 0,
             name: "Scout".into(),
             kind: SessionKind::Codex,

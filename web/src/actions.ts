@@ -46,12 +46,14 @@ import {
   workspaces,
 } from "./state.ts";
 import * as native from "./native.ts";
+import { inheritedProfile } from "./account_profiles.ts";
 import type {
   Agent,
   Channel,
   ChannelId,
   Decision,
   Permissions,
+  ProfileChoice,
   SessionId,
   SessionInfo,
   SessionKind,
@@ -454,6 +456,7 @@ export async function spawn(
     const s = await rpc.call<SessionInfo>("session.spawn", {
       channel_id: ch,
       kind,
+      account_profile: inheritedProfile(kind, sessionOfGroup(at.group)),
       prompt: prompt || undefined,
       window_id: windowId.value ?? undefined,
       ...grid,
@@ -654,6 +657,7 @@ export async function ensureWorkspace(path: string): Promise<Workspace> {
 }
 
 export interface NewTabReq {
+  account_profile?: ProfileChoice;
   /** Folder: an existing workspace, or a path (added as a workspace when new). */
   workspace_id?: number;
   path?: string;
@@ -691,6 +695,7 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
       worktree: req.worktree,
       base: req.base?.trim() || undefined,
       agent: req.agent,
+      account_profile: req.account_profile,
       prompt: req.prompt?.trim() || undefined,
       permissions: req.permissions,
       window_id: here ?? undefined,
@@ -721,11 +726,15 @@ function agentOf(ch: ChannelId): SessionKind | null {
 
 /** The task of group `group`'s active tab (default: the focused tab's). */
 function taskOfGroup(group?: string): Channel | null {
+  const s = sessionOfGroup(group);
+  return s ? channelById.value.get(s.channel_id) ?? null : null;
+}
+
+function sessionOfGroup(group?: string): SessionInfo | undefined {
   const l = layout.value;
   const p = group && l ? findPane(l.root, group) : null;
   const sid = p?.active ?? focusedSession.value?.id ?? null;
-  const s = sid !== null ? sessions.value.get(sid) : undefined;
-  return s ? channelById.value.get(s.channel_id) ?? null : null;
+  return sid !== null ? sessions.value.get(sid) : undefined;
 }
 
 /**
@@ -749,6 +758,7 @@ export function newTabHere(opts: { worktree?: boolean; agent?: SessionKind; grou
     workspace_id: c.workspace_id,
     path: ws?.path,
     agent,
+    account_profile: inheritedProfile(agent, sessionOfGroup(opts.group)),
     worktree: !!opts.worktree,
     group: opts.group,
   })

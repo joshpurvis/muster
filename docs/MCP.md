@@ -264,3 +264,13 @@ MCP guard state is durable application state. Rate-limit reservations are saved 
 agent actions; a failed persistence write refuses the action. Backend replacement
 restores rate windows, send/delivery markers, created-channel membership and remembered
 spawn depths. This state is independent of terminal-host lifetime and protocol.
+
+## Claude profile inheritance
+
+`whoami` and `list_sessions` include the session's nullable `account_profile_id` (a Muster
+configuration-directory reference, not verified account identity). A Claude child created
+by `spawn_session` inherits its calling Claude session's pinned profile, including Default.
+If the caller is not Claude, the target workspace default applies. This also holds when the
+tool creates a new channel. Disabled/missing profiles fail without falling back to another
+account. Named agents keep their own creation-time profile when started through `ask_agent`.
+Profile registration and manual selection are available through the desktop/CLI, not MCP.

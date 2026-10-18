@@ -110,6 +110,9 @@ pub struct Workspace {
     pub path: String,
     pub is_git: bool,
     pub created_at: i64,
+    /// Default for new Claude sessions only. Existing sessions retain their selection.
+    #[serde(default)]
+    pub account_profile_id: Option<crate::account_profiles::ProfileId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +254,9 @@ pub struct SessionInfo {
     pub id: SessionId,
     pub channel_id: ChannelId,
     pub kind: SessionKind,
+    /// Immutable launch selection. None preserves ordinary inherited Claude behavior.
+    #[serde(default)]
+    pub account_profile_id: Option<crate::account_profiles::ProfileId>,
     pub name: String,
     pub cwd: String,
     pub state: AgentState,

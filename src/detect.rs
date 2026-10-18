@@ -212,6 +212,7 @@ mod tests {
 
     fn info(kind: SessionKind, state: AgentState, since: i64) -> SessionInfo {
         SessionInfo {
+            account_profile_id: None,
             id: 1,
             channel_id: 1,
             kind,

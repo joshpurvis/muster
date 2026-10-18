@@ -99,7 +99,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_session",
             "Spawn session",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 8 live children per caller, 24 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -313,6 +313,7 @@ fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
         "id": s.id,
         "channel_id": s.channel_id,
         "kind": s.kind,
+        "account_profile_id": s.account_profile_id,
         "name": s.name,
         "state": s.state,
         "detail": s.state_detail,
@@ -796,6 +797,7 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
                 .channel(me.channel_id)
                 .ok_or("your channel no longer exists")?;
             Ok(CreateChannel {
+                account_profile: None,
                 workspace_id: my_ch.workspace_id,
                 name: ch_name,
                 worktree: nc.bool("worktree")?.unwrap_or(true),
@@ -829,6 +831,7 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
     };
 
     let req = SpawnSession {
+        account_profile: None,
         channel_id: channel.id,
         kind,
         name,

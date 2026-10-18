@@ -94,6 +94,8 @@ pub fn parse_accepts(s: &str) -> anyhow::Result<Vec<Origin>> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
+    /// Pinned for the agent's lifetime, so its resume ID never crosses configuration dirs.
+    pub account_profile_id: Option<crate::account_profiles::ProfileId>,
     pub id: i64,
     pub name: String,
     pub kind: SessionKind,
@@ -1104,6 +1106,8 @@ fn clean_opt(o: Option<String>) -> Option<String> {
 /// `agent.create` / `muster agent new`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewAgent {
+    #[serde(default)]
+    pub account_profile: Option<crate::account_profiles::ProfileChoice>,
     pub name: String,
     #[serde(default)]
     pub kind: Option<SessionKind>,
@@ -1127,6 +1131,10 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     let name = req.name.trim().to_string();
     check_name(&name)?;
     let kind = req.kind.unwrap_or(SessionKind::Claude);
+    anyhow::ensure!(kind == SessionKind::Claude || req.account_profile.is_none(),
+        "account_profile is only supported for Claude agents");
+    let account_profile_id = req.account_profile.and_then(|p| p.id());
+    hub.check_account_profile(account_profile_id)?;
     let (model, effort) = (clean_opt(req.model), clean_opt(req.effort));
     agent_args(kind, model.as_deref(), effort.as_deref(), None)?;
     let accepts = match req.accepts {
@@ -1144,6 +1152,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     let a = hub.agents().insert(
         hub.store(),
         Agent {
+            account_profile_id,
             id: 0,
             name,
             kind,
@@ -1288,6 +1297,18 @@ pub async fn start(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Windo
 async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>) -> anyhow::Result<AgentSession> {
     let _one = hub.agents().start_lock.lock().await;
     let mut agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
+    // Disabling a profile prevents new runs, not messages to an already running agent.
+    if !fresh
+        && let Some(sid) = agent.session_id
+        && let Some(session) = hub.session(sid)
+        && hub.channel(session.channel_id).is_some_and(|c| !c.archived)
+        && session.state != AgentState::Exited
+        && hub.live_session_ids().contains(&sid)
+    {
+        return Ok(AgentSession { agent, session, started: false });
+    }
+    // Before fresh clears the resume ID, or a restart touches a live process.
+    hub.check_account_profile(agent.account_profile_id)?;
     if fresh {
         hub.agents().update(hub.store(), agent.id, |b| b.resume_id = None)?;
         agent.resume_id = None;
@@ -1324,6 +1345,7 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
             let ws = hub.add_workspace(dir.to_string_lossy().into_owned(), Some("agents".into())).await?;
             let c = hub
                 .create_channel(CreateChannel {
+                    account_profile: None,
                     workspace_id: ws.id,
                     name: Some(agent.name.clone()),
                     worktree: false,
@@ -1347,6 +1369,7 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
     };
     let session = hub
         .spawn_session(SpawnSession {
+            account_profile: (agent.kind == SessionKind::Claude).then(|| crate::account_profiles::ProfileChoice::pinned(agent.account_profile_id)),
             channel_id: channel.id,
             kind: agent.kind,
             name: Some(agent.name.clone()),
@@ -1633,6 +1656,7 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "id": b.id,
         "name": b.name,
         "kind": b.kind,
+        "account_profile_id": b.account_profile_id,
         "model": b.model,
         "effort": b.effort,
         "persona": b.persona,
@@ -2079,6 +2103,7 @@ mod tests {
 
     fn agent(kind: SessionKind) -> Agent {
         Agent {
+            account_profile_id: None,
             id: 1,
             name: "ada".into(),
             kind,

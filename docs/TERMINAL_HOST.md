@@ -84,7 +84,7 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: durable MCP guard recovery; stable helper executable paths;
+Remaining before completion: stable helper executable paths;
 additional crash-window tests and code review, including retired-run cleanup
 and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.
@@ -130,3 +130,17 @@ Validation: 234 Rust tests, all 154 full smoke checks, and 31 focused survival c
 including helper invocation during an outage, a lost inbox acknowledgement, and old
 run callback rejection. Further review still needs to cover concurrent prompt/hook
 ordering and reconstruction of transient detector/subagent state.
+
+### MCP recovery checkpoint
+
+MCP rate reservations, send/delivery markers and remembered spawn ancestry now persist
+before agent work. MCP-created channel origin commits with its channel row, closing
+the crash window before the guard snapshot is updated. Constructor recovery restores
+missing child depths from their persisted parent records. Persistence failures refuse
+new work. Errors after durable prompt acceptance retain the message attribution and
+rate reservation, because they do not prove that no input ran.
+
+Validation: 237 Rust tests, including replacement with exhausted rate limits, a removed
+parent and lost child acknowledgement, persistence failure, and pending-delivery errors.
+The focused process-boundary suite also passes all 32 checks, including a real backend
+crash with an exhausted MCP rate window. The original live installation remains untouched.

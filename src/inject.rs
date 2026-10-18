@@ -44,6 +44,17 @@ pub struct SendOutcome {
     pub queued: u32,
 }
 
+/// The prompt was accepted into the durable queue. An error after that point is not
+/// evidence that no input ran; retain its attribution and accounting until review.
+#[derive(Debug)]
+pub struct DeliveryPending;
+impl std::fmt::Display for DeliveryPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("prompt retained in the durable queue; inspect delivery status before retrying")
+    }
+}
+impl std::error::Error for DeliveryPending {}
+
 const SETTLE: Duration = Duration::from_millis(350);
 const SUBMIT_DELAY_MIN: Duration = Duration::from_millis(120);
 const VERIFY_FOR: Duration = Duration::from_millis(3000);
@@ -307,7 +318,7 @@ pub async fn send(
             delivered: false,
             queued: queue_len(hub, id),
         }),
-        Err(e) => Err(e),
+        Err(e) => Err(e.context(DeliveryPending)),
     }
 }
 

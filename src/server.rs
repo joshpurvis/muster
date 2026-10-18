@@ -18,8 +18,8 @@ use tokio::sync::broadcast;
 use crate::devices::{self, Device, Principal};
 use crate::hub::{Hub, ServerEvent};
 
-pub fn router(hub: Arc<Hub>) -> Router {
-    Router::new()
+pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
+    Ok(Router::new()
         .route("/api/health", get(health))
         .route("/api/rpc", post(rpc_http))
         .route("/api/events", get(events_stream))
@@ -31,9 +31,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
         .with_state(hub.clone())
-        .nest("/mcp", crate::mcp::router(hub.clone()))
+        .nest("/mcp", crate::mcp::router(hub.clone())?)
         .fallback(crate::assets::serve)
-        .layer(axum::middleware::from_fn_with_state(hub, classify))
+        .layer(axum::middleware::from_fn_with_state(hub, classify)))
 }
 
 /// How a request reached the daemon (docs/ANDROID.md "Security model").
@@ -659,7 +659,7 @@ mod tests {
             terminal_host: None,
         };
         let hub = Hub::new(cfg, crate::store::Store::open_memory().unwrap()).unwrap();
-        let app = router(hub.clone());
+        let app = router(hub.clone()).unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .await

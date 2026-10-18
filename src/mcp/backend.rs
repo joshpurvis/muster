@@ -13,6 +13,8 @@ use crate::inject::{self, SendMode, SendOutcome};
 use crate::model::*;
 
 pub trait Backend: Send + Sync + 'static {
+    /// Persistent application guard state; absent in pure protocol fixtures.
+    fn guard_store(&self) -> Option<crate::store::Store> { None }
     fn session_by_token(&self, token: &str) -> Option<SessionId>;
     fn session(&self, id: SessionId) -> Option<SessionInfo>;
     fn sessions(&self) -> Vec<SessionInfo>;
@@ -78,6 +80,7 @@ pub trait Backend: Send + Sync + 'static {
 pub struct HubBackend(pub Arc<Hub>);
 
 impl Backend for HubBackend {
+    fn guard_store(&self) -> Option<crate::store::Store> { Some(self.0.store().clone()) }
     fn session_by_token(&self, token: &str) -> Option<SessionId> {
         self.0.session_by_token(token)
     }
@@ -122,7 +125,7 @@ impl Backend for HubBackend {
         self.0.log_event(channel_id, session_id, kind, data);
     }
     async fn create_channel(&self, req: CreateChannel) -> anyhow::Result<Channel> {
-        self.0.create_channel(req).await
+        self.0.create_mcp_channel(req).await
     }
     async fn spawn_session(&self, req: SpawnSession) -> anyhow::Result<SessionInfo> {
         self.0.spawn_session(req).await

@@ -154,6 +154,15 @@ try:
     channel = rpc("channel.create", {"workspace_id": workspace["id"], "agent": "shell"})
     first = next(item for item in rpc("hello")["sessions"] if item["channel_id"] == channel["id"])
     sid, pid = first["id"], first["pid"]
+    with sqlite3.connect(DATA / "muster.db") as database:
+        record = json.loads(database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (sid,)).fetchone()[0])
+    def mcp_post():
+        status, response = http("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "post_to_channel", "arguments": {"text": "MCP restart-limit fixture"}}}, record["token"])
+        assert status == 200 and "result" in response, response
+        return response["result"]
+    for _ in range(30):
+        assert not mcp_post().get("isError", False)
     rpc("session.input", {"id": sid, "data": "for i in $(seq 1 80); do printf 'COUNT:%s\\n' \"$i\"; sleep 0.1; done\r"})
     until("ticker started", lambda: "COUNT:2" in output(sid))
     stop_backend(hard=True)
@@ -163,6 +172,9 @@ try:
     check(live["alive"] and live["pid"] == pid, "backend SIGKILL preserves the terminal process")
     start_backend()
     check(session(sid)["pid"] == pid and session(sid)["state"] != "exited", "new backend adopts the original process")
+    limited = mcp_post()
+    check(limited.get("isError", False) and "rate limit" in str(limited),
+          "MCP rate limits remain exhausted after backend replacement")
     check("COUNT:5" in output(sid), "output produced during backend downtime is available")
     check(json.loads((RUNTIME / "terminal.json").read_text())["instance"] == host_instance,
           "backend restart retains the same terminal host")

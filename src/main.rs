@@ -965,6 +965,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     )?;
 
     hook_inbox::spawn(&hub, hook_inbox)?;
+    let app = server::router(hub.clone())?;
     inject::spawn_tasks(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
@@ -1006,7 +1007,6 @@ async fn daemon_main() -> anyhow::Result<()> {
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
 
-    let app = server::router(hub.clone());
     // Peer addresses let `/api/exchange` check which local user owns the connecting socket.
     let serve = axum::serve(
         listener,

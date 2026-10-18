@@ -36,24 +36,49 @@ pub struct McpState<B> {
     pub backend: B,
     pub limits: guard::Limits,
     pub guard: parking_lot::Mutex<guard::GuardState>,
+    guard_store: Option<crate::store::Store>,
     /// Serializes spawn_session so concurrent calls can't overshoot the spawn limits.
     pub spawn_lock: tokio::sync::Mutex<()>,
 }
 
 impl<B: Backend> McpState<B> {
-    /// Default limits (shell commands and other workspaces off).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn new(backend: B) -> Self {
-        Self::with_limits(backend, guard::Limits::default())
+        Self::try_with_limits(backend, guard::Limits::default()).expect("fixture guard state")
     }
 
-    pub fn with_limits(backend: B, limits: guard::Limits) -> Self {
-        Self {
-            backend,
-            limits,
-            guard: Default::default(),
-            spawn_lock: Default::default(),
+    pub fn try_with_limits(backend: B, limits: guard::Limits) -> anyhow::Result<Self> {
+        let guard_store = backend.guard_store();
+        let mut restored: guard::GuardState = match &guard_store {
+            Some(store) => store.load_runtime("mcp-guards")?.unwrap_or_default(),
+            None => Default::default(),
+        };
+        if let Some(store) = &guard_store { restored.mcp_channels.extend(store.mcp_channels()?); }
+        // A spawn may have completed just before a crash. Its parent's depth was saved
+        // before spawning, so removed ancestors cannot shorten the surviving lineage.
+        let sessions = backend.sessions();
+        for session in &sessions {
+            let depth = guard::spawn_depth(&sessions, &restored.spawned_depth, session.id);
+            restored.spawned_depth.insert(session.id, depth);
         }
+        if let Some(store) = &guard_store { store.save_runtime("mcp-guards", &restored)?; }
+        Ok(Self { backend, limits, guard: parking_lot::Mutex::new(restored),
+            guard_store, spawn_lock: Default::default() })
+    }
+
+    /// Publish guard mutations only after they are durable. A failed write refuses
+    /// new agent work instead of silently restoring an exhausted allowance.
+    pub fn edit_guard<T>(&self, edit: impl FnOnce(&mut guard::GuardState) -> T) -> Result<T, String> {
+        let mut current = self.guard.lock();
+        let mut next = current.clone();
+        let result = edit(&mut next);
+        if next != *current {
+            if let Some(store) = &self.guard_store {
+                store.save_runtime("mcp-guards", &next).map_err(|error| format!("could not persist MCP limits: {error:#}"))?;
+            }
+            *current = next;
+        }
+        Ok(result)
     }
 }
 
@@ -75,19 +100,17 @@ pub fn spawn_tracker<B: Backend>(st: &Arc<McpState<B>>) {
                 Err(RecvError::Closed) => return,
             };
             let Some(st) = weak.upgrade() else { return };
-            match ev {
-                ServerEvent::SessionUpserted(info) => st
-                    .guard
-                    .lock()
-                    .observe_session(&info, crate::model::now_ms()),
-                ServerEvent::SessionRemoved { id } => st.guard.lock().forget(id),
-                _ => {}
-            }
+            let result = st.edit_guard(|guard| match ev {
+                ServerEvent::SessionUpserted(info) => guard.observe_session(&info, crate::model::now_ms()),
+                ServerEvent::SessionRemoved { id } => guard.forget(id),
+                _ => {},
+            });
+            if let Err(error) = result { tracing::warn!("{error}"); }
         }
     });
 }
 
-pub fn router(hub: Arc<Hub>) -> Router {
+pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     let limits = guard::Limits::from_env();
     if limits.allow_shell {
         tracing::warn!(
@@ -101,12 +124,12 @@ pub fn router(hub: Arc<Hub>) -> Router {
             guard::ENV_CROSS_WORKSPACE
         );
     }
-    let st = Arc::new(McpState::with_limits(HubBackend(hub.clone()), limits));
+    let st = Arc::new(McpState::try_with_limits(HubBackend(hub.clone()), limits)?);
     hub.set_mcp(Arc::downgrade(&st));
     spawn_tracker(&st);
-    Router::new()
+    Ok(Router::new()
         .route("/", post(handle_post).get(not_allowed).delete(not_allowed))
-        .with_state(st)
+        .with_state(st))
 }
 
 /// Run tool `name` as session `caller`, for a call that session made through the CLI (rpc.rs):

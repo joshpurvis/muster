@@ -1136,6 +1136,14 @@ impl Hub {
     }
 
     pub async fn create_channel(self: &Arc<Self>, req: CreateChannel) -> anyhow::Result<Channel> {
+        self.create_channel_with_origin(req, false).await
+    }
+
+    pub(crate) async fn create_mcp_channel(self: &Arc<Self>, req: CreateChannel) -> anyhow::Result<Channel> {
+        self.create_channel_with_origin(req, true).await
+    }
+
+    async fn create_channel_with_origin(self: &Arc<Self>, req: CreateChannel, mcp: bool) -> anyhow::Result<Channel> {
         self.ensure_not_shutting_down()?;
         let ws = self
             .workspace(req.workspace_id)
@@ -1188,7 +1196,7 @@ impl Hub {
             auto_named: explicit.is_none(),
             first_prompt,
         };
-        ch.id = self.store.insert_channel(&ch)?;
+        ch.id = self.store.insert_channel_with_origin(&ch, mcp)?;
         if ws.is_git && req.worktree {
             let root = paths::worktrees_dir().join(format!("{}-{}", worktree::slugify(&ws.name), ws.id));
             match worktree::create(&repo, &root, &ch.id.to_string(), req.base.as_deref()).await {

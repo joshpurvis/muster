@@ -1435,7 +1435,11 @@ pub async fn deliver(hub: &Arc<Hub>, out: Outgoing) -> anyhow::Result<Delivery> 
             })
         }
         Err(e) => {
-            let _ = hub.store().delete_agent_message(msg_id);
+            if e.downcast_ref::<crate::inject::DeliveryPending>().is_some() {
+                publish_message(hub, msg_id);
+            } else {
+                let _ = hub.store().delete_agent_message(msg_id);
+            }
             Err(e)
         }
     }

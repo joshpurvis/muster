@@ -276,6 +276,8 @@ const MIGRATIONS: &[&str] = &[
         record TEXT NOT NULL
     );
     "#,
+    // v12: record MCP-created channels atomically with their creation.
+    "CREATE TABLE mcp_channels(channel_id INTEGER PRIMARY KEY);",
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -841,8 +843,20 @@ impl Store {
 
     /// Inserts the channel (its `id` is ignored) and returns the new id.
     pub fn insert_channel(&self, c: &Channel) -> anyhow::Result<ChannelId> {
+        self.insert_channel_with_origin(c, false)
+    }
+
+    pub fn mcp_channels(&self) -> anyhow::Result<std::collections::HashSet<ChannelId>> {
         let conn = self.conn.lock();
-        conn.execute(
+        let mut query = conn.prepare("SELECT m.channel_id FROM mcp_channels m JOIN channels c ON c.id=m.channel_id")?;
+        let rows = query.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn insert_channel_with_origin(&self, c: &Channel, mcp: bool) -> anyhow::Result<ChannelId> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO channels (workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base,
                                    archived, layout, created_at, last_read_at, sort_order, permissions,
                                    window_id, auto_named, first_prompt)
@@ -866,7 +880,10 @@ impl Store {
                 c.first_prompt
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        if mcp { tx.execute("INSERT INTO mcp_channels(channel_id) VALUES (?1)", [id])?; }
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn update_channel(&self, c: &Channel) -> anyhow::Result<()> {

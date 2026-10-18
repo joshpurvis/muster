@@ -285,6 +285,7 @@ pub struct Hub {
     devices: crate::devices::Registry,
     /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
     agents: crate::agents::Registry,
+    pub(crate) injection: crate::inject::Queues,
     /// The MCP server (weak: it holds the hub), set by `mcp::router`.
     #[allow(clippy::type_complexity)]
     mcp: Mutex<Option<Weak<crate::mcp::McpState<crate::mcp::backend::HubBackend>>>>,
@@ -449,11 +450,13 @@ impl Hub {
         }
         let devices = crate::devices::Registry::load(&store)?;
         let agents = crate::agents::Registry::load(&store)?;
+        let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let hub = Arc::new_cyclic(|weak| Hub {
             cfg,
             devices,
             agents,
+            injection,
             mcp: Mutex::new(None),
             state_seq: AtomicU64::new(1),
             store,
@@ -482,6 +485,7 @@ impl Hub {
                 if let Some(hub) = unavailable.upgrade() { hub.notice("error", message); }
             }))?;
         }
+        crate::inject::restore(&hub)?;
         Ok(hub)
     }
 
@@ -677,6 +681,13 @@ impl Hub {
             None if self.session(id).is_some() => anyhow::bail!("session {id} is not running"),
             None => anyhow::bail!("no such session: {id}"),
         }
+    }
+
+    /// Bind delayed input to the process it was prepared for, even across a concurrent restart.
+    pub(crate) fn write_input_generation(&self, id: SessionId, generation: Option<u64>, bytes: &[u8]) -> anyhow::Result<()> {
+        let terminal = self.pty(id).filter(|terminal| Some(terminal.generation) == generation)
+            .context("the terminal run changed before input delivery")?;
+        terminal.write(bytes)
     }
 
     /// Is the session's terminal in application cursor mode (DECCKM)?
@@ -1005,6 +1016,7 @@ impl Hub {
             }
             ch
         };
+        crate::inject::drop_queue(self, id);
         // Replay/screen for exited sessions are served from the log once the PTY is released.
         self.try_release(id, generation);
         let detail = if self.shutting_down.load(Ordering::SeqCst) {
@@ -2423,6 +2435,8 @@ impl Hub {
         }
     }
 
+    pub fn is_shutting_down(&self) -> bool { self.shutting_down.load(Ordering::SeqCst) }
+
     fn ensure_not_shutting_down(&self) -> anyhow::Result<()> {
         if self.shutting_down.load(Ordering::SeqCst) {
             anyhow::bail!("the daemon is shutting down");
@@ -2844,6 +2858,13 @@ impl Hub {
     /// Only the explicit full-stop CLI operation shuts down the terminal host.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        // Let already-started submissions reach a recorded outcome. No new queued
+        // delivery starts while stopping. A timeout leaves its durable in-flight
+        // record for explicit review on recovery, never an automatic duplicate.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while self.injection.in_progress() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
 }

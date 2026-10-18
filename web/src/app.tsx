@@ -77,6 +77,9 @@ terms.setFontSize(prefs.value.fontSize);
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
+  if (h.paused_deliveries?.length) {
+    toast("warn", `Prompt delivery needs review in ${h.paused_deliveries.length} terminal(s). Right-click a tab and choose “Review queued prompts”.`, 12000);
+  }
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
   if (reconnect) terms.reattachAll();

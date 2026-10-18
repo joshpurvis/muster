@@ -858,3 +858,23 @@ export function newAgentDialog() {
 export function editAgent(name: string, tab: "settings" | "memory" = "settings") {
   overlay.value = { kind: "agent", name, tab };
 }
+
+
+/** Review an interrupted delivery before deciding whether to clear its queue. */
+export async function reviewQueue(id: SessionId) {
+  try {
+    const queue = await rpc.call<{ queued: string[]; uncertain: string | null; paused: boolean }>("session.queue", { id });
+    const preview = (text: string) => text.length > 300 ? `${text.slice(0, 300)}…` : text;
+    const text = queue.uncertain ? `Delivery is uncertain for: ${preview(queue.uncertain)}. Check the terminal before resending. ` : "";
+    overlay.value = {
+      kind: "confirm",
+      title: queue.paused ? "Review interrupted delivery" : "Queued prompts",
+      body: `${text}${queue.queued.length} prompt(s) waiting. ${queue.queued.slice(0, 3).map(preview).join(" · ")} Clearing discards the queue records. Already typed text and executed commands remain.`,
+      confirmLabel: "Clear queue",
+      danger: true,
+      run: () => rpc.call("session.clear_queue", { id }).catch(fail("Could not clear queue")).catch(() => {}),
+    };
+  } catch (error) {
+    toast("error", `Could not read queue: ${errText(error)}`);
+  }
+}

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
+import { rpc } from "../rpc.ts";
 import { act, canInteract, errorText, notify, ready } from "./store.ts";
 import { Approval, Icon } from "./ui.tsx";
 
@@ -27,6 +28,7 @@ export function Composer(
   const [collapsed, setCollapsed] = useState(false);
   const [options, setOptions] = useState(false);
   const [sending, setSending] = useState(false);
+  const [queue, setQueue] = useState<{ queued: string[]; uncertain: string | null; paused: boolean } | null>(null);
   const card = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const timer = useRef(0);
@@ -99,6 +101,12 @@ export function Composer(
                   ? "Your answer"
                   : "Message"}
               </span>
+              {s.queued > 0 && (
+                <button type="button" disabled={!ready.value} onClick={async () => {
+                  try { setQueue(await rpc.call("session.queue", { id: s.id })); }
+                  catch (error) { notify(errorText(error)); }
+                }}>Review queue</button>
+              )}
               <button
                 type="button"
                 class="collapse-button"
@@ -111,6 +119,22 @@ export function Composer(
                 <Icon name="down" />
               </button>
             </div>
+            {queue && (
+              <div class="approval-prompt">
+                {queue.uncertain && <p>Delivery interrupted: {queue.uncertain.slice(0, 300)}. Check the terminal before resending.</p>}
+                <p>{queue.queued.length} prompts waiting. Clearing removes queue records; typed text and executed commands remain.</p>
+                <div class="approval-actions">
+                  <button type="button" disabled={disabled} onClick={async () => {
+                    try {
+                      await rpc.call("session.clear_queue", { id: s.id });
+                      setQueue(null);
+                      notify("Queue cleared");
+                    } catch (error) { notify(errorText(error)); }
+                  }}>Clear queue</button>
+                  <button type="button" onClick={() => setQueue(null)}>Close</button>
+                </div>
+              </div>
+            )}
             {(s.state === "needs_approval" || s.state === "asking_question") && (
               <div class="approval-prompt">
                 <p>{s.state_detail || "The agent is waiting for you."}</p>

@@ -114,7 +114,7 @@ impl Principal {
 pub fn method_scope(method: &str) -> Option<Scope> {
     Some(match method {
         "hello" | "session.attach" | "session.detach" | "session.screen" | "session.output" | "session.wait"
-        | "channel.timeline" | "channel.diff" => Scope::View,
+        | "channel.timeline" | "channel.diff" | "session.queue" => Scope::View,
         "session.send" | "session.input" | "session.approve" | "session.interrupt" | "session.clear_queue"
         | "session.resize" | "channel.mark_read" | "channel.post" => Scope::Interact,
         "channel.create" | "channel.archive" | "channel.rename" | "session.spawn" | "session.kill"

@@ -201,6 +201,7 @@ export type ServerEvent =
   | { event: "agent_message"; data: AgentMessage };
 
 export interface HelloResult {
+  paused_deliveries?: SessionId[];
   version: string;
   workspaces: Workspace[];
   channels: Channel[];

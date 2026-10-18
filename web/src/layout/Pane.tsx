@@ -126,6 +126,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
     "sep",
     { label: "Restart", icon: <IconRestart size={14} />, run: () => A.restartSession(s.id) },
     { label: "Interrupt", disabled: s.state === "exited", run: () => A.interruptSession(s.id) },
+    { label: "Review queued prompts", disabled: s.queued === 0, run: () => A.reviewQueue(s.id) },
     "sep",
     { label: "Close tab", keys: "Alt+W", danger: true, run: () => A.closeTab(s.id) },
   );
@@ -191,6 +192,7 @@ function bodyMenu(
     { label: "Rename tab", run: () => A.renameIn("session", s.id) },
     { label: "Restart", icon: <IconRestart size={14} />, run: () => A.restartSession(s.id) },
     { label: "Interrupt", disabled: s.state === "exited", run: () => A.interruptSession(s.id) },
+    { label: "Review queued prompts", disabled: s.queued === 0, run: () => A.reviewQueue(s.id) },
     { label: "Kill process", danger: true, disabled: s.state === "exited", run: () => A.killSession(s.id) },
     { label: "Close tab", keys: "Alt+W", danger: true, run: () => A.closeTab(s.id) },
   );

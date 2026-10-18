@@ -11,6 +11,7 @@ import sqlite3
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -173,6 +174,56 @@ try:
     rpc("session.input", {"id": sid, "data": "printf 'AFTER-RESTART\\n'\r"})
     until("replacement terminal works", lambda: "AFTER-RESTART" in output(sid))
     check("COUNT:5" not in output(sid), "replacement run has independent replay")
+    # A prompt accepted into a busy terminal's queue must survive application replacement.
+    waiting = BASE / "queued-command-runs"
+    rpc("session.input", {"id": sid, "data": "sleep 4\r"})
+    until("shell busy before enqueue", lambda: session(sid)["state"] == "working")
+    sent = rpc("session.send", {"id": sid, "text": f"printf 'once\\n' >> {waiting}"})
+    check(not sent["delivered"] and sent["queued"] == 1, "busy terminal accepts a durable waiting prompt")
+    stop_backend(hard=True)
+    start_backend()
+    check(rpc("session.queue", {"id": sid})["queued"], "waiting prompt survives backend SIGKILL")
+    until("restored queue delivered", lambda: waiting.exists() and waiting.read_text() == "once\n")
+    until("restored queue finished", lambda: rpc("session.queue", {"id": sid})["stage"] is None)
+    stop_backend(hard=True)
+    start_backend()
+    time.sleep(1)
+    check(waiting.read_text() == "once\n", "completed prompt is not replayed after another restart")
+
+    # Crash after the durable Typing checkpoint. The command may have reached the terminal;
+    # replacement must pause for review, never make a second automatic attempt.
+    uncertain = BASE / "uncertain-command-runs"
+    until("shell ready before interrupted delivery", lambda: session(sid)["state"] == "idle")
+    request_errors = []
+    def send_uncertain():
+        try:
+            rpc("session.send", {"id": sid, "text": f"printf 'once\\n' >> {uncertain}; # " + "padding " * 300})
+        except (ConnectionError, OSError, AssertionError) as error:
+            request_errors.append(error)
+    sender = threading.Thread(target=send_uncertain)
+    sender.start()
+    def typing_checkpoint():
+        with sqlite3.connect(DATA / "muster.db") as database:
+            row = database.execute("SELECT record FROM runtime_state WHERE key='prompt-queues'").fetchone()
+        queue = json.loads(row[0]).get(str(sid), {}) if row else {}
+        return (queue.get("active") or {}).get("stage") == "typing"
+    until("delivery typing checkpoint", typing_checkpoint)
+    stop_backend(hard=True)
+    sender.join(timeout=10)
+    assert not sender.is_alive(), "interrupted request thread did not finish"
+    start_backend()
+    review = rpc("session.queue", {"id": sid})
+    check(review["paused"] and review["uncertain"] and review["stage"] == "typing",
+          "interrupted prompt delivery is retained for review")
+    before = uncertain.read_text() if uncertain.exists() else ""
+    time.sleep(1.5)
+    check((uncertain.read_text() if uncertain.exists() else "") == before,
+          "ambiguous input is never automatically replayed")
+    check(sid in rpc("hello")["paused_deliveries"], "reconnecting UI is told about paused delivery")
+    rpc("session.clear_queue", {"id": sid})
+    check(not rpc("session.queue", {"id": sid})["paused"], "explicit queue clearing resolves recovery pause")
+    rpc("session.input", {"id": sid, "data": "\x03"})
+
     full_stop = subprocess.Popen([str(BIN), "stop"], env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if current:
         current.wait(timeout=10)

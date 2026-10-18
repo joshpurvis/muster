@@ -97,6 +97,7 @@ pub fn hello(hub: &Hub) -> Value {
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": default_shell(),
+        "paused_deliveries": inject::paused(hub),
     })
 }
 
@@ -366,9 +367,14 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             inject::interrupt(hub, p.id)?;
             Ok(json!({}))
         }
+        "session.queue" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            if hub.session(p.id).is_none() { return Err(RpcError(format!("no such session: {}", p.id))) }
+            Ok(inject::inspect(hub, p.id))
+        }
         "session.clear_queue" => {
             let p: IdParam<SessionId> = parse(params)?;
-            inject::clear_queue(hub, p.id);
+            inject::clear_queue(hub, p.id)?;
             Ok(json!({}))
         }
         "session.screen" => {

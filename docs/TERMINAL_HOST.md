@@ -57,9 +57,6 @@ application updates must never automatically replace an incompatible live host.
   disconnect/replay, retry-safe spawn, generation fencing, descendant cleanup,
   singleton locks, protocol/instance rejection, explicit shutdown, autonomous
   terminal queries/log flushing, output floods, and host crash/restart.
-- Application integration, persistent application recovery, update commands and
-  end-to-end backend restart tests are still pending. The application currently
-  uses the extracted core in-process; it is not yet restart-safe.
 
 ### Application integration checkpoint
 
@@ -74,8 +71,20 @@ Validation so far: 223 Rust tests, 11 focused backend survival checks in
 The smoke suite exposed transient title loss with polling alone; the backend now
 also consumes host title events. Run all checks through `scripts/isolated.sh`.
 
-Remaining before completion: durable prompt/delivery and provenance recovery;
-hook spooling/deduplication; application/UI update compatibility and asset loading;
+### Durable prompt recovery checkpoint
+
+Agent provenance and active message attribution are saved before input is submitted.
+Waiting prompts are saved before acknowledgement and restored for their original
+terminal generation. A crash during typing or submission preserves an uncertain
+record and pauses the queue. Desktop/mobile queue review and `muster queue TARGET`
+show those records; explicit clearing never resends them or undoes terminal input.
+Backend shutdown lets current submissions settle for up to eight seconds.
+
+Validation: the Rust suite passed 227 tests, with one additional generation-fencing
+unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
+checks, and all 81 frontend tests pass. Frontend types and lint also pass.
+
+Remaining before completion: hook spooling/deduplication; application/UI update compatibility and asset loading;
 additional crash-window tests and code review, including retired-run cleanup,
 slow/disconnected stream recovery, and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.

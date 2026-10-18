@@ -121,6 +121,14 @@ enum Cmd {
         #[arg(long, value_name = "SECS", default_value_t = 600)]
         timeout: u64,
     },
+    /// Inspect queued prompts and any delivery paused for review after a backend crash.
+    Queue {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Discard waiting/uncertain delivery records after inspecting the terminal.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Block until a session reaches a state (exit 124 on timeout).
     Wait {
         #[arg(help = TARGET_HELP)]
@@ -491,6 +499,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::wait(d, &target, until, timeout, json),
+        Cmd::Queue { target, clear } => cli::queue(d, &target, clear),
         Cmd::Keys { target, keys } => cli::keys(d, &target, &keys),
         Cmd::Approve { target, always, deny } => cli::approve(d, &target, always, deny),
         Cmd::Interrupt { target } => cli::by_id(d, &target, "session.interrupt"),

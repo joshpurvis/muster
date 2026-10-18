@@ -78,6 +78,7 @@ mq.addEventListener("change", applyThemePref);
 // ---------- wiring ----------
 terms.setFontSize(prefs.value.fontSize);
 terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
+terms.onClipboardFailed((text) => toast("error", text));
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);

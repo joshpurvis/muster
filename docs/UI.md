@@ -90,7 +90,11 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
   Shell in this task there), Move to window ▸ (existing windows plus
   "New window"), Restart, Interrupt, Close tab, and when it is the task's last session with a
-  worktree, Close + remove worktree (confirmed in a dialog).
+  worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
+  the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
+  "Claude is working" / "Codex is working", "Stop its current turn?" or "Restart it? Its
+  current turn is lost and the program starts fresh.", with Cancel focused. Shells and idle
+  agents don't ask, nor do the palette commands and shortcuts.
 
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
@@ -111,7 +115,14 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   "Not enough room" toast), zoom (Alt+Z maximizes the focused group), focus ring and dim veil
   on unfocused groups, the reparented cached xterm instances, the exited-session bar, the
   approval banner (**Approve** Alt+A, **Always**, **Deny** Alt+Shift+A, "Jump to prompt"),
-  and the right-click group menu (Shift+right-click inside mouse-tracking programs). A zoomed
+  and the right-click terminal menu. The right button is always Muster's: right-clicking a
+  terminal opens this menu even when its program tracks the mouse (e.g. Codex), the program
+  never gets a right-button press, release or drag (dropped where xterm's mouse reports become
+  input, so also during a chord with another button and outside the terminal), and the
+  browser's own menu never shows over a terminal (text fields keep theirs). Left and middle
+  clicks, the wheel and motion still go to programs that track the mouse. The menu's Paste
+  reads the clipboard; if the browser refuses, an error toast says to press Ctrl+Shift+V
+  (which pastes without that permission). Failed copies show an error toast too. A zoomed
   group shows a "zoomed" badge in its strip (click restores).
 - A window with no tabs shows the empty launcher (folder input with `fs.complete`, then
   Claude / Codex / Shell, keys 1 2 3), with Jump and `⋯` in its top-right corner. An empty group

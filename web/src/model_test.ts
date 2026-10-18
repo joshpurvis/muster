@@ -7,6 +7,7 @@ import {
   type JumpCandidate,
   jumpOrder,
   mainSession,
+  midTurn,
   moveChannelLocally,
   needsYouOrder,
   nextInCycle,
@@ -501,4 +502,18 @@ Deno.test("newerPrefs: a reply never undoes a later change", () => {
   assertEquals(newerPrefs({ revision: 3 }, { revision: 3 }), true, "the event of the same write");
   assertEquals(newerPrefs({ revision: 4 }, { revision: 3 }), false, "older than an event seen");
   assertEquals(newerPrefs({}, {}), true, "backends without revisions");
+});
+
+// ---------------- asking before Restart / Interrupt ----------------
+
+Deno.test("midTurn: an agent working, stuck or waiting on the user asks first; shells and idle agents don't", () => {
+  for (const state of ["working", "stuck", "needs_approval", "asking_question"] as AgentState[]) {
+    assertEquals(midTurn(sess(1, 1, state)), true, `claude ${state}`);
+    assertEquals(midTurn(sess(1, 1, state, 0, { kind: "codex" })), true, `codex ${state}`);
+    assertEquals(midTurn(sess(1, 1, state, 0, { kind: "shell" })), false, `shell ${state}`);
+  }
+  for (const state of ["idle", "starting", "error", "exited"] as AgentState[]) {
+    assertEquals(midTurn(sess(1, 1, state)), false, `claude ${state}`);
+    assertEquals(midTurn(sess(1, 1, state, 0, { kind: "codex" })), false, `codex ${state}`);
+  }
 });

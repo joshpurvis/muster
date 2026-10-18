@@ -60,6 +60,7 @@ import type {
   WindowPrefs,
   Workspace,
 } from "./types.ts";
+import { KIND_LABEL } from "./types.ts";
 import {
   activateTab as activateTabTree,
   addTab,
@@ -91,6 +92,7 @@ import { copyText } from "./util.ts";
 import {
   basename,
   mainSession,
+  midTurn,
   moveChannelLocally,
   newerPrefs,
   nextInCycle,
@@ -578,6 +580,26 @@ export function interruptSession(sid: SessionId) {
   rpc.call("session.interrupt", { id: sid }).catch(fail("Interrupt failed")).catch(() => {});
 }
 
+/** Restart / Interrupt from a tab or terminal menu: asks first while an agent is mid-turn (its
+ * turn is lost). Palette commands and shortcuts act at once. Known gap: the dialog holds only the
+ * session id, so if another client restarts that session while it is open, confirming acts on
+ * the replacement run. */
+export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt") {
+  const s = sessions.value.get(sid);
+  const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
+  if (!s || !midTurn(s)) return act();
+  overlay.value = {
+    kind: "confirm",
+    title: `${KIND_LABEL[s.kind]} is working`,
+    body: what === "restart"
+      ? "Restart it? Its current turn is lost and the program starts fresh."
+      : "Stop its current turn?",
+    confirmLabel: what === "restart" ? "Restart" : "Interrupt",
+    danger: true,
+    run: act,
+  };
+}
+
 export function renameSession(sid: SessionId, name: string) {
   const n = name.trim();
   const s = sessions.value.get(sid);
@@ -789,7 +811,19 @@ export function openPermissions(id: ChannelId) {
 }
 
 export function copy(text: string, what = "Copied") {
-  copyText(text).then((ok) => toast(ok ? "success" : "error", ok ? what : "Copy failed", 1800));
+  copyText(text).then((ok) =>
+    ok ? toast("success", what, 1800) : toast("error", "Copy failed: the clipboard isn't available here")
+  );
+}
+
+/** The terminal menu's Paste. Reading the clipboard needs a permission the browser may refuse;
+ * Ctrl+Shift+V pastes through the browser's own paste event, which needs none. */
+export function pasteClipboard(sid: SessionId) {
+  const failed = () =>
+    toast("error", "Muster can't read the clipboard here. Press Ctrl+Shift+V in the terminal to paste.");
+  terms.focusTerminal(sid);
+  if (!navigator.clipboard?.readText) return failed();
+  navigator.clipboard.readText().then((t) => t && terms.terminal(sid)?.paste(t)).catch(failed);
 }
 
 // ---------- view ----------

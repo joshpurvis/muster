@@ -10,6 +10,8 @@ import { SearchAddon } from "@xterm/addon-search";
 import { effect } from "@preact/signals";
 import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
 import type { SessionInfo } from "./types.ts";
+import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
+import { copyText } from "./util.ts";
 
 const MAX_WEBGL = 10;
 
@@ -18,6 +20,11 @@ const MAX_WEBGL = 10;
 let inputPaused: (sid: number) => boolean = () => false;
 export function setInputPaused(paused: (sid: number) => boolean) {
   inputPaused = paused;
+}
+/** Shows a failed clipboard copy or read (an error toast). */
+let clipboardFailed: (text: string) => void = () => {};
+export function onClipboardFailed(f: (text: string) => void) {
+  clipboardFailed = f;
 }
 const FONT_FAMILY =
   '"JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, ui-monospace, monospace';
@@ -41,6 +48,8 @@ interface Entry {
   pasteRead: { cancelled: boolean } | null;
   /** Until then, a late native paste event is dropped (the fallback already pasted). */
   pasteBlockUntil: number;
+  /** Native paste events seen: a failed fallback read only reports if none arrives late. */
+  pastes: number;
   attached: boolean;
   /** Pending dispose of a detached terminal (its tab left this window). */
   evictTimer: number;
@@ -172,7 +181,13 @@ function create(sid: number): Entry {
       ev.stopPropagation();
       if (ev.type === "keydown") {
         const sel = term.getSelection();
-        if (sel) navigator.clipboard?.writeText(sel).catch(() => {});
+        // copyText's fallback copies through a hidden textarea, which takes the focus.
+        if (sel) {
+          copyText(sel).then((ok) => {
+            term.focus();
+            if (!ok) clipboardFailed("Copy failed: the clipboard isn't available here");
+          });
+        }
       }
       return false;
     }
@@ -185,7 +200,15 @@ function create(sid: number): Entry {
         clearTimeout(entry.pasteTimer);
         entry.pasteTimer = setTimeout(() => {
           entry.pasteTimer = 0;
-          if (!navigator.clipboard?.readText) return;
+          const pastes = entry.pastes;
+          // Unless a native paste turns up late after all.
+          const failed = () =>
+            setTimeout(() => {
+              if (entry.pastes === pastes) {
+                clipboardFailed("Paste failed: Muster can't read the clipboard here");
+              }
+            }, 500);
+          if (!navigator.clipboard?.readText) return failed();
           const read = { cancelled: false };
           entry.pasteRead = read;
           const done = () => {
@@ -199,7 +222,10 @@ function create(sid: number): Entry {
               // Only now can a late native paste be a duplicate.
               entry.pasteBlockUntil = Date.now() + 1500;
             })
-            .catch(done);
+            .catch(() => {
+              done();
+              if (!read.cancelled) failed();
+            });
         }, 50);
       }
       return false;
@@ -208,6 +234,7 @@ function create(sid: number): Entry {
   });
 
   el.addEventListener("paste", (ev) => {
+    entry.pastes++;
     if (entry.pasteTimer) {
       // The native paste arrived in time: it does the pasting.
       clearTimeout(entry.pasteTimer);
@@ -231,13 +258,17 @@ function create(sid: number): Entry {
   // onData also carries query answers. Only a user's bytes should take the grid back.
   // Private API: without it only focus takes the grid back.
   (term as any)._core?.coreService?.onUserInput?.(() => userInput = true);
+  const dropReport = rightButtonFilter(term);
   term.onData((d) => {
-    if (userInput) takeSizeBack(entry);
+    const user = userInput;
     userInput = false;
+    if (dropReport(d)) return;
+    if (user) takeSizeBack(entry);
     if (inputPaused(sid)) return;
     rpc.sendInput(sid, enc.encode(d));
   });
   term.onBinary((d) => {
+    if (dropReport(d)) return;
     const b = new Uint8Array(d.length);
     for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 0xff;
     if (inputPaused(sid)) return;
@@ -262,6 +293,7 @@ function create(sid: number): Entry {
     pasteTimer: 0,
     pasteRead: null,
     pasteBlockUntil: 0,
+    pastes: 0,
     attached: false,
     evictTimer: 0,
     lastUse: Date.now(),
@@ -271,6 +303,33 @@ function create(sid: number): Entry {
   };
   entries.set(sid, entry);
   return entry;
+}
+
+/** The right button is Muster's (it opens the terminal menu): a program that tracks the mouse
+ * never gets a report of it, wherever xterm saw the event (its document-level listeners keep
+ * reporting outside the terminal while another button is held). Right-button events are dropped
+ * before xterm encodes them, which also covers legacy releases that carry no button; xterm's own
+ * listener cleanup still runs. Returns a check for onData/onBinary: is this chunk a right-button
+ * report? Only chunks xterm's mouse code emits are looked at, never typed or pasted text. */
+function rightButtonFilter(term: Terminal): (d: string) => boolean {
+  // Private API (xterm 6). Without it, any chunk that is exactly one right-button report while
+  // the program tracks the mouse is dropped (and a legacy right release still passes).
+  const mouse = (term as any)._core?.coreMouseService;
+  if (typeof mouse?.triggerMouseEvent !== "function") {
+    return (d) => term.modes.mouseTrackingMode !== "none" && isRightButtonReport(d);
+  }
+  const trigger = mouse.triggerMouseEvent.bind(mouse);
+  let reporting = false;
+  mouse.triggerMouseEvent = (e: { button: number }) => {
+    if (e.button === RIGHT_BUTTON) return false;
+    reporting = true;
+    try {
+      return trigger(e);
+    } finally {
+      reporting = false;
+    }
+  };
+  return (d) => reporting && isRightButtonReport(d);
 }
 
 /** In-band markers around replayed scrollback. The parser reaches them in stream order, so the

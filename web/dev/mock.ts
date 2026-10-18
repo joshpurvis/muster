@@ -306,6 +306,8 @@ function startProcess(s: Session) {
     for await (const chunk of child.stderr) pushOutput(s.id, chunk);
   })();
   child.status.then((st) => {
+    // A restart's old process may exit after its replacement started.
+    if (procs.get(s.id)?.child !== child) return;
     procs.delete(s.id);
     if (!sessions.has(s.id)) return;
     s.exit_code = st.code;

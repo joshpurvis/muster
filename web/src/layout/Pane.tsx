@@ -123,8 +123,16 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
   }
   items.push(
     "sep",
-    { label: "Restart", icon: <IconRestart size={14} />, run: () => A.restartSession(s.id) },
-    { label: "Interrupt", disabled: s.state === "exited", run: () => A.interruptSession(s.id) },
+    {
+      label: "Restart",
+      icon: <IconRestart size={14} />,
+      run: () => A.restartOrInterruptAsk(s.id, "restart"),
+    },
+    {
+      label: "Interrupt",
+      disabled: s.state === "exited",
+      run: () => A.restartOrInterruptAsk(s.id, "interrupt"),
+    },
     { label: "Review queued prompts", disabled: s.queued === 0, run: () => A.reviewQueue(s.id) },
     "sep",
     { label: "Close tab", keys: "Alt+W", danger: true, run: () => A.closeTab(s.id) },
@@ -135,7 +143,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
   return items;
 }
 
-/** Right-click menu of a group's terminal (Shift+right-click inside mouse-tracking programs). */
+/** Right-click menu of a group's terminal (also over programs that track the mouse). */
 function bodyMenu(
   paneId: string,
   s: SessionInfo,
@@ -147,15 +155,7 @@ function bodyMenu(
   const sel = term?.getSelection() ?? "";
   const items: MenuItem[] = [
     { label: "Copy", keys: "Ctrl+Shift+C", disabled: !sel, run: () => A.copy(sel) },
-    {
-      label: "Paste",
-      keys: "Ctrl+Shift+V",
-      disabled: !navigator.clipboard?.readText,
-      run: () => {
-        navigator.clipboard.readText().then((t) => t && term?.paste(t)).catch(() => {});
-        terms.focusTerminal(s.id);
-      },
-    },
+    { label: "Paste", keys: "Ctrl+Shift+V", run: () => A.pasteClipboard(s.id) },
     { label: "Find…", keys: "Ctrl+Shift+F", run: () => (A.findOpen.value = { sid: s.id }) },
     "sep",
     {
@@ -189,8 +189,16 @@ function bodyMenu(
   items.push(
     "sep",
     { label: "Rename", run: () => A.startRename(s.id, "terminal") },
-    { label: "Restart", icon: <IconRestart size={14} />, run: () => A.restartSession(s.id) },
-    { label: "Interrupt", disabled: s.state === "exited", run: () => A.interruptSession(s.id) },
+    {
+      label: "Restart",
+      icon: <IconRestart size={14} />,
+      run: () => A.restartOrInterruptAsk(s.id, "restart"),
+    },
+    {
+      label: "Interrupt",
+      disabled: s.state === "exited",
+      run: () => A.restartOrInterruptAsk(s.id, "interrupt"),
+    },
     { label: "Review queued prompts", disabled: s.queued === 0, run: () => A.reviewQueue(s.id) },
     { label: "Kill process", danger: true, disabled: s.state === "exited", run: () => A.killSession(s.id) },
     { label: "Close tab", keys: "Alt+W", danger: true, run: () => A.closeTab(s.id) },
@@ -227,9 +235,8 @@ export function Group(
 
   const onContext = (e: MouseEvent) => {
     if (!active || (e.target as HTMLElement).closest?.(".approval, .exited-bar, .input-paused-bar, .findbar, input")) return;
-    // Programs that track the mouse get the right button; Shift+right-click still opens ours.
-    const t = terms.terminal(active.id);
-    if (t && t.modes.mouseTrackingMode !== "none" && !e.shiftKey) return;
+    // Never the browser's own menu over a terminal. The right button is Muster's even over a
+    // program that tracks the mouse; terms.ts keeps its reports from the program.
     e.preventDefault();
     A.focusGroup(pane.id);
     openMenu({ x: e.clientX, y: e.clientY, items: bodyMenu(pane.id, active, multi, zoomed, tabs.length) });

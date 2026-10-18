@@ -414,6 +414,167 @@ try {
   check(!(await sub(agent)).includes("ignored"), "the cancelled edit stayed cancelled");
   ok("clicking away commits the rename");
 
+  // Right-click over a program that tracks the mouse: Muster's menu, and the program gets no
+  // right-button report (left clicks still reach it).
+  await a.eval(`(() => { const r = ${M}.rpc; r.__sent = []; if (r.__countsSent) return;
+    const send = r.sendInput.bind(r);
+    r.sendInput = (sid, d) => {
+      r.__sent.push(sid + ":" + (typeof d === "string" ? d : new TextDecoder().decode(d)));
+      return send(sid, d);
+    };
+    const call = r.call.bind(r);
+    r.call = (m, p) => { if (/^session\.(interrupt|restart)$/.test(m)) r.__sent.push(p.id + ":" + m); return call(m, p); };
+    r.__countsSent = true; })()`);
+  const sent = (): Promise<string[]> => a.eval(`${M}.rpc.__sent.splice(0)`);
+  await a.click(`[data-tab-sid="${sh}"]`);
+  await a.eval(`${M}.term(${sh}).write("\\x1b[?1000h\\x1b[?1006h")`);
+  await a.wait(`${M}.term(${sh}).modes.mouseTrackingMode !== 'none'`, 3000);
+  const bm = await bodyOf(a, sh);
+  await sent();
+  await a.clickAt(bm.x + bm.w / 2, bm.y + bm.h / 2);
+  check((await sent()).some((x) => x.startsWith(`${sh}:\x1b[<0;`)), "a left click reached the program");
+  await a.clickAt(bm.x + bm.w / 2, bm.y + bm.h / 2, { button: "right" });
+  await a.wait(`!!document.querySelector('.menu')`, 2000);
+  check(
+    await a.eval(
+      `[...document.querySelectorAll('.menu .menu-label')].some((e) => e.textContent === 'Find…')`,
+    ),
+    "the terminal menu opened",
+  );
+  check((await sent()).length === 0, "the right-click sent the program nothing");
+  await a.key("Escape");
+  ok("right-click over a mouse-tracking program opens the terminal menu and sends it nothing");
+
+  // A chord: xterm keeps reporting from the whole document while a button is held, so the right
+  // button's drag and release outside the terminal must not reach the program either; xterm's
+  // listeners must still be removed once every button is up. Drag tracking (?1002h) on.
+  await a.eval(`${M}.term(${sh}).write("\\x1b[?1002h")`);
+  await a.wait(`${M}.term(${sh}).modes.mouseTrackingMode === 'drag'`, 3000);
+  const cx = bm.x + bm.w / 2, cy = bm.y + bm.h / 2, ox = cx, oy = bm.y - 12; // oy: the tab strip
+  const mouse = (type: string, x: number, y: number, button: string, buttons: number) =>
+    a.send("Input.dispatchMouseEvent", { type, x, y, button, buttons, clickCount: 1 });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+  await sent();
+  await mouse("mousePressed", cx, cy, "left", 1);
+  await mouse("mousePressed", cx, cy, "right", 3);
+  await mouse("mouseMoved", cx + 30, cy, "left", 3);
+  await mouse("mouseMoved", ox, oy, "left", 3);
+  await mouse("mouseReleased", ox, oy, "left", 2);
+  await mouse("mouseMoved", ox + 20, oy, "right", 2); // right-only drag
+  await mouse("mouseMoved", ox + 40, oy, "right", 2);
+  await mouse("mouseReleased", ox + 40, oy, "right", 0);
+  await a.sleep(150);
+  const chord = await sent();
+  // deno-lint-ignore no-control-regex
+  const codes = chord.map((x) => /^\d+:\x1b\[<(\d+);/.exec(x)?.[1]).filter((c) => c !== undefined).map(
+    Number,
+  );
+  check(codes.includes(0) && codes.includes(32), `the left press and drag reached the program (${codes})`);
+  check(!codes.some((c) => (c & 195) === 2), `no right-button report reached the program (${codes})`);
+  // xterm's document listeners are gone: a stray left release outside reports nothing.
+  await mouse("mouseReleased", ox, oy, "left", 0);
+  await a.sleep(100);
+  check((await sent()).length === 0, "xterm's document listeners were removed after the chord");
+  await a.key("Escape");
+  await a.eval(`${M}.term(${sh}).write("\\x1b[?1002l\\x1b[?1000l\\x1b[?1006l")`);
+  ok(`a left+right chord dragged out of the terminal sent only left reports (${codes.length})`);
+
+  if (!real) {
+    // Interrupt on a working agent asks first; Cancel (focused) sends nothing. An idle one doesn't ask.
+    await R(a, "session.send", { id: agent, text: "ask for approval" });
+    await a.wait(`${M}.sessions.value.get(${agent}).state === 'needs_approval'`, 8000);
+    const ri = await a.rect(`[data-tab-sid="${agent}"]`);
+    await a.clickAt(ri!.x + 20, ri!.y + ri!.h / 2, { button: "right" });
+    await pickMenu("Interrupt");
+    await a.wait(`!!document.querySelector('.confirm-dlg')`, 2000);
+    check(
+      await a.eval(`document.querySelector('.confirm-dlg h2')?.textContent`) === "Claude is working" &&
+        await a.eval(`document.querySelector('.confirm-dlg .dlg-body')?.textContent`) ===
+          "Stop its current turn?",
+      "the dialog names the agent and asks",
+    );
+    check(await a.eval(`document.activeElement?.textContent`) === "Cancel", "Cancel is focused");
+    check(
+      await a.eval(`(() => { const d = document.querySelector('.confirm-dlg');
+        return document.getElementById(d.getAttribute('aria-describedby'))?.textContent; })()`) ===
+        "Stop its current turn?",
+      "the question describes the dialog for screen readers",
+    );
+    await a.key("Enter");
+    await a.wait(`!document.querySelector('.confirm-dlg')`, 2000);
+    await a.sleep(200);
+    check((await sent()).length === 0, "Cancel sent nothing");
+    // Restart from the tab menu asks too, with its own warning.
+    await a.clickAt(ri!.x + 20, ri!.y + ri!.h / 2, { button: "right" });
+    await pickMenu("Restart");
+    await a.wait(`!!document.querySelector('.confirm-dlg')`, 2000);
+    check(
+      await a.eval(`document.querySelector('.confirm-dlg .dlg-body')?.textContent`) ===
+          "Restart it? Its current turn is lost and the program starts fresh." &&
+        await a.eval(`document.querySelector('.confirm-dlg .btn-danger')?.textContent`) === "Restart",
+      "Restart warns the turn is lost",
+    );
+    await a.click(`.confirm-dlg .dlg-foot .btn:not(.btn-danger)`);
+    await a.wait(`!document.querySelector('.confirm-dlg')`, 2000);
+    await a.sleep(200);
+    check((await sent()).length === 0, "Cancel on Restart sent nothing");
+    await R(a, "session.approve", { id: agent, decision: "deny" });
+    await a.wait(`${M}.sessions.value.get(${agent}).state === 'idle'`, 4000);
+    await a.clickAt(ri!.x + 20, ri!.y + ri!.h / 2, { button: "right" });
+    await pickMenu("Interrupt");
+    await a.sleep(200);
+    check(await a.eval(`!document.querySelector('.confirm-dlg')`), "an idle agent doesn't ask");
+    check((await sent()).includes(`${agent}:session.interrupt`), "an idle agent is interrupted at once");
+    ok(
+      "tab menu: Interrupt and Restart on a working agent ask first (Cancel sends nothing); idle doesn't ask",
+    );
+
+    // The terminal menu asks too; confirming acts, once.
+    await R(a, "session.send", { id: agent, text: "ask for approval" });
+    await a.wait(`${M}.sessions.value.get(${agent}).state === 'needs_approval'`, 8000);
+    await a.click(`[data-tab-sid="${agent}"]`);
+    const ab = await bodyOf(a, agent);
+    const termMenu = async (label: string) => {
+      await a.clickAt(ab.x + ab.w / 2, ab.y + ab.h / 2, { button: "right" });
+      await pickMenu(label);
+      await a.wait(`!!document.querySelector('.confirm-dlg')`, 2000);
+    };
+    await sent();
+    await termMenu("Interrupt");
+    check(
+      await a.eval(`document.querySelector('.confirm-dlg .dlg-body')?.textContent`) ===
+        "Stop its current turn?",
+      "terminal menu Interrupt asks",
+    );
+    await a.click(`.confirm-dlg .btn-danger`);
+    await a.wait(`!document.querySelector('.confirm-dlg')`, 2000);
+    await a.sleep(200);
+    check(
+      JSON.stringify(await sent()) === JSON.stringify([`${agent}:session.interrupt`]),
+      "confirming interrupted once",
+    );
+    await termMenu("Restart");
+    check(
+      (await a.eval<string>(`document.querySelector('.confirm-dlg .dlg-body')?.textContent ?? ''`))
+        .startsWith("Restart it?"),
+      "terminal menu Restart asks",
+    );
+    await a.key("Enter"); // Cancel is focused
+    await a.wait(`!document.querySelector('.confirm-dlg')`, 2000);
+    await a.sleep(200);
+    check((await sent()).length === 0, "Cancel on the terminal menu's Restart sent nothing");
+    await termMenu("Restart");
+    await a.click(`.confirm-dlg .btn-danger`);
+    await a.wait(`!document.querySelector('.confirm-dlg')`, 2000);
+    await a.sleep(300);
+    check(
+      JSON.stringify(await sent()) === JSON.stringify([`${agent}:session.restart`]),
+      "confirming restarted once",
+    );
+    await a.wait(`${M}.sessions.value.get(${agent}).state === 'idle'`, 10000);
+    ok("terminal menu: Interrupt and Restart on a working agent ask first; confirming sends it once");
+  }
+
   // Back to one session: the tab shows (and renames) just the task again.
   await a.click(`[data-tab-sid="${sh}"]`);
   await a.key("Alt+W");

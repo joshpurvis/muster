@@ -45,11 +45,13 @@ function close() {
 }
 
 function Modal(
-  { children, class: c, onClose = close, label }: {
+  { children, class: c, onClose = close, label, describedBy }: {
     children: ComponentChildren;
     class?: string;
     onClose?: () => void;
     label: string;
+    /** Id of the text screen readers announce with the name (a confirm's question). */
+    describedBy?: string;
   },
 ) {
   const ref = useRef<HTMLDivElement>(null);
@@ -106,7 +108,15 @@ function Modal(
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div ref={ref} class={cx("modal", c)} role="dialog" aria-modal="true" aria-label={label} tabIndex={-1}>
+      <div
+        ref={ref}
+        class={cx("modal", c)}
+        role="dialog"
+        aria-modal="true"
+        aria-label={label}
+        aria-describedby={describedBy}
+        tabIndex={-1}
+      >
         {children}
       </div>
     </div>
@@ -649,7 +659,7 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Close a tab", keys: ["Middle-click"], group: "Tab" },
   { title: "Rename (the names the tab shows)", keys: ["Double-click", "F2"], group: "Tab" },
   { title: "Reorder, move to a group, split or window", keys: ["Drag tab"], group: "Tab" },
-  { title: "Group menu (Shift for programs using the mouse)", keys: ["Right-click"], group: "Groups" },
+  { title: "Group menu", keys: ["Right-click"], group: "Groups" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },
 ];
 
@@ -747,11 +757,11 @@ function Confirm(
   // A stray Enter must not destroy anything: destructive confirms start on Cancel.
   useLayoutEffect(() => (props.danger ? cancel : ok).current?.focus(), []);
   return (
-    <Modal class="dialog confirm-dlg" label={props.title}>
+    <Modal class="dialog confirm-dlg" label={props.title} describedBy="confirm-body">
       <div class="dlg-head">
         <h2>{props.title}</h2>
       </div>
-      <div class="dlg-body">
+      <div class="dlg-body" id="confirm-body">
         {(Array.isArray(props.body) ? props.body : [props.body]).map((text, i) => <p key={i}>{text}</p>)}
       </div>
       <div class="dlg-foot">
@@ -797,11 +807,11 @@ function Shutdown() {
   const agentCount = running.filter((s) => s.kind !== "shell").length;
   const n = running.length;
   return (
-    <Modal class="dialog confirm-dlg" label="Shut down Muster">
+    <Modal class="dialog confirm-dlg" label="Shut down Muster" describedBy="shutdown-body">
       <div class="dlg-head">
         <h2>Shut down Muster?</h2>
       </div>
-      <div class="dlg-body">
+      <div class="dlg-body" id="shutdown-body">
         <p>
           This stops the Muster backend and its terminal host, in every window. Every terminal closes and every
           agent in them stops.

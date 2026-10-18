@@ -415,3 +415,12 @@ export function confirmAfterUpsert(
 ): SessionId | null {
   return pending === s.id && !busy.has(s.state) ? null : pending;
 }
+
+/** An agent mid-turn (working, stuck, or waiting on an approval or answer): Restart and Interrupt
+ * from a menu ask first, since its turn would be lost. Stuck is still a turn: a quiet one (e.g. a
+ * long build) that src/detect.rs flags after 10 minutes without output. Shells and idle agents
+ * never ask. */
+export function midTurn(s: Pick<SessionInfo, "kind" | "state">): boolean {
+  return s.kind !== "shell" && MID_TURN.has(s.state);
+}
+const MID_TURN = new Set<AgentState>(["working", "stuck", "needs_approval", "asking_question"]);

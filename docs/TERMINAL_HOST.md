@@ -84,7 +84,8 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: additional crash-window tests and code review, including retired-run cleanup.
+Remaining before completion: additional crash-window tests and code review, including
+the host's spawn/ownership-journal window and concurrent hook/prompt ordering.
 Existing
 live terminals and the installed binary have not been changed or migrated.
 
@@ -172,3 +173,31 @@ reach zero with a subscriber still present, failed checkpoint writes retain stat
 for retry, replay and screen survive archival, background descendants prevent
 archival, and a pre-exit stream keeps receiving heartbeats after archival. All 154
 full application smoke checks and all 34 focused backend checks also pass with this change.
+
+### Retirement recovery checkpoint
+
+Session removal now commits the deleted session/events and retired launch in one
+transaction before publishing removal or signaling its process. Reconciliation at
+startup and periodically thereafter completes termination, drain, Forget and record
+deletion. Failed persistence keeps the original session live; failed cleanup retains
+the intent for retry. The application no longer has no-op PTY flushing/release calls
+or a second process-reaping thread for each removal.
+
+Forget also fences an unknown prepared run against a delayed spawn. Terminal generation
+allocation is durable independently of deletable launch records. A second start cannot
+overwrite an unconfirmed launch; late acknowledgements preserve retirement and cannot
+replace a newer generation's record. Restart preserves the prior handle and launch
+record until the host confirms cleanup. Backend shutdown permits an already-started
+launch to finish instead of terminating it solely because the backend is stopping.
+
+Validation: all 245 Rust tests, all 154 full smoke checks and all 36 focused process checks
+pass. The new process case resumes a persisted removal whose process ignores SIGHUP,
+waits for exit/drain, and verifies both host state and application record are removed
+while an unrelated terminal keeps its PID. Unit coverage includes transactional removal
+failure, generation allocation across reopen, unconfirmed-launch preservation, and
+Forget-before-Spawn fencing.
+
+The next audit covers delayed launch/remove responses with explicit fault injection,
+the host's spawn/ownership-journal crash window, hook/prompt ordering and transient
+detector/subagent recovery, plus final UI recovery verification. No live installation
+or existing legacy session has been migrated.

@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -70,9 +69,7 @@ impl TerminalService {
         let run = status.run;
         let handle = Arc::new(Terminal {
             id: run.id, generation: run.generation, pid: status.pid,
-            client: self.client.clone(), status: Mutex::new(status), discarded: AtomicBool::new(false),
-            markers: vec![format!("MUSTER_RUN={}-{}-{}", self.client.hello.instance, run.id, run.generation),
-                format!("MUSTER_SESSION_ID={}", run.id)],
+            client: self.client.clone(), status: Mutex::new(status),
         });
         self.handles.lock().insert(run, Arc::downgrade(&handle));
         handle
@@ -157,20 +154,16 @@ pub struct Terminal {
     pub pid: Option<u32>,
     client: Client,
     status: Mutex<TerminalStatus>,
-    discarded: AtomicBool,
-    markers: Vec<String>,
 }
 
 impl Terminal {
     pub fn run(&self) -> RunId { RunId { id: self.id, generation: self.generation } }
     pub fn is_alive(&self) -> bool { self.status.lock().alive }
-    pub fn is_drained(&self) -> bool { self.status.lock().drained }
     pub fn seq(&self) -> u64 { self.status.lock().output_seq }
     pub fn last_output_at(&self) -> i64 { self.status.lock().last_output_at }
     pub fn application_cursor(&self) -> bool { self.status.lock().application_cursor }
     pub fn exit_code(&self) -> Option<i32> { self.status.lock().exit_code }
     pub fn title(&self) -> Option<String> { self.status.lock().title.clone() }
-    pub fn markers(&self) -> &[String] { &self.markers }
 
     fn observe(&self, status: TerminalStatus, events: &EventSink) {
         let previous = std::mem::replace(&mut *self.status.lock(), status.clone());
@@ -228,12 +221,6 @@ impl Terminal {
         self.client.call(Command::Forget { run: self.run() })?;
         Ok(())
     }
-    pub fn discard(&self) { self.discarded.store(true, Ordering::SeqCst); }
-    // Logs are owned and flushed by the host, independently of backend lifetime.
-    pub fn flush_log(&self) {}
-    pub fn flush_log_final(&self) {}
-    pub fn mark_dirty(&self) {}
-    pub fn log_persisted(&self) -> bool { self.status.lock().log_persisted }
 
     pub fn attach(&self, max_body: Option<usize>) -> anyhow::Result<(Vec<u8>, broadcast::Receiver<Output>)> {
         let mut stream = self.client.subscribe(Command::Attach { run: self.run(), replay_bytes: max_body })?;

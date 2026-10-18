@@ -254,6 +254,10 @@ impl Host {
             }
             Command::Forget { run } => {
                 let _guard = self.lifecycle.lock();
+                anyhow::ensure!(
+                    run.id > 0 && run.generation > 0,
+                    "run identity must be nonzero"
+                );
                 if !self.entries.lock().contains_key(&run)
                     && self
                         .forgotten
@@ -263,15 +267,19 @@ impl Host {
                 {
                     return Ok(Response::Ok);
                 }
-                let p = self.get(run)?;
-                if let Terminal::Live(p) = p {
+                let terminal = self.entries.lock().get(&run).map(|e| e.terminal.clone());
+                if let Some(Terminal::Live(p)) = terminal {
                     anyhow::ensure!(
                         !p.has_processes() && p.is_drained(),
                         "terminal still owns processes or pending output"
                     );
                     p.discard();
                 }
-                std::fs::remove_dir_all(self.run_dir(run))?;
+                match std::fs::remove_dir_all(self.run_dir(run)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
                 self.entries.lock().remove(&run);
                 self.forgotten
                     .lock()
@@ -737,6 +745,32 @@ mod tests {
             assert!(Instant::now() < deadline, "terminal did not settle");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn forgetting_an_unspawned_run_fences_a_delayed_launch() {
+        let fixture = Fixture::new();
+        let spec = fixture.spec(10);
+        fixture
+            .0
+            .execute(Command::Forget { run: spec.run })
+            .unwrap();
+        assert!(fixture.0.spawn(spec).is_err());
+        fixture.0.spawn(fixture.spec(11)).unwrap();
+        let mut unrelated = fixture.spec(1);
+        unrelated.run.id = 2;
+        fixture.0.spawn(unrelated).unwrap();
+        assert!(
+            fixture
+                .0
+                .execute(Command::Forget {
+                    run: RunId {
+                        id: 0,
+                        generation: 0
+                    }
+                })
+                .is_err()
+        );
     }
 
     #[test]

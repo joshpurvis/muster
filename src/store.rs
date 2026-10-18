@@ -1075,6 +1075,31 @@ impl Store {
         Ok(())
     }
 
+    /// A removal either keeps the session and its live launch, or durably removes
+    /// the row and leaves the host retirement intent. Never publish half of it.
+    pub fn retire_session(&self, id: SessionId, terminal: Option<&StoredTerminal>) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        if let Some(terminal) = terminal {
+            anyhow::ensure!(terminal.retired && terminal.spec.run.id == id, "invalid terminal retirement");
+            transaction.execute(
+                "INSERT INTO terminal_runs(session_id, record) VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
+                params![id, serde_json::to_string(terminal)?],
+            )?;
+        }
+        transaction.execute("DELETE FROM sessions WHERE id=?1", [id])?;
+        transaction.execute("DELETE FROM events WHERE session_id=?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn fail_session_removal_for_test(&self) {
+        self.conn.lock().execute_batch("CREATE TRIGGER refuse_session_removal BEFORE DELETE ON sessions
+            BEGIN SELECT RAISE(ABORT, 'fixture removal failure'); END;").unwrap();
+    }
+
     /// Record the session id (= pid of the process muster started) of a session's current
     /// process. Kept after the process exits, so leftovers can be reaped at the next start.
     /// `markers` are `KEY=value`s from that process's environment unique to the run
@@ -1190,6 +1215,25 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve before sending a spawn request. Deleting retired launch records
+    /// must not let a replacement backend reuse a host's generation tombstone.
+    pub fn next_terminal_generation(&self, observed_floor: u64) -> anyhow::Result<u64> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        let previous: Option<String> = transaction.query_row(
+            "SELECT record FROM runtime_state WHERE key='terminal-generation'", [], |row| row.get(0),
+        ).optional()?;
+        let previous = previous.map(|s| s.parse::<u64>()).transpose()?.unwrap_or(0);
+        let next = previous.max(observed_floor).checked_add(1).context("terminal generation exhausted")?;
+        anyhow::ensure!(next <= (1 << 53) - 1, "terminal generation exceeds exact JavaScript integers");
+        transaction.execute(
+            "INSERT INTO runtime_state(key, record) VALUES ('terminal-generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET record=excluded.record", [next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn load_terminals(&self) -> anyhow::Result<std::collections::BTreeMap<SessionId, StoredTerminal>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT session_id, record FROM terminal_runs")?;
@@ -1203,7 +1247,11 @@ impl Store {
     }
 
     pub fn delete_terminal(&self, id: SessionId) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM terminal_runs WHERE session_id=?1", [id])?;
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute("DELETE FROM terminal_runs WHERE session_id=?1", [id])?;
+        transaction.execute("DELETE FROM reap WHERE session_id=?1", [id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1286,6 +1334,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_generations_survive_record_cleanup_and_replacement() {
+        let directory = std::env::temp_dir().join(format!("muster-generations-{}", crate::paths::random_token()));
+        let path = directory.join("state.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.next_terminal_generation(42).unwrap(), 43);
+            store.conn.lock().execute("DELETE FROM terminal_runs", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.next_terminal_generation(0).unwrap(), 44);
+        assert_eq!(store.next_terminal_generation(100).unwrap(), 101);
+        store.fail_runtime_writes_for_test();
+        assert!(store.next_terminal_generation(0).is_err());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn count(s: &Store, sql: &str) -> i64 {
         s.conn.lock().query_row(sql, [], |r| r.get(0)).unwrap()

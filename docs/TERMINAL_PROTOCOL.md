@@ -62,6 +62,11 @@ Commands: `hello`, `inventory`, `spawn`, `status`, `input`, `resize`, `screen`,
 explicit operation that terminates all host-owned processes. SIGTERM/SIGINT have
 that same host-only meaning. SIGHUP is ignored.
 
+Forgetting an unknown nonzero run records its generation watermark too. This cancels
+a prepared launch safely: a delayed spawn either completes before Forget (which then
+refuses while it owns processes), or loses to the watermark and cannot create a process.
+Applications must persist generation allocation independently of removable run records.
+
 Inventory retains exited runs until explicitly forgotten, including exit codes
 and access to replay. Original process exit and terminal drain are separate facts:
 background children can remain after the leader exits.

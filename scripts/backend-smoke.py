@@ -242,6 +242,29 @@ try:
     rpc("session.input", {"id": sid, "data": "printf 'AFTER-RESTART\\n'\r"})
     until("replacement terminal works", lambda: "AFTER-RESTART" in output(sid))
     check("COUNT:5" not in output(sid), "replacement run has independent replay")
+
+    # Model a backend crash after removal is recorded but before kill/drain or
+    # Forget finishes. Only this fixture's database is edited, with its backend off.
+    retiring = rpc("session.spawn", {"channel_id": channel["id"], "kind": "shell"})
+    rpc("session.input", {"id": retiring["id"], "data": "trap '' HUP; printf 'RETIRE-READY\\n'; sleep 100\r"})
+    until("retirement fixture ready", lambda: "RETIRE-READY" in output(retiring["id"]) and session(retiring["id"])["state"] == "working")
+    stop_backend(hard=True)
+    with sqlite3.connect(DATA / "muster.db") as database:
+        retired = json.loads(database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (retiring["id"],)).fetchone()[0])
+        retired["retired"] = True
+        database.execute("UPDATE terminal_runs SET record=? WHERE session_id=?", (json.dumps(retired), retiring["id"]))
+        database.execute("DELETE FROM sessions WHERE id=?", (retiring["id"],))
+    start_backend()
+    def retirement_finished():
+        inventory = host_call("inventory")
+        with sqlite3.connect(DATA / "muster.db") as database:
+            remaining = database.execute("SELECT COUNT(*) FROM terminal_runs WHERE session_id=?", (retiring["id"],)).fetchone()[0]
+        return not remaining and all(item["run"] != retired["spec"]["run"] for item in inventory)
+    until("retired run and record removed", retirement_finished)
+    check(not (DATA / "terminal/runs" / f'{retiring["id"]}-{retired["spec"]["run"]["generation"]}').exists(),
+          "retirement interrupted by a backend crash finishes after process exit and drain")
+    check(session(sid)["pid"] == restarted["pid"], "retirement recovery preserves unrelated terminal processes")
+
     # A prompt accepted into a busy terminal's queue must survive application replacement.
     waiting = BASE / "queued-command-runs"
     rpc("session.input", {"id": sid, "data": "sleep 4\r"})

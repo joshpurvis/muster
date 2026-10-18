@@ -991,8 +991,8 @@ async fn daemon_main() -> anyhow::Result<()> {
         });
     }
 
-    // Periodically persist scrollback so a crash loses at most a few seconds.
-    // Appends only what's new since the last flush, without fsync.
+    // Retry application-owned removal intents after process exit and drain.
+    // Terminal logs are flushed autonomously by the host.
     {
         let hub = hub.clone();
         tokio::spawn(async move {
@@ -1000,7 +1000,11 @@ async fn daemon_main() -> anyhow::Result<()> {
             loop {
                 t.tick().await;
                 let h = hub.clone();
-                let _ = tokio::task::spawn_blocking(move || h.flush_logs()).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = h.reconcile_retired() {
+                        tracing::warn!("completing terminal retirement: {error:#}");
+                    }
+                }).await;
             }
         });
     }

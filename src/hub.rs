@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -195,7 +195,6 @@ struct Started {
     consumed: bool,
     generation: u64,
     early_exit: Option<i32>,
-    pty: Arc<PtySession>,
 }
 
 /// A Screen update can't override a Hook update younger than this.
@@ -275,8 +274,9 @@ pub struct Hub {
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
     inner: Mutex<Inner>,
-    generation: AtomicU64,
+    generation_floor: u64,
     terminal_records: Mutex<BTreeMap<SessionId, StoredTerminal>>,
+    retire_signalled: Mutex<BTreeSet<RunId>>,
     shutting_down: AtomicBool,
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
@@ -356,15 +356,7 @@ impl Hub {
         if let Some(host) = &cfg.terminal_host {
             for record in terminal_records.values_mut() {
                 if record.host_instance != host.client.hello.instance { continue }
-                if record.retired {
-                    if let Some(status) = inventory.iter().find(|s| s.run == record.spec.run) {
-                        if status.has_processes {
-                            host.client.call(HostCommand::Terminate { run: status.run, force: false })?;
-                        } else if status.drained {
-                            let _ = host.client.call(HostCommand::Forget { run: status.run });
-                        }
-                    }
-                } else if record.pending {
+                if !record.retired && record.pending {
                     host.spawn(record.spec.clone())?;
                     record.pending = false;
                     store.save_terminal(record.spec.run.id, record)?;
@@ -372,8 +364,11 @@ impl Hub {
             }
             inventory = host.inventory()?;
         }
-        let next_generation = terminal_records.values().map(|r| r.spec.run.generation)
-            .chain(inventory.iter().map(|s| s.run.generation)).max().unwrap_or(0) + 1;
+        let generation_floor = terminal_records.values().map(|r| r.spec.run.generation)
+            .chain(inventory.iter().map(|s| s.run.generation)).max().unwrap_or(0);
+        // Persist this floor before any retired records can be deleted. Even a
+        // restart with no new spawns must remember the host's older generations.
+        let generation_floor = store.next_terminal_generation(generation_floor)?;
         match store.prune_events(now_ms() - EVENT_MAX_AGE_MS, EVENTS_PER_CHANNEL) {
             Ok(n) if n > 0 => tracing::info!("pruned {n} old events"),
             Ok(_) => {}
@@ -468,8 +463,9 @@ impl Hub {
             store,
             tx,
             inner: Mutex::new(inner),
-            generation: AtomicU64::new(next_generation),
+            generation_floor,
             terminal_records: Mutex::new(terminal_records),
+            retire_signalled: Mutex::new(BTreeSet::new()),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
@@ -485,11 +481,14 @@ impl Hub {
                 match event {
                     TerminalEvent::Title { id, generation, title } => hub.pty_title_changed(id, generation, title),
                     TerminalEvent::Exited { id, generation, code } => hub.pty_exited(id, generation, code),
-                    TerminalEvent::Drained { id, generation } => hub.pty_drained(id, generation),
+                    TerminalEvent::Drained { .. } => {}, // Host releases final terminal resources.
                 }
             }), Arc::new(move |message| {
                 if let Some(hub) = unavailable.upgrade() { hub.notice("error", message); }
             }))?;
+        }
+        if let Err(error) = hub.reconcile_retired() {
+            tracing::warn!("terminal retirement will retry after startup: {error:#}");
         }
         crate::inject::restore(&hub)?;
         Ok(hub)
@@ -1001,10 +1000,6 @@ impl Hub {
         self.rederive_name(cid);
     }
 
-    // Exited terminal handles are retained: their host owns replay and descendant
-    // cleanup. A handle contains metadata, not a PTY or a multi-megabyte buffer.
-    fn try_release(&self, _id: SessionId, _generation: u64) {}
-
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
         let channel_id = {
             let mut g = self.inner.lock();
@@ -1030,8 +1025,6 @@ impl Hub {
             ch
         };
         crate::inject::drop_queue(self, id);
-        // Replay/screen for exited sessions are served from the log once the PTY is released.
-        self.try_release(id, generation);
         let detail = if self.shutting_down.load(Ordering::SeqCst) {
             "daemon stopped".to_string()
         } else {
@@ -1054,12 +1047,6 @@ impl Hub {
             EventKind::SessionExited,
             serde_json::json!({ "session_id": id, "exit_code": code }),
         );
-    }
-
-    /// The reader of a PTY saw EOF (nothing holds the terminal any more). Releases the PTY
-    /// of an exited process.
-    pub(crate) fn pty_drained(&self, id: SessionId, generation: u64) {
-        self.try_release(id, generation);
     }
 
     // ----- mutations -----
@@ -2176,7 +2163,16 @@ impl Hub {
     /// the adapter consumed the initial prompt.
     /// The caller logs SessionStarted, then reports `early_exit` via `pty_exited`.
     fn start_process(self: &Arc<Self>, id: SessionId, prompt: Option<String>) -> anyhow::Result<Started> {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst);
+        let retiring = self.terminal_records.lock().get(&id).is_some_and(|r| r.retired);
+        if retiring { self.reconcile_retired()?; }
+        {
+            let records = self.terminal_records.lock();
+            if let Some(record) = records.get(&id) {
+                anyhow::ensure!(!record.retired, "session {id}'s previous terminal is still being retired; retry after cleanup");
+                anyhow::ensure!(!record.pending, "session {id}'s previous launch is unconfirmed; reload the backend to reconcile it before restarting");
+            }
+        }
+        let generation = self.store.next_terminal_generation(self.generation_floor)?;
         let (info, extra_args, port_base, permissions) = {
             let mut g = self.inner.lock();
             let cwd = PathBuf::from(
@@ -2246,37 +2242,50 @@ impl Hub {
             host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
             spec: launch.clone(), pending: true, retired: false,
         };
-        self.store.save_terminal(id, &record)?;
-        self.terminal_records.lock().insert(id, record.clone());
+        {
+            let g = self.inner.lock();
+            anyhow::ensure!(g.sessions.get(&id).is_some_and(|e| e.generation == generation),
+                "session {id} was removed or replaced before its launch was prepared");
+            let mut records = self.terminal_records.lock();
+            self.store.save_terminal(id, &record)?;
+            records.insert(id, record.clone());
+        }
         let pty = match host.spawn(launch) {
             Ok(pty) => pty,
             Err(error) => {
                 if error.downcast_ref::<crate::terminal::SpawnUncertain>().is_none() {
                     record.retired = true;
-                    self.store.save_terminal(id, &record)?;
-                    self.terminal_records.lock().insert(id, record);
+                    let mut records = self.terminal_records.lock();
+                    if records.get(&id).is_none_or(|r| r.spec.run == record.spec.run) {
+                        self.store.save_terminal(id, &record)?;
+                        records.insert(id, record);
+                    }
                 }
                 return Err(error);
             }
         };
-        record.pending = false;
-        // If this write fails the prepared record still lets the next backend adopt
-        // the exact same process. Never roll back a successful spawn by killing it.
-        if let Err(error) = self.store.save_terminal(id, &record) {
-            tracing::warn!(session = id, "persisting terminal acknowledgement: {error:#}");
-        }
-        self.terminal_records.lock().insert(id, record);
         let (info, early, kill) = {
             let mut g = self.inner.lock();
             let superseded = match g.sessions.get(&id) {
                 None => Some("was removed while starting"),
                 Some(e) if e.generation != generation => Some("was restarted concurrently"),
-                Some(_) if self.shutting_down.load(Ordering::SeqCst) => Some("not started: daemon is stopping"),
                 Some(_) => None,
             };
+            {
+                let mut records = self.terminal_records.lock();
+                if records.get(&id).is_none_or(|r| r.spec.run == record.spec.run) {
+                    record.pending = false;
+                    record.retired = superseded.is_some() || records.get(&id).is_some_and(|r| r.retired);
+                    // A lost acknowledgement still leaves the prepared identity.
+                    // Removal's durable retirement must never be overwritten here.
+                    if let Err(error) = self.store.save_terminal(id, &record) {
+                        tracing::warn!(session = id, "persisting terminal acknowledgement: {error:#}");
+                    }
+                    records.insert(id, record);
+                }
+            }
             if let Some(why) = superseded {
                 drop(g);
-                pty.discard();
                 pty.kill();
                 anyhow::bail!("session {id} {why}");
             }
@@ -2314,7 +2323,6 @@ impl Hub {
             consumed: spec.consumed_initial_prompt,
             generation,
             early_exit: early,
-            pty,
         })
     }
 
@@ -2383,7 +2391,7 @@ impl Hub {
                 let q = p.clone();
                 let busy = tokio::task::spawn_blocking(move || q.has_processes())
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 if !busy {
                     break;
                 }
@@ -2396,42 +2404,36 @@ impl Hub {
                         let q = p.clone();
                         if !tokio::task::spawn_blocking(move || q.has_processes())
                             .await
-                            .unwrap_or(false)
+                            .unwrap_or(true)
                         {
                             gone = true;
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    // The new process's record replaces this one: keep the survivors' for the
-                    // next start's reaper (and keep trying meanwhile).
-                    if !gone && let Some(sid) = p.pid {
-                        if let Err(e) = self.store.add_reap(id, sid, p.markers()) {
-                            tracing::warn!(session = id, "recording pending reap: {e}");
-                        }
-                        self.confirm_reap(id, sid, p.clone());
-                    }
+                    anyhow::ensure!(gone, "session {id}'s previous run still owns processes; retaining its launch record");
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        let previous = self.inner.lock().sessions.get_mut(&id).and_then(|e| e.pty.take());
+        let previous = self.pty(id);
         if let Some(p) = previous {
-            p.discard();
             p.forget()?;
+            let mut g = self.inner.lock();
+            if let Some(e) = g.sessions.get_mut(&id) {
+                if e.generation == p.generation { e.pty = None; }
+            }
         }
         match self.start_process(id, None) {
             Ok(Started {
                 info,
                 generation,
                 early_exit,
-                pty,
                 ..
             }) => {
-                // Only now drop the old scrollback; the new process's first flush rewrites it.
+                // Clear any legacy application-owned log. The host owns new run logs.
                 let _ = std::fs::remove_file(paths::session_dir(id).join("output.log"));
-                pty.mark_dirty();
                 self.log_event(
                     Some(info.channel_id),
                     Some(id),
@@ -2488,12 +2490,15 @@ impl Hub {
 
     /// Kill (if alive) and forget a session, including its scrollback.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
-        if let Some(record) = self.terminal_records.lock().get_mut(&id) {
-            record.retired = true;
-            self.store.save_terminal(id, record)?;
-        }
         let entry = {
             let mut g = self.inner.lock();
+            anyhow::ensure!(g.sessions.contains_key(&id), "no such session: {id}");
+            let mut records = self.terminal_records.lock();
+            let retired = records.get(&id).cloned().map(|mut record| { record.retired = true; record });
+            self.store.retire_session(id, retired.as_ref())?;
+            if let Some(record) = retired {
+                records.insert(id, record);
+            }
             let e = g
                 .sessions
                 .remove(&id)
@@ -2504,28 +2509,10 @@ impl Hub {
             e
         };
         if let Some(p) = &entry.pty {
-            p.discard();
             // Also reaps leftovers (background jobs) of an already exited process.
             p.kill();
-            // Until the kill is confirmed, remember the process session: if the daemon stops
-            // during the grace period, the next start reaps what ignored SIGHUP.
-            // (Whether any are left is checked by `confirm_reap`, off the async workers.)
-            if let Some(sid) = p.pid
-                && !p.markers().is_empty()
-            {
-                if let Err(e) = self.store.add_reap(id, sid, p.markers()) {
-                    tracing::warn!(session = id, "recording pending reap: {e}");
-                }
-                self.confirm_reap(id, sid, p.clone());
-            }
-        } else if let Err(e) = self.store.keep_sid_for_reap(id) {
-            tracing::warn!(session = id, "keeping recorded process session: {e}");
-        }
-        if let Err(e) = self.store.delete_session(id) {
-            tracing::warn!(session = id, "deleting session: {e}");
-        }
-        if let Err(e) = self.store.delete_session_events(id) {
-            tracing::warn!(session = id, "deleting session events: {e}");
+            // The durable retired launch is retried by reconciliation, including
+            // when this backend stops before process exit or terminal drain.
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
@@ -2740,39 +2727,6 @@ impl Hub {
         Ok((info, from))
     }
 
-    /// Wait (off the async workers) for a removed session's processes to die, SIGKILL them after
-    /// the grace period, then drop the pending-reap record once none are left.
-    fn confirm_reap(&self, id: SessionId, sid: u32, p: Arc<PtySession>) {
-        let weak = self.weak.clone();
-        let _ = std::thread::Builder::new().name(format!("reap-{id}")).spawn(move || {
-            let deadline = std::time::Instant::now() + pty::KILL_GRACE + Duration::from_millis(500);
-            while p.has_processes() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if p.has_processes() {
-                p.kill_now();
-                let end = std::time::Instant::now() + Duration::from_secs(1);
-                while p.has_processes() && std::time::Instant::now() < end {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-            if !p.has_processes() {
-                if let Err(error) = p.forget() {
-                    tracing::warn!(session = id, "forgetting terminated run: {error:#}");
-                    return;
-                }
-                if let Some(hub) = weak.upgrade() {
-                    let _ = hub.store.remove_reap(id, sid);
-                    let mut records = hub.terminal_records.lock();
-                    if records.get(&id).is_some_and(|r| r.retired && r.spec.run.generation == p.generation) {
-                        let _ = hub.store.delete_terminal(id);
-                        records.remove(&id);
-                    }
-                }
-            }
-        });
-    }
-
     pub fn rename_session(&self, id: SessionId, name: String) -> anyhow::Result<SessionInfo> {
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -2874,24 +2828,46 @@ impl Hub {
 
     // ----- daemon lifecycle -----
 
-    fn all_ptys(&self) -> Vec<Arc<PtySession>> {
-        self.inner
-            .lock()
-            .sessions
-            .values()
-            .filter_map(|e| e.pty.clone())
-            .collect()
-    }
-
-    /// Append new output of every session to its output.log (called periodically; no fsync).
-    pub fn flush_logs(&self) {
-        for p in self.all_ptys() {
-            p.flush_log();
-            // Exited processes whose leftovers died since: release their PTY now.
-            if !p.is_alive() {
-                self.try_release(p.id, p.generation);
+    /// Finish durable retirement intents after exit/drain, including removals
+    /// interrupted by a backend crash. The host owns signaling and grace periods.
+    pub fn reconcile_retired(&self) -> anyhow::Result<()> {
+        let Some(host) = &self.cfg.terminal_host else { return Ok(()) };
+        let retired: Vec<_> = self.terminal_records.lock().iter().filter(|(_, r)| r.retired)
+            .map(|(id, r)| (*id, r.host_instance.clone(), r.spec.run)).collect();
+        if retired.is_empty() { return Ok(()) }
+        let inventory = host.inventory()?;
+        let mut failure = None;
+        for (id, instance, run) in retired {
+            let result = (|| -> anyhow::Result<()> {
+                if instance == host.client.hello.instance {
+                    if let Some(status) = inventory.iter().find(|s| s.run == run) {
+                        if status.has_processes {
+                            if !self.retire_signalled.lock().contains(&run) {
+                                host.client.call(HostCommand::Terminate { run, force: false })?;
+                                self.retire_signalled.lock().insert(run);
+                            }
+                            return Ok(());
+                        }
+                        if status.alive || !status.drained { return Ok(()); }
+                    }
+                    // Also fences a prepared-but-not-yet-spawned run. A concurrent
+                    // spawn either loses to this tombstone or makes Forget refuse.
+                    host.client.call(HostCommand::Forget { run })?;
+                }
+                let mut records = self.terminal_records.lock();
+                if records.get(&id).is_some_and(|r| r.retired && r.spec.run == run && r.host_instance == instance) {
+                    self.store.delete_terminal(id)?;
+                    records.remove(&id);
+                }
+                self.retire_signalled.lock().remove(&run);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::warn!(session = id, ?run, "retaining terminal retirement for retry: {error:#}");
+                failure = Some(error);
             }
         }
+        match failure { Some(error) => Err(error), None => Ok(()) }
     }
 
     /// Stop accepting application work. The independently owned terminals continue.
@@ -3287,6 +3263,42 @@ mod tests {
             terminal_host: None,
         };
         Hub::new(cfg, store).unwrap()
+    }
+
+    fn remember_launch(hub: &Hub, pending: bool) {
+        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(),
+            port_base: 20000, pending, retired: false,
+            spec: SpawnSpec { run: RunId { id: 1, generation: 42 }, program: "/bin/true".into(),
+                args: vec![], env: BTreeMap::new(), cwd: std::env::temp_dir(), cols: 80, rows: 24 } };
+        hub.store.save_terminal(1, &record).unwrap();
+        hub.terminal_records.lock().insert(1, record);
+    }
+
+    #[test]
+    fn failed_removal_keeps_the_session_and_its_live_launch_record() {
+        let hub = move_fixture();
+        remember_launch(&hub, false);
+        hub.store.fail_session_removal_for_test();
+        assert!(hub.remove_session(1).is_err());
+        assert!(hub.session(1).is_some());
+        assert!(hub.store.load_sessions().unwrap().iter().any(|s| s.info.id == 1));
+        assert!(!hub.terminal_records.lock()[&1].retired);
+        assert!(!hub.store.load_terminals().unwrap()[&1].retired);
+    }
+
+    #[test]
+    fn starting_again_cannot_overwrite_an_unconfirmed_launch() {
+        let hub = move_fixture();
+        remember_launch(&hub, true);
+        assert!(hub.start_process(1, None).err().unwrap().to_string().contains("unconfirmed"));
+        let saved = hub.store.load_terminals().unwrap().remove(&1).unwrap();
+        assert_eq!(saved.spec.run.generation, 42);
+        assert!(saved.pending && !saved.retired);
+        assert_eq!(saved.token, "run-token");
+        hub.remove_session(1).unwrap();
+        assert!(hub.session(1).is_none());
+        assert!(hub.store.load_sessions().unwrap().iter().all(|s| s.info.id != 1));
+        assert!(hub.store.load_terminals().unwrap()[&1].retired);
     }
 
     #[test]

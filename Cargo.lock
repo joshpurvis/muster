@@ -1896,6 +1896,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "muster-terminal-core",
+ "muster-terminal-protocol",
  "notify-rust",
  "parking_lot",
  "rand 0.9.5",

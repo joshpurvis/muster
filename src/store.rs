@@ -28,6 +28,18 @@ pub struct StoredSession {
     pub extra_args: Vec<String>,
 }
 
+/// Application-owned identity and credentials for a host-owned terminal run.
+/// Written before spawn so a lost response can be reconciled without another process.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredTerminal {
+    pub host_instance: String,
+    pub token: String,
+    pub port_base: u16,
+    pub spec: muster_terminal_protocol::SpawnSpec,
+    pub pending: bool,
+    pub retired: bool,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -207,6 +219,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE agent_messages ADD COLUMN text TEXT;
     ALTER TABLE agent_messages ADD COLUMN refused TEXT;
+    "#,
+    // v10: application metadata for terminal runs owned by the independent host.
+    r#"
+    CREATE TABLE terminal_runs (
+        session_id INTEGER PRIMARY KEY,
+        record TEXT NOT NULL
+    );
     "#,
 ];
 
@@ -1041,6 +1060,31 @@ impl Store {
              WHERE state != 'exited'",
             params![detail, now],
         )?)
+    }
+
+    pub fn save_terminal(&self, id: SessionId, run: &StoredTerminal) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO terminal_runs(session_id, record) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
+            params![id, serde_json::to_string(run)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_terminals(&self) -> anyhow::Result<std::collections::BTreeMap<SessionId, StoredTerminal>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT session_id, record FROM terminal_runs")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, SessionId>(0)?, r.get::<_, String>(1)?)))?;
+        let mut records = std::collections::BTreeMap::new();
+        for row in rows {
+            let (id, json) = row?;
+            records.insert(id, serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    pub fn delete_terminal(&self, id: SessionId) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM terminal_runs WHERE session_id=?1", [id])?;
+        Ok(())
     }
 
     // ----- events -----

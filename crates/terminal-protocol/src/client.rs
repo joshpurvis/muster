@@ -4,6 +4,18 @@ use crate::{
     Command, Hello, Request, Response, VERSION,
     wire::{self, Frame},
 };
+
+#[derive(Debug)]
+pub struct HostError {
+    pub code: String,
+    pub message: String,
+}
+impl std::fmt::Display for HostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "terminal host ({}): {}", self.code, self.message)
+    }
+}
+impl std::error::Error for HostError {}
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -85,7 +97,7 @@ fn connect(socket: &Path) -> anyhow::Result<UnixStream> {
 
 fn checked(response: Response) -> anyhow::Result<Response> {
     match response {
-        Response::Error { code, message } => anyhow::bail!("terminal host ({code}): {message}"),
+        Response::Error { code, message } => Err(HostError { code, message }.into()),
         value => Ok(value),
     }
 }

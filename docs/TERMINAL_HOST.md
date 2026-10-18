@@ -60,3 +60,22 @@ application updates must never automatically replace an incompatible live host.
 - Application integration, persistent application recovery, update commands and
   end-to-end backend restart tests are still pending. The application currently
   uses the extracted core in-process; it is not yet restart-safe.
+
+### Application integration checkpoint
+
+The backend now uses remote terminal handles and reconciles persisted launch
+intents and credentials with the surviving host. Backend SIGTERM and SIGKILL no
+longer terminate terminals. `muster reload` replaces only the backend; `muster stop`
+explicitly stops both services. The initial application port is pinned across
+backend restarts. Host logs are generation-specific and owned by the host.
+
+Validation so far: 223 Rust tests, 11 focused backend survival checks in
+`scripts/backend-smoke.py`, and all 154 checks in the updated full smoke suite.
+The smoke suite exposed transient title loss with polling alone; the backend now
+also consumes host title events. Run all checks through `scripts/isolated.sh`.
+
+Remaining before completion: durable prompt/delivery and provenance recovery;
+hook spooling/deduplication; application/UI update compatibility and asset loading;
+additional crash-window tests and code review, including retired-run cleanup,
+slow/disconnected stream recovery, and bounded host resource retention. Existing
+live terminals and the installed binary have not been changed or migrated.

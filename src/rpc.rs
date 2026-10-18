@@ -1283,7 +1283,7 @@ async fn forward_output(
     id: SessionId,
     limit: Option<usize>,
     mut generation: Option<u64>,
-    mut rx: Option<broadcast::Receiver<Bytes>>,
+    mut rx: Option<broadcast::Receiver<crate::terminal::Output>>,
     mut bus: broadcast::Receiver<ServerEvent>,
     out: Outbox,
 ) {
@@ -1295,8 +1295,12 @@ async fn forward_output(
                     None => std::future::pending().await,
                 }
             } => match chunk {
-                Ok(bytes) => {
-                    if out.send(Message::Binary(frame(FRAME_OUTPUT, id, &bytes))).await.is_err() {
+                Ok(output) => {
+                    let (kind, bytes) = match output {
+                        crate::terminal::Output::Bytes(bytes) => (FRAME_OUTPUT, bytes),
+                        crate::terminal::Output::Replay(bytes) => (FRAME_REPLAY, bytes),
+                    };
+                    if out.send(Message::Binary(frame(kind, id, &bytes))).await.is_err() {
                         return;
                     }
                 }
@@ -1331,7 +1335,7 @@ async fn resend_replay(
     id: SessionId,
     limit: Option<usize>,
     generation: &mut Option<u64>,
-    rx: &mut Option<broadcast::Receiver<Bytes>>,
+    rx: &mut Option<broadcast::Receiver<crate::terminal::Output>>,
     out: &Outbox,
 ) -> bool {
     let (replay, new_rx, new_gen) = match hub.attach(id, limit).await {
@@ -1375,6 +1379,7 @@ mod tests {
             port: 0,
             client_token: "t".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
+            terminal_host: None,
         };
         let hub = Hub::new(cfg, store).unwrap();
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));

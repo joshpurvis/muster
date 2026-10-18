@@ -17,6 +17,7 @@ mod pty;
 mod rpc;
 mod server;
 mod store;
+mod terminal;
 mod wm;
 mod worktree;
 
@@ -64,6 +65,8 @@ enum Cmd {
     Status,
     /// Stop the daemon (running sessions are terminated).
     Stop,
+    /// Restart only the application backend; host-owned terminal processes continue.
+    Reload,
     /// Print the UI URL (with its access token).
     Url,
     /// Open a UI window; with PATH, add the folder and open a shell tab there.
@@ -427,6 +430,7 @@ fn main() -> ExitCode {
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
+        Some(Cmd::Reload) => stop_backend().and_then(|_| start_daemon_detached().map(|_| println!("muster backend restarted; terminals preserved"))),
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {
@@ -679,6 +683,28 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn stop() -> anyhow::Result<()> {
+    stop_backend()?;
+    let socket = paths::runtime_dir().join("terminal.sock");
+    match muster_terminal_protocol::client::Client::connect(&socket) {
+        Ok(host) => {
+            anyhow::ensure!(host.hello.data_dir == std::fs::canonicalize(paths::data_dir().join("terminal"))?,
+                "terminal host belongs to another data directory");
+            host.call(muster_terminal_protocol::Command::Shutdown)?;
+            let end = Instant::now() + Duration::from_secs(10);
+            while socket.exists() {
+                anyhow::ensure!(Instant::now() < end, "terminal host did not stop within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            println!("muster terminal host stopped");
+        }
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|
+            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => {},
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn stop_backend() -> anyhow::Result<()> {
     let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
         println!("muster daemon: not running");
         return Ok(());
@@ -694,7 +720,7 @@ fn stop() -> anyhow::Result<()> {
         libc::kill(d.pid as libc::pid_t, libc::SIGTERM);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while paths::pid_alive(d.pid) {
+    while paths::pid_alive(d.pid) && is_muster_process(d.pid) {
         if Instant::now() > deadline {
             anyhow::bail!("daemon (pid {}) did not stop within 10s", d.pid);
         }
@@ -813,18 +839,27 @@ fn load_client_token() -> anyhow::Result<String> {
 
 async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
     use tokio::net::TcpListener;
-    if let Some(port) = paths::port_override()? {
-        return TcpListener::bind(("127.0.0.1", port))
-            .await
-            .with_context(|| format!("binding 127.0.0.1:{port} (MUSTER_PORT)"));
+    let saved_path = paths::runtime_dir().join("application-port");
+    let saved: Option<u16> = match std::fs::read_to_string(&saved_path) {
+        Ok(port) => Some(port.trim().parse().context("invalid saved application port")?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let requested = paths::port_override()?;
+    if let (Some(saved), Some(requested)) = (saved, requested.filter(|p| *p != 0)) {
+        anyhow::ensure!(saved == requested, "application port is pinned to {saved} for surviving terminals; cannot switch to {requested}");
     }
-    match TcpListener::bind(("127.0.0.1", paths::DEFAULT_PORT)).await {
-        Ok(l) => Ok(l),
-        Err(e) => {
-            tracing::info!("port {} unavailable ({e}); picking a free port", paths::DEFAULT_PORT);
-            Ok(TcpListener::bind(("127.0.0.1", 0)).await?)
+    let port = saved.or(requested).unwrap_or(paths::DEFAULT_PORT);
+    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(error) if saved.is_none() && requested.is_none() => {
+            tracing::info!("port {port} unavailable ({error}); assigning the initial application port");
+            TcpListener::bind(("127.0.0.1", 0)).await?
         }
-    }
+        Err(error) => return Err(error).with_context(|| format!("binding pinned application port {port}")),
+    };
+    paths::write_private(&saved_path, listener.local_addr()?.port().to_string().as_bytes())?;
+    Ok(listener)
 }
 
 fn run_daemon() -> anyhow::Result<()> {
@@ -856,9 +891,12 @@ async fn daemon_main() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
-    // Before the hub loads the records and anything starts in those folders.
-    if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
-        tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
+    let terminal_host = terminal::ensure_host()?;
+    // Never move a directory beneath a surviving process during a backend update.
+    if !terminal_host.inventory()?.iter().any(|run| run.has_processes) {
+        if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
+            tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
+        }
     }
     let muster_bin = std::env::current_exe()
         .ok()
@@ -869,6 +907,7 @@ async fn daemon_main() -> anyhow::Result<()> {
             port,
             client_token: client_token.clone(),
             muster_bin,
+            terminal_host: Some(terminal_host),
         },
         store,
     )?;

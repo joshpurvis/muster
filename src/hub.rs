@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::body::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -23,8 +24,10 @@ use tokio::sync::broadcast;
 use crate::adapters::{ScreenSnapshot, SpawnCtx, adapter_for};
 use crate::model::*;
 use crate::paths;
-use crate::pty::{self, PtySession};
-use crate::store::{Store, StoredSession};
+use crate::pty;
+use crate::terminal::{Terminal as PtySession, TerminalService, Output};
+use muster_terminal_protocol::{Command as HostCommand, RunId, SpawnSpec};
+use crate::store::{Store, StoredSession, StoredTerminal};
 use crate::worktree;
 
 /// Pushed to every connected client (and to in-daemon listeners such as the injector,
@@ -161,6 +164,8 @@ pub struct HubConfig {
     pub client_token: String,
     /// Absolute path of the muster binary (exported as MUSTER_BIN).
     pub muster_bin: PathBuf,
+    /// Absent only in pure application fixtures that never launch processes.
+    pub terminal_host: Option<Arc<TerminalService>>,
 }
 
 /// What `attach` hands to a client connection.
@@ -168,7 +173,7 @@ pub enum Attach {
     /// Running (or exited-this-run) session: replay bytes + live output receiver + the
     /// generation of the process they belong to (taken together, so a restart can't
     /// mismatch them; see `pty_generation`).
-    Live(Vec<u8>, broadcast::Receiver<Bytes>, u64),
+    Live(Vec<u8>, broadcast::Receiver<Output>, u64),
     /// Session from a previous daemon run: replay only.
     Replay(Vec<u8>),
 }
@@ -271,6 +276,7 @@ pub struct Hub {
     tx: broadcast::Sender<ServerEvent>,
     inner: Mutex<Inner>,
     generation: AtomicU64,
+    terminal_records: Mutex<BTreeMap<SessionId, StoredTerminal>>,
     shutting_down: AtomicBool,
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
@@ -329,34 +335,39 @@ impl Hub {
     }
 
     pub fn new(cfg: HubConfig, store: Store) -> anyhow::Result<Arc<Hub>> {
-        // Processes that outlived a crashed daemon (or ignored SIGHUP, or were left behind by
-        // an exited shell) would otherwise keep running unmanaged next to a restarted copy.
-        // Waits until they are gone (a few seconds at most, and only if there are any); the
-        // records of sessions whose processes survive are kept for the next start.
-        let url = format!("MUSTER_URL=http://127.0.0.1:{}", cfg.port);
-        let survivors = pty::reap_leftovers(
-            store
-                .session_sids()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, sid, mut markers)| {
-                    // The per-run marker identifies that run's processes (whatever port it
-                    // used); rows from before markers were stored fall back to this daemon's URL.
-                    if markers.is_empty() {
-                        markers.push(url.clone());
-                    }
-                    let own = format!("MUSTER_SESSION_ID={id}");
-                    if !markers.contains(&own) {
-                        markers.push(own);
-                    }
-                    (sid, id, markers)
-                })
-                .collect(),
-        );
-        if let Err(e) = store.clear_session_sids(&survivors) {
-            tracing::warn!("clearing reaped process sessions: {e}");
+        let mut terminal_records = store.load_terminals()?;
+        let mut inventory = match &cfg.terminal_host {
+            Some(host) => host.inventory()?,
+            None => Vec::new(),
+        };
+        for run in inventory.iter().filter(|run| run.has_processes) {
+            anyhow::ensure!(terminal_records.get(&run.run.id).is_some_and(|record| record.spec.run == run.run),
+                "host owns unrecognized terminal {:?} in {}; preserving it and refusing application mutations until its record is recovered",
+                run.run, run.cwd.display());
         }
-        store.mark_all_exited("daemon restarted", now_ms())?;
+        // Complete prepared launch intents using the same run identity. The host
+        // serializes duplicate spawns and returns the original process after a lost reply.
+        if let Some(host) = &cfg.terminal_host {
+            for record in terminal_records.values_mut() {
+                if record.host_instance != host.client.hello.instance { continue }
+                if record.retired {
+                    if let Some(status) = inventory.iter().find(|s| s.run == record.spec.run) {
+                        if status.has_processes {
+                            host.client.call(HostCommand::Terminate { run: status.run, force: false })?;
+                        } else if status.drained {
+                            let _ = host.client.call(HostCommand::Forget { run: status.run });
+                        }
+                    }
+                } else if record.pending {
+                    host.spawn(record.spec.clone())?;
+                    record.pending = false;
+                    store.save_terminal(record.spec.run.id, record)?;
+                }
+            }
+            inventory = host.inventory()?;
+        }
+        let next_generation = terminal_records.values().map(|r| r.spec.run.generation)
+            .chain(inventory.iter().map(|s| s.run.generation)).max().unwrap_or(0) + 1;
         match store.prune_events(now_ms() - EVENT_MAX_AGE_MS, EVENTS_PER_CHANNEL) {
             Ok(n) if n > 0 => tracing::info!("pruned {n} old events"),
             Ok(_) => {}
@@ -370,23 +381,50 @@ impl Hub {
             inner.channels.insert(c.id, c);
         }
         for s in store.load_sessions()? {
-            let StoredSession { info, extra_args } = s;
+            let StoredSession { mut info, extra_args } = s;
+            let record = terminal_records.get(&info.id).filter(|r| !r.retired);
+            let status = record.and_then(|r| cfg.terminal_host.as_ref()
+                .filter(|h| h.client.hello.instance == r.host_instance)
+                .and_then(|_| inventory.iter().find(|s| s.run == r.spec.run)));
+            let pty = status.and_then(|s| cfg.terminal_host.as_ref().map(|h| h.adopt(s.clone())));
+            let generation = record.map_or(0, |r| r.spec.run.generation);
+            let token = record.filter(|_| status.is_some_and(|s| s.alive)).map(|r| r.token.clone());
+            let port_base = record.map_or(0, |r| r.port_base);
+            if let Some(status) = status {
+                info.pid = status.alive.then_some(status.pid).flatten();
+                info.exit_code = status.exit_code;
+                info.cols = status.cols;
+                info.rows = status.rows;
+                info.title = status.title.clone();
+                if !status.alive {
+                    info.state = AgentState::Exited;
+                    info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+                    info.queued = 0;
+                }
+            } else if info.state != AgentState::Exited {
+                info.state = AgentState::Exited;
+                info.state_detail = Some(if record.is_some() { "terminal host restarted or run was lost" } else { "legacy daemon restarted" }.into());
+                info.pid = None;
+                info.queued = 0;
+            }
+            store.update_session(&info)?;
+            if let Some(token) = &token { inner.tokens.insert(token.clone(), info.id); }
             let usable_title = info.title.as_deref().and_then(|t| clean_title(t, info.kind));
             inner.sessions.insert(
                 info.id,
                 SessEntry {
                     info,
                     extra_args,
-                    token: None,
-                    pty: None,
-                    generation: 0,
+                    token,
+                    pty,
+                    generation,
                     early_exit: None,
                     last_hook_at: 0,
                     last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
                     usable_title,
-                    port_base: 0,
+                    port_base,
                 },
             );
         }
@@ -412,7 +450,7 @@ impl Hub {
         let devices = crate::devices::Registry::load(&store)?;
         let agents = crate::agents::Registry::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
-        Ok(Arc::new_cyclic(|weak| Hub {
+        let hub = Arc::new_cyclic(|weak| Hub {
             cfg,
             devices,
             agents,
@@ -421,13 +459,30 @@ impl Hub {
             store,
             tx,
             inner: Mutex::new(inner),
-            generation: AtomicU64::new(1),
+            generation: AtomicU64::new(next_generation),
+            terminal_records: Mutex::new(terminal_records),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
             rt: tokio::runtime::Handle::try_current().ok(),
             weak: weak.clone(),
-        }))
+        });
+        if let Some(host) = &hub.cfg.terminal_host {
+            let weak = Arc::downgrade(&hub);
+            let unavailable = weak.clone();
+            host.watch(Arc::new(move |event| {
+                let Some(hub) = weak.upgrade() else { return };
+                use muster_terminal_core::TerminalEvent;
+                match event {
+                    TerminalEvent::Title { id, generation, title } => hub.pty_title_changed(id, generation, title),
+                    TerminalEvent::Exited { id, generation, code } => hub.pty_exited(id, generation, code),
+                    TerminalEvent::Drained { id, generation } => hub.pty_drained(id, generation),
+                }
+            }), Arc::new(move |message| {
+                if let Some(hub) = unavailable.upgrade() { hub.notice("error", message); }
+            }))?;
+        }
+        Ok(hub)
     }
 
     /// Base URL of this daemon, e.g. "http://127.0.0.1:7433".
@@ -638,19 +693,26 @@ impl Hub {
     /// Current screen as text, from the headless VT.
     pub fn screen(&self, id: SessionId) -> Option<ScreenSnapshot> {
         if let Some(p) = self.pty(id) {
-            return Some(p.screen());
+            return p.screen();
         }
         let info = self.session(id)?;
-        pty::log_screen(&paths::session_dir(id).join("output.log"), info.cols, info.rows)
+        pty::log_screen(&self.session_log_path(id), info.cols, info.rows)
     }
 
     /// Last `lines` lines of output as plain text (scrollback + screen, ANSI stripped).
     pub fn recent_output_text(&self, id: SessionId, lines: usize) -> Option<String> {
         if let Some(p) = self.pty(id) {
-            return Some(p.recent_text(lines));
+            return p.recent_text(lines);
         }
         let info = self.session(id)?;
-        pty::log_tail_text(&paths::session_dir(id).join("output.log"), info.cols, info.rows, lines)
+        pty::log_tail_text(&self.session_log_path(id), info.cols, info.rows, lines)
+    }
+
+    fn session_log_path(&self, id: SessionId) -> PathBuf {
+        match self.terminal_records.lock().get(&id) {
+            Some(record) => crate::terminal::host_log_path(id, record.spec.run.generation),
+            None => paths::session_dir(id).join("output.log"),
+        }
     }
 
     /// Unix ms of the last PTY output for a session (0 if none).
@@ -670,13 +732,13 @@ impl Hub {
     /// `session.attach`'s `replay_bytes`); None = the whole ring.
     pub async fn attach(&self, id: SessionId, max_body: Option<usize>) -> anyhow::Result<Attach> {
         if let Some(p) = self.pty(id) {
-            let (replay, rx) = p.attach(max_body);
+            let (replay, rx) = p.attach(max_body)?;
             return Ok(Attach::Live(replay, rx, p.generation));
         }
         let info = self
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        let path = paths::session_dir(id).join("output.log");
+        let path = self.session_log_path(id);
         let stamp = std::fs::metadata(&path)
             .ok()
             .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
@@ -915,36 +977,9 @@ impl Hub {
         self.rederive_name(cid);
     }
 
-    /// Can an exited process's PTY be dropped from the hub? Only once output.log holds the
-    /// scrollback and nothing of its session is left running (the PTY is the handle used to
-    /// kill leftovers, including ones that closed the terminal, e.g. `nohup … &`). Walks /proc:
-    /// call without the hub lock.
-    fn releasable(p: &PtySession) -> bool {
-        !p.is_alive() && p.is_drained() && p.log_persisted() && !p.has_processes()
-    }
-
-    /// Release an exited process's PTY (and its in-memory ring) if it is releasable and its
-    /// exit has been recorded. Called after each of the events that can make it releasable
-    /// (exit recorded, reader drained, leftovers gone), each time after that event's state is
-    /// published, so whichever comes last sees all of them.
-    fn try_release(&self, id: SessionId, generation: u64) {
-        let Some(p) = self.pty(id).filter(|p| p.generation == generation) else {
-            return;
-        };
-        if !Self::releasable(&p) {
-            return;
-        }
-        let mut g = self.inner.lock();
-        // Only after `pty_exited` recorded the exit: it treats a missing PTY as "not installed
-        // yet" and would otherwise drop the exit.
-        if let Some(e) = g.sessions.get_mut(&id)
-            && e.generation == generation
-            && e.info.exit_code.is_some()
-            && e.pty.as_ref().is_some_and(|q| Arc::ptr_eq(q, &p))
-        {
-            e.pty = None;
-        }
-    }
+    // Exited terminal handles are retained: their host owns replay and descendant
+    // cleanup. A handle contains metadata, not a PTY or a multi-megabyte buffer.
+    fn try_release(&self, _id: SessionId, _generation: u64) {}
 
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
         let channel_id = {
@@ -2029,6 +2064,10 @@ impl Hub {
                 }
                 Ok(self.session(id).unwrap_or(info))
             }
+            Err(e) if e.downcast_ref::<crate::terminal::SpawnUncertain>().is_some() => {
+                let _ = self.update_session_info(id, |info| info.state_detail = Some(e.to_string()));
+                Err(e)
+            }
             Err(e) => {
                 self.inner.lock().sessions.remove(&id);
                 let _ = self.store.delete_session(id);
@@ -2161,34 +2200,38 @@ impl Hub {
         env.insert("TERM".into(), "xterm-256color".into());
         env.insert("COLORTERM".into(), "truecolor".into());
         env.extend(spec.env.clone());
-        let pty = pty::spawn(
-            pty::SpawnParams {
-                id,
-                generation,
-                program: spec.program.clone(),
-                args: spec.args.clone(),
-                env,
-                clear_env: false,
-                // Don't leak "you are inside another agent" markers from the daemon's own env.
-                env_remove: INHERITED_SESSION_MARKERS.iter().map(|s| s.to_string()).collect(),
-                cwd: PathBuf::from(&info.cwd),
-                cols: info.cols,
-                rows: info.rows,
-                log_path: session_dir.join("output.log"),
-            },
-            {
-                let weak = self.weak.clone();
-                Arc::new(move |event| {
-                    let Some(hub) = weak.upgrade() else { return };
-                    use muster_terminal_core::TerminalEvent;
-                    match event {
-                        TerminalEvent::Title { id, generation, title } => hub.pty_title_changed(id, generation, title),
-                        TerminalEvent::Exited { id, generation, code } => hub.pty_exited(id, generation, code),
-                        TerminalEvent::Drained { id, generation } => hub.pty_drained(id, generation),
-                    }
-                })
-            },
-        )?;
+        let host = self.cfg.terminal_host.as_ref().context("terminal host is not configured")?;
+        let mut complete_env: BTreeMap<String, String> = std::env::vars().collect();
+        for key in INHERITED_SESSION_MARKERS { complete_env.remove(*key); }
+        complete_env.extend(env);
+        let launch = SpawnSpec {
+            run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
+            env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
+        };
+        let mut record = StoredTerminal {
+            host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
+            spec: launch.clone(), pending: true, retired: false,
+        };
+        self.store.save_terminal(id, &record)?;
+        self.terminal_records.lock().insert(id, record.clone());
+        let pty = match host.spawn(launch) {
+            Ok(pty) => pty,
+            Err(error) => {
+                if error.downcast_ref::<crate::terminal::SpawnUncertain>().is_none() {
+                    record.retired = true;
+                    self.store.save_terminal(id, &record)?;
+                    self.terminal_records.lock().insert(id, record);
+                }
+                return Err(error);
+            }
+        };
+        record.pending = false;
+        // If this write fails the prepared record still lets the next backend adopt
+        // the exact same process. Never roll back a successful spawn by killing it.
+        if let Err(error) = self.store.save_terminal(id, &record) {
+            tracing::warn!(session = id, "persisting terminal acknowledgement: {error:#}");
+        }
+        self.terminal_records.lock().insert(id, record);
         let (info, early, kill) = {
             let mut g = self.inner.lock();
             let superseded = match g.sessions.get(&id) {
@@ -2215,11 +2258,8 @@ impl Hub {
             e.info.state_since = now_ms();
             e.info.exit_code = None;
             e.info.queued = 0;
-            e.info.title = None;
-            if let Err(err) = self.store.set_session_sid(id, pty.pid, pty.markers()) {
-                tracing::warn!(session = id, "persisting session id: {err}");
-            }
-            let early = e.early_exit.take();
+            e.info.title = pty.title();
+            let early = e.early_exit.take().or_else(|| pty.exit_code());
             let kill = std::mem::take(&mut e.kill_requested);
             let info = e.info.clone();
             if let Err(err) = self.store.update_session(&info) {
@@ -2342,13 +2382,10 @@ impl Hub {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        {
-            let mut g = self.inner.lock();
-            if let Some(e) = g.sessions.get_mut(&id)
-                && let Some(p) = e.pty.take()
-            {
-                p.discard();
-            }
+        let previous = self.inner.lock().sessions.get_mut(&id).and_then(|e| e.pty.take());
+        if let Some(p) = previous {
+            p.discard();
+            p.forget()?;
         }
         match self.start_process(id, None) {
             Ok(Started {
@@ -2407,10 +2444,7 @@ impl Hub {
             }
         }
         match self.pty(id) {
-            Some(p) => {
-                p.kill();
-                Ok(())
-            }
+            Some(p) => p.terminate(false),
             None if self.session(id).is_some() => Ok(()),
             None => anyhow::bail!("no such session: {id}"),
         }
@@ -2418,6 +2452,10 @@ impl Hub {
 
     /// Kill (if alive) and forget a session, including its scrollback.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
+        if let Some(record) = self.terminal_records.lock().get_mut(&id) {
+            record.retired = true;
+            self.store.save_terminal(id, record)?;
+        }
         let entry = {
             let mut g = self.inner.lock();
             let e = g
@@ -2682,11 +2720,19 @@ impl Hub {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
-            if !p.has_processes()
-                && let Some(hub) = weak.upgrade()
-                && let Err(e) = hub.store.remove_reap(id, sid)
-            {
-                tracing::warn!(session = id, "clearing pending reap: {e}");
+            if !p.has_processes() {
+                if let Err(error) = p.forget() {
+                    tracing::warn!(session = id, "forgetting terminated run: {error:#}");
+                    return;
+                }
+                if let Some(hub) = weak.upgrade() {
+                    let _ = hub.store.remove_reap(id, sid);
+                    let mut records = hub.terminal_records.lock();
+                    if records.get(&id).is_some_and(|r| r.retired && r.spec.run.generation == p.generation) {
+                        let _ = hub.store.delete_terminal(id);
+                        records.remove(&id);
+                    }
+                }
             }
         });
     }
@@ -2794,49 +2840,12 @@ impl Hub {
         }
     }
 
-    /// Kill all sessions (and their leftover background processes), wait briefly for them to
-    /// exit, flush and fsync logs, mark the rest Exited.
+    /// Stop accepting application work. The independently owned terminals continue.
+    /// Only the explicit full-stop CLI operation shuts down the terminal host.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let ptys: Vec<Arc<PtySession>> = self
-            .all_ptys()
-            .into_iter()
-            .filter(|p| p.is_alive() || !p.is_drained())
-            .collect();
-        for p in &ptys {
-            p.kill();
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(3500);
-        while ptys.iter().any(|p| p.has_processes()) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // The kill threads' SIGKILL escalation may not get to run before the process exits.
-        for p in &ptys {
-            if p.has_processes() {
-                p.kill_now();
-            }
-        }
-        // Give waiter threads a moment to report exits.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        for p in self.all_ptys() {
-            p.flush_log_final();
-        }
-        let ids: Vec<SessionId> = self
-            .inner
-            .lock()
-            .sessions
-            .values()
-            .filter(|e| e.info.state != AgentState::Exited)
-            .map(|e| e.info.id)
-            .collect();
-        for id in ids {
-            self.set_state(
-                id,
-                StateUpdate::with(AgentState::Exited, "daemon stopped"),
-                StateSource::Daemon,
-            );
-        }
     }
+
 }
 
 /// What the event log keeps of a hook payload: the event's identifying fields only (the full
@@ -3214,6 +3223,7 @@ mod tests {
             port: 0,
             client_token: "t".into(),
             muster_bin: PathBuf::from("/bin/true"),
+            terminal_host: None,
         };
         Hub::new(cfg, store).unwrap()
     }
@@ -3506,6 +3516,7 @@ mod tests {
                 port: 0,
                 client_token: "t".into(),
                 muster_bin: PathBuf::from("/bin/true"),
+            terminal_host: None,
             },
             store,
         )

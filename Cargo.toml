@@ -12,6 +12,7 @@ default = []
 gui = ["dep:wry", "dep:tao"]
 
 [dependencies]
+muster-terminal-protocol = { path = "crates/terminal-protocol" }
 muster-terminal-core = { path = "crates/terminal-core" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }

@@ -544,7 +544,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             };
             match chain {
                 Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => hub.agents().note_human_input(p.id),
+                None => hub.agents().note_human_input(p.id)?,
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -1150,7 +1150,10 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
-                    hub.agents().note_human_input(id);
+                    if let Err(error) = hub.agents().note_human_input(id) {
+                        hub.notice("error", format!("Could not persist input attribution: {error:#}"));
+                        continue;
+                    }
                     if let Err(e) = hub.write_input(id, &data[5..]) {
                         tracing::debug!("input for session {id}: {e}");
                     }
@@ -1416,13 +1419,13 @@ mod tests {
         agent(&hub, "rpc-ada");
         // The codex session handles a scheduled message: its `muster ask` carries that, and no
         // parameter can claim otherwise.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "agent.ask", json!({"agent": "rpc-ada", "text": "hi", "from_session": 3, "origin": "human"}))
             .await
             .unwrap_err();
         assert!(e.contains("accepts only human"), "{e}");
         // Human-rooted again: the MCP send rate limit applies to its CLI asks...
-        hub.agents().set_prov(3, None);
+        hub.agents().set_prov(3, None).unwrap();
         for _ in 0..20 {
             st.guard.lock().sends.check_and_record(3, now_ms(), 20, 60_000).unwrap();
         }
@@ -1446,11 +1449,11 @@ mod tests {
         let e = call(&hub, "session.send", json!({"id": 1, "text": "ls", "from_session": 3})).await.unwrap_err();
         assert!(e.contains("is a shell"), "{e}");
         // Keys from a session on a scheduled chain can't drive a Claude agent.
-        hub.agents().set_prov(1, Some(SCHED));
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
         let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 1})).await.unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // Nor can `muster new` / session.spawn start one.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "session.spawn", json!({"channel_id": 1, "kind": "claude", "from_session": 3}))
             .await
             .unwrap_err();
@@ -1460,10 +1463,10 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // The human's keystrokes (no from_session) make the next plain prompt the human's.
-        hub.agents().set_prov(2, Some(SCHED));
+        hub.agents().set_prov(2, Some(SCHED)).unwrap();
         let _ = call(&hub, "session.input", json!({"id": 2, "data": "x"})).await;
         let info = hub.session(2).unwrap();
-        hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"}));
+        hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"})).unwrap();
         assert_eq!(hub.agents().prov(2), None);
     }
 
@@ -1519,13 +1522,13 @@ mod tests {
         agent(&hub, "rpc-ivy");
         let mut rx = hub.subscribe();
         // An agent session on a scheduled chain asks a Claude agent: refused, and kept.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "nightly report\nmore", "from_session": 3}))
             .await
             .unwrap_err();
         assert!(e.contains("accepts only human"), "{e}");
         // The human's CLI path too (forced origins are daemon-internal; a shell on that chain).
-        hub.agents().set_prov(1, Some(SCHED));
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
         assert!(call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "from a shell", "from_session": 1})).await.is_err());
         let ev = drain(&mut rx, "agent_message");
         assert_eq!(ev.len(), 2);

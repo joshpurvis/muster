@@ -413,7 +413,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
     // The prompt runs from here on: the session now handles a message from `source`.
-    hub.agents().on_delivered(id, item.source, crate::model::now_ms());
+    hub.agents().on_delivered(id, item.source, crate::model::now_ms())?;
     let seq_before = hub.output_seq(id);
     hub.write_input(id, &adapter.submit_bytes())?;
 

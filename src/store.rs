@@ -40,8 +40,9 @@ pub struct StoredTerminal {
     pub retired: bool,
 }
 
+#[derive(Clone)]
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -227,6 +228,13 @@ const MIGRATIONS: &[&str] = &[
         record TEXT NOT NULL
     );
     "#,
+    // v11: application runtime state that must survive backend replacement.
+    r#"
+    CREATE TABLE runtime_state (
+        key TEXT PRIMARY KEY,
+        record TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -274,7 +282,7 @@ impl Store {
         for suffix in ["", "-wal", "-shm"] {
             crate::paths::make_private_file(std::path::Path::new(&format!("{}{suffix}", path.display())));
         }
-        let store = Store { conn: Mutex::new(conn) };
+        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         store.migrate()?;
         Ok(store)
     }
@@ -282,7 +290,7 @@ impl Store {
     #[cfg(test)]
     pub fn open_memory() -> anyhow::Result<Self> {
         let store = Store {
-            conn: Mutex::new(Connection::open_in_memory()?),
+            conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)),
         };
         store.migrate()?;
         Ok(store)
@@ -1062,6 +1070,31 @@ impl Store {
         )?)
     }
 
+    #[cfg(test)]
+    pub fn fail_runtime_writes_for_test(&self) {
+        self.conn.lock().execute("DROP TABLE runtime_state", []).unwrap();
+    }
+
+    pub fn save_runtime(&self, key: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO runtime_state(key, record) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET record=excluded.record",
+            params![key, serde_json::to_string(value)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_runtime<T: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<T>> {
+        let json: Option<String> = self.conn.lock().query_row(
+            "SELECT record FROM runtime_state WHERE key=?1", [key], |row| row.get(0),
+        ).optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into)).transpose()
+    }
+
+    pub fn delete_runtime(&self, key: &str) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM runtime_state WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     pub fn save_terminal(&self, id: SessionId, run: &StoredTerminal) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "INSERT INTO terminal_runs(session_id, record) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
@@ -1174,7 +1207,7 @@ mod tests {
     #[test]
     fn migration_v4_puts_live_channels_in_window_1() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         // Apply v1..v3 only, add channels the old way, then run the rest.
         {
             let c = s.conn.lock();
@@ -1228,7 +1261,7 @@ mod tests {
     #[test]
     fn migration_v5_puts_sessions_in_their_channels_window() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..4] {
@@ -1282,7 +1315,7 @@ mod tests {
     fn migration_v7_creates_agent_tables() {
         use crate::agents::{Agent, AgentMessage, Origin};
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..6] {
@@ -1359,7 +1392,7 @@ mod tests {
     fn migration_v9_renames_bots_to_agents_on_a_populated_db() {
         use crate::agents::Origin;
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..8] {

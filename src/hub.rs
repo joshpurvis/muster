@@ -2026,7 +2026,7 @@ impl Hub {
         for ev in events {
             self.emit(ev);
         }
-        self.agents.set_prov(id, req.prov);
+        self.agents.set_prov(id, req.prov)?;
         let prompt = req.prompt.clone().filter(|p| !p.trim().is_empty());
         let started = self.start_process(id, prompt.clone());
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
@@ -2778,7 +2778,7 @@ impl Hub {
         let update = adapter_for(info.kind).on_hook(event, &payload);
         // Before the state update is published: a waiting ask that sees the agent go idle must
         // also see its reply.
-        let fx = self.agents.on_hook(&self.store, &info, event, &payload);
+        let fx = self.agents.on_hook(&self.store, &info, event, &payload)?;
         if let Some(m) = fx.replied {
             crate::agents::publish_message(self, m);
         }

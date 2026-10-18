@@ -448,3 +448,15 @@ Prompts a device sends are logged with `from: "device:<id>"`.
 | `device.pair_status` | `{pairing_id}` | `{state: "pending"}`, `{state: "paired", device}`, or `{state: "burnt"\|"expired"\|"replaced"}` |
 | `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at}` |
 | `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}` |
+
+### Backend lifetime and compatibility
+
+`hello.terminal_host` identifies the standalone owner (`protocol`, `instance`, `pid`,
+`data_dir`), or is null when no host is configured. Clients use this capability to
+verify backend-only reload is safe. A legacy backend without this capability must
+not be stopped as part of a supposedly non-disruptive update.
+
+`state_seq` values are exact JavaScript integers reserved durably before use. They
+change across backend restarts, so an approval queued against an old view is stale.
+`hello.paused_deliveries` lists session IDs whose prompt queues need review after an
+interrupted submission; use `session.queue` to inspect them.

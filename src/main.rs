@@ -438,7 +438,7 @@ fn main() -> ExitCode {
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
-        Some(Cmd::Reload) => stop_backend().and_then(|_| start_daemon_detached().map(|_| println!("muster backend restarted; terminals preserved"))),
+        Some(Cmd::Reload) => reload(),
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {
@@ -692,7 +692,7 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn stop() -> anyhow::Result<()> {
-    stop_backend()?;
+    stop_backend(None)?;
     let socket = paths::runtime_dir().join("terminal.sock");
     match muster_terminal_protocol::client::Client::connect(&socket) {
         Ok(host) => {
@@ -713,11 +713,40 @@ fn stop() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stop_backend() -> anyhow::Result<()> {
+/// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
+/// compatible host and the same backend identity immediately before signalling.
+fn reload() -> anyhow::Result<()> {
+    let discovery = paths::read_discovery().filter(|d| paths::pid_alive(d.pid) && is_muster_process(d.pid));
+    if let Some(d) = &discovery {
+        let hello = client::rpc(d, "hello", serde_json::json!({}))
+            .context("cannot verify restart safety; backend left running")?;
+        let host = terminal::TerminalService::connect(
+            &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
+        ).context("cannot verify a compatible terminal host; backend left running")?;
+        validate_reload_host(&hello, &host.client.hello)?;
+        stop_backend(Some(d))?;
+    }
+    start_daemon_detached()?;
+    println!("muster backend restarted; terminals preserved");
+    Ok(())
+}
+
+fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_protocol::Hello) -> anyhow::Result<()> {
+    anyhow::ensure!(backend["terminal_host"]["protocol"].as_u64() == Some(host.protocol as u64)
+        && backend["terminal_host"]["instance"].as_str() == Some(host.instance.as_str()),
+        "backend does not confirm ownership by this terminal host; reload refused to preserve existing terminals");
+    Ok(())
+}
+
+fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
     let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
         println!("muster daemon: not running");
         return Ok(());
     };
+    if let Some(expected) = expected {
+        anyhow::ensure!(d.pid == expected.pid && d.token == expected.token && d.port == expected.port,
+            "backend changed while preparing reload; nothing was stopped");
+    }
     // Guard against a stale daemon.json whose pid now belongs to an unrelated process.
     if !is_muster_process(d.pid) {
         let _ = std::fs::remove_file(paths::discovery_path());
@@ -1088,5 +1117,19 @@ mod tests {
             parse(&["events"]).unwrap(),
             Cmd::Events { json: false, session: None, tab: None }
         ));
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn reload_refuses_legacy_and_different_host_backends() {
+        let host = muster_terminal_protocol::Hello { protocol: 1, instance: "one".into(),
+            pid: 1, data_dir: PathBuf::from("/unused") };
+        assert!(validate_reload_host(&serde_json::json!({"version": "0.1.0"}), &host).is_err());
+        assert!(validate_reload_host(&serde_json::json!({"terminal_host": {"protocol": 1, "instance": "other"}}), &host).is_err());
+        assert!(validate_reload_host(&serde_json::json!({"terminal_host": host}), &host).is_ok());
     }
 }

@@ -31,6 +31,7 @@ current = None
 logs = []
 token = None
 passed = 0
+detached_reload = False
 
 
 def check(condition, message):
@@ -224,6 +225,22 @@ try:
     check(not rpc("session.queue", {"id": sid})["paused"], "explicit queue clearing resolves recovery pause")
     rpc("session.input", {"id": sid, "data": "\x03"})
 
+    # Exercise the user-facing reload command after fault tests. The replacement
+    # detaches itself, so cleanup for this one uses the CLI with the same private paths.
+    old_backend = current
+    reload_process = subprocess.Popen([str(BIN), "reload"], env=ENV,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    detached_reload = True
+    old_backend.wait(timeout=15)
+    current = None
+    stdout, stderr = reload_process.communicate(timeout=20)
+    check(reload_process.returncode == 0, f"backend-only reload succeeds: {stderr.decode().strip()}")
+    discovery = json.loads((RUNTIME / "daemon.json").read_text())
+    token = discovery["token"]
+    check(discovery["pid"] != old_backend.pid and session(sid)["pid"] == restarted["pid"],
+          "reload replaces the backend while preserving the terminal PID")
+    check(rpc("hello")["terminal_host"]["instance"] == host_instance,
+          "reload confirms the same terminal host identity")
     full_stop = subprocess.Popen([str(BIN), "stop"], env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if current:
         current.wait(timeout=10)
@@ -234,6 +251,8 @@ try:
     print(f"Passed {passed} backend survival checks.", flush=True)
 finally:
     stop_backend()
+    if detached_reload and (RUNTIME / "daemon.json").exists():
+        subprocess.run([str(BIN), "stop"], env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=True)
     if (RUNTIME / "terminal.sock").exists():
         try:
             host_call("shutdown")

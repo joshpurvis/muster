@@ -45,6 +45,41 @@ pub struct Store {
     conn: std::sync::Arc<Mutex<Connection>>,
 }
 
+/// Reserve sequence ranges durably before publishing any values. Unused numbers are
+/// skipped after a backend crash, so an old client's approval cannot name a new prompt.
+pub struct StateSequences {
+    store: Store,
+    available: Mutex<std::ops::Range<u64>>,
+}
+
+impl StateSequences {
+    pub fn new(store: &Store) -> Self {
+        Self { store: store.clone(), available: Mutex::new(0..0) }
+    }
+
+    pub fn next(&self) -> anyhow::Result<u64> {
+        let mut range = self.available.lock();
+        if range.is_empty() {
+            let mut conn = self.store.conn.lock();
+            let transaction = conn.transaction()?;
+            let previous: Option<String> = transaction.query_row(
+                "SELECT record FROM runtime_state WHERE key='state-sequence-end'", [], |row| row.get(0),
+            ).optional()?;
+            // Start above all values used by the pre-host backend.
+            let start = previous.map(|text| text.parse::<u64>()).transpose()?.unwrap_or(1 << 32);
+            let end = start.checked_add(4096).context("state sequence exhausted")?;
+            anyhow::ensure!(end <= (1 << 53) - 1, "state sequence exceeds exact JavaScript integers");
+            transaction.execute(
+                "INSERT INTO runtime_state(key, record) VALUES ('state-sequence-end', ?1)
+                 ON CONFLICT(key) DO UPDATE SET record=excluded.record", [end.to_string()],
+            )?;
+            transaction.commit()?;
+            *range = start..end;
+        }
+        Ok(range.next().expect("reserved nonempty sequence range"))
+    }
+}
+
 const MIGRATIONS: &[&str] = &[
     // v1
     r#"

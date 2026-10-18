@@ -88,3 +88,13 @@ Remaining before completion: hook spooling/deduplication; application/UI update 
 additional crash-window tests and code review, including retired-run cleanup,
 slow/disconnected stream recovery, and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.
+
+### Restart safety checkpoint
+
+Approval identities reserve durable sequence ranges and cannot be reused after a
+backend restart. Delayed approvals remain bound to their original process generation.
+Output subscriptions recover from socket resets or offset gaps by sending a fresh
+reset replay before more live output. `muster reload` checks that the current backend
+confirms the compatible host identity before it signals that backend; it refuses
+legacy monolithic instances. The CLI reload preserves the terminal PID and host ID
+in the fixture. Validation: 231 Rust tests and 21 focused backend survival checks.

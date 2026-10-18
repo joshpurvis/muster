@@ -98,6 +98,7 @@ pub fn hello(hub: &Hub) -> Value {
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": default_shell(),
         "paused_deliveries": inject::paused(hub),
+        "terminal_host": hub.terminal_host_info(),
     })
 }
 

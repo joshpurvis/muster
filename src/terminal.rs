@@ -242,6 +242,8 @@ impl Terminal {
             _ => anyhow::bail!("terminal host omitted initial replay"),
         };
         let (tx, rx) = broadcast::channel(1024);
+        let client = self.client.clone();
+        let run = self.run();
         std::thread::Builder::new().name(format!("terminal-output-{}", self.id)).spawn(move || {
             while tx.receiver_count() > 0 {
                 let output = match wire::read(&mut stream) {
@@ -254,7 +256,25 @@ impl Terminal {
                         Output::Replay(Bytes::from(data))
                     }
                     Ok(Frame::Ping) => continue,
-                    _ => break,
+                    _ => {
+                        // A stream reset, timeout, or offset gap is recoverable. Reattach
+                        // to exactly this host instance and run; never replay input or
+                        // silently follow a replacement host. Reset the renderer with a
+                        // fresh replay before forwarding any further live bytes.
+                        let mut delay = Duration::from_millis(100);
+                        loop {
+                            if tx.receiver_count() == 0 { return }
+                            std::thread::sleep(delay);
+                            if let Ok(mut next) = client.subscribe(Command::Attach { run, replay_bytes: max_body }) {
+                                if let Ok(Frame::Replay { next_offset, data }) = wire::read(&mut next) {
+                                    stream = next;
+                                    offset = next_offset;
+                                    break Output::Replay(Bytes::from(data));
+                                }
+                            }
+                            delay = (delay * 2).min(Duration::from_secs(2));
+                        }
+                    }
                 };
                 if tx.send(output).is_err() { break }
             }
@@ -310,4 +330,72 @@ pub fn ensure_host() -> anyhow::Result<Arc<TerminalService>> {
 
 pub fn host_log_path(id: u32, generation: u64) -> PathBuf {
     crate::paths::data_dir().join("terminal/runs").join(format!("{id}-{generation}")).join("output.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use muster_terminal_protocol::{Hello, Request, VERSION};
+
+    #[tokio::test]
+    async fn output_stream_reconnects_with_reset_replay_after_disconnect_or_gap() {
+        for offset_gap in [false, true] {
+            let directory = std::env::temp_dir().join(format!("muster-stream-test-{}-{}", std::process::id(), rand::random::<u64>()));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("host.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let hello = Hello { protocol: VERSION, instance: "original-host".into(),
+                pid: std::process::id(), data_dir: directory.clone() };
+            let server = std::thread::spawn(move || {
+                let accept = || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        if let Ok((stream, _)) = listener.accept() {
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            return stream;
+                        }
+                        assert!(Instant::now() < deadline, "client did not reconnect");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                };
+                let mut handshake = accept();
+                let request: Request = wire::read(&mut handshake).unwrap().decode().unwrap();
+                assert!(matches!(request.command, Command::Hello));
+                wire::write(&mut handshake, &Frame::json(&Response::Hello(hello)).unwrap()).unwrap();
+                for attempt in 0..2 {
+                    let mut stream = accept();
+                    let request: Request = wire::read(&mut stream).unwrap().decode().unwrap();
+                    assert_eq!(request.instance.as_deref(), Some("original-host"));
+                    assert!(matches!(request.command, Command::Attach { run: RunId { id: 1, generation: 7 }, .. }));
+                    wire::write(&mut stream, &Frame::json(&Response::Attached).unwrap()).unwrap();
+                    wire::write(&mut stream, &Frame::Replay { next_offset: if attempt == 0 { 1 } else { 2 },
+                        data: if attempt == 0 { b"A".to_vec() } else { b"AB".to_vec() } }).unwrap();
+                    wire::write(&mut stream, &Frame::Output { offset: if attempt == 0 { 1 } else { 2 },
+                        data: if attempt == 0 { b"B".to_vec() } else { b"C".to_vec() } }).unwrap();
+                    if attempt == 0 && offset_gap {
+                        wire::write(&mut stream, &Frame::Output { offset: 99, data: b"invalid-gap".to_vec() }).unwrap();
+                    }
+                    // Closing the socket exercises recovery even while the backend stays up.
+                }
+            });
+            let service = TerminalService::connect(&socket, &directory).unwrap();
+            let terminal = service.adopt(TerminalStatus { run: RunId { id: 1, generation: 7 },
+                pid: Some(1), alive: true, drained: false, has_processes: true, exit_code: None,
+                title: None, cols: 80, rows: 24, output_seq: 0, last_output_at: 0,
+                application_cursor: false, log_persisted: true, cwd: directory.clone() });
+            let (replay, mut rx) = terminal.attach(None).unwrap();
+            assert_eq!(replay, b"A");
+            for (reset, expected) in [(false, "B"), (true, "AB"), (false, "C")] {
+                let output = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+                let (actual_reset, bytes) = match output { Output::Bytes(bytes) => (false, bytes), Output::Replay(bytes) => (true, bytes) };
+                assert_eq!(actual_reset, reset);
+                assert_eq!(&bytes[..], expected.as_bytes());
+            }
+            drop(rx);
+            server.join().unwrap();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }

@@ -290,7 +290,7 @@ pub struct Hub {
     #[allow(clippy::type_complexity)]
     mcp: Mutex<Option<Weak<crate::mcp::McpState<crate::mcp::backend::HubBackend>>>>,
     /// Source of `SessionInfo.state_seq` values.
-    state_seq: AtomicU64,
+    state_seq: crate::store::StateSequences,
     /// Serializes branch renames (git calls) so they see each other's results.
     branch_lock: tokio::sync::Mutex<()>,
     /// For work started from PTY threads (outside the runtime).
@@ -335,7 +335,12 @@ impl Hub {
         &self.cfg.muster_bin
     }
 
+    pub fn terminal_host_info(&self) -> Option<muster_terminal_protocol::Hello> {
+        self.cfg.terminal_host.as_ref().map(|host| host.client.hello.clone())
+    }
+
     pub fn new(cfg: HubConfig, store: Store) -> anyhow::Result<Arc<Hub>> {
+        let state_seq = crate::store::StateSequences::new(&store);
         let mut terminal_records = store.load_terminals()?;
         let mut inventory = match &cfg.terminal_host {
             Some(host) => host.inventory()?,
@@ -383,6 +388,7 @@ impl Hub {
         }
         for s in store.load_sessions()? {
             let StoredSession { mut info, extra_args } = s;
+            info.state_seq = state_seq.next()?;
             let record = terminal_records.get(&info.id).filter(|r| !r.retired);
             let status = record.and_then(|r| cfg.terminal_host.as_ref()
                 .filter(|h| h.client.hello.instance == r.host_instance)
@@ -458,7 +464,7 @@ impl Hub {
             agents,
             injection,
             mcp: Mutex::new(None),
-            state_seq: AtomicU64::new(1),
+            state_seq,
             store,
             tx,
             inner: Mutex::new(inner),
@@ -824,11 +830,18 @@ impl Hub {
             if e.info.state == update.state && e.info.state_detail == update.detail {
                 return false;
             }
+            let next_seq = match self.state_seq.next() {
+                Ok(seq) => seq,
+                Err(error) => {
+                    tracing::error!(session = id, "cannot reserve prompt identity: {error:#}");
+                    return false;
+                }
+            };
             let from = e.info.state;
             if from != update.state {
                 e.info.state_since = now;
             }
-            e.info.state_seq = self.state_seq.fetch_add(1, Ordering::Relaxed);
+            e.info.state_seq = next_seq;
             e.info.state = update.state;
             e.info.state_detail = update.detail.clone();
             if let Err(err) = self.store.update_session(&e.info) {
@@ -871,7 +884,7 @@ impl Hub {
             if seq.is_none() {
                 return Ok(());
             }
-            e.info.state_seq = self.state_seq.fetch_add(1, Ordering::Relaxed);
+            e.info.state_seq = self.state_seq.next()?;
             e.info.clone()
         };
         self.emit(ServerEvent::SessionUpserted(info));
@@ -2005,7 +2018,7 @@ impl Hub {
                 queued: 0,
                 subagents: 0,
                 size_owner: None,
-                state_seq: 0,
+                state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),
             };
@@ -3261,6 +3274,19 @@ mod tests {
         // The same view can't answer twice (a delayed duplicate would hit the next prompt).
         assert!(hub.claim_prompt(1, Some(s.state_seq), None).unwrap_err().to_string().starts_with("stale"));
         hub.claim_prompt(1, None, None).unwrap();
+    }
+
+    #[test]
+    fn approval_views_from_before_backend_replacement_are_stale() {
+        let original = move_fixture();
+        let old = original.session(1).unwrap();
+        let cfg = HubConfig { port: 0, client_token: "replacement".into(),
+            muster_bin: PathBuf::from("/bin/true"), terminal_host: None };
+        let replacement = Hub::new(cfg, original.store.clone()).unwrap();
+        let current = replacement.session(1).unwrap();
+        assert_ne!(old.state_seq, current.state_seq);
+        assert!(replacement.claim_prompt(1, Some(old.state_seq), None).is_err());
+        replacement.claim_prompt(1, Some(current.state_seq), None).unwrap();
     }
 
     #[test]

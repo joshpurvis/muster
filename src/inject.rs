@@ -645,6 +645,7 @@ pub fn approve(
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
     let adapter = adapter_for(info.kind);
+    let generation = hub.pty_generation(id);
     let screen = hub
         .screen(id)
         .ok_or_else(|| anyhow::anyhow!("session {id} has no screen"))?;
@@ -668,7 +669,7 @@ pub fn approve(
     if seen.0.is_some() && hub.screen(id).is_none_or(|now| now.lines != screen.lines) {
         anyhow::bail!("stale: session {id}'s screen changed while answering; check it again");
     }
-    hub.write_input(id, &bytes)?;
+    hub.write_input_generation(id, generation, &bytes)?;
     hub.log_event(
         Some(info.channel_id),
         Some(id),

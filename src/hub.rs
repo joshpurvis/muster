@@ -277,6 +277,8 @@ pub struct Hub {
     generation_floor: u64,
     terminal_records: Mutex<BTreeMap<SessionId, StoredTerminal>>,
     retire_signalled: Mutex<BTreeSet<RunId>>,
+    /// Serializes inbox consumption and input attribution. The host never sees it.
+    pub(crate) callback_inbox: Mutex<Option<crate::hook_inbox::Inbox>>,
     shutting_down: AtomicBool,
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
@@ -466,6 +468,7 @@ impl Hub {
             generation_floor,
             terminal_records: Mutex::new(terminal_records),
             retire_signalled: Mutex::new(BTreeSet::new()),
+            callback_inbox: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
@@ -678,6 +681,28 @@ impl Hub {
     }
 
     // ----- session I/O -----
+
+    fn input_boundary<T>(&self, action: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let mut inbox = self.callback_inbox.lock();
+        match inbox.as_mut() {
+            Some(inbox) => inbox.input_boundary(self, action),
+            None => action(),
+        }
+    }
+
+    pub fn note_human_input(&self, id: SessionId) -> anyhow::Result<()> {
+        self.input_boundary(|| self.agents.note_human_input(id))
+    }
+
+    pub(crate) fn note_prompt_delivery(&self, id: SessionId, generation: Option<u64>,
+        source: crate::agents::Source, now: i64) -> anyhow::Result<()> {
+        self.input_boundary(|| {
+            let g = self.inner.lock();
+            anyhow::ensure!(g.sessions.get(&id).is_some_and(|entry| Some(entry.generation) == generation),
+                "terminal generation changed before prompt attribution");
+            self.agents.on_delivered(id, source, now)
+        })
+    }
 
     /// Raw bytes to the PTY.
     pub fn write_input(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
@@ -2759,7 +2784,7 @@ impl Hub {
     /// Handle a hook callback authenticated by session token. Routes to the adapter's
     /// `on_hook`, logs a Hook event, applies the resulting state.
     pub fn handle_hook(&self, token: &str, event: &str, payload: serde_json::Value) -> anyhow::Result<()> {
-        self.handle_hook_checkpoint(token, event, payload, None)
+        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None))
     }
 
     pub(crate) fn handle_spooled_hook(&self, token: &str, event: &str, payload: serde_json::Value,
@@ -3299,6 +3324,81 @@ mod tests {
         assert!(hub.session(1).is_none());
         assert!(hub.store.load_sessions().unwrap().iter().all(|s| s.info.id != 1));
         assert!(hub.store.load_terminals().unwrap()[&1].retired);
+    }
+
+    #[test]
+    fn callback_boundary_finishes_the_old_reply_before_attributing_the_next_prompt() {
+        use crate::agents::{AgentMessage, Origin, Prov, Source};
+        let hub = move_fixture();
+        let directory = std::env::temp_dir().join(format!("muster-input-boundary-{}", paths::random_token()));
+        let mut inbox = crate::hook_inbox::Inbox::open(&directory.join("hooks.sqlite")).unwrap();
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+            port_base: 20000, pending: false, retired: false,
+            spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };
+        hub.terminal_records.lock().insert(2, record);
+        hub.inner.lock().sessions.get_mut(&2).unwrap().generation = 42;
+        let message = || hub.store.insert_agent_message(&AgentMessage { id: 0, from: "fixture".into(),
+            from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 1,
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None }).unwrap();
+        let first = message();
+        let next = message();
+        let source = |msg| Source::Chain(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(msg) });
+        hub.agents.on_delivered(2, source(first), 100).unwrap();
+        inbox.enqueue("callback-token", "Stop", br#"{"last_assistant_message":"old reply"}"#).unwrap();
+        *hub.callback_inbox.lock() = Some(inbox);
+        hub.note_prompt_delivery(2, Some(42), source(next), 200).unwrap();
+        assert_eq!(hub.store.agent_message(first).unwrap().unwrap().reply.as_deref(), Some("old reply"));
+        assert!(hub.store.agent_message(next).unwrap().unwrap().reply.is_none());
+        assert!(hub.agents.msg_status(&hub.store, next).active);
+        // A stale generation cannot modify the current run's attribution.
+        assert!(hub.note_prompt_delivery(2, Some(41), Source::Human, 300).is_err());
+        assert!(hub.agents.msg_status(&hub.store, next).active);
+
+        // An older prompt callback must not consume the human-input marker that
+        // belongs to a later keystroke and accidentally lower provenance.
+        hub.callback_inbox.lock().as_mut().unwrap()
+            .enqueue("callback-token", "UserPromptSubmit", br#"{"prompt":"earlier input"}"#).unwrap();
+        hub.note_human_input(2).unwrap();
+        assert_eq!(hub.agents.prov(2).unwrap().origin, Origin::Schedule);
+        hub.callback_inbox.lock().as_mut().unwrap()
+            .enqueue("callback-token", "UserPromptSubmit", br#"{"prompt":"new human input"}"#).unwrap();
+        {
+            let inbox = hub.callback_inbox.lock();
+            crate::hook_inbox::drain(&hub, inbox.as_ref().unwrap()).unwrap();
+        }
+        assert_eq!(hub.agents.prov(2), None);
+        drop(hub);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn callback_boundary_defers_input_while_backlogged_and_blocks_concurrent_inserts() {
+        use crate::agents::{Origin, Prov, Source};
+        let hub = move_fixture();
+        let directory = std::env::temp_dir().join(format!("muster-input-boundary-{}", paths::random_token()));
+        let path = directory.join("hooks.sqlite");
+        let mut inbox = crate::hook_inbox::Inbox::open(&path).unwrap();
+        let prior = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+        hub.agents.set_prov(2, Some(prior)).unwrap();
+        // The drain batch is bounded; never publish new attribution ahead of
+        // callbacks left in the queue, even if they belong to another session.
+        for _ in 0..513 { inbox.enqueue("obsolete-token", "Stop", b"{}").unwrap(); }
+        *hub.callback_inbox.lock() = Some(inbox);
+        assert!(hub.note_prompt_delivery(2, Some(0), Source::Human, 200).is_err());
+        assert_eq!(hub.agents.prov(2), Some(prior));
+        hub.note_prompt_delivery(2, Some(0), Source::Human, 200).unwrap();
+        assert_eq!(hub.agents.prov(2), None);
+
+        let mut writer = crate::hook_inbox::Inbox::open(&path).unwrap();
+        hub.input_boundary(|| {
+            assert!(writer.enqueue("obsolete-token", "Stop", b"{}").is_err(), "hook inserts cannot cross the attribution commit");
+            Ok(())
+        }).unwrap();
+        writer.enqueue("obsolete-token", "Stop", b"{}").unwrap();
+        drop(writer);
+        drop(hub);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

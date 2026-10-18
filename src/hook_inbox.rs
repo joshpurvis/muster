@@ -150,6 +150,30 @@ impl Inbox {
             .optional()?;
         Ok(value.map(|value| value.parse()).transpose()?.unwrap_or(0))
     }
+
+    /// Establish an input boundary in the same ordering domain as hook inserts.
+    /// The caller holds the backend's callback mutex. Drain without a writer lock
+    /// first, then briefly prevent new inserts while committing the new attribution.
+    /// If more callbacks arrived, leave attribution unchanged and let the caller retry.
+    pub fn input_boundary<T>(
+        &mut self,
+        hub: &crate::hub::Hub,
+        action: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        drain(hub, self)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending: bool =
+            transaction.query_row("SELECT EXISTS(SELECT 1 FROM hooks)", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            !pending,
+            "agent callbacks are still catching up; input attribution was not changed"
+        );
+        let result = action()?;
+        transaction.commit()?;
+        Ok(result)
+    }
 }
 
 /// Process in insertion order. The application transaction advances the cursor with
@@ -172,7 +196,10 @@ pub fn drain(hub: &crate::hub::Hub, inbox: &Inbox) -> anyhow::Result<()> {
     let dropped = inbox.dropped()?;
     let reported: Option<(String, u64)> = hub.store().load_runtime("hook-inbox-overflow")?;
     if dropped > 0 && reported.as_ref() != Some(&(inbox.instance.clone(), dropped)) {
-        tracing::error!(dropped, "callback inbox overflowed; inspect agent replies and session state");
+        tracing::error!(
+            dropped,
+            "callback inbox overflowed; inspect agent replies and session state"
+        );
         hub.log_event(None, None, crate::model::EventKind::System, serde_json::json!({
             "level": "error", "text": format!("Callback inbox overflowed: {dropped} callbacks could not be saved"),
         }));
@@ -185,6 +212,9 @@ pub fn drain(hub: &crate::hub::Hub, inbox: &Inbox) -> anyhow::Result<()> {
 
 pub fn spawn(hub: &std::sync::Arc<crate::hub::Hub>, inbox: Inbox) -> anyhow::Result<()> {
     // Complete the bounded recovery batch before detectors, queue workers or autostart.
+    let mut guard = hub.callback_inbox.lock();
+    *guard = Some(inbox);
+    let inbox = guard.as_ref().expect("installed callback inbox");
     while inbox
         .next(
             hub.store()
@@ -193,8 +223,9 @@ pub fn spawn(hub: &std::sync::Arc<crate::hub::Hub>, inbox: Inbox) -> anyhow::Res
         )?
         .is_some()
     {
-        drain(hub, &inbox)?;
+        drain(hub, inbox)?;
     }
+    drop(guard);
     let weak = std::sync::Arc::downgrade(hub);
     std::thread::Builder::new()
         .name("hook-inbox".into())
@@ -204,8 +235,13 @@ pub fn spawn(hub: &std::sync::Arc<crate::hub::Hub>, inbox: Inbox) -> anyhow::Res
                 if hub.is_shutting_down() {
                     break;
                 }
-                if let Err(error) = drain(&hub, &inbox) {
-                    tracing::warn!("callback inbox pending recovery: {error:#}");
+                {
+                    let guard = hub.callback_inbox.lock();
+                    if let Some(inbox) = guard.as_ref() {
+                        if let Err(error) = drain(&hub, inbox) {
+                            tracing::warn!("callback inbox pending recovery: {error:#}");
+                        }
+                    }
                 }
                 drop(hub);
                 std::thread::sleep(Duration::from_millis(100));

@@ -552,7 +552,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             };
             match chain {
                 Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => hub.agents().note_human_input(p.id)?,
+                None => hub.note_human_input(p.id)?,
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -1158,7 +1158,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
-                    if let Err(error) = hub.agents().note_human_input(id) {
+                    if let Err(error) = hub.note_human_input(id) {
                         hub.notice("error", format!("Could not persist input attribution: {error:#}"));
                         continue;
                     }

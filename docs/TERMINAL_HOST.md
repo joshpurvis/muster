@@ -203,6 +203,22 @@ wins in both cases, and killing the backend before acknowledgement adopts exactl
 original process on replacement. All 40 focused checks pass, with unrelated terminal
 PIDs and host identity preserved throughout. The proxy operates only on fixture paths.
 
-The next audit covers the host's spawn/ownership-journal crash window, hook/prompt ordering and transient
+The next audit covers the host's spawn/ownership-journal crash window and transient
 detector/subagent recovery, plus final UI recovery verification. No live installation
 or existing legacy session has been migrated.
+
+### Callback/input ordering checkpoint
+
+The backend serializes inbox consumption with prompt attribution and human-input
+markers. Before changing attribution it drains already committed callbacks, then
+briefly holds the inbox writer lock while saving the new context. If callbacks remain
+after the bounded drain, input attribution is deferred instead of overtaking them.
+The background consumer and legacy HTTP hook path share the same serialization.
+This fixes a queued Stop callback being assigned to the next injected message and
+an older prompt callback consuming a later human-input marker. It orders observed
+callback inserts; it cannot infer an agent's event time before its helper enqueues it.
+
+Validation: all 247 Rust tests, all 154 full smoke checks, and all 40 focused survival
+checks pass. New unit tests cover reply association across the input boundary,
+provenance retention, stale-generation refusal, backlog deferral and concurrent inbox
+writes. This coordination remains entirely in the application layer.

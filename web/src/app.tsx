@@ -217,6 +217,11 @@ function EmptyWindow() {
 
 function Splash() {
   const s = connStatus.value;
+  if (s === "incompatible") {
+    return <div class="splash"><div class="welcome-card"><h1>UI update required</h1>
+      <p>Install a UI compatible with this backend, then refresh. Your terminals remain running.</p>
+    </div></div>;
+  }
   if (s === "no_token") {
     return (
       <div class="splash">
@@ -244,7 +249,7 @@ function Splash() {
 
 function App() {
   const ready = helloDone.value && (!windowsSupported.value || windowId.value !== null);
-  if (!ready) {
+  if (!ready || connStatus.value === "incompatible") {
     return (
       <>
         <Splash />

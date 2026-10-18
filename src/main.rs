@@ -67,6 +67,11 @@ enum Cmd {
     Stop,
     /// Restart only the application backend; host-owned terminal processes continue.
     Reload,
+    /// Activate a built UI directory without restarting backend or terminals.
+    UiInstall {
+        /// Built UI directory (for example web/dist).
+        path: PathBuf,
+    },
     /// Print the UI URL (with its access token).
     Url,
     /// Open a UI window; with PATH, add the folder and open a shell tab there.
@@ -439,6 +444,13 @@ fn main() -> ExitCode {
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Reload) => reload(),
+        Some(Cmd::UiInstall { path }) => {
+            if std::env::var_os("MUSTER_WEB_DIR").is_some() {
+                Err(anyhow::anyhow!("MUSTER_WEB_DIR overrides installed UI releases; update that directory or unset the override on the backend"))
+            } else {
+                assets::install(&path, &paths::data_dir()).map(|release| println!("UI activated at {}; refresh the window", release.display()))
+            }
+        },
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {

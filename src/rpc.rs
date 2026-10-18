@@ -91,6 +91,7 @@ pub fn default_shell() -> String {
 pub fn hello(hub: &Hub) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "ui_protocol": crate::assets::UI_PROTOCOL,
         "workspaces": hub.workspaces(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),

@@ -460,3 +460,16 @@ not be stopped as part of a supposedly non-disruptive update.
 change across backend restarts, so an approval queued against an old view is stale.
 `hello.paused_deliveries` lists session IDs whose prompt queues need review after an
 interrupted submission; use `session.queue` to inspect them.
+
+`hello.ui_protocol` is the UI/application protocol major version, currently 1. A missing
+value denotes the original v1 API. A UI receiving a different version rejects queued
+calls and input until a compatible UI is loaded; this version is independent of the
+terminal host IPC version and of the application release number.
+
+UI builds include `muster-ui.json` with `{"protocol":1}`. `muster ui-install` copies a
+complete build to `<data>/ui/releases/<id>` and atomically replaces `<data>/ui/current`.
+The backend reads this pointer for each page request, falling back to embedded assets
+only when no external release is configured. Invalid configured releases produce 503,
+without changing running sessions or API availability. Installed HTML pins JS/CSS to
+`/_ui/<id>/...` (desktop) or `/m/_ui/<id>/...` (phone), so old pages cannot mix bundles
+with a later release. Phone release assets retain the phone CSP and proxy restrictions.

@@ -9,7 +9,7 @@ export const FRAME_OUTPUT = 0x01;
 export const FRAME_INPUT = 0x02;
 export const FRAME_REPLAY = 0x03;
 
-export type ConnStatus = "connecting" | "open" | "reconnecting" | "no_token";
+export type ConnStatus = "connecting" | "open" | "reconnecting" | "no_token" | "incompatible";
 
 export const connStatus = signal<ConnStatus>("connecting");
 
@@ -91,6 +91,7 @@ class Rpc {
   private token: string | null = null;
   private retryTimer = 0;
   private suspended = false;
+  private protocolMismatch = false;
   private cookie = /^\/m(?:\/|$)/.test(location.pathname);
 
   onEvent: EventHandler = () => {};
@@ -155,9 +156,18 @@ class Rpc {
       const id = this.nextId++;
       this.track(id, "hello").then((h) => {
         if (this.ws !== ws) return;
+        const hello = h as HelloResult;
+        // Legacy backends speak v1. Explicit incompatible versions must not receive
+        // queued actions or binary input from an already-open UI after an update.
+        if ((hello.ui_protocol ?? 1) !== 1) {
+          this.protocolMismatch = true;
+          this.suspend();
+          connStatus.value = "incompatible";
+          return;
+        }
         this.ready = true;
         connStatus.value = "open";
-        this.onHello(h as HelloResult, reconnect);
+        this.onHello(hello, reconnect);
         const q = this.queue;
         this.queue = [];
         for (const item of q) ws.send(item.frame);
@@ -221,6 +231,7 @@ class Rpc {
   }
 
   resume() {
+    if (this.protocolMismatch) return;
     this.suspended = false;
     this.backoff = 250;
     this.connect();
@@ -272,6 +283,7 @@ class Rpc {
   }
 
   call<T = unknown>(method: string, params: unknown = {}): Promise<T> {
+    if (this.protocolMismatch) return Promise.reject(new RpcError(method, "UI update required; refresh after installing a compatible UI"));
     if (this.suspended || (this.cookie && !this.isOpen)) {
       return Promise.reject(new RpcError(method, "Disconnected"));
     }

@@ -5,6 +5,7 @@ Requires cargo build --workspace first. No installed Muster executable is used.
 """
 from http.client import HTTPConnection
 import json
+import re
 from pathlib import Path
 import socket
 import sqlite3
@@ -60,6 +61,16 @@ def http(path, body=None, credential=None):
         response = conn.getresponse()
         raw = response.read()
         return response.status, json.loads(raw) if raw else None
+    finally:
+        conn.close()
+
+
+def asset(path):
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    try:
+        conn.request("GET", path)
+        response = conn.getresponse()
+        return response.status, response.read().decode()
     finally:
         conn.close()
 
@@ -224,6 +235,29 @@ try:
     rpc("session.clear_queue", {"id": sid})
     check(not rpc("session.queue", {"id": sid})["paused"], "explicit queue clearing resolves recovery pause")
     rpc("session.input", {"id": sid, "data": "\x03"})
+
+    # UI installation changes only release files. Old HTML keeps loading its own bundle.
+    ui_source = BASE / "ui-source"
+    ui_source.mkdir()
+    (ui_source / "muster-ui.json").write_text('{"protocol":1}')
+    (ui_source / "index.html").write_text('<html>release-one<link href="app.css"><script src="app.js"></script></html>')
+    (ui_source / "app.js").write_text("release-one")
+    (ui_source / "app.css").write_text("body{}")
+    def install_ui():
+        return subprocess.run([str(BIN), "ui-install", str(ui_source)], env=ENV,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    check(install_ui().returncode == 0, "independent UI release installs without a service restart")
+    code, page = asset("/")
+    old_asset = re.search(r'src="([^"]+)"', page).group(1)
+    check(code == 200 and asset(old_asset) == (200, "release-one"), "HTML pins its JavaScript to one UI release")
+    (ui_source / "index.html").write_text('<html>release-two<link href="app.css"><script src="app.js"></script></html>')
+    (ui_source / "app.js").write_text("release-two")
+    check(install_ui().returncode == 0 and "release-two" in asset("/")[1], "UI updates are visible immediately on refresh")
+    check(asset(old_asset) == (200, "release-one"), "a previously loaded page retains access to its original bundle")
+    (ui_source / "muster-ui.json").write_text('{"protocol":999}')
+    check(install_ui().returncode != 0 and "release-two" in asset("/")[1], "incompatible UI installation preserves the active release")
+    check(current.poll() is None and session(sid)["pid"] == restarted["pid"],
+          "UI updates preserve backend and terminal processes")
 
     # Exercise the user-facing reload command after fault tests. The replacement
     # detaches itself, so cleanup for this one uses the CLI with the same private paths.

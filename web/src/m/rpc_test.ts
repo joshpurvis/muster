@@ -31,10 +31,10 @@ async function harness(path: string) {
       this.readyState = Socket.CLOSED;
       this.onclose();
     }
-    async open() {
+    async open(hello: unknown = {}) {
       this.readyState = Socket.OPEN;
       this.onopen();
-      this.reply(this.sent.at(-1)!.id, {});
+      this.reply(this.sent.at(-1)!.id, hello);
       await Promise.resolve();
       await Promise.resolve();
     }
@@ -53,7 +53,9 @@ async function harness(path: string) {
   set("addEventListener", () => {});
   set("WebSocket", Socket);
   const { rpc } =
-    await (path === "/"
+    await (path === "/incompatible"
+      ? import("../rpc.ts?incompatible-test")
+      : path === "/"
       ? import("../rpc.ts?desktop-test")
       : path === "/m"
       ? import("../rpc.ts?close-test")
@@ -132,4 +134,20 @@ Deno.test("close hook can suspend an unpaired phone before reconnect is schedule
   } finally {
     h.restore();
   }
+});
+
+Deno.test("incompatible backend rejects queued input before opening the UI", async () => {
+  const h = await harness("/incompatible");
+  try {
+    await h.rpc.start();
+    let opened = false;
+    h.rpc.onHello = () => { opened = true; };
+    const pending = h.rpc.call("session.input", { id: 1, data: "never-send" }).then(() => false, () => true);
+    await h.sockets[0].open({ ui_protocol: 999 });
+    assert(await pending, "queued call must be rejected");
+    assert(!opened && !h.rpc.isOpen, "incompatible hello must not activate UI");
+    assert(h.sockets[0].sent.length === 1, "only hello may cross the socket");
+    h.rpc.resume();
+    assert(h.sockets.length === 1, "background resume cannot bypass compatibility failure");
+  } finally { h.restore(); }
 });

@@ -11,6 +11,7 @@ const CONN_LABEL = {
   connecting: "connecting…",
   reconnecting: "reconnecting…",
   no_token: "not signed in",
+  incompatible: "UI update required",
 } as const;
 
 export function StatusLine() {

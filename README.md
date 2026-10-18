@@ -2,8 +2,10 @@
 
 A desktop app for running many coding agents (Claude Code, Codex CLI, plain shells) side by
 side in real terminals. Each channel is a task backed by its own git worktree, with one or more
-terminal sessions. A background daemon owns all the terminals, so closing the window never
-kills an agent. The UI reconnects and replays scrollback.
+terminal sessions. A small terminal host owns the PTYs and processes. The application
+backend handles agents, tasks and worktrees; windows render the UI. Closing a window or
+restarting the backend leaves terminal processes running. The UI reconnects and replays
+scrollback. See [the separation design](docs/TERMINAL_HOST.md) for recovery and rollout details.
 
 See [PLAN.md](PLAN.md) for the roadmap, [docs/PROTOCOL.md](docs/PROTOCOL.md) for the client
 protocol and [docs/UI.md](docs/UI.md) for the UI spec, including the keyboard shortcuts.
@@ -11,12 +13,24 @@ protocol and [docs/UI.md](docs/UI.md) for the UI spec, including the keyboard sh
 ## Build
 
 ```sh
-deno task build                      # web/dist, then cargo build --release (browser-window mode)
-cargo build --release --features gui # native window (needs webkit2gtk-4.1 on Linux)
+deno task build                      # web/dist, then cargo build --workspace --release (browser-window mode)
+cargo build --workspace --release --features gui # native window (needs webkit2gtk-4.1 on Linux)
 deno task build:all                  # web/dist, then the release build with the native window
 ```
 
-Debug builds serve `web/dist` from disk, so you can rebuild the frontend without recompiling.
+Build and distribute both `muster` and `muster-terminal-host` side by side. Debug builds
+serve `web/dist` from disk. Release builds can also load an independent UI release:
+
+```sh
+deno task web
+muster ui-install web/dist        # activate UI files, then refresh the window
+muster reload                    # replace only the backend; terminal processes continue
+```
+
+UI installation switches complete releases atomically and keeps older bundles for open
+windows. `MUSTER_WEB_DIR` can point directly to a built UI for development. An incompatible
+UI is refused. Backend reload verifies host ownership and refuses legacy monolithic daemons;
+existing terminals in those daemons need to finish before migrating.
 
 ## Run
 
@@ -25,7 +39,8 @@ muster                           # start the daemon if needed, then open a new w
 muster open [path] [--window N]  # open window N, or a new window with a tab in path
 muster status                    # is the daemon running? how many sessions?
 muster url                       # print the UI URL (includes the access token)
-muster stop                      # stop the daemon (terminates all sessions)
+muster reload                    # restart the backend, preserving terminal processes
+muster stop                      # stop backend and host (terminates all sessions)
 muster daemon [--foreground]
 ```
 
@@ -64,8 +79,9 @@ is found it falls back to `xdg-open`.
 | What | Default | Override |
 |---|---|---|
 | Database, session logs, worktrees, agent homes (`agents/`) | `$XDG_DATA_HOME/muster` | `MUSTER_DATA_DIR` |
-| `daemon.json`, lock, `daemon.log` | `$XDG_RUNTIME_DIR/muster` | `MUSTER_RUNTIME_DIR` |
-| Port | 7433 (a free port if busy) | `MUSTER_PORT` |
+| Backend discovery/logs and terminal host socket/lock/log | `$XDG_RUNTIME_DIR/muster` | `MUSTER_RUNTIME_DIR` |
+| Port | 7433 (a free port if busy on first launch; pinned thereafter) | `MUSTER_PORT` |
+| Independent UI releases | `$MUSTER_DATA_DIR/ui/{releases,current}` | `MUSTER_WEB_DIR` (direct built UI override) |
 
 Log verbosity: `MUSTER_LOG=debug`.
 

@@ -84,9 +84,9 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: hook spooling/deduplication; application/UI update compatibility and asset loading;
-additional crash-window tests and code review, including retired-run cleanup,
-slow/disconnected stream recovery, and bounded host resource retention. Existing
+Remaining before completion: hook spooling/deduplication; durable MCP guard recovery;
+additional crash-window tests and code review, including retired-run cleanup
+and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.
 
 ### Restart safety checkpoint
@@ -98,3 +98,15 @@ reset replay before more live output. `muster reload` checks that the current ba
 confirms the compatible host identity before it signals that backend; it refuses
 legacy monolithic instances. The CLI reload preserves the terminal PID and host ID
 in the fixture. Validation: 231 Rust tests and 21 focused backend survival checks.
+
+### Independent UI checkpoint
+
+`muster ui-install web/dist` stages a compatible release and atomically activates it.
+Installed HTML pins JavaScript/CSS to its release; old bundles remain available to
+open pages. Release validation and the UI/application handshake fail closed for
+incompatible versions. No backend or host restart is needed for UI-only updates.
+`MUSTER_WEB_DIR` remains a direct built-directory override for development.
+
+Validation: 27 focused backend/UI survival checks; external asset isolation/cache/
+activation unit test; frontend type/lint checks, all 82 frontend tests, and both
+production bundles. Remaining work above is still open; no live install was performed.

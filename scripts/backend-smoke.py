@@ -192,6 +192,21 @@ def host_call(method, params=None):
         return reply.get("data")
 
 
+def start_browser(sid):
+    global browser
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        browser_port = reserve.getsockname()[1]
+    browser_log = open(BASE / "browser.log", "a")
+    logs.append(browser_log)
+    browser = subprocess.Popen([shutil.which("deno"), "run", "--allow-net=127.0.0.1",
+        "--allow-run=chromium", f"--allow-write={BASE / 'shots'}",
+        str(PROJECT / "web/dev/recovery.ts"), f"http://127.0.0.1:{PORT}/#token={token}",
+        str(sid), str(BASE), str(browser_port)], env=ENV | {"DENO_DIR": str(BASE / "deno")},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=browser_log, text=True)
+    browser_phase()
+
+
 def session(sid):
     return next(item for item in rpc("hello")["sessions"] if item["id"] == sid)
 
@@ -228,17 +243,7 @@ try:
     for _ in range(30):
         assert not mcp_post().get("isError", False)
     if "--browser" in sys.argv:
-        with socket.socket() as reserve:
-            reserve.bind(("127.0.0.1", 0))
-            browser_port = reserve.getsockname()[1]
-        browser_log = open(BASE / "browser.log", "w")
-        logs.append(browser_log)
-        browser = subprocess.Popen([shutil.which("deno"), "run", "--allow-net=127.0.0.1",
-            "--allow-run=chromium", f"--allow-write={BASE / 'shots'}",
-            str(PROJECT / "web/dev/recovery.ts"), f"http://127.0.0.1:{PORT}/#token={token}",
-            str(sid), str(BASE), str(browser_port)], env=ENV | {"DENO_DIR": str(BASE / "deno")},
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=browser_log, text=True)
-        browser_phase()
+        start_browser(sid)
     rpc("session.input", {"id": sid, "data": "for i in $(seq 1 80); do printf 'COUNT:%s\\n' \"$i\"; sleep 0.1; done\r"})
     until("ticker started", lambda: "COUNT:2" in output(sid))
     browser_phase("before")
@@ -523,26 +528,30 @@ try:
 
     # Crash after the durable Typing checkpoint. The command may have reached the terminal;
     # replacement must pause for review, never make a second automatic attempt.
-    uncertain = BASE / "uncertain-command-runs"
-    until("shell ready before interrupted delivery", lambda: session(sid)["state"] == "idle")
-    request_errors = []
-    def send_uncertain():
-        try:
-            rpc("session.send", {"id": sid, "text": f"printf 'once\\n' >> {uncertain}; # " + "padding " * 300})
-        except (ConnectionError, OSError, AssertionError) as error:
-            request_errors.append(error)
-    sender = threading.Thread(target=send_uncertain)
-    sender.start()
-    def typing_checkpoint():
-        with sqlite3.connect(DATA / "muster.db") as database:
-            row = database.execute("SELECT record FROM runtime_state WHERE key='prompt-queues'").fetchone()
-        queue = json.loads(row[0]).get(str(sid), {}) if row else {}
-        return (queue.get("active") or {}).get("stage") == "typing"
-    until("delivery typing checkpoint", typing_checkpoint)
-    stop_backend(hard=True)
-    sender.join(timeout=10)
-    assert not sender.is_alive(), "interrupted request thread did not finish"
-    start_backend()
+    def interrupted_delivery(name):
+        uncertain = BASE / f"{name}-uncertain-runs"
+        until("shell ready before interrupted delivery", lambda: session(sid)["state"] == "idle")
+        request_errors = []
+        def send_uncertain():
+            try:
+                rpc("session.send", {"id": sid, "text": f"printf 'once\\n' >> {uncertain}; # " + "padding " * 300})
+            except (ConnectionError, OSError, AssertionError) as error:
+                request_errors.append(error)
+        sender = threading.Thread(target=send_uncertain)
+        sender.start()
+        def typing_checkpoint():
+            with sqlite3.connect(DATA / "muster.db") as database:
+                row = database.execute("SELECT record FROM runtime_state WHERE key='prompt-queues'").fetchone()
+            queue = json.loads(row[0]).get(str(sid), {}) if row else {}
+            return (queue.get("active") or {}).get("stage") == "typing"
+        until("delivery typing checkpoint", typing_checkpoint)
+        stop_backend(hard=True)
+        sender.join(timeout=10)
+        assert not sender.is_alive(), "interrupted request thread did not finish"
+        start_backend()
+        return uncertain
+
+    uncertain = interrupted_delivery("first")
     review = rpc("session.queue", {"id": sid})
     check(review["paused"] and review["uncertain"] and review["stage"] == "typing",
           "interrupted prompt delivery is retained for review")
@@ -552,13 +561,36 @@ try:
           "ambiguous input is never automatically replayed")
     check(sid in rpc("hello")["paused_deliveries"], "reconnecting UI is told about paused delivery")
     resumed = BASE / "resumed-after-review"
-    rpc("session.send", {"id": sid, "text": f"printf 'kept\\n' >> {resumed}"})
-    rpc("session.resume_queue", {"id": sid})
+    for text in ("kept", "kept-too"):
+        rpc("session.send", {"id": sid, "text": f"printf '{text}\\n' >> {resumed}"})
+    if browser is None and "--browser" in sys.argv:
+        start_browser(sid)
+    if browser is not None:
+        # The desktop review dialog's Resume button, clicked in the rendered UI.
+        browser_phase("review_desktop")
+    else:
+        rpc("session.resume_queue", {"id": sid})
     review = rpc("session.queue", {"id": sid})
     check(not review["paused"] and not review["uncertain"], "resuming forgets only the reviewed uncertain record")
-    until("waiting prompt delivered after review", lambda: resumed.exists() and resumed.read_text() == "kept\n")
+    until("waiting prompts delivered after review", lambda: resumed.exists() and resumed.read_text() == "kept\nkept-too\n")
+    check(resumed.read_text() == "kept\nkept-too\n", "every waiting prompt survives the resume and is delivered once")
     check((uncertain.read_text() if uncertain.exists() else "") == before,
           "resuming never resends the uncertain prompt")
+    if browser is not None:
+        # The same through the mobile composer's Resume button.
+        uncertain = interrupted_delivery("mobile")
+        before = uncertain.read_text() if uncertain.exists() else ""
+        resumed = BASE / "resumed-from-mobile"
+        for text in ("phone-kept", "phone-kept-too"):
+            rpc("session.send", {"id": sid, "text": f"printf '{text}\\n' >> {resumed}"})
+        assert rpc("session.queue", {"id": sid})["paused"]
+        browser_phase("review_mobile")
+        until("waiting prompts delivered after mobile review",
+              lambda: resumed.exists() and resumed.read_text() == "phone-kept\nphone-kept-too\n")
+        check(not rpc("session.queue", {"id": sid})["paused"]
+              and (uncertain.read_text() if uncertain.exists() else "") == before,
+              "mobile Resume keeps the waiting prompts and never resends the uncertain one")
+        close_browser()
     rpc("session.input", {"id": sid, "data": "\x03"})
 
     # UI installation changes only release files. Old HTML keeps loading its own bundle.
@@ -608,6 +640,26 @@ try:
     check(full_stop.returncode == 0, f"explicit full stop succeeds: {stderr.decode().strip()}")
     check(not (RUNTIME / "terminal.sock").exists(), "full stop terminates the terminal host")
     check(until("host released the fence lock", legacy_daemon_lock_free), "after a full stop an older daemon may start")
+    # A legacy (monolithic) daemon holding daemon.lock, without a usable daemon.json: this
+    # backend must refuse before opening the shared database, and leave no host behind.
+    (RUNTIME / "daemon.json").unlink(missing_ok=True)
+    with open(RUNTIME / "daemon.lock", "a") as legacy_lock:
+        fcntl.flock(legacy_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        log = open(BASE / "backend-legacy-lock.log", "wb")
+        logs.append(log)
+        refused = subprocess.Popen([str(BIN), "daemon", "--foreground"], env=ENV,
+                                   stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+        try:
+            refused.wait(timeout=20)
+        finally:
+            if refused.poll() is None:
+                refused.kill()
+                refused.wait()
+        log.flush()
+        message = (BASE / "backend-legacy-lock.log").read_text()
+        check(refused.returncode != 0 and "older Muster daemon" in message
+              and not (RUNTIME / "terminal.sock").exists() and not (RUNTIME / "daemon.json").exists(),
+              "a backend refuses to start beside a legacy daemon holding daemon.lock")
     print(f"Passed {passed} backend survival checks.", flush=True)
 finally:
     try:

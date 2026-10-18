@@ -32,6 +32,7 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
+  dismissToastKey,
   toast,
   updateLayout,
   windowId,
@@ -551,6 +552,14 @@ export function killSession(sid: SessionId) {
   rpc.call("session.kill", { id: sid }).catch(fail("Kill failed")).catch(() => {});
 }
 
+/** After an input interruption: the user has checked the terminal and types again.
+ * Nothing that may have been lost is resent. */
+export function continueInput(sid: SessionId) {
+  rpc.call("session.continue_input", { id: sid })
+    .then(() => terms.focusTerminal(sid))
+    .catch(fail("Could not continue typing")).catch(() => {});
+}
+
 export function interruptSession(sid: SessionId) {
   rpc.call("session.interrupt", { id: sid }).catch(fail("Interrupt failed")).catch(() => {});
 }
@@ -860,25 +869,65 @@ export function editAgent(name: string, tab: "settings" | "memory" = "settings")
 }
 
 
+/** Sessions whose prompt delivery was interrupted and not yet resumed or cleared. */
+let needsReview = new Set<SessionId>();
+
+function showReviewNotice() {
+  if (!needsReview.size) return dismissToastKey("delivery-review");
+  const n = needsReview.size;
+  toast(
+    "warn",
+    n === 1
+      ? "Prompt delivery needs review in 1 terminal. Right-click its tab and choose “Review queued prompts”."
+      : `Prompt delivery needs review in ${n} terminals. Right-click each one’s tab and choose “Review queued prompts”.`,
+    12000,
+    "delivery-review",
+  );
+}
+
+/** From hello: the sessions whose delivery is paused for review. */
+export function deliveriesNeedReview(ids: SessionId[]) {
+  needsReview = new Set(ids);
+  showReviewNotice();
+}
+
+/** A paused delivery was resumed or its queue cleared. */
+function reviewResolved(id: SessionId) {
+  if (needsReview.delete(id)) showReviewNotice();
+}
+
 /** Review an interrupted delivery before deciding whether to clear its queue. */
 export async function reviewQueue(id: SessionId) {
   try {
     const queue = await rpc.call<{ queued: string[]; uncertain: string | null; paused: boolean }>("session.queue", { id });
-    const preview = (text: string) => text.length > 300 ? `${text.slice(0, 300)}…` : text;
-    const text = queue.uncertain ? `Delivery is uncertain for: ${preview(queue.uncertain)}. Check the terminal before resending. ` : "";
+    const preview = (text: string, max = 300) => text.length > max ? `${text.slice(0, max)}…` : text;
+    const waiting = queue.queued.length;
+    const body = [
+      queue.uncertain
+        ? `This prompt may have been typed only partly before Muster stopped: “${preview(queue.uncertain, 160)}”. Check the terminal before sending it again.`
+        : "",
+      waiting
+        ? `${waiting} ${waiting === 1 ? "prompt" : "prompts"} waiting: ${
+          queue.queued.slice(0, 3).map((text) => `“${preview(text, 120)}”`).join(" · ")
+        }${waiting > 3 ? ` and ${waiting - 3} more` : ""}.`
+        : "No prompts are waiting.",
+      `${queue.paused ? "Resume sends the waiting prompts and forgets only the interrupted one. " : ""}Clear queue discards every queue record. Text already typed and commands already run stay either way.`,
+    ].filter(Boolean);
     overlay.value = {
       kind: "confirm",
       title: queue.paused ? "Review interrupted delivery" : "Queued prompts",
-      body: `${text}${queue.queued.length} prompt(s) waiting. ${queue.queued.slice(0, 3).map(preview).join(" · ")} ${
-        queue.paused ? "Resume keeps the waiting prompts and forgets only the interrupted one. " : ""
-      }Clearing discards the queue records. Already typed text and executed commands remain.`,
+      body,
       confirmLabel: "Clear queue",
       danger: true,
-      run: () => rpc.call("session.clear_queue", { id }).catch(fail("Could not clear queue")).catch(() => {}),
+      run: () =>
+        rpc.call("session.clear_queue", { id }).then(() => reviewResolved(id))
+          .catch(fail("Could not clear queue")).catch(() => {}),
       secondary: queue.paused
         ? {
           label: "Resume queue",
-          run: () => rpc.call("session.resume_queue", { id }).catch(fail("Could not resume queue")).catch(() => {}),
+          run: () =>
+            rpc.call("session.resume_queue", { id }).then(() => reviewResolved(id))
+              .catch(fail("Could not resume queue")).catch(() => {}),
         }
         : undefined,
     };

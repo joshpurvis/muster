@@ -484,6 +484,8 @@ async fn exchange(
 }
 
 async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    // First: keystrokes recorded after this point came after the callback (`Hub::handle_hook_at`).
+    let arrival = hub.human_input_seq();
     let Some(token) = bearer(&headers) else {
         return unauthorized();
     };
@@ -496,7 +498,7 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     if hub.session_by_token(token).is_none() {
         return unauthorized();
     }
-    match hub.handle_hook(token, &event, payload) {
+    match hub.handle_hook_at(token, &event, payload, arrival) {
         Ok(()) => axum::Json(json!({})).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

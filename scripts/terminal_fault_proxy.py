@@ -96,7 +96,7 @@ class SpawnGate:
                     self.entered.set()
                     assert self.release.wait(12), "fixture did not release the acknowledgement gate"
                 client.sendall(response)
-                if command["method"] in ("events", "attach"):
+                if command["method"] in ("events", "attach", "input_stream"):
                     while not self.stopping.is_set():
                         readable, _, _ = select.select([client, upstream], [], [], 0.1)
                         for source in readable:

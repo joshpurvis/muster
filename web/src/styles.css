@@ -34,6 +34,8 @@
   --st-attn: #f0a020;
   --st-idle: #3fb950;
   --st-error: #f85149;
+  /* Filled destructive buttons: white 13px labels need 4.5:1 (#f85149 gives 3.35:1). */
+  --danger-fill: #da3633;
   --st-stuck: #e0823d;
   --st-exited: #6a6a76;
   --attn-bg: rgba(240, 160, 32, 0.11);
@@ -97,6 +99,7 @@
   --st-attn: #c77a00;
   --st-idle: #1f9d3a;
   --st-error: #d92d20;
+  --danger-fill: #d92d20;
   --st-stuck: #c8621a;
   --st-exited: #9a9aa6;
   --attn-bg: rgba(214, 138, 0, 0.1);
@@ -1305,6 +1308,26 @@ button.sl-item:hover {
   border-top: 1px solid var(--border);
 }
 
+/* Typing paused after an input interruption (see InputPausedBar). */
+.input-paused-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--st-error) 14%, var(--bg-1));
+  border-top: 1px solid color-mix(in srgb, var(--st-error) 45%, var(--border));
+}
+
+.input-paused-bar .exited-dot {
+  box-shadow: none;
+  background: var(--st-error);
+}
+
 .exited-dot {
   width: 8px;
   height: 8px;
@@ -1520,13 +1543,13 @@ button.sl-item:hover {
 }
 
 .btn-danger {
-  background: var(--st-error);
+  background: var(--danger-fill);
   border-color: transparent;
   color: #fff;
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--st-error) 85%, #000);
+  background: color-mix(in srgb, var(--danger-fill) 85%, #000);
 }
 
 .btn-approve {

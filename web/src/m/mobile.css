@@ -719,6 +719,22 @@ time {
   line-height: 1.5;
   margin-bottom: 10px;
 }
+/* Queue review: the guidance is read in full; actions stay on one line each. */
+.queue-review .queue-guidance {
+  display: block;
+  overflow: visible;
+  color: var(--text-muted);
+}
+/* What to do next: full colour, so it reads as the instruction, not as fine print. */
+.queue-review .queue-check {
+  color: var(--text);
+  font-weight: 550;
+}
+.queue-review .approval-actions button {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  padding-inline: 10px;
+}
 .approval-prompt small {
   color: var(--text-muted);
 }

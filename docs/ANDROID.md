@@ -147,7 +147,7 @@ revoked_at?}`.
 | Scope | Methods |
 |---|---|
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
-| `interact` | `session.send/keys/input/approve/interrupt/clear_queue/resume_queue/resize`, `channel.mark_read/post` |
+| `interact` | `session.send/keys/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post` |
 | `manage` | `channel.create` (a `permissions` field is rejected: the channel gets defaults), `channel.archive/rename`, `session.spawn` (`extra_args` rejected), `session.kill/restart/remove/rename`, `workspace.add`, `fs.complete` |
 | never for devices | `device.*`, `channel.set_permissions/set_layout/reorder/move`, `window.*`, `workspace.remove` |
 

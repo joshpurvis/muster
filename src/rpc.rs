@@ -384,6 +384,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             inject::resume_queue(hub, p.id)?;
             Ok(json!({}))
         }
+        "session.continue_input" => {
+            // After an input interruption: the user has checked the terminal. Nothing lost
+            // is resent; typing is accepted again and waiting prompts may be delivered.
+            let p: IdParam<SessionId> = parse(params)?;
+            hub.continue_input(p.id)?;
+            Ok(json!({}))
+        }
         "session.screen" => {
             let p: IdParam<SessionId> = parse(params)?;
             if hub.session(p.id).is_none() {
@@ -546,7 +553,6 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 from_session: Option<SessionId>,
             }
             let p: P = parse(params)?;
-            let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
             // Keys typed for an agent on a non-human chain can't drive a Claude agent, and never
             // count as the human's input; keys from the human (or a human-rooted shell) do.
             let caller = caller(hub, p.from_session)?;
@@ -556,11 +562,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 Caller::Human => None,
             };
             match chain {
-                Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => if let Err(error) = hub.note_human_input(p.id) {
-                    // As for keystrokes: the input still goes through with the stricter provenance.
-                    tracing::warn!(session = p.id, "input attribution not saved: {error:#}");
-                },
+                Some(r) => {
+                    let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
+                    crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?
+                }
+                // The human's keys (a paired phone, `muster keys` outside a session) take the
+                // same path as a client's: no session lookup under the hub lock, no SQLite.
+                None => hub.note_human_input(p.id),
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -1166,13 +1174,16 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
-                    // Attribution is bookkeeping: if it can't be saved, the session keeps its
-                    // current (agent) provenance, which is the stricter one. Never drop keys.
-                    if let Err(error) = hub.note_human_input(id) {
-                        tracing::warn!(session = id, "input attribution not saved: {error:#}");
-                    }
-                    if let Err(e) = hub.write_input(id, &data[5..]) {
-                        tracing::debug!("input for session {id}: {e}");
+                    // The marker is recorded in memory and committed off this path, so a
+                    // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
+                    hub.note_human_input(id);
+                    if let Err(e) = hub.send_keys(id, &data[5..]) {
+                        // Lost or refused keystrokes interrupt their run, which the user sees
+                        // on the session (`input_interrupted`) and in a notice.
+                        tracing::debug!("input for session {id}: {e:#}");
+                        // The backend is stopping: stop reading, so the client shows it is
+                        // disconnected (typing paused) instead of sending into a closed link.
+                        if hub.input_closed() { break }
                     }
                 }
             }
@@ -1482,6 +1493,8 @@ mod tests {
         // The human's keystrokes (no from_session) make the next plain prompt the human's.
         hub.agents().set_prov(2, Some(SCHED)).unwrap();
         let _ = call(&hub, "session.input", json!({"id": 2, "data": "x"})).await;
+        // The marker is committed off the input path (the daemon's attribution worker).
+        hub.flush_human_input().unwrap();
         let info = hub.session(2).unwrap();
         hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"})).unwrap();
         assert_eq!(hub.agents().prov(2), None);

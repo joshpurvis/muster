@@ -74,12 +74,11 @@ mq.addEventListener("change", applyThemePref);
 
 // ---------- wiring ----------
 terms.setFontSize(prefs.value.fontSize);
+terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
-  if (h.paused_deliveries?.length) {
-    toast("warn", `Prompt delivery needs review in ${h.paused_deliveries.length} terminal(s). Right-click a tab and choose “Review queued prompts”.`, 12000);
-  }
+  A.deliveriesNeedReview(h.paused_deliveries ?? []);
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
   if (reconnect) terms.reattachAll();
@@ -140,6 +139,8 @@ rpc.start();
     return out.join("\n");
   },
   attached: () => terms.attachedSids(),
+  /** The live (mutable) xterm instance of a session, for fixtures and latency probes. */
+  term: (sid: number) => terms.terminal(sid),
 };
 
 // ---------- components ----------

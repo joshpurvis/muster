@@ -741,12 +741,22 @@ fn reload() -> anyhow::Result<()> {
         let host = terminal::TerminalService::connect(
             &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
         ).context("cannot verify a compatible terminal host; backend left running")?;
-        validate_reload_host(&hello, &host.client.hello)?;
+        check_reload(&hello, &host.client.hello, &paths::lock_path())?;
         stop_backend(Some(d))?;
     }
     start_daemon_detached()?;
     println!("muster backend restarted; terminals preserved");
     Ok(())
+}
+
+/// Everything the replacement backend will require of the running host, checked before
+/// the working backend is stopped: a refused reload leaves it running.
+fn check_reload(backend: &serde_json::Value, host: &muster_terminal_protocol::Hello, lock: &std::path::Path)
+    -> anyhow::Result<()> {
+    validate_reload_host(backend, host)?;
+    // The replacement refuses a host whose fence it cannot verify (`terminal::ensure_host`).
+    terminal::verify_fence(host, lock)
+        .context("the replacement backend would refuse this terminal host; backend left running")
 }
 
 fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_protocol::Hello) -> anyhow::Result<()> {
@@ -943,13 +953,15 @@ fn run_daemon() -> anyhow::Result<()> {
 async fn daemon_main() -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // The terminal host and its rollback fence first: an older, monolithic daemon holding
+    // daemon.lock must stop this backend before it opens the shared database.
+    let release = executables::prepare(&paths::data_dir(), &std::env::current_exe()?)?;
+    let terminal_host = terminal::ensure_host(&release.host())?;
     let listener = bind().await?;
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
     let hook_inbox = hook_inbox::Inbox::open(&hook_inbox::path())?;
-    let release = executables::prepare(&paths::data_dir(), &std::env::current_exe()?)?;
-    let terminal_host = terminal::ensure_host(&release.host())?;
     // Never move a directory beneath a surviving process during a backend update.
     if !terminal_host.inventory()?.iter().any(|run| run.has_processes) {
         if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
@@ -968,6 +980,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     )?;
 
     hook_inbox::spawn(&hub, hook_inbox)?;
+    hub::spawn_input_attribution(&hub)?;
     let app = server::router(hub.clone())?;
     // Publish the helper only after application recovery succeeds. Existing
     // terminals keep this path even when the original build directory is removed.
@@ -1022,6 +1035,15 @@ async fn daemon_main() -> anyhow::Result<()> {
     let mut hup = signal(SignalKind::hangup())?;
 
     // Peer addresses let `/api/exchange` check which local user owns the connecting socket.
+    // TCP_NODELAY: terminal echo is a stream of small WebSocket frames. With Nagle's algorithm
+    // a frame written while the previous one is unacknowledged waits for the peer's delayed
+    // ACK (about 40 ms on Linux), which showed up as echo stalls during fast typing.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::debug!("setting TCP_NODELAY: {error}");
+        }
+    });
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1156,9 +1178,22 @@ mod reload_tests {
     #[test]
     fn reload_refuses_legacy_and_different_host_backends() {
         let host = muster_terminal_protocol::Hello { protocol: 1, instance: "one".into(),
-            pid: 1, data_dir: PathBuf::from("/unused") };
+            pid: 1, data_dir: PathBuf::from("/unused"), fence: None };
         assert!(validate_reload_host(&serde_json::json!({"version": "0.1.0"}), &host).is_err());
         assert!(validate_reload_host(&serde_json::json!({"terminal_host": {"protocol": 1, "instance": "other"}}), &host).is_err());
         assert!(validate_reload_host(&serde_json::json!({"terminal_host": host}), &host).is_ok());
+        // A host the replacement would refuse (no fence it can verify) stops the reload
+        // before the working backend is signalled.
+        let lock = std::env::temp_dir().join(format!("muster-reload-fence-{}", rand::random::<u64>()));
+        std::fs::write(&lock, b"").unwrap();
+        let backend = serde_json::json!({"terminal_host": host});
+        let error = check_reload(&backend, &host, &lock).unwrap_err();
+        assert!(format!("{error:#}").contains("backend left running"), "{error:#}");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&lock).unwrap();
+        let fenced = muster_terminal_protocol::Hello { fence: Some(muster_terminal_protocol::FenceLock {
+            path: lock.clone(), dev: metadata.dev(), ino: metadata.ino() }), ..host.clone() };
+        check_reload(&serde_json::json!({"terminal_host": fenced}), &fenced, &lock).unwrap();
+        std::fs::remove_file(&lock).unwrap();
     }
 }

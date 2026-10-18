@@ -58,6 +58,18 @@ keeps that lock for its whole life. Older daemons take the same lock to start, s
 refuse to run while a host owns terminals instead of autostarting duplicates. This
 build's backend uses `backend.lock` for its own single-instance check.
 
+The fence works in both directions. The host takes the lock (waiting up to 2 s for a
+holder that is exiting) before it binds its socket, and reports it in `Hello.fence` by
+device and inode; if the lock stays held it exits with status 76 and never answers.
+Before opening the database, the backend requires the answering host to report the lock
+that is at `daemon.lock` now. A starting host cannot be mistaken for a legacy daemon,
+because a host only answers once it holds the lock, and a legacy daemon holding it never
+answers as a host. A second host that finds `terminal.lock` taken exits with status 75,
+and the backend then waits for the first one, launching again if that one exits without
+answering. A host that does not report `Hello.fence` is refused (run `muster stop` and start
+again): a lock probed and released by the backend would let a legacy daemon take it right
+afterwards. `muster reload` runs the same check before it stops the working backend.
+
 ## Verified checkpoints
 
 - Extracted the existing PTY implementation into `muster-terminal-core`, removing
@@ -313,19 +325,101 @@ cleanup. No browser console exceptions were reported.
 
 Open after the fix round (not yet fixed):
 
-- The backend now locks `backend.lock` and the host holds `daemon.lock` as a rollback
-  fence, so a legacy monolithic daemon no longer excludes a new backend by flock. Only
-  the `find_daemon()` discovery check stops a new backend starting beside it; a missing
-  or racing `daemon.json` lets both run on one database. The backend should refuse when
-  `daemon.lock` is held and no compatible host answers.
 - A dialog answered by keyboard and replaced before the detector sees the change can
   pair the new dialog with the old description (also on master). Bind approvals to a
   dialog fingerprint.
 - vte buffers an oversized OSC title before the 1 KiB cap; a huge `session.output`
   `lines` request can exceed the frame limit (fails only that request).
-- A host started before this build does not hold the fence lock.
-- The desktop/mobile Resume buttons are type- and lint-checked but not yet rendered in
-  the browser fixture.
+- Keystrokes still in flight at the very end of a graceful backend stop (after its last
+  save, or unread in the WebSocket when it closes) can be lost without pausing the run;
+  the page shows "Disconnected · Typing is paused" at that point. After a backend crash,
+  keystrokes admitted but not yet delivered are lost the same way (as on master).
+- `session.input` from an agent or shell caller still looks up that caller's provenance
+  under the agents lock, which hook processing holds across its commit; the human's keys
+  (client frames, the phone's key chips) do not.
+- The desktop "Typing is paused" bar and the phone's banner are covered by backend and
+  unit tests, not yet by the browser fixture.
+
+## Review fix round 2
+
+Fixes from the three reviews of the typing-latency, fence and Resume-queue change:
+
+- Input never crosses a gap. Any input whose delivery failed or is unknown (connection
+  lost after the frame was written, refused by the host, unsendable, over the byte
+  budget, or refused because the backend is stopping) interrupts its run. Input of that
+  run queued behind it fails unsent and later input is refused, while other runs carry
+  on; input admitted before a refusal still goes. Persistent-stream and one-call fallback
+  input share the same outcome classification (`Client::call_input`). The 4,096-job
+  limit is now an 8 MiB budget across queued and in-flight input; keystrokes never wait
+  for it.
+- The user is told. An interrupted run sets `SessionInfo.input_interrupted`, sends a
+  notice, and is saved (`input-interrupted`) so a restart keeps it. The desktop shows
+  "Typing is paused" under the terminal and drops keystrokes; the phone disables its
+  keys and composer. Prompt delivery waits. `session.continue_input` (the "Continue
+  typing" button, never auto-focused) resumes without resending anything.
+- Shutdown settles input. After prompt submissions settle, the input link is closed,
+  admitted keystrokes are delivered (3 s; any still pending interrupt their run),
+  pending human-input markers are committed under the callback boundary, and the
+  attribution worker is joined. WebSocket readers stop at the first refused frame, so
+  the page shows it is disconnected. A crash before the markers commit keeps the
+  session's current provenance: the safe direction, because treating unknown input as
+  the human's would let a crash raise an agent or scheduled turn to human authority. The
+  cost is that one human turn may keep the stricter provenance.
+- Markers are sequence numbered. A legacy HTTP callback takes the current number when its
+  request arrives; its plain prompt consumes the human-input marker only if some of that
+  input came first, even if a later marker was committed (by its own boundary or the
+  worker) before it ran. Spooled callbacks were already ordered by the inbox.
+- Keystrokes find their terminal through `Hub::input_handles`, updated with
+  `SessEntry::pty` under the hub lock but never held across SQLite, so a callback commit
+  holding the hub lock no longer stalls typing. `write_input`, the generation-checked
+  delivery path, `application_cursor` and the human's `session.input` use it too.
+- Hosts without `Hello.fence` are refused, and `muster reload` checks the fence before
+  stopping the backend. After exit 75 the backend relaunches a host if the other one
+  went away instead of waiting out 15 s.
+- UI: the "needs review" notice tracks the unresolved terminals and goes when they are
+  resumed or cleared; Resume and Clear return focus to the terminal; the dark-mode
+  danger button is #da3633 (4.6:1 for its label); the phone keeps "Check the terminal
+  before sending this prompt again" outside the clamped preview and labels the header
+  "2 waiting · 1 interrupted" while reviewing.
+
+Validation: 273 Rust tests (new: lost stream with input queued behind it, one-call
+fallback loss, byte-budget refusal with a later Enter, close and drain, legacy callback
+vs. a later marker, keystrokes reaching the host while a callback holds the hub lock on
+SQLite, interruption pausing every input path, shutdown settling input and markers,
+unfenced-host refusal, reload preflight), all 154 smoke checks, 54 backend and 57
+browser-enabled survival checks, 82 frontend tests and type/lint checks. Typing latency
+is unchanged from the first round (render p50 3 ms at 100 wpm, 26 ms in 15 ms bursts,
+3 ms held key; 25-28 ms with callbacks running).
+
+## Typing latency
+
+Measured in headless Chromium with a GPU against a stand-in TUI that repaints a
+full-width input box on every byte (numbers and method in the change's notes). Three
+causes, the first two shared with master:
+
+- The server socket used Nagle's algorithm. During bursts, an echo frame written while
+  the previous one was unacknowledged waited for the browser's delayed ACK (about 40 ms).
+  Accepted connections now set `TCP_NODELAY`.
+- `terms.ts` held output until its own animation frame, so xterm's render request landed
+  inside a rAF callback and waited for the following frame: two frames per echo. Output
+  now goes straight to `term.write`; xterm batches parsing and renders once per frame.
+- Each keystroke opened an IMMEDIATE inbox transaction (draining callbacks first) inside
+  the WebSocket reader, and a new host connection for its Input. Under callback traffic
+  on a real disk this added 7 ms median and up to 100 ms to the keystroke itself.
+
+Keystrokes now only record a human-input marker in memory (`Hub::note_human_input`) and
+queue the bytes to one persistent `InputStream` host connection (`terminal::InputLink`).
+Markers are committed by the next input boundary: the attribution worker runs one
+promptly, and every prompt delivery and legacy HTTP hook commits pending markers before
+its own change. The background callback consumer never sees an uncommitted marker, so a
+callback that may predate the keystroke cannot consume it; one that reacts to it before
+the commit keeps the stricter provenance. On the input stream, a write that fails never
+delivered its frame and is retried once on a new connection; input whose answer is lost
+is reported, never resent, and nothing later for that run is sent (see round 2 below).
+
+Still open: while any animation runs (the Working dot's glow, for example), Chromium
+delivers WebSocket messages aligned to frames, which adds about a frame (8 ms median) to
+each echo. A non-animated indicator would remove that; it is a design choice.
 
 ## Completion audit
 

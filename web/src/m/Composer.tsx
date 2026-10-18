@@ -33,12 +33,16 @@ export function Composer(
   const input = useRef<HTMLTextAreaElement>(null);
   const timer = useRef(0);
   const held = useRef(false);
+  // Typing paused after an input interruption, until the user has checked the terminal.
+  const paused = !!s.input_interrupted && s.state !== "exited";
   const reason = !ready.value
     ? "Disconnected — reconnecting…"
     : s.state === "exited"
     ? "Session exited"
     : !canInteract.value
     ? "This device has view access only"
+    : paused
+    ? "Typing is paused until you continue"
     : "";
   const disabled = !!reason;
   useLayoutEffect(() => {
@@ -93,7 +97,10 @@ export function Composer(
           <section class="composer" aria-label="Message composer">
             <div class="composer-handle">
               <span>
-                {s.queued > 0
+                {queue
+                  // The same terms as the review below: Resume sends the waiting prompts.
+                  ? `${queue.queued.length} waiting${queue.uncertain ? " · 1 interrupted" : ""}`
+                  : s.queued > 0
                   ? `${s.queued} queued`
                   : s.state === "needs_approval"
                   ? "Approval needed"
@@ -120,11 +127,15 @@ export function Composer(
               </button>
             </div>
             {queue && (
-              <div class="approval-prompt">
-                {queue.uncertain && <p>Delivery interrupted: {queue.uncertain.slice(0, 300)}. Check the terminal before resending.</p>}
-                <p>
-                  {queue.queued.length} prompts waiting. {queue.paused && "Resume keeps them and forgets only the interrupted one. "}
-                  Clearing removes queue records; typed text and executed commands remain.
+              <div class="approval-prompt queue-review">
+                {queue.uncertain && <p>Interrupted, may have been typed only partly: {queue.uncertain.slice(0, 300)}</p>}
+                {queue.uncertain && (
+                  <p class="queue-guidance queue-check">Check the terminal before sending this prompt again.</p>
+                )}
+                <p class="queue-guidance">
+                  {queue.queued.length} {queue.queued.length === 1 ? "prompt" : "prompts"} waiting.{" "}
+                  {queue.paused && "Resume sends them and forgets only the interrupted one. "}
+                  Clear queue discards every queue record. Typed text and commands already run stay either way.
                 </p>
                 <div class="approval-actions">
                   {queue.paused && (
@@ -144,6 +155,22 @@ export function Composer(
                     } catch (error) { notify(errorText(error)); }
                   }}>Clear queue</button>
                   <button type="button" onClick={() => setQueue(null)}>Close</button>
+                </div>
+              </div>
+            )}
+            {paused && (
+              <div class="approval-prompt queue-review" role="alert">
+                <p class="queue-guidance queue-check">
+                  Typing is paused: some input may not have reached this terminal. Check the screen before you
+                  continue.
+                </p>
+                <div class="approval-actions">
+                  <button type="button" disabled={!ready.value || !canInteract.value} onClick={async () => {
+                    try {
+                      await rpc.call("session.continue_input", { id: s.id });
+                      notify("Typing resumed");
+                    } catch (error) { notify(errorText(error)); }
+                  }}>Continue typing</button>
                 </div>
               </div>
             )}

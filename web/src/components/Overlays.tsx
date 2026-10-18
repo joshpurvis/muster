@@ -732,7 +732,7 @@ function Shortcuts() {
 function Confirm(
   props: {
     title: string;
-    body: string;
+    body: string | string[];
     confirmLabel: string;
     danger?: boolean;
     run: () => void;
@@ -749,7 +749,7 @@ function Confirm(
         <h2>{props.title}</h2>
       </div>
       <div class="dlg-body">
-        <p>{props.body}</p>
+        {(Array.isArray(props.body) ? props.body : [props.body]).map((text, i) => <p key={i}>{text}</p>)}
       </div>
       <div class="dlg-foot">
         <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
@@ -758,7 +758,9 @@ function Confirm(
             type="button"
             class="btn"
             onClick={() => {
-              overlay.value = null;
+              // Back to the terminal, as Cancel does (the dialog's own focus memory pointed
+              // at a button that is gone).
+              close();
               props.secondary!.run();
             }}
           >
@@ -770,7 +772,7 @@ function Confirm(
           type="button"
           class={cx("btn", props.danger ? "btn-danger" : "btn-primary")}
           onClick={() => {
-            overlay.value = null;
+            close();
             props.run();
           }}
         >

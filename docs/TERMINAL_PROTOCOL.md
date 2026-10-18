@@ -14,7 +14,11 @@ connecting UID. Client disconnect never implies shutdown.
 ## Handshake and identity
 
 A request contains `version`, `instance` and `command`. `hello` returns the
-protocol version, random host-instance identifier, PID and canonical data path.
+protocol version, random host-instance identifier, PID and canonical data path, and
+`fence` (`{path, dev, ino}`) when the host was started with
+`MUSTER_TERMINAL_FENCE_LOCK`. A host takes that lock before binding its socket, so an
+answering host holds it; if the lock stays held for 2 s the host exits with status 76.
+A host that finds its runtime directory owned by another host exits with status 75.
 Every other command must name that exact host instance. A stale client cannot
 mutate a replacement host even if its socket path and terminal IDs are reused.
 Incompatible versions fail; clients must not automatically upgrade/restart a host.
@@ -51,12 +55,18 @@ unlimited historical output.
 
 Control connections carry one request and one response. Each output/event stream
 uses a separate connection. `attach` and `events` acknowledge `attached` before
-streaming. Subscribe to events before reading inventory; lifecycle events may
+streaming. `input_stream` also acknowledges `attached`; afterwards every frame the
+client sends is one JSON `input` request, applied in order and answered with `ok` or
+`error`, until the client closes the connection. An incomplete frame is never applied.
+A client that loses the connection after sending a whole frame does not know its
+outcome and must not resend it. Subscribe to events before reading inventory; lifecycle events may
 repeat information already present in inventory. Event stream overflow sends
 `resync`, which requires another inventory read.
 
 Commands: `hello`, `inventory`, `spawn`, `status`, `input`, `resize`, `screen`,
-`recent_text`, `terminate`, `forget`, `attach`, `events`, `flush`, `shutdown`.
+`recent_text`, `terminate`, `forget`, `attach`, `events`, `input_stream`, `flush`,
+`shutdown`. A host that predates `input_stream` closes that connection without an
+answer; nothing was applied, so the client may fall back to one `input` per request.
 `input` is bounded to 1 MiB per request; larger input must be split deliberately.
 `forget` is refused until processes and pending output are gone. Shutdown is an
 explicit operation that terminates all host-owned processes. SIGTERM/SIGINT have

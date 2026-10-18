@@ -227,7 +227,7 @@ export function Group(
   };
 
   const onContext = (e: MouseEvent) => {
-    if (!active || (e.target as HTMLElement).closest?.(".approval, .exited-bar, .findbar, input")) return;
+    if (!active || (e.target as HTMLElement).closest?.(".approval, .exited-bar, .input-paused-bar, .findbar, input")) return;
     // Programs that track the mouse get the right button; Shift+right-click still opens ours.
     const t = terms.terminal(active.id);
     if (t && t.modes.mouseTrackingMode !== "none" && !e.shiftKey) return;
@@ -254,6 +254,7 @@ export function Group(
         )}
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
+        {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (
           <div class="term-veil" role="status">
@@ -662,6 +663,20 @@ function ApprovalBanner({ s }: { s: SessionInfo }) {
             </>
           )}
       </div>
+    </div>
+  );
+}
+
+/** Typing is paused after an input interruption. The button is never focused for the user:
+ * a fast typist's next Enter or Space must not continue without them reading this. */
+function InputPausedBar({ s }: { s: SessionInfo }) {
+  return (
+    <div class="input-paused-bar" role="alert">
+      <span class="exited-dot" />
+      <span>Typing is paused: some input may not have reached this terminal. Check the screen first.</span>
+      <button type="button" class="link-btn" onClick={() => A.continueInput(s.id)}>
+        Continue typing
+      </button>
     </div>
   );
 }

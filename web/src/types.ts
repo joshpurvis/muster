@@ -93,6 +93,9 @@ export interface SessionInfo {
   rows: number;
   /** Last PTY resizer: "local" or "device:<id>". Missing on older daemons. */
   size_owner?: string | null;
+  /** Typing is paused: earlier input may not have reached the terminal. Cleared by
+   * `session.continue_input` (or a new run). */
+  input_interrupted?: boolean;
   /** Changes with every state/detail change and answered prompt (stale-approval guard). */
   state_seq?: number;
   queued: number;

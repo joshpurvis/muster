@@ -441,10 +441,13 @@ pub(crate) fn drop_queue(hub: &Hub, id: SessionId) {
     }
 }
 
-/// Would the next delivery be put straight back (a dialog, an unreadable screen, or the
-/// human's unsent draft)? Checked before taking the prompt off the queue, so waiting costs
+/// Would the next delivery be put straight back (a dialog, an unreadable screen, the
+/// human's unsent draft, or typing paused after an input interruption)? Checked before taking the prompt off the queue, so waiting costs
 /// no queue writes and no queue-count updates. Tells the human once about a draft.
 fn deferred(hub: &Hub, id: SessionId, generation: Option<u64>) -> bool {
+    // Typing is paused after an input interruption: nothing is typed until the user has
+    // checked the terminal and continues (`Hub::continue_input` kicks the queue again).
+    if hub.input_interrupted(id) { return true }
     let Some(info) = hub.session(id) else { return false };
     let adapter = adapter_for(info.kind);
     let head = hub.injection.inner.lock().get(&id)

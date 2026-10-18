@@ -74,6 +74,44 @@ impl Client {
         }
     }
 
+    /// Open a persistent input connection (`Command::InputStream`). A host that predates
+    /// it closes the connection without answering; nothing was sent, so callers may fall
+    /// back to one `call` per input.
+    pub fn input_stream(&self) -> anyhow::Result<UnixStream> {
+        let mut stream = self.request(Command::InputStream)?;
+        match checked(wire::read(&mut stream)?.decode()?)? {
+            Response::Attached => Ok(stream),
+            _ => anyhow::bail!("unexpected input stream response"),
+        }
+    }
+
+    /// Send one input on a stream from `input_stream` and wait for its answer. A failed write
+    /// means the host never received the whole frame (it was not applied); a failure after
+    /// the frame was written leaves the outcome unknown: drop the stream, never resend.
+    pub fn stream_input(stream: &mut UnixStream, command: &Command) -> Result<(), StreamError> {
+        let frame = Frame::json(&Request { version: VERSION, instance: None, command: command.clone() })
+            .map_err(StreamError::Unsent)?;
+        wire::write(stream, &frame).map_err(StreamError::Unsent)?;
+        let response = wire::read(stream).and_then(|frame| frame.decode::<Response>()).map_err(StreamError::Lost)?;
+        checked(response).map(|_| ()).map_err(StreamError::Host)
+    }
+
+    /// One input on its own connection (a host without input streams), classified like
+    /// `stream_input`: a failure to connect or to write the whole frame never applied it; a
+    /// failure after the frame was written leaves the outcome unknown.
+    pub fn call_input(&self, command: &Command) -> Result<(), StreamError> {
+        let mut stream = connect(&self.socket).map_err(StreamError::Unsent)?;
+        let frame = Frame::json(&Request {
+            version: VERSION,
+            instance: Some(self.hello.instance.clone()),
+            command: command.clone(),
+        })
+        .map_err(StreamError::Unsent)?;
+        wire::write(&mut stream, &frame).map_err(StreamError::Unsent)?;
+        let response = wire::read(&mut stream).and_then(|frame| frame.decode::<Response>()).map_err(StreamError::Lost)?;
+        checked(response).map(|_| ()).map_err(StreamError::Host)
+    }
+
     fn request(&self, command: Command) -> anyhow::Result<UnixStream> {
         let mut stream = connect(&self.socket)?;
         wire::write(
@@ -86,6 +124,17 @@ impl Client {
         )?;
         Ok(stream)
     }
+}
+
+/// Outcome of `Client::stream_input` and `Client::call_input`.
+#[derive(Debug)]
+pub enum StreamError {
+    /// The host did not receive the complete input (for example, the stream had closed).
+    Unsent(anyhow::Error),
+    /// The host answered with an error; the stream remains usable.
+    Host(anyhow::Error),
+    /// The connection failed after the input may have been sent: outcome unknown.
+    Lost(anyhow::Error),
 }
 
 fn connect(socket: &Path) -> anyhow::Result<UnixStream> {

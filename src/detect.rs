@@ -229,6 +229,7 @@ mod tests {
             queued: 0,
             subagents: 0,
             size_owner: None,
+            input_interrupted: false,
             state_seq: 0,
             created_at: 0,
             window_id: None,

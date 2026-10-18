@@ -733,6 +733,10 @@ struct Attributions {
 struct RegInner {
     agents: BTreeMap<i64, Agent>,
     runtime: Attributions,
+    /// For each session in `runtime.human_seen`: the first and last human-input sequence
+    /// number behind it (`hub::HumanInputQueue`). In memory only: a marker saved by an
+    /// earlier backend predates every callback of this one (first = 0).
+    human_stamps: HashMap<SessionId, (u64, u64)>,
     refusals: HashMap<String, (i64, u32, u32)>,
 }
 
@@ -778,6 +782,9 @@ impl Registry {
             self.store.save_runtime("agent-attribution", &next)?;
             inner.runtime = next;
         }
+        // Stamps describe only sessions still marked.
+        let RegInner { runtime, human_stamps, .. } = &mut *inner;
+        human_stamps.retain(|id, _| runtime.human_seen.contains(id));
         Ok(result)
     }
 
@@ -913,8 +920,33 @@ impl Registry {
     }
 
     /// Keystrokes or a prompt from the human, through a client or device connection.
+    #[cfg(test)]
     pub fn note_human_input(&self, id: SessionId) -> anyhow::Result<()> {
         self.edit_runtime(|state| { state.human_seen.insert(id); })
+    }
+
+    /// Several sessions' markers in one save (the hub's attribution boundary), each with
+    /// the first and last sequence number of the keystrokes behind it.
+    pub(crate) fn note_human_input_all(&self, marks: &BTreeMap<SessionId, (u64, u64)>) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        let mut next = inner.runtime.clone();
+        for id in marks.keys() {
+            if !next.human_seen.contains(id) {
+                next.human_seen.insert(*id);
+            } else {
+                // Marked already (possibly by an earlier backend): that input is older.
+                inner.human_stamps.entry(*id).or_insert((0, 0));
+            }
+        }
+        if next != inner.runtime {
+            self.store.save_runtime("agent-attribution", &next)?;
+            inner.runtime = next;
+        }
+        for (id, (first, last)) in marks {
+            let stamp = inner.human_stamps.entry(*id).or_insert((*first, *last));
+            *stamp = (stamp.0.min(*first), stamp.1.max(*last));
+        }
+        Ok(())
     }
 
     pub fn msg_status(&self, store: &Store, msg: i64) -> MsgStatus {
@@ -948,12 +980,16 @@ impl Registry {
 
     pub(crate) fn on_hook_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
         payload: &Value, cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<HookEffects> {
-        self.on_hook_session_checkpoint(store, info, event, payload, cursor, None)
+        self.on_hook_session_checkpoint(store, info, event, payload, cursor, None, u64::MAX)
     }
 
+    /// `arrival`: the human-input sequence number when the callback arrived (`u64::MAX` for
+    /// a callback already ordered against markers, as spooled ones are). A plain prompt
+    /// consumes the session's human-input marker only if input behind it came first.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_hook_session_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
         payload: &Value, cursor: Option<&crate::store::HookCursor>,
-        session: Option<(&SessionInfo, &crate::store::HookSession)>) -> anyhow::Result<HookEffects> {
+        session: Option<(&SessionInfo, &crate::store::HookSession)>, arrival: u64) -> anyhow::Result<HookEffects> {
         let mut g = self.inner.lock();
         if let Some(cursor) = cursor {
             if store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor")?
@@ -962,6 +998,7 @@ impl Registry {
             }
         }
         let mut next = g.runtime.clone();
+        let mut stamp = g.human_stamps.get(&info.id).copied();
         let mut fx = HookEffects::default();
         if event == "UserPromptSubmit" {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -977,7 +1014,22 @@ impl Registry {
                 }
                 None => {
                     next.active.remove(&info.id);
-                    if next.human_seen.remove(&info.id) { next.prov.remove(&info.id); }
+                    if next.human_seen.contains(&info.id) {
+                        let (first, last) = stamp.unwrap_or((0, 0));
+                        if first <= arrival {
+                            // The human typed before this prompt: it is theirs.
+                            next.prov.remove(&info.id);
+                            if last > arrival {
+                                // And again since: that input belongs to the next prompt.
+                                stamp = Some((last, last));
+                            } else {
+                                next.human_seen.remove(&info.id);
+                                stamp = None;
+                            }
+                        }
+                        // Otherwise all of it came after this callback arrived: keep the
+                        // stricter provenance and leave the marker for the next prompt.
+                    }
                 }
                 _ => {},
             }
@@ -1003,6 +1055,11 @@ impl Registry {
             store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
+        }
+        // Applied only once the change above is saved (an error returned before this).
+        match stamp {
+            Some(stamp) if g.runtime.human_seen.contains(&info.id) => { g.human_stamps.insert(info.id, stamp); }
+            _ => { g.human_stamps.remove(&info.id); }
         }
         Ok(fx)
     }

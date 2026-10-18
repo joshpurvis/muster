@@ -24,6 +24,37 @@ async function command(): Promise<string | null> {
   return JSON.parse(line).phase;
 }
 
+/** Click the first `selector` element whose text includes `text`. */
+async function clickText(selector: string, text: string, timeoutMs = 10000) {
+  const find = `[...document.querySelectorAll(${JSON.stringify(selector)})]
+    .find((e) => e.textContent.includes(${JSON.stringify(text)}) && !e.disabled)`;
+  await browser.wait(`!!(${find})`, timeoutMs);
+  const r = await browser.eval(`(() => { const r = (${find}).getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  await browser.clickAt(r.x, r.y);
+}
+
+/** Everything inside `container` stays within it and the viewport (nothing clipped). */
+async function contained(container: string) {
+  const bad = await browser.eval(`(() => {
+    const box = document.querySelector(${JSON.stringify(container)}).getBoundingClientRect();
+    const out = [];
+    for (const e of document.querySelectorAll(${JSON.stringify(container)} + " button")) {
+      const r = e.getBoundingClientRect();
+      if (r.left < box.left - 1 || r.right > box.right + 1 || r.right > innerWidth || r.bottom > innerHeight
+        || e.scrollWidth > e.clientWidth + 1) out.push(e.textContent.trim());
+    }
+    if (document.documentElement.scrollWidth > innerWidth) out.push("page overflows horizontally");
+    return out;
+  })()`);
+  if (bad.length) throw new Error(`clipped or overflowing in ${container}: ${bad.join(", ")}`);
+}
+
+async function queueSettled() {
+  await browser.wait(`${M}.rpc.call("session.queue", { id: ${sid} })
+    .then((q) => !q.paused && !q.uncertain && q.queued.length === 0 && q.stage === null)`, 20000);
+}
+
 try {
   await Deno.mkdir(`${base}/shots`, { recursive: true });
   await browser.size(1440, 900);
@@ -90,6 +121,36 @@ try {
       if (exceptions.length) throw new Error(exceptions.join("\n"));
       console.log(JSON.stringify({ phase, pid: session.pid }));
       continue;
+    } else if (phase === "review_desktop") {
+      // A paused delivery with prompts waiting behind it: review it from the tab menu.
+      await browser.wait(`!!document.querySelector('[data-tab-sid="${sid}"]')`, 15000);
+      await browser.wait(`${M}.rpc.call("session.queue", { id: ${sid} }).then((q) => q.paused && q.queued.length === 2)`, 15000);
+      await browser.click(`[data-tab-sid="${sid}"]`, { button: "right" });
+      await clickText(".menu-item", "Review queued prompts");
+      await browser.wait("!!document.querySelector('.confirm-dlg')");
+      await contained(".confirm-dlg");
+      await browser.shot(`${base}/shots/review-desktop.png`);
+      await clickText(".confirm-dlg button", "Resume queue");
+      await browser.wait("!document.querySelector('.confirm-dlg')");
+      await queueSettled();
+      await browser.shot(`${base}/shots/review-desktop-resumed.png`);
+    } else if (phase === "review_mobile") {
+      const pairing = await browser.eval(`${M}.rpc.call("device.pair_code", {
+        url: "https://muster-fixture.invalid", name: "Queue review fixture", scopes: ["view", "interact"]
+      })`);
+      await browser.size(412, 915, true);
+      await browser.goto(`${new URL(url).origin}/m/#pair=${pairing.code}`);
+      await browser.wait(`!!document.querySelector('[data-session="${sid}"] .session-open')`, 15000);
+      await browser.click(`[data-session="${sid}"] .session-open`);
+      await clickText(".composer-handle button", "Review queue", 15000);
+      await browser.wait("[...document.querySelectorAll('.approval-actions button')].some((b) => b.textContent.includes('Resume queue'))");
+      await contained(".approval-prompt");
+      await browser.shot(`${base}/shots/review-mobile.png`);
+      await clickText(".approval-actions button", "Resume queue");
+      await browser.wait("![...document.querySelectorAll('.approval-actions button')].some((b) => b.textContent.includes('Resume queue'))");
+      await browser.shot(`${base}/shots/review-mobile-resumed.png`);
+      const exceptions = browser.console.filter((line) => line.startsWith("exception:"));
+      if (exceptions.length) throw new Error(exceptions.join("\n"));
     } else {
       throw new Error(`unknown recovery phase: ${phase}`);
     }

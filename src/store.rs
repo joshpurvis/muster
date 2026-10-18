@@ -1016,6 +1016,7 @@ impl Store {
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     subagents: 0,
                     size_owner: None,
+                    input_interrupted: false,
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
@@ -1206,6 +1207,12 @@ impl Store {
              WHERE state != 'exited'",
             params![detail, now],
         )?)
+    }
+
+    /// Hold the database connection, as a slow SQLite statement or commit would.
+    #[cfg(test)]
+    pub fn hold_connection_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
     }
 
     #[cfg(test)]

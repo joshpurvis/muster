@@ -283,6 +283,106 @@ struct Inner {
     launch_codes: HashMap<String, std::time::Instant>,
 }
 
+/// Runtime key of the runs whose input is interrupted (`Hub::on_input_interrupted`).
+const INPUT_INTERRUPTED_KEY: &str = "input-interrupted";
+
+/// Human-input markers waiting for the callback boundary (see `Hub::note_human_input`).
+/// Each keystroke takes a sequence number, so a callback can tell input that came before it
+/// arrived from input that came after (`Hub::handle_hook`).
+#[derive(Default)]
+pub(crate) struct HumanInputQueue {
+    /// The last sequence number handed out (0: none yet).
+    seq: std::sync::atomic::AtomicU64,
+    /// Per session, the first and last sequence number of its uncommitted keystrokes.
+    pending: Mutex<BTreeMap<SessionId, (u64, u64)>>,
+    wake: parking_lot::Condvar,
+}
+
+impl HumanInputQueue {
+    fn note(&self, id: SessionId) {
+        let mut pending = self.pending.lock();
+        // Numbered under the lock, so a later number is never recorded before an earlier one.
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        match pending.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((seq, seq));
+                self.wake.notify_one();
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => entry.get_mut().1 = seq,
+        }
+    }
+    /// The newest sequence number: input numbered after this came later.
+    pub(crate) fn now(&self) -> u64 { self.seq.load(Ordering::SeqCst) }
+    fn is_empty(&self) -> bool { self.pending.lock().is_empty() }
+    fn take(&self) -> BTreeMap<SessionId, (u64, u64)> { std::mem::take(&mut *self.pending.lock()) }
+    fn restore(&self, marks: BTreeMap<SessionId, (u64, u64)>) {
+        let mut pending = self.pending.lock();
+        for (id, (first, last)) in marks {
+            let entry = pending.entry(id).or_insert((first, last));
+            *entry = (entry.0.min(first), entry.1.max(last));
+        }
+    }
+    /// Wait until a marker is pending (or the timeout passes).
+    fn wait(&self, timeout: Duration) {
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            self.wake.wait_for(&mut pending, timeout);
+        }
+    }
+}
+
+/// Commit human-input markers off the input path, promptly after each keystroke. A boundary
+/// that cannot be established yet (callbacks still arriving) keeps the markers and retries.
+/// Stops when the backend shuts down; `Hub::shutdown` commits what is left and joins it.
+pub fn spawn_input_attribution(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    let queue = hub.human_input.clone();
+    let weak = Arc::downgrade(hub);
+    let worker = std::thread::Builder::new().name("input-attribution".into()).spawn(move || {
+        let mut failing = false;
+        loop {
+            queue.wait(Duration::from_millis(500));
+            let Some(hub) = weak.upgrade() else { break };
+            if hub.is_shutting_down() {
+                break;
+            }
+            match hub.flush_human_input() {
+                Ok(()) => failing = false,
+                Err(error) => {
+                    if !failing {
+                        tracing::debug!("human-input attribution waiting for callbacks: {error:#}");
+                    }
+                    failing = true;
+                    drop(hub);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    })?;
+    *hub.workers.lock() = vec![worker];
+    Ok(())
+}
+
+/// Tell the user when a terminal's input was interrupted (`terminal::InputLink`), off the
+/// input path: the link's hook only queues the run here.
+pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    let Some(host) = hub.cfg.terminal_host.clone() else { return Ok(()) };
+    let (tx, rx) = std::sync::mpsc::channel::<RunId>();
+    let queued = hub.interruptions_pending.clone();
+    host.input().on_interrupt(Arc::new(move |run| {
+        queued.fetch_add(1, Ordering::SeqCst);
+        if tx.send(run).is_err() { queued.fetch_sub(1, Ordering::SeqCst); }
+    }));
+    let weak = Arc::downgrade(hub);
+    let queued = hub.interruptions_pending.clone();
+    std::thread::Builder::new().name("input-interrupted".into()).spawn(move || {
+        while let Ok(run) = rx.recv() {
+            if let Some(hub) = weak.upgrade() { hub.on_input_interrupted(run); }
+            queued.fetch_sub(1, Ordering::SeqCst);
+        }
+    })?;
+    Ok(())
+}
+
 pub struct Hub {
     cfg: HubConfig,
     store: Store,
@@ -293,6 +393,18 @@ pub struct Hub {
     retire_signalled: Mutex<BTreeSet<RunId>>,
     /// Serializes inbox consumption and input attribution. The host never sees it.
     pub(crate) callback_inbox: Mutex<Option<crate::hook_inbox::Inbox>>,
+    /// Sessions that received human keystrokes whose attribution marker is not committed
+    /// yet (`note_human_input`). Keystrokes only add to it; markers are taken and committed
+    /// under the callback boundary, never on the input path.
+    human_input: Arc<HumanInputQueue>,
+    /// Each session's current terminal handle, for the input path: the same handle as
+    /// `SessEntry::pty` (updated together, under `inner`), but behind a lock that is never
+    /// held across SQLite I/O, so a keystroke never waits for a callback's commit.
+    input_handles: Mutex<HashMap<SessionId, Arc<PtySession>>>,
+    /// Interruption announcements not yet handled (`spawn_input_interruptions`).
+    interruptions_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Background threads `shutdown` joins (the attribution worker).
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     shutting_down: AtomicBool,
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
@@ -462,6 +574,18 @@ impl Hub {
                 },
             );
         }
+        // Typing stays paused for a run whose input was interrupted before a restart, until
+        // the user continues. The input path finds each session's handle without `inner`.
+        let interrupted: Vec<(RunId, String)> = store.load_runtime(INPUT_INTERRUPTED_KEY)?.unwrap_or_default();
+        let mut input_handles = HashMap::new();
+        for (id, entry) in inner.sessions.iter_mut() {
+            let Some(pty) = &entry.pty else { continue };
+            if let Some((run, reason)) = interrupted.iter().find(|(run, _)| *run == pty.run() && pty.is_alive()) {
+                if let Some(host) = &cfg.terminal_host { host.input().restore_interrupted(*run, reason); }
+                entry.info.input_interrupted = true;
+            }
+            input_handles.insert(*id, pty.clone());
+        }
         let devices = crate::devices::Registry::load(&store)?;
         let agents = crate::agents::Registry::load(&store)?;
         let injection = crate::inject::Queues::load(&store)?;
@@ -480,6 +604,10 @@ impl Hub {
             terminal_records: Mutex::new(terminal_records),
             retire_signalled: Mutex::new(BTreeSet::new()),
             callback_inbox: Mutex::new(None),
+            human_input: Arc::default(),
+            input_handles: Mutex::new(input_handles),
+            interruptions_pending: Arc::default(),
+            workers: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
@@ -501,6 +629,8 @@ impl Hub {
                 if let Some(hub) = unavailable.upgrade() { hub.notice("error", message); }
             }))?;
         }
+        // Before any input can flow (queue recovery below may type).
+        spawn_input_interruptions(&hub)?;
         if let Err(error) = hub.reconcile_retired() {
             tracing::warn!("terminal retirement will retry after startup: {error:#}");
         }
@@ -715,16 +845,58 @@ impl Hub {
 
     // ----- session I/O -----
 
-    fn input_boundary<T>(&self, action: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    /// Attribution changes that must be ordered against agent callbacks. Under the callback
+    /// lock: drain committed callbacks, then (with hook inserts blocked) commit the human-input
+    /// markers recorded so far and run `action`. Pending markers are taken only here, so a
+    /// prompt delivery can never clear `human_seen` before a keystroke that preceded it is
+    /// marked, and the marker worker can never re-set it afterwards.
+    pub(crate) fn input_boundary<T>(&self, action: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
         let mut inbox = self.callback_inbox.lock();
+        let action = || {
+            self.commit_human_input()?;
+            action()
+        };
         match inbox.as_mut() {
             Some(inbox) => inbox.input_boundary(self, action),
             None => action(),
         }
     }
 
-    pub fn note_human_input(&self, id: SessionId) -> anyhow::Result<()> {
-        self.input_boundary(|| self.agents.note_human_input(id))
+    /// Keystrokes from a client: the human's input. Records the marker and returns at once;
+    /// the keystroke itself never waits on SQLite or the callback lock. The marker is
+    /// committed by the next input boundary (the attribution worker runs one promptly, and
+    /// every prompt delivery or legacy hook runs one first). Until then, callbacks drained
+    /// by the background consumer do not see it: a callback that might predate the keystroke
+    /// can never consume it, and one that reacts to it at worst keeps the session's current,
+    /// stricter provenance. Each marker carries a sequence number, so a legacy HTTP callback
+    /// that arrived before the keystroke can never consume it either (`handle_hook`).
+    pub fn note_human_input(&self, id: SessionId) {
+        self.human_input.note(id);
+    }
+
+    /// Commit every pending human-input marker now (tests, the attribution worker, shutdown).
+    pub(crate) fn flush_human_input(&self) -> anyhow::Result<()> {
+        if self.human_input.is_empty() {
+            return Ok(());
+        }
+        self.input_boundary(|| Ok(()))
+    }
+
+    /// Only call inside `input_boundary`.
+    fn commit_human_input(&self) -> anyhow::Result<()> {
+        let pending = self.human_input.take();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let live: BTreeMap<SessionId, (u64, u64)> = {
+            let g = self.inner.lock();
+            pending.iter().filter(|(id, _)| g.sessions.contains_key(id)).map(|(id, marks)| (*id, *marks)).collect()
+        };
+        if let Err(error) = self.agents.note_human_input_all(&live) {
+            self.human_input.restore(pending);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn note_prompt_delivery(&self, id: SessionId, generation: Option<u64>,
@@ -737,25 +909,110 @@ impl Hub {
         })
     }
 
+    /// The session's current terminal handle for input. Never takes `inner` (held across
+    /// SQLite commits by hook processing and session updates).
+    fn input_handle(&self, id: SessionId) -> Option<Arc<PtySession>> {
+        self.input_handles.lock().get(&id).cloned()
+    }
+
+    /// Change a session's terminal handle. Call with `inner` held, wherever `SessEntry::pty`
+    /// changes, so the input path's lookup always names the same run. A new run starts with
+    /// its input open.
+    fn set_pty(&self, id: SessionId, entry: &mut SessEntry, pty: Option<Arc<PtySession>>) {
+        let mut handles = self.input_handles.lock();
+        match &pty {
+            Some(pty) => { handles.insert(id, pty.clone()); }
+            None => { handles.remove(&id); }
+        }
+        entry.info.input_interrupted = pty.as_ref().is_some_and(|pty| pty.input_interrupted().is_some());
+        entry.pty = pty;
+    }
+
+    fn not_running(&self, id: SessionId) -> anyhow::Error {
+        // Only on the error path: nothing reaches a terminal here, so waiting is harmless.
+        match self.session(id) {
+            Some(_) => anyhow::anyhow!("session {id} is not running"),
+            None => anyhow::anyhow!("no such session: {id}"),
+        }
+    }
+
     /// Raw bytes to the PTY.
     pub fn write_input(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
-        match self.pty(id) {
+        match self.input_handle(id) {
             Some(p) => p.write(bytes),
-            None if self.session(id).is_some() => anyhow::bail!("session {id} is not running"),
-            None => anyhow::bail!("no such session: {id}"),
+            None => Err(self.not_running(id)),
+        }
+    }
+
+    /// Keystrokes from a client: queued to the PTY in order without waiting on the host.
+    pub fn send_keys(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
+        match self.input_handle(id) {
+            Some(p) => p.send_keys(bytes),
+            None => Err(self.not_running(id)),
         }
     }
 
     /// Bind delayed input to the process it was prepared for, even across a concurrent restart.
     pub(crate) fn write_input_generation(&self, id: SessionId, generation: Option<u64>, bytes: &[u8]) -> anyhow::Result<()> {
-        let terminal = self.pty(id).filter(|terminal| Some(terminal.generation) == generation)
+        let terminal = self.input_handle(id).filter(|terminal| Some(terminal.generation) == generation)
             .context("the terminal run changed before input delivery")?;
         terminal.write(bytes)
     }
 
+    /// Typing into the session's current run is paused (`terminal::InputInterrupted`).
+    pub fn input_interrupted(&self, id: SessionId) -> bool {
+        self.input_handle(id).is_some_and(|p| p.input_interrupted().is_some())
+    }
+
+    /// The backend is stopping and refuses input.
+    pub fn input_closed(&self) -> bool {
+        self.cfg.terminal_host.as_ref().is_some_and(|host| host.input().is_closed())
+    }
+
+    fn save_input_interrupted(&self) {
+        let Some(host) = &self.cfg.terminal_host else { return };
+        if let Err(error) = self.store.save_runtime(INPUT_INTERRUPTED_KEY, &host.input().interrupted_runs()) {
+            tracing::warn!("saving interrupted terminal input: {error:#}");
+        }
+    }
+
+    /// A run's input was interrupted (lost, refused or dropped input): later input for it is
+    /// refused. Show it on the session and tell the user, unless the run is gone anyway.
+    pub(crate) fn on_input_interrupted(&self, run: RunId) {
+        self.save_input_interrupted();
+        let info = {
+            let mut g = self.inner.lock();
+            let Some(entry) = g.sessions.get_mut(&run.id) else { return };
+            let current = entry.pty.as_ref()
+                .is_some_and(|p| p.run() == run && p.is_alive() && p.input_interrupted().is_some());
+            if !current || entry.info.input_interrupted { return }
+            entry.info.input_interrupted = true;
+            entry.info.clone()
+        };
+        tracing::warn!(session = run.id, generation = run.generation, "terminal input interrupted");
+        self.emit(ServerEvent::SessionUpserted(info.clone()));
+        self.notice("error", format!(
+            "Some input to \u{201c}{}\u{201d} may not have reached its terminal, so typing there is paused. \
+            Check the terminal, then choose Continue typing.", info.name));
+    }
+
+    /// The user has checked the terminal after an interruption: accept its input again.
+    /// Nothing that was lost is resent.
+    pub fn continue_input(self: &Arc<Self>, id: SessionId) -> anyhow::Result<()> {
+        anyhow::ensure!(self.session(id).is_some(), "no such session: {id}");
+        if let Some(host) = &self.cfg.terminal_host {
+            host.input().resume(id);
+        }
+        self.save_input_interrupted();
+        self.update_session_info(id, |info| info.input_interrupted = false)?;
+        // Prompts that waited while typing was paused.
+        crate::inject::kick_initial(self, id);
+        Ok(())
+    }
+
     /// Is the session's terminal in application cursor mode (DECCKM)?
     pub fn application_cursor(&self, id: SessionId) -> bool {
-        self.pty(id).is_some_and(|p| p.application_cursor())
+        self.input_handle(id).is_some_and(|p| p.application_cursor())
     }
 
     /// Generation of the session's current process (changes on every restart), if it has one
@@ -2099,6 +2356,7 @@ impl Hub {
                 queued: 0,
                 subagents: 0,
                 size_owner: None,
+                input_interrupted: false,
                 state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),
@@ -2183,7 +2441,7 @@ impl Hub {
                 if let Some(agent) = req.agent_id.filter(|_| self.agents.by_session(id).is_some()) {
                     let _ = self.agents.link_session(&self.store, agent, None);
                 }
-                self.inner.lock().sessions.remove(&id);
+                if self.inner.lock().sessions.remove(&id).is_some() { self.input_handles.lock().remove(&id); }
                 let _ = self.store.delete_session(id);
                 let _ = std::fs::remove_dir_all(paths::session_dir(id));
                 self.emit(ServerEvent::SessionRemoved { id });
@@ -2428,7 +2686,7 @@ impl Hub {
                 anyhow::bail!("session {id} was removed while starting");
             };
             let old = e.token.replace(token.clone());
-            e.pty = Some(pty.clone());
+            self.set_pty(id, e, Some(pty.clone()));
             // The initial state was installed before Spawn. Callbacks that arrived since
             // may already have advanced it; keep their state, count and grace time.
             e.info.pid = pty.pid;
@@ -2553,7 +2811,7 @@ impl Hub {
             p.forget()?;
             let mut g = self.inner.lock();
             if let Some(e) = g.sessions.get_mut(&id) {
-                if e.generation == p.generation { e.pty = None; }
+                if e.generation == p.generation { self.set_pty(id, e, None); }
             }
         }
         match self.start_process(id, None, None) {
@@ -2634,6 +2892,7 @@ impl Hub {
                 .sessions
                 .remove(&id)
                 .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+            self.input_handles.lock().remove(&id);
             if let Some(t) = &e.token {
                 g.tokens.remove(t);
             }
@@ -2889,17 +3148,35 @@ impl Hub {
 
     /// Handle a hook callback authenticated by session token. Routes to the adapter's
     /// `on_hook`, logs a Hook event, applies the resulting state.
+    #[cfg(test)]
     pub fn handle_hook(&self, token: &str, event: &str, payload: serde_json::Value) -> anyhow::Result<()> {
-        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None))
+        self.handle_hook_at(token, event, payload, self.human_input_seq())
+    }
+
+    /// The newest human-input sequence number. A legacy HTTP callback takes this when its
+    /// request arrives: keystrokes numbered later came after it.
+    pub fn human_input_seq(&self) -> u64 {
+        self.human_input.now()
+    }
+
+    /// A legacy HTTP callback that arrived when the human-input sequence was at `arrival`.
+    /// It may wait for the callback boundary while later keystrokes are recorded and even
+    /// committed (by the attribution worker); a prompt callback consumes the human-input
+    /// marker only if some of that input came before it arrived, so a later keystroke can
+    /// never lower the provenance of an earlier, agent-delivered turn.
+    pub fn handle_hook_at(&self, token: &str, event: &str, payload: serde_json::Value, arrival: u64) -> anyhow::Result<()> {
+        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None, arrival))
     }
 
     pub(crate) fn handle_spooled_hook(&self, token: &str, event: &str, payload: serde_json::Value,
         cursor: &crate::store::HookCursor) -> anyhow::Result<()> {
-        self.handle_hook_checkpoint(token, event, payload, Some(cursor))
+        // Spooled callbacks are ordered against markers by the inbox itself: a marker is
+        // committed only after every earlier insert was drained, with inserts blocked.
+        self.handle_hook_checkpoint(token, event, payload, Some(cursor), u64::MAX)
     }
 
     fn handle_hook_checkpoint(&self, token: &str, event: &str, payload: serde_json::Value,
-        cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<()> {
+        cursor: Option<&crate::store::HookCursor>, arrival: u64) -> anyhow::Result<()> {
         // Spool callbacks from a process that exited during an outage may still contain
         // its final reply. Accept only the recorded current run, never a previous generation.
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
@@ -2950,7 +3227,7 @@ impl Hub {
             // State/count/grace and reply attribution all commit with the cursor.
             // A crash before publishing memory can recover state and attribution.
             let fx = self.agents.on_hook_session_checkpoint(&self.store, &entry.info, event, &payload,
-                cursor, Some((&info, &runtime)))?;
+                cursor, Some((&info, &runtime)), arrival)?;
             if fx.duplicate { return Ok(()) }
             let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents;
             entry.info = info.clone();
@@ -3041,7 +3318,7 @@ impl Hub {
                     records.insert(id, record.clone());
                     drop(records);
                     let old = e.token.replace(record.token.clone());
-                    e.pty = Some(pty.clone());
+                    self.set_pty(id, e, Some(pty.clone()));
                     e.info.pid = pty.pid;
                     e.info.title = pty.title();
                     e.info.state_detail = None;
@@ -3084,6 +3361,7 @@ impl Hub {
     /// Only the explicit full-stop CLI operation shuts down the terminal host.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.human_input.wake.notify_all();
         // Let already-started submissions reach a recorded outcome. No new queued
         // delivery starts while stopping. A timeout leaves its durable in-flight
         // record for explicit review on recovery, never an automatic duplicate.
@@ -3091,6 +3369,43 @@ impl Hub {
         while self.injection.in_progress() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        // Keystrokes: refuse new ones (they interrupt their run, so the user hears of them)
+        // and let every admitted one reach the host. Input still pending at the deadline
+        // interrupts its run too; nothing is ever resent.
+        if let Some(host) = &self.cfg.terminal_host {
+            let input = host.input().clone();
+            input.close();
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            if !tokio::task::spawn_blocking(move || input.drain(until)).await.unwrap_or(false) {
+                tracing::warn!("terminal input did not settle before shutdown");
+            }
+        }
+        // Commit the markers of human input that reached a terminal, under the callback
+        // boundary, so a callback for that input is attributed to the human after restart.
+        // (A crash before this keeps the session's current provenance, the stricter one.)
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.flush_human_input() {
+                Ok(()) => break,
+                Err(error) if std::time::Instant::now() >= until => {
+                    tracing::warn!("human-input attribution not saved before shutdown: {error:#}");
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let workers = std::mem::take(&mut *self.workers.lock());
+        for worker in workers {
+            while !worker.is_finished() && std::time::Instant::now() < until {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if worker.is_finished() { let _ = worker.join(); }
+        }
+        // Interruptions announced while stopping are saved for the next backend.
+        while self.interruptions_pending.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.save_input_interrupted();
     }
 
 }
@@ -3493,6 +3808,10 @@ mod tests {
     /// 1), archived channel 3, sessions of channel 1 (window 1): a shell titled "build the
     /// widget" and a claude without a title.
     fn move_fixture() -> Arc<Hub> {
+        fixture(None)
+    }
+
+    fn fixture(terminal_host: Option<Arc<TerminalService>>) -> Arc<Hub> {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
         let ch = |name: &str, archived| Channel {
@@ -3534,9 +3853,28 @@ mod tests {
             port: 0,
             client_token: "t".into(),
             muster_bin: PathBuf::from("/bin/true"),
-            terminal_host: None,
+            terminal_host,
         };
         Hub::new(cfg, store).unwrap()
+    }
+
+    /// Give session `id` a live run on `service` (as an acknowledged launch would).
+    fn install_terminal(hub: &Hub, service: &TerminalService, id: SessionId, generation: u64, directory: &Path)
+        -> Arc<PtySession> {
+        let terminal = crate::terminal::testing::live(service, id, generation, directory);
+        let mut g = hub.inner.lock();
+        let entry = g.sessions.get_mut(&id).unwrap();
+        entry.generation = generation;
+        hub.set_pty(id, entry, Some(terminal.clone()));
+        terminal
+    }
+
+    fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn remember_launch(hub: &Hub, pending: bool) {
@@ -3667,20 +4005,239 @@ mod tests {
         assert!(hub.agents.msg_status(&hub.store, next).active);
 
         // An older prompt callback must not consume the human-input marker that
-        // belongs to a later keystroke and accidentally lower provenance.
-        hub.callback_inbox.lock().as_mut().unwrap()
-            .enqueue("callback-token", "UserPromptSubmit", br#"{"prompt":"earlier input"}"#).unwrap();
-        hub.note_human_input(2).unwrap();
-        assert_eq!(hub.agents.prov(2).unwrap().origin, Origin::Schedule);
-        hub.callback_inbox.lock().as_mut().unwrap()
-            .enqueue("callback-token", "UserPromptSubmit", br#"{"prompt":"new human input"}"#).unwrap();
-        {
+        // belongs to a later keystroke and accidentally lower provenance. The marker is
+        // only recorded on the input path; its boundary drains the older callback first.
+        let enqueue = |event: &str, payload: &[u8]| hub.callback_inbox.lock().as_mut().unwrap()
+            .enqueue("callback-token", event, payload).unwrap();
+        let drain = || {
             let inbox = hub.callback_inbox.lock();
             crate::hook_inbox::drain(&hub, inbox.as_ref().unwrap()).unwrap();
-        }
+        };
+        enqueue("UserPromptSubmit", br#"{"prompt":"earlier input"}"#);
+        hub.note_human_input(2);
+        hub.flush_human_input().unwrap();
+        assert_eq!(hub.agents.prov(2).unwrap().origin, Origin::Schedule);
+        enqueue("UserPromptSubmit", br#"{"prompt":"new human input"}"#);
+        drain();
         assert_eq!(hub.agents.prov(2), None);
+
+        // While a marker is still uncommitted, the background consumer drains callbacks
+        // without it: one that may predate the keystroke cannot consume it.
+        hub.note_prompt_delivery(2, Some(42), source(message()), 400).unwrap();
+        enqueue("UserPromptSubmit", br#"{"prompt":"typed before the keystroke reached us"}"#);
+        hub.note_human_input(2);
+        drain();
+        assert_eq!(hub.agents.prov(2).unwrap().origin, Origin::Schedule, "an uncommitted marker is never consumed");
+        hub.flush_human_input().unwrap();
+        enqueue("UserPromptSubmit", br#"{"prompt":"after the keystroke"}"#);
+        drain();
+        assert_eq!(hub.agents.prov(2), None, "the committed marker belongs to the next prompt");
+
+        // A keystroke followed by a prompt delivery: the boundary of the delivery commits
+        // the earlier marker first and then clears it, so the marker can never be applied
+        // after the delivery and hand the delivered (envelope-less) prompt to the human.
+        let chain = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+        hub.note_human_input(2);
+        hub.note_prompt_delivery(2, Some(42), Source::Chain(chain), 500).unwrap();
+        hub.flush_human_input().unwrap();
+        enqueue("UserPromptSubmit", br#"{"prompt":"scheduled task text"}"#);
+        drain();
+        assert_eq!(hub.agents.prov(2), Some(chain), "a delivered prompt keeps its chain");
         drop(hub);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn keystrokes_never_wait_on_the_callback_lock_or_sqlite() {
+        let hub = move_fixture();
+        let directory = std::env::temp_dir().join(format!("muster-input-hot-path-{}", paths::random_token()));
+        let path = directory.join("hooks.sqlite");
+        *hub.callback_inbox.lock() = Some(crate::hook_inbox::Inbox::open(&path).unwrap());
+        let (held, release) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // A slow callback batch: the callback lock and the inbox write lock are held.
+                let _callbacks = hub.callback_inbox.lock();
+                let writer = rusqlite::Connection::open(&path).unwrap();
+                writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held.wait();
+                release.wait();
+                writer.execute_batch("COMMIT").unwrap();
+            });
+            held.wait();
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                hub.note_human_input(2);
+            }
+            assert!(started.elapsed() < Duration::from_millis(50), "keystrokes waited: {:?}", started.elapsed());
+            release.wait();
+        });
+        hub.flush_human_input().unwrap();
+        drop(hub);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_callback_never_consumes_a_marker_recorded_after_it_arrived() {
+        use crate::agents::{Origin, Prov};
+        let hub = move_fixture();
+        hub.inner.lock().tokens.insert("legacy-token".into(), 2);
+        let scheduled = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+        let prompt = |text: &str| serde_json::json!({ "prompt": text });
+
+        // The callback for a scheduled turn arrives; the human types afterwards and the
+        // attribution worker commits that marker before the callback gets its boundary.
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        let arrival = hub.human_input_seq();
+        hub.note_human_input(2);
+        hub.flush_human_input().unwrap();
+        hub.handle_hook_at("legacy-token", "UserPromptSubmit", prompt("scheduled task"), arrival).unwrap();
+        assert_eq!(hub.agents.prov(2), Some(scheduled), "a later keystroke never lowers an earlier turn");
+        // The marker stays for the human's own prompt.
+        hub.handle_hook("legacy-token", "UserPromptSubmit", prompt("typed by the human")).unwrap();
+        assert_eq!(hub.agents.prov(2), None);
+
+        // Same, with the callback's own boundary committing the later marker.
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        let arrival = hub.human_input_seq();
+        hub.note_human_input(2);
+        hub.handle_hook_at("legacy-token", "UserPromptSubmit", prompt("scheduled task"), arrival).unwrap();
+        assert_eq!(hub.agents.prov(2), Some(scheduled));
+        hub.handle_hook("legacy-token", "UserPromptSubmit", prompt("typed by the human")).unwrap();
+        assert_eq!(hub.agents.prov(2), None);
+
+        // Typing before and after the callback arrived: this prompt is the human's, and so
+        // is the next one.
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        hub.note_human_input(2);
+        let arrival = hub.human_input_seq();
+        hub.note_human_input(2);
+        hub.handle_hook_at("legacy-token", "UserPromptSubmit", prompt("typed"), arrival).unwrap();
+        assert_eq!(hub.agents.prov(2), None);
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        hub.handle_hook("legacy-token", "UserPromptSubmit", prompt("typed again")).unwrap();
+        assert_eq!(hub.agents.prov(2), None, "the later input still marks the next prompt");
+        // Consumed: a further plain prompt keeps its provenance.
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        hub.handle_hook("legacy-token", "UserPromptSubmit", prompt("no human input")).unwrap();
+        assert_eq!(hub.agents.prov(2), Some(scheduled));
+    }
+
+    #[test]
+    fn keystrokes_reach_the_terminal_while_a_callback_commit_holds_the_hub_lock() {
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-hot-path");
+        let hub = move_fixture();
+        let terminal = install_terminal(&hub, &service, 2, 42, &directory);
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+            port_base: 20000, pending: false, retired: false,
+            spec: SpawnSpec { run: terminal.run(), program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };
+        hub.terminal_records.lock().insert(2, record);
+        let cursor = crate::store::HookCursor { instance: "fixture".into(), sequence: 1 };
+        std::thread::scope(|scope| {
+            // A slow SQLite statement: the application database connection is busy.
+            let database = hub.store.hold_connection_for_test();
+            // A real callback reaches its checkpoint and waits for the database while it
+            // holds the hub lock (as hook processing does across its commit).
+            let callback = scope.spawn(|| hub.handle_spooled_hook("callback-token", "PreToolUse",
+                serde_json::json!({"tool_name": "Agent"}), &cursor));
+            wait_until("the callback to hold the hub lock", || hub.inner.is_locked());
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(hub.inner.is_locked() && !callback.is_finished(), "the callback is waiting on SQLite");
+            let started = std::time::Instant::now();
+            for key in 0..500u32 {
+                hub.note_human_input(2);
+                hub.send_keys(2, &[b'a' + (key % 26) as u8]).unwrap();
+            }
+            assert!(started.elapsed() < Duration::from_millis(100), "keystrokes waited: {:?}", started.elapsed());
+            wait_until("every keystroke at the host", || received.inputs.lock().len() == 500);
+            assert!(!callback.is_finished(), "they arrived while the commit was still blocked");
+            drop(database);
+            callback.join().unwrap().unwrap();
+        });
+        let typed: Vec<u8> = received.inputs.lock().iter().flat_map(|(_, data)| data.clone()).collect();
+        assert_eq!(typed, (0..500u32).map(|key| b'a' + (key % 26) as u8).collect::<Vec<_>>(), "in order, once each");
+        hub.flush_human_input().unwrap();
+        drop((terminal, hub, service));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn interrupted_input_pauses_the_session_and_its_queue_until_the_user_continues() {
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-interrupted");
+        let hub = fixture(Some(service.clone()));
+        let mut events = hub.subscribe();
+        let terminal = install_terminal(&hub, &service, 2, 42, &directory);
+        // As the input link does when a keystroke was lost or refused.
+        service.input().restore_interrupted(terminal.run(), "the terminal host connection was lost");
+        hub.on_input_interrupted(terminal.run());
+        assert!(hub.session(2).unwrap().input_interrupted);
+        assert!(hub.input_interrupted(2));
+        let mut seen = (false, false);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ServerEvent::SessionUpserted(info) if info.id == 2 && info.input_interrupted => seen.0 = true,
+                ServerEvent::Notice { text, .. } if text.contains("Continue typing") => seen.1 = true,
+                _ => {}
+            }
+        }
+        assert_eq!(seen, (true, true), "the session shows it and the user is told");
+        let saved: Vec<(RunId, String)> = hub.store.load_runtime(INPUT_INTERRUPTED_KEY).unwrap().unwrap();
+        assert_eq!(saved[0].0, terminal.run(), "kept across a backend restart");
+        // Every input path refuses: keystrokes, RPC/prompt input, and queued delivery waits.
+        let error = hub.send_keys(2, b"x").unwrap_err();
+        assert!(error.downcast_ref::<crate::terminal::InputInterrupted>().is_some(), "{error:#}");
+        assert!(hub.write_input(2, b"x").is_err());
+        assert!(hub.write_input_generation(2, Some(42), b"x").is_err());
+        hub.continue_input(2).unwrap();
+        assert!(!hub.session(2).unwrap().input_interrupted);
+        hub.send_keys(2, b"y").unwrap();
+        wait_until("input after continuing", || received.inputs.lock().len() == 1);
+        assert_eq!(received.inputs.lock()[0].1, b"y", "nothing refused earlier was resent");
+        let saved: Vec<(RunId, String)> = hub.store.load_runtime(INPUT_INTERRUPTED_KEY).unwrap().unwrap();
+        assert!(saved.is_empty());
+        drop((terminal, hub, service));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn shutdown_delivers_admitted_keystrokes_commits_their_markers_and_reports_refused_ones() {
+        use crate::agents::{Origin, Prov};
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-shutdown");
+        let hub = fixture(Some(service.clone()));
+        spawn_input_attribution(&hub).unwrap();
+        let terminal = install_terminal(&hub, &service, 2, 42, &directory);
+        let scheduled = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+        hub.agents.set_prov(2, Some(scheduled)).unwrap();
+        // A stalled host: the keystrokes are admitted but not yet delivered.
+        received.stall.store(true, Ordering::SeqCst);
+        for key in [b"a", b"b", b"c"] {
+            hub.note_human_input(2);
+            hub.send_keys(2, key).unwrap();
+        }
+        let stopping = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.shutdown().await })
+        };
+        while !hub.input_closed() { tokio::time::sleep(Duration::from_millis(5)).await }
+        // Typed while the backend stops: refused, and the run is marked interrupted.
+        hub.note_human_input(2);
+        assert!(hub.send_keys(2, b"late").is_err());
+        received.stall.store(false, Ordering::SeqCst);
+        stopping.await.unwrap();
+        let typed: Vec<Vec<u8>> = received.inputs.lock().iter().map(|(_, data)| data.clone()).collect();
+        assert_eq!(typed, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()], "admitted keystrokes all arrived");
+        assert!(hub.workers.lock().is_empty(), "the attribution worker was joined");
+        // The markers were committed: the human's next prompt callback lowers provenance.
+        let info = hub.session(2).unwrap();
+        hub.agents.on_hook(&hub.store, &info, "UserPromptSubmit", &serde_json::json!({"prompt": "typed"})).unwrap();
+        assert_eq!(hub.agents.prov(2), None);
+        // The refused keystroke paused the run, and the next backend will know.
+        let saved: Vec<(RunId, String)> = hub.store.load_runtime(INPUT_INTERRUPTED_KEY).unwrap().unwrap();
+        assert_eq!(saved.iter().map(|(run, _)| *run).collect::<Vec<_>>(), vec![terminal.run()]);
+        assert!(hub.session(2).unwrap().input_interrupted);
+        drop((terminal, hub, service));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -3728,7 +4285,8 @@ mod tests {
         inbox.enqueue("run-token", "PreToolUse", br#"{"tool_name":"Agent"}"#).unwrap();
         *hub.callback_inbox.lock() = Some(inbox);
         // Human input to another session establishes its boundary without waiting.
-        hub.note_human_input(2).unwrap();
+        hub.note_human_input(2);
+        hub.flush_human_input().unwrap();
         assert_eq!(hub.session(1).unwrap().subagents, 1, "the early callback was applied");
         drop(hub);
         std::fs::remove_dir_all(directory).unwrap();

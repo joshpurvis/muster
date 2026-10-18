@@ -284,6 +284,11 @@ pub struct SessionInfo {
     /// Runtime only: None after a daemon restart.
     #[serde(default)]
     pub size_owner: Option<String>,
+    /// Typing into the current run is paused: earlier input may not have reached it
+    /// (`terminal::InputInterrupted`). Cleared by `session.continue_input` or a new run.
+    /// Not a session column; the interrupted runs are saved separately.
+    #[serde(default)]
+    pub input_interrupted: bool,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).

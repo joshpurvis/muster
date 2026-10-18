@@ -17,7 +17,7 @@ use muster_terminal_core::{
     private_fs,
     pty::{self, PtySession, SpawnParams},
 };
-use muster_terminal_protocol::{
+use muster_terminal_protocol::{FenceLock, 
     Command, Hello, MAX_INPUT, Request, Response, RunId, SpawnSpec, TerminalEvent, TerminalStatus,
     VERSION,
     wire::{self, Frame},
@@ -323,7 +323,7 @@ impl Host {
                 Ok(Response::Ok)
             }
             Command::Shutdown => anyhow::bail!("shutdown must be acknowledged before stopping"),
-            Command::Attach { .. } | Command::Events => {
+            Command::Attach { .. } | Command::Events | Command::InputStream => {
                 anyhow::bail!("streaming command requires streaming connection")
             }
         }
@@ -476,38 +476,62 @@ impl Drop for Lock {
     }
 }
 
-/// Hold an advisory lock on `path` for the rest of this process's life, retrying while
-/// another process holds it. The application names the file; the host attaches no meaning
-/// to it. (Muster uses it to keep older, monolithic daemon builds from starting beside
-/// terminals this host owns.) The descriptor is close-on-exec, so children never inherit it.
-pub fn hold_fence_lock(path: PathBuf) {
-    let _ = std::thread::Builder::new().name("fence-lock".into()).spawn(move || {
-        let mut warned = false;
-        loop {
-            match Lock::acquire(&path) {
-                Ok(lock) => {
-                    std::mem::forget(lock);
-                    return;
-                }
-                Err(error) if !warned => {
-                    tracing::warn!("fence lock {} not held yet: {error:#}", path.display());
-                    warned = true;
-                }
-                Err(_) => {}
-            }
-            std::thread::sleep(Duration::from_secs(2));
+/// Startup refused because another process holds a lock the host needs.
+#[derive(Debug)]
+pub enum Busy {
+    /// Another terminal host owns this runtime directory (it may still be starting).
+    Host,
+    /// The fence lock is held by someone else (for Muster: an older, monolithic daemon).
+    Fence(PathBuf),
+}
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Busy::Host => write!(f, "another terminal host owns this runtime directory"),
+            Busy::Fence(path) => write!(f, "fence lock {} is held by another process", path.display()),
         }
-    });
+    }
+}
+impl std::error::Error for Busy {}
+
+/// Exit statuses for refused startup (see `Busy`).
+pub use muster_terminal_protocol::{EXIT_FENCE_BUSY, EXIT_HOST_BUSY};
+
+/// How long startup waits for a fence holder that may be exiting.
+const FENCE_WAIT: Duration = Duration::from_secs(2);
+
+/// Take the advisory lock on `path` for the rest of this process's life, waiting briefly
+/// for a holder that is shutting down. The application names the file; the host attaches no
+/// meaning to it. (Muster uses it to keep older, monolithic daemon builds from starting
+/// beside terminals this host owns.) The descriptor is close-on-exec, so children never
+/// inherit it. Taken before the host answers anyone, so every answering host holds it.
+fn take_fence(path: &Path) -> anyhow::Result<(Lock, FenceLock)> {
+    use std::os::unix::fs::MetadataExt;
+    let end = std::time::Instant::now() + FENCE_WAIT;
+    let lock = loop {
+        match Lock::acquire(path) {
+            Ok(lock) => break lock,
+            Err(_) if std::time::Instant::now() < end => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => return Err(Busy::Fence(path.to_owned()).into()),
+        }
+    };
+    let metadata = lock.0.metadata()?;
+    Ok((lock, FenceLock { path: path.to_owned(), dev: metadata.dev(), ino: metadata.ino() }))
 }
 
-pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
+pub async fn serve(runtime: PathBuf, data: PathBuf, fence: Option<PathBuf>) -> anyhow::Result<()> {
     private_fs::ensure_private_dir(&runtime)?;
     private_fs::ensure_private_dir(&data)?;
     let runtime = std::fs::canonicalize(runtime)?;
     let data = std::fs::canonicalize(data)?;
-    let _lock = Lock::acquire(&runtime.join("terminal.lock"))?;
+    let _lock = Lock::acquire(&runtime.join("terminal.lock")).map_err(|_| Busy::Host)?;
     // A different runtime directory must not allow a second host to reap these processes.
-    let _data_lock = Lock::acquire(&data.join("host.lock"))?;
+    let _data_lock = Lock::acquire(&data.join("host.lock")).map_err(|_| Busy::Host)?;
+    let fence = match fence {
+        Some(path) => Some(tokio::task::spawn_blocking(move || take_fence(&path)).await??),
+        None => None,
+    };
+    let (_fence_lock, fence) = fence.map_or((None, None), |(lock, fence)| (Some(lock), Some(fence)));
     let reap_data = data.clone();
     tokio::task::spawn_blocking(move || reap_previous_host(&reap_data)).await??;
     let socket = runtime.join("terminal.sock");
@@ -523,6 +547,7 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
         instance: format!("{:032x}", rand::random::<u128>()),
         pid: std::process::id(),
         data_dir: data,
+        fence,
     };
     let discovery = runtime.join("terminal.json");
     private_fs::write_private(&discovery, &serde_json::to_vec(&hello)?)?;
@@ -628,7 +653,7 @@ async fn connection(mut stream: UnixStream, host: Arc<Host>, streams: Arc<tokio:
     }
     // Classify the bounded first request before a stream can hold a slot.
     let _stream_permit = match request.command {
-        Command::Attach { .. } | Command::Events => match streams.try_acquire_owned() {
+        Command::Attach { .. } | Command::Events | Command::InputStream => match streams.try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => return send(&mut stream, Frame::json(&Response::Error {
                 code: "busy".into(),
@@ -732,6 +757,29 @@ async fn connection(mut stream: UnixStream, host: Arc<Host>, streams: Arc<tokio:
                 }
             }
         }
+        Command::InputStream => {
+            // Persistent input: no connect/accept/handshake per keystroke. Items are applied
+            // strictly in order; an idle connection is kept until the client closes it.
+            send(&mut stream, Frame::json(&Response::Attached)?).await?;
+            loop {
+                let frame = match wire::read_async(&mut stream).await {
+                    Ok(frame) => frame,
+                    Err(_) => return Ok(()), // EOF or a broken client ends the stream.
+                };
+                let response = match frame.decode::<Request>() {
+                    Ok(Request { command: command @ Command::Input { .. }, .. }) => {
+                        let host = host.clone();
+                        tokio::task::spawn_blocking(move || host.execute(command)).await?
+                    }
+                    Ok(_) => Err(anyhow::anyhow!("only input is accepted on an input stream")),
+                    Err(error) => Err(error),
+                };
+                match response {
+                    Ok(response) => send(&mut stream, Frame::json(&response)?).await?,
+                    Err(error) => send_error(&mut stream, error).await?,
+                }
+            }
+        }
         command => {
             let result = tokio::task::spawn_blocking(move || host.execute(command)).await?;
             match result {
@@ -758,20 +806,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fence_lock_is_held_for_the_host_lifetime() {
+    fn fence_is_taken_after_a_brief_wait_or_refused() {
         let directory = std::env::temp_dir().join(format!("muster-fence-{}", rand::random::<u64>()));
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("daemon.lock");
-        // Another holder first: the host waits for it, then takes the lock.
+        // A holder that is exiting: the host waits for it, then takes the lock.
         let earlier = Lock::acquire(&path).unwrap();
-        hold_fence_lock(path.clone());
-        std::thread::sleep(Duration::from_millis(100));
-        drop(earlier);
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while Lock::acquire(&path).is_ok() {
-            assert!(std::time::Instant::now() < deadline, "the host never took the fence lock");
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let releaser = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(300)); drop(earlier); });
+        let (held, fence) = take_fence(&path).unwrap();
+        releaser.join().unwrap();
+        assert!(Lock::acquire(&path).is_err(), "the host keeps the fence");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fence.ino, std::fs::metadata(&path).unwrap().ino());
+        // A holder that stays (a legacy daemon): refused, never waited on forever.
+        let started = std::time::Instant::now();
+        let Err(error) = take_fence(&path) else { panic!("a held fence was taken") };
+        assert!(matches!(error.downcast_ref::<Busy>(), Some(Busy::Fence(_))));
+        assert!(started.elapsed() < FENCE_WAIT + Duration::from_secs(1));
+        drop(held);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -789,6 +841,7 @@ mod tests {
                     instance: format!("{:032x}", rand::random::<u128>()),
                     pid: std::process::id(),
                     data_dir: data,
+                    fence: None,
                 },
                 bootstrap: None,
                 entries: Mutex::new(BTreeMap::new()),

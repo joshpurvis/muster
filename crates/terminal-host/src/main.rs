@@ -22,12 +22,11 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("muster_terminal_host=info")
         .init();
-    // Optional: an application-named file to keep locked while this host lives.
-    if let Some(path) = std::env::var_os("MUSTER_TERMINAL_FENCE_LOCK") {
-        // SAFETY: no other thread exists yet; children get explicit launch environments.
-        unsafe { std::env::remove_var("MUSTER_TERMINAL_FENCE_LOCK") };
-        muster_terminal_host::hold_fence_lock(PathBuf::from(path));
-    }
+    // Optional: an application-named file to keep locked while this host lives. It is
+    // taken before the host answers anyone, or the host exits with FENCE_BUSY.
+    let fence = std::env::var_os("MUSTER_TERMINAL_FENCE_LOCK").map(PathBuf::from);
+    // SAFETY: no other thread exists yet; children get explicit launch environments.
+    unsafe { std::env::remove_var("MUSTER_TERMINAL_FENCE_LOCK") };
     let mut args = std::env::args_os().skip(1);
     let (mut runtime, mut data) = (None, None);
     while let Some(arg) = args.next() {
@@ -39,9 +38,20 @@ fn main() -> anyhow::Result<()> {
     }
     let runtime = runtime.ok_or_else(|| anyhow::anyhow!("--runtime-dir is required"))?;
     let data = data.ok_or_else(|| anyhow::anyhow!("--data-dir is required"))?;
-    tokio::runtime::Builder::new_multi_thread()
+    let result = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?
-        .block_on(muster_terminal_host::serve(runtime, data))
+        .block_on(muster_terminal_host::serve(runtime, data, fence));
+    // Distinct statuses let the launching application tell why startup was refused.
+    match result.as_ref().err().and_then(|e| e.downcast_ref::<muster_terminal_host::Busy>()) {
+        Some(busy) => {
+            eprintln!("muster-terminal-host: {busy}");
+            std::process::exit(match busy {
+                muster_terminal_host::Busy::Host => muster_terminal_host::EXIT_HOST_BUSY,
+                muster_terminal_host::Busy::Fence(_) => muster_terminal_host::EXIT_FENCE_BUSY,
+            });
+        }
+        None => result,
+    }
 }

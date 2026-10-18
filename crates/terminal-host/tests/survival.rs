@@ -743,3 +743,65 @@ fn bootstrap_exits_when_its_owner_dies_while_the_journal_is_uncommitted() {
         "the target must never run after its owning process dies"
     );
 }
+
+#[test]
+fn input_stream_applies_every_keystroke_in_order_and_survives_rejections() {
+    let fixture = Fixture::new();
+    let received = fixture.root.join("received");
+    let status = fixture.spawn(fixture.spec(1, 1, &format!(
+        "stty raw -echo; head -c 600 > '{}'; printf 'INPUT-DONE\\n'; sleep 30", received.display())));
+    let mut stream = fixture.client.input_stream().unwrap();
+    let expected: Vec<u8> = (0..600).map(|i| b"abcdefghijklmnopqrstuvwxyz0123456789"[i % 36]).collect();
+    for (i, byte) in expected.iter().enumerate() {
+        Client::stream_input(&mut stream, &Command::Input { run: status.run, data: vec![*byte] }).unwrap();
+        if i == 300 {
+            // A rejected item is answered and leaves the stream usable.
+            let unknown = Command::Input { run: RunId { id: 99, generation: 1 }, data: b"x".to_vec() };
+            assert!(matches!(Client::stream_input(&mut stream, &unknown),
+                Err(muster_terminal_protocol::client::StreamError::Host(_))));
+            assert!(matches!(Client::stream_input(&mut stream, &Command::Flush),
+                Err(muster_terminal_protocol::client::StreamError::Host(_))));
+            // An idle stream stays open.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    until("all input applied", || fixture.text(status.run).contains("INPUT-DONE").then_some(()));
+    assert_eq!(std::fs::read(&received).unwrap(), expected, "every byte, once, in order");
+}
+
+#[test]
+fn host_answers_only_after_taking_its_fence_and_refuses_a_held_one() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let root = std::env::temp_dir().join(format!("muster-host-fence-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir_all(root.join("run")).unwrap();
+    let fence = root.join("run/daemon.lock");
+    let launch = || {
+        Process::new(env!("CARGO_BIN_EXE_muster-terminal-host"))
+            .args(["--runtime-dir", root.join("run").to_str().unwrap(), "--data-dir", root.join("data").to_str().unwrap()])
+            .env("MUSTER_RUNTIME_DIR", root.join("run")).env("MUSTER_DATA_DIR", root.join("data")).env("MUSTER_PORT", "0")
+            .env("MUSTER_TERMINAL_FENCE_LOCK", &fence)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+    };
+    // A legacy daemon holds the fence: the host never answers and exits with FENCE_BUSY.
+    let legacy = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&fence).unwrap();
+    assert_eq!(unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let mut refused = launch();
+    let status = until("refused host exits", || refused.try_wait().unwrap());
+    assert_eq!(status.code(), Some(muster_terminal_protocol::EXIT_FENCE_BUSY));
+    assert!(Client::connect(&root.join("run/terminal.sock")).is_err(), "a refused host never answered");
+    drop(legacy);
+    // With the fence free, the first answer already reports it held.
+    let mut child = launch();
+    let client = until("host startup", || Client::connect(&root.join("run/terminal.sock")).ok());
+    let reported = client.hello.fence.clone().expect("fence reported");
+    assert_eq!(reported.ino, std::fs::metadata(&fence).unwrap().ino());
+    let probe = std::fs::OpenOptions::new().write(true).open(&fence).unwrap();
+    assert_ne!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "the host holds it");
+    // A second host for the same runtime directory reports HOST_BUSY, not a fence problem.
+    let mut second = launch();
+    let status = until("second host exits", || second.try_wait().unwrap());
+    assert_eq!(status.code(), Some(muster_terminal_protocol::EXIT_HOST_BUSY));
+    stop_owned(&mut child);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -46,6 +46,14 @@ pub struct HookCursor {
     pub sequence: i64,
 }
 
+/// Hook-derived runtime facts, committed with the inbox cursor and session state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HookSession {
+    pub generation: u64,
+    pub subagents: u32,
+    pub last_hook_at: i64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: std::sync::Arc<Mutex<Connection>>,
@@ -711,7 +719,7 @@ impl Store {
         Ok(())
     }
 
-    /// Commit a hook's attribution, reply, resume ID and inbox checkpoint together.
+    /// Commit attribution, reply, resume ID, session state and inbox checkpoint together.
     /// A crash cannot leave a saved reply eligible for attribution to a later message.
     pub fn commit_hook(
         &self,
@@ -719,6 +727,7 @@ impl Store {
         reply: Option<(i64, &str)>,
         agent: Option<&crate::agents::Agent>,
         cursor: Option<&HookCursor>,
+        session: Option<(&SessionInfo, &HookSession)>,
     ) -> anyhow::Result<()> {
         let mut connection = self.conn.lock();
         let tx = connection.transaction()?;
@@ -736,8 +745,20 @@ impl Store {
             tx.execute("INSERT INTO runtime_state(key,record) VALUES ('hook-inbox-cursor',?1)
                 ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(cursor)?])?;
         }
+        if let Some((info, runtime)) = session {
+            tx.execute("UPDATE sessions SET state=?2, state_detail=?3, state_since=?4 WHERE id=?1",
+                params![info.id, info.state.as_str(), info.state_detail, info.state_since])?;
+            tx.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET record=excluded.record",
+                params![format!("hook-session:{}", info.id), serde_json::to_string(runtime)?])?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn load_hook_session(&self, id: SessionId, generation: u64) -> anyhow::Result<Option<HookSession>> {
+        Ok(self.load_runtime::<HookSession>(&format!("hook-session:{id}"))?
+            .filter(|saved| saved.generation == generation))
     }
 
     pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
@@ -1071,7 +1092,11 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: SessionId) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1089,6 +1114,7 @@ impl Store {
             )?;
         }
         transaction.execute("DELETE FROM sessions WHERE id=?1", [id])?;
+        transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
         transaction.execute("DELETE FROM events WHERE session_id=?1", [id])?;
         transaction.commit()?;
         Ok(())
@@ -1334,6 +1360,37 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_session_state_and_cursor_commit_or_roll_back_together() {
+        let store = Store::open_memory().unwrap();
+        let mut info = crate::mcp::guard::test_session(0, None);
+        info.state = AgentState::Idle;
+        info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
+        let cursor = HookCursor { instance: "fixture".into(), sequence: 4 };
+        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234 };
+        info.state = AgentState::Working;
+        info.state_detail = Some("Agent".into());
+        info.state_since = 1234;
+        store.conn.lock().execute_batch("CREATE TRIGGER refuse_hook_runtime BEFORE INSERT ON runtime_state
+            WHEN NEW.key LIKE 'hook-session:%' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        assert!(store.commit_hook(&serde_json::json!({}), None, None, Some(&cursor), Some((&info, &runtime))).is_err());
+        assert_eq!(store.load_sessions().unwrap()[0].info.state, AgentState::Idle);
+        assert!(store.load_runtime::<HookCursor>("hook-inbox-cursor").unwrap().is_none());
+        assert!(store.load_runtime::<serde_json::Value>("agent-attribution").unwrap().is_none());
+        assert!(store.load_hook_session(info.id, 42).unwrap().is_none());
+        store.conn.lock().execute_batch("DROP TRIGGER refuse_hook_runtime").unwrap();
+        store.commit_hook(&serde_json::json!({}), None, None, Some(&cursor), Some((&info, &runtime))).unwrap();
+        let saved = &store.load_sessions().unwrap()[0].info;
+        assert_eq!((saved.state, saved.state_since, saved.state_detail.as_deref()),
+            (AgentState::Working, 1234, Some("Agent")));
+        assert_eq!(store.load_runtime::<HookCursor>("hook-inbox-cursor").unwrap(), Some(cursor));
+        let saved = store.load_hook_session(info.id, 42).unwrap().unwrap();
+        assert_eq!((saved.subagents, saved.last_hook_at), (1, 1234));
+        assert!(store.load_hook_session(info.id, 43).unwrap().is_none());
+        store.retire_session(info.id, None).unwrap();
+        assert!(store.load_hook_session(info.id, 42).unwrap().is_none());
+    }
 
     #[test]
     fn terminal_generations_survive_record_cleanup_and_replacement() {

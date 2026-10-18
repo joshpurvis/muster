@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Backend/host fault tests. Only fixture-owned processes and private temp paths.
 Run: bash scripts/isolated.sh python3 scripts/backend-smoke.py
+Add --browser for rendered desktop reconnect/input checks (requires Chromium and web/dist).
 Requires cargo build --workspace first. No installed Muster executable is used.
 """
 from http.client import HTTPConnection
 import json
 import re
+import selectors
 import shutil
 from pathlib import Path
 import socket
@@ -42,6 +44,42 @@ logs = []
 token = None
 passed = 0
 detached_reload = False
+browser = None
+
+
+def browser_phase(phase=None):
+    if browser is None:
+        return None
+    if phase is not None:
+        browser.stdin.write(json.dumps({"phase": phase}) + "\n")
+        browser.stdin.flush()
+    with selectors.DefaultSelector() as selector:
+        selector.register(browser.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=35), f"browser phase timed out: {phase}; inspect {BASE / 'browser.log'}"
+    line = browser.stdout.readline()
+    assert line, f"browser exited during {phase}; inspect {BASE / 'browser.log'}"
+    result = json.loads(line)
+    assert result["phase"] == (phase or "ready"), result
+    return result
+
+
+def close_browser():
+    global browser
+    if browser is not None:
+        if browser.poll() is None and not browser.stdin.closed:
+            browser.stdin.write('{"phase":"close"}\n')
+            browser.stdin.flush()
+        # EOF also releases the driver's stream read, which can otherwise keep
+        # Deno alive after Chromium itself has already exited.
+        if not browser.stdin.closed:
+            browser.stdin.close()
+        try:
+            browser.wait(timeout=35)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"browser cleanup timed out; inspect {BASE / 'browser.log'}") from None
+        browser.stdout.close()
+        assert browser.returncode == 0, f"browser recovery failed; inspect {BASE / 'browser.log'}"
+        browser = None
 
 
 def check(condition, message):
@@ -183,8 +221,21 @@ try:
         return response["result"]
     for _ in range(30):
         assert not mcp_post().get("isError", False)
+    if "--browser" in sys.argv:
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            browser_port = reserve.getsockname()[1]
+        browser_log = open(BASE / "browser.log", "w")
+        logs.append(browser_log)
+        browser = subprocess.Popen([shutil.which("deno"), "run", "--allow-net=127.0.0.1",
+            "--allow-run=chromium", f"--allow-write={BASE / 'shots'}",
+            str(PROJECT / "web/dev/recovery.ts"), f"http://127.0.0.1:{PORT}/#token={token}",
+            str(sid), str(BASE), str(browser_port)], env=ENV | {"DENO_DIR": str(BASE / "deno")},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=browser_log, text=True)
+        browser_phase()
     rpc("session.input", {"id": sid, "data": "for i in $(seq 1 80); do printf 'COUNT:%s\\n' \"$i\"; sleep 0.1; done\r"})
     until("ticker started", lambda: "COUNT:2" in output(sid))
+    browser_phase("before")
     stop_backend(hard=True)
     time.sleep(0.6)
     inventory = host_call("inventory")
@@ -198,6 +249,10 @@ try:
     check("COUNT:5" in output(sid), "output produced during backend downtime is available")
     check(json.loads((RUNTIME / "terminal.json").read_text())["instance"] == host_instance,
           "backend restart retains the same terminal host")
+    if browser is not None:
+        check(browser_phase("after")["pid"] == pid,
+              "rendered UI reconnects, replays downtime output and accepts keyboard input with the same PID")
+        close_browser()
     with sqlite3.connect(DATA / "muster.db") as database:
         record = json.loads(database.execute("SELECT record FROM terminal_runs WHERE session_id=?", (sid,)).fetchone()[0])
     check(http("/hook/Stop", {"hook_event_name": "Stop"}, record["token"])[0] == 200,
@@ -211,6 +266,9 @@ try:
                               env=hook_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
     check(callback.returncode == 0 and not callback.stdout and not callback.stderr,
           "hook helper durably accepts a callback while the backend is absent")
+    callback = subprocess.run([str(BIN), "hook", "shell", "PreToolUse", '{"tool_name":"Agent"}'],
+                              env=hook_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+    assert callback.returncode == 0, callback.stderr
     with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:
         saved_callback = database.execute("SELECT id,token,event,payload FROM hooks ORDER BY id DESC LIMIT 1").fetchone()
     assert saved_callback is not None
@@ -219,12 +277,14 @@ try:
             return database.execute("SELECT COUNT(*) FROM events WHERE kind='hook' AND json_extract(data,'$.event')='SmokeDurableCallback'").fetchone()[0]
     start_backend()
     check(callback_count() == 1, "replacement backend drains the durable callback before serving clients")
+    check(session(sid)["subagents"] == 1, "replacement backend restores a queued subagent-start callback")
     # Simulate an acknowledgement lost after application commit: restore the same inbox row.
     stop_backend(hard=True)
     with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:
         database.execute("INSERT INTO hooks(id,token,event,payload) VALUES (?,?,?,?)", saved_callback)
     start_backend()
     check(callback_count() == 1, "a callback with a committed checkpoint is not applied twice")
+    check(session(sid)["subagents"] == 1, "subagent count survives backend replacement without duplicate increments")
     dying = rpc("session.spawn", {"channel_id": channel["id"], "kind": "shell"})
     rpc("session.input", {"id": dying["id"], "data": "sleep 0.4; exit 7\r"})
     stop_backend(hard=True)
@@ -234,6 +294,7 @@ try:
           "exit during backend outage is reconciled with its actual status")
     restarted = rpc("session.restart", {"id": sid})
     check(restarted["pid"] != pid and restarted["state"] != "exited", "explicit session restart creates one new process")
+    check(restarted["subagents"] == 0, "a new terminal generation discards the previous run's subagent count")
     callback = subprocess.run([str(BIN), "hook", "shell", "SmokeDurableCallback", '{}'], env=hook_env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
     assert callback.returncode == 0
@@ -426,6 +487,10 @@ try:
     check(not (RUNTIME / "terminal.sock").exists(), "full stop terminates the terminal host")
     print(f"Passed {passed} backend survival checks.", flush=True)
 finally:
+    try:
+        close_browser()
+    except Exception as error:
+        print(f"Browser fixture cleanup needs inspection at {BASE}: {error}", flush=True)
     stop_backend()
     if detached_reload and (RUNTIME / "daemon.json").exists():
         subprocess.run([str(BIN), "stop"], env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=True)

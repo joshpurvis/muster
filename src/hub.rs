@@ -411,6 +411,10 @@ impl Hub {
                 info.pid = None;
                 info.queued = 0;
             }
+            let hook = store.load_hook_session(info.id, generation)?
+                .filter(|_| info.state != AgentState::Exited);
+            info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
+            let last_hook_at = hook.map_or(0, |saved| saved.last_hook_at);
             store.update_session(&info)?;
             if let Some(token) = &token { inner.tokens.insert(token.clone(), info.id); }
             let usable_title = info.title.as_deref().and_then(|t| clean_title(t, info.kind));
@@ -423,7 +427,7 @@ impl Hub {
                     pty,
                     generation,
                     early_exit: None,
-                    last_hook_at: 0,
+                    last_hook_at,
                     last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
@@ -2331,6 +2335,7 @@ impl Hub {
             e.info.state_since = now_ms();
             e.info.exit_code = None;
             e.info.queued = 0;
+            e.info.subagents = 0;
             e.info.title = pty.title();
             let early = e.early_exit.take().or_else(|| pty.exit_code());
             let kill = std::mem::take(&mut e.kill_requested);
@@ -2803,12 +2808,14 @@ impl Hub {
         // its final reply. Accept only the recorded current run, never a previous generation.
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
             .find(|(_, record)| !record.retired && record.token == token)
-            .map(|(id, record)| (*id, record.spec.run.generation)));
-        let (info, generation, fx) = {
-            let g = self.inner.lock();
-            let entry = if cursor.is_some() {
-                recorded.and_then(|(id, generation)| g.sessions.get(&id).filter(|entry| entry.generation == generation))
-            } else { g.tokens.get(token).and_then(|id| g.sessions.get(id)) };
+            .map(|(id, record)| (*id, record.spec.run.generation, record.pending)));
+        let (info, from, changed, fx) = {
+            let mut g = self.inner.lock();
+            let id = if cursor.is_some() {
+                recorded.filter(|(id, generation, _)| g.sessions.get(id).is_some_and(|entry| entry.generation == *generation))
+                    .map(|(id, _, _)| id)
+            } else { g.tokens.get(token).copied() };
+            let entry = id.and_then(|id| g.sessions.get_mut(&id));
             let Some(entry) = entry else {
                 if let Some(cursor) = cursor {
                     // Removed/restarted sessions cannot receive old callbacks. Advance
@@ -2818,42 +2825,57 @@ impl Hub {
                 }
                 anyhow::bail!("unknown session token");
             };
-            let info = entry.info.clone();
-            let fx = self.agents.on_hook_checkpoint(&self.store, &info, event, &payload, cursor)?;
-            (info, entry.generation, fx)
+            // A target can enqueue hooks before its spawn acknowledgement returns.
+            // Keep them in the inbox until start_process has installed its initial
+            // state, otherwise that initialization could overwrite a consumed hook.
+            anyhow::ensure!(!recorded.is_some_and(|(_, _, pending)| pending),
+                "terminal launch is still being acknowledged; callback retained");
+            let mut info = entry.info.clone();
+            let from = info.state;
+            let mut last_hook_at = entry.last_hook_at;
+            let now = now_ms();
+            if info.state != AgentState::Exited {
+                if let Some(update) = adapter_for(info.kind).on_hook(event, &payload) {
+                    last_hook_at = now;
+                    if info.state != update.state || info.state_detail != update.detail {
+                        info.state_seq = self.state_seq.next()?;
+                        if info.state != update.state { info.state_since = now; }
+                        info.state = update.state;
+                        info.state_detail = update.detail;
+                    }
+                }
+                if let Some(delta) = subagent_delta(event, &payload) {
+                    info.subagents = delta.map_or(0, |d| info.subagents.saturating_add_signed(d));
+                }
+            } else {
+                info.subagents = 0;
+            }
+            let runtime = crate::store::HookSession { generation: entry.generation,
+                subagents: info.subagents, last_hook_at };
+            // State/count/grace and reply attribution all commit with the cursor.
+            // A crash before publishing memory can recover state and attribution.
+            let fx = self.agents.on_hook_session_checkpoint(&self.store, &entry.info, event, &payload,
+                cursor, Some((&info, &runtime)))?;
+            if fx.duplicate { return Ok(()) }
+            let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents;
+            entry.info = info.clone();
+            entry.last_hook_at = last_hook_at;
+            (info, from, changed, fx)
         };
-        if fx.duplicate { return Ok(()) }
         let id = info.id;
         if let Some(m) = fx.replied { crate::agents::publish_message(self, m); }
         if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
         self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
             serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));
-        if let Some(update) = adapter_for(info.kind).on_hook(event, &payload) {
-            self.set_state_checked(id, update, StateSource::Hook, Some(generation));
+        if from != info.state {
+            self.log_event(Some(info.channel_id), Some(id), EventKind::StateChange,
+                serde_json::json!({"session_id": id, "from": from, "to": info.state,
+                    "detail": info.state_detail, "source": StateSource::Hook}));
         }
-        if let Some(delta) = subagent_delta(event, &payload) {
-            self.adjust_subagents_checked(id, delta, Some(generation));
+        if changed {
+            self.emit(ServerEvent::SessionUpserted(info));
         }
         Ok(())
-    }
-
-    /// Change the running-subagent count (runtime only; emits on change). `None`: reset to 0.
-    fn adjust_subagents_checked(&self, id: SessionId, delta: Option<i32>, generation: Option<u64>) {
-        let info = {
-            let mut g = self.inner.lock();
-            let Some(e) = g.sessions.get_mut(&id) else { return };
-            if generation.is_some_and(|generation| e.generation != generation) { return }
-            let next = match delta {
-                Some(d) => (e.info.subagents as i64 + d as i64).max(0) as u32,
-                None => 0,
-            };
-            if next == e.info.subagents {
-                return;
-            }
-            e.info.subagents = next;
-            e.info.clone()
-        };
-        self.emit(ServerEvent::SessionUpserted(info));
     }
 
     // ----- daemon lifecycle -----
@@ -3345,6 +3367,44 @@ mod tests {
         assert!(hub.session(1).is_none());
         assert!(hub.store.load_sessions().unwrap().iter().all(|s| s.info.id != 1));
         assert!(hub.store.load_terminals().unwrap()[&1].retired);
+    }
+
+    #[test]
+    fn hook_count_state_and_grace_are_checkpointed_without_duplicate_effects() {
+        let hub = move_fixture();
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+            port_base: 20000, pending: false, retired: false,
+            spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::new(), cwd: "/".into(), cols: 80, rows: 24 } };
+        hub.terminal_records.lock().insert(2, record);
+        {
+            let mut g = hub.inner.lock();
+            let entry = g.sessions.get_mut(&2).unwrap();
+            entry.generation = 42;
+            entry.info.state = AgentState::Idle;
+        }
+        let mut cursor = crate::store::HookCursor { instance: "fixture".into(), sequence: 1 };
+        let payload = serde_json::json!({"tool_name":"Agent"});
+        hub.terminal_records.lock().get_mut(&2).unwrap().pending = true;
+        assert!(hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor).is_err());
+        assert!(hub.store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor").unwrap().is_none());
+        assert_eq!(hub.session(2).unwrap().subagents, 0);
+        hub.terminal_records.lock().get_mut(&2).unwrap().pending = false;
+        hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor).unwrap();
+        let info = hub.session(2).unwrap();
+        assert_eq!((info.state, info.subagents), (AgentState::Working, 1));
+        let checkpoint = hub.store.load_hook_session(2, 42).unwrap().unwrap();
+        assert_eq!(checkpoint.subagents, 1);
+        assert!(checkpoint.last_hook_at > 0);
+        assert_eq!(hub.inner.lock().sessions[&2].last_hook_at, checkpoint.last_hook_at);
+        assert_eq!(hub.store.load_sessions().unwrap()[1].info.state, AgentState::Working);
+        hub.handle_spooled_hook("callback-token", "PreToolUse", payload, &cursor).unwrap();
+        assert_eq!(hub.session(2).unwrap().subagents, 1);
+        assert_eq!(hub.session(2).unwrap().state_seq, info.state_seq);
+        cursor.sequence += 1;
+        hub.handle_spooled_hook("callback-token", "Stop", serde_json::json!({}), &cursor).unwrap();
+        assert_eq!(hub.session(2).unwrap().subagents, 0);
+        assert_eq!(hub.store.load_hook_session(2, 42).unwrap().unwrap().subagents, 0);
     }
 
     #[test]

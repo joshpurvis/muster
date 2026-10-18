@@ -272,11 +272,14 @@ directory never moves.
 
 ## Subagents
 
-`SessionInfo.subagents` (runtime only, 0 after a restart) counts the built-in subagents a
+`SessionInfo.subagents` counts the built-in subagents a
 Claude session is running right now (its Agent/Task tool): +1 on the tool's `PreToolUse`, -1
 on its `PostToolUse`/`PostToolUseFailure`, reset to 0 on `SessionStart`, `SessionEnd`, `Stop`, `StopFailure` (a turn's end) and when the process exits, so a missed hook can't leave it stuck. Background
 subagents return at launch, so only foreground ones are counted. Changes emit
-`session_upserted`.
+`session_upserted`. The count survives application-backend replacement for the same
+terminal generation and resets on an explicit terminal restart. Hook-derived state,
+count, grace timestamp and reply attribution commit with the inbox cursor, so a
+callback recovered after a lost acknowledgement cannot increment the count twice.
 
 ## Groups layout (v2)
 

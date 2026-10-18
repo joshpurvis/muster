@@ -251,3 +251,44 @@ Validation: all 253 Rust tests pass, including application database reopen with 
 preserved stuck timer, a fresh timer for a replacement generation, and refusal of
 an old generation's detector verdict. Subagent/hook state recovery and final UI
 recovery verification remain open.
+
+### Hook session recovery checkpoint
+
+Hook-derived session state, subagent counts and the hook-precedence timestamp now
+commit in the same transaction as attribution and the inbox cursor. Memory is
+published only after that commit. Startup restores the count and grace timestamp
+for the surviving generation; new or exited runs begin with zero subagents.
+Callbacks arriving before a launch acknowledgement remain queued until initial
+session state is installed. Removal deletes the saved hook runtime with the session.
+
+Validation: all 255 Rust tests, all 154 full smoke checks and all 43 focused backend
+checks pass. The tests include transaction rollback, duplicate count prevention,
+callback deferral during launch, real backend replacement with a running subagent,
+and an explicit terminal restart clearing the old count. All 82 frontend tests pass.
+
+The optional `scripts/backend-smoke.py --browser` mode uses a fresh Chromium profile
+and captures screenshots under its private fixture directory. Its rendered desktop
+check confirms that an open page reconnects after backend SIGKILL, replays captured
+output, and accepts keyboard input into the original terminal PID. The screenshots
+have been inspected and all 44 checks in the browser-enabled suite passed. Mobile
+recovery and the final requirement audit remain open.
+
+## Completion audit (in progress)
+
+The scope is independent terminal lifetime during application/UI iteration. Host
+replacement, machine reboot and migration of legacy daemon-owned PTYs are not
+promised to preserve open terminals. The proxy transport may pause interaction
+while the application reconnects; the host keeps processes and output capture alive.
+
+| Requirement | Current evidence | Status |
+| --- | --- | --- |
+| Small host independent of application policy | Host/core/protocol Cargo manifests contain no application, database, agent or MCP dependency. Generic PTY ownership lives in the host/core crates. | Implemented; dependency boundary inspected |
+| Backend crash/reload preserves terminal identity and output | Host survival tests; backend smoke checks for SIGKILL, SIGTERM, reload, delayed spawn acknowledgement and output during downtime. | Verified |
+| Reconnect cannot accidentally duplicate or kill a run | Instance/protocol checks, monotonic generations, retry-safe Spawn, durable retirement and delayed-ack fault proxy cases. | Verified |
+| Prompt and agent recovery is explicit and safe | Durable waiting/uncertain queues, generation-bound input, atomic hook attribution/state/count/cursor, MCP reservations and detector progress checkpoints. | Rust and process checks pass; final cross-feature review remains |
+| Upper-layer executable updates preserve helper availability | Immutable copied executable releases and stable command link; fixture deletes its original build before hook/reload checks. | Verified |
+| UI releases activate independently | Staged compatible releases, pinned asset URLs and retained old bundles; fixture verifies unchanged backend/terminal PIDs during UI installation. Complete staged assets are checked before publication. | Verified with asset and process tests |
+| Actual UI reconnects to the surviving terminal | Desktop Chromium test verifies rendered replay and post-reconnect keyboard input; screenshots inspected. | Desktop verified; mobile browser check remains |
+| Host behaves correctly without clients | Query replies, periodic log flush, flood bounds, exited-run archival and background descendant tests. | Verified |
+| Work remains isolated from the live instance | Separate `/tmp/muster-terminal-host` worktree; explicit private runtime/data/port on all fixtures; original checkout remains at `9e67a6d`. No installation or migration performed. | Verified development boundary |
+| Reviewable delivery and rollout guidance | Committed branch, README build/reload/UI commands, private protocol specification and this design/checkpoint document. | Final clean-tree and requirement review remain |

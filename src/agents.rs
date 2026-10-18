@@ -942,6 +942,12 @@ impl Registry {
 
     pub(crate) fn on_hook_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
         payload: &Value, cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<HookEffects> {
+        self.on_hook_session_checkpoint(store, info, event, payload, cursor, None)
+    }
+
+    pub(crate) fn on_hook_session_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
+        payload: &Value, cursor: Option<&crate::store::HookCursor>,
+        session: Option<(&SessionInfo, &crate::store::HookSession)>) -> anyhow::Result<HookEffects> {
         let mut g = self.inner.lock();
         if let Some(cursor) = cursor {
             if store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor")?
@@ -987,8 +993,8 @@ impl Registry {
             }
         }
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
-        if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() {
-            store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor)?;
+        if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some() {
+            store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
         }

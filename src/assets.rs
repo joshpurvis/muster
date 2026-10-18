@@ -76,12 +76,8 @@ impl Source {
     }
 }
 
-/// Stage a complete release before one atomic switch. Existing releases remain available
-/// for explicit rollback, and no running application or host process is signalled.
-pub fn install(source: &Path, data: &Path) -> anyhow::Result<PathBuf> {
-    let Source::Directory(source) = Source::directory(source)? else {
-        unreachable!()
-    };
+fn validate_complete_release(source: &Path) -> anyhow::Result<()> {
+    Source::directory(source)?;
     for required in ["index.html", "app.js", "app.css"] {
         anyhow::ensure!(
             source.join(required).is_file(),
@@ -96,6 +92,16 @@ pub fn install(source: &Path, data: &Path) -> anyhow::Result<PathBuf> {
             );
         }
     }
+    Ok(())
+}
+
+/// Stage a complete release before one atomic switch. Existing releases remain available
+/// for explicit rollback, and no running application or host process is signalled.
+pub fn install(source: &Path, data: &Path) -> anyhow::Result<PathBuf> {
+    let Source::Directory(source) = Source::directory(source)? else {
+        unreachable!()
+    };
+    validate_complete_release(&source)?;
     let ui = data.join("ui");
     let releases = ui.join("releases");
     crate::paths::ensure_private_dir(&releases)?;
@@ -112,7 +118,9 @@ pub fn install(source: &Path, data: &Path) -> anyhow::Result<PathBuf> {
     let link = ui.join(format!("next-{name}"));
     let result = (|| {
         copy_release(&source, &staged, 0)?;
-        Source::directory(&staged)?;
+        // A development rebuild may remove source assets while copying. Validate
+        // the complete staged tree before publishing it, not just the source tree.
+        validate_complete_release(&staged)?;
         // Pin JS/CSS requests to this release, even if another update happens between
         // fetching HTML and fetching its assets. Keep the old release for open windows.
         for (html, prefix) in [

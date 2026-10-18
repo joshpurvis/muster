@@ -88,5 +88,12 @@ process ownership separately from the application database. Only host startup
 reaps verified leftovers of a previous host instance. Restarting a backend must
 instead reconnect and reconcile inventory.
 
+Launch first writes an ownership intent without a PID. The PTY child starts in an
+early exec mode of the host binary and waits for that journal to name its exact PID
+and markers. Only then does it exec the requested target, preserving its PID and
+terminal. Before publication, owner death or journal removal makes the bootstrap
+exit without running the target; after publication, host restart can identify the
+process from the journal. This closes the spawn-before-ownership-record window.
+
 Open PTYs are not recovered after host crash. The application must distinguish a
 new host instance from a surviving one. Previous output files remain on disk.

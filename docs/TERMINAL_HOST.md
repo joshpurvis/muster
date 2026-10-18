@@ -222,3 +222,18 @@ Validation: all 247 Rust tests, all 154 full smoke checks, and all 40 focused su
 checks pass. New unit tests cover reply association across the input boundary,
 provenance retention, stale-generation refusal, backlog deferral and concurrent inbox
 writes. This coordination remains entirely in the application layer.
+
+### Launch ownership checkpoint
+
+The host writes an ownership intent before spawning its early exec mode. That child
+waits until the host publishes its exact PID and markers, then executes the requested
+program with the same PID and PTY. If the parent exits before publication, the child
+exits without running the target. This closes the spawn-before-journal crash window.
+New launches reject missing executables or working directories; retries of existing
+runs remain valid even after their original launch files have disappeared.
+
+Validation: all 250 Rust tests passed, followed by all 16 host tests after adding
+the deleted-launch-files retry regression. All 154 full application smoke checks
+and all 40 focused backend survival checks passed. Process tests cover parent death
+before ownership publication, PID preservation, vanished cwd, and host replacement.
+Detector/subagent recovery and final UI recovery verification remain under review.

@@ -1,5 +1,8 @@
 //! A private local service for generic terminal operations only.
 mod archive;
+mod ownership;
+use ownership::OwnedProcess;
+pub use ownership::launch_owned_child;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -55,6 +58,9 @@ struct Attachment {
 
 struct Host {
     hello: Hello,
+    // Production uses the host's own early exec mode. Core resource unit fixtures
+    // can spawn directly; process-boundary tests exercise this guard end to end.
+    bootstrap: Option<PathBuf>,
     entries: Mutex<BTreeMap<RunId, Entry>>,
     // One generation watermark per session, rather than one tombstone per restart.
     forgotten: Mutex<BTreeMap<u32, u64>>,
@@ -143,6 +149,13 @@ impl Host {
                 );
             }
         }
+        // Existing runs remain retryable even if their original cwd or executable
+        // has since disappeared. Validate filesystem inputs only for a new launch.
+        anyhow::ensure!(
+            spec.cwd.is_dir(),
+            "launch cwd must be an existing directory"
+        );
+        ownership::check_program(&spec)?;
         let log_dir = self.run_dir(spec.run);
         private_fs::ensure_private_dir(&log_dir)?;
         let mut env = spec.env.clone();
@@ -155,13 +168,34 @@ impl Host {
             ),
         );
         env.insert("MUSTER_SESSION_ID".into(), spec.run.id.to_string());
+        let mut owned = OwnedProcess {
+            run: spec.run,
+            pid: None,
+            markers: pty::run_markers(&env),
+        };
+        let journal = log_dir.join("owner.json");
+        private_fs::write_private(&journal, &serde_json::to_vec(&owned)?)?;
+        let (program, args) = match &self.bootstrap {
+            Some(bootstrap) => {
+                let mut args = vec![
+                    "--owned-child".into(),
+                    self.hello.pid.to_string(),
+                    journal.to_string_lossy().into_owned(),
+                    spec.cwd.to_string_lossy().into_owned(),
+                    spec.program.clone(),
+                ];
+                args.extend(spec.args.clone());
+                (bootstrap.to_string_lossy().into_owned(), args)
+            }
+            None => (spec.program.clone(), spec.args.clone()),
+        };
         let events = self.events.clone();
         let pty = pty::spawn(
             SpawnParams {
                 id: spec.run.id,
                 generation: spec.run.generation,
-                program: spec.program.clone(),
-                args: spec.args.clone(),
+                program,
+                args,
                 env,
                 clear_env: true,
                 env_remove: vec![],
@@ -176,14 +210,8 @@ impl Host {
         )?;
         // Save process ownership before acknowledging spawn. The journal contains only
         // host-owned process markers, not the launch environment or application tokens.
-        let owned = OwnedProcess {
-            run: spec.run,
-            pid: pty.pid,
-            markers: pty.markers().to_vec(),
-        };
-        if let Err(error) =
-            private_fs::write_private(&log_dir.join("owner.json"), &serde_json::to_vec(&owned)?)
-        {
+        owned.pid = pty.pid;
+        if let Err(error) = private_fs::write_private(&journal, &serde_json::to_vec(&owned)?) {
             pty.kill_now();
             return Err(error.into());
         }
@@ -394,13 +422,6 @@ impl Host {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct OwnedProcess {
-    run: RunId,
-    pid: Option<u32>,
-    markers: Vec<String>,
-}
-
 // Runs only when the host itself restarts, never when an application reconnects.
 fn reap_previous_host(data: &Path) -> anyhow::Result<()> {
     let runs = data.join("runs");
@@ -484,6 +505,7 @@ pub async fn serve(runtime: PathBuf, data: PathBuf) -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(4096);
     let host = Arc::new(Host {
         hello,
+        bootstrap: Some(std::env::current_exe()?),
         entries: Mutex::new(BTreeMap::new()),
         forgotten: Mutex::new(BTreeMap::new()),
         lifecycle: Mutex::new(()),
@@ -707,6 +729,7 @@ mod tests {
                     pid: std::process::id(),
                     data_dir: data,
                 },
+                bootstrap: None,
                 entries: Mutex::new(BTreeMap::new()),
                 forgotten: Mutex::new(BTreeMap::new()),
                 lifecycle: Mutex::new(()),
@@ -771,6 +794,47 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_targets_are_rejected_before_preparing_an_owned_launch() {
+        let fixture = Fixture::new();
+        let mut spec = fixture.spec(1);
+        spec.program = fixture
+            .0
+            .hello
+            .data_dir
+            .join("missing-program")
+            .to_string_lossy()
+            .into_owned();
+        assert!(fixture.0.spawn(spec.clone()).is_err());
+        assert!(!fixture.0.run_dir(spec.run).exists());
+        spec.program = "/bin/sh".into();
+        spec.cwd = fixture.0.hello.data_dir.join("missing-cwd");
+        assert!(fixture.0.spawn(spec).is_err());
+        assert!(fixture.0.entries.lock().is_empty());
+    }
+
+    #[test]
+    fn spawn_retry_survives_deleted_launch_files() {
+        let fixture = Fixture::new();
+        let mut spec = fixture.spec(1);
+        spec.cwd = fixture.0.hello.data_dir.join("disposable-cwd");
+        std::fs::create_dir(&spec.cwd).unwrap();
+        let program = spec.cwd.join("shell");
+        std::fs::copy("/bin/sh", &program).unwrap();
+        spec.program = program.to_string_lossy().into_owned();
+        spec.args = vec!["-c".into(), "exit 0".into()];
+        let Response::Status(first) = fixture.0.spawn(spec.clone()).unwrap() else {
+            panic!("spawn did not return status");
+        };
+        until(|| fixture.0.status(spec.run).unwrap().drained);
+        std::fs::remove_dir_all(&spec.cwd).unwrap();
+        let Response::Status(retry) = fixture.0.spawn(spec).unwrap() else {
+            panic!("retry did not return status");
+        };
+        assert_eq!(first.pid, retry.pid);
+        assert_eq!(first.run, retry.run);
     }
 
     #[test]

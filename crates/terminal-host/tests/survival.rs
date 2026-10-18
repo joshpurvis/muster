@@ -547,9 +547,16 @@ fn output_is_bounded_and_replay_survives_a_flood_without_subscribers() {
 #[test]
 fn host_crash_is_distinct_from_client_loss_and_rejects_stale_clients() {
     let mut fixture = Fixture::new();
-    let first = fixture.spawn(fixture.spec(1, 1, "trap '' HUP; while :; do sleep 1; done"));
+    let first = fixture.spawn(fixture.spec(
+        1,
+        1,
+        "trap '' HUP; printf 'target-ready\\n'; while :; do sleep 1; done",
+    ));
     until("process ready", || {
-        fixture.status(first.run).alive.then_some(())
+        fixture
+            .text(first.run)
+            .contains("target-ready")
+            .then_some(())
     });
     fixture.child.kill().unwrap();
     fixture.child.wait().unwrap();
@@ -567,6 +574,172 @@ fn host_crash_is_distinct_from_client_loss_and_rejects_stale_clients() {
     assert!(
         matches!(replacement.call(Command::Inventory).unwrap(), Response::Inventory(runs) if runs.is_empty())
     );
+    let old_marker = format!("MUSTER_RUN={}-1-1", fixture.client.hello.instance);
+    let old_environment =
+        std::fs::read(format!("/proc/{}/environ", first.pid.unwrap())).unwrap_or_default();
+    assert!(
+        !old_environment
+            .split(|byte| *byte == 0)
+            .any(|value| value == old_marker.as_bytes()),
+        "the old marked process must be gone before the replacement host serves"
+    );
     // Reaping belongs to host restart; a fresh controller in the first test preserves this same process.
     fixture.client = replacement;
+}
+
+#[test]
+fn bootstrap_waits_for_owned_pid_and_never_executes_for_a_dead_parent() {
+    for (publish, vanished_cwd) in [(true, false), (false, false), (true, true)] {
+        let root = std::env::temp_dir().join(format!(
+            "muster-bootstrap-test-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let cwd = root.join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let journal = root.join("owner.json");
+        let result = root.join("target-pid");
+        let marker = format!("bootstrap-{:032x}", rand::random::<u128>());
+        let mut owner = serde_json::json!({"run":{"id":9,"generation":1},"pid":null,
+            "markers":[format!("MUSTER_RUN={marker}"),"MUSTER_SESSION_ID=9"]});
+        muster_terminal_core::private_fs::write_private(
+            &journal,
+            &serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        let child = Process::new(env!("CARGO_BIN_EXE_muster-terminal-host"))
+            .arg("--owned-child")
+            .arg(if publish { std::process::id() } else { 0 }.to_string())
+            .arg(&journal)
+            .arg(&cwd)
+            .args(["/bin/sh", "-c", "printf '%s' \"$$\" > \"$1\"", "fixture"])
+            .arg(&result)
+            .env_clear()
+            .env("MUSTER_RUNTIME_DIR", root.join("run"))
+            .env("MUSTER_DATA_DIR", root.join("data"))
+            .env("MUSTER_PORT", "0")
+            .env("MUSTER_RUN", &marker)
+            .env("MUSTER_SESSION_ID", "9")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = Starting {
+            child: Some(child),
+            root,
+        };
+        let child = guard.child.as_mut().unwrap();
+        if publish {
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                child.try_wait().unwrap().is_none() && !result.exists(),
+                "target ran before ownership was committed"
+            );
+            owner["pid"] = child.id().into();
+            if vanished_cwd {
+                std::fs::remove_dir(&cwd).unwrap();
+            }
+            muster_terminal_core::private_fs::write_private(
+                &journal,
+                &serde_json::to_vec(&owner).unwrap(),
+            )
+            .unwrap();
+            let status = until("owned target exits", || child.try_wait().unwrap());
+            if vanished_cwd {
+                assert!(
+                    !status.success() && !result.exists(),
+                    "a vanished cwd must not fall back to another directory"
+                );
+            } else {
+                assert!(status.success());
+                assert_eq!(
+                    std::fs::read_to_string(&result).unwrap(),
+                    child.id().to_string(),
+                    "exec preserves the journaled PID"
+                );
+            }
+        } else {
+            let status = until("orphan bootstrap exits", || child.try_wait().unwrap());
+            assert!(
+                !status.success() && !result.exists(),
+                "unowned target must never execute"
+            );
+        }
+    }
+}
+
+#[test]
+fn bootstrap_exits_when_its_owner_dies_while_the_journal_is_uncommitted() {
+    use std::os::unix::process::CommandExt;
+    let root = std::env::temp_dir().join(format!(
+        "muster-bootstrap-test-{:032x}",
+        rand::random::<u128>()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let journal = root.join("owner.json");
+    let result = root.join("target-ran");
+    let child_pid = root.join("bootstrap-pid");
+    let marker = format!("bootstrap-{:032x}", rand::random::<u128>());
+    let owner = serde_json::json!({"run":{"id":9,"generation":1},"pid":null,
+        "markers":[format!("MUSTER_RUN={marker}"),"MUSTER_SESSION_ID=9"]});
+    muster_terminal_core::private_fs::write_private(&journal, &serde_json::to_vec(&owner).unwrap())
+        .unwrap();
+    let script = r#"
+        "$1" --owned-child "$$" "$2" "$3" /bin/sh -c 'printf target > "$1"' fixture "$4" &
+        printf '%s' "$!" > "$5"
+        wait
+    "#;
+    let child = Process::new("/bin/sh")
+        .args(["-c", script, "fixture"])
+        .arg(env!("CARGO_BIN_EXE_muster-terminal-host"))
+        .arg(&journal)
+        .arg(&root)
+        .arg(&result)
+        .arg(&child_pid)
+        .process_group(0)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("MUSTER_RUNTIME_DIR", root.join("run"))
+        .env("MUSTER_DATA_DIR", root.join("data"))
+        .env("MUSTER_PORT", "0")
+        .env("MUSTER_RUN", &marker)
+        .env("MUSTER_SESSION_ID", "9")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut guard = Starting {
+        child: Some(child),
+        root,
+    };
+    // The PID file is used only for read-only observations, never as a signal target.
+    let pid: u32 = until("bootstrap PID", || {
+        std::fs::read_to_string(&child_pid)
+            .ok()
+            .and_then(|s| s.parse().ok())
+    });
+    let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_muster-terminal-host")).unwrap();
+    until("bootstrap reached its exec guard", || {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .is_ok_and(|path| path == executable)
+            .then_some(())
+    });
+    assert!(!result.exists());
+    let parent = guard.child.as_mut().unwrap();
+    parent.kill().unwrap();
+    parent.wait().unwrap();
+    let marker = format!("MUSTER_RUN={marker}");
+    until("uncommitted bootstrap exits after owner death", || {
+        let env = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        (!env
+            .split(|byte| *byte == 0)
+            .any(|item| item == marker.as_bytes()))
+        .then_some(())
+    });
+    assert!(
+        !result.exists(),
+        "the target must never run after its owning process dies"
+    );
 }

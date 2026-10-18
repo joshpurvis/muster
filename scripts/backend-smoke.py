@@ -173,7 +173,26 @@ try:
     stop_backend()
     check(next(item for item in host_call("inventory") if item["run"]["id"] == sid)["alive"],
           "graceful backend shutdown preserves the terminal")
+    hook_env = ENV | {"MUSTER_URL": f"http://127.0.0.1:{PORT}", "MUSTER_TOKEN": record["token"],
+                      "MUSTER_HOOK_DB": str(DATA / "hook-inbox.sqlite")}
+    callback = subprocess.run([str(BIN), "hook", "shell", "SmokeDurableCallback", '{"saved":"during outage"}'],
+                              env=hook_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+    check(callback.returncode == 0 and not callback.stdout and not callback.stderr,
+          "hook helper durably accepts a callback while the backend is absent")
+    with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:
+        saved_callback = database.execute("SELECT id,token,event,payload FROM hooks ORDER BY id DESC LIMIT 1").fetchone()
+    assert saved_callback is not None
+    def callback_count():
+        with sqlite3.connect(DATA / "muster.db") as database:
+            return database.execute("SELECT COUNT(*) FROM events WHERE kind='hook' AND json_extract(data,'$.event')='SmokeDurableCallback'").fetchone()[0]
     start_backend()
+    check(callback_count() == 1, "replacement backend drains the durable callback before serving clients")
+    # Simulate an acknowledgement lost after application commit: restore the same inbox row.
+    stop_backend(hard=True)
+    with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:
+        database.execute("INSERT INTO hooks(id,token,event,payload) VALUES (?,?,?,?)", saved_callback)
+    start_backend()
+    check(callback_count() == 1, "a callback with a committed checkpoint is not applied twice")
     dying = rpc("session.spawn", {"channel_id": channel["id"], "kind": "shell"})
     rpc("session.input", {"id": dying["id"], "data": "sleep 0.4; exit 7\r"})
     stop_backend(hard=True)
@@ -183,6 +202,14 @@ try:
           "exit during backend outage is reconciled with its actual status")
     restarted = rpc("session.restart", {"id": sid})
     check(restarted["pid"] != pid and restarted["state"] != "exited", "explicit session restart creates one new process")
+    callback = subprocess.run([str(BIN), "hook", "shell", "SmokeDurableCallback", '{}'], env=hook_env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+    assert callback.returncode == 0
+    def inbox_empty():
+        with sqlite3.connect(DATA / "hook-inbox.sqlite") as database:
+            return database.execute("SELECT COUNT(*) FROM hooks").fetchone()[0] == 0
+    until("obsolete callback drained", inbox_empty)
+    check(callback_count() == 1, "old run callbacks cannot affect a restarted session")
     rpc("session.input", {"id": sid, "data": "printf 'AFTER-RESTART\\n'\r"})
     until("replacement terminal works", lambda: "AFTER-RESTART" in output(sid))
     check("COUNT:5" not in output(sid), "replacement run has independent replay")

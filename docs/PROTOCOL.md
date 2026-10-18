@@ -473,3 +473,18 @@ only when no external release is configured. Invalid configured releases produce
 without changing running sessions or API availability. Installed HTML pins JS/CSS to
 `/_ui/<id>/...` (desktop) or `/m/_ui/<id>/...` (phone), so old pages cannot mix bundles
 with a later release. Phone release assets retain the phone CSP and proxy restrictions.
+
+### Callback recovery
+
+New host-managed runs set `MUSTER_HOOK_DB` for `muster hook`. Helpers append JSON callbacks
+to the application's private `hook-inbox.sqlite`, independently of HTTP availability.
+The backend reads insertion IDs in order; the application transaction saves agent reply,
+resume ID, attribution and inbox cursor together before acknowledging deletion. A
+repeated inbox row cannot be assigned to a newer message. Credentials must match the
+session's recorded terminal generation. The existing `POST /hook/<event>` remains
+available for legacy callbacks and does not acquire automatic transport retries.
+
+The inbox limits pending payloads to 64 MiB and 100,000 events. Overflow is recorded
+and reported, and the helper remains bounded by its two-second write deadline. Full
+payloads stay in the private inbox only until acknowledged; the timeline still records
+hook summaries. These are application features, outside terminal-host IPC.

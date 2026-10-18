@@ -714,6 +714,7 @@ pub async fn wait_for_reply(
 /// What a hook changed (`Registry::on_hook`).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HookEffects {
+    pub duplicate: bool,
     /// This message got its reply.
     pub replied: Option<i64>,
     /// This agent's record changed (its conversation id).
@@ -933,69 +934,67 @@ impl Registry {
         }
     }
 
-    /// A UserPromptSubmit: which prompt is running now. An envelope only counts for a message
-    /// muster delivered to this session and that hasn't been answered; a prompt without one is
-    /// the human's only if the human gave input through a client since the last attributed
-    /// delivery. Otherwise provenance stays: a hook never lowers it on its own.
-    fn on_prompt(&self, store: &Store, id: SessionId, prompt: &str) -> anyhow::Result<()> {
-        match parse_envelope(prompt) {
-            Some(msg) => {
-                let pending = {
-                    let g = self.inner.lock();
-                    if g.runtime.active.get(&id) == Some(&msg) { return Ok(()) }
-                    g.runtime.delivered.get(&msg).is_some_and(|(session, _)| *session == id)
-                };
-                if !pending { return Ok(()) }
-                if let Some(message) = store.agent_message(msg)? {
-                    if message.to_session == Some(id) && message.reply.is_none() {
-                        self.edit_runtime(|state| {
-                            state.active.insert(id, msg);
-                            state.prov.insert(id, Prov { origin: message.origin, hop: message.hop, msg_id: Some(msg) });
-                        })?;
-                    }
-                }
-            }
-            None => self.edit_runtime(|state| {
-                state.active.remove(&id);
-                if state.human_seen.remove(&id) { state.prov.remove(&id); }
-            })?,
-        }
-        Ok(())
+    /// Apply hook attribution atomically with its durable inbox checkpoint, when present.
+    /// Hooks never lower provenance unless human input was observed through a client.
+    pub fn on_hook(&self, store: &Store, info: &SessionInfo, event: &str, payload: &Value) -> anyhow::Result<HookEffects> {
+        self.on_hook_checkpoint(store, info, event, payload, None)
     }
 
-    /// Every hook callback passes through here, before the adapter's state update is published
-    /// (so a waiting `ask` that sees the idle state also sees the reply):
-    /// - UserPromptSubmit: `on_prompt`;
-    /// - Stop / notify: the turn's final message -> the reply of the active agent message;
-    /// - SessionStart / notify (agents): the agent's conversation id -> the agent's `resume_id`.
-    ///
-    /// Returns what changed, for the hub to tell clients.
-    pub fn on_hook(&self, store: &Store, info: &SessionInfo, event: &str, payload: &Value) -> anyhow::Result<HookEffects> {
+    pub(crate) fn on_hook_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
+        payload: &Value, cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<HookEffects> {
+        let mut g = self.inner.lock();
+        if let Some(cursor) = cursor {
+            if store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor")?
+                .is_some_and(|saved| saved.instance == cursor.instance && saved.sequence >= cursor.sequence) {
+                return Ok(HookEffects { duplicate: true, ..HookEffects::default() });
+            }
+        }
+        let mut next = g.runtime.clone();
         let mut fx = HookEffects::default();
         if event == "UserPromptSubmit" {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-            self.on_prompt(store, info.id, prompt)?;
-        }
-        if let Some(reply) = reply_from_hook(info.kind, event, payload) {
-            let msg = self.inner.lock().runtime.active.get(&info.id).copied();
-            if let Some(msg) = msg {
-                store.set_agent_message_reply(msg, &reply, now_ms())?;
-                self.edit_runtime(|state| {
-                    if state.active.get(&info.id) == Some(&msg) { state.active.remove(&info.id); }
-                    state.delivered.remove(&msg);
-                })?;
-                fx.replied = Some(msg);
+            match parse_envelope(prompt) {
+                Some(msg) if next.active.get(&info.id) != Some(&msg)
+                    && next.delivered.get(&msg).is_some_and(|(session, _)| *session == info.id) => {
+                    if let Some(message) = store.agent_message(msg)? {
+                        if message.to_session == Some(info.id) && message.reply.is_none() {
+                            next.active.insert(info.id, msg);
+                            next.prov.insert(info.id, Prov { origin: message.origin, hop: message.hop, msg_id: Some(msg) });
+                        }
+                    }
+                }
+                None => {
+                    next.active.remove(&info.id);
+                    if next.human_seen.remove(&info.id) { next.prov.remove(&info.id); }
+                }
+                _ => {},
             }
         }
-        let Some(agent) = self.by_session(info.id) else { return Ok(fx) };
-        if let Some(rid) = resume_id_from_hook(info.kind, event, payload)
-            && agent.resume_id.as_deref() != Some(rid.as_str())
-        {
-            self.update(store, agent.id, |b| b.resume_id = Some(rid))?;
-            fx.agent = Some(agent.id);
+        let reply = reply_from_hook(info.kind, event, payload)
+            .and_then(|reply| next.active.get(&info.id).copied().map(|msg| (msg, reply)));
+        if let Some((msg, _)) = &reply {
+            next.active.remove(&info.id);
+            next.delivered.remove(msg);
+            fx.replied = Some(*msg);
+        }
+        let mut agent = g.agents.values().find(|agent| agent.session_id == Some(info.id)).cloned();
+        if let Some(agent) = &mut agent {
+            if let Some(resume_id) = resume_id_from_hook(info.kind, event, payload) {
+                if agent.resume_id.as_deref() != Some(resume_id.as_str()) {
+                    agent.resume_id = Some(resume_id);
+                    fx.agent = Some(agent.id);
+                }
+            }
+        }
+        let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
+        if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() {
+            store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor)?;
+            g.runtime = next;
+            if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
         }
         Ok(fx)
     }
+
 }
 
 // ----- operations (RPC and MCP) -----
@@ -2105,6 +2104,31 @@ mod tests {
         let status = replacement.msg_status(&store, message);
         assert_eq!(status.reply.as_deref(), Some("survived"));
         assert!(!status.active);
+    }
+
+    #[test]
+    fn hook_reply_and_checkpoint_are_atomic_and_duplicate_cannot_reply_to_next_message() {
+        let store = Store::open_memory().unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let first = msg(&store, 1, 5, Origin::Schedule, 2);
+        let provenance = |message| Prov { origin: Origin::Schedule, hop: 2, msg_id: Some(message) };
+        reg.on_delivered(5, Source::Chain(provenance(first)), 100).unwrap();
+        let mut info = test_session(5, None);
+        info.kind = SessionKind::Claude;
+        let cursor = crate::store::HookCursor { instance: "fixture".into(), sequence: 1 };
+        let payload = json!({"last_assistant_message": "first reply"});
+        reg.on_hook_checkpoint(&store, &info, "Stop", &payload, Some(&cursor)).unwrap();
+        let replacement = Registry::load(&store).unwrap();
+        let second = msg(&store, 1, 5, Origin::Schedule, 2);
+        replacement.on_delivered(5, Source::Chain(provenance(second)), 200).unwrap();
+        assert!(replacement.on_hook_checkpoint(&store, &info, "Stop", &payload, Some(&cursor)).unwrap().duplicate);
+        assert_eq!(store.agent_message(first).unwrap().unwrap().reply.as_deref(), Some("first reply"));
+        assert!(store.agent_message(second).unwrap().unwrap().reply.is_none());
+        assert!(replacement.msg_status(&store, second).active);
+        store.fail_runtime_writes_for_test();
+        assert!(replacement.on_hook(&store, &info, "Stop", &payload).is_err());
+        assert!(store.agent_message(second).unwrap().unwrap().reply.is_none(), "reply write rolls back with failed attribution write");
+        assert!(replacement.msg_status(&store, second).active);
     }
 
     #[test]

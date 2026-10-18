@@ -2216,6 +2216,7 @@ impl Hub {
         env.insert("MUSTER_CHANNEL_ID".into(), info.channel_id.to_string());
         env.insert("MUSTER_URL".into(), self.daemon_url());
         env.insert("MUSTER_TOKEN".into(), token.clone());
+        env.insert("MUSTER_HOOK_DB".into(), crate::hook_inbox::path().to_string_lossy().to_string());
         // Non-secret per-run marker: recognizes this run's processes when reaping leftovers.
         // (Agent CLIs may strip MUSTER_TOKEN from the commands they run; Codex does by default.)
         env.insert("MUSTER_RUN".into(), paths::random_token()[..16].to_string());
@@ -2796,42 +2797,60 @@ impl Hub {
     /// Handle a hook callback authenticated by session token. Routes to the adapter's
     /// `on_hook`, logs a Hook event, applies the resulting state.
     pub fn handle_hook(&self, token: &str, event: &str, payload: serde_json::Value) -> anyhow::Result<()> {
-        let id = self
-            .session_by_token(token)
-            .ok_or_else(|| anyhow::anyhow!("unknown session token"))?;
-        let info = self
-            .session(id)
-            .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        let update = adapter_for(info.kind).on_hook(event, &payload);
-        // Before the state update is published: a waiting ask that sees the agent go idle must
-        // also see its reply.
-        let fx = self.agents.on_hook(&self.store, &info, event, &payload)?;
-        if let Some(m) = fx.replied {
-            crate::agents::publish_message(self, m);
-        }
-        if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) {
-            crate::agents::publish(self, &a);
-        }
-        self.log_event(
-            Some(info.channel_id),
-            Some(id),
-            EventKind::Hook,
-            serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}),
-        );
-        if let Some(u) = update {
-            self.set_state(id, u, StateSource::Hook);
+        self.handle_hook_checkpoint(token, event, payload, None)
+    }
+
+    pub(crate) fn handle_spooled_hook(&self, token: &str, event: &str, payload: serde_json::Value,
+        cursor: &crate::store::HookCursor) -> anyhow::Result<()> {
+        self.handle_hook_checkpoint(token, event, payload, Some(cursor))
+    }
+
+    fn handle_hook_checkpoint(&self, token: &str, event: &str, payload: serde_json::Value,
+        cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<()> {
+        // Spool callbacks from a process that exited during an outage may still contain
+        // its final reply. Accept only the recorded current run, never a previous generation.
+        let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
+            .find(|(_, record)| !record.retired && record.token == token)
+            .map(|(id, record)| (*id, record.spec.run.generation)));
+        let (info, generation, fx) = {
+            let g = self.inner.lock();
+            let entry = if cursor.is_some() {
+                recorded.and_then(|(id, generation)| g.sessions.get(&id).filter(|entry| entry.generation == generation))
+            } else { g.tokens.get(token).and_then(|id| g.sessions.get(id)) };
+            let Some(entry) = entry else {
+                if let Some(cursor) = cursor {
+                    // Removed/restarted sessions cannot receive old callbacks. Advance
+                    // the checkpoint so one obsolete run cannot block every other session.
+                    self.store.save_runtime("hook-inbox-cursor", cursor)?;
+                    return Ok(());
+                }
+                anyhow::bail!("unknown session token");
+            };
+            let info = entry.info.clone();
+            let fx = self.agents.on_hook_checkpoint(&self.store, &info, event, &payload, cursor)?;
+            (info, entry.generation, fx)
+        };
+        if fx.duplicate { return Ok(()) }
+        let id = info.id;
+        if let Some(m) = fx.replied { crate::agents::publish_message(self, m); }
+        if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
+        self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
+            serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));
+        if let Some(update) = adapter_for(info.kind).on_hook(event, &payload) {
+            self.set_state_checked(id, update, StateSource::Hook, Some(generation));
         }
         if let Some(delta) = subagent_delta(event, &payload) {
-            self.adjust_subagents(id, delta);
+            self.adjust_subagents_checked(id, delta, Some(generation));
         }
         Ok(())
     }
 
     /// Change the running-subagent count (runtime only; emits on change). `None`: reset to 0.
-    fn adjust_subagents(&self, id: SessionId, delta: Option<i32>) {
+    fn adjust_subagents_checked(&self, id: SessionId, delta: Option<i32>, generation: Option<u64>) {
         let info = {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else { return };
+            if generation.is_some_and(|generation| e.generation != generation) { return }
             let next = match delta {
                 Some(d) => (e.info.subagents as i64 + d as i64).max(0) as u32,
                 None => 0,

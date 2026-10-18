@@ -84,7 +84,7 @@ Validation: the Rust suite passed 227 tests, with one additional generation-fenc
 unit test subsequently passing; all 154 full smoke checks, 18 focused backend crash
 checks, and all 81 frontend tests pass. Frontend types and lint also pass.
 
-Remaining before completion: hook spooling/deduplication; durable MCP guard recovery;
+Remaining before completion: durable MCP guard recovery; stable helper executable paths;
 additional crash-window tests and code review, including retired-run cleanup
 and bounded host resource retention. Existing
 live terminals and the installed binary have not been changed or migrated.
@@ -110,3 +110,23 @@ incompatible versions. No backend or host restart is needed for UI-only updates.
 Validation: 27 focused backend/UI survival checks; external asset isolation/cache/
 activation unit test; frontend type/lint checks, all 82 frontend tests, and both
 production bundles. Remaining work above is still open; no live install was performed.
+
+### Durable callback checkpoint
+
+New terminal runs receive `MUSTER_HOOK_DB`, an application-owned SQLite inbox. Hook
+helpers append callbacks even while no backend is listening and keep a two-second
+write deadline. The backend processes the inbox in insertion order before starting
+detectors, prompt queue workers or autostart. Reply attribution, resume IDs and the
+inbox checkpoint commit in one transaction; deleting the acknowledged inbox row is
+safe to retry. Callbacks from retired or superseded runs are discarded. A run that
+exited during the outage can still report its final reply.
+
+Pending callback payloads are capped at 64 MiB and 100,000 events. Overflow is counted
+persistently, logged and reported by the backend. Legacy runs without the new inbox
+variable keep the existing HTTP callback path. The inbox is not part of the terminal
+host and is never needed to keep terminal processes or output alive.
+
+Validation: 234 Rust tests, all 154 full smoke checks, and 31 focused survival checks,
+including helper invocation during an outage, a lost inbox acknowledgement, and old
+run callback rejection. Further review still needs to cover concurrent prompt/hook
+ordering and reconstruction of transient detector/subagent state.

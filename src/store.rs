@@ -40,6 +40,12 @@ pub struct StoredTerminal {
     pub retired: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookCursor {
+    pub instance: String,
+    pub sequence: i64,
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: std::sync::Arc<Mutex<Connection>>,
@@ -700,6 +706,35 @@ impl Store {
     /// A message that was never delivered (the send failed): it must not count toward the cap.
     pub fn delete_agent_message(&self, id: i64) -> anyhow::Result<()> {
         self.conn.lock().execute("DELETE FROM agent_messages WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Commit a hook's attribution, reply, resume ID and inbox checkpoint together.
+    /// A crash cannot leave a saved reply eligible for attribution to a later message.
+    pub fn commit_hook(
+        &self,
+        attribution: &impl serde::Serialize,
+        reply: Option<(i64, &str)>,
+        agent: Option<&crate::agents::Agent>,
+        cursor: Option<&HookCursor>,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.conn.lock();
+        let tx = connection.transaction()?;
+        if let Some((id, reply)) = reply {
+            tx.execute("UPDATE agent_messages SET reply=?2, replied_at=?3 WHERE id=?1",
+                params![id, reply, now_ms()])?;
+        }
+        if let Some(agent) = agent {
+            tx.execute("UPDATE agents SET channel_id=?2, session_id=?3, resume_id=?4 WHERE id=?1",
+                params![agent.id, agent.channel_id, agent.session_id, agent.resume_id])?;
+        }
+        tx.execute("INSERT INTO runtime_state(key,record) VALUES ('agent-attribution',?1)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(attribution)?])?;
+        if let Some(cursor) = cursor {
+            tx.execute("INSERT INTO runtime_state(key,record) VALUES ('hook-inbox-cursor',?1)
+                ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(cursor)?])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

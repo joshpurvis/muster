@@ -7,6 +7,7 @@ mod detect;
 mod devices;
 mod gui;
 mod hookcmd;
+mod hook_inbox;
 mod hub;
 mod inject;
 mod mcp;
@@ -941,6 +942,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
+    let hook_inbox = hook_inbox::Inbox::open(&hook_inbox::path())?;
     let terminal_host = terminal::ensure_host()?;
     // Never move a directory beneath a surviving process during a backend update.
     if !terminal_host.inventory()?.iter().any(|run| run.has_processes) {
@@ -962,6 +964,7 @@ async fn daemon_main() -> anyhow::Result<()> {
         store,
     )?;
 
+    hook_inbox::spawn(&hub, hook_inbox)?;
     inject::spawn_tasks(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());

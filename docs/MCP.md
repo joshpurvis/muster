@@ -142,9 +142,9 @@ bots → agents move also rewrites exact occurrences of those names (and
 
 **Limits** (not closed): an agent that drops `MUSTER_SESSION_ID` and calls the API with the client
 token is the human as far as the daemon can tell (the documented client-token limit, PROTOCOL.md
-"Limits"). Provenance lives in memory: after a daemon restart every session is human-rooted
-again (their processes were stopped; a restarted agent resumes its conversation but has no pending
-message). Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
+"Limits"). Provenance, active message attribution and prompt queues persist across backend
+replacement. Surviving terminal processes retain their tokens and non-human origin. Hook
+callbacks from new runs use a durable inbox while the backend is unavailable. Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
 prompt typed in their terminal never clears provenance (stricter, never looser). Replies need the
 Stop hook or Codex notify; without them `ask_agent` returns the unattributed terminal tail.
 

@@ -13,7 +13,9 @@
 //!   huge tool result doesn't bloat the event log.
 //! - Also sends `X-Muster-Agent: <agent>` (informational only).
 //!
-//! Behavior: blocking HTTP/1.1 over std TcpStream with ~1.5s timeouts, no async runtime.
+//! Host-managed runs use `$MUSTER_HOOK_DB`: append to the application-owned durable inbox
+//! without requiring a live backend. The backend replays it with transactional checkpoints.
+//! Legacy runs retain blocking HTTP/1.1 forwarding. Both paths have an absolute deadline.
 //! Always exits 0 and prints nothing on stdout (Claude/Codex may treat hook stdout as context
 //! or decisions). No-ops silently when MUSTER_URL / MUSTER_TOKEN are unset.
 
@@ -43,6 +45,21 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         None => read_stdin(),
     };
     let body = shrink_payload(&raw);
+    if let Some(path) = std::env::var_os("MUSTER_HOOK_DB") {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let event = event.to_string();
+        std::thread::spawn(move || {
+            let saved = crate::hook_inbox::Inbox::open(std::path::Path::new(&path))
+                .and_then(|mut inbox| inbox.enqueue(&token, &event, &body));
+            let _ = tx.send(saved);
+        });
+        let saved = rx.recv_timeout(OVERALL).unwrap_or_else(|_| Err(anyhow::anyhow!("callback inbox timed out")));
+        if let Err(error) = saved {
+            // No HTTP fallback: an uncertain durable write must not become a duplicate.
+            eprintln!("muster hook: callback could not be saved: {error:#}");
+        }
+        return 0;
+    }
     // One absolute deadline over resolve + connect + write + read: the POST runs on a thread
     // we simply stop waiting for (the process exits right after).
     let (tx, rx) = std::sync::mpsc::channel();

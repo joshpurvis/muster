@@ -12,9 +12,12 @@ import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+sys.dont_write_bytecode = True
+from terminal_fault_proxy import SpawnGate
 
 PROJECT = Path(__file__).resolve().parents[1]
 BIN = PROJECT / "target/debug/muster"
@@ -58,8 +61,8 @@ def until(message, fn):
     raise AssertionError(f"timed out: {message}")
 
 
-def http(path, body=None, credential=None):
-    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+def http(path, body=None, credential=None, timeout=5):
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=timeout)
     try:
         headers = {"Authorization": f"Bearer {credential or token}", "Content-Type": "application/json"}
         conn.request("POST" if body is not None else "GET", path,
@@ -264,6 +267,66 @@ try:
     check(not (DATA / "terminal/runs" / f'{retiring["id"]}-{retired["spec"]["run"]["generation"]}').exists(),
           "retirement interrupted by a backend crash finishes after process exit and drain")
     check(session(sid)["pid"] == restarted["pid"], "retirement recovery preserves unrelated terminal processes")
+
+    def launch_through_gate():
+        result = []
+        def request():
+            try:
+                result.append(http("/api/rpc", {"id": 1, "method": "session.spawn",
+                    "params": {"channel_id": channel["id"], "kind": "shell"}}, timeout=20))
+            except (ConnectionError, OSError) as error:
+                result.append(error)
+        sender = threading.Thread(target=request)
+        sender.start()
+        return sender, result
+
+    def no_launch_record(run):
+        with sqlite3.connect(DATA / "muster.db") as database:
+            return database.execute("SELECT COUNT(*) FROM terminal_runs WHERE session_id=?", (run["id"],)).fetchone()[0] == 0
+
+    for phase in ("before", "after"):
+        with SpawnGate(RUNTIME, phase) as gate:
+            sender, result = launch_through_gate()
+            try:
+                assert gate.entered.wait(5), f"spawn did not reach {phase} gate: {gate.errors}"
+                run = gate.request["run"]
+                if phase == "after":
+                    assert gate.response["type"] == "status", gate.response
+                rpc("session.remove", {"id": run["id"]})
+                if phase == "before":
+                    until("unspawned launch durably cancelled", lambda: no_launch_record(run))
+                gate.release.set()
+                sender.join(timeout=10)
+                assert not sender.is_alive() and len(result) == 1, result
+                assert isinstance(result[0], tuple) and "error" in result[0][1], result
+                until("removed in-flight launch forgotten", lambda: no_launch_record(run)
+                      and all(item["run"] != run for item in host_call("inventory")))
+                check(all(item["id"] != run["id"] for item in rpc("hello")["sessions"]),
+                      f"removal wins against a spawn delayed {phase} host creation")
+            finally:
+                gate.release.set()
+                sender.join(timeout=12)
+
+    with SpawnGate(RUNTIME, "after") as gate:
+        sender, result = launch_through_gate()
+        try:
+            assert gate.entered.wait(5), f"spawn acknowledgement was not captured: {gate.errors}"
+            assert gate.response["type"] == "status", gate.response
+            run = gate.request["run"]
+            unacknowledged_pid = gate.response["data"]["pid"]
+            stop_backend(hard=True)
+        finally:
+            gate.release.set()
+            sender.join(timeout=12)
+    start_backend()
+    check(session(run["id"])["pid"] == unacknowledged_pid
+          and sum(item["run"] == run for item in host_call("inventory")) == 1,
+          "backend crash before spawn acknowledgement adopts exactly the original process")
+    rpc("session.remove", {"id": run["id"]})
+    until("unacknowledged fixture run retired", lambda: no_launch_record(run))
+    check(session(sid)["pid"] == restarted["pid"]
+          and rpc("hello")["terminal_host"]["instance"] == host_instance,
+          "delayed launch and removal faults preserve unrelated terminals and the host")
 
     # A prompt accepted into a busy terminal's queue must survive application replacement.
     waiting = BASE / "queued-command-runs"

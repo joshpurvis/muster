@@ -197,7 +197,12 @@ while an unrelated terminal keeps its PID. Unit coverage includes transactional 
 failure, generation allocation across reopen, unconfirmed-launch preservation, and
 Forget-before-Spawn fencing.
 
-The next audit covers delayed launch/remove responses with explicit fault injection,
-the host's spawn/ownership-journal crash window, hook/prompt ordering and transient
+Deterministic fault injection now also passes: a private socket proxy delays Spawn
+before host creation or after creation but before acknowledgement. Concurrent removal
+wins in both cases, and killing the backend before acknowledgement adopts exactly the
+original process on replacement. All 40 focused checks pass, with unrelated terminal
+PIDs and host identity preserved throughout. The proxy operates only on fixture paths.
+
+The next audit covers the host's spawn/ownership-journal crash window, hook/prompt ordering and transient
 detector/subagent recovery, plus final UI recovery verification. No live installation
 or existing legacy session has been migrated.

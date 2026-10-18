@@ -28,7 +28,10 @@ struct Data {
     next_channel: ChannelId,
     diff: String,
     fail_spawn: bool,
+    /// The host may have started the process, but its acknowledgement was lost.
+    uncertain_spawn: bool,
     fail_send: bool,
+    pending_send: bool,
     /// extra_args of the last spawn_session call.
     last_args: Vec<String>,
     /// What the mock's send reports: (delivered, queued).
@@ -48,6 +51,7 @@ struct Data {
 }
 
 struct Mock {
+    store: crate::store::Store,
     d: Mutex<Data>,
     tx: broadcast::Sender<ServerEvent>,
 }
@@ -114,6 +118,7 @@ impl Mock {
             d.tokens.insert(tok.into(), id);
         }
         Arc::new(Self {
+            store: crate::store::Store::open_memory().unwrap(),
             d: Mutex::new(d),
             tx,
         })
@@ -131,6 +136,7 @@ impl Mock {
 }
 
 impl Backend for Arc<Mock> {
+    fn guard_store(&self) -> Option<crate::store::Store> { Some(self.store.clone()) }
     fn session_by_token(&self, token: &str) -> Option<SessionId> {
         self.d.lock().tokens.get(token).copied()
     }
@@ -203,6 +209,10 @@ impl Backend for Arc<Mock> {
         }
         d.sessions.insert(s.id, s.clone());
         d.live.insert(s.id);
+        if d.uncertain_spawn {
+            return Err(anyhow::Error::new(crate::terminal::SpawnUncertain("lost".into()))
+                .context(crate::hub::SpawnRetained(s.id)));
+        }
         Ok(s)
     }
     async fn send(
@@ -214,6 +224,7 @@ impl Backend for Arc<Mock> {
         source: crate::agents::Source,
     ) -> anyhow::Result<SendOutcome> {
         let mut d = self.d.lock();
+        if d.pending_send { return Err(crate::inject::DeliveryPending.into()) }
         if d.fail_send {
             anyhow::bail!("pty gone");
         }
@@ -244,6 +255,7 @@ impl Backend for Arc<Mock> {
     }
     async fn agent_deliver(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::Delivery> {
         let mut d = self.d.lock();
+        if d.pending_send { return Err(crate::inject::DeliveryPending.into()) }
         if d.fail_send {
             anyhow::bail!("pty gone");
         }
@@ -1264,6 +1276,27 @@ async fn failed_spawn_rolls_back_new_channel() {
 }
 
 #[tokio::test]
+async fn uncertain_spawn_keeps_its_channel_and_reservation() {
+    let (m, st) = state();
+    m.d.lock().uncertain_spawn = true;
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "claude", "new_channel": {"name": "maybe-running"}})).await;
+    assert!(err && t.contains("unconfirmed") && t.contains("Do not spawn again"), "{t}");
+    let d = m.d.lock();
+    let ch = d.channels.values().find(|c| c.name == "maybe-running").unwrap();
+    // Archiving would retire the run (killing the agent) and could delete its worktree.
+    assert!(!ch.archived, "the channel of a possibly running agent is kept");
+    let sid = d.next_session;
+    assert!(d.sessions.contains_key(&sid));
+    drop(d);
+    st.edit_guard(|g| {
+        assert!(g.spawned_depth.contains_key(&sid), "the retained child's depth is recorded");
+        // With one slot per window, the kept reservation leaves none.
+        assert!(g.spawns.check_and_record(1, crate::model::now_ms(), 1, 3_600_000).is_err(),
+            "the spawn reservation was not refunded");
+    }).unwrap();
+}
+
+#[tokio::test]
 async fn recorded_depth_survives_removed_ancestor() {
     let (m, st) = state();
     // 1 spawns 101 (depth 1); 101 spawns 102 (depth 2); 102 spawns 103 (depth 3).
@@ -1782,4 +1815,52 @@ async fn provenance_survives_plain_sends() {
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;
     assert!(!err, "{t}");
     assert_eq!(*m.d.lock().sources.last().unwrap(), Source::Chain(Prov { origin: Origin::Human, hop: 0, msg_id: None }));
+}
+
+#[tokio::test]
+async fn backend_replacement_preserves_rate_limits_and_refuses_unsaved_actions() {
+    let (m, mut original) = state();
+    original.limits.send_per_window = 1;
+    assert!(!call(&original, "send_message", json!({"session_id": 2, "text": "first"})).await.1);
+    drop(original);
+    let mut replacement = McpState::new(m.clone());
+    replacement.limits.send_per_window = 1;
+    let (message, error) = call(&replacement, "send_message", json!({"session_id": 2, "text": "second"})).await;
+    assert!(error && message.contains("rate limit"), "{message}");
+    assert_eq!(m.d.lock().sends.len(), 1);
+    m.store.fail_runtime_writes_for_test();
+    let (message, error) = call(&replacement, "post_to_channel", json!({"text": "must not post"})).await;
+    assert!(error && message.contains("persist MCP limits"), "{message}");
+    assert!(m.d.lock().events.iter().all(|event| event.2 != EventKind::AgentPost));
+}
+
+#[test]
+fn backend_replacement_recovers_depth_after_missing_spawn_ack_and_removed_parent() {
+    let (m, original) = state();
+    original.edit_guard(|guard| { guard.spawned_depth.insert(99, 4); }).unwrap();
+    // The child exists but its final guard update never happened. Its parent was removed.
+    m.d.lock().sessions.insert(100, session(100, 10, SessionKind::Codex, Some(99)));
+    let replacement = McpState::new(m.clone());
+    assert_eq!(replacement.guard.lock().spawned_depth[&100], 5);
+    let channels = m.store.mcp_channels().unwrap();
+    assert!(channels.is_empty());
+    let marked = m.store.insert_channel_with_origin(&channel(0, "mcp-created"), true).unwrap();
+    // Simulate loss of the in-memory channel acknowledgement after durable creation.
+    let again = McpState::new(m);
+    assert!(again.guard.lock().mcp_channels.contains(&marked));
+}
+
+#[tokio::test]
+async fn durably_accepted_delivery_error_is_not_refunded_after_replacement() {
+    let (m, mut original) = state();
+    original.limits.send_per_window = 1;
+    m.d.lock().pending_send = true;
+    let (message, error) = call(&original, "send_message", json!({"session_id": 2, "text": "pending"})).await;
+    assert!(error && message.contains("durable queue"), "{message}");
+    let mut replacement = McpState::new(m.clone());
+    replacement.limits.send_per_window = 1;
+    m.d.lock().pending_send = false;
+    let (message, error) = call(&replacement, "send_message", json!({"session_id": 2, "text": "retry"})).await;
+    assert!(error && message.contains("rate limit"), "{message}");
+    assert!(m.d.lock().sends.is_empty());
 }

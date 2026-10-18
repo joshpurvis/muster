@@ -18,8 +18,8 @@ use tokio::sync::broadcast;
 use crate::devices::{self, Device, Principal};
 use crate::hub::{Hub, ServerEvent};
 
-pub fn router(hub: Arc<Hub>) -> Router {
-    Router::new()
+pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
+    Ok(Router::new()
         .route("/api/health", get(health))
         .route("/api/rpc", post(rpc_http))
         .route("/api/events", get(events_stream))
@@ -31,9 +31,9 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
         .with_state(hub.clone())
-        .nest("/mcp", crate::mcp::router(hub.clone()))
+        .nest("/mcp", crate::mcp::router(hub.clone())?)
         .fallback(crate::assets::serve)
-        .layer(axum::middleware::from_fn_with_state(hub, classify))
+        .layer(axum::middleware::from_fn_with_state(hub, classify)))
 }
 
 /// How a request reached the daemon (docs/ANDROID.md "Security model").
@@ -484,6 +484,8 @@ async fn exchange(
 }
 
 async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    // First: keystrokes recorded after this point came after the callback (`Hub::handle_hook_at`).
+    let arrival = hub.human_input_seq();
     let Some(token) = bearer(&headers) else {
         return unauthorized();
     };
@@ -496,7 +498,7 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     if hub.session_by_token(token).is_none() {
         return unauthorized();
     }
-    match hub.handle_hook(token, &event, payload) {
+    match hub.handle_hook_at(token, &event, payload, arrival) {
         Ok(()) => axum::Json(json!({})).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -656,9 +658,10 @@ mod tests {
             port,
             client_token: "tok".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
+            terminal_host: None,
         };
         let hub = Hub::new(cfg, crate::store::Store::open_memory().unwrap()).unwrap();
-        let app = router(hub.clone());
+        let app = router(hub.clone()).unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .await

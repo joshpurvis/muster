@@ -28,8 +28,70 @@ pub struct StoredSession {
     pub extra_args: Vec<String>,
 }
 
+/// Application-owned identity and credentials for a host-owned terminal run.
+/// Written before spawn so a lost response can be reconciled without another process.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredTerminal {
+    pub host_instance: String,
+    pub token: String,
+    pub port_base: u16,
+    pub spec: muster_terminal_protocol::SpawnSpec,
+    pub pending: bool,
+    pub retired: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HookCursor {
+    pub instance: String,
+    pub sequence: i64,
+}
+
+/// Hook-derived runtime facts, committed with the inbox cursor and session state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HookSession {
+    pub generation: u64,
+    pub subagents: u32,
+    pub last_hook_at: i64,
+}
+
+#[derive(Clone)]
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
+}
+
+/// Reserve sequence ranges durably before publishing any values. Unused numbers are
+/// skipped after a backend crash, so an old client's approval cannot name a new prompt.
+pub struct StateSequences {
+    store: Store,
+    available: Mutex<std::ops::Range<u64>>,
+}
+
+impl StateSequences {
+    pub fn new(store: &Store) -> Self {
+        Self { store: store.clone(), available: Mutex::new(0..0) }
+    }
+
+    pub fn next(&self) -> anyhow::Result<u64> {
+        let mut range = self.available.lock();
+        if range.is_empty() {
+            let mut conn = self.store.conn.lock();
+            let transaction = conn.transaction()?;
+            let previous: Option<String> = transaction.query_row(
+                "SELECT record FROM runtime_state WHERE key='state-sequence-end'", [], |row| row.get(0),
+            ).optional()?;
+            // Start above all values used by the pre-host backend.
+            let start = previous.map(|text| text.parse::<u64>()).transpose()?.unwrap_or(1 << 32);
+            let end = start.checked_add(4096).context("state sequence exhausted")?;
+            anyhow::ensure!(end <= (1 << 53) - 1, "state sequence exceeds exact JavaScript integers");
+            transaction.execute(
+                "INSERT INTO runtime_state(key, record) VALUES ('state-sequence-end', ?1)
+                 ON CONFLICT(key) DO UPDATE SET record=excluded.record", [end.to_string()],
+            )?;
+            transaction.commit()?;
+            *range = start..end;
+        }
+        Ok(range.next().expect("reserved nonempty sequence range"))
+    }
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -208,6 +270,22 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agent_messages ADD COLUMN text TEXT;
     ALTER TABLE agent_messages ADD COLUMN refused TEXT;
     "#,
+    // v10: application metadata for terminal runs owned by the independent host.
+    r#"
+    CREATE TABLE terminal_runs (
+        session_id INTEGER PRIMARY KEY,
+        record TEXT NOT NULL
+    );
+    "#,
+    // v11: application runtime state that must survive backend replacement.
+    r#"
+    CREATE TABLE runtime_state (
+        key TEXT PRIMARY KEY,
+        record TEXT NOT NULL
+    );
+    "#,
+    // v12: record MCP-created channels atomically with their creation.
+    "CREATE TABLE mcp_channels(channel_id INTEGER PRIMARY KEY);",
 ];
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
@@ -255,7 +333,7 @@ impl Store {
         for suffix in ["", "-wal", "-shm"] {
             crate::paths::make_private_file(std::path::Path::new(&format!("{}{suffix}", path.display())));
         }
-        let store = Store { conn: Mutex::new(conn) };
+        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         store.migrate()?;
         Ok(store)
     }
@@ -263,7 +341,7 @@ impl Store {
     #[cfg(test)]
     pub fn open_memory() -> anyhow::Result<Self> {
         let store = Store {
-            conn: Mutex::new(Connection::open_in_memory()?),
+            conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)),
         };
         store.migrate()?;
         Ok(store)
@@ -641,6 +719,48 @@ impl Store {
         Ok(())
     }
 
+    /// Commit attribution, reply, resume ID, session state and inbox checkpoint together.
+    /// A crash cannot leave a saved reply eligible for attribution to a later message.
+    pub fn commit_hook(
+        &self,
+        attribution: &impl serde::Serialize,
+        reply: Option<(i64, &str)>,
+        agent: Option<&crate::agents::Agent>,
+        cursor: Option<&HookCursor>,
+        session: Option<(&SessionInfo, &HookSession)>,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.conn.lock();
+        let tx = connection.transaction()?;
+        if let Some((id, reply)) = reply {
+            tx.execute("UPDATE agent_messages SET reply=?2, replied_at=?3 WHERE id=?1",
+                params![id, reply, now_ms()])?;
+        }
+        if let Some(agent) = agent {
+            tx.execute("UPDATE agents SET channel_id=?2, session_id=?3, resume_id=?4 WHERE id=?1",
+                params![agent.id, agent.channel_id, agent.session_id, agent.resume_id])?;
+        }
+        tx.execute("INSERT INTO runtime_state(key,record) VALUES ('agent-attribution',?1)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(attribution)?])?;
+        if let Some(cursor) = cursor {
+            tx.execute("INSERT INTO runtime_state(key,record) VALUES ('hook-inbox-cursor',?1)
+                ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(cursor)?])?;
+        }
+        if let Some((info, runtime)) = session {
+            tx.execute("UPDATE sessions SET state=?2, state_detail=?3, state_since=?4 WHERE id=?1",
+                params![info.id, info.state.as_str(), info.state_detail, info.state_since])?;
+            tx.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET record=excluded.record",
+                params![format!("hook-session:{}", info.id), serde_json::to_string(runtime)?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_hook_session(&self, id: SessionId, generation: u64) -> anyhow::Result<Option<HookSession>> {
+        Ok(self.load_runtime::<HookSession>(&format!("hook-session:{id}"))?
+            .filter(|saved| saved.generation == generation))
+    }
+
     pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agent_messages SET reply = ?2, replied_at = ?3 WHERE id = ?1",
@@ -744,8 +864,20 @@ impl Store {
 
     /// Inserts the channel (its `id` is ignored) and returns the new id.
     pub fn insert_channel(&self, c: &Channel) -> anyhow::Result<ChannelId> {
+        self.insert_channel_with_origin(c, false)
+    }
+
+    pub fn mcp_channels(&self) -> anyhow::Result<std::collections::HashSet<ChannelId>> {
         let conn = self.conn.lock();
-        conn.execute(
+        let mut query = conn.prepare("SELECT m.channel_id FROM mcp_channels m JOIN channels c ON c.id=m.channel_id")?;
+        let rows = query.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn insert_channel_with_origin(&self, c: &Channel, mcp: bool) -> anyhow::Result<ChannelId> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO channels (workspace_id, name, cwd, branch, base_branch, owns_worktree, port_base,
                                    archived, layout, created_at, last_read_at, sort_order, permissions,
                                    window_id, auto_named, first_prompt)
@@ -769,7 +901,10 @@ impl Store {
                 c.first_prompt
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        if mcp { tx.execute("INSERT INTO mcp_channels(channel_id) VALUES (?1)", [id])?; }
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn update_channel(&self, c: &Channel) -> anyhow::Result<()> {
@@ -881,6 +1016,7 @@ impl Store {
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     subagents: 0,
                     size_owner: None,
+                    input_interrupted: false,
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
@@ -957,8 +1093,38 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: SessionId) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// A removal either keeps the session and its live launch, or durably removes
+    /// the row and leaves the host retirement intent. Never publish half of it.
+    pub fn retire_session(&self, id: SessionId, terminal: Option<&StoredTerminal>) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        if let Some(terminal) = terminal {
+            anyhow::ensure!(terminal.retired && terminal.spec.run.id == id, "invalid terminal retirement");
+            transaction.execute(
+                "INSERT INTO terminal_runs(session_id, record) VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
+                params![id, serde_json::to_string(terminal)?],
+            )?;
+        }
+        transaction.execute("DELETE FROM sessions WHERE id=?1", [id])?;
+        transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        transaction.execute("DELETE FROM events WHERE session_id=?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn fail_session_removal_for_test(&self) {
+        self.conn.lock().execute_batch("CREATE TRIGGER refuse_session_removal BEFORE DELETE ON sessions
+            BEGIN SELECT RAISE(ABORT, 'fixture removal failure'); END;").unwrap();
     }
 
     /// Record the session id (= pid of the process muster started) of a session's current
@@ -1043,6 +1209,85 @@ impl Store {
         )?)
     }
 
+    /// Hold the database connection, as a slow SQLite statement or commit would.
+    #[cfg(test)]
+    pub fn hold_connection_for_test(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.conn.lock()
+    }
+
+    #[cfg(test)]
+    pub fn fail_runtime_writes_for_test(&self) {
+        self.conn.lock().execute("DROP TABLE runtime_state", []).unwrap();
+    }
+
+    pub fn save_runtime(&self, key: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO runtime_state(key, record) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET record=excluded.record",
+            params![key, serde_json::to_string(value)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_runtime<T: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<T>> {
+        let json: Option<String> = self.conn.lock().query_row(
+            "SELECT record FROM runtime_state WHERE key=?1", [key], |row| row.get(0),
+        ).optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into)).transpose()
+    }
+
+    pub fn delete_runtime(&self, key: &str) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM runtime_state WHERE key=?1", [key])?;
+        Ok(())
+    }
+
+    pub fn save_terminal(&self, id: SessionId, run: &StoredTerminal) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO terminal_runs(session_id, record) VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET record=excluded.record",
+            params![id, serde_json::to_string(run)?],
+        )?;
+        Ok(())
+    }
+
+    /// Reserve before sending a spawn request. Deleting retired launch records
+    /// must not let a replacement backend reuse a host's generation tombstone.
+    pub fn next_terminal_generation(&self, observed_floor: u64) -> anyhow::Result<u64> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        let previous: Option<String> = transaction.query_row(
+            "SELECT record FROM runtime_state WHERE key='terminal-generation'", [], |row| row.get(0),
+        ).optional()?;
+        let previous = previous.map(|s| s.parse::<u64>()).transpose()?.unwrap_or(0);
+        let next = previous.max(observed_floor).checked_add(1).context("terminal generation exhausted")?;
+        anyhow::ensure!(next <= (1 << 53) - 1, "terminal generation exceeds exact JavaScript integers");
+        transaction.execute(
+            "INSERT INTO runtime_state(key, record) VALUES ('terminal-generation', ?1)
+             ON CONFLICT(key) DO UPDATE SET record=excluded.record", [next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn load_terminals(&self) -> anyhow::Result<std::collections::BTreeMap<SessionId, StoredTerminal>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT session_id, record FROM terminal_runs")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, SessionId>(0)?, r.get::<_, String>(1)?)))?;
+        let mut records = std::collections::BTreeMap::new();
+        for row in rows {
+            let (id, json) = row?;
+            records.insert(id, serde_json::from_str(&json)?);
+        }
+        Ok(records)
+    }
+
+    pub fn delete_terminal(&self, id: SessionId) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let transaction = conn.transaction()?;
+        transaction.execute("DELETE FROM terminal_runs WHERE session_id=?1", [id])?;
+        transaction.execute("DELETE FROM reap WHERE session_id=?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     // ----- events -----
 
     pub fn insert_event(
@@ -1123,6 +1368,55 @@ impl Store {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hook_session_state_and_cursor_commit_or_roll_back_together() {
+        let store = Store::open_memory().unwrap();
+        let mut info = crate::mcp::guard::test_session(0, None);
+        info.state = AgentState::Idle;
+        info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
+        let cursor = HookCursor { instance: "fixture".into(), sequence: 4 };
+        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234 };
+        info.state = AgentState::Working;
+        info.state_detail = Some("Agent".into());
+        info.state_since = 1234;
+        store.conn.lock().execute_batch("CREATE TRIGGER refuse_hook_runtime BEFORE INSERT ON runtime_state
+            WHEN NEW.key LIKE 'hook-session:%' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        assert!(store.commit_hook(&serde_json::json!({}), None, None, Some(&cursor), Some((&info, &runtime))).is_err());
+        assert_eq!(store.load_sessions().unwrap()[0].info.state, AgentState::Idle);
+        assert!(store.load_runtime::<HookCursor>("hook-inbox-cursor").unwrap().is_none());
+        assert!(store.load_runtime::<serde_json::Value>("agent-attribution").unwrap().is_none());
+        assert!(store.load_hook_session(info.id, 42).unwrap().is_none());
+        store.conn.lock().execute_batch("DROP TRIGGER refuse_hook_runtime").unwrap();
+        store.commit_hook(&serde_json::json!({}), None, None, Some(&cursor), Some((&info, &runtime))).unwrap();
+        let saved = &store.load_sessions().unwrap()[0].info;
+        assert_eq!((saved.state, saved.state_since, saved.state_detail.as_deref()),
+            (AgentState::Working, 1234, Some("Agent")));
+        assert_eq!(store.load_runtime::<HookCursor>("hook-inbox-cursor").unwrap(), Some(cursor));
+        let saved = store.load_hook_session(info.id, 42).unwrap().unwrap();
+        assert_eq!((saved.subagents, saved.last_hook_at), (1, 1234));
+        assert!(store.load_hook_session(info.id, 43).unwrap().is_none());
+        store.retire_session(info.id, None).unwrap();
+        assert!(store.load_hook_session(info.id, 42).unwrap().is_none());
+    }
+
+    #[test]
+    fn terminal_generations_survive_record_cleanup_and_replacement() {
+        let directory = std::env::temp_dir().join(format!("muster-generations-{}", crate::paths::random_token()));
+        let path = directory.join("state.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.next_terminal_generation(42).unwrap(), 43);
+            store.conn.lock().execute("DELETE FROM terminal_runs", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.next_terminal_generation(0).unwrap(), 44);
+        assert_eq!(store.next_terminal_generation(100).unwrap(), 101);
+        store.fail_runtime_writes_for_test();
+        assert!(store.next_terminal_generation(0).is_err());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn count(s: &Store, sql: &str) -> i64 {
         s.conn.lock().query_row(sql, [], |r| r.get(0)).unwrap()
     }
@@ -1130,7 +1424,7 @@ mod tests {
     #[test]
     fn migration_v4_puts_live_channels_in_window_1() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         // Apply v1..v3 only, add channels the old way, then run the rest.
         {
             let c = s.conn.lock();
@@ -1184,7 +1478,7 @@ mod tests {
     #[test]
     fn migration_v5_puts_sessions_in_their_channels_window() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..4] {
@@ -1238,7 +1532,7 @@ mod tests {
     fn migration_v7_creates_agent_tables() {
         use crate::agents::{Agent, AgentMessage, Origin};
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..6] {
@@ -1315,7 +1609,7 @@ mod tests {
     fn migration_v9_renames_bots_to_agents_on_a_populated_db() {
         use crate::agents::Origin;
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: Mutex::new(conn) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..8] {

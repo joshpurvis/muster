@@ -1,3 +1,4 @@
+import { connStatus } from "../rpc.ts";
 import { render } from "preact";
 import "@xterm/xterm/css/xterm.css";
 import "./mobile.css";
@@ -24,7 +25,7 @@ function App() {
     <div class="mobile-app">
       {auth.value === "paired" && !ready.value && (
         <div class="connection-banner" role="status">
-          {online.value ? "Reconnecting…" : "Offline — waiting for a connection"}
+          {connStatus.value === "incompatible" ? "UI update required. Install a compatible UI and refresh; terminals remain running." : online.value ? "Reconnecting…" : "Offline — waiting for a connection"}
         </div>
       )}
       {auth.value === "unpaired" || pairBusy.value ? <Pair /> : auth.value === "paired"

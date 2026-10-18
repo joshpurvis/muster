@@ -3,17 +3,16 @@
 # (temp data/runtime dirs, port 17433). Deno permissions are scoped to exactly what it needs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo build --quiet
+CARGO_TARGET_DIR="$PWD/target" cargo build --workspace --quiet
 BIN="$PWD/target/debug/muster"
 TMP="$(mktemp -d -t muster-smoke.XXXXXX)"
 cleanup() {
-  # Stop a daemon the test may have left behind, then remove the temp dir.
-  if [[ -f "$TMP/run/daemon.json" ]]; then
-    pid="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$TMP/run/daemon.json")"
-    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-    sleep 1
+  test_status=$?
+  if [[ "$test_status" -eq 0 ]]; then
+    rm -rf "$TMP"
+  else
+    echo "Failed test artifacts retained: $TMP" >&2
   fi
-  rm -rf "$TMP"
 }
 trap cleanup EXIT
 deno run \

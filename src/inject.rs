@@ -15,7 +15,7 @@
 //! (bash and zsh keep it in the kill ring: Ctrl-Y brings it back).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -44,14 +44,29 @@ pub struct SendOutcome {
     pub queued: u32,
 }
 
+/// The prompt was accepted into the durable queue. An error after that point is not
+/// evidence that no input ran; retain its attribution and accounting until review.
+#[derive(Debug)]
+pub struct DeliveryPending;
+impl std::fmt::Display for DeliveryPending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("prompt retained in the durable queue; inspect delivery status before retrying")
+    }
+}
+impl std::error::Error for DeliveryPending {}
+
 const SETTLE: Duration = Duration::from_millis(350);
 const SUBMIT_DELAY_MIN: Duration = Duration::from_millis(120);
 const VERIFY_FOR: Duration = Duration::from_millis(3000);
 const VERIFY_RETRY_FOR: Duration = Duration::from_millis(1500);
 const MAX_ATTEMPTS: u8 = 3;
+/// After a prompt could not be typed (a human draft, a dialog, a screen that isn't ready),
+/// wait this long before trying again instead of looping on our own queue updates.
+const REQUEUE_BACKOFF: Duration = Duration::from_millis(1000);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Item {
+    generation: Option<u64>,
     text: String,
     /// Clear whatever is in the input box first (set for Interrupt-mode sends).
     clear_first: bool,
@@ -62,32 +77,144 @@ struct Item {
     source: crate::agents::Source,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Stage { Selected, Typing, Submitting }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Active { item: Item, stage: Stage }
+
+#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessQ {
     items: VecDeque<Item>,
-    /// A delivery is in progress (only one per session at a time).
+    #[serde(skip)]
     busy: bool,
-    /// The last text muster typed, to recognize it if the CLI puts it back in the box.
     last_sent: Option<String>,
+    active: Option<Active>,
+    blocked: bool,
+    generation: Option<u64>,
 }
 
-static QUEUES: LazyLock<Mutex<HashMap<SessionId, SessQ>>> = LazyLock::new(Default::default);
-
-/// Put an item back at the head of a session's queue.
-fn requeue_front(id: SessionId, item: Item) {
-    QUEUES.lock().entry(id).or_default().items.push_front(item);
+/// Per-backend durable delivery state. No global queue survives by accident across fixtures.
+pub struct Queues {
+    inner: Mutex<HashMap<SessionId, SessQ>>,
+    store: crate::store::Store,
+    /// In memory only: no delivery attempt before this time (see REQUEUE_BACKOFF).
+    retry_at: Mutex<HashMap<SessionId, tokio::time::Instant>>,
 }
 
-fn queue_len(id: SessionId) -> u32 {
-    QUEUES
-        .lock()
-        .get(&id)
-        .map(|q| q.items.len() as u32)
-        .unwrap_or(0)
+impl Queues {
+    pub fn in_progress(&self) -> bool { self.inner.lock().values().any(|queue| queue.busy) }
+
+    pub fn load(store: &crate::store::Store) -> anyhow::Result<Self> {
+        let mut queues: HashMap<SessionId, SessQ> = store.load_runtime("prompt-queues")?.unwrap_or_default();
+        for queue in queues.values_mut() {
+            if let Some(active) = queue.active.take() {
+                if active.stage == Stage::Selected {
+                    queue.items.push_front(active.item);
+                } else {
+                    queue.active = Some(active);
+                    queue.blocked = true;
+                }
+            }
+            queue.busy = false;
+        }
+        store.save_runtime("prompt-queues", &queues)?;
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()) })
+    }
+
+    fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
+        let mut guard = self.inner.lock();
+        let previous = guard.get(&id).cloned().unwrap_or_default();
+        let mut queue = previous.clone();
+        let result = change(&mut queue);
+        if queue != previous {
+            // `busy` is not persisted: flipping it alone needs no database write.
+            let durable = |q: &SessQ| SessQ { busy: false, ..q.clone() };
+            let persist = durable(&queue) != durable(&previous);
+            let mut next = guard.clone();
+            next.insert(id, queue);
+            if persist { self.store.save_runtime("prompt-queues", &next)?; }
+            *guard = next;
+        }
+        Ok(result)
+    }
+
+    fn remove(&self, id: SessionId) -> anyhow::Result<bool> {
+        let mut guard = self.inner.lock();
+        let mut next = guard.clone();
+        let existed = next.remove(&id).is_some();
+        if existed {
+            self.store.save_runtime("prompt-queues", &next)?;
+            *guard = next;
+        }
+        Ok(existed)
+    }
+
+    fn back_off(&self, id: SessionId) {
+        self.retry_at.lock().insert(id, tokio::time::Instant::now() + REQUEUE_BACKOFF);
+    }
+
+    fn backing_off(&self, id: SessionId) -> bool {
+        let mut retry = self.retry_at.lock();
+        match retry.get(&id) {
+            Some(at) if *at > tokio::time::Instant::now() => true,
+            Some(_) => { retry.remove(&id); false }
+            None => false,
+        }
+    }
+
+    fn requeue(&self, id: SessionId, item: Item) -> anyhow::Result<()> {
+        self.edit(id, |queue| {
+            if queue.generation != item.generation { return }
+            queue.active = None;
+            queue.items.push_front(item);
+        })
+    }
+}
+
+/// Waiting prompts plus the one being delivered (or paused for review). Counting the
+/// active one keeps the number steady while an attempt pops and requeues it.
+fn queue_len(hub: &Hub, id: SessionId) -> u32 {
+    hub.injection.inner.lock().get(&id).map(waiting).unwrap_or(0)
+}
+
+fn waiting(q: &SessQ) -> u32 {
+    q.items.len() as u32 + u32::from(q.active.is_some())
 }
 
 fn sync_queued(hub: &Hub, id: SessionId) {
-    hub.set_queued(id, queue_len(id));
+    hub.set_queued(id, queue_len(hub, id));
+}
+
+/// Called after host reconciliation and before any automatic delivery tasks start.
+pub fn restore(hub: &Hub) -> anyhow::Result<()> {
+    let queues = hub.injection.inner.lock().clone();
+    for (id, queue) in queues {
+        if !is_live(hub, id) || queue.generation != hub.pty_generation(id) {
+            hub.injection.remove(id)?;
+        }
+        sync_queued(hub, id);
+    }
+    Ok(())
+}
+
+pub fn paused(hub: &Hub) -> Vec<SessionId> {
+    hub.injection.inner.lock().iter().filter(|(_, queue)| queue.blocked)
+        .map(|(id, _)| *id).collect()
+}
+
+/// Includes ambiguous in-flight input so clients can explain why a queue is paused.
+pub fn inspect(hub: &Hub, id: SessionId) -> serde_json::Value {
+    match hub.injection.inner.lock().get(&id) {
+        Some(queue) => serde_json::json!({
+            "queued": queue.items.iter().map(|item| &item.text).collect::<Vec<_>>(),
+            "uncertain": if queue.blocked { queue.active.as_ref().map(|active| &active.item.text) } else { None },
+            "stage": queue.active.as_ref().map(|active| active.stage),
+            "paused": queue.blocked,
+        }),
+        None => serde_json::json!({"queued": [], "uncertain": null, "stage": null, "paused": false}),
+    }
 }
 
 fn log_prompt(hub: &Hub, id: SessionId, text: &str, from: &str, queued: bool) {
@@ -122,6 +249,7 @@ pub async fn send(
     from: String,
     source: crate::agents::Source,
 ) -> anyhow::Result<SendOutcome> {
+    anyhow::ensure!(!hub.is_shutting_down(), "application backend is stopping; prompt was not queued");
     let info = hub
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
@@ -135,6 +263,7 @@ pub async fn send(
     hub.note_prompt(id, &text);
     let adapter = adapter_for(info.kind);
     let item = Item {
+        generation: hub.pty_generation(id),
         text: text.clone(),
         clear_first: mode == SendMode::Interrupt,
         attempts: 0,
@@ -145,14 +274,16 @@ pub async fn send(
     if mode == SendMode::Interrupt {
         let busy_now = !adapter.is_ready(info.state);
         if busy_now {
-            hub.write_input(id, &adapter.interrupt_bytes())?;
+            hub.write_input_generation(id, item.generation, &adapter.interrupt_bytes())?;
         }
-        let n = {
-            let mut g = QUEUES.lock();
-            let q = g.entry(id).or_default();
+        let generation = item.generation;
+        let n = hub.injection.edit(id, |q| {
+            anyhow::ensure!(hub.pty_generation(id) == generation, "the terminal run changed");
+            if q.generation != generation { *q = SessQ::default(); }
+            q.generation = generation;
             q.items.push_front(item);
-            q.items.len() as u32
-        };
+            Ok(q.items.len() as u32)
+        })??;
         sync_queued(hub, id);
         log_prompt(hub, id, &text, &from, true);
         kick(hub.clone(), id);
@@ -163,19 +294,22 @@ pub async fn send(
     }
 
     // Deliver right away if nothing is ahead of us and the agent is ready.
-    let deliver_now = {
-        let mut g = QUEUES.lock();
-        let q = g.entry(id).or_default();
-        if q.items.is_empty() && !q.busy && adapter.is_ready(info.state) {
+    let generation = item.generation;
+    let deliver_now = hub.injection.edit(id, |q| {
+        anyhow::ensure!(hub.pty_generation(id) == generation, "the terminal run changed");
+        if q.generation != generation { *q = SessQ::default(); }
+        q.generation = generation;
+        if q.items.is_empty() && !q.busy && !q.blocked && adapter.is_ready(info.state) {
             q.busy = true;
-            true
+            q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
+            Ok(true)
         } else {
             q.items.push_back(item.clone());
-            false
+            Ok(false)
         }
-    };
+    })??;
     if !deliver_now {
-        let n = queue_len(id);
+        let n = queue_len(hub, id);
         sync_queued(hub, id);
         log_prompt(hub, id, &text, &from, true);
         kick(hub.clone(), id);
@@ -191,8 +325,9 @@ pub async fn send(
     let task = {
         let hub = hub.clone();
         tokio::spawn(async move {
+            let generation = item.generation;
             let r = deliver(&hub, id, item).await;
-            finish(&hub, id);
+            finish(&hub, id, generation, &r);
             r
         })
     };
@@ -206,72 +341,144 @@ pub async fn send(
         }),
         Ok(false) => Ok(SendOutcome {
             delivered: false,
-            queued: queue_len(id),
+            queued: queue_len(hub, id),
         }),
-        Err(e) => Err(e),
+        Err(e) => Err(e.context(DeliveryPending)),
     }
 }
 
-fn finish(hub: &Arc<Hub>, id: SessionId) {
-    if let Some(q) = QUEUES.lock().get_mut(&id) {
+fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyhow::Result<bool>) {
+    if let Err(error) = hub.injection.edit(id, |q| {
+        if q.generation != generation { return }
         q.busy = false;
+        if result.is_ok() {
+            q.active = None;
+        } else if let Some(active) = q.active.take() {
+            if active.stage == Stage::Selected {
+                q.items.push_front(active.item);
+            } else {
+                q.active = Some(active);
+                q.blocked = true;
+            }
+        }
+    }) {
+        hub.notice("error", format!("Could not save prompt delivery status for {id}: {error:#}"));
+        return;
     }
     sync_queued(hub, id);
     kick(hub.clone(), id);
 }
 
-/// Start delivering the head of the queue if the session is ready and idle-handed.
+/// Save a spawn's initial prompt for run `generation` before the launch is sent.
+pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: String,
+    source: crate::agents::Source) -> anyhow::Result<()> {
+    let item = Item { generation: Some(generation), text, clear_first: false, attempts: 0,
+        draft_noticed: false, source };
+    hub.injection.edit(id, |q| {
+        if q.generation != Some(generation) { *q = SessQ { generation: Some(generation), ..SessQ::default() }; }
+        q.items.push_back(item);
+    })
+}
+
+/// The launch carrying a prepared initial prompt was acknowledged.
+pub(crate) fn kick_initial(hub: &Arc<Hub>, id: SessionId) {
+    sync_queued(hub, id);
+    kick(hub.clone(), id);
+}
+
 fn kick(hub: Arc<Hub>, id: SessionId) {
+    if hub.is_shutting_down() { return }
     if !is_live(&hub, id) {
-        drop_queue(&hub, id);
+        // A prepared launch (its acknowledgement may still be on the way) keeps its queue.
+        if !hub.may_deliver(id) { drop_queue(&hub, id); }
         return;
     }
-    if !ready(&hub, id) {
-        return;
-    }
-    {
-        let mut g = QUEUES.lock();
-        let Some(q) = g.get_mut(&id) else { return };
-        if q.busy || q.items.is_empty() {
-            return;
-        }
+    if !ready(&hub, id) || hub.injection.backing_off(id) { return }
+    let generation = hub.pty_generation(id);
+    let should_start = hub.injection.edit(id, |q| {
+        if q.generation != generation || q.busy || q.blocked || q.items.is_empty() { return false }
         q.busy = true;
+        true
+    });
+    match should_start {
+        Ok(true) => {},
+        Ok(false) => return,
+        Err(error) => { hub.notice("error", format!("Could not save prompt queue: {error:#}")); return; }
     }
     tokio::spawn(async move {
-        // Let the TUI finish rendering after the state flip, then re-check.
         tokio::time::sleep(SETTLE).await;
-        let is_ready = ready(&hub, id);
-        let item = {
-            let mut g = QUEUES.lock();
-            let q = g.entry(id).or_default();
-            let next = if is_ready { q.items.pop_front() } else { None };
-            if next.is_none() {
-                // Not ready any more, or the queue was cleared meanwhile.
-                q.busy = false;
+        let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
+        let selected = hub.injection.edit(id, |q| {
+            if q.generation != generation { return None }
+            let item = if is_ready { q.items.pop_front() } else { None };
+            if let Some(item) = &item {
+                q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
+            } else { q.busy = false; }
+            item
+        });
+        match selected {
+            Ok(Some(item)) => {
+                sync_queued(&hub, id);
+                let generation = item.generation;
+                let result = deliver(&hub, id, item).await;
+                if let Err(error) = &result {
+                    hub.notice("error", format!("Prompt delivery for session {id} needs review: {error:#}"));
+                }
+                if matches!(result, Ok(false)) { hub.injection.back_off(id); }
+                finish(&hub, id, generation, &result);
             }
-            next
-        };
-        if let Some(item) = item {
-            sync_queued(&hub, id);
-            if let Err(e) = deliver(&hub, id, item).await {
-                hub.notice(
-                    "error",
-                    format!("Could not deliver a queued prompt to session {id}: {e:#}"),
-                );
-            }
-            finish(&hub, id);
+            Ok(None) => {},
+            Err(error) => hub.notice("error", format!("Could not select queued prompt: {error:#}")),
         }
     });
 }
 
-fn drop_queue(hub: &Hub, id: SessionId) {
-    let had = QUEUES
-        .lock()
-        .remove(&id)
-        .is_some_and(|q| !q.items.is_empty());
-    if had {
-        hub.set_queued(id, 0);
+pub(crate) fn drop_queue(hub: &Hub, id: SessionId) {
+    match hub.injection.remove(id) {
+        Ok(true) => hub.set_queued(id, 0),
+        Ok(false) => {},
+        Err(error) => hub.notice("error", format!("Could not clear prompt queue: {error:#}")),
     }
+}
+
+/// Would the next delivery be put straight back (a dialog, an unreadable screen, the
+/// human's unsent draft, or typing paused after an input interruption)? Checked before taking the prompt off the queue, so waiting costs
+/// no queue writes and no queue-count updates. Tells the human once about a draft.
+fn deferred(hub: &Hub, id: SessionId, generation: Option<u64>) -> bool {
+    // Typing is paused after an input interruption: nothing is typed until the user has
+    // checked the terminal and continues (`Hub::continue_input` kicks the queue again).
+    if hub.input_interrupted(id) { return true }
+    let Some(info) = hub.session(id) else { return false };
+    let adapter = adapter_for(info.kind);
+    let head = hub.injection.inner.lock().get(&id)
+        .filter(|q| q.generation == generation)
+        .and_then(|q| q.items.front().map(|item| (item.clear_first, item.draft_noticed)));
+    let Some((clear_first, noticed)) = head else { return false };
+    let blocked = if unsafe_to_type(hub, id, adapter, generation).is_some() {
+        true
+    } else if let Some(current) = composer(hub, id, adapter).filter(|c| !c.trim().is_empty()) {
+        let ours = hub.injection.inner.lock().get(&id)
+            .and_then(|q| q.last_sent.clone())
+            .is_some_and(|last| box_holds(&current, &last));
+        let draft = adapter.clear_input_bytes().is_none() || !(ours || clear_first);
+        if draft && !noticed {
+            let marked = hub.injection.edit(id, |q| {
+                if q.generation != generation { return false }
+                q.items.front_mut().map(|item| item.draft_noticed = true).is_some()
+            });
+            if matches!(marked, Ok(true)) {
+                hub.notice(
+                    "info",
+                    format!("Session {id} has unsent text in its input box; the queued prompt waits until it's sent or cleared."),
+                );
+            }
+        }
+        draft
+    } else {
+        false
+    };
+    if blocked { hub.injection.back_off(id); }
+    blocked
 }
 
 fn composer(hub: &Hub, id: SessionId, adapter: &dyn Adapter) -> Option<String> {
@@ -325,7 +532,9 @@ fn unsafe_to_type(
     if info.state == AgentState::Exited || hub.pty_generation(id) != generation {
         return Some(Unsafe::Gone("the process exited or was restarted"));
     }
-    let screen = hub.screen(id)?;
+    let Some(screen) = hub.screen(id) else {
+        return Some(Unsafe::Gone("the terminal host is unavailable"));
+    };
     match adapter
         .detect_from_screen(&screen, info.state)
         .map(|u| u.state)
@@ -359,9 +568,9 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
     let adapter = adapter_for(info.kind);
-    let generation = hub.pty_generation(id);
+    let generation = item.generation;
     let requeue = |item: Item| {
-        requeue_front(id, item);
+        hub.injection.requeue(id, item)?;
         Ok(false)
     };
     if let Some(why) = unsafe_to_type(hub, id, adapter, generation) {
@@ -373,14 +582,15 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     //    interrupted prompt) or on interrupt-mode sends; otherwise it's the human's draft:
     //    wait rather than append to it and submit both.
     if let Some(current) = composer(hub, id, adapter).filter(|c| !c.trim().is_empty()) {
-        let ours = QUEUES
+        let ours = hub.injection.inner
             .lock()
             .get(&id)
             .and_then(|q| q.last_sent.clone())
             .is_some_and(|last| box_holds(&current, &last));
         match adapter.clear_input_bytes() {
             Some(clear) if ours || item.clear_first => {
-                hub.write_input(id, &clear)?;
+                mark_stage(hub, id, generation, Stage::Typing)?;
+                hub.write_input_generation(id, generation, &clear)?;
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
             _ => {
@@ -399,8 +609,11 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
 
     // 2. Type, pause, submit.
     let bytes = adapter.prompt_bytes(&item.text);
-    hub.write_input(id, &bytes)?;
-    QUEUES.lock().entry(id).or_default().last_sent = Some(item.text.clone());
+    mark_stage(hub, id, generation, Stage::Typing)?;
+    hub.write_input_generation(id, generation, &bytes)?;
+    hub.injection.edit(id, |q| {
+        if q.generation == generation { q.last_sent = Some(item.text.clone()); }
+    })?;
     let extra = Duration::from_millis((bytes.len() as u64 / 50).min(900));
     tokio::time::sleep(SUBMIT_DELAY_MIN + extra).await;
     // Something took over while we typed; don't press Enter into it.
@@ -413,13 +626,14 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
     // The prompt runs from here on: the session now handles a message from `source`.
-    hub.agents().on_delivered(id, item.source, crate::model::now_ms());
+    hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;
+    mark_stage(hub, id, generation, Stage::Submitting)?;
     let seq_before = hub.output_seq(id);
-    hub.write_input(id, &adapter.submit_bytes())?;
+    hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
 
     // 3. Verify. Submit once more only if our text demonstrably still sits in the input box
     //    (or the box is unreadable and nothing happened at all).
-    match accepted(hub, id, adapter, &item.text, seq_before, VERIFY_FOR).await {
+    match accepted(hub, id, generation, adapter, &item.text, seq_before, VERIFY_FOR).await {
         Outcome::Accepted => return Ok(true),
         Outcome::Gone => anyhow::bail!("the session exited"),
         Outcome::Pending => {}
@@ -428,9 +642,10 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         return Ok(true);
     }
     tracing::debug!(session = id, "prompt not accepted yet; submitting again");
+    mark_stage(hub, id, generation, Stage::Submitting)?;
     let seq_before = hub.output_seq(id);
-    hub.write_input(id, &adapter.submit_bytes())?;
-    match accepted(hub, id, adapter, &item.text, seq_before, VERIFY_RETRY_FOR).await {
+    hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+    match accepted(hub, id, generation, adapter, &item.text, seq_before, VERIFY_RETRY_FOR).await {
         Outcome::Accepted => return Ok(true),
         Outcome::Gone => anyhow::bail!("the session exited"),
         Outcome::Pending => {}
@@ -440,7 +655,8 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     let still_there = composer(hub, id, adapter).is_some_and(|c| box_holds(&c, &item.text));
     if still_there && unsafe_to_type(hub, id, adapter, generation).is_none() {
         if let Some(clear) = adapter.clear_input_bytes() {
-            hub.write_input(id, &clear)?;
+            mark_stage(hub, id, generation, Stage::Typing)?;
+            hub.write_input_generation(id, generation, &clear)?;
         }
         if item.attempts < MAX_ATTEMPTS {
             return requeue(item);
@@ -452,6 +668,15 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     Ok(true)
 }
 
+fn mark_stage(hub: &Hub, id: SessionId, generation: Option<u64>, stage: Stage) -> anyhow::Result<()> {
+    hub.injection.edit(id, |q| {
+        if q.generation != generation { return Err(anyhow::anyhow!("the terminal run changed")) }
+        let active = q.active.as_mut().ok_or_else(|| anyhow::anyhow!("the prompt delivery was cancelled"))?;
+        active.stage = stage;
+        Ok(())
+    })?
+}
+
 enum Outcome {
     Accepted,
     Pending,
@@ -461,6 +686,7 @@ enum Outcome {
 async fn accepted(
     hub: &Hub,
     id: SessionId,
+    generation: Option<u64>,
     adapter: &dyn Adapter,
     text: &str,
     seq_before: u64,
@@ -469,6 +695,7 @@ async fn accepted(
     let deadline = tokio::time::Instant::now() + within;
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
+        if hub.pty_generation(id) != generation { return Outcome::Gone }
         let Some(info) = hub.session(id) else {
             return Outcome::Gone;
         };
@@ -513,6 +740,7 @@ pub fn approve(
         .session(id)
         .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
     let adapter = adapter_for(info.kind);
+    let generation = hub.pty_generation(id);
     let screen = hub
         .screen(id)
         .ok_or_else(|| anyhow::anyhow!("session {id} has no screen"))?;
@@ -536,7 +764,7 @@ pub fn approve(
     if seen.0.is_some() && hub.screen(id).is_none_or(|now| now.lines != screen.lines) {
         anyhow::bail!("stale: session {id}'s screen changed while answering; check it again");
     }
-    hub.write_input(id, &bytes)?;
+    hub.write_input_generation(id, generation, &bytes)?;
     hub.log_event(
         Some(info.channel_id),
         Some(id),
@@ -553,11 +781,28 @@ pub fn interrupt(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
     hub.write_input(id, &adapter_for(info.kind).interrupt_bytes())
 }
 
-pub fn clear_queue(hub: &Arc<Hub>, id: SessionId) {
-    if let Some(q) = QUEUES.lock().get_mut(&id) {
+pub fn clear_queue(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
+    hub.injection.edit(id, |q| {
         q.items.clear();
-    }
-    hub.set_queued(id, 0);
+        if !q.busy { q.active = None; q.blocked = false; }
+    })?;
+    sync_queued(hub, id);
+    Ok(())
+}
+
+/// The human reviewed an uncertain delivery: forget that record and resume the prompts
+/// waiting behind it. Never resends the uncertain prompt or undoes typed input.
+pub fn resume_queue(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
+    let resumed = hub.injection.edit(id, |q| {
+        if !q.blocked || q.busy { return false }
+        q.active = None;
+        q.blocked = false;
+        true
+    })?;
+    anyhow::ensure!(resumed, "session {id} has no paused delivery to resume");
+    sync_queued(hub, id);
+    kick(hub.clone(), id);
+    Ok(())
 }
 
 /// Background tasks (queue draining). Called once at daemon start.
@@ -570,20 +815,20 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
             tokio::select! {
                 ev = rx.recv() => match ev {
                     Ok(ServerEvent::SessionUpserted(info)) => {
-                        let has_items = QUEUES.lock().get(&info.id).is_some_and(|q| !q.items.is_empty());
+                        let has_items = hub.injection.inner.lock().get(&info.id).is_some_and(|q| !q.items.is_empty());
                         if has_items {
                             kick(hub.clone(), info.id);
                         }
                     }
                     Ok(ServerEvent::SessionRemoved { id }) => {
-                        QUEUES.lock().remove(&id);
+                        drop_queue(&hub, id);
                     }
                     Ok(_) => {}
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
                 },
                 _ = tick.tick() => {
-                    let ids: Vec<SessionId> = QUEUES
+                    let ids: Vec<SessionId> = hub.injection.inner
                         .lock()
                         .iter()
                         .filter(|(_, q)| !q.items.is_empty() && !q.busy)
@@ -619,30 +864,99 @@ mod tests {
         // Requeue puts it ahead of what was queued meanwhile.
         let id = 4_000_000_001;
         let item = |t: &str| Item {
+            generation: Some(1),
             text: t.into(),
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
             source: crate::agents::Source::Human,
         };
-        QUEUES
-            .lock()
-            .entry(id)
-            .or_default()
-            .items
-            .push_back(item("later"));
-        requeue_front(id, item("interrupted"));
-        let texts: Vec<String> = QUEUES
-            .lock()
-            .remove(&id)
-            .unwrap()
-            .items
-            .into_iter()
-            .map(|i| i.text)
-            .collect();
+        let store = crate::store::Store::open_memory().unwrap();
+        let queues = Queues::load(&store).unwrap();
+        queues.edit(id, |q| { q.generation = Some(1); q.items.push_back(item("later")); }).unwrap();
+        queues.requeue(id, item("interrupted")).unwrap();
+        let restored = Queues::load(&store).unwrap();
+        let texts: Vec<String> = restored.inner.lock().remove(&id).unwrap()
+            .items.into_iter().map(|item| item.text).collect();
         assert_eq!(texts, ["interrupted", "later"]);
         // The next attempt recognizes the leftover text as ours (so it clears it first).
         assert!(box_holds("interrupted", "interrupted"));
+    }
+
+    #[test]
+    fn recovery_requeues_only_work_that_never_started_typing() {
+        for stage in [Stage::Selected, Stage::Typing, Stage::Submitting] {
+            let store = crate::store::Store::open_memory().unwrap();
+            let queues = Queues::load(&store).unwrap();
+            let item = Item { generation: Some(7), text: "run-once".into(), clear_first: false, attempts: 1,
+                draft_noticed: false, source: crate::agents::Source::Human };
+            queues.edit(1, |q| {
+                q.busy = true;
+                q.generation = Some(7);
+                q.active = Some(Active { item, stage });
+            }).unwrap();
+            drop(queues);
+            let replacement = Queues::load(&store).unwrap();
+            let state = replacement.inner.lock();
+            let q = &state[&1];
+            assert!(!q.busy);
+            assert_eq!(q.generation, Some(7));
+            if stage == Stage::Selected {
+                assert_eq!(q.items[0].text, "run-once");
+                assert!(q.active.is_none() && !q.blocked);
+            } else {
+                assert!(q.items.is_empty(), "ambiguous input must not be automatically replayed");
+                assert!(q.blocked);
+                assert_eq!(q.active.as_ref().unwrap().item.text, "run-once");
+            }
+        }
+    }
+
+    #[test]
+    fn failed_queue_write_does_not_accept_work_in_memory() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let queues = Queues::load(&store).unwrap();
+        store.fail_runtime_writes_for_test();
+        assert!(queues.edit(1, |q| q.last_sent = Some("must-not-be-accepted".into())).is_err());
+        assert!(queues.inner.lock().is_empty());
+    }
+
+    #[test]
+    fn obsolete_delivery_cannot_requeue_into_replacement_run() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let queues = Queues::load(&store).unwrap();
+        queues.edit(1, |q| q.generation = Some(2)).unwrap();
+        queues.requeue(1, Item { generation: Some(1), text: "obsolete".into(),
+            clear_first: false, attempts: 1, draft_noticed: false,
+            source: crate::agents::Source::Human }).unwrap();
+        assert!(queues.inner.lock()[&1].items.is_empty());
+        queues.remove(1).unwrap();
+        queues.requeue(1, Item { generation: Some(1), text: "removed".into(),
+            clear_first: false, attempts: 1, draft_noticed: false,
+            source: crate::agents::Source::Human }).unwrap();
+        assert!(queues.inner.lock().is_empty(), "late tasks cannot recreate deleted queues");
+    }
+
+    #[test]
+    fn an_attempt_neither_changes_the_count_nor_writes_for_busy_alone() {
+        let store = crate::store::Store::open_memory().unwrap();
+        let queues = Queues::load(&store).unwrap();
+        let item = Item { generation: Some(1), text: "later".into(), clear_first: false, attempts: 0,
+            draft_noticed: false, source: crate::agents::Source::Human };
+        queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(item.clone()); }).unwrap();
+        let count = || waiting(&queues.inner.lock()[&1]);
+        assert_eq!(count(), 1);
+        // Taking the prompt for an attempt, then putting it back (a draft or dialog), keeps
+        // the count steady, so the tab's queued badge doesn't flicker.
+        queues.edit(1, |q| { let item = q.items.pop_front().unwrap(); q.active = Some(Active { item, stage: Stage::Selected }); }).unwrap();
+        assert_eq!(count(), 1);
+        queues.requeue(1, item).unwrap();
+        assert_eq!(count(), 1);
+        // `busy` is in memory only: flipping it never needs the database.
+        store.fail_runtime_writes_for_test();
+        queues.edit(1, |q| q.busy = true).unwrap();
+        queues.edit(1, |q| q.busy = false).unwrap();
+        assert!(queues.edit(1, |q| q.last_sent = Some("x".into())).is_err());
     }
 
     #[test]

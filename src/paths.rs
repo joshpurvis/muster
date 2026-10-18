@@ -52,8 +52,15 @@ pub fn port_override() -> anyhow::Result<Option<u16>> {
 pub fn discovery_path() -> PathBuf {
     runtime_dir().join("daemon.json")
 }
+/// Held by the terminal host for its whole life (see `terminal::ensure_host`). Older,
+/// monolithic builds take this lock to start, so they refuse to run beside surviving
+/// host-owned terminals and can't autostart duplicates of them.
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("daemon.lock")
+}
+/// One application backend per runtime directory.
+pub fn backend_lock_path() -> PathBuf {
+    runtime_dir().join("backend.lock")
 }
 pub fn log_path() -> PathBuf {
     runtime_dir().join("daemon.log")

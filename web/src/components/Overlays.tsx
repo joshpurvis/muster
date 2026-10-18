@@ -730,7 +730,14 @@ function Shortcuts() {
 // ---------------- confirm ----------------
 
 function Confirm(
-  props: { title: string; body: string; confirmLabel: string; danger?: boolean; run: () => void },
+  props: {
+    title: string;
+    body: string | string[];
+    confirmLabel: string;
+    danger?: boolean;
+    run: () => void;
+    secondary?: { label: string; run: () => void };
+  },
 ) {
   const ok = useRef<HTMLButtonElement>(null);
   const cancel = useRef<HTMLButtonElement>(null);
@@ -742,16 +749,30 @@ function Confirm(
         <h2>{props.title}</h2>
       </div>
       <div class="dlg-body">
-        <p>{props.body}</p>
+        {(Array.isArray(props.body) ? props.body : [props.body]).map((text, i) => <p key={i}>{text}</p>)}
       </div>
       <div class="dlg-foot">
         <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
+        {props.secondary && (
+          <button
+            type="button"
+            class="btn"
+            onClick={() => {
+              // Back to the terminal, as Cancel does (the dialog's own focus memory pointed
+              // at a button that is gone).
+              close();
+              props.secondary!.run();
+            }}
+          >
+            {props.secondary.label}
+          </button>
+        )}
         <button
           ref={ok}
           type="button"
           class={cx("btn", props.danger ? "btn-danger" : "btn-primary")}
           onClick={() => {
-            overlay.value = null;
+            close();
             props.run();
           }}
         >

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
+import { rpc } from "../rpc.ts";
 import { act, canInteract, errorText, notify, ready } from "./store.ts";
 import { Approval, Icon } from "./ui.tsx";
 
@@ -27,16 +28,21 @@ export function Composer(
   const [collapsed, setCollapsed] = useState(false);
   const [options, setOptions] = useState(false);
   const [sending, setSending] = useState(false);
+  const [queue, setQueue] = useState<{ queued: string[]; uncertain: string | null; paused: boolean } | null>(null);
   const card = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const timer = useRef(0);
   const held = useRef(false);
+  // Typing paused after an input interruption, until the user has checked the terminal.
+  const paused = !!s.input_interrupted && s.state !== "exited";
   const reason = !ready.value
     ? "Disconnected — reconnecting…"
     : s.state === "exited"
     ? "Session exited"
     : !canInteract.value
     ? "This device has view access only"
+    : paused
+    ? "Typing is paused until you continue"
     : "";
   const disabled = !!reason;
   useLayoutEffect(() => {
@@ -91,7 +97,10 @@ export function Composer(
           <section class="composer" aria-label="Message composer">
             <div class="composer-handle">
               <span>
-                {s.queued > 0
+                {queue
+                  // The same terms as the review below: Resume sends the waiting prompts.
+                  ? `${queue.queued.length} waiting${queue.uncertain ? " · 1 interrupted" : ""}`
+                  : s.queued > 0
                   ? `${s.queued} queued`
                   : s.state === "needs_approval"
                   ? "Approval needed"
@@ -99,6 +108,12 @@ export function Composer(
                   ? "Your answer"
                   : "Message"}
               </span>
+              {s.queued > 0 && (
+                <button type="button" disabled={!ready.value} onClick={async () => {
+                  try { setQueue(await rpc.call("session.queue", { id: s.id })); }
+                  catch (error) { notify(errorText(error)); }
+                }}>Review queue</button>
+              )}
               <button
                 type="button"
                 class="collapse-button"
@@ -111,6 +126,54 @@ export function Composer(
                 <Icon name="down" />
               </button>
             </div>
+            {queue && (
+              <div class="approval-prompt queue-review">
+                {queue.uncertain && <p>Interrupted, may have been typed only partly: {queue.uncertain.slice(0, 300)}</p>}
+                {queue.uncertain && (
+                  <p class="queue-guidance queue-check">Check the terminal before sending this prompt again.</p>
+                )}
+                <p class="queue-guidance">
+                  {queue.queued.length} {queue.queued.length === 1 ? "prompt" : "prompts"} waiting.{" "}
+                  {queue.paused && "Resume sends them and forgets only the interrupted one. "}
+                  Clear queue discards every queue record. Typed text and commands already run stay either way.
+                </p>
+                <div class="approval-actions">
+                  {queue.paused && (
+                    <button type="button" disabled={disabled} onClick={async () => {
+                      try {
+                        await rpc.call("session.resume_queue", { id: s.id });
+                        setQueue(null);
+                        notify("Queue resumed");
+                      } catch (error) { notify(errorText(error)); }
+                    }}>Resume queue</button>
+                  )}
+                  <button type="button" disabled={disabled} onClick={async () => {
+                    try {
+                      await rpc.call("session.clear_queue", { id: s.id });
+                      setQueue(null);
+                      notify("Queue cleared");
+                    } catch (error) { notify(errorText(error)); }
+                  }}>Clear queue</button>
+                  <button type="button" onClick={() => setQueue(null)}>Close</button>
+                </div>
+              </div>
+            )}
+            {paused && (
+              <div class="approval-prompt queue-review" role="alert">
+                <p class="queue-guidance queue-check">
+                  Typing is paused: some input may not have reached this terminal. Check the screen before you
+                  continue.
+                </p>
+                <div class="approval-actions">
+                  <button type="button" disabled={!ready.value || !canInteract.value} onClick={async () => {
+                    try {
+                      await rpc.call("session.continue_input", { id: s.id });
+                      notify("Typing resumed");
+                    } catch (error) { notify(errorText(error)); }
+                  }}>Continue typing</button>
+                </div>
+              </div>
+            )}
             {(s.state === "needs_approval" || s.state === "asking_question") && (
               <div class="approval-prompt">
                 <p>{s.state_detail || "The agent is waiting for you."}</p>

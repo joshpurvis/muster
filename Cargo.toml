@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/terminal-core", "crates/terminal-protocol", "crates/terminal-host"]
+resolver = "3"
+
 [package]
 name = "muster"
 version = "0.1.0"
@@ -8,6 +12,8 @@ default = []
 gui = ["dep:wry", "dep:tao"]
 
 [dependencies]
+muster-terminal-protocol = { path = "crates/terminal-protocol" }
+muster-terminal-core = { path = "crates/terminal-core" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
@@ -17,17 +23,16 @@ futures = "0.3"
 libc = "0.2"
 notify-rust = "4"
 parking_lot = "0.12"
-portable-pty = "0.9"
 rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rust-embed = "8"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-vt100 = "0.16"
 wry = { version = "0.53", optional = true }
 tao = { version = "0.34", optional = true }
 

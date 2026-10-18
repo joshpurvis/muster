@@ -259,10 +259,13 @@ export type Overlay =
   | {
     kind: "confirm";
     title: string;
-    body: string;
+    /** One paragraph, or several. */
+    body: string | string[];
     confirmLabel: string;
     danger?: boolean;
     run: () => void;
+    /** A second, non-destructive action shown before the confirm button. */
+    secondary?: { label: string; run: () => void };
   }
   | null;
 export const overlay = signal<Overlay>(null);
@@ -271,18 +274,27 @@ export interface Toast {
   id: number;
   level: "info" | "warn" | "error" | "success";
   text: string;
+  /** A toast that is updated or dismissed as its subject changes (one per key). */
+  key?: string;
 }
 export const toasts = signal<Toast[]>([]);
 let toastSeq = 0;
-export function toast(level: Toast["level"], text: string, ms?: number) {
+export function toast(level: Toast["level"], text: string, ms?: number, key?: string) {
+  if (key && toasts.value.some((t) => t.key === key)) {
+    toasts.value = toasts.value.map((t) => t.key === key ? { ...t, level, text } : t);
+    return;
+  }
   const id = ++toastSeq;
   // Collapse exact duplicates that arrive in a burst.
   if (toasts.value.some((t) => t.text === text && t.level === level)) return;
-  toasts.value = [...toasts.value, { id, level, text }].slice(-5);
+  toasts.value = [...toasts.value, { id, level, text, key }].slice(-5);
   setTimeout(() => dismissToast(id), ms ?? (level === "error" ? 8000 : 4000));
 }
 export function dismissToast(id: number) {
   toasts.value = toasts.value.filter((t) => t.id !== id);
+}
+export function dismissToastKey(key: string) {
+  toasts.value = toasts.value.filter((t) => t.key !== key);
 }
 
 /** A tab (session) whose close awaits the inline "Close? ⏎ / Esc". */

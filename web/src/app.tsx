@@ -74,9 +74,11 @@ mq.addEventListener("change", applyThemePref);
 
 // ---------- wiring ----------
 terms.setFontSize(prefs.value.fontSize);
+terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
+  A.deliveriesNeedReview(h.paused_deliveries ?? []);
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
   if (reconnect) terms.reattachAll();
@@ -137,6 +139,8 @@ rpc.start();
     return out.join("\n");
   },
   attached: () => terms.attachedSids(),
+  /** The live (mutable) xterm instance of a session, for fixtures and latency probes. */
+  term: (sid: number) => terms.terminal(sid),
 };
 
 // ---------- components ----------
@@ -214,6 +218,11 @@ function EmptyWindow() {
 
 function Splash() {
   const s = connStatus.value;
+  if (s === "incompatible") {
+    return <div class="splash"><div class="welcome-card"><h1>UI update required</h1>
+      <p>Install a UI compatible with this backend, then refresh. Your terminals remain running.</p>
+    </div></div>;
+  }
   if (s === "no_token") {
     return (
       <div class="splash">
@@ -241,7 +250,7 @@ function Splash() {
 
 function App() {
   const ready = helloDone.value && (!windowsSupported.value || windowId.value !== null);
-  if (!ready) {
+  if (!ready || connStatus.value === "incompatible") {
     return (
       <>
         <Splash />

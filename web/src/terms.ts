@@ -12,6 +12,13 @@ import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
 import type { SessionInfo } from "./types.ts";
 
 const MAX_WEBGL = 10;
+
+/** Is typing into this session paused (an input interruption the user has not cleared)?
+ * Keystrokes are dropped here too, so nothing is sent that the backend would refuse. */
+let inputPaused: (sid: number) => boolean = () => false;
+export function setInputPaused(paused: (sid: number) => boolean) {
+  inputPaused = paused;
+}
 const FONT_FAMILY =
   '"JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, ui-monospace, monospace';
 
@@ -24,11 +31,6 @@ interface Entry {
   host: HTMLElement | null;
   webgl: WebglAddon | null;
   webglFailed: boolean;
-  queue: Uint8Array[];
-  queued: number;
-  raf: number;
-  /** Fallback flush for hidden tabs (no rAF there). */
-  flushTimer: number;
   /** The parser is inside replayed scrollback (between the in-band markers, see
    * `writeReplay`): queries in it are old, so xterm must not answer them. Typing is never
    * blocked. */
@@ -232,11 +234,13 @@ function create(sid: number): Entry {
   term.onData((d) => {
     if (userInput) takeSizeBack(entry);
     userInput = false;
+    if (inputPaused(sid)) return;
     rpc.sendInput(sid, enc.encode(d));
   });
   term.onBinary((d) => {
     const b = new Uint8Array(d.length);
     for (let i = 0; i < d.length; i++) b[i] = d.charCodeAt(i) & 0xff;
+    if (inputPaused(sid)) return;
     rpc.sendInput(sid, b);
   });
   term.onResize(({ cols, rows }) => sendResize(entry, cols, rows));
@@ -254,10 +258,6 @@ function create(sid: number): Entry {
     host: null,
     webgl: null,
     webglFailed: false,
-    queue: [],
-    queued: 0,
-    raf: 0,
-    flushTimer: 0,
     inReplay: false,
     pasteTimer: 0,
     pasteRead: null,
@@ -505,67 +505,31 @@ export function dispose(sid: number) {
   const e = entries.get(sid);
   if (!e) return;
   entries.delete(sid);
-  if (e.raf) cancelAnimationFrame(e.raf);
-  clearTimeout(e.flushTimer);
   clearTimeout(e.pasteTimer);
   clearTimeout(e.resizeTimer);
   clearTimeout(e.evictTimer);
-  e.raf =
-    e.flushTimer =
-    e.pasteTimer =
+  e.pasteTimer =
     e.evictTimer =
       0;
-  e.queue = [];
-  e.queued = 0;
   if (e.host) ro.unobserve(e.host);
   disableWebgl(e);
   e.term.dispose();
   e.el.remove();
 }
 
-function flush(e: Entry) {
-  if (e.raf) cancelAnimationFrame(e.raf);
-  clearTimeout(e.flushTimer);
-  e.raf = e.flushTimer = 0;
-  if (!e.queue.length || entries.get(e.sid) !== e) return;
-  let data: Uint8Array;
-  if (e.queue.length === 1) data = e.queue[0];
-  else {
-    data = new Uint8Array(e.queued);
-    let off = 0;
-    for (const c of e.queue) {
-      data.set(c, off);
-      off += c.length;
-    }
-  }
-  e.queue = [];
-  e.queued = 0;
-  e.term.write(data);
-}
-
 rpc.onBinary = (type, sid, payload) => {
   const e = entries.get(sid);
   if (!e) return;
   if (type === FRAME_REPLAY) {
-    // Output not yet handed to xterm is superseded by the replay.
-    e.queue = [];
-    e.queued = 0;
-    if (e.raf) cancelAnimationFrame(e.raf);
-    clearTimeout(e.flushTimer);
-    e.raf = e.flushTimer = 0;
     writeReplay(e, payload.slice());
     return;
   }
   if (type !== FRAME_OUTPUT) return;
+  // Straight to xterm, which batches parsing itself and paints once per frame. Holding
+  // output for our own animation frame cost a whole extra frame on every echo: the write
+  // then landed inside a rAF callback, so xterm's render request waited for the next one.
   // Copy: the underlying buffer may be reused.
-  e.queue.push(payload.slice());
-  e.queued += payload.length;
-  if (e.queued > 1 << 20) flush(e);
-  else if (!e.raf) {
-    e.raf = requestAnimationFrame(() => flush(e));
-    // Hidden tabs don't run rAF; make sure output still lands.
-    e.flushTimer = setTimeout(() => flush(e), 250);
-  }
+  e.term.write(payload.slice());
 };
 
 export function focusTerminal(sid: number): boolean {

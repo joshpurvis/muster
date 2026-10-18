@@ -52,7 +52,18 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
-| `muster status` / `stop` / `url` / `daemon` / `hook` | As before. |
+| `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
+| `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it. Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
+| `muster reload` | Replace the application backend while its terminal host and terminal processes keep running. Clients reconnect to the same endpoint. |
+| `muster stop` | Explicitly stop both backend and terminal host, terminating sessions. |
+| `muster status` / `url` / `daemon` / `hook` | As before. |
+
+New sessions receive `$MUSTER_BIN` pointing to `<data>/bin/muster`; agent hooks use the
+same stable executable path. Successful backend startup atomically switches it to a
+private copy of that build, so callers survive deletion of the original checkout.
+The first startup requires both executables side by side; backend-only updates can
+reuse the saved host binary. This never restarts a running host. Executable snapshots
+under `<data>/application-releases` are retained rather than pruned during updates.
 
 Inside a muster session, `send`, `keys`, `ask` and `new` pass `$MUSTER_SESSION_ID` to the daemon
 as `from_session`, so what an agent does through the CLI is attributed to it: `send` and `ask` run

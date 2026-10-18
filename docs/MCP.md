@@ -142,9 +142,9 @@ bots → agents move also rewrites exact occurrences of those names (and
 
 **Limits** (not closed): an agent that drops `MUSTER_SESSION_ID` and calls the API with the client
 token is the human as far as the daemon can tell (the documented client-token limit, PROTOCOL.md
-"Limits"). Provenance lives in memory: after a daemon restart every session is human-rooted
-again (their processes were stopped; a restarted agent resumes its conversation but has no pending
-message). Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
+"Limits"). Provenance, active message attribution and prompt queues persist across backend
+replacement. Surviving terminal processes retain their tokens and non-human origin. Hook
+callbacks from new runs use a durable inbox while the backend is unavailable. Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
 prompt typed in their terminal never clears provenance (stricter, never looser). Replies need the
 Stop hook or Codex notify; without them `ask_agent` returns the unattributed terminal tail.
 
@@ -210,12 +210,12 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 
 | Rule | Value |
 |---|---|
-| Spawn depth | A human-started session is depth 0. Its children are depth 1, and so on. Max depth **3**: a depth-3 session can't spawn. Computed by walking `parent_id` (cycle-safe), and also remembered at spawn time, so removing an ancestor can't shorten a lineage. (The remembered depths live in memory; after a daemon restart only the `parent_id` walk remains.) |
+| Spawn depth | A human-started session is depth 0. Its children are depth 1, and so on. Max depth **3**: a depth-3 session can't spawn. Computed by walking `parent_id` (cycle-safe), and also remembered at spawn time, so removing an ancestor can't shorten a lineage. Remembered parent depths persist before spawn, so backend replacement can recover a child even when its acknowledgement was lost. |
 | Live children per caller | **8** (live sessions whose `parent_id` is the caller) |
 | Live MCP-spawned sessions, daemon-wide | **24** (live sessions with any `parent_id`) |
-| `send_message` rate | **20 per 60 s** sliding window, per caller. A send that fails (e.g. the PTY is gone) doesn't use up a slot. |
+| `send_message` rate | **20 per 60 s** sliding window, per caller. A refusal before durable queue acceptance doesn't use up a slot; retained or uncertain deliveries still count. |
 | `spawn_session` rate | **10 per 10 minutes** sliding window, per caller. Refused or failed spawns don't use up a slot. |
-| Agent-created channels | At most **10** non-archived channels created through `spawn_session`'s `new_channel`, daemon-wide. Spawning into existing channels is not affected. (Tracked in memory: after a daemon restart, earlier channels no longer count.) |
+| Agent-created channels | At most **10** non-archived channels created through `spawn_session`'s `new_channel`, daemon-wide. Spawning into existing channels is not affected. Channel origin is recorded in the same transaction as creation, so earlier open channels still count after backend replacement. |
 | Shell commands | Off by default, see below. |
 | Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
@@ -259,3 +259,8 @@ either is on. Agents can see the current setting in `whoami`'s `policy`.
 If `spawn_session` created a new channel and the spawn then fails, the channel (and its
 worktree) is archived again.
 Spawn limits apply to MCP spawns only. Humans can start any number of sessions from the UI.
+
+MCP guard state is durable application state. Rate-limit reservations are saved before
+agent actions; a failed persistence write refuses the action. Backend replacement
+restores rate windows, send/delivery markers, created-channel membership and remembered
+spawn depths. This state is independent of terminal-host lifetime and protocol.

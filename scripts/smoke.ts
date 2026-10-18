@@ -11,7 +11,11 @@ const DATA = `${BASE}/data`;
 const RUNTIME = `${BASE}/run`;
 const REPO = `${BASE}/repo`;
 // Sessions run $SHELL; the test types bash syntax.
-const ENV = { MUSTER_DATA_DIR: DATA, MUSTER_RUNTIME_DIR: RUNTIME, MUSTER_PORT: String(PORT), SHELL: "/bin/bash" };
+const ENV = {
+  MUSTER_DATA_DIR: DATA, MUSTER_RUNTIME_DIR: RUNTIME, MUSTER_PORT: String(PORT), SHELL: "/bin/bash",
+  HOME: `${BASE}/home`, MUSTER_URL: "", MUSTER_TOKEN: "", MUSTER_BIN: "",
+  MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "", MUSTER_RUN: "",
+};
 
 let passed = 0;
 function ok(cond: unknown, what: string): void {
@@ -62,6 +66,7 @@ async function startDaemon(): Promise<Daemon> {
     stderr: "piped",
   }).spawn();
   const log: string[] = [];
+  current = { proc, log, token: "" };
   for (const s of [proc.stdout, proc.stderr]) {
     (async () => {
       for await (const chunk of s) log.push(dec.decode(chunk));
@@ -652,7 +657,8 @@ async function main() {
   const comp = await c.call("fs.complete", { prefix: `${BASE}/re` });
   ok(comp.entries.includes(`${BASE}/repo/`), "fs.complete");
 
-  // --- hard crash: sessions become exited on restart
+  // --- backend crash: the host keeps the same processes and replay alive
+  const beforeCrash = (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
   c.close();
   console.log("SIGKILL daemon, restart");
   await sleep(3500); // let the periodic flush persist output.log
@@ -665,14 +671,14 @@ async function main() {
   await c.open();
   let h = await c.call("hello");
   let s = h.sessions.find((x: Json) => x.id === sid);
-  ok(s.state === "exited" && s.state_detail === "daemon restarted", "after crash: session exited (daemon restarted)");
+  ok(s.state !== "exited" && s.pid === beforeCrash.pid, "after backend crash: original terminal process survives");
   ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
   ok(canon(h.windows.find((w: Json) => w.id === 1).layout) === canon(layout) && s.window_id === 1, "window layouts and session windows persist");
   await c.call("session.attach", { id: sid });
   await c.waitFor("replay after restart", () => c.frames.some((f) => f.id === sid && f.type === 0x03));
   const replayed = c.terminal(sid);
   // 2 MiB of output plus a short terminal-mode prefix.
-  ok(replayed.includes(marker) && replayed.length <= 2 * 1024 * 1024 + 256, "exited session replays persisted output.log (capped at 2 MiB)");
+  ok(replayed.includes(marker) && replayed.length <= 2 * 1024 * 1024 + 256, "surviving session replays host output (capped at 2 MiB)");
 
   // restart the session: same id, new process, replay cleared
   const rs = await c.call("session.restart", { id: sid });
@@ -712,7 +718,8 @@ async function main() {
   await c.waitFor("leftover check", () => c.terminal(sid).includes("BG-GONE1") || c.terminal(sid).includes("BG-ALIVE\r"));
   ok(c.terminal(sid).includes("BG-GONE1"), "background job of an exited shell killed by session.kill");
 
-  // --- clean shutdown
+  // --- clean backend shutdown also preserves terminals
+  const beforeCleanStop = (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
   c.close();
   console.log("SIGTERM daemon, restart");
   const status = await stopDaemon(d, "SIGTERM");
@@ -723,7 +730,7 @@ async function main() {
   await c.open();
   h = await c.call("hello");
   s = h.sessions.find((x: Json) => x.id === sid);
-  ok(s.state === "exited" && s.state_detail === "daemon stopped", "after clean stop: session exited (daemon stopped)");
+  ok(s.state !== "exited" && s.pid === beforeCleanStop.pid, "after clean backend stop: original terminal process survives");
 
   // archive with worktree removal (branch kept)
   await c.call("channel.archive", { id: ch.id, remove_worktree: true });
@@ -788,18 +795,30 @@ async function main() {
   console.log(`\nPASS (${passed} checks)`);
 }
 
+let failed = false;
 try {
+  await Deno.mkdir(`${BASE}/home`, { recursive: true, mode: 0o700 });
   await main();
 } catch (e) {
+  failed = true;
   console.error(String(e));
+  if (current) console.error("--- daemon log ---\n" + current.log.join("").slice(-4000));
+} finally {
   if (current) {
-    console.error("--- daemon log ---\n" + current.log.join("").slice(-4000));
     try {
       current.proc.kill("SIGTERM");
       await current.proc.status;
-    } catch {
-      // already gone
-    }
+    } catch { /* already gone: only our child handle is ever signalled */ }
   }
-  Deno.exit(1);
+  // The backend child is reaped. Remove its discovery before the explicit host stop,
+  // so cleanup never signals a recycled PID from a stale discovery file.
+  try { await Deno.remove(`${RUNTIME}/daemon.json`); } catch { /* absent */ }
+  const cleanup = await new Deno.Command(BIN, {
+    args: ["stop"], env: ENV, stdin: "null", stdout: "piped", stderr: "piped",
+  }).output();
+  if (!cleanup.success) {
+    failed = true;
+    console.error("isolated host cleanup failed: " + dec.decode(cleanup.stderr));
+  }
 }
+if (failed) Deno.exit(1);

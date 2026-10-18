@@ -5,8 +5,10 @@ mod cli;
 mod client;
 mod detect;
 mod devices;
+mod executables;
 mod gui;
 mod hookcmd;
+mod hook_inbox;
 mod hub;
 mod inject;
 mod mcp;
@@ -17,6 +19,7 @@ mod pty;
 mod rpc;
 mod server;
 mod store;
+mod terminal;
 mod wm;
 mod worktree;
 
@@ -64,6 +67,13 @@ enum Cmd {
     Status,
     /// Stop the daemon (running sessions are terminated).
     Stop,
+    /// Restart only the application backend; host-owned terminal processes continue.
+    Reload,
+    /// Activate a built UI directory without restarting backend or terminals.
+    UiInstall {
+        /// Built UI directory (for example web/dist).
+        path: PathBuf,
+    },
     /// Print the UI URL (with its access token).
     Url,
     /// Open a UI window; with PATH, add the folder and open a shell tab there.
@@ -117,6 +127,18 @@ enum Cmd {
         /// With --wait: give up after SECS (exit 124).
         #[arg(long, value_name = "SECS", default_value_t = 600)]
         timeout: u64,
+    },
+    /// Inspect queued prompts and any delivery paused for review after a backend crash.
+    Queue {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// Discard waiting/uncertain delivery records after inspecting the terminal.
+        #[arg(long, conflicts_with = "resume")]
+        clear: bool,
+        /// Mark the uncertain delivery as reviewed and resume the prompts waiting behind it
+        /// (the uncertain prompt is not resent).
+        #[arg(long)]
+        resume: bool,
     },
     /// Block until a session reaches a state (exit 124 on timeout).
     Wait {
@@ -427,6 +449,14 @@ fn main() -> ExitCode {
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
+        Some(Cmd::Reload) => reload(),
+        Some(Cmd::UiInstall { path }) => {
+            if std::env::var_os("MUSTER_WEB_DIR").is_some() {
+                Err(anyhow::anyhow!("MUSTER_WEB_DIR overrides installed UI releases; update that directory or unset the override on the backend"))
+            } else {
+                assets::install(&path, &paths::data_dir()).map(|release| println!("UI activated at {}; refresh the window", release.display()))
+            }
+        },
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {
@@ -487,6 +517,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::wait(d, &target, until, timeout, json),
+        Cmd::Queue { target, clear, resume } => cli::queue(d, &target, clear, resume),
         Cmd::Keys { target, keys } => cli::keys(d, &target, &keys),
         Cmd::Approve { target, always, deny } => cli::approve(d, &target, always, deny),
         Cmd::Interrupt { target } => cli::by_id(d, &target, "session.interrupt"),
@@ -679,10 +710,71 @@ fn status() -> anyhow::Result<()> {
 }
 
 fn stop() -> anyhow::Result<()> {
+    stop_backend(None)?;
+    let socket = paths::runtime_dir().join("terminal.sock");
+    match muster_terminal_protocol::client::Client::connect(&socket) {
+        Ok(host) => {
+            anyhow::ensure!(host.hello.data_dir == std::fs::canonicalize(paths::data_dir().join("terminal"))?,
+                "terminal host belongs to another data directory");
+            host.call(muster_terminal_protocol::Command::Shutdown)?;
+            let end = Instant::now() + Duration::from_secs(10);
+            while socket.exists() {
+                anyhow::ensure!(Instant::now() < end, "terminal host did not stop within 10s");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            println!("muster terminal host stopped");
+        }
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|
+            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => {},
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
+/// compatible host and the same backend identity immediately before signalling.
+fn reload() -> anyhow::Result<()> {
+    let discovery = paths::read_discovery().filter(|d| paths::pid_alive(d.pid) && is_muster_process(d.pid));
+    if let Some(d) = &discovery {
+        let hello = client::rpc(d, "hello", serde_json::json!({}))
+            .context("cannot verify restart safety; backend left running")?;
+        let host = terminal::TerminalService::connect(
+            &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
+        ).context("cannot verify a compatible terminal host; backend left running")?;
+        check_reload(&hello, &host.client.hello, &paths::lock_path())?;
+        stop_backend(Some(d))?;
+    }
+    start_daemon_detached()?;
+    println!("muster backend restarted; terminals preserved");
+    Ok(())
+}
+
+/// Everything the replacement backend will require of the running host, checked before
+/// the working backend is stopped: a refused reload leaves it running.
+fn check_reload(backend: &serde_json::Value, host: &muster_terminal_protocol::Hello, lock: &std::path::Path)
+    -> anyhow::Result<()> {
+    validate_reload_host(backend, host)?;
+    // The replacement refuses a host whose fence it cannot verify (`terminal::ensure_host`).
+    terminal::verify_fence(host, lock)
+        .context("the replacement backend would refuse this terminal host; backend left running")
+}
+
+fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_protocol::Hello) -> anyhow::Result<()> {
+    anyhow::ensure!(backend["terminal_host"]["protocol"].as_u64() == Some(host.protocol as u64)
+        && backend["terminal_host"]["instance"].as_str() == Some(host.instance.as_str()),
+        "backend does not confirm ownership by this terminal host; reload refused to preserve existing terminals");
+    Ok(())
+}
+
+fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
     let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
         println!("muster daemon: not running");
         return Ok(());
     };
+    if let Some(expected) = expected {
+        anyhow::ensure!(d.pid == expected.pid && d.token == expected.token && d.port == expected.port,
+            "backend changed while preparing reload; nothing was stopped");
+    }
     // Guard against a stale daemon.json whose pid now belongs to an unrelated process.
     if !is_muster_process(d.pid) {
         let _ = std::fs::remove_file(paths::discovery_path());
@@ -694,7 +786,7 @@ fn stop() -> anyhow::Result<()> {
         libc::kill(d.pid as libc::pid_t, libc::SIGTERM);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while paths::pid_alive(d.pid) {
+    while paths::pid_alive(d.pid) && is_muster_process(d.pid) {
         if Instant::now() > deadline {
             anyhow::bail!("daemon (pid {}) did not stop within 10s", d.pid);
         }
@@ -789,7 +881,7 @@ fn acquire_lock() -> anyhow::Result<DaemonLock> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(paths::lock_path())?;
+        .open(paths::backend_lock_path())?;
     // SAFETY: flock on an fd we own.
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if r != 0 {
@@ -813,18 +905,27 @@ fn load_client_token() -> anyhow::Result<String> {
 
 async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
     use tokio::net::TcpListener;
-    if let Some(port) = paths::port_override()? {
-        return TcpListener::bind(("127.0.0.1", port))
-            .await
-            .with_context(|| format!("binding 127.0.0.1:{port} (MUSTER_PORT)"));
+    let saved_path = paths::runtime_dir().join("application-port");
+    let saved: Option<u16> = match std::fs::read_to_string(&saved_path) {
+        Ok(port) => Some(port.trim().parse().context("invalid saved application port")?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let requested = paths::port_override()?;
+    if let (Some(saved), Some(requested)) = (saved, requested.filter(|p| *p != 0)) {
+        anyhow::ensure!(saved == requested, "application port is pinned to {saved} for surviving terminals; cannot switch to {requested}");
     }
-    match TcpListener::bind(("127.0.0.1", paths::DEFAULT_PORT)).await {
-        Ok(l) => Ok(l),
-        Err(e) => {
-            tracing::info!("port {} unavailable ({e}); picking a free port", paths::DEFAULT_PORT);
-            Ok(TcpListener::bind(("127.0.0.1", 0)).await?)
+    let port = saved.or(requested).unwrap_or(paths::DEFAULT_PORT);
+    let listener = match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(error) if saved.is_none() && requested.is_none() => {
+            tracing::info!("port {port} unavailable ({error}); assigning the initial application port");
+            TcpListener::bind(("127.0.0.1", 0)).await?
         }
-    }
+        Err(error) => return Err(error).with_context(|| format!("binding pinned application port {port}")),
+    };
+    paths::write_private(&saved_path, listener.local_addr()?.port().to_string().as_bytes())?;
+    Ok(listener)
 }
 
 fn run_daemon() -> anyhow::Result<()> {
@@ -852,27 +953,38 @@ fn run_daemon() -> anyhow::Result<()> {
 async fn daemon_main() -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // The terminal host and its rollback fence first: an older, monolithic daemon holding
+    // daemon.lock must stop this backend before it opens the shared database.
+    let release = executables::prepare(&paths::data_dir(), &std::env::current_exe()?)?;
+    let terminal_host = terminal::ensure_host(&release.host())?;
     let listener = bind().await?;
     let port = listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
-    // Before the hub loads the records and anything starts in those folders.
-    if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
-        tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
+    let hook_inbox = hook_inbox::Inbox::open(&hook_inbox::path())?;
+    // Never move a directory beneath a surviving process during a backend update.
+    if !terminal_host.inventory()?.iter().any(|run| run.has_processes) {
+        if let Err(e) = agents::relocate_homes(&store, &paths::data_dir()) {
+            tracing::warn!("moving agent homes to {}: {e:#}", paths::agents_dir().display());
+        }
     }
-    let muster_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .unwrap_or_else(|| PathBuf::from("muster"));
+    let muster_bin = release.command();
     let hub = hub::Hub::new(
         hub::HubConfig {
             port,
             client_token: client_token.clone(),
             muster_bin,
+            terminal_host: Some(terminal_host),
         },
         store,
     )?;
 
+    hook_inbox::spawn(&hub, hook_inbox)?;
+    hub::spawn_input_attribution(&hub)?;
+    let app = server::router(hub.clone())?;
+    // Publish the helper only after application recovery succeeds. Existing
+    // terminals keep this path even when the original build directory is removed.
+    release.activate()?;
     inject::spawn_tasks(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
@@ -896,8 +1008,9 @@ async fn daemon_main() -> anyhow::Result<()> {
         });
     }
 
-    // Periodically persist scrollback so a crash loses at most a few seconds.
-    // Appends only what's new since the last flush, without fsync.
+    // Retry application-owned removal intents after process exit and drain, and adopt
+    // launches whose acknowledgement was lost.
+    // Terminal logs are flushed autonomously by the host.
     {
         let hub = hub.clone();
         tokio::spawn(async move {
@@ -905,7 +1018,14 @@ async fn daemon_main() -> anyhow::Result<()> {
             loop {
                 t.tick().await;
                 let h = hub.clone();
-                let _ = tokio::task::spawn_blocking(move || h.flush_logs()).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = h.reconcile_pending() {
+                        tracing::warn!("reconciling unconfirmed launches: {error:#}");
+                    }
+                    if let Err(error) = h.reconcile_retired() {
+                        tracing::warn!("completing terminal retirement: {error:#}");
+                    }
+                }).await;
             }
         });
     }
@@ -914,8 +1034,16 @@ async fn daemon_main() -> anyhow::Result<()> {
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
 
-    let app = server::router(hub.clone());
     // Peer addresses let `/api/exchange` check which local user owns the connecting socket.
+    // TCP_NODELAY: terminal echo is a stream of small WebSocket frames. With Nagle's algorithm
+    // a frame written while the previous one is unacknowledged waits for the peer's delayed
+    // ACK (about 40 ms on Linux), which showed up as echo stalls during fast typing.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        if let Err(error) = tcp.set_nodelay(true) {
+            tracing::debug!("setting TCP_NODELAY: {error}");
+        }
+    });
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -1040,5 +1168,32 @@ mod tests {
             parse(&["events"]).unwrap(),
             Cmd::Events { json: false, session: None, tab: None }
         ));
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn reload_refuses_legacy_and_different_host_backends() {
+        let host = muster_terminal_protocol::Hello { protocol: 1, instance: "one".into(),
+            pid: 1, data_dir: PathBuf::from("/unused"), fence: None };
+        assert!(validate_reload_host(&serde_json::json!({"version": "0.1.0"}), &host).is_err());
+        assert!(validate_reload_host(&serde_json::json!({"terminal_host": {"protocol": 1, "instance": "other"}}), &host).is_err());
+        assert!(validate_reload_host(&serde_json::json!({"terminal_host": host}), &host).is_ok());
+        // A host the replacement would refuse (no fence it can verify) stops the reload
+        // before the working backend is signalled.
+        let lock = std::env::temp_dir().join(format!("muster-reload-fence-{}", rand::random::<u64>()));
+        std::fs::write(&lock, b"").unwrap();
+        let backend = serde_json::json!({"terminal_host": host});
+        let error = check_reload(&backend, &host, &lock).unwrap_err();
+        assert!(format!("{error:#}").contains("backend left running"), "{error:#}");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&lock).unwrap();
+        let fenced = muster_terminal_protocol::Hello { fence: Some(muster_terminal_protocol::FenceLock {
+            path: lock.clone(), dev: metadata.dev(), ino: metadata.ino() }), ..host.clone() };
+        check_reload(&serde_json::json!({"terminal_host": fenced}), &fenced, &lock).unwrap();
+        std::fs::remove_file(&lock).unwrap();
     }
 }

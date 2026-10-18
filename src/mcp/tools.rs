@@ -767,19 +767,20 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
             st.limits.max_mcp_channels
         ));
     }
-    if let Err(wait_s) = st.guard.lock().spawns.check_and_record(
-        caller,
-        now_ms(),
-        st.limits.spawn_per_window,
-        st.limits.spawn_window_ms,
-    ) {
+    if let Err(wait_s) = st.edit_guard(|g| {
+        let allowed = g.spawns.check_and_record(caller, now_ms(), st.limits.spawn_per_window, st.limits.spawn_window_ms);
+        if allowed.is_ok() { g.spawned_depth.insert(caller, b.caller_depth); }
+        allowed
+    })? {
         return Err(format!(
             "rate limit: at most {} spawns per {} minutes. Try again in {wait_s}s.",
             st.limits.spawn_per_window,
             st.limits.spawn_window_ms / 60_000
         ));
     }
-    let refund = || st.guard.lock().spawns.refund(caller);
+    let refund = || {
+        if let Err(error) = st.edit_guard(|g| g.spawns.refund(caller)) { tracing::warn!("{error}"); }
+    };
 
     let (channel, created) = if let Some(nc) = new_channel {
         let nc = Args(nc);
@@ -818,7 +819,7 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
             refund();
             format!("could not create channel: {e:#}")
         })?;
-        st.guard.lock().mcp_channels.insert(ch.id);
+        st.edit_guard(|g| g.mcp_channels.insert(ch.id))?;
         (ch, true)
     } else {
         (
@@ -842,9 +843,21 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         from_session: None,
         // The child starts with the caller's provenance and keeps it (agents.rs).
         prov: Some(caller_route(st, caller).prov(None)),
+        agent_id: None,
     };
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,
+        Err(ref e) if let Some(&crate::hub::SpawnRetained(id)) = e.downcast_ref::<crate::hub::SpawnRetained>() => {
+            // The agent may be running its task already. Keep the reservation, the channel
+            // and its worktree; cleaning up could kill it and delete its work.
+            if let Err(error) = st.edit_guard(|g| g.spawned_depth.insert(id, b.caller_depth + 1)) {
+                tracing::warn!(session = id, "unconfirmed spawn; guard snapshot pending: {error}");
+            }
+            return Err(format!(
+                "spawn outcome unconfirmed: session {id} in channel {} was kept and is being confirmed. Do not spawn again; use wait_for_state(session_id={id}).",
+                channel.id
+            ));
+        }
         Err(e) => {
             refund();
             // Don't leave an empty channel/worktree behind for a failed spawn.
@@ -862,10 +875,10 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
             return Err(msg);
         }
     };
-    st.guard
-        .lock()
-        .spawned_depth
-        .insert(info.id, b.caller_depth + 1);
+    if let Err(error) = st.edit_guard(|g| g.spawned_depth.insert(info.id, b.caller_depth + 1)) {
+        // Parent depth was persisted before spawning; reconstruction also finds this child.
+        tracing::warn!(session = info.id, "spawn completed; guard snapshot pending: {error}");
+    }
     // The spawn's prompt may have named an auto-named channel: report it as it is now.
     let channel = st.backend.channel(channel.id).unwrap_or(channel);
     let ws = st.backend.workspace(channel.workspace_id);
@@ -928,8 +941,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let now = now_ms();
-    let prev_send = {
-        let mut g = st.guard.lock();
+    let prev_send = st.edit_guard(|g| {
         if let Err(wait_s) = g.sends.check_and_record(
             caller,
             now,
@@ -941,8 +953,8 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
                 st.limits.send_per_window
             ));
         }
-        g.last_send.insert(target, now)
-    };
+        Ok(g.last_send.insert(target, now))
+    })??;
     let mode = if interrupt {
         SendMode::Interrupt
     } else {
@@ -961,18 +973,22 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     {
         Ok(out) => out,
         Err(e) => {
-            // Nothing was sent: give the rate-limit slot back and restore the send marker.
-            let mut g = st.guard.lock();
-            g.sends.refund(caller);
-            match prev_send {
-                Some(t) => g.last_send.insert(target, t),
-                None => g.last_send.remove(&target),
-            };
+            // Only a refusal before durable queue acceptance can be refunded. A
+            // partially submitted or retained prompt still counts as agent work.
+            if e.downcast_ref::<crate::inject::DeliveryPending>().is_none() {
+                if let Err(error) = st.edit_guard(|g| {
+                    g.sends.refund(caller);
+                    match prev_send {
+                        Some(t) => g.last_send.insert(target, t),
+                        None => g.last_send.remove(&target),
+                    };
+                }) { tracing::warn!("{error}"); }
+            }
             return Err(format!("send failed: {e:#}"));
         }
     };
     if !out.delivered {
-        st.guard.lock().note_queued(target, out.queued);
+        if let Err(error) = st.edit_guard(|g| g.note_queued(target, out.queued)) { tracing::warn!("{error}"); }
     }
     Ok(pretty(&json!({
         "session_id": target,
@@ -1070,15 +1086,14 @@ async fn wait_loop<B: Backend>(
             .session(id)
             .ok_or_else(|| format!("session {id} was removed while waiting"))?;
         let now_unix = now_ms();
-        let (last_send_ms, last_delivery_ms) = {
-            let mut g = st.guard.lock();
+        let (last_send_ms, last_delivery_ms) = st.edit_guard(|g| {
             // Also observe here: the tracker task may not have seen this update yet.
             g.observe_session(&info, now_unix);
             (
                 g.last_send.get(&id).copied(),
                 g.last_delivery.get(&id).copied(),
             )
-        };
+        })?;
         let ctx = WaitCtx {
             after_ms,
             last_send_ms,
@@ -1175,12 +1190,9 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);
     let route = crate::agents::route(&agent, st.backend.prov(caller), None, recent).map_err(refused)?;
-    if let Err(wait_s) = st.guard.lock().sends.check_and_record(
-        caller,
-        now_ms(),
-        st.limits.send_per_window,
-        st.limits.send_window_ms,
-    ) {
+    if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
+        caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
+    ))? {
         return Err(format!(
             "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
             st.limits.send_per_window
@@ -1196,17 +1208,16 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
     let d = match st.backend.agent_deliver(out).await {
         Ok(d) => d,
         Err(e) => {
-            st.guard.lock().sends.refund(caller);
+            if e.downcast_ref::<crate::inject::DeliveryPending>().is_none() {
+                if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+            }
             return Err(format!("could not deliver to agent {}: {e:#}", agent.name));
         }
     };
-    {
-        let mut g = st.guard.lock();
+    if let Err(error) = st.edit_guard(|g| {
         g.last_send.insert(d.session_id, d.sent_at_ms);
-        if !d.delivered {
-            g.note_queued(d.session_id, d.queued);
-        }
-    }
+        if !d.delivered { g.note_queued(d.session_id, d.queued); }
+    }) { tracing::warn!("{error}"); }
     // Wait for this message's own turn (not whatever runs before it in the queue).
     let mut rx = st.backend.subscribe();
     let (info, verdict, waited_ms) = crate::agents::wait_for_reply(
@@ -1245,12 +1256,9 @@ fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
     };
     let ch = open_channel(st, ch_id)?;
     check_channel_reach(st, caller, &ch)?;
-    if let Err(wait_s) = st.guard.lock().posts.check_and_record(
-        caller,
-        now_ms(),
-        st.limits.post_per_window,
-        st.limits.send_window_ms,
-    ) {
+    if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+        caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+    ))? {
         return Err(format!(
             "rate limit: at most {} posts per minute. Try again in {wait_s}s.",
             st.limits.post_per_window

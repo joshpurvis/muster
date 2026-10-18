@@ -91,12 +91,15 @@ pub fn default_shell() -> String {
 pub fn hello(hub: &Hub) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "ui_protocol": crate::assets::UI_PROTOCOL,
         "workspaces": hub.workspaces(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": default_shell(),
+        "paused_deliveries": inject::paused(hub),
+        "terminal_host": hub.terminal_host_info(),
     })
 }
 
@@ -366,9 +369,26 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             inject::interrupt(hub, p.id)?;
             Ok(json!({}))
         }
+        "session.queue" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            if hub.session(p.id).is_none() { return Err(RpcError(format!("no such session: {}", p.id))) }
+            Ok(inject::inspect(hub, p.id))
+        }
         "session.clear_queue" => {
             let p: IdParam<SessionId> = parse(params)?;
-            inject::clear_queue(hub, p.id);
+            inject::clear_queue(hub, p.id)?;
+            Ok(json!({}))
+        }
+        "session.resume_queue" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            inject::resume_queue(hub, p.id)?;
+            Ok(json!({}))
+        }
+        "session.continue_input" => {
+            // After an input interruption: the user has checked the terminal. Nothing lost
+            // is resent; typing is accepted again and waiting prompts may be delivered.
+            let p: IdParam<SessionId> = parse(params)?;
+            hub.continue_input(p.id)?;
             Ok(json!({}))
         }
         "session.screen" => {
@@ -533,7 +553,6 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 from_session: Option<SessionId>,
             }
             let p: P = parse(params)?;
-            let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
             // Keys typed for an agent on a non-human chain can't drive a Claude agent, and never
             // count as the human's input; keys from the human (or a human-rooted shell) do.
             let caller = caller(hub, p.from_session)?;
@@ -543,8 +562,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 Caller::Human => None,
             };
             match chain {
-                Some(r) => crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?,
-                None => hub.agents().note_human_input(p.id),
+                Some(r) => {
+                    let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
+                    crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?
+                }
+                // The human's keys (a paired phone, `muster keys` outside a session) take the
+                // same path as a client's: no session lookup under the hub lock, no SQLite.
+                None => hub.note_human_input(p.id),
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -1150,9 +1174,16 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                 if data.len() >= 5 && data[0] == FRAME_INPUT {
                     let id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
                     // Keystrokes from a client window or a paired phone: the human's input.
-                    hub.agents().note_human_input(id);
-                    if let Err(e) = hub.write_input(id, &data[5..]) {
-                        tracing::debug!("input for session {id}: {e}");
+                    // The marker is recorded in memory and committed off this path, so a
+                    // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
+                    hub.note_human_input(id);
+                    if let Err(e) = hub.send_keys(id, &data[5..]) {
+                        // Lost or refused keystrokes interrupt their run, which the user sees
+                        // on the session (`input_interrupted`) and in a notice.
+                        tracing::debug!("input for session {id}: {e:#}");
+                        // The backend is stopping: stop reading, so the client shows it is
+                        // disconnected (typing paused) instead of sending into a closed link.
+                        if hub.input_closed() { break }
                     }
                 }
             }
@@ -1283,7 +1314,7 @@ async fn forward_output(
     id: SessionId,
     limit: Option<usize>,
     mut generation: Option<u64>,
-    mut rx: Option<broadcast::Receiver<Bytes>>,
+    mut rx: Option<broadcast::Receiver<crate::terminal::Output>>,
     mut bus: broadcast::Receiver<ServerEvent>,
     out: Outbox,
 ) {
@@ -1295,8 +1326,12 @@ async fn forward_output(
                     None => std::future::pending().await,
                 }
             } => match chunk {
-                Ok(bytes) => {
-                    if out.send(Message::Binary(frame(FRAME_OUTPUT, id, &bytes))).await.is_err() {
+                Ok(output) => {
+                    let (kind, bytes) = match output {
+                        crate::terminal::Output::Bytes(bytes) => (FRAME_OUTPUT, bytes),
+                        crate::terminal::Output::Replay(bytes) => (FRAME_REPLAY, bytes),
+                    };
+                    if out.send(Message::Binary(frame(kind, id, &bytes))).await.is_err() {
                         return;
                     }
                 }
@@ -1331,7 +1366,7 @@ async fn resend_replay(
     id: SessionId,
     limit: Option<usize>,
     generation: &mut Option<u64>,
-    rx: &mut Option<broadcast::Receiver<Bytes>>,
+    rx: &mut Option<broadcast::Receiver<crate::terminal::Output>>,
     out: &Outbox,
 ) -> bool {
     let (replay, new_rx, new_gen) = match hub.attach(id, limit).await {
@@ -1375,6 +1410,7 @@ mod tests {
             port: 0,
             client_token: "t".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
+            terminal_host: None,
         };
         let hub = Hub::new(cfg, store).unwrap();
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));
@@ -1411,13 +1447,13 @@ mod tests {
         agent(&hub, "rpc-ada");
         // The codex session handles a scheduled message: its `muster ask` carries that, and no
         // parameter can claim otherwise.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "agent.ask", json!({"agent": "rpc-ada", "text": "hi", "from_session": 3, "origin": "human"}))
             .await
             .unwrap_err();
         assert!(e.contains("accepts only human"), "{e}");
         // Human-rooted again: the MCP send rate limit applies to its CLI asks...
-        hub.agents().set_prov(3, None);
+        hub.agents().set_prov(3, None).unwrap();
         for _ in 0..20 {
             st.guard.lock().sends.check_and_record(3, now_ms(), 20, 60_000).unwrap();
         }
@@ -1441,11 +1477,11 @@ mod tests {
         let e = call(&hub, "session.send", json!({"id": 1, "text": "ls", "from_session": 3})).await.unwrap_err();
         assert!(e.contains("is a shell"), "{e}");
         // Keys from a session on a scheduled chain can't drive a Claude agent.
-        hub.agents().set_prov(1, Some(SCHED));
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
         let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 1})).await.unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // Nor can `muster new` / session.spawn start one.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "session.spawn", json!({"channel_id": 1, "kind": "claude", "from_session": 3}))
             .await
             .unwrap_err();
@@ -1455,10 +1491,12 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         // The human's keystrokes (no from_session) make the next plain prompt the human's.
-        hub.agents().set_prov(2, Some(SCHED));
+        hub.agents().set_prov(2, Some(SCHED)).unwrap();
         let _ = call(&hub, "session.input", json!({"id": 2, "data": "x"})).await;
+        // The marker is committed off the input path (the daemon's attribution worker).
+        hub.flush_human_input().unwrap();
         let info = hub.session(2).unwrap();
-        hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"}));
+        hub.agents().on_hook(hub.store(), &info, "UserPromptSubmit", &json!({"prompt": "new task"})).unwrap();
         assert_eq!(hub.agents().prov(2), None);
     }
 
@@ -1514,13 +1552,13 @@ mod tests {
         agent(&hub, "rpc-ivy");
         let mut rx = hub.subscribe();
         // An agent session on a scheduled chain asks a Claude agent: refused, and kept.
-        hub.agents().set_prov(3, Some(SCHED));
+        hub.agents().set_prov(3, Some(SCHED)).unwrap();
         let e = call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "nightly report\nmore", "from_session": 3}))
             .await
             .unwrap_err();
         assert!(e.contains("accepts only human"), "{e}");
         // The human's CLI path too (forced origins are daemon-internal; a shell on that chain).
-        hub.agents().set_prov(1, Some(SCHED));
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
         assert!(call(&hub, "agent.ask", json!({"agent": "rpc-ivy", "text": "from a shell", "from_session": 1})).await.is_err());
         let ev = drain(&mut rx, "agent_message");
         assert_eq!(ev.len(), 2);

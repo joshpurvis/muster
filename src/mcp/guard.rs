@@ -241,7 +241,7 @@ pub fn check_spawn(b: &SpawnBudget) -> Result<(), String> {
 }
 
 /// Sliding-window rate limiter keyed by caller.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateLimiter {
     hits: HashMap<SessionId, VecDeque<i64>>,
 }
@@ -281,13 +281,12 @@ impl RateLimiter {
 }
 
 /// Mutable guard state shared by all MCP requests.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardState {
     pub sends: RateLimiter,
     pub posts: RateLimiter,
     pub spawns: RateLimiter,
-    /// Channels created through spawn_session's `new_channel` (in memory: after a daemon restart
-    /// earlier ones no longer count toward `max_mcp_channels`).
+    /// Channels created through spawn_session's `new_channel`, retained across backend replacement.
     pub mcp_channels: HashSet<ChannelId>,
     /// Target session -> unix ms of the last MCP send_message to it (for wait_for_state).
     pub last_send: HashMap<SessionId, i64>,
@@ -365,6 +364,7 @@ pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionI
         queued: 0,
         subagents: 0,
         size_owner: None,
+        input_interrupted: false,
         state_seq: 0,
         created_at: 0,
         window_id: None,

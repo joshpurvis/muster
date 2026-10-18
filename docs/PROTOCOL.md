@@ -85,7 +85,7 @@ Text frames carry JSON. Binary frames carry terminal bytes.
 | type | direction | meaning |
 |---|---|---|
 | `0x01` | daemon → client | Live output bytes. |
-| `0x02` | client → daemon | Keyboard input bytes (from xterm `onData`, UTF-8). |
+| `0x02` | client → daemon | Keyboard input bytes (from xterm `onData`, UTF-8). Queued to the terminal in order without waiting for it. If any input for a run is lost, refused or dropped, that run's input is paused: later frames for it are discarded (never delivered after the gap) and the session gets `input_interrupted: true` until `session.continue_input`. |
 | `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. |
 
 Terminal queries: the daemon is the **only** responder for DA1 (`CSI c` → `CSI ? 1 ; 2 c`),
@@ -141,7 +141,10 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.send` | `{id, text, mode?: "queue"\|"interrupt", from_session?}` | `{delivered, queued}`. `from_session` (`muster send` passes `$MUSTER_SESSION_ID`): an agent session's send runs MCP `send_message` as that session (guards, provenance; the reply then also has `sent_at_ms`); a shell session's carries that shell's provenance (docs/MCP.md "Agents"). For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
 | `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny", state_seq?, state_since?}` | `{}`. With `state_seq` and/or `state_since` (from the `SessionInfo` the caller rendered), refused with an error starting `stale:` when they no longer match. `state_seq` changes on every state or detail change and whenever a prompt is answered with it, so an approval never answers a prompt the caller didn't see, and a delayed duplicate never answers the next one. The `approval` event records `from` (`"human"` or `"device:<id>"`). |
 | `session.interrupt` | `{id}` | `{}` |
-| `session.clear_queue` | `{id}` | `{}` |
+| `session.queue` | `{id}` | `{queued: string[], uncertain: string\|null, stage: "selected"\|"typing"\|"submitting"\|null, paused: boolean}`. Waiting prompts survive backend replacement. A crash during typing/submission pauses delivery for human review; uncertain input is never automatically replayed. |
+| `session.clear_queue` | `{id}` | `{}`. Discards waiting and paused delivery records. Does not undo input already sent, or cancel delivery currently in progress. |
+| `session.continue_input` | `{id}` | `{}`. After an input interruption (`SessionInfo.input_interrupted`), accepts typing into the session again and lets waiting prompts be delivered. Nothing that may have been lost is resent. |
+| `session.resume_queue` | `{id}` | `{}`. Forgets the paused (uncertain) delivery record and resumes the prompts waiting behind it. The uncertain prompt is not resent. Error when no delivery is paused. |
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
 | `fs.complete` | `{prefix}` | `{entries: string[]}` directory completions for the "add workspace" path box |
 | `channel.move` | `{id, window_id, index?}` | `Channel` (moves the task and all its sessions to another window, at `index` among the window's `channel_ids` or the end; emits `channel_upserted`, `session_upserted` for each session that changed window, and `window_upserted` for both windows, or `window_removed` for a window left unheld without tabs or tasks) |
@@ -154,7 +157,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.show` | `{id}` | `{shown: "raised" \| "open" \| "launching" \| "launched"}`. Puts window `id` on screen. When a connection holds it: raises it (`"raised"`, or `"open"` when no WM helper could), never a second client. Otherwise the daemon launches `<muster binary> open --window <id>` detached (a native window can't open another one itself); Whether a client holds it and whether a launch is already on its way are decided under one lock, so concurrent calls can't both launch; repeated calls within 15 s, before a client claims the window, return `"launching"`. A launcher that exits non-zero within 3 s is an error (the UI then falls back); a later failure drops the launch record (so the next call retries) and sends a `notice`. |
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
-| `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. |
+| `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
 | `agent.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). Emits `agent_upserted`. |
 | `agent.update` | `{name, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Model, effort and permissions apply from its next start. Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, Background worker, for the New agent dialog. |
@@ -271,11 +274,14 @@ directory never moves.
 
 ## Subagents
 
-`SessionInfo.subagents` (runtime only, 0 after a restart) counts the built-in subagents a
+`SessionInfo.subagents` counts the built-in subagents a
 Claude session is running right now (its Agent/Task tool): +1 on the tool's `PreToolUse`, -1
 on its `PostToolUse`/`PostToolUseFailure`, reset to 0 on `SessionStart`, `SessionEnd`, `Stop`, `StopFailure` (a turn's end) and when the process exits, so a missed hook can't leave it stuck. Background
 subagents return at launch, so only foreground ones are counted. Changes emit
-`session_upserted`.
+`session_upserted`. The count survives application-backend replacement for the same
+terminal generation and resets on an explicit terminal restart. Hook-derived state,
+count, grace timestamp and reply attribution commit with the inbox cursor, so a
+callback recovered after a lost acknowledgement cannot increment the count twice.
 
 ## Groups layout (v2)
 
@@ -435,7 +441,7 @@ its sockets close at once on revoke):
 | Scope | Methods |
 |---|---|
 | `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
-| `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resize`, `channel.mark_read/post`, binary `0x02` input frames |
+| `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
 | never | `device.*`, `agent.*`, `window.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
@@ -447,3 +453,43 @@ Prompts a device sends are logged with `from: "device:<id>"`.
 | `device.pair_status` | `{pairing_id}` | `{state: "pending"}`, `{state: "paired", device}`, or `{state: "burnt"\|"expired"\|"replaced"}` |
 | `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at}` |
 | `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}` |
+
+### Backend lifetime and compatibility
+
+`hello.terminal_host` identifies the standalone owner (`protocol`, `instance`, `pid`,
+`data_dir`), or is null when no host is configured. Clients use this capability to
+verify backend-only reload is safe. A legacy backend without this capability must
+not be stopped as part of a supposedly non-disruptive update.
+
+`state_seq` values are exact JavaScript integers reserved durably before use. They
+change across backend restarts, so an approval queued against an old view is stale.
+`hello.paused_deliveries` lists session IDs whose prompt queues need review after an
+interrupted submission; use `session.queue` to inspect them.
+
+`hello.ui_protocol` is the UI/application protocol major version, currently 1. A missing
+value denotes the original v1 API. A UI receiving a different version rejects queued
+calls and input until a compatible UI is loaded; this version is independent of the
+terminal host IPC version and of the application release number.
+
+UI builds include `muster-ui.json` with `{"protocol":1}`. `muster ui-install` copies a
+complete build to `<data>/ui/releases/<id>` and atomically replaces `<data>/ui/current`.
+The backend reads this pointer for each page request, falling back to embedded assets
+only when no external release is configured. Invalid configured releases produce 503,
+without changing running sessions or API availability. Installed HTML pins JS/CSS to
+`/_ui/<id>/...` (desktop) or `/m/_ui/<id>/...` (phone), so old pages cannot mix bundles
+with a later release. Phone release assets retain the phone CSP and proxy restrictions.
+
+### Callback recovery
+
+New host-managed runs set `MUSTER_HOOK_DB` for `muster hook`. Helpers append JSON callbacks
+to the application's private `hook-inbox.sqlite`, independently of HTTP availability.
+The backend reads insertion IDs in order; the application transaction saves agent reply,
+resume ID, attribution and inbox cursor together before acknowledging deletion. A
+repeated inbox row cannot be assigned to a newer message. Credentials must match the
+session's recorded terminal generation. The existing `POST /hook/<event>` remains
+available for legacy callbacks and does not acquire automatic transport retries.
+
+The inbox limits pending payloads to 64 MiB and 100,000 events. Overflow is recorded
+and reported, and the helper remains bounded by its two-second write deadline. Full
+payloads stay in the private inbox only until acknowledged; the timeline still records
+hook summaries. These are application features, outside terminal-host IPC.

@@ -644,7 +644,7 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Resize focused group", keys: ["Alt+Shift+←↑→↓"], group: "Groups" },
   { title: "Copy / paste in terminal", keys: ["Ctrl+Shift+C", "Ctrl+Shift+V"], group: "View" },
   { title: "Close a tab", keys: ["Middle-click"], group: "Tab" },
-  { title: "Rename (the task, on its main tab)", keys: ["Double-click", "F2"], group: "Tab" },
+  { title: "Rename (the names the tab shows)", keys: ["Double-click", "F2"], group: "Tab" },
   { title: "Reorder, move to a group, split or window", keys: ["Drag tab"], group: "Tab" },
   { title: "Group menu (Shift for programs using the mouse)", keys: ["Right-click"], group: "Groups" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },

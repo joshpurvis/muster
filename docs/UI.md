@@ -61,8 +61,15 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   Tooltip: full name, folder, branch, state detail.
 - The active tab of the focused group has an accent top bar; other groups' active tabs are
   muted. Unread activity shows a bold label.
-- Double-click renames (the task for its main tab, i.e. the task's first agent session or else
-  its first session; the session otherwise; the context menu offers both). Middle-click
+- Double-click renames exactly what the tab shows. A tab showing one name edits that name: the
+  task's, or the session's when its task is unknown. A tab showing `task · session` edits both,
+  as two fields `[task] · [session]`, from any of the task's tabs. The cursor starts in the task
+  field on the task's main tab (its first agent session, else its first session), in the session
+  field otherwise. Tab / Shift+Tab move between the fields, Enter renames whatever changed, Esc
+  cancels, clicking away commits. Blank or unchanged fields are left alone. After Enter or Esc
+  the keyboard goes back to the tab, or to the terminal when the rename came from its menu or the
+  palette. While renaming, the tab keeps room for its fields; in a narrow strip it takes the whole
+  strip. Middle-click
   closes. `+` at the end of each strip opens a new tab in that group (same folder as the group's active tab, no worktree, last agent kind); `▾` next to it:
   New tab…, New worktree tab, New terminal in this task, and Claude / Codex / Shell.
 - The **top-right group's** strip ends with the window controls: Split right `◫`, Split down
@@ -74,7 +81,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `⋯`.
 - Strips scroll sideways past their width (wheel scrolls, active tab kept in view) with an
   `N ▾` overflow list. Roving tabindex: ←/→/Home/End, Enter focuses the terminal, F2 renames.
-- Context menu: Rename tab, Rename task, Permissions… (task), Copy path, Copy branch, New
+- Context menu: Rename (same as double-click), Permissions… (task), Copy path, Copy branch, New
   terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
   Shell in this task there), Move to window ▸ (existing windows plus
   "New window"), Restart, Interrupt, Close tab, and when it is the task's last session with a
@@ -243,7 +250,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
 | Alt+G | Show / hide the agents panel (per window) |
-| F2 (in a focused strip) | Rename the tab (the task on its main tab) |
+| F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |

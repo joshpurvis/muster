@@ -172,7 +172,62 @@ export function tabText(l: TabLabel): string {
   return l.sub ? `${l.text} · ${l.sub}` : l.text;
 }
 
-/** A task's main session (what renaming its tab renames the task for): its first agent, else its
+/** What renaming a tab edits: exactly the names it shows. `task` is null when the tab shows no task
+ * name (its task is unknown), `session` when it doesn't show the session's (its task has one). */
+export interface RenameFields {
+  task: string | null;
+  session: string | null;
+  /** The field the cursor starts in. */
+  focus: "task" | "session";
+}
+
+/** The rename of tab `s`: one field when it shows one name, `[task] · [session]` when it shows both.
+ * With both, the task's main tab (`isMain`) starts in the task field, the others in the session's. */
+export function renameFields(
+  s: Pick<SessionInfo, "name">,
+  task: Pick<Channel, "name" | "cwd" | "auto_named"> | undefined,
+  ws: Pick<Workspace, "name" | "path"> | null | undefined,
+  siblings: number,
+  isMain: boolean,
+): RenameFields {
+  if (!task) return { task: null, session: s.name, focus: "session" };
+  const l = tabLabel(s, task, ws, siblings);
+  return { task: l.text, session: l.sub, focus: l.sub !== null && !isMain ? "session" : "task" };
+}
+
+/** The rename's inputs, left to right: the task's name, then the session's. */
+export function renameInputs(f: RenameFields): { key: "task" | "session"; value: string }[] {
+  const out: { key: "task" | "session"; value: string }[] = [];
+  if (f.task !== null) out.push({ key: "task", value: f.task });
+  if (f.session !== null) out.push({ key: "session", value: f.session });
+  return out;
+}
+
+/** The renames a committed rename makes: each shown field that changed and isn't blank. */
+export function renameChanges(
+  f: Pick<RenameFields, "task" | "session">,
+  v: { task?: string; session?: string },
+): { task?: string; session?: string } {
+  const out: { task?: string; session?: string } = {};
+  const t = v.task?.trim();
+  if (f.task !== null && t && t !== f.task) out.task = t;
+  const n = v.session?.trim();
+  if (f.session !== null && n && n !== f.session) out.session = n;
+  return out;
+}
+
+/** A rename (of session `sid`, task `channel`) is over once its tab isn't among `shown` (this
+ * window's tabs) or its session or task is gone. */
+export function renameOutlived(
+  r: { sid: number; channel: number | null },
+  shown: readonly number[],
+  sessions: { has(id: number): boolean },
+  tasks: { has(id: number): boolean },
+): boolean {
+  return !shown.includes(r.sid) || !sessions.has(r.sid) || (r.channel !== null && !tasks.has(r.channel));
+}
+
+/** A task's main session (where renaming starts in the task's name): its first agent, else its
  * first session. `list` is in age order. */
 export function mainSession<T extends Pick<SessionInfo, "id" | "kind">>(list: T[]): T | null {
   return list.find((s) => s.kind !== "shell") ?? list[0] ?? null;

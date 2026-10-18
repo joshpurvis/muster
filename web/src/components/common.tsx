@@ -1,5 +1,5 @@
 // Shared bits: state dots, kbd, delegated tooltips, inline edit, spinner.
-import type { JSX } from "preact";
+import { Fragment } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { AgentState } from "../types.ts";
 import { STATE_LABEL } from "../types.ts";
@@ -105,47 +105,91 @@ function tipDelay(_t: HTMLElement) {
   return d;
 }
 
-/** Inline text edit: Enter commits, Esc/blur-without-change cancels, blur commits. */
+/** Inline text edit of one or more fields side by side (`[task] · [session]`): Enter commits,
+ * Esc / leaving without a change cancels, leaving commits. Tab / Shift+Tab move between the fields
+ * (and only blur when there is one). `onCommit` gets every field's trimmed value; `byKey` says it
+ * closed with Enter / Esc (the caller puts the focus back), not by focus leaving. Removed before it
+ * closed (its tab went away), it cancels. */
 export function InlineEdit(
   props: {
-    value: string;
-    onCommit: (v: string) => void;
-    onCancel: () => void;
+    fields: { value: string; label: string }[];
+    /** The field that starts focused. */
+    focus?: number;
+    onCommit: (values: string[], byKey: boolean) => void;
+    onCancel: (byKey: boolean) => void;
     class?: string;
-    style?: JSX.CSSProperties;
   },
 ) {
-  const ref = useRef<HTMLInputElement>(null);
+  const wrap = useRef<HTMLSpanElement>(null);
+  const refs = useRef<(HTMLInputElement | null)[]>([]);
   const done = useRef(false);
+  const cancel = useRef(props.onCancel);
+  cancel.current = props.onCancel;
+  const n = props.fields.length;
+  const focusField = (i: number) => {
+    const el = refs.current[i];
+    el?.focus();
+    el?.select();
+  };
   useLayoutEffect(() => {
-    const el = ref.current!;
-    el.focus();
-    el.select();
+    const el = refs.current[props.focus ?? 0];
+    el?.focus({ preventScroll: true });
+    el?.select();
+    // All of the fields in view (a crowded strip scrolls to them).
+    wrap.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, []);
-  const finish = (commit: boolean) => {
+  // Cleanups run before the inputs leave the DOM, so the blur that removal may fire is ignored.
+  useEffect(() => () => {
     if (done.current) return;
     done.current = true;
-    const v = ref.current!.value.trim();
-    if (commit && v && v !== props.value) props.onCommit(v);
-    else props.onCancel();
+    cancel.current(false);
+  }, []);
+  const finish = (commit: boolean, byKey: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    const vs = refs.current.slice(0, n).map((el) => el?.value.trim() ?? "");
+    if (commit && vs.some((v, i) => v && v !== props.fields[i].value)) props.onCommit(vs, byKey);
+    else props.onCancel(byKey);
   };
-  return (
+  const input = (i: number) => (
     <input
-      ref={ref}
-      class={cx("inline-edit", props.class)}
-      style={props.style}
-      defaultValue={props.value}
+      ref={(el) => {
+        refs.current[i] = el;
+      }}
+      class="inline-edit"
+      aria-label={props.fields[i].label}
+      defaultValue={props.fields[i].value}
       spellcheck={false}
       onKeyDown={(e) => {
         e.stopPropagation();
-        if (e.key === "Enter") finish(true);
-        else if (e.key === "Escape") finish(false);
+        if (e.key === "Enter") finish(true, true);
+        else if (e.key === "Escape") finish(false, true);
+        else if (e.key === "Tab" && n > 1) {
+          e.preventDefault();
+          focusField((i + (e.shiftKey ? n - 1 : 1)) % n);
+        }
       }}
-      onBlur={() => finish(true)}
+      // Moving between the fields isn't leaving.
+      onBlur={(e) => !refs.current.includes(e.relatedTarget as HTMLInputElement) && finish(true, false)}
+    />
+  );
+  return (
+    <span
+      ref={wrap}
+      class={cx("inline-edit-fields", props.class)}
       onClick={(e) => e.stopPropagation()}
       onDblClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
-    />
+      // A press on the gap or the separator keeps the focus where it is.
+      onMouseDown={(e) => !(e.target instanceof HTMLInputElement) && e.preventDefault()}
+    >
+      {props.fields.map((_, i) => (
+        <Fragment key={i}>
+          {i > 0 && <span class="inline-edit-sep">·</span>}
+          {input(i)}
+        </Fragment>
+      ))}
+    </span>
   );
 }
 

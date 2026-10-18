@@ -38,6 +38,8 @@ import {
   documentTitle,
   needsYouOrder,
   pushFront,
+  type RenameFields,
+  renameOutlived,
   sessionsOfWindow,
   SessionVersions,
   sessionWindowId,
@@ -306,8 +308,12 @@ export const BUSY_STATES = new Set<AgentState>(["working", "starting", "needs_ap
 /** Alt has been held on its own for a moment (the focused strip shows its Alt+1..9 numbers). */
 export const altHeld = signal(false);
 
-/** What is being renamed inline: a task or a session, edited in tab `sid`. */
-export const renaming = signal<{ kind: "channel" | "session"; id: number; sid: SessionId } | null>(null);
+/** The inline rename in tab `sid`: the names it shows (`fields`, as they were when it opened), of
+ * task `channel` (null when the task is unknown) and session `sid`. `from`: where it was opened
+ * (its tab, or its terminal), where the keyboard goes back to when it closes. */
+export const renaming = signal<
+  { sid: SessionId; channel: ChannelId | null; fields: RenameFields; from: "tab" | "terminal" } | null
+>(null);
 
 // ---------------- the window's layout (groups) ----------------
 
@@ -370,6 +376,13 @@ const liveIds = computed(() => windowSessions.value.filter((s) => !held.value.ha
 
 /** The session ids of the layout in on-screen order (groups, then their strips). */
 export const layoutOrder = computed(() => (layout.value ? allSessions(layout.value.root) : []));
+
+// A rename ends when its tab leaves this window or its session or task is gone: reopening it when
+// the tab comes back would show (and could commit) the names from before.
+effect(() => {
+  const r = renaming.value;
+  if (r && renameOutlived(r, layoutOrder.value, sessions.value, channelById.value)) renaming.value = null;
+});
 
 /**
  * Change the layout. `fn` gets the current one; the result is reconciled with this window's

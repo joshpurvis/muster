@@ -249,22 +249,12 @@ export const commands: Command[] = [
   })),
   {
     id: "rename-tab",
-    title: "Rename tab",
+    title: "Rename",
     group: "Tab",
     enabled: hasTab,
     run: () => {
       const s = focusedSession.value;
-      if (s) A.renameIn("session", s.id);
-    },
-  },
-  {
-    id: "rename-task",
-    title: "Rename task",
-    group: "Tab",
-    enabled: hasTab,
-    run: () => {
-      const s = focusedSession.value;
-      if (s) A.renameIn("channel", s.id);
+      if (s) A.startRename(s.id, "terminal");
     },
   },
   {

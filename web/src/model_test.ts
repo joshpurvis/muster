@@ -12,6 +12,10 @@ import {
   nextInCycle,
   pushFront,
   rankJump,
+  renameChanges,
+  renameFields,
+  renameInputs,
+  renameOutlived,
   sessionsOfWindow,
   SessionVersions,
   sessionWindowId,
@@ -263,6 +267,76 @@ Deno.test("tabLabel: the task's name, plus the session's when the task has sever
   assertEquals(tabLabel(shell, auto, ws, 3), { text: "proj", muted: true, sub: "shell" });
   // Task unknown (its event lags): the session's own name.
   assertEquals(tabLabel(shell, undefined, ws, 1), { text: "shell", muted: false, sub: null });
+});
+
+Deno.test("renameFields: exactly the names the tab shows", () => {
+  const ws = { name: "proj", path: "/home/u/proj" };
+  const c = ch(1, { name: "fix auth" });
+  const shell = { ...sess(2, 1, "idle"), name: "shell" };
+  // One session: only the task's name, wherever.
+  assertEquals(renameFields(shell, c, ws, 1, true), { task: "fix auth", session: null, focus: "task" });
+  assertEquals(renameInputs(renameFields(shell, c, ws, 1, true)), [{ key: "task", value: "fix auth" }]);
+  // Several: both, starting in the task's on its main tab, else in the session's.
+  assertEquals(renameFields(shell, c, ws, 2, true), { task: "fix auth", session: "shell", focus: "task" });
+  assertEquals(renameFields(shell, c, ws, 2, false), {
+    task: "fix auth",
+    session: "shell",
+    focus: "session",
+  });
+  assertEquals(renameInputs(renameFields(shell, c, ws, 2, false)), [
+    { key: "task", value: "fix auth" },
+    { key: "session", value: "shell" },
+  ]);
+  // Still only the folder: the field starts with what the tab shows.
+  const auto = ch(1, { name: "proj", auto_named: true });
+  assertEquals(renameFields(shell, auto, ws, 1, true).task, "proj");
+  // Nothing stored yet: the field shows the folder the tab shows; keeping it renames nothing.
+  const unnamed = renameFields(shell, ch(1, { name: "" }), ws, 1, true);
+  assertEquals(unnamed.task, "proj");
+  assertEquals(renameChanges(unnamed, { task: "proj" }), {});
+  assertEquals(renameChanges(unnamed, { task: "fix auth" }), { task: "fix auth" });
+  // Task unknown: the tab shows the session's name, so that is what is renamed.
+  assertEquals(renameFields(shell, undefined, ws, 1, false), {
+    task: null,
+    session: "shell",
+    focus: "session",
+  });
+  assertEquals(renameInputs(renameFields(shell, undefined, ws, 1, false)), [{
+    key: "session",
+    value: "shell",
+  }]);
+});
+
+Deno.test("renameChanges: only shown fields that changed and aren't blank", () => {
+  const both = { task: "fix auth", session: "shell" };
+  assertEquals(renameChanges(both, { task: "fix login", session: "shell" }), { task: "fix login" });
+  assertEquals(renameChanges(both, { task: "fix auth", session: " tests " }), { session: "tests" });
+  assertEquals(renameChanges(both, { task: "a", session: "b" }), { task: "a", session: "b" });
+  assertEquals(renameChanges(both, { task: "  ", session: "" }), {});
+  // One field blanked, the other changed: only the changed one.
+  assertEquals(renameChanges(both, { task: "", session: "logs" }), { session: "logs" });
+  assertEquals(renameChanges(both, { task: "fix login", session: "   " }), { task: "fix login" });
+  // A field left out of the commit stays as it is.
+  assertEquals(renameChanges(both, { session: "logs" }), { session: "logs" });
+  assertEquals(renameChanges(both, { task: "fix auth ", session: "shell" }), {});
+  // A field the tab doesn't show is never renamed.
+  assertEquals(renameChanges({ task: "fix auth", session: null }, { task: "x", session: "y" }), {
+    task: "x",
+  });
+  assertEquals(renameChanges({ task: null, session: "shell" }, { task: "x", session: "y" }), {
+    session: "y",
+  });
+});
+
+Deno.test("renameOutlived: once its tab leaves this window or its session or task is gone", () => {
+  const r = { sid: 2, channel: 1 };
+  const has = (...ids: number[]) => new Set(ids);
+  assertEquals(renameOutlived(r, [1, 2], has(1, 2), has(1)), false);
+  assertEquals(renameOutlived(r, [1], has(1, 2), has(1)), true); // moved to another window
+  assertEquals(renameOutlived(r, [1, 2], has(1), has(1)), true); // session gone
+  assertEquals(renameOutlived(r, [1, 2], has(1, 2), has()), true); // task gone
+  // A rename of a tab whose task is unknown only needs its session.
+  assertEquals(renameOutlived({ sid: 2, channel: null }, [2], has(2), has()), false);
 });
 
 Deno.test("mainSession: a task's first agent, else its first session", () => {

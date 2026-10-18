@@ -44,7 +44,7 @@ import {
   KindIcon,
 } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
-import { type TabLabel, tabLabel, tabText } from "../model.ts";
+import { renameInputs, type TabLabel, tabLabel, tabText } from "../model.ts";
 
 export function spawnMenuItems(onPick: (k: SessionKind) => void): MenuItem[] {
   return [
@@ -83,11 +83,10 @@ function splitMenu(
 function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInGroup: number): MenuItem[] {
   const last = (sessionsByChannel.value.get(s.channel_id) ?? []).every((x) => x.id === s.id);
   const items: MenuItem[] = [
-    { label: "Rename tab", keys: "F2", run: () => A.renameIn("session", s.id) },
+    { label: "Rename", keys: "F2", run: () => A.startRename(s.id) },
   ];
   if (c) {
     items.push(
-      { label: "Rename task", run: () => A.renameIn("channel", s.id) },
       { label: "Permissions…", icon: <IconShield size={14} />, run: () => A.openPermissions(c.id) },
       "sep",
       { label: "Copy path", run: () => A.copy(s.cwd || c.cwd, "Path copied") },
@@ -189,7 +188,7 @@ function bodyMenu(
   }
   items.push(
     "sep",
-    { label: "Rename tab", run: () => A.renameIn("session", s.id) },
+    { label: "Rename", run: () => A.startRename(s.id, "terminal") },
     { label: "Restart", icon: <IconRestart size={14} />, run: () => A.restartSession(s.id) },
     { label: "Interrupt", disabled: s.state === "exited", run: () => A.interruptSession(s.id) },
     { label: "Review queued prompts", disabled: s.queued === 0, run: () => A.reviewQueue(s.id) },
@@ -519,7 +518,7 @@ function GroupTab(
     c?.branch ? `⎇ ${c.branch}` : null,
     s.state_detail || STATE_LABEL[s.state],
   ].filter(Boolean).join(" · ");
-  const editValue = r?.kind === "channel" ? label.text : s.name;
+  const edit = isRenaming ? renameInputs(r!.fields) : null;
   return (
     <div
       class={cx(
@@ -528,6 +527,8 @@ function GroupTab(
         active && groupFocused && "focused",
         isUnread && "unread",
         dragging && "dragging",
+        edit && "renaming",
+        edit && edit.length > 1 && "renaming-two",
         "st-" + s.state,
       )}
       role="tab"
@@ -559,17 +560,18 @@ function GroupTab(
         ? <span class="tab-num">{index + 1}</span>
         : <StateDot state={s.state} />}
       <KindIcon kind={s.kind} size={13} />
-      {isRenaming
+      {edit
         ? (
           <InlineEdit
-            value={editValue}
+            fields={edit.map((f) => ({
+              value: f.value,
+              label: f.key === "task" ? "Task name" : "Session name",
+            }))}
+            focus={Math.max(0, edit.findIndex((f) => f.key === r!.fields.focus))}
             class="tab-edit"
-            onCommit={(v) => {
-              renaming.value = null;
-              if (r?.kind === "channel") A.renameChannel(r.id, v);
-              else A.renameSession(s.id, v);
-            }}
-            onCancel={() => (renaming.value = null)}
+            onCommit={(v, byKey) =>
+              A.commitRename(r!, Object.fromEntries(edit.map((f, i) => [f.key, v[i]])), byKey)}
+            onCancel={(byKey) => A.endRename(r!, byKey)}
           />
         )
         : (

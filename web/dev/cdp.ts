@@ -34,6 +34,7 @@ const KEYS: Record<string, { key: string; code: string; vk: number }> = {
   Right: { key: "ArrowRight", code: "ArrowRight", vk: 39 },
   Down: { key: "ArrowDown", code: "ArrowDown", vk: 40 },
   F1: { key: "F1", code: "F1", vk: 112 },
+  F2: { key: "F2", code: "F2", vk: 113 },
   "/": { key: "/", code: "Slash", vk: 191 },
   "[": { key: "[", code: "BracketLeft", vk: 219 },
   "]": { key: "]", code: "BracketRight", vk: 221 },

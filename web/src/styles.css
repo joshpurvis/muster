@@ -913,8 +913,42 @@ button.sl-item:hover {
   background: var(--hover-strong);
 }
 
+/* Renaming: the tab keeps room for its fields instead of shrinking with its neighbours (the strip
+   scrolls around it), but stays narrower than its strip; its badges and close button make way.
+   Two fields (`[task] · [session]`) get more room. */
+.tab.renaming {
+  flex: none;
+  width: clamp(120px, 100cqw - 96px, 210px);
+  min-width: 0;
+  max-width: none;
+}
+
+.tab.renaming-two {
+  width: clamp(150px, 100cqw - 96px, 340px);
+}
+
+.tab.renaming > .icon,
+.tab.renaming .tab-wt,
+.tab.renaming .tab-perm,
+.tab.renaming .tab-queued,
+.tab.renaming .tab-close {
+  display: none;
+}
+
+/* Renaming in a narrow strip: the editor gets the whole strip; its other controls step aside. */
+@container (max-width: 480px) {
+  .tabstrip:has(.tab.renaming) > :not(.tabs) {
+    display: none;
+  }
+
+  .tab.renaming,
+  .tab.renaming-two {
+    width: calc(100cqw - 8px);
+  }
+}
+
 .tab-edit {
-  width: 110px;
+  flex: 1;
 }
 
 .tab-queued {
@@ -1601,6 +1635,24 @@ textarea {
 .dialog textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-softer);
+}
+
+.inline-edit-fields {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.inline-edit-sep {
+  flex: none;
+  color: var(--text-faint);
+}
+
+/* With two fields, only the one being typed in is highlighted. */
+.inline-edit-fields .inline-edit:not(:focus) {
+  border-color: var(--border-strong) !important;
+  box-shadow: none;
 }
 
 .inline-edit {

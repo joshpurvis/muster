@@ -83,7 +83,15 @@ import {
 } from "./layout/tree.ts";
 import * as terms from "./terms.ts";
 import { copyText } from "./util.ts";
-import { basename, mainSession, moveChannelLocally, nextInCycle, windowLabel } from "./model.ts";
+import {
+  basename,
+  mainSession,
+  moveChannelLocally,
+  nextInCycle,
+  renameChanges,
+  renameFields,
+  windowLabel,
+} from "./model.ts";
 
 export function fail(prefix: string) {
   return (e: unknown) => {
@@ -573,18 +581,39 @@ export function renameSession(sid: SessionId, name: string) {
     .catch(fail("Rename failed")).catch(() => {});
 }
 
-/** Double-click / F2 on a tab: the task's main tab renames the task, others the session. */
-export function startRename(sid: SessionId) {
+/** Rename (double-click, F2, menus, palette): edit exactly the names tab `sid` shows, inline in that
+ * tab. `from`: where the keyboard goes back to when it closes (the tab, or its terminal). */
+export function startRename(sid: SessionId, from: "tab" | "terminal" = "tab") {
   const s = sessions.value.get(sid);
   if (!s) return;
-  const main = mainSession(sessionsByChannel.value.get(s.channel_id) ?? []);
-  renameIn(main?.id === sid ? "channel" : "session", sid);
+  const c = channelById.value.get(s.channel_id);
+  const list = sessionsByChannel.value.get(s.channel_id) ?? [];
+  const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;
+  const fields = renameFields(s, c, ws, list.length, mainSession(list)?.id === sid);
+  renaming.value = { sid, channel: c ? c.id : null, fields, from };
 }
 
-/** Rename tab `sid`'s task or session inline, in that tab. */
-export function renameIn(kind: "channel" | "session", sid: SessionId) {
-  const s = sessions.value.get(sid);
-  if (s) renaming.value = { kind, id: kind === "channel" ? s.channel_id : sid, sid };
+type Renaming = NonNullable<typeof renaming.value>;
+
+/** Inline rename `r` was committed: rename the task and/or the session, whichever changed.
+ * `byKey`: closed with Enter (see `endRename`). */
+export function commitRename(r: Renaming, v: { task?: string; session?: string }, byKey: boolean) {
+  // An editor whose rename already ended (its tab left, a newer one started) renames nothing.
+  if (renaming.value !== r) return;
+  endRename(r, byKey);
+  const ch = renameChanges(r.fields, v);
+  if (ch.task !== undefined && r.channel !== null) renameChannel(r.channel, ch.task);
+  if (ch.session !== undefined) renameSession(r.sid, ch.session);
+}
+
+/** Inline rename `r` is over (never a newer one). Closed from the keyboard, focus goes back to
+ * where it was opened (its tab, or its terminal) instead of falling to <body>; closed by clicking
+ * away, it stays where the click put it. */
+export function endRename(r: Renaming, byKey: boolean) {
+  if (renaming.value === r) renaming.value = null;
+  if (!byKey) return;
+  if (r.from === "terminal") terms.focusTerminal(r.sid);
+  else document.querySelector<HTMLElement>(`.tab[data-tab-sid="${r.sid}"]`)?.focus();
 }
 
 export function approve(sid: SessionId, decision: Decision) {

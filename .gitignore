@@ -1,3 +1,5 @@
 /target
 /web/dist
 /web/node_modules
+/OWNER.md
+/.claude/

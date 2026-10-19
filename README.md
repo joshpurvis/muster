@@ -119,3 +119,7 @@ Log verbosity: `MUSTER_LOG=debug`.
 ```sh
 scripts/smoke.sh   # end-to-end: temp dirs, port 17433, scoped Deno permissions
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).

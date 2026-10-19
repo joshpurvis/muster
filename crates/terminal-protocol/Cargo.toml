@@ -2,6 +2,7 @@
 name = "muster-terminal-protocol"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

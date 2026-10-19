@@ -56,7 +56,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
 | `muster reload` | Replace the application backend while its terminal host and terminal processes keep running. Clients reconnect to the same endpoint. A window's "Restart backend" banner runs this from the path the backend was started from (`daemon.reload`). |
 | `muster stop` | Explicitly stop both backend and terminal host, terminating sessions. A window's "Shut down Muster…" does the same (`daemon.shutdown`). |
-| `muster status` / `url` / `daemon` / `hook` | As before. |
+| `muster status` / `url` / `daemon` / `hook` | As before. With the native window on Linux, `status` also prints a `next native window:` line: the WebKitGTK renderer a window opened from this shell would use and why, and the fallback marker's path when there is one (README.md, "Native window renderer"). |
 
 New sessions receive `$MUSTER_BIN` pointing to `<data>/bin/muster`; agent hooks use the
 same stable executable path. Successful backend startup atomically switches it to a

@@ -18,6 +18,22 @@ cargo build --workspace --release --features gui # native window (needs webkit2g
 deno task build:all                  # web/dist, then the release build with the native window
 ```
 
+**Native window renderer (Linux).** WebKitGTK's DMA-BUF renderer is much faster (typing
+feels instant) but crashes at startup on many Wayland setups ("Error 71 (Protocol error)").
+On Wayland with the NVIDIA driver, the window keeps it on and sets
+`__NV_DISABLE_EXPLICIT_SYNC=1`, which makes it work there. Every other setup keeps it off.
+While such a window starts it keeps a file in `<data>/webkit-dmabuf-launching/` (one per
+window process), and deletes it a few seconds after the page loads or when the window
+closes normally. If the next window finds one left by a process that is gone (the previous
+window crashed during startup), or a window's web process crashes during startup, Muster
+writes `<data>/webkit-dmabuf-failed` (usually `~/.local/share/muster/webkit-dmabuf-failed`),
+keyed by the NVIDIA driver and WebKitGTK versions. From then on windows use
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` until one of those versions changes or you delete the file.
+The window that crashed is not reopened for you; open a new one. Setting either variable
+yourself always wins (`env WEBKIT_DISABLE_DMABUF_RENDERER=0 muster` forces the fast renderer
+on, `=1` off). `muster status` shows what the next window would use, and each window logs its
+choice and any fallback to the daemon log.
+
 Build and distribute both `muster` and `muster-terminal-host` side by side. Debug builds
 serve `web/dist` from disk. Release builds can also load an independent UI release:
 

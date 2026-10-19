@@ -36,7 +36,12 @@ pub fn run_window(
     browser_url: impl FnOnce() -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
-    native::run(&d.base_url(), &d.token, window, decorations(d), browser_url);
+    {
+        // Pick the WebKitGTK renderer before GTK or any thread starts.
+        #[cfg(target_os = "linux")]
+        linux::prepare();
+        native::run(&d.base_url(), &d.token, window, decorations(d), browser_url);
+    }
     #[cfg(not(feature = "gui"))]
     {
         let _ = (d, window);
@@ -123,6 +128,8 @@ fn find_in_path(prog: &str) -> Option<PathBuf> {
 
 fn spawn_detached(mut cmd: Command, stderr: Option<Stdio>) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
+    #[cfg(all(feature = "gui", target_os = "linux"))]
+    linux::scrub_env(&mut cmd);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr.unwrap_or_else(Stdio::null));
@@ -172,6 +179,212 @@ pub fn open_browser(url: &str) -> anyhow::Result<()> {
     spawn_detached(cmd, None).with_context(|| format!("no browser found; open {url} manually"))
 }
 
+/// The Linux renderer choice (see `crate::renderer`): gathers the inputs, applies the plan
+/// before GTK starts, and keeps this window's "launching" file while the fast path is on
+/// probation. No extra process: a crash during startup leaves the file behind, and the next
+/// window's `prepare` turns that into the fallback marker.
+#[cfg(all(feature = "gui", target_os = "linux"))]
+pub mod linux {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::renderer::{self, DISABLE_DMABUF, NV_EXPLICIT_SYNC};
+
+    /// How long the window must stay up after its page loaded before the fast path counts as working.
+    const PROBATION: Duration = Duration::from_secs(3);
+
+    /// The plan `prepare` applied, for the checks after GTK starts.
+    static PLAN: Mutex<Option<renderer::Plan>> = Mutex::new(None);
+    /// This process's launching file while it is on probation.
+    static LAUNCHING: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// Set on the re-exec after GDK opened a non-Wayland display (see `after_gtk_init`).
+    const REEXEC: &str = "MUSTER_WINDOW_NOT_WAYLAND";
+    static NOT_WAYLAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// First thing in `muster native-window`, before anything can spawn a process: take the
+    /// re-exec flag out of the environment so nothing started from here inherits it.
+    pub fn take_reexec_flag() {
+        if std::env::var_os(REEXEC).is_some() {
+            // SAFETY: called at the start of the command, before any thread starts.
+            unsafe { std::env::remove_var(REEXEC) };
+            NOT_WAYLAND.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Processes this window starts (links, a browser fallback) get the user's environment,
+    /// not the renderer variables this window set for itself.
+    pub fn scrub_env(cmd: &mut std::process::Command) {
+        if let Some(p) = PLAN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            for (k, _) in &p.set_env {
+                cmd.env_remove(k);
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        fn webkit_get_major_version() -> u32;
+        fn webkit_get_minor_version() -> u32;
+        fn webkit_get_micro_version() -> u32;
+    }
+
+    fn webkit_version() -> String {
+        // SAFETY: plain getters on the linked WebKitGTK; no initialisation needed.
+        unsafe { format!("{}.{}.{}", webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version()) }
+    }
+
+    fn env(name: &str) -> Option<String> {
+        std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
+    }
+
+    fn data_dir() -> PathBuf {
+        crate::paths::data_dir()
+    }
+
+    /// `cleanup`: delete launching files of processes that are gone (a launch does; status doesn't).
+    fn inputs(cleanup: bool) -> renderer::Inputs {
+        let nvidia = std::fs::read_to_string("/proc/driver/nvidia/version")
+            .ok()
+            .map(|t| renderer::parse_nvidia_version(&t).unwrap_or_else(|| "unknown".into()));
+        let webkit = webkit_version();
+        let display = renderer::DisplayEnv {
+            gdk_backend: env("GDK_BACKEND"),
+            wayland_display: env("WAYLAND_DISPLAY"),
+            wayland_socket: env("WAYLAND_SOCKET"),
+            xdg_runtime_dir: env("XDG_RUNTIME_DIR"),
+            display: env("DISPLAY"),
+        };
+        let crashed_launch = nvidia.as_deref().is_some_and(|n| {
+            renderer::scan_launching(
+                &renderer::launching_dir(&data_dir()),
+                &renderer::marker_key(n, Some(&webkit)),
+                crate::paths::pid_alive,
+                cleanup,
+            )
+        });
+        let not_wayland = NOT_WAYLAND.load(std::sync::atomic::Ordering::Relaxed);
+        renderer::Inputs {
+            user_disable_dmabuf: env(DISABLE_DMABUF),
+            user_nv_explicit_sync: env(NV_EXPLICIT_SYNC),
+            wayland: !not_wayland && renderer::expect_wayland(&display, |p| p.exists()),
+            nvidia,
+            webkit: Some(webkit),
+            marker: renderer::read_marker(&renderer::marker_path(&data_dir())),
+            crashed_launch,
+        }
+    }
+
+    fn describe(p: &renderer::Plan) -> String {
+        format!("{} ({})", if p.dmabuf { "DMA-BUF renderer on" } else { "DMA-BUF renderer off" }, p.reason)
+    }
+
+    /// For `muster status`: what a window opened from this shell's environment would use.
+    pub fn status_line() -> String {
+        let mut line = describe(&renderer::decide(&inputs(false)));
+        let marker = renderer::marker_path(&data_dir());
+        if marker.exists() {
+            line.push_str(&format!("; fallback marker: {} (delete it to retry DMA-BUF)", marker.display()));
+        }
+        line
+    }
+
+    /// Choose the renderer and set its environment. Runs in `muster native-window` after the
+    /// daemon is found (so a daemon this process starts never inherits these variables) and
+    /// before GTK or any thread starts.
+    pub fn prepare() {
+        let plan = renderer::decide(&inputs(true));
+        eprintln!("muster: native window: {}", describe(&plan));
+        if plan.write_marker
+            && let Some(key) = &plan.marker_key
+        {
+            let path = renderer::marker_path(&data_dir());
+            match renderer::write_marker(&path, key) {
+                Ok(()) => eprintln!(
+                    "muster: native window: DMA-BUF renderer off from now on for {key}; delete {} to try it again",
+                    path.display()
+                ),
+                Err(e) => eprintln!("muster: native window: could not write {}: {e}", path.display()),
+            }
+        }
+        for (k, v) in &plan.set_env {
+            // SAFETY: called before the event loop or any other thread of this process starts.
+            unsafe { std::env::set_var(k, v) };
+        }
+        *PLAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(plan);
+    }
+
+    /// After GTK opened its display, before WebKit starts. If the fast path was chosen for a
+    /// Wayland display but GDK opened X11 (a black window there), re-exec this process with
+    /// DMA-BUF off: WebKit reads its environment when the webview is created, and changing the
+    /// environment of a process whose GTK threads are running is not safe. Otherwise, when the
+    /// fast path is on probation, write this process's launching file.
+    pub fn after_gtk_init(is_wayland: bool) {
+        let plan = PLAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(plan) = plan else { return };
+        let expected = plan.dmabuf && plan.guarded;
+        if expected && !is_wayland {
+            use std::os::unix::process::CommandExt;
+            eprintln!("muster: native window: GDK opened a non-Wayland display; restarting with DMA-BUF off");
+            if let Ok(exe) = std::env::current_exe() {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(std::env::args_os().skip(1)).env(REEXEC, "1");
+                scrub_env(&mut cmd);
+                let err = cmd.exec();
+                eprintln!("muster: native window: restart failed ({err}); continuing with DMA-BUF on");
+            }
+        }
+        if !plan.guarded {
+            if is_wayland && !plan.dmabuf && plan.reason.starts_with("DMA-BUF is only enabled") {
+                eprintln!("muster: native window: note: GDK opened a Wayland display, but the environment did not predict it");
+            }
+            return;
+        }
+        let Some(key) = &plan.marker_key else { return };
+        match renderer::write_launching(&renderer::launching_dir(&data_dir()), std::process::id(), key) {
+            Ok(path) => *LAUNCHING.lock().unwrap_or_else(|e| e.into_inner()) = Some(path),
+            Err(e) => eprintln!("muster: native window: could not write the launching file ({e}); a startup crash won't be detected"),
+        }
+    }
+
+    /// The page loaded: end probation once the window has stayed up a little longer.
+    pub fn page_loaded() {
+        if LAUNCHING.lock().map(|l| l.is_none()).unwrap_or(true) {
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(PROBATION);
+            if end_probation() {
+                eprintln!("muster: native window: DMA-BUF renderer up");
+            }
+        });
+    }
+
+    /// WebKit's web process crashed while the fast path was on probation: the window survives
+    /// (blank), so nothing would be left behind. Record the failure now for later windows.
+    pub fn web_process_crashed() {
+        if !end_probation() {
+            return;
+        }
+        let plan = PLAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(key) = plan.and_then(|p| p.marker_key) {
+            let path = renderer::marker_path(&data_dir());
+            match renderer::write_marker(&path, &key) {
+                Ok(()) => eprintln!(
+                    "muster: native window: the web process crashed during startup with DMA-BUF on; later windows use DMA-BUF off (delete {} to try again). Close this window and open a new one.",
+                    path.display()
+                ),
+                Err(e) => eprintln!("muster: native window: could not write {}: {e}", path.display()),
+            }
+        }
+    }
+
+    /// Delete this process's launching file (probation over, or a normal exit). True if there was one.
+    pub fn end_probation() -> bool {
+        let path = LAUNCHING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        path.map(|p| std::fs::remove_file(p).is_ok()).unwrap_or(false)
+    }
+}
+
 #[cfg(feature = "gui")]
 mod native {
     use tao::dpi::LogicalSize;
@@ -204,6 +417,9 @@ mod native {
         let mut browser_url = Some(browser_url);
         let mut fallback = move |why: &str| -> ! {
             eprintln!("muster: native window unavailable ({why}); opening a browser instead");
+            // A normal exit: not a renderer crash.
+            #[cfg(target_os = "linux")]
+            super::linux::end_probation();
             let r = browser_url
                 .take()
                 .map(|f| f())
@@ -217,18 +433,19 @@ mod native {
             };
             std::process::exit(code)
         };
-        // WebKitGTK's DMA-BUF renderer dies with "Error 71 (Protocol error)" on many Wayland
-        // setups (notably NVIDIA). Opt out unless the user chose otherwise.
-        #[cfg(target_os = "linux")]
-        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-            // SAFETY: called before the event loop or any other thread of this process starts.
-            unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
-        }
         // User events carry document title changes and the page's messages into the event loop.
         let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+        // GTK is up (its display open), WebKit not yet: check the display matches the renderer
+        // plan, and start the fast path's probation (see `linux`).
+        #[cfg(target_os = "linux")]
+        {
+            use tao::platform::unix::EventLoopWindowTargetExtUnix;
+            super::linux::after_gtk_init(event_loop.is_wayland());
+        }
         let proxy = event_loop.create_proxy();
         let ipc_proxy = event_loop.create_proxy();
         let ipc_origin = origin.clone();
+        let load_origin = origin.clone();
         let window = match WindowBuilder::new()
             .with_title("muster")
             .with_inner_size(LogicalSize::new(1400.0, 900.0))
@@ -242,6 +459,14 @@ mod native {
             .with_initialization_script(super::init_script(&origin, token, window_id))
             .with_url(&url)
             .with_devtools(cfg!(debug_assertions))
+            // The fast renderer's probation ends a few seconds after our own page loads.
+            .with_on_page_load_handler(move |event, url| {
+                let ours = url == load_origin || url.starts_with(&format!("{load_origin}/"));
+                if ours && matches!(event, wry::PageLoadEvent::Finished) {
+                    #[cfg(target_os = "linux")]
+                    super::linux::page_loaded();
+                }
+            })
             .with_document_title_changed_handler(move |title| {
                 let _ = proxy.send_event(UserEvent::Title(title));
             })
@@ -284,6 +509,17 @@ mod native {
             Ok(w) => w,
             Err(e) => fallback(&e.to_string()),
         };
+        // A web process that crashes leaves this process (and its launching file) alive.
+        #[cfg(target_os = "linux")]
+        {
+            use webkit2gtk::WebViewExt;
+            use wry::WebViewExtUnix;
+            webview.webview().connect_web_process_terminated(|_, reason| {
+                if matches!(reason, webkit2gtk::WebProcessTerminationReason::Crashed) {
+                    super::linux::web_process_crashed();
+                }
+            });
+        }
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -296,6 +532,11 @@ mod native {
                 Event::UserEvent(UserEvent::Title(title)) if !title.trim().is_empty() => window.set_title(&title),
                 Event::UserEvent(UserEvent::Ipc(IpcMessage::Decorations(on))) => window.set_decorations(on),
                 Event::UserEvent(UserEvent::Ipc(IpcMessage::Close)) => *control_flow = ControlFlow::Exit,
+                // A normal exit (closed by the user or the page): not a renderer crash.
+                #[cfg(target_os = "linux")]
+                Event::LoopDestroyed => {
+                    super::linux::end_probation();
+                }
                 _ => {}
             }
         })

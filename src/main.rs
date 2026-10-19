@@ -16,6 +16,7 @@ mod mcp;
 mod model;
 mod notify;
 mod paths;
+mod renderer;
 mod pty;
 mod rpc;
 mod server;
@@ -493,6 +494,8 @@ fn main() -> ExitCode {
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {
+            #[cfg(all(feature = "gui", target_os = "linux"))]
+            gui::linux::take_reexec_flag();
             ensure_daemon().and_then(|d| gui::run_window(&d, window, || browser_url(&d, window)))
         }
         Some(Cmd::Ls { all, json }) => cli::ls(find_daemon().as_ref(), all, json),
@@ -752,6 +755,10 @@ fn status() -> anyhow::Result<()> {
         );
     }
     println!("data: {}", paths::data_dir().display());
+    #[cfg(all(feature = "gui", target_os = "linux"))]
+    if std::env::var_os("MUSTER_BROWSER").is_none() {
+        println!("next native window: {}", gui::linux::status_line());
+    }
     Ok(())
 }
 

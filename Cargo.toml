@@ -9,7 +9,7 @@ edition = "2024"
 
 [features]
 default = []
-gui = ["dep:wry", "dep:tao"]
+gui = ["dep:wry", "dep:tao", "dep:webkit2gtk"]
 
 [dependencies]
 muster-terminal-protocol = { path = "crates/terminal-protocol" }
@@ -35,6 +35,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wry = { version = "0.53", optional = true }
 tao = { version = "0.34", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The same version wry uses; only for the web-process-crash signal (src/gui.rs).
+webkit2gtk = { version = "=2.0.1", optional = true }
 
 [profile.release]
 lto = "thin"

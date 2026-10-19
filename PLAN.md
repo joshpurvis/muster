@@ -1,7 +1,6 @@
-# Agent Multiplexer: Project Plan
+# Muster: Project Plan
 
-> Working name: TBD (shortlist: Muster, Drove, Switchyard, Corral, Tessel).
-> Status: personal tool first. Distribution, teams, and monetization are explicitly deferred until the concept is proven.
+> Status: personal tool first. Distribution and team features are deferred until the concept is proven.
 
 ## 0. Direction change (2026-09-23)
 
@@ -137,13 +136,12 @@ Phase 0 → 1 → 2 → 3 → 4, but build the Phase 3 adapter trait early (Phas
 - **Hibernate/resume:** suspend a session with worktree + conversation (via CLI resume flags) and restore later.
 - **Playbooks:** save a multi-agent workflow as a reusable template.
 - **Multiplayer + mobile approvals:** relay server, teammates share a workspace, approve from phone. Each user must use their own CLI login.
-- **Distribution:** packaging, auto-update, possible paid tier (team/relay features).
+- **Distribution:** packaging, auto-update, team/relay features.
 
 ## 9. Open questions
 - Headless VT backend: `alacritty_terminal` vs `vt100` vs `libghostty-vt`. Pick the one that best supports reliable screen-state matching for the agent CLIs.
 - Frontend framework.
 - How "catch me up" summaries get generated (e.g., the user's own `claude -p` in a session vs. an API key).
-- Product name.
 
 ## 10. Agents (first pass and panel v1, 2026-10-11)
 

@@ -2,14 +2,14 @@
 
 - Never run `muster stop`, `muster daemon` or any other muster CLI command against the real
   daemon unless the user asks. In tests, set `MUSTER_RUNTIME_DIR`, `MUSTER_DATA_DIR` and
-  `MUSTER_PORT` to temp values on every call (as `scripts/smoke.sh` does). On 2026-10-11 a bare
-  `muster stop` during testing killed the user's live daemon and every session in it.
+  `MUSTER_PORT` to temp values on every call (as `scripts/smoke.sh` does). A bare `muster stop`
+  during testing kills the user's live daemon and every session in it.
 - Exception: after a successful `deno task build:all` in the main checkout
-  (`/home/josh/projects/muster`, on `master`), you may apply the build to the live daemon
-  without asking, using that checkout's binary by its full path:
-  - backend changes (`src/`): `/home/josh/projects/muster/target/release/muster reload`
+  (the repository's primary working tree, not a `git worktree`, on `master`), you may apply the
+  build to the live daemon without asking, using that checkout's own binary, run from its root:
+  - backend changes (`src/`): `./target/release/muster reload`
     (terminals keep running); run it before any UI install.
-  - UI changes (`web/`): `/home/josh/projects/muster/target/release/muster ui-install web/dist`,
+  - UI changes (`web/`): `./target/release/muster ui-install web/dist`,
     then tell the user to reload the window.
 
   Never apply from a worktree or another branch: `reload` restarts the backend from whichever

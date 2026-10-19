@@ -4020,6 +4020,28 @@ mod tests {
         Hub::new(cfg, store).unwrap()
     }
 
+    #[test]
+    fn default_profile_keeps_the_inherited_claude_config_dir() {
+        let hub = fixture(None);
+        let home = std::env::temp_dir().join(format!("muster-hub-profile-{}", paths::random_token()));
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let env = |id| {
+            let mut env = BTreeMap::from([
+                ("HOME".to_string(), home.display().to_string()),
+                ("CLAUDE_CONFIG_DIR".to_string(), "/previous".to_string()),
+            ]);
+            hub.apply_account_profile(id, &mut env).unwrap();
+            env.get("CLAUDE_CONFIG_DIR").cloned()
+        };
+        assert_eq!(env(None).as_deref(), Some("/previous"));
+        let at_default = hub.add_account_profile("Main", &format!("{}/.claude/", home.display())).unwrap();
+        assert_eq!(env(Some(at_default.id)), None);
+        let work = hub.add_account_profile("Work", home.join("work").to_str().unwrap()).unwrap();
+        assert_eq!(env(Some(work.id)), Some(work.config_dir));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Give session `id` a live run on `service` (as an acknowledged launch would).
     fn install_terminal(hub: &Hub, service: &TerminalService, id: SessionId, generation: u64, directory: &Path)
         -> Arc<PtySession> {

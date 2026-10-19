@@ -85,6 +85,13 @@ on the child process when starting a session. It does not change the daemon's en
 or switch the machine's global Claude login. Two sessions can therefore use different
 accounts at the same time.
 
+A profile whose folder is Claude Code's default, `$HOME/.claude` (compared as canonical paths,
+so a symlink or trailing slash still matches), is the exception: its sessions start with
+`CLAUDE_CONFIG_DIR` removed, exactly like Default. Setting it, even to `~/.claude`, makes Claude
+Code keep a separate state file at `~/.claude/.claude.json` instead of `~/.claude.json`. A
+`CLAUDE_CONFIG_DIR` in the daemon's own environment does not make its folder "the default":
+a profile there gets the same value set, which already matches what Default inherits.
+
 Preserve the credential boundary in PLAN.md: Muster never reads, copies, stores, refreshes,
 or proxies Claude credentials or tokens. Claude Code owns authentication. Profile setup
 must detect or explain conflicting API-key and gateway environment settings so an inherited

@@ -142,7 +142,8 @@ export function AccountProfilesDialog({ Modal, close }: { Modal: ModalT; close: 
           <p class="field-hint">
             First, run <code>CLAUDE_CONFIG_DIR=/absolute/path claude</code>{" "}
             in your terminal and sign in normally. Then register that directory here. Its location stays
-            fixed.
+            fixed. A profile at the default <code>~/.claude</code> folder starts its sessions without{" "}
+            <code>CLAUDE_CONFIG_DIR</code>, like Default.
           </p>
           <label class="field">
             <span class="field-label">Name</span>

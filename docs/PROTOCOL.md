@@ -475,7 +475,8 @@ this preflight before interrupting the previous run. Error messages name conflic
 environment variables without their values. Default/null-pinned sessions retain the legacy
 environment behavior, including any inherited `CLAUDE_CONFIG_DIR`.
 
-The launcher sets only `CLAUDE_CONFIG_DIR` in the selected child's existing environment and
+The launcher sets only `CLAUDE_CONFIG_DIR` in the selected child's existing environment (or,
+for a profile at the canonical `$HOME/.claude`, removes it, so the session matches Default) and
 uses the ordinary adapter arguments. It never opens profile contents or invokes Claude auth
 commands. Configuration and account changes made outside Muster remain Claude Code's
 responsibility; a profile ID is not a verified account identity. The terminal host's complete

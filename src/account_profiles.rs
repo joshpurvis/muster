@@ -142,8 +142,28 @@ pub fn apply_environment(
         "Claude profile '{}' directory moved or was redirected; register its new location as a new profile",
         profile.name
     );
-    env.insert("CLAUDE_CONFIG_DIR".into(), profile.config_dir.clone());
+    // Claude Code keeps its state file in $HOME/.claude.json only while CLAUDE_CONFIG_DIR is
+    // unset; set (even to the default folder) it moves to $CLAUDE_CONFIG_DIR/.claude.json. So a
+    // profile at the default folder launches exactly like Default, minus any inherited value.
+    let home = env.get("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from);
+    if is_default_folder(&canonical, home.as_deref()) {
+        env.remove("CLAUDE_CONFIG_DIR");
+    } else {
+        env.insert("CLAUDE_CONFIG_DIR".into(), profile.config_dir.clone());
+    }
     Ok(())
+}
+
+/// Whether `dir` is the folder Claude Code uses when CLAUDE_CONFIG_DIR is unset:
+/// `$HOME/.claude` (`home`, else the daemon's home), compared as canonical paths so a symlink
+/// or trailing slash still matches. A CLAUDE_CONFIG_DIR in the daemon's own environment does
+/// not count: Claude Code's state file only stays in $HOME when the variable is unset.
+pub fn is_default_folder(dir: &Path, home: Option<&Path>) -> bool {
+    let home = home.map(Path::to_path_buf).unwrap_or_else(crate::paths::home_dir);
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(home.join(".claude"))) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +252,53 @@ mod tests {
         );
         assert!(env.is_empty());
         std::fs::remove_file(&f.0).unwrap();
+    }
+
+    #[test]
+    fn a_profile_at_the_default_folder_launches_without_claude_config_dir() {
+        // A fake HOME: <home>/.claude is the default folder, <home>/dotfiles/claude a real
+        // folder that <home>/link points at, <home>/other a separate profile folder.
+        let home = Fixture::new();
+        let default = home.0.join(".claude");
+        std::fs::create_dir(&default).unwrap();
+        std::os::unix::fs::symlink(&default, home.0.join("link")).unwrap();
+        std::fs::create_dir(home.0.join("other")).unwrap();
+        let profile = |dir: &std::path::Path| AccountProfile {
+            id: 2, name: "Work".into(), enabled: true, created_at: 1,
+            config_dir: config_directory(dir.to_str().unwrap()).unwrap(),
+        };
+        let launch = |p: &AccountProfile, home: String| {
+            let mut env = BTreeMap::from([
+                ("HOME".into(), home),
+                ("CLAUDE_CONFIG_DIR".into(), "/previous".into()),
+                ("EDITOR".into(), "vi".into()),
+            ]);
+            apply_environment(p, &mut env).unwrap();
+            env
+        };
+        let h = home.0.display().to_string();
+        for dir in [default.clone(), home.0.join("link"), home.0.join(".claude/"), home.0.join("other/../.claude")] {
+            for home in [h.clone(), format!("{h}/"), home.0.join("link/..").display().to_string()] {
+                let env = launch(&profile(&dir), home);
+                assert!(!env.contains_key("CLAUDE_CONFIG_DIR"), "{dir:?} must not set CLAUDE_CONFIG_DIR");
+                assert_eq!(env["EDITOR"], "vi");
+            }
+        }
+        // The default folder itself reached through a symlinked HOME/.claude also matches.
+        let real = home.0.join("dotfiles");
+        std::fs::create_dir(&real).unwrap();
+        let other_home = Fixture::new();
+        std::os::unix::fs::symlink(&real, other_home.0.join(".claude")).unwrap();
+        let env = launch(&profile(&real), other_home.0.display().to_string());
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+        // Any other folder still selects itself.
+        let other = profile(&home.0.join("other"));
+        assert_eq!(launch(&other, h.clone())["CLAUDE_CONFIG_DIR"], other.config_dir);
+        // The default folder of a different HOME is just another folder.
+        let env = launch(&profile(&default), other_home.0.display().to_string());
+        assert_eq!(env["CLAUDE_CONFIG_DIR"], default.canonicalize().unwrap().to_str().unwrap());
+        assert!(is_default_folder(&default, Some(&home.0)));
+        assert!(!is_default_folder(&home.0.join("missing"), Some(&home.0)));
     }
 
     #[test]

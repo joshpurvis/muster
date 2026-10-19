@@ -1574,6 +1574,9 @@ pub fn profile_add(d: &Discovery, name: &str, directory: &std::path::Path) -> an
     } else { std::env::current_dir()?.join(directory).to_string_lossy().into_owned() })?;
     let p = client::rpc(d, "account_profile.create", json!({"name": name, "config_dir": directory}))?;
     println!("Registered {} ({}). Sign in and verify the account inside Claude Code; Muster has not checked or changed authentication.\nRun `muster skills install` to give this profile's sessions Muster's agent skills.", p["name"].as_str().unwrap_or(name), p["id"]);
+    if crate::account_profiles::is_default_folder(std::path::Path::new(&directory), None) {
+        println!("This is Claude Code's default folder (~/.claude), so its sessions start without CLAUDE_CONFIG_DIR, exactly like Default.");
+    }
     Ok(())
 }
 

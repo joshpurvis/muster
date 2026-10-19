@@ -102,6 +102,40 @@ seconds (default 300). A timeout prints `{events: [], remaining: 0, timed_out: t
 successfully; a wait fails if the session moves to another task or restarts. `event` fetches
 the full event that a panel prompt showed only as a placeholder (panel ID, then event ID).
 
+## Agent skills
+
+Muster ships two agent skills (in `skills/`, embedded in the binary): `muster-pr-review`, the
+PR decision flow (review one snapshot, open a `pr_decision` panel, merge only on its Merge
+event), and `muster-panels`, a short guide to panels, the built-in apps and custom MCP Apps.
+An agent loads one when the request matches its description ("review PR 812", "chart this").
+Both only work inside a Muster session and say so otherwise.
+
+```sh
+muster skills install            # Claude Code and Codex
+muster skills install --claude   # or --codex; --dry-run shows the changes, writes nothing
+muster skills status
+```
+
+A skill runs in your current agent, so the PR's text enters its context; for PRs from people
+you don't trust, start a separate agent from the PR reviewer template (New agent) to keep it
+isolated. Loading a skill never widens what you allowed the agent to do.
+
+Targets: Claude Code `$CLAUDE_CONFIG_DIR/skills`, else `~/.claude/skills`; Codex
+`$CODEX_HOME/skills`, else `~/.codex/skills` (where Codex's own skill-creator puts user skills).
+Each skill is `<target>/<name>/SKILL.md` (mode 0600, folders 0700), with a `.muster-installed`
+marker beside it holding the SHA-256 of what Muster wrote. `install` lists each file as new,
+updated, unchanged or locally modified. It writes nothing at all if a file was edited since
+Muster wrote it, or Muster did not write it (`--force` replaces those), or if the `skills`
+folder, a skill folder, SKILL.md or the marker is a symlink (even a dangling one), a special
+file or larger than 256 KiB (refused even with `--force`: move it away). Each file is written
+through an exclusively created, randomly named temporary file and a rename, SKILL.md before
+its marker, and is checked again just before: a file that changed since the plan is left
+alone and reported as "changed while installing". If a write fails, every file's result is
+still printed and the command exits 1. Running it again is a no-op. `status` shows each skill
+and target as missing, current, outdated (Muster's older version), locally modified or
+blocked. The marker only records what Muster wrote; it is not proof of origin. Nothing else in those folders is touched. Start
+a new agent session afterwards to pick the skills up.
+
 ## Claude profiles
 
 Profiles are Muster-owned names and references to existing Claude configuration directories.

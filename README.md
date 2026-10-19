@@ -7,6 +7,9 @@ backend handles agents, tasks and worktrees; windows render the UI. Closing a wi
 restarting the backend leaves terminal processes running. The UI reconnects and replays
 scrollback. See [the separation design](docs/TERMINAL_HOST.md) for recovery and rollout details.
 
+Agents can show images, charts, tables and pull request decisions in panels beside their
+terminal; `muster skills install` teaches Claude Code and Codex how ([docs/CLI.md](docs/CLI.md#agent-skills)).
+
 See [PLAN.md](PLAN.md) for the roadmap, [docs/PROTOCOL.md](docs/PROTOCOL.md) for the client
 protocol and [docs/UI.md](docs/UI.md) for the UI spec, including the keyboard shortcuts.
 

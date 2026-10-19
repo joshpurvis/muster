@@ -16,6 +16,7 @@ mod mcp;
 mod model;
 mod panels;
 mod panel_apps;
+mod skills;
 mod notify;
 mod paths;
 mod renderer;
@@ -61,6 +62,11 @@ enum Cmd {
     Panel {
         #[command(subcommand)]
         action: cli::PanelCmd,
+    },
+    /// Install Muster's agent skills (PR review, panels) for Claude Code and Codex.
+    Skills {
+        #[command(subcommand)]
+        action: skills::SkillsCmd,
     },
     /// Run the daemon (detaches into the background unless --foreground).
     Daemon {
@@ -498,6 +504,7 @@ fn main() -> ExitCode {
                 assets::install(&path, &paths::data_dir()).map(|release| println!("UI activated at {}; reload the window (open windows offer it)", release.display()))
             }
         },
+        Some(Cmd::Skills { action }) => skills::run(action),
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {

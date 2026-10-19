@@ -40,8 +40,12 @@ pub struct Panel {
     pub dropped_events: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PanelEvent {
+    /// The stored event's id (0 for the synthetic `overflow` notice). It stays the same when an
+    /// undelivered batch returns to its panel, and `panel_event` fetches an event by it.
+    #[serde(default)]
+    pub id: i64,
     pub panel_id: PanelId,
     pub kind: String,
     pub payload: serde_json::Value,

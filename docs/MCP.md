@@ -111,24 +111,67 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 | `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
 | `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
-| `list_panels` | `{}` | `{panels: [...]}`; open panels in this task |
-| `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], timed_out}`; consumes queued events |
+| `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
+| `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], remaining, timed_out}`; consumes the returned events |
+| `panel_event` | `panel_id`, `event_id` | `{event}`; the full event a panel prompt showed only as a placeholder; consumes it |
 
 `markdown` takes `data: {markdown: "# Review"}`; the other built-ins are below. `custom` requires either inline `html` or
-`html_path`, resolved inside the task cwd; symlinks escaping it are refused. HTML and JSON
-input each have a 1 MiB limit; data must be an object. Open/update share the post rate limit.
-`csp` uses MCP Apps fields (`resourceDomains`, `connectDomains`, `frameDomains`,
+`html_path`, resolved inside the task cwd; symlinks escaping it are refused, and the path must
+name a regular file (a FIFO or device is refused without waiting on it). HTML and JSON input
+each have a 1 MiB limit; data must be an object. A task can have 16 open panels (128 in all);
+closing one frees its slot and deletes its HTML and data. Open/update share the post rate
+limit. `csp` uses MCP Apps fields (`resourceDomains`, `connectDomains`, `frameDomains`,
 `baseUriDomains`): declared asset origins work, fetching and nested frames stay blocked.
 Only loopback HTTP frame declarations are accepted; base URI overrides are refused.
 
-Events contain `{panel_id, kind, payload, at}`. The latest app context accompanies the last
-event in each panel batch. The durable queue keeps 200 events per panel, adding an `overflow`
-event with the dropped count. An active wait takes precedence over idle-agent delivery.
-Otherwise the opener receives a marked prompt (at most about 24 KiB, with truncation notes),
-through the durable injection queue. The queue records `Panel(id)` provenance and the timeline
-records `panel:<id>`; a user action starts a human-origin turn at hop 0. Shell, exited and
+A custom app is an MCP Apps (2026-01-26) page talking JSON-RPC to its parent frame. Until it
+calls `ui/initialize` and then sends `ui/notifications/initialized`, the panel shows
+"Loading"; after 10 s without it, the panel shows an error naming the stage that stalled, with
+Reload. Input arrives as `ui/notifications/tool-input` (`params.arguments` is the panel's
+`data`, again on every `panel_update`). A user action reaches the agent through `ui/message`,
+accepted only straight after a click or key inside the panel's content (checked by the sandbox
+proxy), at most 3 per user action (a 4th within about 5.5 s gets JSON-RPC error -32000), so
+send one message per deliberate action; `_meta.muster.kind` names it.
+A minimal app:
+
+```html
+<!doctype html><meta charset="utf-8"><button>Approve</button><script>
+let n = 0; const calls = new Map();
+const call = (method, params) => new Promise((ok) => { calls.set(++n, ok);
+  parent.postMessage({jsonrpc: "2.0", id: n, method, params}, "*"); });
+addEventListener("message", ({source, data: m}) => {
+  if (source !== parent || m?.jsonrpc !== "2.0") return;
+  if (m.id && calls.has(m.id)) { calls.get(m.id)(m.result); calls.delete(m.id); }
+  if (m.method === "ui/notifications/tool-input") console.log(m.params.arguments);
+  if (m.method === "ui/resource-teardown") parent.postMessage({jsonrpc: "2.0", id: m.id, result: {}}, "*");
+});
+call("ui/initialize", {protocolVersion: "2026-01-26", appInfo: {name: "approve", version: "1"},
+  appCapabilities: {}}).then(() =>
+  parent.postMessage({jsonrpc: "2.0", method: "ui/notifications/initialized", params: {}}, "*"));
+document.querySelector("button").onclick = () => call("ui/message", {role: "user",
+  content: {type: "text", text: "approved"}, _meta: {muster: {kind: "approve"}}});
+</script>
+```
+
+Events contain `{id, panel_id, kind, payload, at}`; `id` stays the same if an event is
+delivered later than first planned. The latest app context rides on the last event of each
+panel in a result. The durable queue keeps 200 events per panel, adding an `overflow` event
+(id 0) with the dropped count. A wait returns whole events, up to about 256 KiB, and how many
+remain. A wait is bound to the caller's task and terminal run: it fails if the caller moves to
+another task or restarts, and only then do events go to the idle opener again.
+
+Without a wait, the idle opener receives a marked prompt through the durable injection queue,
+at most 24 KiB of whole events in order (the app context is cut to 4 KiB in it; `list_panels`
+has it all). Events that do not fit stay queued for the next prompt; one too long for any
+prompt appears as a placeholder with its id, for `panel_event`. The timeline records the
+prompt as `panel:<id>`; a user action starts a human-origin turn at hop 0. A prompt is typed
+only while its opener is still in the panels' task and run: if the opener moves, exits or
+restarts before the prompt is typed, its events go back to the panel queue. Once typing has
+begun the prompt is never resent; if its run then ends, a notice says the events may not have
+arrived. Clearing a session's prompt queue discards panel prompts in it. Shell, exited and
 moved-to-another-task openers keep events queued. A human closing a tab queues `closed`;
-agent `panel_close` does not. Archiving the task removes panels, files and events.
+agent `panel_close` does not. Archiving the task, including when its last session closes or
+moves out, removes panels, files and events.
 
 #### Built-in apps
 

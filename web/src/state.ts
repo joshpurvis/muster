@@ -65,6 +65,8 @@ export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 export const panels = signal<Map<number, Panel>>(new Map());
 export const panelOrigin = signal("");
+/** Bumped by every hello (connect and reconnect): panels retry a resource that failed to load. */
+export const helloEpoch = signal(0);
 
 /** Every window the daemon knows (all clients). */
 export const windows = signal<Win[]>([]);
@@ -589,6 +591,7 @@ export function applyHello(h: HelloResult) {
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
     panels.value = new Map((h.panels ?? []).filter((p) => !p.closed).map((p) => [p.id, p]));
     panelOrigin.value = h.panel_origin ?? "";
+    helloEpoch.value++;
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
     }
@@ -605,15 +608,19 @@ export function applyHello(h: HelloResult) {
   }
 }
 
+/** Record a panel change we made before its event arrives. */
+export function knowPanel(p: Panel) {
+  const next = new Map(panels.value);
+  if (p.closed) next.delete(p.id);
+  else next.set(p.id, p);
+  panels.value = next;
+}
+
 export function applyEvent(ev: ServerEvent) {
   switch (ev.event) {
-    case "panel_upserted": {
-      const next = new Map(panels.value);
-      if (ev.data.closed) next.delete(ev.data.id);
-      else next.set(ev.data.id, ev.data);
-      panels.value = next;
+    case "panel_upserted":
+      knowPanel(ev.data);
       break;
-    }
     case "panel_removed": {
       const next = new Map(panels.value);
       next.delete(ev.data.id);

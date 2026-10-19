@@ -953,8 +953,10 @@ ${question}`,
     render();
     result.catch((e) => {
       sent = null;
-      setNotice(`Not sent: ${e.message}`, "danger");
+      if (pr?.head_sha === event.data.head_sha && pr.status !== "merged") mode = "confirm";
+      setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
+      focusMode();
     });
   }
   function submit(kind) {
@@ -977,7 +979,7 @@ ${question}`,
       sent = null;
       drafts[kind] = text;
       mode = kind;
-      setNotice(`Not sent: ${e.message}`, "danger");
+      setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
     });
   }

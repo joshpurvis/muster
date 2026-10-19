@@ -2385,6 +2385,10 @@ impl Hub {
         for ev in events {
             self.emit(ev);
         }
+        // Outside `inner`: the task's panels, events and files go with it, as in `archive_channel`.
+        if let Err(e) = crate::panels::archive(self, id) {
+            tracing::warn!(channel = id, "removing an emptied task's panels (retried at startup): {e:#}");
+        }
         Ok(true)
     }
 
@@ -3216,6 +3220,9 @@ impl Hub {
         channel_id: ChannelId,
         expect_from: Option<ChannelId>,
     ) -> anyhow::Result<(SessionInfo, ChannelId)> {
+        // Panel waits and panel prompts check their task under this lock: none can act for the
+        // old task once the move is visible.
+        let _panels = self.panels.operations.lock();
         let (info, from) = {
             let mut g = self.inner.lock();
             match g.channels.get(&channel_id) {
@@ -3265,6 +3272,8 @@ impl Hub {
             }
             (next, from)
         };
+        if from != channel_id { crate::inject::release_unbound_panel_batches(self, id); }
+        drop(_panels);
         self.rederive_name(from);
         self.rederive_name(channel_id);
         Ok((info, from))

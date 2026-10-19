@@ -152,13 +152,13 @@ pub struct Prov {
     pub msg_id: Option<i64>,
 }
 
-/// Who a prompt typed by the injector comes from.
+/// Who a prompt typed by the injector comes from. Persisted in the prompt queue, which an
+/// older backend must still load after a rollback: add no variants (a panel prompt is a
+/// human-origin `Chain` at hop 0; its panel attribution rides on the queue item instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     /// The human, through a client or device connection: clears the session's provenance.
     Human,
-    /// A user action in a sandboxed panel. Retains explicit attribution in the queue.
-    Panel(crate::model::PanelId),
     /// A message on a chain (an agent's send or spawn prompt, an agent message): becomes it.
     Chain(Prov),
 }
@@ -884,10 +884,6 @@ impl Registry {
             state.human_seen.remove(&id);
             match source {
                 Source::Human => { state.prov.remove(&id); state.active.remove(&id); }
-                Source::Panel(_) => {
-                    state.prov.insert(id, Prov { origin: Origin::Human, hop: 0, msg_id: None });
-                    state.active.remove(&id);
-                }
                 Source::Chain(prov) => {
                     state.prov.insert(id, prov);
                     match prov.msg_id {
@@ -1750,10 +1746,14 @@ sum up the rest in rest_note. Add open questions if you have any.
 url, base, head, head_sha (headRefOid, exactly as fetched), merge_method_default, delete_branch_default, \
 summary, risk: {level, reasons}, checks: {state: passing|failing|pending|none, items: [{name, state: \
 bucket, url: link}]}, reviews: {decision, items: [{author, state}]}, changes: [{file, note, diff}], \
-rest_note, questions} (docs/MCP.md, Built-in apps). Then call wait_for_panel_event for that panel; call \
-it again after a timeout. panel_update replaces the whole data, so always send every field.
+rest_note, questions} (docs/MCP.md, Built-in apps). panel_update replaces the whole data, so always \
+send every field.
+4. Loop on wait_for_panel_event {panel_id}: handle each returned event in order, call it again at \
+once while remaining > 0, and again after a timeout. If you were not waiting, events arrive as a \
+prompt headed [panel \"PR #<n>\" #<panel_id>] with one JSON event per line; for a placeholder there, \
+fetch the event with panel_event {panel_id, event_id}.
 
-Each event has a kind; its fields are in payload._meta.muster.data.
+Each event has an id and a kind; its fields are in payload._meta.muster.data.
 - merge {number, method, delete_branch, head_sha}: check that number and head_sha are the ones you \
 put in the panel and method is squash, merge or rebase. panel_update status \"merging\", then run \
 exactly `gh pr merge <number> --<method> [--delete-branch] --match-head-commit <head_sha>`. Report the \
@@ -2667,7 +2667,7 @@ mod tests {
         assert!(by("orchestrator").persona.contains("ask_agent") && by("orchestrator").persona.contains("list_agents"));
         assert_eq!((by("reviewer").kind, by("reviewer").permissions.codex_sandbox), (SessionKind::Codex, CodexSandbox::ReadOnly));
         let pr = by("pr_reviewer").persona;
-        for want in ["pr_decision", "wait_for_panel_event", "--match-head-commit <head_sha>", "headRefOid", "payload._meta.muster.data", "--request-changes"] {
+        for want in ["pr_decision", "wait_for_panel_event", "remaining > 0", "panel_event {panel_id, event_id}", "--match-head-commit <head_sha>", "headRefOid", "payload._meta.muster.data", "--request-changes"] {
             assert!(pr.contains(want), "PR reviewer persona mentions {want}");
         }
         assert_eq!(by("pr_reviewer").permissions, Permissions::default(), "gh still asks under the default profile");

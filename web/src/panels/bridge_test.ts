@@ -8,7 +8,11 @@ function check(value: unknown, message = "assertion failed") {
 function fixture() {
   const sent: RpcMessage[] = [];
   const calls: { method: string; params: Record<string, unknown> }[] = [];
-  let active = false;
+  // `shown`: the host's own check (tab shown, frame focused); `verdict`: the sandbox proxy's.
+  let shown = false;
+  let verdict = false;
+  const keys: unknown[] = [];
+  const errors: string[] = [];
   let mode = "inline";
   const resource: PanelResource = {
     panel: { id: 7, channel_id: 2, session_id: 3, title: "Review", app: "markdown", csp: {}, window_id: 1,
@@ -19,23 +23,30 @@ function fixture() {
     send: (m) => sent.push(m),
     call: (method, params) => { calls.push({ method, params }); return Promise.resolve({ content: [] }); },
     context: () => ({ theme: "dark", displayMode: mode }),
-    userActive: () => active,
+    userActive: () => shown,
     openLink: (url) => { calls.push({ method: "link", params: { url } }); },
     displayMode: (next) => { mode = next; return next; },
     resized: () => {},
+    keys: () => [{ ctrl: true, alt: false, shift: true, meta: false, code: "KeyP", editAlt: false }],
+    key: (k) => keys.push(k),
+    appError: (m) => errors.push(m),
   };
   const bridge = new PanelBridge(resource, host);
   let id = 0;
   const request = async (method: string, params: Record<string, unknown> = {}) => {
     const next = ++id;
-    await bridge.receive({ jsonrpc: "2.0", id: next, method, params });
+    await bridge.receive({ jsonrpc: "2.0", id: next, method, params }, verdict);
     return sent.find((m) => m.id === next)!;
   };
   const init = async () => {
     await request("ui/initialize", { protocolVersion: "2026-01-26", appInfo: { name: "test", version: "1" }, appCapabilities: {} });
     await bridge.receive({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
   };
-  return { sent, calls, request, init, bridge, resource, activate: () => { active = true; } };
+  return {
+    sent, calls, request, init, bridge, resource, keys, errors,
+    activate: () => { shown = true; verdict = true; },
+    set: (next: { shown?: boolean; verdict?: boolean }) => { shown = next.shown ?? shown; verdict = next.verdict ?? verdict; },
+  };
 }
 
 Deno.test("panel bridge waits for initialized before sending input and result", async () => {
@@ -115,4 +126,41 @@ Deno.test("panel update, theme, fullscreen and teardown follow the lifecycle", a
   const count = f.sent.length;
   await f.request("ping");
   check(f.sent.length === count, "closed bridge is inert");
+});
+
+Deno.test("panel events need the proxy's activation verdict, not only a shown and focused frame", async () => {
+  const f = fixture(); await f.init();
+  const message = { role: "user", content: { type: "text", text: "Approve" } };
+  // A click on the tab strip: the host is active and focuses the frame, the proxy saw nothing.
+  f.set({ shown: true, verdict: false });
+  check((await f.request("ui/message", message)).error?.message.includes("user action"));
+  check(!!(await f.request("ui/open-link", { url: "https://example.com" })).error);
+  // A real click inside a panel that is hidden (another tab of the group) still fails.
+  f.set({ shown: false, verdict: true });
+  check((await f.request("ui/message", message)).error?.code === -32000);
+  check(f.calls.length === 0);
+  f.set({ shown: true, verdict: true });
+  check((await f.request("ui/message", message)).result !== undefined && f.calls.length === 1);
+});
+
+Deno.test("the sandbox hears Muster's chords; keys reach the host only while the panel has focus", async () => {
+  const f = fixture();
+  await f.request("ui/notifications/sandbox-proxy-ready");
+  check((f.sent[0].params as any).keys[0].code === "KeyP", "chords travel with the resource");
+  const key = { code: "KeyP", key: "P", ctrl: true, alt: false, shift: true, meta: false, inInput: false };
+  await f.bridge.receive({ jsonrpc: "2.0", method: "muster/key", params: key });
+  check(f.keys.length === 0, "not while hidden or unfocused");
+  f.set({ shown: true });
+  await f.bridge.receive({ jsonrpc: "2.0", method: "muster/key", params: key });
+  check(f.keys.length === 1, "works before the app initializes");
+  for (const bad of [{ ...key, ctrl: "yes" }, { ...key, code: "x".repeat(40) }, { code: "KeyP" }]) {
+    await f.bridge.receive({ jsonrpc: "2.0", method: "muster/key", params: bad });
+  }
+  check(f.keys.length === 1, "malformed keys are dropped");
+  await f.bridge.receive({ jsonrpc: "2.0", method: "muster/app-error", params: { message: "ReferenceError: x (line 3)" } });
+  await f.bridge.receive({ jsonrpc: "2.0", method: "muster/app-error", params: { message: 42 } });
+  check(f.errors.length === 1 && f.errors[0].startsWith("ReferenceError"));
+  check(!f.bridge.ready);
+  await f.init();
+  check(f.bridge.ready);
 });

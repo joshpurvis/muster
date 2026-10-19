@@ -40,7 +40,7 @@ pub fn run_window(
         // Pick the WebKitGTK renderer before GTK or any thread starts.
         #[cfg(target_os = "linux")]
         linux::prepare();
-        native::run(&d.base_url(), &d.token, window, decorations(d), browser_url);
+        native::run(&d.base_url(), &d.token, d.panel_port, window, decorations(d), browser_url);
     }
     #[cfg(not(feature = "gui"))]
     {
@@ -59,6 +59,32 @@ fn decorations(d: &crate::paths::Discovery) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the native window may load `target` (wry's navigation handler: main frame and
+/// subframes alike, which it cannot tell apart). The daemon's own UI, `about:blank`, and for
+/// agent panels (docs/AGENT_PANELS.md) exactly the panel server's sandbox proxy page
+/// (`http://127.0.0.1:<panel_port>/proxy?...`) and the proxy's inline app frame
+/// (`about:srcdoc`). `panel_port` is asked for only when a proxy URL is seen, so a backend
+/// reload that moved the panel server is followed. Everything else stays blocked.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn allow_navigation(origin: &str, target: &str, panel_port: impl FnOnce() -> Option<u16>) -> bool {
+    if target == origin || target.starts_with(&format!("{origin}/")) || target == "about:blank" || target == "about:srcdoc" {
+        return true;
+    }
+    let Some(rest) = target.strip_prefix("http://127.0.0.1:") else { return false };
+    let Some((port, path)) = rest.split_once('/') else { return false };
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let path = path.split_once('#').map_or(path, |(p, _)| p);
+    if path != "proxy" && !path.starts_with("proxy?") {
+        return false;
+    }
+    match (port.parse::<u16>(), panel_port()) {
+        (Ok(p), Some(want)) => p != 0 && p == want,
+        _ => false,
+    }
+}
+
 /// A message the page sends the native window (`window.ipc.postMessage`, JSON).
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[derive(Debug, PartialEq)]
@@ -72,7 +98,10 @@ pub enum IpcMessage {
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn parse_ipc(body: &str, secret: &str) -> Option<IpcMessage> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if secret.is_empty() || v.get("secret").and_then(|s| s.as_str()) != Some(secret) { return None }
+    let sent = v.get("secret").and_then(|s| s.as_str()).unwrap_or("");
+    if secret.is_empty() || !crate::paths::token_eq(sent, secret) {
+        return None;
+    }
     if let Some(d) = v.get("decorations").and_then(|d| d.as_bool()) {
         return Some(IpcMessage::Decorations(d));
     }
@@ -410,6 +439,7 @@ mod native {
     pub fn run(
         base_url: &str,
         token: &str,
+        panel_port: Option<u16>,
         window_id: Option<i64>,
         decorations: bool,
         browser_url: impl FnOnce() -> anyhow::Result<String>,
@@ -449,6 +479,7 @@ mod native {
         let ipc_origin = origin.clone();
         let ipc_secret = rand::random::<[u8; 32]>().iter().map(|b| format!("{b:02x}")).collect::<String>();
         let load_origin = origin.clone();
+        let nav_panel_port = std::sync::Mutex::new(panel_port);
         let window = match WindowBuilder::new()
             .with_title("muster")
             .with_inner_size(LogicalSize::new(1400.0, 900.0))
@@ -491,9 +522,28 @@ mod native {
                 let _ = super::spawn_detached(c, None);
                 NewWindowResponse::Deny
             })
-            // Keep the window on the daemon's own origin.
+            // Keep the window on the daemon's own origin; panel frames load only the panel
+            // server's proxy. wry does not say whether a navigation is the main frame's, so a
+            // top-level load of the proxy is allowed too: it holds no token or IPC capability
+            // and does nothing outside a frame (web/panels/proxy.html). The UI's frames are
+            // sandboxed without top navigation, so only the UI itself could navigate there.
             .with_navigation_handler(move |target| {
-                target == origin || target.starts_with(&format!("{origin}/")) || target == "about:blank"
+                super::allow_navigation(&origin, &target, || {
+                    let mut known = nav_panel_port.lock().unwrap_or_else(|e| e.into_inner());
+                    let want = target
+                        .strip_prefix("http://127.0.0.1:")
+                        .and_then(|r| r.split('/').next())
+                        .and_then(|p| p.parse::<u16>().ok());
+                    // A backend reload starts a new panel server: re-read the daemon's discovery
+                    // file (same daemon: same UI port) when a proxy names a port we don't know.
+                    if want.is_some() && *known != want
+                        && let Some(d) = crate::paths::read_discovery()
+                        && d.base_url() == origin
+                    {
+                        *known = d.panel_port;
+                    }
+                    *known
+                })
             });
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -557,6 +607,30 @@ mod tests {
         assert!(s.contains(r#"window.__musterNative={ipc:2,secret:"secret"};"#), "{s}");
         let s = super::init_script("http://127.0.0.1:7433", "t", Some(3), "secret");
         assert!(s.contains(r#"sessionStorage.setItem("muster.window","3");"#), "{s}");
+    }
+
+    #[test]
+    fn navigation_allows_only_the_ui_and_the_panel_proxy() {
+        use super::allow_navigation as allow;
+        let ui = "http://127.0.0.1:7433";
+        let port = || Some(40001);
+        for ok in [
+            "http://127.0.0.1:7433", "http://127.0.0.1:7433/", "http://127.0.0.1:7433/#token=x", "about:blank",
+            "about:srcdoc", "http://127.0.0.1:40001/proxy", "http://127.0.0.1:40001/proxy?csp=%7B%7D",
+        ] {
+            assert!(allow(ui, ok, port), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:40002/proxy", "http://127.0.0.1:40001/", "http://127.0.0.1:40001/proxyx",
+            "http://127.0.0.1:40001/api/rpc", "http://localhost:40001/proxy", "https://127.0.0.1:40001/proxy",
+            "http://127.0.0.1:40001@evil.example/proxy", "http://127.0.0.1:7433.evil.example/", "http://127.0.0.1:0/proxy",
+            "https://example.com/", "data:text/html,x", "file:///etc/passwd", "about:srcdoc2", "javascript:alert(1)",
+        ] {
+            assert!(!allow(ui, bad, port), "{bad}");
+        }
+        assert!(!allow(ui, "http://127.0.0.1:40001/proxy", || None), "an older daemon has no panel server");
+        let mut asked = false;
+        assert!(allow(ui, "http://127.0.0.1:7433/x", || { asked = true; None }) && !asked, "UI loads never read discovery");
     }
 
     #[test]

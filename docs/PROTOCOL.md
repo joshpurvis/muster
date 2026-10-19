@@ -228,7 +228,7 @@ neither panel records nor panel events. The proxy listener has no daemon routes 
 
 | Method | Params | Result |
 |---|---|---|
-| `panel.open/update/close/list/wait` | `{from_session, arguments}` | Corresponding MCP tool result; same task scope and guards |
+| `panel.open/update/close/list/wait/fetch_event` | `{from_session, arguments}` | Corresponding MCP tool result (`fetch_event` is `panel_event`); same task scope and guards |
 | `panel.resource` | `{id}` | `{panel, html, data}` |
 | `panel.event` | `{panel_id, kind, payload}` | `{}`; 16 KiB payload limit, 30 events/minute/panel |
 | `panel.context` | `{panel_id, context}` | `{}`; latest context, 16 KiB limit |
@@ -240,8 +240,16 @@ WebSocket pushes: `panel_upserted` carries a full panel, `panel_removed` carries
 `hello.panels` contains open panels and `panel_origin` is `http://127.0.0.1:<panel_port>`.
 Records contain `id`, `channel_id`, `session_id` (opener), `window_id`, `title`, `app`, `csp`,
 `revision`, `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
-Schema v14 stores records in `panels` and queued events in `panel_events`. Immutable revision
-files under `<data>/panels/<id>/` are written atomically, mode 0600, before the row is committed.
+Schema v14 stores records in `panels` and queued events in `panel_events`; v15 adds `parked`
+(events a prompt showed as a placeholder, kept for `panel_event`). Immutable revision files
+under `<data>/panels/<id>/` are written, mode 0600, under temporary names outside the panel
+lock and renamed into place as the row commits. A closed panel's files are deleted; the
+startup sweep removes files no record names and closed panels with nothing left to deliver.
+
+Events admitted to an idle prompt move, in the same transaction, from `panel_events` into that
+prompt's entry in the `prompt-queues` runtime record (as an optional `panel` field, with the
+existing human-origin `Chain` source, so a backend without panels still loads the queue). They
+return to `panel_events` with their ids if the entry is dropped before typing starts.
 
 The UI embeds `/proxy?csp=<JSON>` on the separate origin, with sandbox permissions
 `allow-scripts allow-same-origin`. The proxy creates an opaque `srcdoc` app with only

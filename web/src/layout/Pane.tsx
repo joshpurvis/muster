@@ -3,7 +3,7 @@
 // window controls.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { panelId, panelTab, type PaneNode } from "./tree.ts";
-import { PanelView, reloadPanel } from "../panels/PanelView.tsx";
+import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
 import {
   accountProfiles,
   altHeld,
@@ -225,6 +225,7 @@ export function Group(
   const all = sessions.value;
   const tabs = pane.tabs.filter((id) => all.has(id) || panels.value.has(panelId(id) ?? -1));
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
+  const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
   const find = A.findOpen.value;
   const dragging = drag.value;
 
@@ -265,10 +266,7 @@ export function Group(
         )}
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
-        {tabs.flatMap((id) => {
-          const p = panels.value.get(panelId(id) ?? -1);
-          return p ? [<PanelView key={p.id} panel={p} paneId={pane.id} active={id === pane.active} />] : [];
-        })}
+        {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
         {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (

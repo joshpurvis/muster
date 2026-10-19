@@ -1057,10 +1057,8 @@ async fn daemon_main() -> anyhow::Result<()> {
     hook_inbox::spawn(&hub, hook_inbox)?;
     hub::spawn_input_attribution(&hub)?;
     hub.panels.port.store(panel_port, std::sync::atomic::Ordering::Relaxed);
-    // Finish interrupted archive cleanup before publishing any panel to a UI.
-    for panel in panels::list(&hub)? {
-        if hub.channel(panel.channel_id).is_none_or(|c| c.archived) { panels::archive(&hub, panel.channel_id)?; }
-    }
+    // Finish interrupted archive cleanup and sweep stale files before publishing any panel.
+    panels::recover(&hub)?;
     let app = server::router(hub.clone())?;
     // Publish the helper only after application recovery succeeds. Existing
     // terminals keep this path even when the original build directory is removed.

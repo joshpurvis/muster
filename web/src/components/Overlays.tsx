@@ -13,6 +13,7 @@ import {
   meta,
   myWindow,
   overlay,
+  panels,
   prefs,
   sessions,
   toasts,
@@ -24,7 +25,8 @@ import {
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
-import { IconBranch, IconCheck, IconCodex, IconFolder, IconSpark, IconTerminal, IconX } from "../icons.tsx";
+import { IconBranch, IconCheck, IconCodex, IconFolder, IconPanel, IconSpark, IconTerminal, IconX } from "../icons.tsx";
+import { panelTab } from "../layout/tree.ts";
 import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
@@ -241,6 +243,28 @@ function jumpEntries(): Entry[] {
       },
     });
   }
+  // Agent panels in every window: choosing one shows it, pulling it here from another window.
+  for (const p of panels.value.values()) {
+    const c = channelById.value.get(p.channel_id);
+    if (!c || c.archived || p.closed) continue;
+    const isHere = here.has(panelTab(p.id));
+    const folder = tildify(c.cwd, home);
+    out.push({
+      key: "p:" + p.id,
+      label: p.title,
+      hay: `${p.title} panel ${basename(c.cwd)} ${c.branch ?? ""}`,
+      needs: false,
+      here: isHere,
+      boost: 1,
+      sub: isHere ? `panel · ${folder}` : `${winName(p.window_id)} · panel · ${folder}`,
+      icon: <IconPanel size={14} />,
+      right: <span class="sw-detail">panel</span>,
+      run: () => {
+        overlay.value = null;
+        A.gotoPanel(p.id);
+      },
+    });
+  }
   // Every named agent, stopped ones too: choosing one starts it and pulls its tab here.
   for (const a of agents.value) {
     const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
@@ -324,7 +348,7 @@ function Jump({ initial }: { initial: string }) {
     const cmds = rankJump(commandEntries(), query, [], 10).map((r) => ({ e: r.item, hits: r.hits }));
     return [...ranked, ...cmds];
     // Live: states and tabs change while Jump is open.
-  }, [q, sessions.value, channels.value, windows.value, layoutOrder.value, agents.value]);
+  }, [q, sessions.value, panels.value, channels.value, windows.value, layoutOrder.value, agents.value]);
 
   useEffect(() => setSel(0), [q]);
   useEffect(() => {

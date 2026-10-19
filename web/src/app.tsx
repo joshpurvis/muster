@@ -13,7 +13,7 @@ import {
   applyHello,
   daemonStopped,
   focusedSession,
-  focusedSessionId,
+  focusedTabId,
   helloDone,
   hereIds,
   layout,
@@ -43,6 +43,7 @@ import { AgentsPanel } from "./components/Agents.tsx";
 import { Kbd, TooltipHost } from "./components/common.tsx";
 import { FolderInput } from "./components/FolderInput.tsx";
 import { SplitView } from "./layout/SplitView.tsx";
+import { PanelLayer } from "./panels/PanelView.tsx";
 import { DragOverlay } from "./layout/dnd.tsx";
 import { LaunchButtons } from "./layout/Pane.tsx";
 import { focusPane, paneOfSession } from "./layout/tree.ts";
@@ -130,7 +131,7 @@ terms.onTerminalFocus((sid) => {
 // The focused tab closed or moved to another window while its terminal had focus: focus falls to
 // <body>, so hand it to the tab that took its place (never steal it from a dialog or field).
 effect(() => {
-  void focusedSessionId.value;
+  void focusedTabId.value;
   const a = document.activeElement;
   if (!a || a === document.body) A.focusActiveTerminalSoon();
 });
@@ -317,6 +318,7 @@ function App() {
             ? (
               <div class="panes">
                 <SplitView layout={l} />
+                <PanelLayer />
               </div>
             )
             : <EmptyWindow />}

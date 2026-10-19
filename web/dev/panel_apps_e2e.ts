@@ -222,6 +222,13 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check((await events(p.pid)).length === 0, "Merge alone sends nothing");
     await p.shots2("pr-confirm");
     await p.waitIn(`document.querySelector('.drawer pre.command')`);
+    // The proxy allows 3 messages per ~5.5 s of user activity: use them up with links, and the
+    // refused Merge keeps the confirm open to try again.
+    for (let i = 0; i < 3; i++) await a.key("o");
+    await p.click("#confirm-merge");
+    await p.waitIn(`document.querySelector('.notice.danger')?.textContent.includes('Try again') && document.activeElement?.id === 'confirm-merge'`);
+    check((await events(p.pid)).length === 0, "a refused Merge sent nothing");
+    await a.sleep(5600);
     await p.click("#confirm-merge");
     got = await events(p.pid);
     check(got.length === 1 && got[0].kind === "merge", `one merge event: ${JSON.stringify(got)} ${await p.inApp(`document.querySelector('.notice')?.textContent + '|' + !!document.querySelector('.drawer')`)}`);
@@ -229,12 +236,13 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check(JSON.stringify(data) === JSON.stringify({ action: "merge", number: 812, method: "squash", delete_branch: true, head_sha: HEAD_SHA }), `merge payload: ${JSON.stringify(data)}`);
     check(String(got[0].payload.content.text).endsWith(command), "event text carries the command");
     check(await p.inApp(`document.querySelector('#merge').disabled`), "Merge disabled while the agent works");
-    ok("pr_decision: Merge shows the exact gh command; Confirm sends one merge event with that PR, method, branch flag and head SHA");
+    ok("pr_decision: Merge shows the exact gh command; a refused send keeps the confirm for a retry; Confirm sends one merge event with that PR, method, branch flag and head SHA");
 
     // Keyboard: method change, M, Enter.
     await call("panel.update", { panel_id: p.pid, data: { ...prSample, status: "failed", status_detail: "Head branch was modified. Review and try the merge again." } });
     await p.waitIn(`document.querySelector('.status.danger')`);
     await p.inApp(`(() => { const s = document.querySelector('#method'); s.value = 'rebase'; s.dispatchEvent(new Event('change')); })()`);
+    await a.sleep(5600);
     await p.click("h1");
     await a.key("m");
     await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);

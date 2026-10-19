@@ -234,7 +234,6 @@ impl Backend for Arc<Mock> {
         match source {
             crate::agents::Source::Chain(p) => d.prov.insert(id, p),
             crate::agents::Source::Human => d.prov.remove(&id),
-            crate::agents::Source::Panel(_) => d.prov.insert(id, crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None }),
         };
         let (delivered, queued) = d.send_outcome.unwrap_or((true, 0));
         Ok(SendOutcome { delivered, queued })

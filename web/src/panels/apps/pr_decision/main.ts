@@ -64,7 +64,14 @@ function confirmMerge() {
   mode = null;
   setNotice(`Merge sent to the agent: it runs the command below and reports here. ${mergeCommand(pr.number, method, deleteBranch, pr.head_sha)}`);
   render();
-  result.catch((e) => { sent = null; setNotice(`Not sent: ${e.message}`, "danger"); render(); });
+  // Refused (e.g. too many actions in a few seconds): keep the confirm open to try again.
+  result.catch((e) => {
+    sent = null;
+    if (pr?.head_sha === event.data.head_sha && pr.status !== "merged") mode = "confirm";
+    setNotice(`Not sent (${e.message}). Try again.`, "danger");
+    render();
+    focusMode();
+  });
 }
 
 function submit(kind: "request" | "ask") {
@@ -78,7 +85,7 @@ function submit(kind: "request" | "ask") {
   drafts[kind] = "";
   setNotice(kind === "request" ? "Request for changes sent to the agent." : "Question sent; the answer will appear here.");
   render();
-  result.catch((e) => { sent = null; drafts[kind] = text; mode = kind; setNotice(`Not sent: ${e.message}`, "danger"); render(); });
+  result.catch((e) => { sent = null; drafts[kind] = text; mode = kind; setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
 }
 
 function setMode(next: Mode) {

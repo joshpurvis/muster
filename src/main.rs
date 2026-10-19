@@ -19,6 +19,7 @@ mod panel_apps;
 mod skills;
 mod notify;
 mod paths;
+mod pr;
 mod renderer;
 mod pty;
 mod rpc;
@@ -62,6 +63,11 @@ enum Cmd {
     Panel {
         #[command(subcommand)]
         action: cli::PanelCmd,
+    },
+    /// Read-only GitHub PR fetches for reviews: the open PR list, or one PR's snapshot (JSON).
+    Pr {
+        #[command(subcommand)]
+        action: pr::PrCmd,
     },
     /// Install Muster's agent skills (PR review, panels) for Claude Code and Codex.
     Skills {
@@ -505,6 +511,7 @@ fn main() -> ExitCode {
             }
         },
         Some(Cmd::Skills { action }) => skills::run(action),
+        Some(Cmd::Pr { action }) => pr::run(action),
         Some(Cmd::Url) => running().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Open { path, window }) => open(path, window),
         Some(Cmd::NativeWindow { window }) => {

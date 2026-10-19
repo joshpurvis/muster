@@ -17,6 +17,7 @@ const markdownApp = await Deno.readTextFile(new URL("../panels/markdown.html", i
 const panels = new Map<number, PanelResource>();
 const panelEvents: any[] = [];
 let panelSeq = 0;
+let panelResourceDelay = 0;
 const panelServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, (req) => {
   const u = new URL(req.url);
   if (u.pathname !== "/proxy" || !["GET", "HEAD"].includes(req.method)) return new Response("Not found", { status: 404 });
@@ -778,6 +779,15 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       "channel.mark_read",
     ].includes(method)
   ) throw new Error("This device does not have permission for " + method);
+  // Panel loading under a flaky connection: delay resource replies, drop every client.
+  if (method === "mock.panel_delay") {
+    panelResourceDelay = Number(p.ms) || 0;
+    return {};
+  }
+  if (method === "mock.drop_clients") {
+    setTimeout(() => { for (const c of clients) c.close(); }, 150);
+    return {};
+  }
   if (method === "mock.updates") {
     // Pretend a build or UI release is waiting: {ui_release?, backend?, host?}.
     Object.assign(updates, p);
@@ -799,6 +809,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       return { panel_id: id };
     }
     case "panel.resource": {
+      if (panelResourceDelay) await new Promise((r) => setTimeout(r, panelResourceDelay));
       const resource = panels.get(p.id);
       if (!resource || resource.panel.closed) throw new Error("panel not found");
       return resource;

@@ -11,6 +11,7 @@
 // blocks `window.show` in the pages it drives, so it can never launch a window.
 import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
+import { panelChecks } from "./e2e_panels.ts";
 
 const [url, shots, repo, mode] = Deno.args;
 // `real`: against a real (isolated!) daemon. Agents are replaced by a named shell and the
@@ -958,95 +959,8 @@ try {
     ok("Ctrl+Shift+R reloaded the window");
   }
 
-  // ---- light theme, shortcuts sheet
-  if (!real) {
-    const opener = (await here(a))[0];
-    check(opener !== undefined, "panel opener exists");
-    const opened = await R(a, "panel.open", { from_session: opener, arguments: {
-      title: "Panel review", app: "markdown", data: { markdown: "# Sandbox review\n\n**Safe** text and `<script>` literals.\n\n| Check | Result |\n| --- | --- |\n| Bridge | Ready |" },
-    } });
-    const pid = opened.panel_id;
-    const tab = -pid - 1;
-    await a.wait(`!!document.querySelector('[data-panel-view="${pid}"] iframe') && !document.querySelector('[data-panel-view="${pid}"] .panel-status')`, 8000);
-    const frameTree: any = await a.send("Page.getFrameTree");
-    const frames: any[] = [];
-    const collect = (n: any) => { frames.push(n.frame); for (const c of n.childFrames ?? []) collect(c); };
-    collect(frameTree.frameTree);
-    const proxy = frames.find((f) => f.url.startsWith(hello.panel_origin + "/proxy"));
-    // Chromium puts the opaque srcdoc in its own renderer process on recent builds.
-    const targets: any = await a.send("Target.getTargets");
-    const child = targets.targetInfos.find((t: any) => t.type === "iframe" && t.parentFrameId === proxy?.id && t.url === "about:srcdoc");
-    const app = frames.find((f) => f.parentId === proxy?.id && f.url === "about:srcdoc");
-    check(proxy && (app || child), `proxy on second origin, app in its inner srcdoc frame: ${JSON.stringify(frames)}`);
-    const session = child ? (await a.send("Target.attachToTarget", { targetId: child.targetId, flatten: true })).sessionId : undefined;
-    const world: any = await a.send("Page.createIsolatedWorld", { frameId: app?.id ?? child.targetId, worldName: "panel-check" }, session);
-    const inApp = async (expression: string): Promise<any> => {
-      const r: any = await a.send("Runtime.evaluate", { expression, contextId: world.executionContextId, returnByValue: true, awaitPromise: true }, session);
-      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
-      return r.result.value;
-    };
-    check(await inApp(`document.querySelector('h1')?.textContent`) === "Sandbox review", "markdown heading renders");
-    check(await inApp(`document.querySelectorAll('table tr').length`) === 2, "simple table renders");
-    check(await a.eval(`document.querySelector('[data-panel-id="${pid}"]').sandbox.value`) === "allow-scripts allow-same-origin", "outer sandbox grants only script and same-origin permissions");
-    check(await inApp(`(() => { try { return top.sessionStorage.getItem('muster.token'); } catch { return 'blocked'; } })()`) === "blocked", "app cannot read host token");
-    check(await inApp(`typeof globalThis.__musterNative`) === "undefined", "no native capability in app");
-    ok("Markdown panel renders in the separate-origin proxy and opaque sandbox; token stays private");
-
-    await inApp(`globalThis.panelRequest = (method, params) => new Promise((resolve, reject) => {
-      const id = 'e2e:' + Math.random();
-      const timer = setTimeout(() => { removeEventListener('message', listen); reject(new Error('panel RPC timed out')); }, 3000);
-      const listen = (e) => { if (e.source === parent && e.data?.id === id) { clearTimeout(timer); removeEventListener('message', listen); resolve(e.data); } };
-      addEventListener('message', listen); parent.postMessage({jsonrpc:'2.0',id,method,params}, '*');
-    }); true`);
-    await a.wait(`navigator.userActivation.isActive === false`, 8000);
-    const denied = await inApp(`panelRequest('ui/message', {role:'user',content:{type:'text',text:'unsolicited'}})`);
-    check(denied.error?.message.includes("user action"), "message without activation refused");
-    const disallowed = await inApp(`panelRequest('tools/call', {name:'send_message',arguments:{session_id:${opener},text:'bad'}})`);
-    check(disallowed.error?.code === -32601, "non-allowlisted tool refused");
-    const scoped = await inApp(`panelRequest('tools/call', {name:'get_diff',arguments:{channel_id:9999}})`);
-    check(!!scoped.error, "app cannot override task scope");
-    const diff = await inApp(`panelRequest('tools/call', {name:'get_diff',arguments:{}})`);
-    check(diff.result?.content?.[0]?.text === "Mock diff", "allowlisted get_diff works");
-    const blockedFetch = await inApp(`fetch(${JSON.stringify(hello.panel_origin + "/api/rpc")}).then(() => false, () => true)`);
-    check(blockedFetch, "fetch blocked by CSP");
-    const navigated = await inApp(`(() => { try { top.location.href='https://example.invalid/panel-escape'; return true; } catch { return false; } })()`);
-    check(!navigated && (await a.eval(`location.origin`)) === new URL(url).origin, "top navigation blocked");
-    ok("bridge rejects unsolicited events and forbidden tools; task override, fetch and top navigation are blocked");
-
-    const outer = (await a.rect(`[data-panel-id="${pid}"]`))!;
-    const field = await inApp(`(() => { const r = document.querySelector('textarea').getBoundingClientRect(); return {x:r.x+20,y:r.y+15}; })()`);
-    await a.clickAt(outer.x + field.x, outer.y + field.y);
-    await a.type("Looks good from the sandbox");
-    await inApp(`document.querySelector('button').scrollIntoView({block:'center'})`);
-    const button = await inApp(`(() => { const r = document.querySelector('button').getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`);
-    await a.clickAt(outer.x + button.x, outer.y + button.y);
-    await a.sleep(250);
-    const delivery = await R(a, "panel.wait", { from_session: opener, arguments: { panel_id: pid, timeout_seconds: 0 } });
-    check(delivery.events.length === 1 && delivery.events[0].kind === "ui/message" && delivery.events[0].payload.content.text === "Looks good from the sandbox", `real click reaches event queue exactly once: ${JSON.stringify({ delivery, status: await inApp("document.querySelector('output').textContent"), host: await a.eval("({active:navigator.userActivation.isActive,focus:document.activeElement?.outerHTML})"), button, outer })}`);
-    check(await inApp(`document.querySelector('output').textContent`) === "Sent", "app receives event acknowledgement");
-    ok("trusted Chromium click activates the host through both frames and delivers one panel event");
-
-    await inApp(`globalThis.__keptAcrossInputUpdate = true`);
-    await R(a, "panel.update", { from_session: opener, arguments: { panel_id: pid, data: { markdown: "# Updated in place" } } });
-    await a.sleep(350);
-    check(await inApp(`document.querySelector('h1')?.textContent`) === "Updated in place" && await inApp(`globalThis.__keptAcrossInputUpdate`) === true, "input update keeps the same frame");
-    await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
-    await a.sleep(150);
-    check(await inApp(`document.documentElement.dataset.theme`) === "light", "theme reaches app");
-    await inApp(`panelRequest('ui/request-display-mode', {mode:'fullscreen'})`);
-    await a.sleep(150);
-    check(await a.eval(`!!${M}.layout.value.zoom`) && await inApp(`globalThis.__keptAcrossInputUpdate`) === true, "fullscreen zoom preserves the app frame");
-    await inApp(`panelRequest('ui/request-display-mode', {mode:'inline'})`);
-    await a.sleep(150);
-    check(await a.eval(`${M}.layout.value.zoom === null`) && await inApp(`globalThis.__keptAcrossInputUpdate`) === true, "inline mode restores groups without reloading the app");
-    await shot(a, "15-panel");
-    await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
-    await a.click(`[data-tab-sid="${tab}"] .tab-close`);
-    await a.wait(`!document.querySelector('[data-tab-sid="${tab}"]')`);
-    const closed = await R(a, "panel.wait", { from_session: opener, arguments: { panel_id: pid, timeout_seconds: 0 } });
-    check(closed.events.length === 1 && closed.events[0].kind === "closed", "tab close queues closed event");
-    ok("panel updates preserve the frame, theme follows the host, and closing delivers closed");
-  }
+  // ---- agent panels (dev/e2e_panels.ts)
+  if (!real) await panelChecks(a, { url, shots, hello, ok, check });
 
   // ---- light theme, shortcuts sheet
   await a.send("Emulation.setEmulatedMedia", {

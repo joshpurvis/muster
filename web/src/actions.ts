@@ -14,6 +14,7 @@ import {
   focusedSession,
   focusedTask,
   focusedTabId,
+  knowPanel,
   panels,
   hereIds,
   holdNewSessions,
@@ -48,7 +49,7 @@ import {
   workspaces,
 } from "./state.ts";
 import * as native from "./native.ts";
-import { panelId } from "./layout/tree.ts";
+import { panelId, panelTab } from "./layout/tree.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import type {
   Agent,
@@ -288,6 +289,32 @@ export async function gotoSession(sid: SessionId) {
     if (!(await pullHere(sid))) return;
   }
   revealSession(sid);
+}
+
+/** Show panel `id` wherever it is: selected here, or moved here from another window (with
+ * "Jump focuses the other window", that window is raised instead when it can be). */
+export async function gotoPanel(id: number) {
+  const p = panels.value.get(id);
+  if (!p) return;
+  const tab = panelTab(id);
+  pushRecent("p:" + id);
+  if (!hereIds.value.has(tab)) {
+    const here = windowId.value;
+    if (here === null) return;
+    if (prefs.value.jumpRaises && p.window_id !== null && p.window_id !== here) {
+      const raised = await rpc.call<{ raised: boolean }>("window.raise", { id: p.window_id })
+        .then((r) => !!r?.raised).catch(() => false);
+      if (raised) return;
+    }
+    try {
+      await rpc.call("panel.move", { id, window_id: here });
+      knowPanel({ ...p, window_id: here });
+    } catch (e) {
+      toast("error", `Couldn't bring the panel here: ${errText(e)}`);
+      return;
+    }
+  }
+  revealSession(tab);
 }
 
 /** Alt+J: the next session that needs you, in any window. */
@@ -536,7 +563,13 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
 export function closeTab(sid: SessionId, force = false) {
   const pid = panelId(sid);
   if (pid !== null) {
-    rpc.call("panel.dismiss", { id: pid }).catch(fail("Close failed")).catch(() => {});
+    // Focus was on the panel or its close button: once it is gone, the tab that takes its
+    // place gets the keyboard (otherwise focus falls to <body> and typing goes nowhere).
+    rpc.call("panel.dismiss", { id: pid }).then(() => {
+      const p = panels.value.get(pid);
+      if (p) knowPanel({ ...p, closed: true });
+      focusActiveTerminalSoon();
+    }).catch(fail("Close failed")).catch(() => {});
     return;
   }
   const s = sessions.value.get(sid);

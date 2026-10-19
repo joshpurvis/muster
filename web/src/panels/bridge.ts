@@ -15,12 +15,25 @@ export interface Host {
   send: (msg: RpcMessage) => void;
   call: (method: string, params: ObjectValue) => Promise<unknown>;
   context: () => ObjectValue;
-  // Read synchronously while handling the postMessage, before any await.
+  /** The panel's frame can take a user's action now (shown, focused). Read synchronously while
+   * handling the postMessage, before any await; the sandbox proxy's activation verdict is
+   * passed to `receive` separately. */
   userActive: () => boolean;
   openLink: (url: string) => void;
+  /** Sandbox keys the host should hear (Muster's shortcuts), and one the user pressed. */
+  keys: () => KeyChord[];
+  key: (key: PanelKey) => void;
+  /** The app reported a script, load or content-policy error. */
+  appError: (message: string) => void;
   displayMode: (mode: "inline" | "fullscreen") => "inline" | "fullscreen";
   resized: (size: { width: number; height: number }) => void;
 }
+
+export interface KeyChord { ctrl: boolean; alt: boolean; shift: boolean; meta: boolean; code: string; editAlt: boolean }
+export interface PanelKey { code: string; key: string; ctrl: boolean; alt: boolean; shift: boolean; meta: boolean; inInput: boolean }
+
+/** Set only by the sandbox proxy (web/panels/proxy.html) on messages it forwards from the app. */
+export const ACTIVATION = "muster_user_activation";
 
 const object = (v: unknown): v is ObjectValue => !!v && typeof v === "object" && !Array.isArray(v);
 const requestId = (v: unknown): v is string | number => typeof v === "string" || (typeof v === "number" && Number.isFinite(v));
@@ -41,6 +54,9 @@ export class PanelBridge {
   private rates = new Map<string, number[]>();
 
   constructor(resource: PanelResource, private host: Host) { this.resource = resource; }
+
+  /** The app finished the MCP Apps handshake. */
+  get ready() { return this.initialized && !this.disposed; }
 
   private notify(method: string, params: ObjectValue) {
     if (!this.disposed) this.host.send({ jsonrpc: "2.0", method, params });
@@ -81,7 +97,9 @@ export class PanelBridge {
     this.disposed = true;
   }
 
-  async receive(raw: unknown) {
+  /** `activated`: the sandbox proxy saw a fresh user action inside this panel's app and the
+   * message is within that action's small budget (see proxy.html). */
+  async receive(raw: unknown, activated = false) {
     if (this.disposed || !object(raw)) return;
     const id = requestId(raw.id) ? raw.id : undefined;
     const reply = (result: unknown) => {
@@ -100,8 +118,25 @@ export class PanelBridge {
       const panel_id = this.resource.panel.id;
       if (raw.method === "ui/notifications/sandbox-proxy-ready") {
         this.notify("ui/notifications/sandbox-resource-ready", {
-          html: this.resource.html, csp: this.resource.panel.csp, sandbox: "allow-scripts",
+          html: this.resource.html, csp: this.resource.panel.csp, sandbox: "allow-scripts", keys: this.host.keys(),
         });
+        return;
+      }
+      // Muster's own notifications from the sandbox helper; they work before initialize too.
+      if (raw.method === "muster/key") {
+        const flag = (v: unknown) => typeof v === "boolean";
+        if (!(typeof p.code === "string" && typeof p.key === "string" && p.code.length <= 20 && p.key.length <= 20 &&
+          flag(p.ctrl) && flag(p.alt) && flag(p.shift) && flag(p.meta) && flag(p.inInput))) return;
+        if (!this.host.userActive()) return;
+        this.limit("key", 240);
+        this.host.key(p as unknown as PanelKey);
+        return;
+      }
+      if (raw.method === "muster/app-error") {
+        if (typeof p.message === "string" && p.message.trim()) {
+          this.limit("app-error", 20);
+          this.host.appError(p.message.slice(0, 300));
+        }
         return;
       }
       if (raw.method === "ui/initialize") {
@@ -132,7 +167,7 @@ export class PanelBridge {
           this.host.resized({ width: Math.min(p.width, 100_000), height: Math.min(p.height, 100_000) });
           return;
         case "ui/open-link": {
-          if (!this.host.userActive()) throw new Failure(-32000, "A user action is required to open a link");
+          if (!activated || !this.host.userActive()) throw new Failure(-32000, "A user action is required to open a link");
           requireParams(typeof p.url === "string", "url must be a string");
           let url: URL;
           try { url = new URL(p.url); } catch { throw new Failure(-32602, "Invalid URL"); }
@@ -143,7 +178,7 @@ export class PanelBridge {
           return;
         }
         case "ui/message": {
-          if (!this.host.userActive()) throw new Failure(-32000, "A real user action in this panel is required");
+          if (!activated || !this.host.userActive()) throw new Failure(-32000, "A real user action in this panel is required");
           requireParams(p.role === "user" && object(p.content) && p.content.type === "text" && typeof p.content.text === "string" && p.content.text.trim(), "Expected a user text message");
           let kind = "ui/message";
           if (object(p._meta) && object(p._meta.muster) && p._meta.muster.kind !== undefined) {

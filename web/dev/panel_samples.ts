@@ -2,6 +2,8 @@
 // handy for trying an app by hand: `muster panel open --app chart --data "$(...)"`.
 
 export const HEAD_SHA = "3f9c2b7e41d0a8c6e5f4b3a2918d7c6b5a493827";
+/** The quick-win card's head (#815 in overviewSample). */
+export const QUICK_SHA = "8a1d0c9b7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a21";
 
 export const prSample = {
   repo: "acme/api",
@@ -14,6 +16,8 @@ export const prSample = {
   head_sha: HEAD_SHA,
   merge_method_default: "squash",
   delete_branch_default: true,
+  verdict: "Worth a careful look: it changes how login works, but the tests pass.",
+  undo: "If this goes wrong: revert the merge commit; no data needs fixing.",
   summary:
     "Adds a sliding-window limit of 5 failed logins per IP per 10 minutes to POST /login, returning 429 with Retry-After. Successful logins reset the window. The limiter lives in a new module and reuses the existing Redis pool.",
   risk: {
@@ -46,6 +50,19 @@ export const prSample = {
   ],
   rest_note: "Not shown: 64 lines of tests in tests/login_limit.rs and a config default.",
   questions: ["Is 5 attempts per 10 minutes what support wants, or should it match the old 10 per hour?"],
+};
+
+/** The agent's questions in the new form, answered in place (and the old string form above). */
+export const prQuestionsSample = {
+  ...prSample,
+  questions: [
+    { id: "limit", text: "Keep the limit at 5 failed logins per 10 minutes?", why: "Support asked for 10 per hour last year; 5 is stricter.",
+      kind: "yes_no", recommended: "yes" },
+    { id: "proxy", text: "Which addresses should count as one visitor?", why: "Behind a proxy, everyone can look like one visitor.", kind: "choice",
+      options: [{ label: "Trust only our own proxies", value: "ours" }, { label: "Trust any proxy", value: "any" }, { label: "Ignore proxies", value: "none" }],
+      recommended: "ours" },
+    { id: "note", text: "Anything to tell the author?", kind: "text" },
+  ],
 };
 
 export const chartSample = {
@@ -108,7 +125,9 @@ export const overviewSample = {
     {
       number: 815, title: "Fix a typo in the README", author: "lee", url: "https://github.com/acme/api/pull/815",
       created_at: "2026-10-18T16:00:00Z", additions: 1, deletions: 1, files: 1, checks: "passing", review: "APPROVED",
-      labels: ["docs"], risk: "low", summary: "One word in the install section.",
+      labels: ["docs"], risk: "low", summary: "One word in the install section.", base: "master",
+      quick_win: true, status: "ready", head_sha: QUICK_SHA, verdict: "Safe to merge: one word in the docs, checks pass.",
+      delete_branch_default: true,
     },
     {
       number: 801, title: "Rewrite the session store on Redis streams", author: "sam", url: "https://github.com/acme/api/pull/801",

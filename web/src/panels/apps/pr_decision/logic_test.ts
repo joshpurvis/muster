@@ -1,5 +1,5 @@
 import {
-  askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, mergeBlocked, mergeCommand, mergeEvent, type Pr,
+  answersEvent, askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, mergeBlocked, mergeCommand, mergeEvent, type Pr,
   requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
@@ -23,7 +23,7 @@ Deno.test("pr input: defaults and optional parts", () => {
   const pr = valid({ ...samplePr, merge_method_default: undefined, delete_branch_default: undefined });
   eq([pr.merge_method_default, pr.delete_branch_default, pr.status, pr.questions], ["squash", false, "open", []]);
   const full = valid({ ...samplePr, reviews: { decision: "APPROVED", items: [{ author: "lee", state: "APPROVED" }] }, questions: ["Why 5?", " "], answer: { question: "q", text: "a" }, status: "merged", status_detail: "Merged as abc" });
-  eq([full.questions, full.answer, full.status], [["Why 5?"], { question: "q", text: "a" }, "merged"]);
+  eq([full.questions, full.answer, full.status], [[{ id: "q1", text: "Why 5?", kind: "text", options: [], required: false }], { question: "q", text: "a" }, "merged"]);
 });
 
 Deno.test("pr input: rejects what would make the merge command unsafe or wrong", () => {
@@ -65,9 +65,9 @@ Deno.test("events carry exactly what the panel showed: repo, base and head", () 
   const pr = valid(samplePr);
   const m = mergeEvent(pr, "merge", false);
   eq(m.kind, "merge");
-  eq(m.data, { action: "merge", repo: "acme/api", number: 812, base: "master", method: "merge", delete_branch: false, head_sha: sha });
+  eq(m.data, { action: "merge", repo: "acme/api", number: 812, base: "master", method: "merge", delete_branch: false, head_sha: sha, answers: {}, options: [] });
   check(m.text.endsWith(`gh pr merge 812 --repo acme/api --merge --match-head-commit ${sha}`));
-  eq(requestChangesEvent(pr, "Add a test").data, { action: "request_changes", repo: "acme/api", number: 812, head_sha: sha, body: "Add a test" });
+  eq(requestChangesEvent(pr, "Add a test").data, { action: "request_changes", repo: "acme/api", number: 812, head_sha: sha, body: "Add a test", answers: {}, options: [] });
   eq(askEvent(pr, "Why?").data, { action: "ask", repo: "acme/api", number: 812, question: "Why?" });
 });
 
@@ -197,16 +197,64 @@ Deno.test("media: pictures (as Muster read them) and charts, each checked by its
 Deno.test("skip and hold are one event each, about the PR shown", () => {
   const pr = valid(samplePr);
   eq(skipEvent(pr).kind, "skip");
-  eq(skipEvent(pr).data, { action: "skip", repo: "acme/api", number: 812, head_sha: sha });
+  eq(skipEvent(pr).data, { action: "skip", repo: "acme/api", number: 812, head_sha: sha, answers: {}, options: [] });
   eq(holdEvent(pr).kind, "hold");
-  eq(holdEvent(pr).data, { action: "hold", repo: "acme/api", number: 812, head_sha: sha });
+  eq(holdEvent(pr).data, { action: "hold", repo: "acme/api", number: 812, head_sha: sha, answers: {}, options: [] });
   check(holdEvent(pr).text.includes("come back to later"));
 });
 
 Deno.test("actions: the user's own buttons are validated with the PR", () => {
   const pr = valid({ ...samplePr, actions: [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }] });
   eq(valid({ ...samplePr, actions: [{ id: "x", label: "X", description: "d" }] }).actions[0].outward, true, "a missing outward asks first");
-  eq(pr.actions, [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }]);
+  eq(pr.actions, [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true, mode: "toggle" }]);
   const e = errorsOf(validatePr({ ...samplePr, actions: [{ id: "x", label: "X", key: "m", description: "d" }] }));
   check(e.some((x) => x.startsWith("actions[0].key: \"m\" is a built-in key")), e.join("\n"));
+});
+
+Deno.test("verdict and undo: one plain line each, shown first", () => {
+  const pr = valid({ ...samplePr, verdict: "Safe to merge: small bug fix, tests pass.", undo: "If this goes wrong: revert the merge commit." });
+  eq([pr.verdict, pr.undo], ["Safe to merge: small bug fix, tests pass.", "If this goes wrong: revert the merge commit."]);
+  eq([valid(samplePr).verdict, valid({ ...samplePr, verdict: " " }).verdict], [undefined, undefined]);
+  for (const [patch, want] of [[{ verdict: "x".repeat(301) }, "verdict: is longer than 300"], [{ undo: "a\nb" }, "undo: must be one line"],
+    [{ verdict: 5 }, "verdict: must be a string"]] as const) {
+    const e = errorsOf(validatePr({ ...samplePr, ...patch }));
+    check(e.some((x) => x.startsWith(want)), `${want}\n${e.join("\n")}`);
+  }
+});
+
+const draftPr = () => valid({ ...samplePr, questions: [
+  { id: "limit", text: "Keep 5 per 10 minutes?", kind: "yes_no", recommended: "yes" },
+  { id: "note", text: "Anything for the author?", kind: "text" },
+], actions: [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }] });
+const d = { answers: { limit: "no", note: "Use 10" }, options: ["needs-qa"] };
+
+Deno.test("the draft rides along with Merge, Request changes, Hold and Skip; Send answers sends it alone", () => {
+  const pr = draftPr();
+  const m = mergeEvent(pr, "squash", true, d);
+  eq(m.data, { action: "merge", repo: "acme/api", number: 812, base: "master", method: "squash", delete_branch: true, head_sha: sha, answers: d.answers, options: d.options });
+  check(m.text.includes(`Answers: [limit] No; [note] "Use 10". Also do, for this PR: needs-qa (Add the needs-qa label on GitHub.).`), m.text);
+  check(m.text.endsWith(`gh pr merge 812 --repo acme/api --squash --delete-branch --match-head-commit ${sha}`), "the command stays last");
+  const r = requestChangesEvent(pr, "Please add a test", d);
+  eq([r.data.answers, r.data.options, r.data.body], [d.answers, d.options, "Please add a test"]);
+  check(r.text.endsWith("The review comment:\nPlease add a test"), r.text);
+  for (const ev of [holdEvent(pr, d), skipEvent(pr, d)]) eq([ev.data.answers, ev.data.options, ev.data.head_sha], [d.answers, d.options, sha]);
+  const a = answersEvent(pr, d);
+  eq(a.kind, "answers");
+  eq(a.data, { action: "answers", repo: "acme/api", number: 812, head_sha: sha, answers: d.answers, options: d.options });
+  check(a.text.includes("nothing is decided yet"), a.text);
+  eq(askEvent(pr, "Why?").data, { action: "ask", repo: "acme/api", number: 812, question: "Why?" }, "Ask stays a free-form question");
+  // One message per send: everything must fit the event limit together.
+  const long = { answers: Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`t${i}`, "é".repeat(1000)])), options: [] };
+  check(eventBytes(mergeEvent(pr, "squash", true, long)) > MAX_EVENT_BYTES, "too many long answers are refused before sending");
+});
+
+Deno.test("confirm gate: a changed answer or option while confirming cancels it", () => {
+  const pr = draftPr();
+  const g = new ConfirmGate();
+  g.open(pr, d);
+  check(g.canConfirm(pr, d));
+  check(!g.canConfirm(pr, { ...d, options: [] }), "a confirm never sends a draft it did not show");
+  check(g.input(pr, { ...d, answers: { ...d.answers, limit: "yes" } }) && !g.isOpen, "an answer changed: cancelled");
+  g.open(pr, d);
+  check(!g.input(pr, { answers: { note: "Use 10", limit: "no" }, options: ["needs-qa"] }), "the same draft keeps it");
 });

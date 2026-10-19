@@ -258,6 +258,43 @@ button .out { color: var(--color-text-warning); }
 .lb-stage.actual img { max-width: none; max-height: none; flex: none; cursor: grab; }
 .lb-stage.actual:active img { cursor: grabbing; }
 .lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
+/* The agent's verdict, first and prominent, with how to undo it under it. */
+.verdict { border: 1px solid var(--color-border-secondary); border-left: 4px solid var(--color-border-primary); border-radius: var(--border-radius-md); padding: 8px 12px; margin: 0 0 14px; background: var(--color-background-secondary); }
+.verdict.risk-low { border-left-color: var(--color-text-success); }
+.verdict.risk-medium { border-left-color: var(--color-text-warning); }
+.verdict.risk-high { border-left-color: var(--color-text-danger); }
+.verdict-text { font-size: 16px; font-weight: 600; margin: 0; }
+.undo { margin: 4px 0 0; font-size: 13px; color: var(--color-text-secondary); }
+.undo-icon { font-weight: 700; }
+/* The agent's questions, answered in place. */
+.questions-form .qhint { margin: -2px 0 8px; }
+.question { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 8px 10px; margin: 0 0 8px; }
+.question:focus-within { border-color: var(--color-ring-primary); box-shadow: 0 0 0 1px var(--color-ring-primary); }
+.q-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.q-num { flex: none; min-width: 1.6em; height: 1.6em; line-height: 1.6em; border-radius: 999px; text-align: center; font-size: 12px; font-weight: 700; background: var(--color-background-tertiary); color: var(--color-text-secondary); }
+.question.answered .q-num { background: var(--color-background-success); color: var(--color-text-success); }
+.q-text { flex: 1 1 200px; min-width: 0; font-weight: 600; white-space: pre-wrap; }
+.q-req { flex: none; }
+.q-why { margin: 2px 0 0 calc(1.6em + 8px); font-size: 13px; }
+.q-options, .q-text-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 0 calc(1.6em + 8px); }
+.q-opt { min-height: 30px; padding: 3px 10px; }
+.q-opt kbd { margin: 0 2px 0 0; }
+.q-opt.on { border-color: var(--accent-fill); background: var(--color-background-info); box-shadow: inset 0 0 0 1px var(--accent-fill); font-weight: 600; }
+.q-opt .rec { font-size: 11.5px; font-weight: 600; color: var(--color-text-success); }
+.q-input { flex: 1 1 220px; min-width: 0; }
+.draft-row { justify-content: space-between; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed var(--color-border-primary); }
+.draft-what { min-width: 0; flex: 1 1 200px; }
+.draft-summary { margin: 0 0 8px; font-size: 13px; }
+.draft-summary ul { margin: 2px 0 0; padding-left: 18px; }
+.draft-summary .out { color: var(--color-text-warning); }
+.drawer-sub { margin: 0; font-weight: 600; }
+.draft-none { margin: 0 0 8px; }
+button.toggle.on { border-color: var(--accent-fill); background: var(--color-background-info); font-weight: 600; }
+button.toggle .tick { font-weight: 700; }
+@media (max-width: 520px) {
+  .q-why, .q-options, .q-text-row { margin-left: 0; }
+  .draft-row button kbd { display: none; }
+}
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -416,6 +453,13 @@ button .out { color: var(--color-text-warning); }
       class: "error",
       role: "alert"
     }, h("strong", null, title), h("ul", null, errors.slice(0, 20).map((e) => h("li", null, e))), errors.length > 20 ? h("p", null, `\u2026and ${errors.length - 20} more`) : null));
+  }
+  function reveal(el, bar) {
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const bottom = innerHeight - (bar ? bar.getBoundingClientRect().height : 0) - 8;
+    if (r.top < 8) scrollBy(0, r.top - 8);
+    else if (r.bottom > bottom) scrollBy(0, Math.min(r.bottom - bottom, r.top - 8));
   }
   function cycle(count, at, back) {
     if (count <= 0) return -1;
@@ -605,6 +649,10 @@ button .out { color: var(--color-text-warning); }
   };
 
   // src/panels/apps/shared/actions.ts
+  var ACTION_MODES = [
+    "toggle",
+    "now"
+  ];
   var RESERVED_KEYS = [
     "m",
     "r",
@@ -620,6 +668,7 @@ button .out { color: var(--color-text-warning); }
     "merge",
     "request_changes",
     "ask",
+    "answers",
     "open",
     "skip",
     "hold",
@@ -642,7 +691,8 @@ button .out { color: var(--color-text-warning); }
     "hold",
     "next",
     "cancel",
-    "confirm"
+    "confirm",
+    "send answers"
   ];
   function labelKey(label) {
     return label.split(/\s+/).filter(Boolean).join(" ").toLowerCase().replace(/[….!:]+$/u, "").replace(/^#+/, "").trim();
@@ -664,7 +714,8 @@ button .out { color: var(--color-text-warning); }
         "label",
         "key",
         "description",
-        "outward"
+        "outward",
+        "mode"
       ]);
       const id = p.string(ao, "id", at, {
         required: true,
@@ -712,12 +763,14 @@ button .out { color: var(--color-text-warning); }
         }
       }
       const outward2 = p.boolean(ao, "outward", at) ?? true;
+      const mode2 = p.oneOf(ao, "mode", at, ACTION_MODES) ?? "toggle";
       if (id !== void 0 && label !== void 0 && description !== void 0) out.push({
         id,
         label,
         key,
         description,
-        outward: outward2
+        outward: outward2,
+        mode: mode2
       });
     });
     return out;
@@ -752,109 +805,6 @@ button .out { color: var(--color-text-warning); }
       t.base ?? null,
       t.status ?? null
     ]);
-  }
-
-  // src/panels/apps/shared/actions_view.ts
-  function actionButton(a, onclick, disabled = false) {
-    return h("button", {
-      type: "button",
-      id: `act-${a.id}`,
-      class: a.outward ? "custom outward" : "custom",
-      disabled,
-      title: `${a.description}${a.outward ? " (asks you to confirm first)" : ""}`,
-      "aria-keyshortcuts": a.key?.toUpperCase(),
-      onclick
-    }, a.label, a.outward ? h("span", {
-      class: "out",
-      "aria-hidden": "true"
-    }, " \u2197") : null, a.key ? [
-      " ",
-      h("kbd", null, a.key.toUpperCase())
-    ] : null);
-  }
-  function outwardDrawer(a, what, onConfirm, onCancel) {
-    return h("div", {
-      class: "drawer",
-      role: "group",
-      "aria-labelledby": "outward-title"
-    }, h("div", {
-      id: "outward-title",
-      class: "drawer-title"
-    }, `${a.label} on ${what}? The agent will:`), h("p", {
-      class: "prose outward-desc"
-    }, a.description), h("p", {
-      class: "muted small"
-    }, "This changes things outside this machine (GitHub or elsewhere)."), h("div", {
-      class: "row"
-    }, h("button", {
-      type: "button",
-      id: "confirm-outward",
-      class: "primary",
-      onclick: onConfirm
-    }, `Confirm ${a.label} `, h("kbd", null, "Enter")), h("button", {
-      type: "button",
-      onclick: onCancel
-    }, "Cancel ", h("kbd", null, "Esc"))));
-  }
-  var roomy = () => innerHeight >= 560 && innerWidth > 520;
-  function actionsGroup(actions, run, off, open, toggle) {
-    if (!actions.length) return null;
-    const folds = !roomy();
-    const shown = !folds || open;
-    return h("div", {
-      class: "custom-group",
-      role: "group",
-      "aria-labelledby": "your-actions-label"
-    }, folds ? h("button", {
-      type: "button",
-      id: "your-actions",
-      class: "fold",
-      "aria-expanded": String(shown),
-      onclick: toggle
-    }, h("span", {
-      id: "your-actions-label"
-    }, `Your actions (${actions.length})`), shown ? " \u25B4" : " \u25BE") : h("span", {
-      id: "your-actions-label",
-      class: "group-label"
-    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a))) : null);
-  }
-  function shortcutsDrawer(rows, actions, onClose) {
-    const all = [
-      ...rows,
-      ...actions.filter((a) => a.key).map((a) => [
-        a.key.toUpperCase(),
-        `${a.label} (your action${a.outward ? ", asks first" : ""})`
-      ])
-    ];
-    return h("div", {
-      class: "drawer shortcuts",
-      role: "group",
-      "aria-labelledby": "shortcuts-title"
-    }, h("div", {
-      id: "shortcuts-title",
-      class: "drawer-title"
-    }, "Keyboard shortcuts"), h("dl", null, all.map(([k, what]) => [
-      h("dt", null, h("kbd", null, k)),
-      h("dd", null, what)
-    ])), h("div", {
-      class: "row"
-    }, h("button", {
-      type: "button",
-      id: "shortcuts-close",
-      onclick: onClose
-    }, "Close ", h("kbd", null, "Esc"))));
-  }
-  function helpButton(onclick, open) {
-    return h("button", {
-      type: "button",
-      id: "keys-help",
-      class: "help",
-      "aria-label": "Keyboard shortcuts",
-      "aria-expanded": String(open),
-      "aria-keyshortcuts": "?",
-      title: "Keyboard shortcuts (?)",
-      onclick
-    }, "?");
   }
 
   // src/panels/apps/shared/validate.ts
@@ -980,6 +930,346 @@ button .out { color: var(--color-text-warning); }
     } catch {
       return void 0;
     }
+  }
+
+  // src/panels/apps/shared/questions.ts
+  var QUESTION_KINDS = [
+    "yes_no",
+    "choice",
+    "text"
+  ];
+  var MAX_QUESTIONS = 20;
+  var MAX_QUESTION = 500;
+  var MAX_LEGACY_QUESTION = 2e3;
+  var MAX_WHY = 300;
+  var MAX_OPTIONS = 9;
+  var MAX_OPTION_LABEL = 80;
+  var MAX_OPTION_VALUE = 100;
+  var MAX_ANSWER = 1e3;
+  var YES_NO = [
+    {
+      label: "Yes",
+      value: "yes"
+    },
+    {
+      label: "No",
+      value: "no"
+    }
+  ];
+  var ID2 = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+  var optionsOf = (q) => q.kind === "yes_no" ? YES_NO : q.options;
+  function validateQuestions(p, o) {
+    const out = [];
+    const ids = /* @__PURE__ */ new Set();
+    p.array(o, "questions", "", {
+      max: MAX_QUESTIONS
+    })?.forEach((v, i) => {
+      const at = `questions[${i}]`;
+      if (typeof v === "string") {
+        if (!fits(v, MAX_LEGACY_QUESTION)) {
+          p.add(at, `is longer than ${MAX_LEGACY_QUESTION} characters`);
+          return;
+        }
+        if (!v.trim()) return;
+        const id2 = `q${i + 1}`;
+        if (ids.has(id2)) {
+          p.add(at, `id "${id2}" is used twice`);
+          return;
+        }
+        ids.add(id2);
+        out.push({
+          id: id2,
+          text: v,
+          kind: "text",
+          options: [],
+          required: false
+        });
+        return;
+      }
+      const qo = p.object(v, at);
+      if (!qo) {
+        p.errors[p.errors.length - 1] = `${at}: must be a string or an object`;
+        return;
+      }
+      p.known(qo, at, [
+        "id",
+        "text",
+        "why",
+        "kind",
+        "options",
+        "recommended",
+        "required"
+      ]);
+      const id = p.string(qo, "id", at, {
+        required: true,
+        max: 40
+      });
+      if (id !== void 0) {
+        if (!ID2.test(id)) {
+          p.add(`${at}.id`, "must be lowercase letters, digits, - or _ (at most 40)");
+          return;
+        }
+        if (ids.has(id)) {
+          p.add(`${at}.id`, `"${id}" is used twice`);
+          return;
+        }
+        ids.add(id);
+      }
+      const text = p.string(qo, "text", at, {
+        required: true,
+        max: MAX_QUESTION
+      });
+      const why = p.string(qo, "why", at, {
+        max: MAX_WHY
+      });
+      const kind = p.oneOf(qo, "kind", at, QUESTION_KINDS, true);
+      const required = p.boolean(qo, "required", at) ?? false;
+      const options = [];
+      if (kind === "choice") {
+        const values = /* @__PURE__ */ new Set();
+        p.array(qo, "options", at, {
+          required: true,
+          max: MAX_OPTIONS,
+          min: 2
+        })?.forEach((c, j) => {
+          const oat = `${at}.options[${j}]`;
+          const co = p.object(c, oat);
+          if (!co) return;
+          p.known(co, oat, [
+            "label",
+            "value"
+          ]);
+          const label = p.string(co, "label", oat, {
+            required: true,
+            max: MAX_OPTION_LABEL
+          });
+          const value = p.string(co, "value", oat, {
+            required: true,
+            max: MAX_OPTION_VALUE
+          });
+          if (value !== void 0 && values.has(value)) {
+            p.add(`${oat}.value`, `"${value}" is used twice`);
+            return;
+          }
+          if (value !== void 0) values.add(value);
+          if (label !== void 0 && value !== void 0) options.push({
+            label,
+            value
+          });
+        });
+      } else if (kind && qo.options !== void 0 && qo.options !== null) {
+        p.add(`${at}.options`, kind === "yes_no" ? "a yes_no question has its own Yes and No; use kind choice for other options" : "a text question takes no options");
+      }
+      let recommended;
+      if (kind === "text") recommended = p.string(qo, "recommended", at, {
+        max: MAX_ANSWER,
+        nonEmpty: true
+      });
+      else if (kind) {
+        const r = p.string(qo, "recommended", at, {
+          max: MAX_OPTION_VALUE
+        });
+        const allowed = kind === "yes_no" ? YES_NO : options;
+        if (r !== void 0 && !allowed.some((x) => x.value === r)) {
+          p.add(`${at}.recommended`, `must be one of the option values (${allowed.map((x) => JSON.stringify(x.value)).join(", ")})`);
+        } else recommended = r;
+      }
+      if (id !== void 0 && text !== void 0 && kind) out.push({
+        id,
+        text,
+        why: why?.trim() ? why : void 0,
+        kind,
+        options,
+        recommended,
+        required
+      });
+    });
+    return out;
+  }
+  var EMPTY_DRAFT = {
+    answers: {},
+    options: []
+  };
+  function answerOf(q, choices2) {
+    const c = Object.hasOwn(choices2, q.id) ? choices2[q.id] : void 0;
+    if (q.kind === "text") {
+      const t = (c ?? q.recommended ?? "").trim();
+      return t ? t : void 0;
+    }
+    const valid = (v) => v !== void 0 && optionsOf(q).some((x) => x.value === v);
+    if (valid(c)) return c;
+    return valid(q.recommended) ? q.recommended : void 0;
+  }
+  function isRecommended(q, choices2) {
+    return q.recommended !== void 0 && answerOf(q, choices2) === (q.kind === "text" ? q.recommended.trim() : q.recommended);
+  }
+  function draftAnswers(questions, choices2) {
+    const out = {};
+    for (const q of questions) {
+      const a = answerOf(q, choices2);
+      if (a !== void 0) out[q.id] = a;
+    }
+    return out;
+  }
+  var missingRequired = (questions, choices2) => questions.filter((q) => q.required && answerOf(q, choices2) === void 0);
+  function pruneChoices(questions, choices2) {
+    const out = {};
+    for (const q of questions) {
+      if (!Object.hasOwn(choices2, q.id)) continue;
+      const c = choices2[q.id];
+      if (q.kind === "text" || optionsOf(q).some((x) => x.value === c)) out[q.id] = c;
+    }
+    return out;
+  }
+  function valueForDigit(q, digit) {
+    if (!/^[1-9]$/.test(digit)) return void 0;
+    return optionsOf(q)[Number(digit) - 1]?.value;
+  }
+  function answerLabel(q, value) {
+    return optionsOf(q).find((x) => x.value === value)?.label ?? value;
+  }
+  function draftOptions(actions, on) {
+    return actions.filter((a) => a.mode === "toggle" && on.has(a.id)).map((a) => a.id);
+  }
+  var draftEmpty = (d) => !Object.keys(d.answers).length && !d.options.length;
+  var toggleSig = (a) => JSON.stringify([
+    a.id,
+    a.label,
+    a.description,
+    a.outward,
+    a.mode
+  ]);
+  function draftText(questions, actions, d) {
+    const parts = [];
+    const answered = questions.filter((q) => Object.hasOwn(d.answers, q.id));
+    if (answered.length) {
+      parts.push(`Answers: ${answered.map((q) => {
+        const v = d.answers[q.id];
+        return `[${q.id}] ${q.kind === "text" ? JSON.stringify(v) : answerLabel(q, v)}`;
+      }).join("; ")}.`);
+    }
+    const opts = d.options.map((id) => actions.find((a) => a.id === id)).filter((a) => !!a);
+    if (opts.length) parts.push(`Also do, for this PR: ${opts.map((a) => `${a.id} (${a.description})`).join("; ")}.`);
+    return parts.length ? ` ${parts.join(" ")}` : "";
+  }
+  var draftSig = (d) => JSON.stringify([
+    Object.entries(d.answers).sort(),
+    d.options
+  ]);
+
+  // src/panels/apps/shared/actions_view.ts
+  function actionButton(a, onclick, disabled = false, pressed) {
+    const toggle = pressed !== void 0;
+    const cls = [
+      "custom",
+      a.outward ? "outward" : "",
+      toggle ? "toggle" : "",
+      pressed ? "on" : ""
+    ].filter(Boolean).join(" ");
+    const asks = a.outward ? toggle ? " (asks you to confirm before it is switched on)" : " (asks you to confirm first)" : "";
+    return h("button", {
+      type: "button",
+      id: `act-${a.id}`,
+      class: cls,
+      disabled,
+      "aria-pressed": toggle ? String(pressed) : null,
+      title: `${a.description}${asks}${toggle ? " Switched on, it goes with your next send." : ""}`,
+      "aria-keyshortcuts": a.key?.toUpperCase(),
+      onclick
+    }, toggle ? h("span", {
+      class: "tick",
+      "aria-hidden": "true"
+    }, pressed ? "\u2713 " : "+ ") : null, a.label, a.outward ? h("span", {
+      class: "out",
+      "aria-hidden": "true"
+    }, " \u2197") : null, a.key ? [
+      " ",
+      h("kbd", null, a.key.toUpperCase())
+    ] : null);
+  }
+  function outwardDrawer(a, what, onConfirm, onCancel, toggle = false) {
+    return h("div", {
+      class: "drawer",
+      role: "group",
+      "aria-labelledby": "outward-title"
+    }, h("div", {
+      id: "outward-title",
+      class: "drawer-title"
+    }, toggle ? `Switch on ${a.label} for ${what}? With your next send (Merge, Request changes, Hold, Skip or Send answers), the agent will:` : `${a.label} on ${what}? The agent will:`), h("p", {
+      class: "prose outward-desc"
+    }, a.description), h("p", {
+      class: "muted small"
+    }, "This changes things outside this machine (GitHub or elsewhere)."), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "confirm-outward",
+      class: "primary",
+      onclick: onConfirm
+    }, toggle ? "Switch on " : `Confirm ${a.label} `, h("kbd", null, "Enter")), h("button", {
+      type: "button",
+      onclick: onCancel
+    }, "Cancel ", h("kbd", null, "Esc"))));
+  }
+  var roomy = () => innerHeight >= 560 && innerWidth > 520;
+  function actionsGroup(actions, run, off, open, toggle, pressed) {
+    if (!actions.length) return null;
+    const folds = !roomy();
+    const shown = !folds || open;
+    return h("div", {
+      class: "custom-group",
+      role: "group",
+      "aria-labelledby": "your-actions-label"
+    }, folds ? h("button", {
+      type: "button",
+      id: "your-actions",
+      class: "fold",
+      "aria-expanded": String(shown),
+      onclick: toggle
+    }, h("span", {
+      id: "your-actions-label"
+    }, `Your actions (${actions.length})`), shown ? " \u25B4" : " \u25BE") : h("span", {
+      id: "your-actions-label",
+      class: "group-label"
+    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a), pressed?.(a))) : null);
+  }
+  function shortcutsDrawer(rows, actions, onClose, toggles2 = false) {
+    const all = [
+      ...rows,
+      ...actions.filter((a) => a.key).map((a) => [
+        a.key.toUpperCase(),
+        `${a.label} (your action${toggles2 && a.mode === "toggle" ? ", switches on or off for your next send" : ""}${a.outward ? ", asks first" : ""})`
+      ])
+    ];
+    return h("div", {
+      class: "drawer shortcuts",
+      role: "group",
+      "aria-labelledby": "shortcuts-title"
+    }, h("div", {
+      id: "shortcuts-title",
+      class: "drawer-title"
+    }, "Keyboard shortcuts"), h("dl", null, all.map(([k, what]) => [
+      h("dt", null, h("kbd", null, k)),
+      h("dd", null, what)
+    ])), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "shortcuts-close",
+      onclick: onClose
+    }, "Close ", h("kbd", null, "Esc"))));
+  }
+  function helpButton(onclick, open) {
+    return h("button", {
+      type: "button",
+      id: "keys-help",
+      class: "help",
+      "aria-label": "Keyboard shortcuts",
+      "aria-expanded": String(open),
+      "aria-keyshortcuts": "?",
+      title: "Keyboard shortcuts (?)",
+      onclick
+    }, "?");
   }
 
   // src/panels/apps/chart/logic.ts
@@ -1687,12 +1977,48 @@ button .out { color: var(--color-text-warning); }
     return `${(n / 1024 / 1024).toFixed(1)} MiB`;
   }
 
-  // src/panels/apps/pr_decision/logic.ts
+  // src/panels/apps/shared/merge.ts
   var METHODS = [
     "squash",
     "merge",
     "rebase"
   ];
+  var SHA = /^[0-9a-f]{40}$/;
+  var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+  var branchOk = (b) => b.length > 0 && b.length <= 255 && ![
+    ...b
+  ].some((c) => c.charCodeAt(0) < 33 || c.charCodeAt(0) === 127 || "~^:?*[\\".includes(c));
+  function mergeCommand(repo, number, method2, deleteBranch2, headSha) {
+    if (!REPO.test(repo)) throw new Error("invalid repo");
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error("invalid PR number");
+    if (!METHODS.includes(method2)) throw new Error("invalid merge method");
+    if (!SHA.test(headSha)) throw new Error("invalid head SHA");
+    return `gh pr merge ${number} --repo ${repo} --${method2}${deleteBranch2 ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
+  }
+  function mergeEventFor(t, method2, deleteBranch2, draft2, extra2 = "") {
+    const command = mergeCommand(t.repo, t.number, method2, deleteBranch2, t.head_sha);
+    return {
+      kind: "merge",
+      text: `Merge PR #${t.number} (${t.repo}) into ${t.base}.${extra2} Run exactly: ${command}`,
+      data: {
+        action: "merge",
+        repo: t.repo,
+        number: t.number,
+        base: t.base,
+        method: method2,
+        delete_branch: deleteBranch2,
+        head_sha: t.head_sha,
+        answers: {
+          ...draft2.answers
+        },
+        options: [
+          ...draft2.options
+        ]
+      }
+    };
+  }
+
+  // src/panels/apps/pr_decision/logic.ts
   var RISKS = [
     "low",
     "medium",
@@ -1725,11 +2051,17 @@ button .out { color: var(--color-text-warning); }
   ];
   var MAX_MEDIA = 8;
   var MAX_MEDIA_BYTES = 6 * 1024 * 1024;
-  var SHA = /^[0-9a-f]{40}$/;
-  var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
-  var branchOk = (b) => b.length > 0 && b.length <= 255 && ![
-    ...b
-  ].some((c) => c.charCodeAt(0) < 33 || c.charCodeAt(0) === 127 || "~^:?*[\\".includes(c));
+  var MAX_LINE = 300;
+  function oneLine(p, o, key, path, max) {
+    const v = p.string(o, key, path, {
+      max
+    });
+    if (v !== void 0 && /[\r\n]/.test(v)) {
+      p.add(path ? `${path}.${key}` : key, "must be one line");
+      return void 0;
+    }
+    return v?.trim() ? v : void 0;
+  }
   function validatePr(data) {
     const p = new Problems();
     const o = p.object(data, "data");
@@ -1746,6 +2078,8 @@ button .out { color: var(--color-text-warning); }
       "merge_method_default",
       "delete_branch_default",
       "summary",
+      "verdict",
+      "undo",
       "risk",
       "checks",
       "reviews",
@@ -1808,6 +2142,8 @@ button .out { color: var(--color-text-warning); }
       required: true,
       max: 2e4
     });
+    const verdict = oneLine(p, o, "verdict", "", MAX_LINE);
+    const undo = oneLine(p, o, "undo", "", MAX_LINE);
     let risk;
     if (o.risk === void 0) p.add("risk", "is required ({level, reasons})");
     else {
@@ -1941,7 +2277,7 @@ button .out { color: var(--color-text-warning); }
     const rest_note = p.string(o, "rest_note", "", {
       max: 2e3
     });
-    const questions = strings(p, o, "questions", "", 20, 2e3);
+    const questions = validateQuestions(p, o);
     let answer;
     if (o.answer !== void 0 && o.answer !== null) {
       const ao = p.object(o.answer, "answer");
@@ -1982,6 +2318,8 @@ button .out { color: var(--color-text-warning); }
       merge_method_default,
       delete_branch_default,
       summary,
+      verdict,
+      undo,
       risk,
       checks,
       reviews,
@@ -2081,40 +2419,27 @@ button .out { color: var(--color-text-warning); }
     if (items.some((c) => c.state === "pending")) return "pending";
     return "passing";
   }
-  function mergeCommand(repo, number, method2, deleteBranch2, headSha) {
-    if (!REPO.test(repo)) throw new Error("invalid repo");
-    if (!Number.isSafeInteger(number) || number < 1) throw new Error("invalid PR number");
-    if (!METHODS.includes(method2)) throw new Error("invalid merge method");
-    if (!SHA.test(headSha)) throw new Error("invalid head SHA");
-    return `gh pr merge ${number} --repo ${repo} --${method2}${deleteBranch2 ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
+  var extra = (pr2, d) => draftText(pr2.questions, pr2.actions, d);
+  function mergeEvent(pr2, method2, deleteBranch2, draft2 = EMPTY_DRAFT) {
+    return mergeEventFor(pr2, method2, deleteBranch2, draft2, extra(pr2, draft2));
   }
-  function mergeEvent(pr2, method2, deleteBranch2) {
-    const command = mergeCommand(pr2.repo, pr2.number, method2, deleteBranch2, pr2.head_sha);
-    return {
-      kind: "merge",
-      text: `Merge PR #${pr2.number} (${pr2.repo}) into ${pr2.base}. Run exactly: ${command}`,
-      data: {
-        action: "merge",
-        repo: pr2.repo,
-        number: pr2.number,
-        base: pr2.base,
-        method: method2,
-        delete_branch: deleteBranch2,
-        head_sha: pr2.head_sha
-      }
-    };
-  }
-  function requestChangesEvent(pr2, body) {
+  function requestChangesEvent(pr2, body, draft2 = EMPTY_DRAFT) {
     return {
       kind: "request_changes",
-      text: `Request changes on PR #${pr2.number} (${pr2.repo}) with this review comment:
+      text: `Request changes on PR #${pr2.number} (${pr2.repo}).${extra(pr2, draft2)} The review comment:
 ${body}`,
       data: {
         action: "request_changes",
         repo: pr2.repo,
         number: pr2.number,
         head_sha: pr2.head_sha,
-        body
+        body,
+        answers: {
+          ...draft2.answers
+        },
+        options: [
+          ...draft2.options
+        ]
       }
     };
   }
@@ -2131,27 +2456,57 @@ ${question}`,
       }
     };
   }
-  function skipEvent(pr2) {
+  function skipEvent(pr2, draft2 = EMPTY_DRAFT) {
     return {
       kind: "skip",
-      text: `Skip PR #${pr2.number} (${pr2.repo}) for now: move on without changing it.`,
+      text: `Skip PR #${pr2.number} (${pr2.repo}) for now: move on without changing it.${extra(pr2, draft2)}`,
       data: {
         action: "skip",
         repo: pr2.repo,
         number: pr2.number,
-        head_sha: pr2.head_sha
+        head_sha: pr2.head_sha,
+        answers: {
+          ...draft2.answers
+        },
+        options: [
+          ...draft2.options
+        ]
       }
     };
   }
-  function holdEvent(pr2) {
+  function holdEvent(pr2, draft2 = EMPTY_DRAFT) {
     return {
       kind: "hold",
-      text: `Hold PR #${pr2.number} (${pr2.repo}): put it aside to come back to later.`,
+      text: `Hold PR #${pr2.number} (${pr2.repo}): put it aside to come back to later.${extra(pr2, draft2)}`,
       data: {
         action: "hold",
         repo: pr2.repo,
         number: pr2.number,
-        head_sha: pr2.head_sha
+        head_sha: pr2.head_sha,
+        answers: {
+          ...draft2.answers
+        },
+        options: [
+          ...draft2.options
+        ]
+      }
+    };
+  }
+  function answersEvent(pr2, draft2) {
+    return {
+      kind: "answers",
+      text: `The user's answers on PR #${pr2.number} (${pr2.repo}); nothing is decided yet.${extra(pr2, draft2)}`,
+      data: {
+        action: "answers",
+        repo: pr2.repo,
+        number: pr2.number,
+        head_sha: pr2.head_sha,
+        answers: {
+          ...draft2.answers
+        },
+        options: [
+          ...draft2.options
+        ]
       }
     };
   }
@@ -2188,25 +2543,26 @@ ${question}`,
     if (pr2.status === "requested_changes") return "Changes were requested.";
     return null;
   }
-  function confirmTarget(pr2) {
+  function confirmTarget(pr2, draft2 = EMPTY_DRAFT) {
     return JSON.stringify([
       pr2.repo,
       pr2.number,
       pr2.base,
       pr2.head_sha,
       pr2.checks.state,
-      pr2.merge_method_default
+      pr2.merge_method_default,
+      draftSig(draft2)
     ]);
   }
   var ConfirmGate = class extends Gate {
-    open(pr2) {
-      this.openTarget(confirmTarget(pr2));
+    open(pr2, draft2 = EMPTY_DRAFT) {
+      this.openTarget(confirmTarget(pr2, draft2));
     }
-    canConfirm(pr2) {
-      return this.canConfirmTarget(pr2 ? confirmTarget(pr2) : null);
+    canConfirm(pr2, draft2 = EMPTY_DRAFT) {
+      return this.canConfirmTarget(pr2 ? confirmTarget(pr2, draft2) : null);
     }
-    input(pr2) {
-      return this.inputTarget(pr2 ? confirmTarget(pr2) : null);
+    input(pr2, draft2 = EMPTY_DRAFT) {
+      return this.inputTarget(pr2 ? confirmTarget(pr2, draft2) : null);
     }
   };
 
@@ -2241,6 +2597,10 @@ ${question}`,
   var answers = [];
   var newAnswer = false;
   var mergeButton = null;
+  var choices = {};
+  var toggles = /* @__PURE__ */ new Map();
+  var outwardToggle = false;
+  var sentAnswers = null;
   var short = (sha) => sha.slice(0, 7);
   var triggers = {
     confirm: "merge",
@@ -2253,6 +2613,138 @@ ${question}`,
       text,
       tone
     };
+  }
+  var draft = (p = pr) => p ? {
+    answers: draftAnswers(p.questions, choices),
+    options: draftOptions(p.actions, new Set(toggles.keys()))
+  } : {
+    answers: {},
+    options: []
+  };
+  var answersSig = (d) => draftSig({
+    answers: d.answers,
+    options: []
+  });
+  var deciding = () => sent !== null && sent !== "ask";
+  var hasToggles = (p) => p.actions.some((a) => a.mode === "toggle");
+  var tooBig = (event) => eventBytes(event) > MAX_EVENT_BYTES;
+  function draftChanged(full = true) {
+    if (pr && mode === "confirm" && gate.input(pr, draft())) {
+      mode = null;
+      setNotice("Your answers or options changed while you were confirming. Check them, then Merge again.", "warning");
+      full = true;
+    }
+    if (full) render();
+    else refreshDraftRow();
+  }
+  function spendDraft(d) {
+    const before = new Map(toggles);
+    const was = sentAnswers;
+    for (const id of d.options) toggles.delete(id);
+    if (Object.keys(d.answers).length) sentAnswers = answersSig(d);
+    return () => {
+      toggles.clear();
+      for (const [k, v] of before) toggles.set(k, v);
+      sentAnswers = was;
+    };
+  }
+  function pick(q, value) {
+    if (enlarged !== null || !pr || formsClosed(pr)) return;
+    choices = {
+      ...choices,
+      [q.id]: value
+    };
+    draftChanged();
+    focusQuestion(q.id);
+  }
+  function focusQuestion(id) {
+    const box = document.getElementById(`q-${id}`);
+    if (!box) return;
+    const el = box.querySelector('[role="radio"][aria-checked="true"]') ?? box.querySelector('[role="radio"], input');
+    el?.focus({
+      preventScroll: true
+    });
+    reveal(el ?? box, document.querySelector(".actions"));
+  }
+  function moveQuestion(from, by) {
+    if (!pr) return false;
+    const next = pr.questions[pr.questions.findIndex((q) => q.id === from) + by];
+    if (!next) return false;
+    focusQuestion(next.id);
+    return true;
+  }
+  function sendAnswers() {
+    if (enlarged !== null || !pr || deciding()) return;
+    const closed = formsClosed(pr);
+    if (closed) {
+      setNotice(`Not sent: ${closed}`, "warning");
+      render();
+      return;
+    }
+    const d = draft();
+    if (draftEmpty(d)) {
+      setNotice("Nothing to send yet: answer a question or switch on one of your options.", "warning");
+      render();
+      return;
+    }
+    if (!d.options.length && sentAnswers === answersSig(d)) {
+      setNotice("These answers were sent already.", "info");
+      render();
+      return;
+    }
+    const event = answersEvent(pr, d);
+    if (tooBig(event)) {
+      setNotice("Too long to send: shorten your typed answers.", "warning");
+      render();
+      return;
+    }
+    const result = sendEvent(event.kind, event.text, event.data);
+    const undo = spendDraft(d);
+    setNotice(`Sent to the agent: ${summaryWords(d)}. Nothing is decided yet.`);
+    render();
+    result.catch((e) => {
+      undo();
+      setNotice(`Not sent (${e.message}). Try again.`, "danger");
+      render();
+    });
+  }
+  function summaryWords(d) {
+    const n = Object.keys(d.answers).length;
+    const labels = d.options.map((id) => pr?.actions.find((a) => a.id === id)?.label ?? id);
+    const parts = [
+      n ? `${n} answer${n === 1 ? "" : "s"}` : "",
+      ...labels
+    ].filter(Boolean);
+    return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0] ?? "nothing";
+  }
+  function toggleAction(a) {
+    if (!pr || formsClosed(pr)) {
+      if (pr) {
+        setNotice(`${formsClosed(pr)} Options can no longer be sent.`, "warning");
+        render();
+      }
+      return;
+    }
+    if (toggles.has(a.id)) {
+      toggles.delete(a.id);
+      draftChanged();
+      document.getElementById(`act-${a.id}`)?.focus();
+      return;
+    }
+    if (a.outward) {
+      if (mode === "confirm") gate.close();
+      outward = a;
+      outwardToggle = true;
+      mode = "outward";
+      outGate.openTarget(outwardTarget(a, target(pr)));
+      notice = null;
+      render();
+      document.getElementById("confirm-outward")?.focus();
+      return;
+    }
+    toggles.set(a.id, toggleSig(a));
+    draftChanged();
+    document.getElementById(`act-${a.id}`)?.focus();
   }
   function link(url, label) {
     return h("button", {
@@ -2280,9 +2772,16 @@ ${question}`,
       render();
       return;
     }
+    const missing = missingRequired(pr.questions, choices);
+    if (missing.length) {
+      setNotice(`Answer question ${pr.questions.indexOf(missing[0]) + 1} first: the agent needs it before merging.`, "warning");
+      render();
+      focusQuestion(missing[0].id);
+      return;
+    }
     override = checksBlock(pr);
     mode = "confirm";
-    gate.open(pr);
+    gate.open(pr, draft());
     notice = null;
     render();
     document.getElementById("confirm-merge")?.focus();
@@ -2294,6 +2793,7 @@ ${question}`,
     if (mode === "outward") {
       outGate.close();
       outward = null;
+      outwardToggle = false;
     }
     mode = null;
     render();
@@ -2307,14 +2807,23 @@ ${question}`,
       return;
     }
     if (mode) closeMode();
-    const event = kind === "skip" ? skipEvent(pr) : holdEvent(pr);
+    const d = formsClosed(pr) ? draft(null) : draft();
+    const event = kind === "skip" ? skipEvent(pr, d) : holdEvent(pr, d);
+    if (tooBig(event)) {
+      setNotice("Too long to send: shorten your typed answers.", "warning");
+      render();
+      return;
+    }
     const result = sendEvent(event.kind, event.text, event.data);
     sent = kind;
-    setNotice(kind === "skip" ? "Skipped: the agent moves on without changing this PR." : "Held: the agent puts this PR aside to come back to later.");
+    const undo = spendDraft(d);
+    const withDraft = draftEmpty(d) ? "" : ` With it: ${summaryWords(d)}.`;
+    setNotice(kind === "skip" ? `Skipped: the agent moves on without deciding this PR.${withDraft}` : `Held: the agent puts this PR aside to come back to later.${withDraft}`);
     render();
     document.getElementById(kind)?.focus();
     result.catch((e) => {
       sent = null;
+      undo();
       setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
     });
@@ -2328,10 +2837,16 @@ ${question}`,
     status: p.status
   });
   function runAction(a) {
-    if (enlarged !== null || !pr || sentCustom.has(a.id)) return;
+    if (enlarged !== null || !pr) return;
+    if (a.mode === "toggle") {
+      toggleAction(a);
+      return;
+    }
+    if (sentCustom.has(a.id)) return;
     if (a.outward) {
       if (mode === "confirm") gate.close();
       outward = a;
+      outwardToggle = false;
       mode = "outward";
       outGate.openTarget(outwardTarget(a, target(pr)));
       notice = null;
@@ -2360,7 +2875,12 @@ ${question}`,
     outGate.close();
     outward = null;
     mode = null;
-    sendCustom(a);
+    if (outwardToggle) {
+      outwardToggle = false;
+      toggles.set(a.id, toggleSig(a));
+      setNotice(`${a.label} is on: it goes with your next send.`);
+      render();
+    } else sendCustom(a);
     document.getElementById(`act-${a.id}`)?.focus();
   }
   function enlarge(i) {
@@ -2370,6 +2890,7 @@ ${question}`,
       gate.close();
       outGate.close();
       outward = null;
+      outwardToggle = false;
       mode = null;
       setNotice("The confirm was closed while you look at the pictures. Start it again when you are ready.", "warning");
     }
@@ -2383,25 +2904,33 @@ ${question}`,
   }
   function confirmMerge() {
     if (enlarged !== null || !pr || mode !== "confirm") return;
-    if (!gate.canConfirm(pr)) return;
+    const d = draft();
+    if (!gate.canConfirm(pr, d)) return;
     const blocked = mergeBlocked(pr, override, !!sent);
     if (blocked) {
       setNotice(blocked, "warning");
       closeMode();
       return;
     }
-    const event = mergeEvent(pr, method, deleteBranch);
+    const event = mergeEvent(pr, method, deleteBranch, d);
+    if (tooBig(event)) {
+      setNotice("Too long to send: shorten your typed answers.", "warning");
+      render();
+      return;
+    }
     const result = sendEvent(event.kind, event.text, event.data);
     sent = "merge";
     mode = null;
     gate.close();
-    setNotice(`Merge sent to the agent: it checks the PR is unchanged, runs ${mergeCommand(pr.repo, pr.number, method, deleteBranch, pr.head_sha)} and reports here.`);
+    const undo = spendDraft(d);
+    setNotice(`Merge sent to the agent${draftEmpty(d) ? "" : ` with ${summaryWords(d)}`}: it checks the PR is unchanged, runs ${mergeCommand(pr.repo, pr.number, method, deleteBranch, pr.head_sha)} and reports here.`);
     render();
     result.catch((e) => {
       sent = null;
+      undo();
       if (pr && pr.head_sha === event.data.head_sha && pr.base === event.data.base && !mergeBlocked(pr, override, false)) {
         mode = "confirm";
-        gate.open(pr);
+        gate.open(pr, draft());
       }
       setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
@@ -2409,7 +2938,7 @@ ${question}`,
     });
   }
   function formEvent(kind, text) {
-    return kind === "request" ? requestChangesEvent(pr, text) : askEvent(pr, text);
+    return kind === "request" ? requestChangesEvent(pr, text, draft()) : askEvent(pr, text);
   }
   function submit(kind) {
     if (enlarged !== null || !pr) return;
@@ -2437,11 +2966,14 @@ ${question}`,
     sent = event.kind;
     mode = null;
     drafts[kind] = "";
+    const undo = event.kind === "request_changes" ? spendDraft(event.data) : () => {
+    };
     setNotice(kind === "request" ? "Request for changes sent to the agent." : "Question sent; the answer will appear here.");
     render();
     document.getElementById(triggers[kind])?.focus();
     result.catch((e) => {
       sent = null;
+      undo();
       drafts[kind] = text;
       mode = kind;
       setNotice(`Not sent (${e.message}). Try again.`, "danger");
@@ -2592,7 +3124,7 @@ ${question}`,
       }, `Merge #${p.number} into ${p.base} in ${p.repo}? The agent will run exactly:`), h("pre", {
         class: "command",
         "aria-label": "Merge command"
-      }, h("code", null, command)), override ? h("p", {
+      }, h("code", null, command)), draftSummary(p, draft()), override ? h("p", {
         class: "warn"
       }, "Checks are failing. You are merging anyway.") : null, p.checks.state === "pending" ? h("p", {
         class: "warn"
@@ -2611,7 +3143,7 @@ ${question}`,
       }, "Cancel ", h("kbd", null, "Esc"))));
     }
     if (mode === "outward" && outward) {
-      return outwardDrawer(outward, `#${p.number}`, () => confirmOutward(), () => closeMode());
+      return outwardDrawer(outward, `#${p.number}`, () => confirmOutward(), () => closeMode(), outwardToggle);
     }
     if (mode === "request" || mode === "ask") {
       const kind = mode;
@@ -2660,6 +3192,164 @@ ${question}`,
       }, "Cancel ", h("kbd", null, "Esc")), count));
     }
     return null;
+  }
+  var clip = (t, n) => [
+    ...t
+  ].length > n ? `${[
+    ...t
+  ].slice(0, n - 1).join("")}\u2026` : t;
+  function draftSummary(p, d) {
+    if (!p.questions.length && !hasToggles(p)) return null;
+    const answered = p.questions.filter((q) => Object.hasOwn(d.answers, q.id));
+    const opts = d.options.map((id) => p.actions.find((a) => a.id === id)).filter((a) => !!a);
+    if (!answered.length && !opts.length) return h("p", {
+      class: "muted small draft-none"
+    }, "No answers or options go with it.");
+    return h("div", {
+      class: "draft-summary",
+      "aria-label": "Also sent with the merge"
+    }, h("p", {
+      class: "drawer-sub"
+    }, "Also sent with it:"), h("ul", null, answered.map((q) => h("li", null, h("span", {
+      class: "muted"
+    }, `${p.questions.indexOf(q) + 1}. ${clip(q.text, 90)} `), h("strong", null, clip(answerLabel(q, d.answers[q.id]), 120)), isRecommended(q, choices) ? h("span", {
+      class: "muted small"
+    }, " (recommended)") : null)), opts.map((a) => h("li", null, h("strong", null, a.label), a.outward ? h("span", {
+      class: "out"
+    }, " \u2197") : null, h("span", {
+      class: "muted"
+    }, `: ${a.description}`)))));
+  }
+  function questionsSection(p) {
+    if (!p.questions.length) return null;
+    const closed = formsClosed(p);
+    return h("section", {
+      class: "questions-form",
+      "aria-labelledby": "questions-title"
+    }, h("h2", {
+      id: "questions-title"
+    }, p.questions.length === 1 ? "The agent asks" : `The agent asks (${p.questions.length})`), h("p", {
+      class: "muted small qhint"
+    }, closed ? `${closed} Answers can no longer be sent.` : "Your answers go with your next decision, or send them now. Number keys pick; Tab moves to the next question."), p.questions.map((q, i) => questionView(q, i, !!closed)));
+  }
+  function questionView(q, i, closed) {
+    const answer = answerOf(q, choices);
+    const label = `q-${q.id}-label`;
+    const head = h("div", {
+      class: "q-head"
+    }, h("span", {
+      class: "q-num",
+      "aria-hidden": "true"
+    }, String(i + 1)), h("span", {
+      class: "q-text",
+      id: label
+    }, q.text), q.required ? h("span", {
+      class: "badge warning q-req"
+    }, "Needed to merge") : null);
+    const why = q.why ? h("p", {
+      class: "q-why muted",
+      id: `q-${q.id}-why`
+    }, q.why) : null;
+    let body;
+    if (q.kind === "text") {
+      const input = h("input", {
+        type: "text",
+        id: `q-${q.id}-text`,
+        class: "q-input",
+        maxlength: MAX_ANSWER,
+        autocomplete: "off",
+        "aria-labelledby": label,
+        "aria-describedby": q.why ? `q-${q.id}-why` : null,
+        placeholder: "A short answer",
+        disabled: closed
+      });
+      input.value = Object.hasOwn(choices, q.id) ? choices[q.id] : q.recommended ?? "";
+      input.addEventListener("input", () => {
+        choices = {
+          ...choices,
+          [q.id]: input.value
+        };
+        draftChanged(false);
+      });
+      body = h("div", {
+        class: "q-text-row"
+      }, input, q.recommended ? h("span", {
+        class: "muted small"
+      }, isRecommended(q, choices) ? "Suggested by the agent" : "") : null);
+    } else {
+      const opts = optionsOf(q);
+      const at = opts.findIndex((o) => o.value === answer);
+      body = h("div", {
+        class: "q-options",
+        role: "radiogroup",
+        "aria-labelledby": label,
+        "aria-describedby": q.why ? `q-${q.id}-why` : null
+      }, opts.map((o, j) => h("button", {
+        type: "button",
+        role: "radio",
+        id: `q-${q.id}-o${j}`,
+        class: `q-opt${j === at ? " on" : ""}`,
+        "aria-checked": String(j === at),
+        tabindex: j === (at < 0 ? 0 : at) ? 0 : -1,
+        disabled: closed,
+        "aria-keyshortcuts": j < 9 ? String(j + 1) : null,
+        onclick: () => pick(q, o.value)
+      }, j < 9 ? h("kbd", null, String(j + 1)) : null, " ", o.label, o.value === q.recommended ? h("span", {
+        class: "rec"
+      }, " Recommended") : null)));
+    }
+    return h("div", {
+      class: `question${answer !== void 0 ? " answered" : ""}`,
+      id: `q-${q.id}`,
+      "data-q": q.id
+    }, head, why, body);
+  }
+  function draftRow(p) {
+    if (!p.questions.length && !hasToggles(p)) return null;
+    const d = draft();
+    const closed = formsClosed(p);
+    const n = Object.keys(d.answers).length;
+    const labels = d.options.map((id) => p.actions.find((a) => a.id === id)).filter((a) => !!a);
+    const done = !d.options.length && n > 0 && sentAnswers === answersSig(d);
+    const what = [
+      p.questions.length ? `${n} of ${p.questions.length} answered` : "",
+      ...labels.map((a) => `${a.label}${a.outward ? " \u2197" : ""}`)
+    ].filter(Boolean);
+    return h("div", {
+      class: "row draft-row",
+      id: "draft-row"
+    }, h("span", {
+      class: "draft-what small"
+    }, h("span", {
+      class: "muted"
+    }, closed ? "Draft: " : "With your next decision: "), what.length ? what.join(" \xB7 ") : "nothing yet"), h("button", {
+      type: "button",
+      id: "send-answers",
+      "aria-keyshortcuts": "Control+Enter",
+      disabled: !!closed || deciding() || draftEmpty(d) || done,
+      title: "Send your answers and options now, without deciding",
+      onclick: () => sendAnswers()
+    }, done ? "Answers sent \u2713" : "Send answers", " ", h("kbd", null, "Ctrl+Enter")));
+  }
+  function refreshDraftRow() {
+    if (!pr) return;
+    const now = document.getElementById("draft-row");
+    const next = draftRow(pr);
+    if (now && next) now.replaceWith(next);
+  }
+  function verdictBlock(p) {
+    if (!p.verdict && !p.undo) return null;
+    return h("section", {
+      class: `verdict risk-${p.risk.level}`,
+      "aria-label": "The agent's verdict"
+    }, p.verdict ? h("p", {
+      class: "verdict-text"
+    }, p.verdict) : null, p.undo ? h("p", {
+      class: "undo"
+    }, h("span", {
+      class: "undo-icon",
+      "aria-hidden": "true"
+    }, "\u21A9 "), p.undo) : null);
   }
   function mediaSection(p) {
     if (!p.media.length) return null;
@@ -2832,6 +3522,18 @@ ${question}`,
       "Hold: put aside for later"
     ],
     [
+      "1\u20139",
+      "Pick that answer in the focused question"
+    ],
+    [
+      "Tab",
+      "Next question (Shift+Tab: previous)"
+    ],
+    [
+      "Ctrl+Enter",
+      "Send your answers and options now (they also go with your next decision)"
+    ],
+    [
       "Enter",
       "Confirm, in a confirm step"
     ],
@@ -2916,6 +3618,7 @@ ${question}`,
         title: p.head_sha
       }, short(p.head_sha)))),
       statusBanner(p),
+      verdictBlock(p),
       warnings.length ? h("p", {
         class: "warnings"
       }, warnings.join("; ")) : null,
@@ -2948,6 +3651,7 @@ ${question}`,
       }, p.reviews.items.map((r) => h("li", null, h("span", null, r.author), h("span", {
         class: `state ${reviewTone(r.state)}`
       }, words(r.state))))) : null)),
+      questionsSection(p),
       mediaSection(p),
       h("section", null, h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"), p.changes.length ? null : h("p", {
         class: "muted"
@@ -2966,14 +3670,9 @@ ${question}`,
       }, c.note), diffView(c.diff))), p.rest_note ? h("p", {
         class: "rest muted"
       }, p.rest_note) : null),
-      p.questions.length ? h("section", null, h("h2", null, "The agent's open questions"), h("ol", {
-        class: "questions"
-      }, p.questions.map((q) => h("li", null, q))), h("p", {
-        class: "muted small"
-      }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null,
       answers.length ? h("section", {
         id: "answers"
-      }, h("h2", null, "Answers"), answers.map((a) => h("div", {
+      }, h("h2", null, "The agent's answers"), answers.map((a) => h("div", {
         class: "answer"
       }, h("p", {
         class: "q muted"
@@ -2982,7 +3681,7 @@ ${question}`,
       }, a.text)))) : null,
       h("div", {
         class: `actions${mode || showKeys ? " has-drawer" : ""}`
-      }, showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false)) : null, actionPanel(p), effective ? h("div", {
+      }, showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false), true) : null, actionPanel(p), draftRow(p), effective ? h("div", {
         class: `notice ${effective.tone}`,
         role: effective.tone === "danger" ? "alert" : "status"
       }, effective.text) : null, h("div", {
@@ -3021,11 +3720,11 @@ ${question}`,
         disabled: !!sent || !!holdClosed(p),
         title: holdClosed(p) ?? "Put this PR aside to come back to later",
         onclick: () => sendSimple("hold")
-      }, "Hold ", h("kbd", null, "H")), helpButton(() => setKeys(!showKeys), showKeys)), actionsGroup(p.actions, runAction, (a) => sentCustom.has(a.id), actionsOpen, () => {
+      }, "Hold ", h("kbd", null, "H")), helpButton(() => setKeys(!showKeys), showKeys)), actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentCustom.has(a.id), actionsOpen, () => {
         actionsOpen = !actionsOpen;
         render();
         document.getElementById("your-actions")?.focus();
-      }), h("p", {
+      }, (a) => a.mode === "toggle" ? toggles.has(a.id) : void 0), h("p", {
         id: "merge-hint",
         class: "hint small",
         "aria-live": "polite"
@@ -3083,6 +3782,46 @@ ${question}`,
       } else if (!box?.contains(e.target)) e.preventDefault();
       return;
     }
+    const qBox = e.target.closest?.("[data-q]");
+    const q = qBox ? pr.questions.find((x) => x.id === qBox.dataset.q) : void 0;
+    if (q && !e.altKey && !e.metaKey) {
+      if (e.key === "Tab" && !e.ctrlKey) {
+        if (moveQuestion(q.id, e.shiftKey ? -1 : 1)) e.preventDefault();
+        return;
+      }
+      if (e.key === "Enter" && e.ctrlKey) {
+        e.preventDefault();
+        sendAnswers();
+        return;
+      }
+      if (q.kind === "text") {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          if (!moveQuestion(q.id, 1)) document.getElementById("send-answers")?.focus();
+          return;
+        }
+      } else if (!e.ctrlKey) {
+        if (/^[0-9]$/.test(e.key)) {
+          e.preventDefault();
+          const v = valueForDigit(q, e.key);
+          if (v !== void 0 && !e.repeat) pick(q, v);
+          return;
+        }
+        const step = {
+          ArrowRight: 1,
+          ArrowDown: 1,
+          ArrowLeft: -1,
+          ArrowUp: -1
+        }[e.key];
+        if (step) {
+          e.preventDefault();
+          const opts = optionsOf(q);
+          const at = opts.findIndex((o) => o.value === answerOf(q, choices));
+          pick(q, opts[((at < 0 ? step > 0 ? -1 : 0 : at) + step + opts.length) % opts.length].value);
+          return;
+        }
+      }
+    }
     if (typing(e)) {
       const target2 = e.target;
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && (target2.id === "request-text" || target2.id === "ask-text")) {
@@ -3092,6 +3831,11 @@ ${question}`,
         e.preventDefault();
         closeMode();
       }
+      return;
+    }
+    if (e.key === "Enter" && e.ctrlKey && !e.altKey && !e.metaKey && !mode) {
+      e.preventDefault();
+      sendAnswers();
       return;
     }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -3190,6 +3934,7 @@ ${question}`,
         gate.input(null);
         outGate.inputTarget(null);
         outward = null;
+        outwardToggle = false;
         enlarged = null;
         if (mode === "confirm" || mode === "outward") mode = null;
         pr = null;
@@ -3201,15 +3946,26 @@ ${question}`,
       let closedView = false;
       const id = `${next.repo}#${next.number}`;
       const changedSha = !!pr && pr.head_sha !== next.head_sha;
-      if (gate.input(next) && mode === "confirm") {
+      if (id !== identity) {
+        choices = {};
+        toggles.clear();
+        sentAnswers = null;
+      }
+      choices = pruneChoices(next.questions, choices);
+      for (const [k, sig] of toggles) {
+        const a = next.actions.find((x) => x.id === k);
+        if (!a || toggleSig(a) !== sig) toggles.delete(k);
+      }
+      if (gate.input(next, draft(next)) && mode === "confirm") {
         mode = null;
         setNotice("The PR changed while you were confirming. Check it again, then Merge.", "warning");
       }
       if (mode === "outward" && outward) {
         const a = next.actions.find((x) => x.id === outward.id);
-        if (outGate.inputTarget(a ? outwardTarget(a, target(next)) : null)) {
+        if (outGate.inputTarget(a && a.mode === outward.mode ? outwardTarget(a, target(next)) : null)) {
           mode = null;
           outward = null;
+          outwardToggle = false;
           setNotice("The PR or the action changed while you were confirming. Check it, then try again.", "warning");
         } else outward = a;
       }

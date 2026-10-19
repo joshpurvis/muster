@@ -1,4 +1,5 @@
 import {
+  quickMergeBlocked, quickMergeEvent, quickTarget, quickWins,
   age, arrange, followCurrent, canHold, holdEvent, type Item, matches, nextEvent, nextPr, openEvent, type Overview, queue, sortPrs, tally, validateOverview,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
@@ -40,7 +41,7 @@ Deno.test("overview input: names the bad field", () => {
   bad(pr({ number: 0 }), "prs[0].number: must be a positive whole number");
   bad({ prs: [sampleOverview.prs[0], sampleOverview.prs[0]] }, "prs[1].number: #812 is listed twice");
   bad(pr({ title: "" }), "prs[0].title: must not be empty");
-  bad(pr({ status: "done" }), "prs[0].status: must be one of new, reviewing");
+  bad(pr({ status: "done" }), "prs[0].status: must be one of new, ready, reviewing");
   bad(pr({ risk: "extreme" }), "prs[0].risk");
   bad(pr({ checks: "green" }), "prs[0].checks");
   bad(pr({ review: "LGTM" }), "prs[0].review");
@@ -114,4 +115,58 @@ Deno.test("selection: the agent moving on never retargets a card the user is on"
   eq(followCurrent(801, 812, 815, true), 801, "keeps the user's pick while they navigate");
   eq(followCurrent(801, 812, 812, false), 801, "no change of current: no change");
   eq(followCurrent(801, 812, undefined, false), 801);
+});
+
+const win = { number: 815, title: "Fix a typo in the README", author: "lee", additions: 1, deletions: 1, files: 1, checks: "passing", review: "APPROVED",
+  risk: "low", quick_win: true, head_sha: "0123456789abcdef0123456789abcdef01234567", base: "master", verdict: "Safe to merge: one word in the docs.",
+  status: "ready" };
+
+Deno.test("quick wins: only after a review (head, base, verdict), green and not a draft", () => {
+  const o = valid({ ...sampleOverview, prs: [win, ...sampleOverview.prs.filter((p) => p.number !== 815)] });
+  const w = o.prs[0];
+  eq([w.quick_win, w.status, w.merge_method_default, w.delete_branch_default], [true, "ready", "squash", false]);
+  eq(o.prs[1].quick_win, false);
+  const bad = (patch: Record<string, unknown>, want: string) => {
+    const e = errorsOf(validateOverview({ ...sampleOverview, prs: [{ ...win, ...patch }] }));
+    check(e.some((x) => x.startsWith(want)), `${want}\n${e.join("\n")}`);
+  };
+  bad({ head_sha: undefined }, "prs[0].head_sha: is required for a quick win");
+  bad({ base: undefined }, "prs[0].base: is required for a quick win");
+  bad({ verdict: undefined }, "prs[0].verdict: is required for a quick win");
+  bad({ verdict: "a\nb" }, "prs[0].verdict: must be one line");
+  bad({ checks: "pending" }, "prs[0].quick_win: needs checks passing");
+  bad({ draft: true }, "prs[0].quick_win: cannot be a draft");
+  bad({ base: "ma ster" }, "prs[0].base: is not a valid branch name");
+  bad({ merge_method_default: "ff" }, "prs[0].merge_method_default: must be one of squash");
+  bad({ quick_win: "yes" }, "prs[0].quick_win: must be true or false");
+  check(validateOverview({ ...sampleOverview, prs: [{ ...win, quick_win: false, verdict: undefined, base: undefined }] }).ok, "a plain card needs none of it");
+});
+
+Deno.test("quick wins: first in the quick sort, the filter and the queue; merge gating", () => {
+  const o = valid({ ...sampleOverview, prs: [...sampleOverview.prs.filter((p) => p.number !== 815), win] });
+  eq(nums(sortPrs(o.prs, "quick"))[0], 815, "quick wins first");
+  eq(nums(arrange(o.prs, "risk", "", true).flatMap((g) => g.items)), [815], "quick wins only");
+  eq(nums(arrange(o.prs, "risk", "quick win").flatMap((g) => g.items)), [815], "the filter finds them by name");
+  check(nums(queue(sortPrs(o.prs, "risk"))).includes(815), "a ready PR is still to review");
+  const w = o.prs.find((p) => p.number === 815)!;
+  eq(quickMergeBlocked(w, false), null);
+  check(quickMergeBlocked(w, true)!.includes("Waiting"));
+  for (const status of ["merged", "merging", "queued", "reviewing", "changes_requested"]) check(quickMergeBlocked({ ...w, status: status as never }, false), status);
+  eq(quickMergeBlocked({ ...w, status: "held" }, false), null, "a held quick win can still be merged from here");
+  check(quickMergeBlocked(o.prs[0], false)!.startsWith("Not a quick win"));
+  eq(nums(quickWins(o.prs)), [815]);
+});
+
+Deno.test("quick wins: the merge event has pr_decision's shape and the card's exact command; any card change cancels the confirm", () => {
+  const w = valid({ repo: "acme/api", prs: [{ ...win, merge_method_default: "rebase", delete_branch_default: true }] }).prs[0];
+  const ev = quickMergeEvent("acme/api", w);
+  eq(ev.kind, "merge");
+  eq(ev.data, { action: "merge", repo: "acme/api", number: 815, base: "master", method: "rebase", delete_branch: true, head_sha: win.head_sha, answers: {}, options: [] });
+  check(ev.text.endsWith(`Run exactly: gh pr merge 815 --repo acme/api --rebase --delete-branch --match-head-commit ${win.head_sha}`), ev.text);
+  const t = quickTarget("acme/api", w);
+  eq(quickTarget("acme/api", { ...w }), t);
+  for (const change of [{ head_sha: "f".repeat(40) }, { base: "release" }, { verdict: "Changed." }, { checks: "failing" }, { status: "reviewing" }]) {
+    check(quickTarget("acme/api", { ...w, ...change } as never) !== t, JSON.stringify(change));
+  }
+  check(quickTarget("acme/web", w) !== t, "another repo");
 });

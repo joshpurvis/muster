@@ -86,3 +86,10 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
 @media (max-height: 559px), (max-width: 520px) {
   .keys { display: none; }
 }
+/* Quick wins: reviewed, small, green and low risk; merged from here after the same confirm. */
+.verdict-line { margin: 6px 0 0; font-size: 13px; font-weight: 600; }
+.drawer .verdict-line { margin: 0 0 6px; font-weight: 400; }
+.command { margin: 0 0 8px; padding: 8px 10px; background: var(--color-background-primary); border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+button.quick-toggle { flex: none; }
+button.quick-toggle.on { border-color: var(--accent-fill); background: var(--color-background-info); font-weight: 600; }
+button.merge-quick { border-color: var(--color-text-success); }

@@ -15,7 +15,7 @@ const later = { id: "later", label: "Label later", description: "Note this PR in
 Deno.test("actions: valid ones come back normalised", () => {
   const r = run([qa, later]);
   eq(r.errors, []);
-  eq(r.out, [{ ...qa, key: "q" }, { ...later, key: undefined }]);
+  eq(r.out, [{ ...qa, key: "q", mode: "toggle" }, { ...later, key: undefined, mode: "toggle" }]);
   eq(run(undefined).out, []);
   // Muster refuses an action without `outward`; should one get here, it asks first.
   eq(run([{ id: "x", label: "X", description: "d" }]).out[0].outward, true);
@@ -37,6 +37,10 @@ Deno.test("actions: keys never clash with the apps' own keys or each other; ids 
   bad([{ ...later, description: " " }], "actions[0].description: must not be empty");
   bad([{ id: "x", label: "X" }], "actions[0].description: is required");
   bad([{ ...later, outward: "yes" }], "actions[0].outward: must be true or false");
+  bad([{ ...later, mode: "later" }], "actions[0].mode: must be one of toggle, now");
+  eq(run([{ ...later, mode: "now" }]).out[0].mode, "now");
+  bad([{ ...later, id: "answers" }], `actions[0].id: "answers" is a built-in action`);
+  bad([{ ...later, label: "Send answers" }], "actions[0].label:");
   for (const label of ["Hold", " merge ", "Open on  GitHub…", "Request changes.", "SKIP!", "Next", "Confirm merge"]) {
     bad([{ ...later, label }], "actions[0].label:");
   }

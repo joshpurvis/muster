@@ -36,7 +36,9 @@ export function validateImage(data: unknown): Result<ImageInput> {
     if (!safe) p.add("url", "must be an https URL without a user name or password");
     else { shown = safe; source = safe; }
   } else if (!p.errors.length) p.add("data", "needs path (a file in the task worktree) or url (https)");
-  return p.result({ src: shown, source, alt: alt ?? "", caption, bytes });
+  // The image is the panel's content: without alt text, name it by its caption or file name.
+  const fallback = caption?.trim() || `Image: ${source.split(/[/\\]/).filter(Boolean).pop()?.split("?")[0] ?? "untitled"}`;
+  return p.result({ src: shown, source, alt: alt?.trim() ? alt : fallback, caption, bytes });
 }
 
 export function formatBytes(n: number): string {

@@ -18,6 +18,13 @@ export const MAX_SERIES = 12;
 /** Series colours, in order. Each keeps 3:1 contrast on both the light and dark panel background. */
 export const PALETTE = ["#2f7fd0", "#d0661a", "#2a9450", "#7f6ad8", "#c94f7c", "#18938f", "#b07d12", "#7a8296"];
 export const color = (i: number) => PALETTE[i % PALETTE.length];
+/** Series 9–12 reuse the colours with a dash (lines), hatching (bars, areas) and square markers. */
+export const DASHES = ["7 4", "2 3", "10 3 2 3", "4 4"];
+export interface SeriesStyle { color: string; dash?: string; hatch: boolean }
+export function seriesStyle(i: number): SeriesStyle {
+  const second = i >= PALETTE.length;
+  return { color: color(i), dash: second ? DASHES[(i - PALETTE.length) % DASHES.length] : undefined, hatch: second };
+}
 
 export function validateChart(data: unknown): Result<ChartSpec> {
   const p = new Problems();
@@ -83,13 +90,15 @@ export function niceStep(rough: number): number {
   return nice * 10 ** exp;
 }
 
-/** Decimal places that show `step` exactly (0.25 → 2, 2.5 → 1, 500 → 0). */
+/** Decimal places that show `step` exactly (0.25 → 2, 2.5 → 1, 500 → 0, 1e-10 → 10). */
 export function decimals(step: number): number {
-  for (let d = 0; d < 12; d++) {
+  if (!(step > 0) || !Number.isFinite(step)) return 0;
+  for (let d = 0; d <= 20; d++) {
     const x = step * 10 ** d;
-    if (Math.abs(x - Math.round(x)) < 1e-9 * Math.max(1, x)) return d;
+    // Relative tolerance: a tiny step is never "an integer zero".
+    if (Math.round(x) !== 0 && Math.abs(x - Math.round(x)) <= 1e-6 * x) return d;
   }
-  return 12;
+  return 20;
 }
 
 /** Round, evenly spaced ticks covering [min, max] with about `count` intervals. */
@@ -110,6 +119,10 @@ export function niceTicks(min: number, max: number, count = 5): { min: number; m
     if (v > hi + step / 2) break;
     ticks.push(v === 0 ? 0 : v);
   }
+  // Ticks must increase strictly; if float precision ran out, fall back to the bare range.
+  if (ticks.length < 2 || ticks.some((t, i) => i && t <= ticks[i - 1]) || !(hi > lo)) {
+    return { min, max, step: max - min, ticks: [min, max] };
+  }
   return { min: lo, max: hi, step, ticks };
 }
 
@@ -121,7 +134,14 @@ export function formatTick(v: number, step: number): string {
       return trim((v / div).toFixed(Math.min(2, decimals(step / div)))) + suffix;
     }
   }
-  return trim(v.toFixed(decimals(step)));
+  const d = decimals(step);
+  if (d > 6 || a >= 1e15) {
+    if (v === 0) return "0";
+    // Enough significant digits to tell neighbouring ticks apart.
+    const digits = Math.max(1, Math.min(6, Math.ceil(Math.log10(a / step)) + 1));
+    return v.toExponential(digits - 1).replace(/\.?0+e/, "e");
+  }
+  return trim(v.toFixed(d));
 }
 
 /** Values in tooltips and the data table: as given, with float noise removed. */
@@ -143,12 +163,21 @@ export function yScale(spec: ChartSpec, count = 5) {
   let lo = all.length ? Math.min(...all) : 0;
   let hi = all.length ? Math.max(...all) : 1;
   if (spec.type === "bar" || spec.type === "area") { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
-  if (spec.y.min !== undefined) lo = spec.y.min;
-  if (spec.y.max !== undefined) hi = spec.y.max;
+  const span = Math.max(hi - lo, Math.abs(hi), Math.abs(lo)) || 1;
+  const { min: fixedMin, max: fixedMax } = spec.y;
+  if (fixedMin !== undefined) lo = fixedMin;
+  if (fixedMax !== undefined) hi = fixedMax;
+  // One fixed bound beyond the data: keep a non-empty range on the open side.
+  if (hi <= lo) {
+    if (fixedMin !== undefined && fixedMax === undefined) hi = lo + span;
+    else if (fixedMax !== undefined && fixedMin === undefined) lo = hi - span;
+    else hi = lo + 1;
+  }
   const t = niceTicks(lo, hi, count);
-  const min = spec.y.min ?? t.min;
-  const max = spec.y.max ?? t.max;
-  return { min, max, step: t.step, ticks: t.ticks.filter((v) => v >= min - 1e-9 && v <= max + 1e-9) };
+  const min = fixedMin ?? t.min;
+  const max = fixedMax ?? t.max;
+  const eps = (max - min) * 1e-9;
+  return { min, max, step: t.step, ticks: t.ticks.filter((v) => v >= min - eps && v <= max + eps) };
 }
 
 /** Numeric x (scatter, or line/area with only numbers) uses a linear axis; anything else is categorical. */

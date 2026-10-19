@@ -28,3 +28,4 @@ table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
 table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
 table.data th, table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
 table.data th[scope="row"], table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }
+.swatch-svg { flex: none; display: block; }

@@ -39,7 +39,14 @@ function headerCells() {
     return h("th", { scope: "col", class: align, "aria-sort": dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none" },
       h("button", {
         type: "button", class: "sort", title: `Sort by ${c.label}`,
-        onclick: () => { sort = nextSort(sort, c.key, c.numeric); headerCells(); rowsShown(); },
+        "data-key": c.key,
+        onclick: () => {
+          sort = nextSort(sort, c.key, c.numeric);
+          headerCells();
+          rowsShown();
+          // The header was rebuilt: keep the keyboard on the same column.
+          [...document.querySelectorAll<HTMLElement>("button.sort")].find((b) => b.dataset.key === c.key)?.focus();
+        },
       }, h("span", null, c.label), h("span", { class: "arrow", "aria-hidden": "true" }, dir === "asc" ? "▲" : dir === "desc" ? "▼" : "")));
   }));
 }

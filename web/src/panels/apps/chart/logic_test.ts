@@ -1,5 +1,5 @@
 import {
-  contrast, formatTick, formatValue, labelEvery, linear, niceStep, niceTicks, numericX, PALETTE, validateChart, yScale,
+  contrast, decimals, formatTick, seriesStyle, formatValue, labelEvery, linear, niceStep, niceTicks, numericX, PALETTE, validateChart, yScale,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
@@ -63,4 +63,32 @@ Deno.test("palette keeps 3:1 contrast on light and dark backgrounds", () => {
     check(contrast(c, "#19191d") >= 3, `${c} on dark: ${contrast(c, "#19191d")}`);
   }
   eq(new Set(PALETTE).size, PALETTE.length);
+});
+
+Deno.test("degenerate ranges still give distinct, increasing ticks", () => {
+  eq([decimals(1e-10), decimals(0.25), decimals(2.5), decimals(500)], [10, 2, 1, 0]);
+  const tiny = validateChart({ type: "line", x: { values: [1, 2] }, series: [{ name: "a", values: [0, 1e-10] }] });
+  check(tiny.ok);
+  const t = yScale(tiny.value);
+  check(t.max > t.min && t.ticks.length >= 2 && t.ticks.every((v, i) => !i || v > t.ticks[i - 1]), JSON.stringify(t));
+  check(new Set(t.ticks.map((v) => formatTick(v, t.step))).size === t.ticks.length, "labels differ");
+  const flat = niceTicks(1e-300, 1e-300);
+  check(flat.ticks.length >= 2 && flat.max > flat.min, JSON.stringify(flat));
+});
+
+Deno.test("one fixed bound beyond the data keeps a non-empty domain", () => {
+  const above = validateChart({ type: "line", x: { values: [1, 2] }, series: [{ name: "a", values: [1, 2] }], y: { min: 10 } });
+  check(above.ok);
+  const a = yScale(above.value);
+  check(a.min === 10 && a.max > 10, JSON.stringify(a));
+  const below = validateChart({ type: "line", x: { values: [1, 2] }, series: [{ name: "a", values: [10, 20] }], y: { max: 5 } });
+  check(below.ok);
+  const b = yScale(below.value);
+  check(b.max === 5 && b.min < 5, JSON.stringify(b));
+});
+
+Deno.test("all 12 series look different: colour, then dash and hatching", () => {
+  const styles = Array.from({ length: 12 }, (_, i) => seriesStyle(i));
+  eq(new Set(styles.map((s) => `${s.color}|${s.dash ?? ""}|${s.hatch}`)).size, 12);
+  check(styles.slice(8).every((s) => s.dash && s.hatch) && styles.slice(0, 8).every((s) => !s.dash && !s.hatch));
 });

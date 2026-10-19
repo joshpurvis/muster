@@ -8,7 +8,9 @@ Deno.test("image input: a loaded path or an https url", () => {
   check(r.ok);
   eq([r.value.src, r.value.source, r.value.alt, r.value.caption, r.value.bytes], [png, "shots/a.png", "Login page", "After", 8]);
   const u = validateImage({ url: "https://example.com/a.svg" });
-  check(u.ok && u.value.src === "https://example.com/a.svg" && u.value.alt === "");
+  check(u.ok && u.value.src === "https://example.com/a.svg" && u.value.alt === "Image: a.svg", "no alt: named by its file");
+  const c = validateImage({ url: "https://example.com/x/chart.png?v=2", caption: "Weekly CI minutes" });
+  check(c.ok && c.value.alt === "Weekly CI minutes", "no alt: the caption describes it");
 });
 
 Deno.test("image input: clear errors for missing, mixed, unsafe or unloaded sources", () => {

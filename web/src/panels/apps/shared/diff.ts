@@ -1,7 +1,8 @@
 // Unified diff parsing for display. Tolerates a bare hunk body (no @@ header) and the
 // `diff --git` / `index` / `---` / `+++` preamble that `gh pr diff` prints per file.
 
-export type DiffKind = "add" | "del" | "ctx" | "hunk" | "note";
+/** `meta`: a file-level change with no lines to show (rename, mode, binary, new or deleted file). */
+export type DiffKind = "add" | "del" | "ctx" | "hunk" | "note" | "meta";
 export interface DiffLine {
   kind: DiffKind;
   text: string;
@@ -17,6 +18,7 @@ export function parseDiff(diff: string): DiffLine[] {
   let oldNo: number | undefined;
   let newNo: number | undefined;
   let inHunk = false;
+  const pending: Pending = {};
   const lines = diff.replace(/\r\n?/g, "\n").split("\n");
   if (lines.length && lines[lines.length - 1] === "") lines.pop();
   for (const line of lines) {
@@ -28,11 +30,15 @@ export function parseDiff(diff: string): DiffLine[] {
       out.push({ kind: "hunk", text: line });
       continue;
     }
-    if (!inHunk && /^(diff --git |index |--- |\+\+\+ |new file mode|deleted file mode|similarity index|rename (from|to) |old mode|new mode|Binary files)/.test(line)) {
-      continue;
+    if (!inHunk) {
+      const meta = metaLine(line, pending);
+      if (meta !== undefined) {
+        if (meta) out.push({ kind: "meta", text: meta });
+        continue;
+      }
     }
     if (line.startsWith("\\")) { out.push({ kind: "note", text: line.slice(1).trim() }); continue; }
-    if (inHunk && line.startsWith("diff --git ")) { inHunk = false; continue; }
+    if (inHunk && line.startsWith("diff --git ")) { inHunk = false; pending.from = pending.oldMode = undefined; continue; }
     const sign = line[0];
     if (sign === "+") {
       out.push({ kind: "add", text: line.slice(1), new: newNo });
@@ -48,6 +54,35 @@ export function parseDiff(diff: string): DiffLine[] {
     }
   }
   return out;
+}
+
+interface Pending { from?: string; oldMode?: string }
+
+/**
+ * A header line before a hunk: undefined when it is not one, "" when it is shown with a later
+ * line (or not at all), else the text to show.
+ */
+function metaLine(line: string, pending: Pending): string | undefined {
+  let m: RegExpExecArray | null;
+  if ((m = /^rename from (.*)$/.exec(line))) { pending.from = m[1]; return ""; }
+  if ((m = /^rename to (.*)$/.exec(line))) {
+    const text = `renamed ${pending.from ?? "?"} → ${m[1]}`;
+    pending.from = undefined;
+    return text;
+  }
+  if ((m = /^copy from (.*)$/.exec(line))) { pending.from = m[1]; return ""; }
+  if ((m = /^copy to (.*)$/.exec(line))) { const text = `copied ${pending.from ?? "?"} → ${m[1]}`; pending.from = undefined; return text; }
+  if ((m = /^old mode (\d+)$/.exec(line))) { pending.oldMode = m[1]; return ""; }
+  if ((m = /^new mode (\d+)$/.exec(line))) {
+    const text = `mode ${pending.oldMode ?? "?"} → ${m[1]}`;
+    pending.oldMode = undefined;
+    return text;
+  }
+  if ((m = /^new file mode (\d+)$/.exec(line))) return `new file (mode ${m[1]})`;
+  if ((m = /^deleted file mode (\d+)$/.exec(line))) return `file deleted (mode ${m[1]})`;
+  if (/^Binary files .* differ$/.test(line) || line === "GIT binary patch") return "binary file changed";
+  if (/^(diff --git |index |--- |\+\+\+ |similarity index |dissimilarity index )/.test(line)) return "";
+  return undefined;
 }
 
 export function diffStats(lines: DiffLine[]): { added: number; removed: number } {

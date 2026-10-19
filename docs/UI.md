@@ -116,9 +116,11 @@ The other built-ins follow the theme and work by keyboard: Image toggles fit/act
 (Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
 Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
 has Merge (M), Request changes (R), Ask (A) and Open on GitHub (O). Merge first shows the
-exact `gh pr merge` command and needs Enter or "Confirm merge"; with failing checks it is
-disabled unless Shift is held (Shift+M). Esc closes the confirm or a comment box;
-Ctrl+Enter sends a comment or question.
+exact `gh pr merge` command and needs a fresh Enter or "Confirm merge" (a held key never
+confirms; a change to the PR cancels the step); with failing checks it is disabled unless
+Shift is held (Shift+M), and a hint beside it says so. Esc closes the confirm or a comment
+box and returns to its button; Ctrl+Enter sends a comment or question. The latest action's
+result shows above the action bar.
 
 An app sends a message or opens a link only right after a real click or key inside it: the
 sandbox proxy checks its own user activation (selecting the tab or focusing the panel does not

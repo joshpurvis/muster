@@ -20,8 +20,10 @@
   --color-text-warning: #9a5b00;
   --color-background-warning: rgba(214, 138, 0, 0.12);
   --accent: #6d5ce8;
+  /* Filled buttons keep white text at 4.5:1 or more in both themes. */
+  --accent-fill: #6d5ce8;
   --on-accent: #ffffff;
-  --danger-fill: #d92d20;
+  --danger-fill: #c4291c;
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   --border-radius-sm: 4px;
@@ -50,7 +52,8 @@
   --color-text-warning: #f0a020;
   --color-background-warning: rgba(240, 160, 32, 0.13);
   --accent: #8b7cf6;
-  --danger-fill: #da3633;
+  --accent-fill: #6652e0;
+  --danger-fill: #c4291c;
 }
 * { box-sizing: border-box; }
 html { background: var(--color-background-primary); color: var(--color-text-primary); }
@@ -70,8 +73,8 @@ button {
 }
 button:hover:not(:disabled) { background: var(--color-background-tertiary); }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent-fill); }
 button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
 button.link { border: 0; background: none; padding: 0; min-height: 0; color: var(--color-text-info); text-decoration: underline; }
 select, input[type="search"], input[type="text"], textarea {

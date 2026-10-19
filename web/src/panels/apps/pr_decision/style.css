@@ -22,7 +22,7 @@ section { margin: 0 0 18px; }
 .status, .notice { border-radius: var(--border-radius-md); padding: 8px 12px; margin: 0 0 14px; border: 1px solid; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
 .status { font-size: 15px; }
 .status.info, .notice.info { border-color: var(--color-text-info); background: var(--color-background-info); color: var(--color-text-primary); }
-.status.success { border-color: var(--color-text-success); background: var(--color-background-success); color: var(--color-text-primary); }
+.notice.success, .status.success { border-color: var(--color-text-success); background: var(--color-background-success); color: var(--color-text-primary); }
 .status.danger, .notice.danger { border-color: var(--color-text-danger); background: var(--color-background-danger); color: var(--color-text-primary); }
 .status.warning, .notice.warning { border-color: var(--color-text-warning); background: var(--color-background-warning); color: var(--color-text-primary); }
 .status strong { font-size: 15px; }
@@ -30,6 +30,10 @@ section { margin: 0 0 18px; }
 .status.danger strong { color: var(--color-text-danger); }
 .status .detail { white-space: pre-wrap; font-size: 13px; }
 .notice { font-size: 13px; }
+.actions .notice { margin: 0 0 8px; padding: 6px 10px; }
+.hint:empty { display: none; }
+.hint { margin: 6px 0 0; color: var(--color-text-warning); }
+.count { margin-left: auto; }
 .change { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); margin: 0 0 12px; overflow: hidden; }
 .change > header { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; background: var(--color-background-secondary); border-bottom: 1px solid var(--color-border-secondary); }
 .change .file { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
@@ -48,6 +52,7 @@ section { margin: 0 0 18px; }
 .diff tr.del .sign { color: var(--color-text-danger); }
 .diff tr.hunk td { color: var(--color-text-info); background: var(--color-background-info); padding: 2px 8px; }
 .diff tr.note td { color: var(--color-text-tertiary); font-style: italic; }
+.diff tr.meta td { color: var(--color-text-secondary); background: var(--color-background-secondary); padding: 3px 8px; font-family: var(--font-sans); }
 .diff-wrap .more { padding: 4px 10px; margin: 0; font-size: 12px; }
 .rest { font-size: 13px; }
 .questions { margin: 0 0 6px; padding-left: 20px; }

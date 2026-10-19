@@ -25,8 +25,10 @@
   --color-text-warning: #9a5b00;
   --color-background-warning: rgba(214, 138, 0, 0.12);
   --accent: #6d5ce8;
+  /* Filled buttons keep white text at 4.5:1 or more in both themes. */
+  --accent-fill: #6d5ce8;
   --on-accent: #ffffff;
-  --danger-fill: #d92d20;
+  --danger-fill: #c4291c;
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   --border-radius-sm: 4px;
@@ -55,7 +57,8 @@
   --color-text-warning: #f0a020;
   --color-background-warning: rgba(240, 160, 32, 0.13);
   --accent: #8b7cf6;
-  --danger-fill: #da3633;
+  --accent-fill: #6652e0;
+  --danger-fill: #c4291c;
 }
 * { box-sizing: border-box; }
 html { background: var(--color-background-primary); color: var(--color-text-primary); }
@@ -75,8 +78,8 @@ button {
 }
 button:hover:not(:disabled) { background: var(--color-background-tertiary); }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent-fill); }
 button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
 button.link { border: 0; background: none; padding: 0; min-height: 0; color: var(--color-text-info); text-decoration: underline; }
 select, input[type="search"], input[type="text"], textarea {
@@ -125,6 +128,7 @@ table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
 table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
 table.data th, table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
 table.data th[scope="row"], table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }
+.swatch-svg { flex: none; display: block; }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -378,6 +382,20 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     "#7a8296"
   ];
   var color = (i) => PALETTE[i % PALETTE.length];
+  var DASHES = [
+    "7 4",
+    "2 3",
+    "10 3 2 3",
+    "4 4"
+  ];
+  function seriesStyle(i) {
+    const second = i >= PALETTE.length;
+    return {
+      color: color(i),
+      dash: second ? DASHES[(i - PALETTE.length) % DASHES.length] : void 0,
+      hatch: second
+    };
+  }
   function validateChart(data) {
     const p = new Problems();
     const o = p.object(data, "data");
@@ -488,11 +506,12 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     return nice * 10 ** exp;
   }
   function decimals(step) {
-    for (let d = 0; d < 12; d++) {
+    if (!(step > 0) || !Number.isFinite(step)) return 0;
+    for (let d = 0; d <= 20; d++) {
       const x = step * 10 ** d;
-      if (Math.abs(x - Math.round(x)) < 1e-9 * Math.max(1, x)) return d;
+      if (Math.round(x) !== 0 && Math.abs(x - Math.round(x)) <= 1e-6 * x) return d;
     }
-    return 12;
+    return 20;
   }
   function niceTicks(min, max, count = 5) {
     if (min > max) [min, max] = [
@@ -513,6 +532,17 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       const v = Number((lo + i * step).toFixed(d));
       if (v > hi + step / 2) break;
       ticks.push(v === 0 ? 0 : v);
+    }
+    if (ticks.length < 2 || ticks.some((t, i) => i && t <= ticks[i - 1]) || !(hi > lo)) {
+      return {
+        min,
+        max,
+        step: max - min,
+        ticks: [
+          min,
+          max
+        ]
+      };
     }
     return {
       min: lo,
@@ -544,7 +574,13 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
         return trim((v / div).toFixed(Math.min(2, decimals(step / div)))) + suffix;
       }
     }
-    return trim(v.toFixed(decimals(step)));
+    const d = decimals(step);
+    if (d > 6 || a >= 1e15) {
+      if (v === 0) return "0";
+      const digits = Math.max(1, Math.min(6, Math.ceil(Math.log10(a / step)) + 1));
+      return v.toExponential(digits - 1).replace(/\.?0+e/, "e");
+    }
+    return trim(v.toFixed(d));
   }
   function formatValue(v) {
     if (v === null) return "\u2013";
@@ -563,16 +599,24 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       lo = Math.min(lo, 0);
       hi = Math.max(hi, 0);
     }
-    if (spec2.y.min !== void 0) lo = spec2.y.min;
-    if (spec2.y.max !== void 0) hi = spec2.y.max;
+    const span = Math.max(hi - lo, Math.abs(hi), Math.abs(lo)) || 1;
+    const { min: fixedMin, max: fixedMax } = spec2.y;
+    if (fixedMin !== void 0) lo = fixedMin;
+    if (fixedMax !== void 0) hi = fixedMax;
+    if (hi <= lo) {
+      if (fixedMin !== void 0 && fixedMax === void 0) hi = lo + span;
+      else if (fixedMax !== void 0 && fixedMin === void 0) lo = hi - span;
+      else hi = lo + 1;
+    }
     const t = niceTicks(lo, hi, count);
-    const min = spec2.y.min ?? t.min;
-    const max = spec2.y.max ?? t.max;
+    const min = fixedMin ?? t.min;
+    const max = fixedMax ?? t.max;
+    const eps = (max - min) * 1e-9;
     return {
       min,
       max,
       step: t.step,
-      ticks: t.ticks.filter((v) => v >= min - 1e-9 && v <= max + 1e-9)
+      ticks: t.ticks.filter((v) => v >= min - eps && v <= max + eps)
     };
   }
   function numericX(spec2) {
@@ -601,6 +645,57 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     const n = s.x.values.length;
     const names = s.series.map((x) => x.name).join(", ");
     return `${typeName[s.type]} of ${s.series.length} series (${names}) over ${n} ${s.x.label ?? "x"} value${n === 1 ? "" : "s"}, from ${xText(s.x.values[0])} to ${xText(s.x.values[n - 1])}. ${s.y.label ?? "y"} axis from ${formatValue(y.min)} to ${formatValue(y.max)}.`;
+  }
+  function hatchDefs(count) {
+    return svg("defs", null, Array.from({
+      length: count
+    }, (_, i) => seriesStyle(i)).flatMap((st, i) => st.hatch ? [
+      svg("pattern", {
+        id: `hatch-${i}`,
+        width: 6,
+        height: 6,
+        patternUnits: "userSpaceOnUse",
+        patternTransform: "rotate(45)"
+      }, svg("rect", {
+        width: 6,
+        height: 6,
+        fill: st.color,
+        "fill-opacity": 0.25
+      }), svg("line", {
+        x1: 0,
+        y1: 0,
+        x2: 0,
+        y2: 6,
+        stroke: st.color,
+        "stroke-width": 3
+      }))
+    ] : []));
+  }
+  function swatch(i, type) {
+    const st = seriesStyle(i);
+    const line = type === "line" || type === "scatter";
+    return svg("svg", {
+      class: "swatch-svg",
+      width: 16,
+      height: 10,
+      "aria-hidden": "true"
+    }, line ? svg("line", {
+      x1: 1,
+      y1: 5,
+      x2: 15,
+      y2: 5,
+      stroke: st.color,
+      "stroke-width": 3,
+      "stroke-dasharray": st.dash ? "4 2" : null
+    }) : svg("rect", {
+      x: 1,
+      y: 0,
+      width: 14,
+      height: 10,
+      rx: 2,
+      fill: st.hatch ? `url(#hatch-${i})` : st.color,
+      stroke: st.hatch ? st.color : null
+    }));
   }
   function dataTable(s) {
     return h("div", {
@@ -670,7 +765,23 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     const marks = [];
     const zero = clampY(Math.max(y.min, Math.min(0, y.max)));
     s.series.forEach((ser, si) => {
-      const c = color(si);
+      const st = seriesStyle(si);
+      const c = st.color;
+      const fill2 = st.hatch ? `url(#hatch-${si})` : c;
+      const dot = (cx, cy, r, cls) => st.hatch ? svg("rect", {
+        x: cx - r,
+        y: cy - r,
+        width: 2 * r,
+        height: 2 * r,
+        fill: c,
+        class: cls
+      }) : svg("circle", {
+        cx,
+        cy,
+        r,
+        fill: c,
+        class: cls
+      });
       if (s.type === "bar") {
         const inner = band * 0.8;
         const bw = Math.max(1, inner / s.series.length);
@@ -683,7 +794,8 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
             y: top,
             width: Math.max(1, bw - (s.series.length > 1 ? 1 : 0)),
             height: Math.max(v === 0 ? 0 : 1, bottom - top),
-            fill: c,
+            fill: fill2,
+            stroke: st.hatch ? c : null,
             class: "bar",
             "data-i": i
           }));
@@ -692,14 +804,11 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       }
       if (s.type === "scatter") {
         ser.values.forEach((v, i) => {
-          if (v !== null) marks.push(svg("circle", {
-            cx: X(i),
-            cy: clampY(v),
-            r: 4,
-            fill: c,
-            class: "dot",
-            "data-i": i
-          }));
+          if (v !== null) {
+            const d = dot(X(i), clampY(v), 4, "dot");
+            d.setAttribute("data-i", String(i));
+            marks.push(d);
+          }
         });
         return;
       }
@@ -717,8 +826,8 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
         if (s.type === "area") {
           marks.push(svg("path", {
             d: `M${X(r[0]).toFixed(1)},${zero}L${pts.join("L")}L${X(r[r.length - 1]).toFixed(1)},${zero}Z`,
-            fill: c,
-            "fill-opacity": 0.16,
+            fill: fill2,
+            "fill-opacity": st.hatch ? 0.5 : 0.16,
             stroke: "none"
           }));
         }
@@ -727,15 +836,11 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
           fill: "none",
           stroke: c,
           "stroke-width": 2,
+          "stroke-dasharray": st.dash ?? null,
           "stroke-linejoin": "round",
           "stroke-linecap": "round"
         }));
-        if (n <= 60 || r.length === 1) for (const i of r) marks.push(svg("circle", {
-          cx: X(i),
-          cy: clampY(ser.values[i]),
-          r: 2.5,
-          fill: c
-        }));
+        if (n <= 60 || r.length === 1) for (const i of r) marks.push(dot(X(i), clampY(ser.values[i]), 2.5));
       }
     });
     const guide = svg("line", {
@@ -760,7 +865,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       "aria-describedby": descId
     }, svg("title", {
       id: titleId
-    }, s.title ?? typeName[s.type]), svg("desc", {
+    }, s.title ?? typeName[s.type]), hatchDefs(s.series.length), svg("desc", {
       id: descId
     }, describe(s, y)), svg("g", {
       class: "grid"
@@ -832,7 +937,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
           cy: clampY(ser.values[i]),
           r: 5,
           fill: "none",
-          stroke: color(si),
+          stroke: seriesStyle(si).color,
           "stroke-width": 2
         })
       ]));
@@ -840,10 +945,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
         class: "tip-x"
       }, `${s.x.label ?? "x"}: ${xText(s.x.values[i])}`), s.series.map((ser, si) => h("div", {
         class: "tip-row"
-      }, h("span", {
-        class: "swatch",
-        style: `background:${color(si)}`
-      }), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
+      }, swatch(si, s.type), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
       tip.hidden = false;
       const fw = figure.clientWidth;
       const left = (px ?? x) + 14;
@@ -886,11 +988,13 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     const toggle = h("button", {
       type: "button",
       class: "link",
+      id: "toggle-data",
       "aria-controls": "data",
       "aria-expanded": String(showTable),
       onclick: () => {
         showTable = !showTable;
         render();
+        document.getElementById("toggle-data")?.focus();
       }
     }, showTable ? "Hide data table" : "Show data table");
     mount(root, s.title ? h("h1", null, s.title) : null, warnings.length ? h("p", {
@@ -898,10 +1002,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     }, warnings.join("; ")) : null, h("ul", {
       class: "legend",
       "aria-label": "Series"
-    }, s.series.map((ser, si) => h("li", null, h("span", {
-      class: `swatch ${s.type === "line" ? "line" : ""}`,
-      style: `background:${color(si)}`
-    }), ser.name))), figure, h("p", {
+    }, s.series.map((ser, si) => h("li", null, swatch(si, s.type), ser.name))), figure, h("p", {
       class: "hint muted"
     }, "Hover for values, or focus the chart and use the arrow keys. ", toggle), live, dataTable(s));
   }

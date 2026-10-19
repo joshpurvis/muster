@@ -137,7 +137,7 @@ The goal is a decision in under a minute, not a line-by-line review.
    appears in the panel), **Open on GitHub** (system browser).
 4. On Merge, the panel shows the exact command first, then the agent, waiting in
    `wait_for_panel_event`, runs it and reports the result in the panel:
-   `gh pr merge 812 --squash --delete-branch --match-head-commit <sha>`.
+   `gh pr merge 812 --repo owner/name --squash --delete-branch --match-head-commit <sha>`.
    `--match-head-commit` binds the merge to the commit the user saw: if anyone pushed to the PR
    after the panel opened, GitHub refuses the merge and the agent refreshes the panel instead.
    The Merge button is disabled while checks are failing, unless the user holds Shift to merge

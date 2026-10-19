@@ -1,7 +1,7 @@
 import { startApp } from "../shared/client.ts";
 import { h, mount, problems, svg } from "../shared/dom.ts";
 import {
-  type ChartSpec, color, formatTick, formatValue, labelEvery, linear, niceTicks, numericX, validateChart, yScale,
+  type ChartSpec, formatTick, seriesStyle, formatValue, labelEvery, linear, niceTicks, numericX, validateChart, yScale,
 } from "./logic.ts";
 
 const root = document.getElementById("app")!;
@@ -18,6 +18,25 @@ function describe(s: ChartSpec, y: { min: number; max: number }) {
   const names = s.series.map((x) => x.name).join(", ");
   return `${typeName[s.type]} of ${s.series.length} series (${names}) over ${n} ${s.x.label ?? "x"} value${n === 1 ? "" : "s"}` +
     `, from ${xText(s.x.values[0])} to ${xText(s.x.values[n - 1])}. ${s.y.label ?? "y"} axis from ${formatValue(y.min)} to ${formatValue(y.max)}.`;
+}
+
+/** Diagonal hatching in a series colour, for series 9–12. */
+function hatchDefs(count: number) {
+  return svg("defs", null, Array.from({ length: count }, (_, i) => seriesStyle(i)).flatMap((st, i) => st.hatch ? [
+    svg("pattern", { id: `hatch-${i}`, width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" },
+      svg("rect", { width: 6, height: 6, fill: st.color, "fill-opacity": 0.25 }),
+      svg("line", { x1: 0, y1: 0, x2: 0, y2: 6, stroke: st.color, "stroke-width": 3 })),
+  ] : []));
+}
+
+/** The legend and tooltip key: the same colour, dash and hatching as the marks. */
+function swatch(i: number, type: ChartSpec["type"]) {
+  const st = seriesStyle(i);
+  const line = type === "line" || type === "scatter";
+  return svg("svg", { class: "swatch-svg", width: 16, height: 10, "aria-hidden": "true" },
+    line
+      ? svg("line", { x1: 1, y1: 5, x2: 15, y2: 5, stroke: st.color, "stroke-width": 3, "stroke-dasharray": st.dash ? "4 2" : null })
+      : svg("rect", { x: 1, y: 0, width: 14, height: 10, rx: 2, fill: st.hatch ? `url(#hatch-${i})` : st.color, stroke: st.hatch ? st.color : null }));
 }
 
 function dataTable(s: ChartSpec) {
@@ -70,7 +89,13 @@ function render() {
   const marks: SVGElement[] = [];
   const zero = clampY(Math.max(y.min, Math.min(0, y.max)));
   s.series.forEach((ser, si) => {
-    const c = color(si);
+    const st = seriesStyle(si);
+    const c = st.color;
+    const fill = st.hatch ? `url(#hatch-${si})` : c;
+    // A point marker: circles for the first eight series, squares for the dashed ones.
+    const dot = (cx: number, cy: number, r: number, cls?: string) => st.hatch
+      ? svg("rect", { x: cx - r, y: cy - r, width: 2 * r, height: 2 * r, fill: c, class: cls, })
+      : svg("circle", { cx, cy, r, fill: c, class: cls });
     if (s.type === "bar") {
       const inner = band * 0.8;
       const bw = Math.max(1, inner / s.series.length);
@@ -78,13 +103,13 @@ function render() {
         if (v === null) return;
         const x0 = m.left + band * i + band * 0.1 + bw * si;
         const top = Math.min(clampY(v), zero), bottom = Math.max(clampY(v), zero);
-        marks.push(svg("rect", { x: x0, y: top, width: Math.max(1, bw - (s.series.length > 1 ? 1 : 0)), height: Math.max(v === 0 ? 0 : 1, bottom - top), fill: c, class: "bar", "data-i": i }));
+        marks.push(svg("rect", { x: x0, y: top, width: Math.max(1, bw - (s.series.length > 1 ? 1 : 0)), height: Math.max(v === 0 ? 0 : 1, bottom - top), fill, stroke: st.hatch ? c : null, class: "bar", "data-i": i }));
       });
       return;
     }
     if (s.type === "scatter") {
       ser.values.forEach((v, i) => {
-        if (v !== null) marks.push(svg("circle", { cx: X(i), cy: clampY(v), r: 4, fill: c, class: "dot", "data-i": i }));
+        if (v !== null) { const d = dot(X(i), clampY(v), 4, "dot"); d.setAttribute("data-i", String(i)); marks.push(d); }
       });
       return;
     }
@@ -98,10 +123,10 @@ function render() {
     for (const r of runs) {
       const pts = r.map((i) => `${X(i).toFixed(1)},${clampY(ser.values[i]!).toFixed(1)}`);
       if (s.type === "area") {
-        marks.push(svg("path", { d: `M${X(r[0]).toFixed(1)},${zero}L${pts.join("L")}L${X(r[r.length - 1]).toFixed(1)},${zero}Z`, fill: c, "fill-opacity": 0.16, stroke: "none" }));
+        marks.push(svg("path", { d: `M${X(r[0]).toFixed(1)},${zero}L${pts.join("L")}L${X(r[r.length - 1]).toFixed(1)},${zero}Z`, fill, "fill-opacity": st.hatch ? 0.5 : 0.16, stroke: "none" }));
       }
-      marks.push(svg("path", { d: `M${pts.join("L")}`, fill: "none", stroke: c, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
-      if (n <= 60 || r.length === 1) for (const i of r) marks.push(svg("circle", { cx: X(i), cy: clampY(ser.values[i]!), r: 2.5, fill: c }));
+      marks.push(svg("path", { d: `M${pts.join("L")}`, fill: "none", stroke: c, "stroke-width": 2, "stroke-dasharray": st.dash ?? null, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      if (n <= 60 || r.length === 1) for (const i of r) marks.push(dot(X(i), clampY(ser.values[i]!), 2.5));
     }
   });
 
@@ -113,6 +138,7 @@ function render() {
     "aria-labelledby": titleId, "aria-describedby": descId,
   },
   svg("title", { id: titleId }, s.title ?? typeName[s.type]),
+  hatchDefs(s.series.length),
   svg("desc", { id: descId }, describe(s, y)),
   svg("g", { class: "grid" }, y.ticks.map((t) => svg("line", { x1: m.left, x2: m.left + pw, y1: Y(t), y2: Y(t) }))),
   svg("g", { class: "axis y" }, y.ticks.map((t, i) => svg("text", { x: m.left - 8, y: Y(t), "text-anchor": "end", "dominant-baseline": "middle" }, yLabels[i]))),
@@ -137,11 +163,11 @@ function render() {
       guide.setAttribute("visibility", "visible");
     }
     focusRing.replaceChildren(...s.series.flatMap((ser, si) => ser.values[i] === null || s.type === "bar" ? [] :
-      [svg("circle", { cx: x, cy: clampY(ser.values[i]!), r: 5, fill: "none", stroke: color(si), "stroke-width": 2 })]));
+      [svg("circle", { cx: x, cy: clampY(ser.values[i]!), r: 5, fill: "none", stroke: seriesStyle(si).color, "stroke-width": 2 })]));
     mount(tip, 
       h("div", { class: "tip-x" }, `${s.x.label ?? "x"}: ${xText(s.x.values[i])}`),
       s.series.map((ser, si) => h("div", { class: "tip-row" },
-        h("span", { class: "swatch", style: `background:${color(si)}` }), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
+        swatch(si, s.type), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
     tip.hidden = false;
     const fw = figure.clientWidth;
     const left = (px ?? x) + 14;
@@ -177,13 +203,13 @@ function render() {
     show(Math.max(-1, Math.min(n - 1, next)));
   });
 
-  const toggle = h("button", { type: "button", class: "link", "aria-controls": "data", "aria-expanded": String(showTable),
-    onclick: () => { showTable = !showTable; render(); } }, showTable ? "Hide data table" : "Show data table");
+  const toggle = h("button", { type: "button", class: "link", id: "toggle-data", "aria-controls": "data", "aria-expanded": String(showTable),
+    onclick: () => { showTable = !showTable; render(); document.getElementById("toggle-data")?.focus(); } }, showTable ? "Hide data table" : "Show data table");
   mount(root, 
     s.title ? h("h1", null, s.title) : null,
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
     h("ul", { class: "legend", "aria-label": "Series" }, s.series.map((ser, si) =>
-      h("li", null, h("span", { class: `swatch ${s.type === "line" ? "line" : ""}`, style: `background:${color(si)}` }), ser.name))),
+      h("li", null, swatch(si, s.type), ser.name))),
     figure,
     h("p", { class: "hint muted" }, "Hover for values, or focus the chart and use the arrow keys. ", toggle),
     live,

@@ -25,8 +25,10 @@
   --color-text-warning: #9a5b00;
   --color-background-warning: rgba(214, 138, 0, 0.12);
   --accent: #6d5ce8;
+  /* Filled buttons keep white text at 4.5:1 or more in both themes. */
+  --accent-fill: #6d5ce8;
   --on-accent: #ffffff;
-  --danger-fill: #d92d20;
+  --danger-fill: #c4291c;
   --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   --border-radius-sm: 4px;
@@ -55,7 +57,8 @@
   --color-text-warning: #f0a020;
   --color-background-warning: rgba(240, 160, 32, 0.13);
   --accent: #8b7cf6;
-  --danger-fill: #da3633;
+  --accent-fill: #6652e0;
+  --danger-fill: #c4291c;
 }
 * { box-sizing: border-box; }
 html { background: var(--color-background-primary); color: var(--color-text-primary); }
@@ -75,8 +78,8 @@ button {
 }
 button:hover:not(:disabled) { background: var(--color-background-tertiary); }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent-fill); }
 button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
 button.link { border: 0; background: none; padding: 0; min-height: 0; color: var(--color-text-info); text-decoration: underline; }
 select, input[type="search"], input[type="text"], textarea {
@@ -119,7 +122,7 @@ section { margin: 0 0 18px; }
 .status, .notice { border-radius: var(--border-radius-md); padding: 8px 12px; margin: 0 0 14px; border: 1px solid; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
 .status { font-size: 15px; }
 .status.info, .notice.info { border-color: var(--color-text-info); background: var(--color-background-info); color: var(--color-text-primary); }
-.status.success { border-color: var(--color-text-success); background: var(--color-background-success); color: var(--color-text-primary); }
+.notice.success, .status.success { border-color: var(--color-text-success); background: var(--color-background-success); color: var(--color-text-primary); }
 .status.danger, .notice.danger { border-color: var(--color-text-danger); background: var(--color-background-danger); color: var(--color-text-primary); }
 .status.warning, .notice.warning { border-color: var(--color-text-warning); background: var(--color-background-warning); color: var(--color-text-primary); }
 .status strong { font-size: 15px; }
@@ -127,6 +130,10 @@ section { margin: 0 0 18px; }
 .status.danger strong { color: var(--color-text-danger); }
 .status .detail { white-space: pre-wrap; font-size: 13px; }
 .notice { font-size: 13px; }
+.actions .notice { margin: 0 0 8px; padding: 6px 10px; }
+.hint:empty { display: none; }
+.hint { margin: 6px 0 0; color: var(--color-text-warning); }
+.count { margin-left: auto; }
 .change { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); margin: 0 0 12px; overflow: hidden; }
 .change > header { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; background: var(--color-background-secondary); border-bottom: 1px solid var(--color-border-secondary); }
 .change .file { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
@@ -145,6 +152,7 @@ section { margin: 0 0 18px; }
 .diff tr.del .sign { color: var(--color-text-danger); }
 .diff tr.hunk td { color: var(--color-text-info); background: var(--color-background-info); padding: 2px 8px; }
 .diff tr.note td { color: var(--color-text-tertiary); font-style: italic; }
+.diff tr.meta td { color: var(--color-text-secondary); background: var(--color-background-secondary); padding: 3px 8px; font-family: var(--font-sans); }
 .diff-wrap .more { padding: 4px 10px; margin: 0; font-size: 12px; }
 .rest { font-size: 13px; }
 .questions { margin: 0 0 6px; padding-left: 20px; }
@@ -335,6 +343,7 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     let oldNo;
     let newNo;
     let inHunk = false;
+    const pending2 = {};
     const lines = diff.replace(/\r\n?/g, "\n").split("\n");
     if (lines.length && lines[lines.length - 1] === "") lines.pop();
     for (const line of lines) {
@@ -349,8 +358,15 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
         });
         continue;
       }
-      if (!inHunk && /^(diff --git |index |--- |\+\+\+ |new file mode|deleted file mode|similarity index|rename (from|to) |old mode|new mode|Binary files)/.test(line)) {
-        continue;
+      if (!inHunk) {
+        const meta = metaLine(line, pending2);
+        if (meta !== void 0) {
+          if (meta) out.push({
+            kind: "meta",
+            text: meta
+          });
+          continue;
+        }
       }
       if (line.startsWith("\\")) {
         out.push({
@@ -361,6 +377,7 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
       }
       if (inHunk && line.startsWith("diff --git ")) {
         inHunk = false;
+        pending2.from = pending2.oldMode = void 0;
         continue;
       }
       const sign = line[0];
@@ -390,6 +407,41 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
       }
     }
     return out;
+  }
+  function metaLine(line, pending2) {
+    let m;
+    if (m = /^rename from (.*)$/.exec(line)) {
+      pending2.from = m[1];
+      return "";
+    }
+    if (m = /^rename to (.*)$/.exec(line)) {
+      const text = `renamed ${pending2.from ?? "?"} \u2192 ${m[1]}`;
+      pending2.from = void 0;
+      return text;
+    }
+    if (m = /^copy from (.*)$/.exec(line)) {
+      pending2.from = m[1];
+      return "";
+    }
+    if (m = /^copy to (.*)$/.exec(line)) {
+      const text = `copied ${pending2.from ?? "?"} \u2192 ${m[1]}`;
+      pending2.from = void 0;
+      return text;
+    }
+    if (m = /^old mode (\d+)$/.exec(line)) {
+      pending2.oldMode = m[1];
+      return "";
+    }
+    if (m = /^new mode (\d+)$/.exec(line)) {
+      const text = `mode ${pending2.oldMode ?? "?"} \u2192 ${m[1]}`;
+      pending2.oldMode = void 0;
+      return text;
+    }
+    if (m = /^new file mode (\d+)$/.exec(line)) return `new file (mode ${m[1]})`;
+    if (m = /^deleted file mode (\d+)$/.exec(line)) return `file deleted (mode ${m[1]})`;
+    if (/^Binary files .* differ$/.test(line) || line === "GIT binary patch") return "binary file changed";
+    if (/^(diff --git |index |--- |\+\+\+ |similarity index |dissimilarity index )/.test(line)) return "";
+    return void 0;
   }
   function diffStats(lines) {
     let added = 0, removed = 0;
@@ -548,11 +600,12 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
   var STATUSES = [
     "open",
     "merging",
+    "queued",
     "merged",
     "failed",
     "requested_changes"
   ];
-  var SHA = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+  var SHA = /^[0-9a-f]{40}$/;
   var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
   var branchOk = (b) => b.length > 0 && b.length <= 255 && ![
     ...b
@@ -624,7 +677,7 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     ]) if (v !== void 0 && !branchOk(v)) p.add(k, "is not a valid branch name");
     const head_sha = p.string(o, "head_sha", "", {
       required: true,
-      max: 64
+      max: 40
     });
     if (head_sha !== void 0 && !SHA.test(head_sha)) p.add("head_sha", "must be the full lowercase commit SHA (40 hex characters), e.g. headRefOid");
     const merge_method_default = p.oneOf(o, "merge_method_default", "", METHODS) ?? "squash";
@@ -687,10 +740,14 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
             url: link2
           });
         });
-        if (state) checks = {
-          state,
-          items
-        };
+        if (state) {
+          const derived = deriveChecks(items);
+          if (derived && derived !== state) p.warnings.push(`checks.state: says ${state} but the items are ${derived}; showing ${derived}`);
+          checks = {
+            state: derived ?? state,
+            items
+          };
+        }
       }
     }
     let reviews;
@@ -824,20 +881,29 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     });
     return out;
   }
-  function mergeCommand(number, method2, deleteBranch2, headSha) {
+  function deriveChecks(items) {
+    if (!items.length) return null;
+    if (items.some((c) => c.state === "fail")) return "failing";
+    if (items.some((c) => c.state === "pending")) return "pending";
+    return "passing";
+  }
+  function mergeCommand(repo, number, method2, deleteBranch2, headSha) {
+    if (!REPO.test(repo)) throw new Error("invalid repo");
     if (!Number.isSafeInteger(number) || number < 1) throw new Error("invalid PR number");
     if (!METHODS.includes(method2)) throw new Error("invalid merge method");
     if (!SHA.test(headSha)) throw new Error("invalid head SHA");
-    return `gh pr merge ${number} --${method2}${deleteBranch2 ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
+    return `gh pr merge ${number} --repo ${repo} --${method2}${deleteBranch2 ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
   }
   function mergeEvent(pr2, method2, deleteBranch2) {
-    const command = mergeCommand(pr2.number, method2, deleteBranch2, pr2.head_sha);
+    const command = mergeCommand(pr2.repo, pr2.number, method2, deleteBranch2, pr2.head_sha);
     return {
       kind: "merge",
-      text: `Merge PR #${pr2.number} (${pr2.repo}). Run exactly: ${command}`,
+      text: `Merge PR #${pr2.number} (${pr2.repo}) into ${pr2.base}. Run exactly: ${command}`,
       data: {
         action: "merge",
+        repo: pr2.repo,
         number: pr2.number,
+        base: pr2.base,
         method: method2,
         delete_branch: deleteBranch2,
         head_sha: pr2.head_sha
@@ -851,6 +917,7 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
 ${body}`,
       data: {
         action: "request_changes",
+        repo: pr2.repo,
         number: pr2.number,
         head_sha: pr2.head_sha,
         body
@@ -864,20 +931,105 @@ ${body}`,
 ${question}`,
       data: {
         action: "ask",
+        repo: pr2.repo,
         number: pr2.number,
         question
       }
     };
+  }
+  var MAX_EVENT_BYTES = 15 * 1024;
+  function eventBytes(event) {
+    const params = {
+      role: "user",
+      content: {
+        type: "text",
+        text: event.text
+      },
+      _meta: {
+        muster: {
+          kind: event.kind,
+          data: event.data
+        }
+      }
+    };
+    return new TextEncoder().encode(JSON.stringify(params)).length;
   }
   function checksBlock(pr2) {
     return pr2.checks.state === "failing" || pr2.checks.items.some((c) => c.state === "fail");
   }
   function mergeBlocked(pr2, shift2, sent2) {
     if (pr2.status === "merged") return "Already merged";
+    if (pr2.status === "queued") return "Queued to merge on GitHub";
     if (pr2.status === "merging" || sent2) return "Waiting for the agent";
-    if (checksBlock(pr2) && !shift2) return "Checks are failing: hold Shift to merge anyway";
+    if (checksBlock(pr2) && !shift2) return "Checks are failing: Shift+M (or Shift+click) merges anyway";
     return null;
   }
+  function formsClosed(pr2) {
+    if (pr2.status === "merged") return "The PR is merged.";
+    if (pr2.status === "queued") return "The PR is queued to merge.";
+    if (pr2.status === "requested_changes") return "Changes were requested.";
+    return null;
+  }
+  function confirmTarget(pr2) {
+    return JSON.stringify([
+      pr2.repo,
+      pr2.number,
+      pr2.base,
+      pr2.head_sha,
+      pr2.checks.state,
+      pr2.merge_method_default
+    ]);
+  }
+  var MODIFIERS = /* @__PURE__ */ new Set([
+    "Shift",
+    "Control",
+    "Alt",
+    "Meta",
+    "AltGraph",
+    "CapsLock"
+  ]);
+  var ConfirmGate = class {
+    held = /* @__PURE__ */ new Set();
+    target = null;
+    armed = false;
+    /** `code` is the physical key (KeyboardEvent.code), so Shift+M and its "m" keyup match.
+     * Returns true when the browser's default action must be prevented (a repeat while open). */
+    keyDown(code, key, repeat) {
+      if (!MODIFIERS.has(key)) this.held.add(code);
+      return this.target !== null && repeat;
+    }
+    keyUp(code) {
+      this.held.delete(code);
+      if (this.target !== null && this.held.size === 0) this.armed = true;
+    }
+    /** Focus left the app: keyups may never come. */
+    blur() {
+      this.held.clear();
+      if (this.target !== null) this.armed = true;
+    }
+    open(pr2) {
+      this.target = confirmTarget(pr2);
+      this.armed = this.held.size === 0;
+    }
+    close() {
+      this.target = null;
+      this.armed = false;
+    }
+    get isOpen() {
+      return this.target !== null;
+    }
+    /** A confirm may send only when armed and still about the same PR state. */
+    canConfirm(pr2) {
+      return this.target !== null && this.armed && pr2 !== null && confirmTarget(pr2) === this.target;
+    }
+    /** New input: returns true if it cancelled an open confirm. */
+    input(pr2) {
+      if (this.target === null) return false;
+      if (pr2 && confirmTarget(pr2) === this.target) return false;
+      this.close();
+      return true;
+    }
+  };
 
   // src/panels/apps/pr_decision/main.ts
   var root = document.getElementById("app");
@@ -888,6 +1040,7 @@ ${question}`,
   var method = "squash";
   var deleteBranch = false;
   var mode = null;
+  var gate = new ConfirmGate();
   var override = false;
   var drafts = {
     request: "",
@@ -897,8 +1050,14 @@ ${question}`,
   var sent = null;
   var notice = null;
   var answers = [];
+  var newAnswer = false;
   var mergeButton = null;
   var short = (sha) => sha.slice(0, 7);
+  var triggers = {
+    confirm: "merge",
+    request: "request",
+    ask: "ask"
+  };
   function setNotice(text, tone = "info") {
     notice = {
       text,
@@ -919,8 +1078,9 @@ ${question}`,
     if (!pr || !mergeButton) return;
     const blocked = mergeBlocked(pr, shift, !!sent);
     mergeButton.disabled = !!blocked && mode !== "confirm";
-    mergeButton.title = blocked ?? "Merge (M)";
     mergeButton.querySelector(".label").textContent = checksBlock(pr) && shift && !blocked ? "Merge anyway" : "Merge";
+    const hint = document.getElementById("merge-hint");
+    if (hint) hint.textContent = blocked && mode !== "confirm" && checksBlock(pr) && blocked.includes("Shift+M") ? blocked : "";
   }
   function openConfirm(withShift) {
     if (!pr) return;
@@ -932,35 +1092,56 @@ ${question}`,
     }
     override = checksBlock(pr);
     mode = "confirm";
+    gate.open(pr);
     notice = null;
     render();
     document.getElementById("confirm-merge")?.focus();
   }
+  function closeMode() {
+    const was = mode;
+    if (mode === "confirm") gate.close();
+    mode = null;
+    render();
+    if (was) document.getElementById(triggers[was])?.focus();
+  }
   function confirmMerge() {
     if (!pr || mode !== "confirm") return;
+    if (!gate.canConfirm(pr)) return;
     const blocked = mergeBlocked(pr, override, !!sent);
     if (blocked) {
       setNotice(blocked, "warning");
-      mode = null;
-      render();
+      closeMode();
       return;
     }
     const event = mergeEvent(pr, method, deleteBranch);
     const result = sendEvent(event.kind, event.text, event.data);
     sent = "merge";
     mode = null;
-    setNotice(`Merge sent to the agent: it runs the command below and reports here. ${mergeCommand(pr.number, method, deleteBranch, pr.head_sha)}`);
+    gate.close();
+    setNotice(`Merge sent to the agent: it checks the PR is unchanged, runs ${mergeCommand(pr.repo, pr.number, method, deleteBranch, pr.head_sha)} and reports here.`);
     render();
     result.catch((e) => {
       sent = null;
-      if (pr?.head_sha === event.data.head_sha && pr.status !== "merged") mode = "confirm";
+      if (pr && pr.head_sha === event.data.head_sha && pr.base === event.data.base && !mergeBlocked(pr, override, false)) {
+        mode = "confirm";
+        gate.open(pr);
+      }
       setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
       focusMode();
     });
   }
+  function formEvent(kind, text) {
+    return kind === "request" ? requestChangesEvent(pr, text) : askEvent(pr, text);
+  }
   function submit(kind) {
     if (!pr) return;
+    const closed = formsClosed(pr);
+    if (closed) {
+      setNotice(`Not sent: ${closed}`, "warning");
+      render();
+      return;
+    }
     const text = drafts[kind].trim();
     if (!text) {
       setNotice(kind === "request" ? "Write what should change first." : "Write a question first.", "warning");
@@ -968,19 +1149,27 @@ ${question}`,
       focusMode();
       return;
     }
-    const event = kind === "request" ? requestChangesEvent(pr, text) : askEvent(pr, text);
+    const event = formEvent(kind, text);
+    if (eventBytes(event) > MAX_EVENT_BYTES) {
+      setNotice("Too long to send: shorten the text.", "warning");
+      render();
+      focusMode();
+      return;
+    }
     const result = sendEvent(event.kind, event.text, event.data);
     sent = event.kind;
     mode = null;
     drafts[kind] = "";
     setNotice(kind === "request" ? "Request for changes sent to the agent." : "Question sent; the answer will appear here.");
     render();
+    document.getElementById(triggers[kind])?.focus();
     result.catch((e) => {
       sent = null;
       drafts[kind] = text;
       mode = kind;
       setNotice(`Not sent (${e.message}). Try again.`, "danger");
       render();
+      focusMode();
     });
   }
   function setMode(next) {
@@ -1039,6 +1228,28 @@ ${question}`,
   };
   var reviewTone = (s) => /APPROVED/i.test(s) ? "success" : /CHANGES_REQUESTED/i.test(s) ? "danger" : "muted";
   var words = (s) => s.toLowerCase().replace(/_/g, " ");
+  var statusText = {
+    merging: [
+      "Merging\u2026",
+      "info"
+    ],
+    queued: [
+      "Queued to merge",
+      "info"
+    ],
+    merged: [
+      "Merged",
+      "success"
+    ],
+    failed: [
+      "Failed",
+      "danger"
+    ],
+    requested_changes: [
+      "Changes requested",
+      "warning"
+    ]
+  };
   function diffView(diff) {
     const lines = parseDiff(diff);
     const shown = lines.slice(0, MAX_DIFF_LINES);
@@ -1052,8 +1263,8 @@ ${question}`,
       }, h("td", {
         colspan: 3
       }, l.text));
-      if (l.kind === "note") return h("tr", {
-        class: "note"
+      if (l.kind === "note" || l.kind === "meta") return h("tr", {
+        class: l.kind
       }, h("td", {
         colspan: 3
       }, l.text));
@@ -1073,40 +1284,22 @@ ${question}`,
       }, sign), l.text));
     }))), lines.length > shown.length ? h("p", {
       class: "muted more"
-    }, `${lines.length - shown.length} more lines not shown`) : null);
+    }, `${lines.length - shown.length} more lines not shown`) : null, lines.length ? null : h("p", {
+      class: "muted more"
+    }, "No diff lines."));
   }
   function statusBanner(p) {
-    const map = {
-      merging: [
-        "Merging\u2026",
-        "info"
-      ],
-      merged: [
-        "Merged",
-        "success"
-      ],
-      failed: [
-        "Merge failed",
-        "danger"
-      ],
-      requested_changes: [
-        "Changes requested",
-        "warning"
-      ]
-    };
     if (p.status === "open") return null;
-    const [label, tone] = map[p.status];
+    const [label, tone] = statusText[p.status];
     return h("div", {
-      class: `status ${tone}`,
-      role: "status",
-      "aria-live": "polite"
+      class: `status ${tone}`
     }, h("strong", null, label), p.status_detail ? h("span", {
       class: "detail"
     }, p.status_detail) : null);
   }
   function actionPanel(p) {
     if (mode === "confirm") {
-      const command = mergeCommand(p.number, method, deleteBranch, p.head_sha);
+      const command = mergeCommand(p.repo, p.number, method, deleteBranch, p.head_sha);
       return h("div", {
         class: "drawer",
         role: "group",
@@ -1114,7 +1307,7 @@ ${question}`,
       }, h("div", {
         id: "confirm-title",
         class: "drawer-title"
-      }, `Merge #${p.number} into ${p.base}? The agent will run exactly:`), h("pre", {
+      }, `Merge #${p.number} into ${p.base} in ${p.repo}? The agent will run exactly:`), h("pre", {
         class: "command",
         "aria-label": "Merge command"
       }, h("code", null, command)), override ? h("p", {
@@ -1123,7 +1316,7 @@ ${question}`,
         class: "warn"
       }, "Some checks are still running.") : null, h("p", {
         class: "muted small"
-      }, `--match-head-commit ties the merge to ${short(p.head_sha)}, the commit shown here: if anyone pushed since, GitHub refuses.`), h("div", {
+      }, `--match-head-commit ties the merge to ${short(p.head_sha)}, the commit shown here: if anyone pushed since, GitHub refuses. The agent also re-checks the base branch first. A merge queue may use its own method.`), h("div", {
         class: "row"
       }, h("button", {
         type: "button",
@@ -1132,38 +1325,54 @@ ${question}`,
         onclick: () => confirmMerge()
       }, "Confirm merge ", h("kbd", null, "Enter")), h("button", {
         type: "button",
-        onclick: () => setMode(null)
+        onclick: () => closeMode()
       }, "Cancel ", h("kbd", null, "Esc"))));
     }
     if (mode === "request" || mode === "ask") {
       const kind = mode;
+      const closed = formsClosed(p);
       const label = kind === "request" ? "What should change? This becomes the review comment." : "Your question for the agent";
       const area = h("textarea", {
         id: `${kind}-text`,
         rows: 3,
-        maxlength: 8e3
+        "aria-describedby": `${kind}-count`
       });
       area.value = drafts[kind];
+      const count = h("span", {
+        id: `${kind}-count`,
+        class: "count muted small"
+      });
+      const send = h("button", {
+        type: "button",
+        class: "primary",
+        id: `${kind}-send`,
+        onclick: () => submit(kind)
+      }, kind === "request" ? "Request changes" : "Ask", " ", h("kbd", null, "Ctrl+Enter"));
+      const measure = () => {
+        const left = MAX_EVENT_BYTES - eventBytes(formEvent(kind, drafts[kind].trim()));
+        count.textContent = left < 0 ? `${-left} bytes too long` : left < 2e3 ? `${left} bytes left` : "";
+        count.className = `count small ${left < 0 ? "danger" : "muted"}`;
+        send.disabled = left < 0 || !!closed;
+      };
       area.addEventListener("input", () => {
         drafts[kind] = area.value;
+        measure();
       });
+      measure();
       return h("div", {
         class: "drawer",
         role: "group"
       }, h("label", {
         for: `${kind}-text`,
         class: "drawer-title"
-      }, label), area, h("div", {
+      }, label), area, closed ? h("p", {
+        class: "warn"
+      }, `${closed} This can no longer be sent.`) : null, h("div", {
         class: "row"
-      }, h("button", {
+      }, send, h("button", {
         type: "button",
-        class: "primary",
-        id: `${kind}-send`,
-        onclick: () => submit(kind)
-      }, kind === "request" ? "Request changes" : "Ask", " ", h("kbd", null, "Ctrl+Enter")), h("button", {
-        type: "button",
-        onclick: () => setMode(null)
-      }, "Cancel ", h("kbd", null, "Esc"))));
+        onclick: () => closeMode()
+      }, "Cancel ", h("kbd", null, "Esc")), count));
     }
     return null;
   }
@@ -1175,7 +1384,7 @@ ${question}`,
     const select = h("select", {
       id: "method",
       "aria-label": "Merge method",
-      disabled: p.status === "merged"
+      disabled: p.status === "merged" || p.status === "queued"
     });
     for (const m of METHODS) select.append(h("option", {
       value: m,
@@ -1189,7 +1398,7 @@ ${question}`,
       type: "checkbox",
       id: "delete-branch",
       checked: deleteBranch,
-      disabled: p.status === "merged"
+      disabled: p.status === "merged" || p.status === "queued"
     });
     box.addEventListener("change", () => {
       deleteBranch = box.checked;
@@ -1199,13 +1408,17 @@ ${question}`,
       type: "button",
       id: "merge",
       class: "primary",
+      "aria-describedby": "merge-hint",
       onclick: (e) => openConfirm(e.shiftKey || shift)
     }, h("span", {
       class: "label"
     }, "Merge"), " ", h("kbd", null, "M"));
-    const done = p.status === "merged";
+    const closed = formsClosed(p);
     const stats = p.changes.map((c) => diffStats(parseDiff(c.diff)));
-    const allAnswers = answers.length ? answers : [];
+    const effective = notice ?? (p.status !== "open" ? {
+      text: `${statusText[p.status][0]}${p.status_detail ? `: ${p.status_detail}` : ""}`,
+      tone: statusText[p.status][1]
+    } : null);
     mount(root, h("header", {
       class: "head"
     }, h("h1", null, p.title, " ", h("span", {
@@ -1214,10 +1427,7 @@ ${question}`,
       class: "meta muted"
     }, `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} \xB7 head `, h("code", {
       title: p.head_sha
-    }, short(p.head_sha)))), statusBanner(p), notice ? h("div", {
-      class: `notice ${notice.tone}`,
-      role: notice.tone === "danger" ? "alert" : "status"
-    }, notice.text) : null, warnings.length ? h("p", {
+    }, short(p.head_sha)))), statusBanner(p), warnings.length ? h("p", {
       class: "warnings"
     }, warnings.join("; ")) : null, h("section", null, h("h2", null, "What changed"), h("p", {
       class: "prose"
@@ -1265,9 +1475,9 @@ ${question}`,
       class: "questions"
     }, p.questions.map((q) => h("li", null, q))), h("p", {
       class: "muted small"
-    }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null, allAnswers.length ? h("section", {
-      "aria-live": "polite"
-    }, h("h2", null, "Answers"), allAnswers.map((a) => h("div", {
+    }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null, answers.length ? h("section", {
+      id: "answers"
+    }, h("h2", null, "Answers"), answers.map((a) => h("div", {
       class: "answer"
     }, h("p", {
       class: "q muted"
@@ -1275,7 +1485,10 @@ ${question}`,
       class: "prose"
     }, a.text)))) : null, h("div", {
       class: "actions"
-    }, actionPanel(p), h("div", {
+    }, actionPanel(p), effective ? h("div", {
+      class: `notice ${effective.tone}`,
+      role: effective.tone === "danger" ? "alert" : "status"
+    }, effective.text) : null, h("div", {
       class: "row bar"
     }, h("div", {
       class: "merge-group"
@@ -1286,12 +1499,14 @@ ${question}`,
     }), h("button", {
       type: "button",
       id: "request",
-      disabled: done || sent === "request_changes",
+      disabled: !!closed || sent === "request_changes",
+      title: closed ?? null,
       onclick: () => setMode("request")
     }, "Request changes ", h("kbd", null, "R")), h("button", {
       type: "button",
       id: "ask",
-      disabled: done,
+      disabled: !!closed,
+      title: closed ?? null,
       onclick: () => setMode("ask")
     }, "Ask ", h("kbd", null, "A")), h("button", {
       type: "button",
@@ -1300,17 +1515,33 @@ ${question}`,
         setNotice(e.message, "danger");
         render();
       })
-    }, "Open on GitHub ", h("kbd", null, "O")))));
+    }, "Open on GitHub ", h("kbd", null, "O"))), h("p", {
+      id: "merge-hint",
+      class: "hint small",
+      "aria-live": "polite"
+    }), closed ? h("p", {
+      class: "hint small"
+    }, `${closed} Request changes and Ask are off.`) : null));
     updateMergeButton();
     scrollTo(0, scroll);
     if (focusId) document.getElementById(focusId)?.focus({
       preventScroll: true
     });
+    if (newAnswer) {
+      newAnswer = false;
+      document.querySelector("#answers .answer:last-child")?.scrollIntoView({
+        block: "nearest"
+      });
+    }
   }
   addEventListener("keydown", (e) => {
     if (e.key === "Shift" && !shift) {
       shift = true;
       updateMergeButton();
+    }
+    if (gate.keyDown(e.code, e.key, e.repeat) && mode === "confirm") {
+      e.preventDefault();
+      return;
     }
     if (!pr) return;
     if (typing(e)) {
@@ -1320,7 +1551,7 @@ ${question}`,
         submit(target.id === "request-text" ? "request" : "ask");
       } else if (e.key === "Escape" && mode) {
         e.preventDefault();
-        setMode(null);
+        closeMode();
       }
       return;
     }
@@ -1328,23 +1559,23 @@ ${question}`,
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
     if (key === "Escape" && mode) {
       e.preventDefault();
-      setMode(null);
+      closeMode();
       return;
     }
     if (key === "Enter" && mode === "confirm") {
-      if (e.target.tagName === "BUTTON") return;
       e.preventDefault();
-      confirmMerge();
+      if (e.target.id === "confirm-merge" || e.target.tagName !== "BUTTON") confirmMerge();
+      else e.target.click();
       return;
     }
     if (e.repeat) return;
     if (key === "m") {
       e.preventDefault();
       openConfirm(e.shiftKey);
-    } else if (key === "r" && pr.status !== "merged" && sent !== "request_changes") {
+    } else if (key === "r" && !formsClosed(pr) && sent !== "request_changes") {
       e.preventDefault();
       setMode("request");
-    } else if (key === "a" && pr.status !== "merged") {
+    } else if (key === "a" && !formsClosed(pr)) {
       e.preventDefault();
       setMode("ask");
     } else if (key === "o") {
@@ -1360,6 +1591,7 @@ ${question}`,
       shift = false;
       updateMergeButton();
     }
+    gate.keyUp(e.code);
   });
   var pointer = (e) => {
     if (e.shiftKey !== shift) {
@@ -1370,6 +1602,7 @@ ${question}`,
   addEventListener("pointermove", pointer);
   addEventListener("pointerdown", pointer, true);
   addEventListener("blur", () => {
+    gate.blur();
     if (shift) {
       shift = false;
       updateMergeButton();
@@ -1380,6 +1613,8 @@ ${question}`,
     input: (data) => {
       const r = validatePr(data);
       if (!r.ok) {
+        gate.input(null);
+        if (mode === "confirm") mode = null;
         pr = null;
         mergeButton = null;
         problems(root, "This PR decision panel's input is invalid", r.errors);
@@ -1387,19 +1622,26 @@ ${question}`,
       }
       const next = r.value;
       const id = `${next.repo}#${next.number}`;
+      const changedSha = !!pr && pr.head_sha !== next.head_sha;
+      if (gate.input(next) && mode === "confirm") {
+        mode = null;
+        setNotice("The PR changed while you were confirming. Check it again, then Merge.", "warning");
+      }
       if (id !== identity) {
         identity = id;
         method = next.merge_method_default;
         deleteBranch = next.delete_branch_default;
         answers.length = 0;
-        mode = null;
-        notice = null;
-      } else if (pr && pr.head_sha !== next.head_sha) {
         if (mode === "confirm") mode = null;
+        notice = null;
+      } else if (changedSha) {
         setNotice(`The PR's head commit changed to ${short(next.head_sha)}. Check the changes again before merging.`, "warning");
       } else if (sent) notice = null;
       sent = null;
-      if (next.answer && !answers.some((a) => a.question === next.answer.question && a.text === next.answer.text)) answers.push(next.answer);
+      if (next.answer && !answers.some((a) => a.question === next.answer.question && a.text === next.answer.text)) {
+        answers.push(next.answer);
+        newAnswer = true;
+      }
       pr = next;
       warnings = r.warnings;
       render();

@@ -175,10 +175,14 @@ moves out, removes panels, files and events.
 
 #### Built-in apps
 
-Built-ins take only `data` (no `html`). Each follows the host theme, works by keyboard, and
-shows invalid input as a list of problems inside the panel (the tool call itself succeeds,
-except for `image`, whose path and URL Muster checks at open/update time). Unknown fields are
-listed as warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
+Built-ins take only `data` (no `html`). Each follows the host theme and works by keyboard.
+`panel_open` and `panel_update` refuse input whose basic shape is wrong, naming the field:
+`image` (all of it, unknown fields included), `chart` (type, x values, series names and
+lengths), `table` (column keys, rows as objects) and `pr_decision` (`repo`, `number`,
+`head_sha`, `base`, `head`, `url`, `title`, `author`, `summary`, `risk.level`, `checks`,
+`changes`, `merge_method_default`, `status`). The app then checks the rest and shows any
+problem as a list inside the panel; unknown fields of chart, table and pr_decision are only
+listed there as warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
 `cd web && deno task panels`.
 
 **`image`**: `{path?, url?, alt?, caption?}`, exactly one of `path` or `url`. `path` is a file
@@ -188,7 +192,8 @@ WebP and SVG (by content; SVG also needs the `.svg` extension), and stores it as
 (`src`, `mime`, `bytes` are added by Muster; an agent may not pass them). SVG is shown with
 `<img>`, so its scripts never run. `url` must be https without credentials; `panel_open` adds
 its origin to `csp.resourceDomains`, and a later update must keep to an origin already
-declared. Z or the button toggles zoom to fit / actual size.
+declared. The host must be a plain name or IP (no wildcards). Without `alt`, the caption or
+"Image: <file name>" is the text alternative. Z or the button toggles zoom to fit / actual size.
 
 ```json
 {"path": "shots/login.png", "alt": "Login page after the fix", "caption": "Chromium, 1280 px"}
@@ -198,7 +203,9 @@ declared. Z or the button toggles zoom to fit / actual size.
 `type` is `bar`, `line`, `scatter` or `area`; `x.values` are 1–2000 numbers or strings
 (numbers only for `scatter`; all-number x gives `line`/`area` a linear axis); 1–12 series,
 each with one value per x value (a number, or `null` for a gap). Bars and areas include zero;
-`y.min`/`y.max` fix the axis. Drawn as SVG with an accessible title and description, a
+`y.min`/`y.max` fix the axis (with only one fixed, the other side follows the data, even if
+the fixed bound lies beyond it). Series 1–8 get distinct colours; 9–12 reuse them with dashed
+lines, hatched bars and square markers. Drawn as SVG with an accessible title and description, a
 legend, hover and arrow-key tooltips, and a data table (hidden until "Show data table").
 
 ```json
@@ -228,29 +235,38 @@ filter box (`/`) matches every word in any column, and the header stays visible 
 | `base`, `head`, `head_sha` | branches, and the full 40-hex head commit (`headRefOid`) |
 | `merge_method_default?`, `delete_branch_default?` | `squash` (default), `merge` or `rebase`; `false` |
 | `summary` | what changed and why, plain text |
-| `risk` | `{level: low\|medium\|high, reasons: [string]}` |
-| `checks` | `{state: passing\|failing\|pending\|none, items?: [{name, state: pass\|fail\|pending\|skipping\|cancel, url?}]}` (`gh pr checks --json name,bucket,link`) |
+| `risk` | `{level: low\|medium\|high, reasons?: [string]}` |
+| `checks` | `{state: passing\|failing\|pending\|none, items?: [{name, state: pass\|fail\|pending\|skipping\|cancel, url?}]}`, the checks of `head_sha`. With items, the badge comes from them (any `fail`: failing; else any `pending`: pending; else passing) and a contradicting `state` is a warning |
 | `reviews?` | `{decision?: "APPROVED"…, items?: [{author, state}]}` |
-| `changes` | `[{file, note, diff}]`: only the changes worth a look, each a unified diff (with or without the `diff --git` header) and the agent's note |
+| `changes` | `[{file, note, diff}]`: only the changes worth a look, each a unified diff (with or without the `diff --git` header; renames, mode changes and binary files show as a line) and the agent's note |
 | `rest_note?`, `questions?` | a line about what is not shown; the agent's open questions |
 | `answer?` | `{question, text}`: the agent's answer to an Ask, shown inline |
-| `status?`, `status_detail?` | `open` (default), `merging`, `merged`, `failed` or `requested_changes`, shown as a banner |
+| `status?`, `status_detail?` | `open` (default), `merging`, `queued` (in a merge queue or set to auto-merge), `merged`, `failed` or `requested_changes`, shown as a banner and beside the actions |
 
 Actions: **Merge** (M) with a method select and a delete-branch box shows the exact command
-`gh pr merge <number> --<method> [--delete-branch] --match-head-commit <head_sha>` and sends
-only after Enter or "Confirm merge"; it is disabled while checks fail unless Shift is held, and
-while the agent works (`merging`, or until the next update after a sent decision). **Request
-changes** (R) and **Ask** (A) open a text box (Ctrl+Enter sends). **Open on GitHub** (O) uses
-the host browser. A new `head_sha` in an update closes an open confirm.
+`gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>`
+and sends only after Enter or "Confirm merge". The confirm arms only once the key that opened
+it is released (a held or repeated key never confirms), and any update that changes `repo`,
+`number`, `base`, `head_sha`, the checks state or `merge_method_default`, or any invalid
+update, cancels it. Merge is disabled while checks fail unless Shift is held (Shift+M; a hint
+says so beside it), and while the agent works (`merging`, `queued`, `merged`, or until the next
+update after a sent decision). **Request changes** (R) and **Ask** (A) open a text box
+(Ctrl+Enter sends); text that would make the event exceed the 16 KiB event limit cannot be
+sent, and both are off once the PR is `merged`, `queued` or `requested_changes`. **Open on
+GitHub** (O) uses the host browser.
 
 Events are sent with `ui/message`; the decision is in the event's `kind`, and its fields in
 `payload._meta.muster.data` (`payload.content.text` repeats it for people):
 
 | `kind` | `payload._meta.muster.data` |
 |---|---|
-| `merge` | `{action: "merge", number, method, delete_branch, head_sha}` |
-| `request_changes` | `{action: "request_changes", number, head_sha, body}` |
-| `ask` | `{action: "ask", number, question}` |
+| `merge` | `{action: "merge", repo, number, base, method, delete_branch, head_sha}` |
+| `request_changes` | `{action: "request_changes", repo, number, head_sha, body}` |
+| `ask` | `{action: "ask", repo, number, question}` |
+
+`--match-head-commit` binds the merge to the head only; the agent must also check that the
+PR's base and repo still match the event before running the command (the PR reviewer flow
+does).
 
 ```json
 {"repo": "acme/api", "number": 812, "title": "Rate-limit failed logins per IP", "author": "dana",
@@ -264,8 +280,10 @@ Events are sent with `ui/message`; the decision is in the event's `kind`, and it
  "rest_note": "64 more lines of tests.", "questions": ["Is 5 per 10 minutes right?"]}
 ```
 
-The **PR reviewer** agent template (New agent) carries the agent side: gather with `gh`, open
-this panel, wait for its events, merge only on its Merge event with that head commit.
+The **PR reviewer** agent template (New agent) carries the agent side: review one immutable
+snapshot (head and base SHAs; diff and checks of that head), open this panel, wait for its
+events, re-check head and base before merging, merge only on its Merge event, and report
+`merged`, `queued` or `failed` from what GitHub says afterwards.
 
 ### Agents
 

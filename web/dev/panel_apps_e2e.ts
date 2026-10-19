@@ -193,7 +193,8 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.waitIn(`document.querySelector('#merge').disabled`);
     await p.click("h1");
     await a.key("m");
-    check((await p.inApp(`document.querySelector('.notice')?.textContent ?? ''`)).includes("hold Shift"), "m with failing checks explains the Shift override");
+    check((await p.inApp(`document.querySelector('.notice')?.textContent ?? ''`)).includes("Shift+M"), "m with failing checks explains the Shift override");
+    check((await p.inApp(`document.querySelector('#merge-hint').textContent`)).includes("Shift+M"), "the override hint shows beside the disabled Merge");
     await a.key("Shift+M");
     await p.waitIn(`document.querySelector('.drawer .warn')?.textContent.includes('failing')`);
     await a.key("Escape");
@@ -218,7 +219,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.click("#merge");
     await p.waitIn(`document.querySelector('.drawer pre.command')`);
     const command: string = await p.inApp(`document.querySelector('.drawer pre.command').textContent`);
-    check(command === `gh pr merge 812 --squash --delete-branch --match-head-commit ${HEAD_SHA}`, `exact command shown: ${command}`);
+    check(command === `gh pr merge 812 --repo acme/api --squash --delete-branch --match-head-commit ${HEAD_SHA}`, `exact command shown: ${command}`);
     check((await events(p.pid)).length === 0, "Merge alone sends nothing");
     await p.shots2("pr-confirm");
     await p.waitIn(`document.querySelector('.drawer pre.command')`);
@@ -233,7 +234,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     got = await events(p.pid);
     check(got.length === 1 && got[0].kind === "merge", `one merge event: ${JSON.stringify(got)} ${await p.inApp(`document.querySelector('.notice')?.textContent + '|' + !!document.querySelector('.drawer')`)}`);
     const data = got[0].payload._meta.muster.data;
-    check(JSON.stringify(data) === JSON.stringify({ action: "merge", number: 812, method: "squash", delete_branch: true, head_sha: HEAD_SHA }), `merge payload: ${JSON.stringify(data)}`);
+    check(JSON.stringify(data) === JSON.stringify({ action: "merge", repo: "acme/api", number: 812, base: "master", method: "squash", delete_branch: true, head_sha: HEAD_SHA }), `merge payload: ${JSON.stringify(data)}`);
     check(String(got[0].payload.content.text).endsWith(command), "event text carries the command");
     check(await p.inApp(`document.querySelector('#merge').disabled`), "Merge disabled while the agent works");
     ok("pr_decision: Merge shows the exact gh command; a refused send keeps the confirm for a retry; Confirm sends one merge event with that PR, method, branch flag and head SHA");
@@ -243,6 +244,23 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.waitIn(`document.querySelector('.status.danger')`);
     await p.inApp(`(() => { const s = document.querySelector('#method'); s.value = 'rebase'; s.dispatchEvent(new Event('change')); })()`);
     await a.sleep(5600);
+    // A held Enter on the focused Merge button opens the confirm, and its auto-repeat must not
+    // confirm; only a fresh press after release does.
+    await p.inApp(`document.querySelector('#merge').focus()`);
+    const enter = (type: string, autoRepeat = false) => a.send("Input.dispatchKeyEvent", {
+      type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, autoRepeat, ...(type === "keyDown" ? { text: "\r", unmodifiedText: "\r" } : {}),
+    });
+    await enter("keyDown");
+    await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    for (let i = 0; i < 4; i++) { await enter("keyDown", true); await a.sleep(40); }
+    check((await events(p.pid)).length === 0 && await p.inApp(`!!document.querySelector('.drawer pre.command')`), "a held Enter never confirms");
+    await enter("keyUp");
+    // A base retarget while confirming cancels the confirm.
+    await call("panel.update", { panel_id: p.pid, data: { ...prSample, base: "production", status: "failed", status_detail: "Head branch was modified. Review and try the merge again." } });
+    await p.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
+    check((await events(p.pid)).length === 0, "retargeting sent nothing");
+    await call("panel.update", { panel_id: p.pid, data: { ...prSample, status: "failed", status_detail: "Head branch was modified. Review and try the merge again." } });
+    await p.waitIn(`document.querySelector('.status.danger')`);
     await p.click("h1");
     await a.key("m");
     await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
@@ -255,7 +273,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.waitIn(`document.querySelector('.status.success')?.textContent.includes('Merged as 9e1f2c4')`);
     check(await p.inApp(`document.querySelector('#merge').disabled && document.querySelector('#ask').disabled`), "merged: Merge and Ask are off");
     await p.shots2("pr-merged");
-    ok("pr_decision: M then Enter merges by keyboard with the chosen method; merging and merged statuses show prominently");
+    ok("pr_decision: a held Enter cannot confirm; a base change cancels the confirm; M then Enter merges by keyboard with the chosen method; merging and merged statuses show prominently");
 
     await call("panel.update", { panel_id: p.pid, data: prSample });
     await p.waitIn(`!document.querySelector('.status')`);

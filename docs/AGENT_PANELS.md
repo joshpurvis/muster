@@ -235,3 +235,7 @@ action; the phone comes last.
 - On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
   afterwards, so swapping a parent directory for a symlink in between could copy a file from
   outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.
+
+## Tools
+
+- `muster pr list` / `muster pr snapshot` (docs/CLI.md, "PR snapshots"): read-only, parallel GitHub fetches whose JSON fits `pr_overview` and `pr_decision` as is, so the agent adds only its judgement.

@@ -128,7 +128,13 @@ a session started under a profile reads skills from that profile's folder. The p
 read from Muster's database, read-only, so the daemon need not run. Each real folder is one
 target: a profile that points at the default folder shares its line, labelled
 `claude (default, Name)`; profile lines read `claude (Name)`. A profile folder that is missing
-is reported as skipped and never created. Codex: `$CODEX_HOME/skills`, else `~/.codex/skills`
+is reported as skipped and never created. A profile folder is only written to if its stored
+path is absolute, has no control characters, resolves (symlinks followed) to a directory inside
+your home other than home itself, and holds `settings.json`, `projects/`, `plugins/` or
+`.claude.json` (checked by name only, never opened); anything else is reported as "skipped (not
+a Claude config folder under your home)". Each folder is resolved once when planning and its
+identity pinned: if it is moved or replaced before Muster writes, that target stops with
+"changed while installing". Names and paths are printed with control characters escaped. Codex: `$CODEX_HOME/skills`, else `~/.codex/skills`
 (where Codex's own skill-creator puts user skills); profiles do not change Codex's folder.
 After adding a profile, run `muster skills install` again to cover it.
 Each skill is `<target>/<name>/SKILL.md` (mode 0600, folders 0700), with a `.muster-installed`

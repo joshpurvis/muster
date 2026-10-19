@@ -60,11 +60,40 @@ pub struct Target {
     pub tool: &'static str,
     /// What output calls this target: the tool, plus the Claude profiles that use the folder.
     pub label: String,
-    /// The tool's user skills folder.
+    /// The tool's configuration folder (~/.claude, a profile's folder, ~/.codex), resolved once
+    /// at planning: canonical when it existed then, so a symlink changed later cannot redirect.
+    pub config: PathBuf,
+    /// The tool's user skills folder: `config/skills`.
     pub root: PathBuf,
-    /// Whether Muster may create the folder holding `root` (the default ~/.claude or ~/.codex).
-    /// A profile's folder is the user's own setup and must already exist.
+    /// `config`'s identity (device, inode) at planning; None when it did not exist yet.
+    /// Checked again before anything is created under it and before every write.
+    pub pin: Option<(u64, u64)>,
+    /// Whether Muster may create `config` (the default ~/.claude or ~/.codex). A profile's
+    /// folder is the user's own setup and must already exist.
     pub create_parent: bool,
+}
+
+impl Target {
+    /// A target for `config`, resolved and pinned now.
+    pub fn new(tool: &'static str, label: String, config: PathBuf, create_parent: bool) -> Self {
+        let (config, pin) = match std::fs::canonicalize(&config) {
+            Ok(real) => match identity(&real) { Some(id) if real.is_dir() => (real, Some(id)), _ => (config, None) },
+            Err(_) => (config, None),
+        };
+        Target { tool, label, root: config.join("skills"), config, pin, create_parent }
+    }
+}
+
+/// A directory's (device, inode), following symlinks.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Text shown on a terminal (profile names, paths, reasons) with control characters escaped,
+/// so a stored value cannot forge or hide output lines.
+pub fn shown(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { c.escape_default().to_string() } else { c.to_string() }).collect()
 }
 
 /// A Claude account profile as Muster stores it (`muster profile ls`).
@@ -73,21 +102,15 @@ pub struct ProfileDir { pub name: String, pub config_dir: PathBuf, pub enabled: 
 
 /// Reads the configured Claude profiles straight from Muster's database, read-only, without
 /// the daemon. No database (Muster never ran) or no profiles table yet means no profiles.
+/// A normal locking connection: a write by a running daemon is either seen whole or waited
+/// for. SQLite may create the -wal/-shm files beside it; it gives them the database's own
+/// mode (0600 for Muster's), which the tests check.
 pub fn read_profiles(db: &Path) -> anyhow::Result<Vec<ProfileDir>> {
     use rusqlite::OpenFlags;
     if !db.try_exists().unwrap_or(true) { return Ok(Vec::new()) }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let wal = PathBuf::from(format!("{}-wal", db.display()));
-    let conn = if wal.try_exists().unwrap_or(true) {
-        // The daemon has it open (or left a log to replay): read through the log as it does.
-        rusqlite::Connection::open_with_flags(db, flags)
-    } else {
-        // No log: everything is in the main file. Read it as is, so a plain read-only open
-        // does not leave -wal/-shm files (with default permissions) beside Muster's database.
-        let encoded = db.display().to_string().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
-        rusqlite::Connection::open_with_flags(format!("file:{encoded}?immutable=1"), flags | OpenFlags::SQLITE_OPEN_URI)
-    }.with_context(|| format!("opening {}", db.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .with_context(|| format!("opening {}", shown(&db.display().to_string())))?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
     let has_table: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='account_profiles'", [], |r| r.get(0))?;
     if has_table == 0 { return Ok(Vec::new()) }
@@ -98,12 +121,38 @@ pub fn read_profiles(db: &Path) -> anyhow::Result<Vec<ProfileDir>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// The targets, and notes on profiles that were left out (their folder is unavailable).
+/// Entries whose presence (never contents) shows a folder is a Claude Code configuration
+/// folder: a fresh one that was signed in has `.claude.json` or `plugins/`, a used one
+/// `settings.json` or `projects/`. Only `symlink_metadata` is taken; nothing is opened.
+const CLAUDE_FOLDER_SIGNS: &[&str] = &["settings.json", "projects", "plugins", ".claude.json"];
+
+/// A stored profile folder Muster may write skills into: an absolute path without control
+/// characters that resolves to an existing directory strictly inside the (resolved) home
+/// and looks like a Claude configuration folder. Returns the resolved folder, or why not.
+fn profile_folder(dir: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let not_claude = || "skipped (not a Claude config folder under your home)".to_string();
+    let text = dir.to_str().ok_or_else(not_claude)?;
+    if text.chars().any(char::is_control) || !dir.is_absolute() { return Err(not_claude()) }
+    let real = match std::fs::canonicalize(dir) {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("skipped: its folder is unavailable".into()),
+        Err(_) => return Err(not_claude()),
+    };
+    let home = home.and_then(|h| std::fs::canonicalize(h).ok()).ok_or_else(not_claude)?;
+    if !real.is_dir() || real == home || !real.starts_with(&home)
+        || !CLAUDE_FOLDER_SIGNS.iter().any(|sign| std::fs::symlink_metadata(real.join(sign)).is_ok()) {
+        return Err(not_claude());
+    }
+    Ok(real)
+}
+
+/// The targets, and notes on profiles that were left out.
 pub struct Targets { pub list: Vec<Target>, pub notes: Vec<String> }
 
 /// Targets from the environment and the Claude profiles: `env` reads a variable (HOME,
-/// CLAUDE_CONFIG_DIR, CODEX_HOME). Claude gets the default folder plus every profile's folder,
-/// one target per real folder (a profile that points at the default folder shares its target).
+/// CLAUDE_CONFIG_DIR, CODEX_HOME). Claude gets the default folder plus every valid profile
+/// folder ([`profile_folder`]), one target per real folder (a profile that points at the
+/// default folder shares its target).
 pub fn targets(claude: bool, codex: bool, env: impl Fn(&str) -> Option<String>, profiles: &[ProfileDir]) -> anyhow::Result<Targets> {
     let (claude, codex) = if claude || codex { (claude, codex) } else { (true, true) };
     let home = || env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).context("HOME is not set");
@@ -113,25 +162,28 @@ pub fn targets(claude: bool, codex: bool, env: impl Fn(&str) -> Option<String>, 
     let mut out = Vec::new();
     let mut notes = Vec::new();
     if claude {
-        // (canonical folder, folder, names using it ("default" for the default folder), is default)
-        let default = dir("CLAUDE_CONFIG_DIR", ".claude")?;
-        let mut folders = vec![(std::fs::canonicalize(&default).unwrap_or_else(|_| default.clone()), default, vec!["default".to_string()], true)];
+        let mut targets = vec![(Target::new("claude", String::new(), dir("CLAUDE_CONFIG_DIR", ".claude")?, true), vec!["default".to_string()])];
+        let home = home().ok();
         for p in profiles {
-            let name = if p.enabled { p.name.clone() } else { format!("{}: disabled", p.name) };
-            match std::fs::canonicalize(&p.config_dir) {
-                Ok(real) if real.is_dir() => match folders.iter_mut().find(|f| f.0 == real) {
-                    Some(f) => f.2.push(name),
-                    None => folders.push((real, p.config_dir.clone(), vec![name], false)),
+            let name = if p.enabled { shown(&p.name) } else { format!("{}: disabled", shown(&p.name)) };
+            if p.name.chars().any(char::is_control) {
+                notes.push(format!("claude ({name}) skipped: its name has control characters"));
+                continue;
+            }
+            match profile_folder(&p.config_dir, home.as_deref()) {
+                Ok(real) => match targets.iter_mut().find(|(t, _)| t.pin.is_some() && t.config == real) {
+                    Some((_, names)) => names.push(name),
+                    None => targets.push((Target::new("claude", String::new(), real, false), vec![name])),
                 },
-                _ => notes.push(format!("claude ({name}) skipped: its folder {} is unavailable", p.config_dir.display())),
+                Err(why) => notes.push(format!("claude ({name}) {why}: {}", shown(&p.config_dir.display().to_string()))),
             }
         }
-        for (_, folder, names, is_default) in folders {
-            let label = if names == ["default"] { "claude".to_string() } else { format!("claude ({})", names.join(", ")) };
-            out.push(Target { tool: "claude", label, root: folder.join("skills"), create_parent: is_default });
+        for (mut t, names) in targets {
+            t.label = if names == ["default"] { "claude".to_string() } else { format!("claude ({})", names.join(", ")) };
+            out.push(t);
         }
     }
-    if codex { out.push(Target { tool: "codex", label: "codex".into(), root: dir("CODEX_HOME", ".codex")?.join("skills"), create_parent: true }); }
+    if codex { out.push(Target::new("codex", "codex".into(), dir("CODEX_HOME", ".codex")?, true)); }
     Ok(Targets { list: out, notes })
 }
 
@@ -232,56 +284,81 @@ fn observe(target: &Target, skill: &Skill) -> Observed {
 
 pub fn state(target: &Target, skill: &Skill) -> State { observe(target, skill).state }
 
-/// Creates `dir` (one level, 0700) if missing, then insists it is a real directory.
-fn make_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    if !check_dir(dir)? {
-        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("creating {}: {e}", dir.display())),
-        }
-        if !check_dir(dir)? { return Err(format!("{} vanished", dir.display())) }
-    }
-    Ok(())
+fn cpath(path: &Path) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| format!("{} contains a NUL byte", path.display()))
 }
 
-/// Writes `bytes` as `dir/name`: an exclusively created, unpredictably named 0600 temporary
-/// file (never opened through a symlink), then a rename. With `no_replace`, an entry that
-/// appeared meanwhile is left alone and the write fails.
-fn write_file(dir: &Path, name: &str, bytes: &[u8], no_replace: bool) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let target = dir.join(name);
-    let (tmp, mut f) = (0..8).find_map(|_| {
-        let tmp = dir.join(format!(".{name}.muster-{:016x}.tmp", rand::random::<u64>()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&tmp) {
-            Ok(f) => Some(Ok((tmp, f))),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-            Err(e) => Some(Err(format!("writing in {}: {e}", dir.display()))),
-        }
-    }).unwrap_or_else(|| Err(format!("no free temporary name in {}", dir.display())))?;
-    let result = f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| e.to_string()).and_then(|()| rename(&tmp, &target, no_replace));
-    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
-    result.map_err(|e| format!("writing {}: {e}", target.display()))
+fn fd_identity(fd: &std::os::fd::OwnedFd) -> Result<(u64, u64), String> {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid open descriptor and a properly sized stat buffer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 { return Err(std::io::Error::last_os_error().to_string()) }
+    Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
-fn rename(from: &Path, to: &Path, no_replace: bool) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    if no_replace {
-        use std::os::unix::ffi::OsStrExt;
-        let (a, b) = (std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(|e| e.to_string())?,
-            std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(|e| e.to_string())?);
-        // SAFETY: both are valid NUL-terminated paths for the duration of the call.
-        let r = unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_NOREPLACE) };
-        return if r == 0 { Ok(()) } else {
+/// Opens directory `name` inside `parent` (or `path` itself when `parent` is None) without
+/// following a symlink at the last step; with `create`, makes it (0700) first if missing.
+fn open_dir(parent: Option<&std::os::fd::OwnedFd>, name: &Path, create: bool) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c = cpath(name)?;
+    let at = parent.map_or(libc::AT_FDCWD, |p| p.as_raw_fd());
+    if create {
+        // SAFETY: a valid directory descriptor (or AT_FDCWD) and a NUL-terminated name.
+        if unsafe { libc::mkdirat(at, c.as_ptr(), 0o700) } != 0 {
             let e = std::io::Error::last_os_error();
-            Err(if e.kind() == std::io::ErrorKind::AlreadyExists { "changed while installing (it appeared)".into() } else { e.to_string() })
-        };
+            if e.kind() != std::io::ErrorKind::AlreadyExists { return Err(format!("creating {}: {e}", name.display())) }
+        }
     }
-    let _ = no_replace;
-    std::fs::rename(from, to).map_err(|e| e.to_string())
+    // SAFETY: as above; the returned descriptor is owned below.
+    let fd = unsafe { libc::openat(at, c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::ELOOP) => format!("{} is a symlink", name.display()),
+            Some(libc::ENOTDIR) => format!("{} is not a directory", name.display()),
+            Some(libc::ENOENT) => format!("{} is unavailable", name.display()),
+            _ => format!("{}: {e}", name.display()),
+        });
+    }
+    // SAFETY: fd is a fresh descriptor nothing else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Writes `bytes` as `name` inside the open directory `dir`: an exclusively created,
+/// unpredictably named 0600 temporary file (never opened through a symlink), then a rename
+/// within that same directory. With `no_replace`, an entry that appeared meanwhile is left
+/// alone and the write fails. `shown_dir` is only for messages.
+fn write_at(dir: &std::os::fd::OwnedFd, shown_dir: &Path, name: &str, bytes: &[u8], no_replace: bool) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let target = shown_dir.join(name);
+    let (tmp, mut f) = (0..8).find_map(|_| {
+        let tmp = cpath(Path::new(&format!(".{name}.muster-{:016x}.tmp", rand::random::<u64>()))).ok()?;
+        // SAFETY: a valid directory descriptor and a NUL-terminated name.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600 as libc::c_uint) };
+        if fd >= 0 {
+            // SAFETY: a fresh descriptor nothing else owns.
+            return Some(Ok((tmp, std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::AlreadyExists { None } else { Some(Err(format!("writing in {}: {e}", shown_dir.display()))) }
+    }).unwrap_or_else(|| Err(format!("no free temporary name in {}", shown_dir.display())))?;
+    let to = cpath(Path::new(name))?;
+    let result = f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| e.to_string()).and_then(|()| {
+        #[cfg(target_os = "linux")]
+        // SAFETY: valid descriptors and NUL-terminated names for the duration of the call.
+        let r = unsafe { libc::renameat2(dir.as_raw_fd(), tmp.as_ptr(), dir.as_raw_fd(), to.as_ptr(), if no_replace { libc::RENAME_NOREPLACE } else { 0 }) };
+        #[cfg(not(target_os = "linux"))]
+        let r = { let _ = no_replace; unsafe { libc::renameat(dir.as_raw_fd(), tmp.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } };
+        if r == 0 { return Ok(()) }
+        let e = std::io::Error::last_os_error();
+        Err(if e.kind() == std::io::ErrorKind::AlreadyExists { "changed while installing (it appeared)".into() } else { e.to_string() })
+    });
+    // SAFETY: as above; removing our own temporary name.
+    if result.is_err() { unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0); } }
+    result.map_err(|e| format!("writing {}: {e}", target.display()))
 }
 
 /// One planned change: what `install` would do for a skill in a target.
@@ -311,7 +388,7 @@ fn width(targets: &[Target], min: usize) -> usize {
 }
 
 fn line(label: &str, w: usize, what: &str, path: &Path, home: Option<&str>) -> String {
-    format!("{label:<w$} {what:<26} {}", tilde(path, home))
+    shown(&format!("{label:<w$} {what:<26} {}", tilde(path, home)))
 }
 
 /// Installs every skill into every target. Nothing is written while any entry is blocked, or
@@ -360,39 +437,60 @@ fn install_with(targets: &[Target], dry_run: bool, force: bool, home: Option<&st
 }
 
 fn apply(p: &Plan) -> Result<(), String> {
-    let dir = p.target.root.join(p.skill.name);
-    if let Some(tool_dir) = p.target.root.parent() {
-        // The tool's own folder (~/.claude, $CODEX_HOME, a profile's folder) is the user's to
-        // arrange, links included. Only the default folders are created; a profile's must exist.
-        if p.target.create_parent {
-            std::fs::create_dir_all(tool_dir).map_err(|e| format!("creating {}: {e}", tool_dir.display()))?;
-        } else if !std::fs::metadata(tool_dir).is_ok_and(|m| m.is_dir()) {
-            return Err(format!("profile folder {} is unavailable", tool_dir.display()));
+    use std::os::unix::fs::MetadataExt;
+    let t = &p.target;
+    let changed = || format!("{} changed while installing (moved or replaced); nothing more was written there; run again", t.config.display());
+    // The tool's own folder (~/.claude, $CODEX_HOME, a profile's folder) is the user's to
+    // arrange, links included; it was resolved at planning. Only a default folder that did
+    // not exist then is created now, and pinned as created.
+    let pin = match t.pin {
+        Some(pin) => pin,
+        None if t.create_parent => {
+            std::fs::create_dir_all(&t.config).map_err(|e| format!("creating {}: {e}", t.config.display()))?;
+            identity(&t.config).ok_or_else(changed)?
         }
-    }
-    make_dir(&p.target.root)?;
-    make_dir(&dir)?;
+        None => return Err(format!("profile folder {} is unavailable", t.config.display())),
+    };
+    // Everything below happens through descriptors of the pinned folder, never by path.
+    let config = open_dir(None, &t.config, false).or_else(|_| {
+        // A default folder that is itself a symlink (allowed): open what it resolves to.
+        std::fs::canonicalize(&t.config).map_err(|e| format!("{}: {e}", t.config.display())).and_then(|real| open_dir(None, &real, false))
+    })?;
+    if fd_identity(&config)? != pin { return Err(changed()) }
+    let skills = open_dir(Some(&config), Path::new("skills"), true).map_err(|e| e.replace("skills", &t.root.display().to_string()))?;
+    let dir_path = t.root.join(p.skill.name);
+    let dir = open_dir(Some(&skills), Path::new(p.skill.name), true).map_err(|e| e.replace(p.skill.name, &dir_path.display().to_string()))?;
+    // The paths `observe` reads must still be these very folders.
+    let (skills_id, dir_id) = (fd_identity(&skills)?, fd_identity(&dir)?);
+    let same = |path: &Path, id: (u64, u64), follow: bool| {
+        let m = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) };
+        m.is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == id)
+    };
+    let check = || if same(&t.config, pin, true) && same(&t.root, skills_id, false) && same(&dir_path, dir_id, false) { Ok(()) } else { Err(changed()) };
+    check()?;
     // Revalidate: what is there now must be what was planned and shown.
-    let now = observe(&p.target, p.skill);
+    let now = observe(t, p.skill);
     if now != p.seen && !(p.seen.state == State::Missing && now.state == State::Missing) {
         return Err("changed while installing; run again".into());
     }
     let hash = format!("{}\n", sha(p.skill.text.as_bytes()));
     if now.state != State::Current {
+        check()?;
         // The skill first, then its marker: a failed skill write leaves the old file and its
         // old marker together, so it still reads as Muster's own (outdated), not as edited.
-        write_file(&dir, "SKILL.md", p.skill.text.as_bytes(), now.state == State::Missing)?;
+        write_at(&dir, &dir_path, "SKILL.md", p.skill.text.as_bytes(), now.state == State::Missing)?;
     }
     if now.marker.as_deref() != Some(hash.as_bytes()) {
-        write_file(&dir, MARKER, hash.as_bytes(), false)?;
+        check()?;
+        write_at(&dir, &dir_path, MARKER, hash.as_bytes(), false)?;
     }
     Ok(())
 }
 
 pub fn status(targets: &[Target], home: Option<&str>) -> Vec<String> {
     let w = width(targets, 8);
-    plan(targets).iter().map(|p| format!("{:<18} {:<w$} {:<17} {}", p.skill.name, p.target.label, p.state().word(),
-        tilde(&file(&p.target, p.skill), home))).collect()
+    plan(targets).iter().map(|p| shown(&format!("{:<18} {:<w$} {:<17} {}", p.skill.name, p.target.label, p.state().word(),
+        tilde(&file(&p.target, p.skill), home)))).collect()
 }
 
 /// Shown after install and in docs/CLI.md.
@@ -405,7 +503,7 @@ pub fn run(cmd: SkillsCmd) -> anyhow::Result<()> {
     let profiles = if claude || !codex {
         let db = crate::paths::db_path();
         read_profiles(&db).unwrap_or_else(|e| {
-            eprintln!("warning: could not read Muster's Claude profiles from {}: {e:#}; only the default Claude folder is covered", db.display());
+            eprintln!("{}", shown(&format!("warning: could not read Muster's Claude profiles from {}: {e:#}; only the default Claude folder is covered", db.display())));
             Vec::new()
         })
     } else { Vec::new() };
@@ -414,7 +512,7 @@ pub fn run(cmd: SkillsCmd) -> anyhow::Result<()> {
         SkillsCmd::Install { dry_run, force, .. } => {
             let report = install(&ts.list, dry_run, force, home.as_deref());
             for line in report.lines.iter().chain(&ts.notes) { println!("{line}"); }
-            if let Some(why) = report.failed { bail!("{why}") }
+            if let Some(why) = report.failed { bail!("{}", shown(&why)) }
             if !dry_run { println!("Start a new agent session to pick up the skills.\n{TRADE_OFF}"); }
         }
         SkillsCmd::Status { .. } => {
@@ -678,19 +776,24 @@ mod tests {
         std::fs::remove_dir_all(&home).unwrap();
     }
 
-    #[test]
-    fn every_claude_profile_folder_is_a_target_once() {
-        let home = temp_home("profiles");
-        // Muster's own store, as `muster profile add` leaves it (the daemon's database).
+    /// A home with Muster's database holding Personal (a symlinked folder) and Work (plain).
+    fn profile_home(name: &str) -> (PathBuf, PathBuf) {
+        let home = temp_home(name);
         let db = home.join("data/muster.db");
         let store = crate::store::Store::open(&db).unwrap();
-        // Personal is a symlink to the real folder (the user's arrangement); Work is plain.
-        std::fs::create_dir_all(home.join("real-personal")).unwrap();
+        std::fs::create_dir_all(home.join("real-personal/plugins")).unwrap();
+        std::fs::write(home.join("real-personal/.claude.json"), "{}").unwrap();
         std::os::unix::fs::symlink(home.join("real-personal"), home.join(".claude-personal")).unwrap();
         std::fs::create_dir_all(home.join(".claude-work")).unwrap();
+        std::fs::write(home.join(".claude-work/settings.json"), "{}").unwrap();
         store.insert_account_profile("Personal", home.join(".claude-personal").to_str().unwrap()).unwrap();
         store.insert_account_profile("Work", home.join(".claude-work").to_str().unwrap()).unwrap();
-        drop(store);
+        (home, db)
+    }
+
+    #[test]
+    fn every_claude_profile_folder_is_a_target_once() {
+        let (home, db) = profile_home("profiles");
         let profiles = read_profiles(&db).unwrap();
         assert_eq!(profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Personal", "Work"]);
         assert!(read_profiles(&home.join("no-such.db")).unwrap().is_empty(), "Muster never ran: no profiles");
@@ -709,7 +812,8 @@ mod tests {
         let st = status(&ts.list, Some(home.to_str().unwrap()));
         assert_eq!(st.len(), 8, "{st:?}");
         assert!(st.iter().all(|l| l.contains("current")), "{st:?}");
-        for want in ["claude (Personal) current           ~/.claude-personal/skills/muster-pr-review/SKILL.md",
+        // The symlinked profile is shown (and written) where it resolved at planning.
+        for want in ["claude (Personal) current           ~/real-personal/skills/muster-pr-review/SKILL.md",
             "claude (Work)     current           ~/.claude-work/skills/muster-panels/SKILL.md"] {
             assert!(st.iter().any(|l| l.contains(want)), "{want} in {st:?}");
         }
@@ -717,11 +821,12 @@ mod tests {
         assert_eq!(targets(false, true, env, &profiles).unwrap().list.len(), 1);
 
         // A profile pointing at the default folder (here through CLAUDE_CONFIG_DIR) shares its
-        // target; a missing or disabled profile folder is noted, never created.
+        // target; a missing profile folder is noted, never created; a disabled one is marked.
         let mut more = profiles.clone();
         more.push(ProfileDir { name: "Alias".into(), config_dir: home.join(".claude"), enabled: true });
         more.push(ProfileDir { name: "Gone".into(), config_dir: home.join(".claude-gone"), enabled: true });
         more[1].enabled = false;
+        std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
         let env2 = |k: &str| match k { "HOME" => Some(home.display().to_string()), "CLAUDE_CONFIG_DIR" => Some(home.join("./.claude").display().to_string()), _ => None };
         let ts = targets(true, false, env2, &more).unwrap();
         let labels: Vec<_> = ts.list.iter().map(|t| t.label.as_str()).collect();
@@ -730,15 +835,113 @@ mod tests {
         assert!(ts.notes[0].contains("claude (Gone) skipped") && ts.notes[0].contains("unavailable"), "{:?}", ts.notes);
         assert!(install(&ts.list, false, false, None).lines.iter().all(|l| l.contains("unchanged")));
         assert!(!home.join(".claude-gone").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
-        // A profile folder that disappears after planning is not recreated.
+    #[test]
+    fn only_claude_folders_under_home_are_profile_targets() {
+        let home = temp_home("profile-rules");
+        let outside = temp_home("profile-rules-outside");
+        std::fs::write(outside.join("settings.json"), "{}").unwrap();
+        std::fs::write(home.join(".claude.json"), "{}").unwrap(); // home itself looks like one
+        std::fs::create_dir_all(home.join("plain")).unwrap(); // no Claude signs
+        std::fs::create_dir_all(home.join("ok/projects")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link-out")).unwrap();
+        std::os::unix::fs::symlink(home.join("ok"), home.join("link-in")).unwrap();
+        let p = |name: &str, dir: PathBuf| ProfileDir { name: name.into(), config_dir: dir, enabled: true };
+        let bad = [p("Dot", ".".into()), p("Up", "..".into()), p("Rel", "ok".into()), p("Root", "/".into()), p("Etc", "/etc".into()),
+            p("Outside", outside.clone()), p("Home", home.clone()), p("Plain", home.join("plain")), p("LinkOut", home.join("link-out")),
+            p("Ctl", PathBuf::from(format!("{}/ok\n", home.display()))), p("Up2", home.join("ok/../plain"))];
+        let env = |k: &str| (k == "HOME").then(|| home.display().to_string());
+        let ts = targets(true, false, env, &bad).unwrap();
+        assert_eq!(ts.list.len(), 1, "only the default: {:?}", ts.list.iter().map(|t| &t.label).collect::<Vec<_>>());
+        assert_eq!(ts.notes.len(), bad.len(), "{:?}", ts.notes);
+        assert!(ts.notes.iter().all(|n| n.contains("skipped (not a Claude config folder under your home)")), "{:?}", ts.notes);
+        assert!(ts.notes.iter().all(|n| !n.chars().any(char::is_control)), "{:?}", ts.notes);
+        assert!(ts.notes.iter().any(|n| n.ends_with("/ok\\n")), "{:?}", ts.notes);
+        assert!(install(&ts.list, false, false, None).failed.is_none());
+        assert!(!outside.join("skills").exists() && !home.join("plain/skills").exists() && !home.join("skills").exists());
+        // A symlinked profile folder inside home works, through its resolved destination.
+        let ts = targets(true, false, env, &[p("In", home.join("link-in"))]).unwrap();
+        assert_eq!(ts.list[1].config, std::fs::canonicalize(home.join("ok")).unwrap());
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn a_folder_replaced_after_planning_is_never_written() {
+        let (home, db) = profile_home("profile-race");
+        let profiles = read_profiles(&db).unwrap();
+        let env = |k: &str| (k == "HOME").then(|| home.display().to_string());
+        let ts = targets(true, false, env, &profiles).unwrap().list;
+        // Retargeting the profile's symlink after planning does not redirect the writes.
+        std::fs::create_dir_all(home.join("elsewhere")).unwrap();
+        std::fs::remove_file(home.join(".claude-personal")).unwrap();
+        std::os::unix::fs::symlink(home.join("elsewhere"), home.join(".claude-personal")).unwrap();
+        // Work's folder itself is swapped for another directory before Muster writes there.
+        let swapped = std::cell::Cell::new(false);
+        let r = install_with(&ts, false, false, None, &|p| {
+            if p.target.label == "claude (Work)" && !swapped.replace(true) {
+                std::fs::rename(home.join(".claude-work"), home.join("work-moved")).unwrap();
+                std::fs::create_dir_all(home.join(".claude-work")).unwrap();
+            }
+        });
+        assert!(r.failed.is_some());
+        let work: Vec<_> = r.lines.iter().filter(|l| l.contains("claude (Work)")).collect();
+        assert!(work.len() == 2 && work.iter().all(|l| l.contains("changed while installing")), "{:?}", r.lines);
+        assert!(names_in(&home.join(".claude-work")).is_empty(), "nothing written in the replacement");
+        assert!(names_in(&home.join("elsewhere")).is_empty(), "nothing written through the retargeted link");
+        for s in SKILLS { assert!(home.join("real-personal/skills").join(s.name).join("SKILL.md").exists()); }
+        // A planned profile folder that disappeared is not recreated.
+        let work = ts.iter().find(|t| t.label == "claude (Work)").unwrap().clone();
         std::fs::remove_dir_all(home.join(".claude-work")).unwrap();
-        let ts = targets(true, false, env2, &profiles).unwrap();
-        assert!(ts.notes.iter().any(|n| n.contains("claude (Work) skipped")));
-        let work = Target { tool: "claude", label: "claude (Work)".into(), root: home.join(".claude-work/skills"), create_parent: false };
+        std::fs::remove_dir_all(home.join("work-moved")).unwrap();
         let r = install(&[work], false, false, None);
-        assert!(r.lines.iter().all(|l| l.contains("is unavailable")), "{:?}", r.lines);
+        assert!(r.lines.iter().all(|l| l.contains("failed:")), "{:?}", r.lines);
         assert!(!home.join(".claude-work").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn profiles_are_read_with_locking_and_private_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, db) = profile_home("profile-db");
+        // The daemon still has the database open and commits another profile: it is seen.
+        let store = crate::store::Store::open(&db).unwrap();
+        std::fs::create_dir_all(home.join(".claude-new/projects")).unwrap();
+        store.insert_account_profile("New", home.join(".claude-new").to_str().unwrap()).unwrap();
+        assert_eq!(read_profiles(&db).unwrap().len(), 3);
+        drop(store);
+        // With the daemon gone (log checkpointed away), a read leaves only private sidecars.
+        for suffix in ["-wal", "-shm"] { let _ = std::fs::remove_file(format!("{}{suffix}", db.display())); }
+        assert_eq!(read_profiles(&db).unwrap().len(), 3);
+        for suffix in ["", "-wal", "-shm"] {
+            if let Ok(m) = std::fs::metadata(format!("{}{suffix}", db.display())) {
+                assert_eq!(m.permissions().mode() & 0o777, 0o600, "{suffix}");
+            }
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn stored_names_and_paths_cannot_forge_output() {
+        let home = temp_home("profile-escape");
+        std::fs::create_dir_all(home.join("ok/projects")).unwrap();
+        let profiles = [ProfileDir { name: "Evil\n\x1b[2Kclaude".into(), config_dir: home.join("ok"), enabled: true },
+            ProfileDir { name: "Gone".into(), config_dir: home.join("gone\r\x1b]0;x\x07"), enabled: true }];
+        let env = |k: &str| (k == "HOME").then(|| home.display().to_string());
+        let ts = targets(true, false, env, &profiles).unwrap();
+        assert_eq!(ts.list.len(), 1);
+        assert_eq!(ts.notes.len(), 2, "{:?}", ts.notes);
+        assert!(ts.notes[0].contains("Evil\\n\\u{1b}[2Kclaude") && ts.notes[0].contains("control characters"), "{:?}", ts.notes);
+        assert!(ts.notes.iter().all(|n| !n.chars().any(char::is_control)), "{:?}", ts.notes);
+        // Paths and reasons in install and status lines are escaped too.
+        let odd = home.join("odd\nname");
+        let t = Target::new("claude", "claude".into(), odd, true);
+        let lines = install(std::slice::from_ref(&t), false, false, None).lines;
+        let lines: Vec<_> = lines.into_iter().chain(status(std::slice::from_ref(&t), None)).collect();
+        assert!(lines.iter().all(|l| !l.contains('\n') && l.contains("odd\\nname")), "{lines:?}");
+        assert_eq!(shown("a\tb\u{9b}c"), "a\\tb\\u{9b}c");
         std::fs::remove_dir_all(&home).unwrap();
     }
 }

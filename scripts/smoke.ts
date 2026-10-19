@@ -427,8 +427,28 @@ exec cat > '${BASE}/fake-input'
   await c.call("panel.event", { panel_id: fakePanel, kind: "approve", payload: { message: "approved from panel" } });
   let injected = "";
   for (let n = 0; n < 100; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (injected.includes("approved from panel")) break; await sleep(100); }
-  ok(injected.includes('[panel "Idle delivery"]') && injected.includes("approved from panel"), "idle agent stand-in receives the marked panel prompt");
+  ok(injected.includes('[panel "Idle delivery" #') && injected.includes("approved from panel"), "idle agent stand-in receives the marked panel prompt");
   ok((await mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 0 })).timed_out, "injected event is not returned again by wait");
+  // Three ~9 KiB comments exceed one 24 KiB prompt: each arrives whole, over two prompts.
+  const tails = [0, 1, 2].map((n) => `END-OF-COMMENT-${n}`);
+  for (const tail of tails) await c.call("panel.event", { panel_id: fakePanel, kind: "comment", payload: { text: "x".repeat(9000) + tail } });
+  for (let n = 0; n < 300; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (tails.every((t) => injected.includes(t))) break; await sleep(100); }
+  ok(tails.every((t) => injected.includes(`x${t}`)) && !injected.includes("truncated"), "long panel events reach the idle agent whole, none cut");
+  // Typed is not yet submitted: let the last prompt finish before moving its opener.
+  for (let n = 0; n < 200; n++) { if ((await c.call("hello")).sessions.find((x: Json) => x.id === fake.id).queued === 0) break; await sleep(100); }
+  // A wait is bound to its caller's task: moving the caller ends it, and the click stays queued.
+  const movedWait = mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 10 }).then(() => "returned", (e) => String(e));
+  await sleep(150);
+  await c.call("session.move", { id: fake.id, channel_id: ch2.id });
+  ok((await movedWait).includes("moved to another task"), "moving the caller cancels its panel wait");
+  await c.call("panel.event", { panel_id: fakePanel, kind: "after-move", payload: {} });
+  await sleep(1200);
+  ok(!(await Deno.readTextFile(`${BASE}/fake-input`)).includes("after-move"), "a moved opener gets no prompt for its old task's panel");
+  const collected = await mcp(shellToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 0 });
+  ok(collected.events[0]?.kind === "after-move", `the old task can still collect that event (${JSON.stringify(collected).slice(0, 300)})`);
+  const closing = (await mcp(shellToken, "panel_open", { title: "Closing", app: "markdown" })).panel_id;
+  await mcp(shellToken, "panel_close", { panel_id: closing });
+  ok(!(await exists(`${DATA}/panels/${closing}`)), "closing a panel deletes its app and data files");
   await c.call("session.remove", { id: fake.id });
   await c.call("panel.event", { panel_id: pid, kind: "durable", payload: { persisted: true } });
 

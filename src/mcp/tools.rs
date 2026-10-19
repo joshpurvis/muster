@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 17] = [
+pub const TOOL_NAMES: [&str; 18] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -34,7 +34,7 @@ pub const TOOL_NAMES: [&str; 17] = [
     "get_diff",
     "list_agents",
     "ask_agent",
-    "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event",
+    "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -248,15 +248,17 @@ pub fn tool_definitions() -> Vec<Value> {
         "baseUriDomains":{"type":"array","items":{"type":"string"}}
     },"additionalProperties":false});
     tools.extend([
-        tool("panel_open", "Open panel", "Open a sandboxed MCP App beside your terminal, scoped to your task. Built-in: markdown with data {markdown}. Custom: html or html_path inside the task cwd. HTML/data limit 1 MiB each. Declared resource domains may load assets; fetching and nested frames stay blocked.",
+        tool("panel_open", "Open panel", "Open a sandboxed MCP App beside your terminal, scoped to your task. Built-in: markdown with data {markdown}. Custom: html or html_path inside the task cwd; the page must call ui/initialize and then send ui/notifications/initialized (MCP Apps 2026-01-26), or it stays on \"Loading\" (minimal example in Muster's docs/MCP.md). HTML/data limit 1 MiB each; at most 16 open panels per task. Declared resource domains may load assets; fetching and nested frames stay blocked.",
             json!({"type":"object","properties":{"title":{"type":"string"},"app":{"type":"string","enum":["markdown","custom"]},"data":{"type":"object"},"html":{"type":"string"},"html_path":{"type":"string"},"csp":csp},"required":["title","app"],"additionalProperties":false}), false),
         tool("panel_update", "Update panel", "Update a panel in your task. Data changes are sent to its app in place; changed HTML reloads the app. Each update advances the revision.",
             json!({"type":"object","properties":{"panel_id":{"type":"integer"},"title":{"type":"string"},"data":{"type":"object"},"html":{"type":"string"},"html_path":{"type":"string"}},"required":["panel_id"],"additionalProperties":false}), false),
-        tool("panel_close", "Close panel", "Close a panel belonging to your task; queued user events remain available until the task is archived.",
+        tool("panel_close", "Close panel", "Close a panel belonging to your task. Its app and data are deleted; user events queued before the close are still delivered.",
             json!({"type":"object","properties":{"panel_id":{"type":"integer"}},"required":["panel_id"],"additionalProperties":false}), false),
         tool("list_panels", "List panels", "List the open panels belonging to your task, including their revision, title and opener.", empty_schema(), true),
-        tool("wait_for_panel_event", "Wait for panel event", "Wait for queued user events in your task's panels. While waiting, matching events are returned here instead of injected into the opener. Otherwise events reach an idle agent as a marked panel prompt. Shells and exited sessions retain queued events.",
+        tool("wait_for_panel_event", "Wait for panel event", "Wait for queued user events in your task's panels and consume them. Returns whole events (each with an id) up to about 256 KiB and `remaining`, the number still queued. While waiting, matching events come here instead of being typed into the opener; otherwise they reach the idle opener as a marked panel prompt. Shells and exited sessions keep events queued. The wait fails if your session moves to another task or restarts.",
             json!({"type":"object","properties":{"panel_id":{"type":"integer"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":1800,"default":300}},"additionalProperties":false}), true),
+        tool("panel_event", "Fetch panel event", "Fetch the full payload of a user event that a panel prompt showed only as a placeholder because it was too long. Fetching consumes it.",
+            json!({"type":"object","properties":{"panel_id":{"type":"integer"},"event_id":{"type":"integer"}},"required":["panel_id","event_id"],"additionalProperties":false}), true),
     ]);
     tools
 }
@@ -446,7 +448,7 @@ pub async fn call_tool<B: Backend>(
         // accepted (same guards), not listed.
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
-        "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" => panel_tool(st, caller, name, map).await,
+        "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
         _ => return Err(()),
     };
     Ok(match res {

@@ -513,6 +513,8 @@ pub enum PanelCmd {
         panel_id: Option<i64>,
         #[arg(long, default_value_t = 300)] timeout_seconds: u64,
     },
+    /// Fetch an event a panel prompt showed only as a placeholder (too long for the prompt).
+    Event { panel_id: i64, event_id: i64 },
 }
 
 pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
@@ -531,6 +533,7 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
             anyhow::ensure!(timeout_seconds <= 1800, "timeout_seconds must be at most 1800");
             ("panel.wait", json!({"panel_id":panel_id,"timeout_seconds":timeout_seconds}), timeout_seconds + 10)
         },
+        PanelCmd::Event { panel_id, event_id } => ("panel.fetch_event", json!({"panel_id":panel_id,"event_id":event_id}), 30),
     };
     args.as_object_mut().unwrap().retain(|_, v| !v.is_null());
     print_json(&client::rpc_with_timeout(d, method, json!({"from_session":session,"arguments":args}), Duration::from_secs(timeout))?)

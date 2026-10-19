@@ -152,13 +152,13 @@ pub struct Prov {
     pub msg_id: Option<i64>,
 }
 
-/// Who a prompt typed by the injector comes from.
+/// Who a prompt typed by the injector comes from. Persisted in the prompt queue, which an
+/// older backend must still load after a rollback: add no variants (a panel prompt is a
+/// human-origin `Chain` at hop 0; its panel attribution rides on the queue item instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     /// The human, through a client or device connection: clears the session's provenance.
     Human,
-    /// A user action in a sandboxed panel. Retains explicit attribution in the queue.
-    Panel(crate::model::PanelId),
     /// A message on a chain (an agent's send or spawn prompt, an agent message): becomes it.
     Chain(Prov),
 }
@@ -884,10 +884,6 @@ impl Registry {
             state.human_seen.remove(&id);
             match source {
                 Source::Human => { state.prov.remove(&id); state.active.remove(&id); }
-                Source::Panel(_) => {
-                    state.prov.insert(id, Prov { origin: Origin::Human, hop: 0, msg_id: None });
-                    state.active.remove(&id);
-                }
                 Source::Chain(prov) => {
                     state.prov.insert(id, prov);
                     match prov.msg_id {

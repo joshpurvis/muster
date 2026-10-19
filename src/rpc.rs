@@ -161,13 +161,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             Ok(result)
         }
 
-        "panel.open" | "panel.update" | "panel.close" | "panel.list" | "panel.wait" => {
+        "panel.open" | "panel.update" | "panel.close" | "panel.list" | "panel.wait" | "panel.fetch_event" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
             struct P { from_session: SessionId, #[serde(default = "empty_object")] arguments: Value }
             let p: P = parse(params)?;
             let tool = match method {
                 "panel.open" => "panel_open", "panel.update" => "panel_update", "panel.close" => "panel_close",
-                "panel.list" => "list_panels", _ => "wait_for_panel_event",
+                "panel.list" => "list_panels", "panel.fetch_event" => "panel_event", _ => "wait_for_panel_event",
             };
             mcp_json(crate::mcp::call_as(hub, p.from_session, tool, p.arguments).await)
         }

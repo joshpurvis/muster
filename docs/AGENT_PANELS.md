@@ -184,3 +184,12 @@ device scopes ([ANDROID.md](ANDROID.md)) decide whether it may send events or on
 Also settled: MCP Apps as the panel format; events reach the agent through
 `wait_for_panel_event` or, when it is idle, as a marked prompt; apps send events only on a user
 action; the phone comes last.
+
+## Known gaps
+
+- `wait_for_panel_event` and `panel_event` delete the events they return as the result is
+  built. If the backend dies, or the caller's connection drops, before the caller reads it,
+  those events are lost. Chosen over redelivering events the agent may already have acted on.
+- On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
+  afterwards, so swapping a parent directory for a symlink in between could copy a file from
+  outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.

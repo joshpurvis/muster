@@ -323,7 +323,33 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX panel_events_panel ON panel_events(panel_id, id);
     "#,
+    // v15: events shown to an agent only as a placeholder stay fetchable by id (`panel_event`).
+    r#"
+    ALTER TABLE panel_events ADD COLUMN parked INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
+
+/// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
+#[derive(Debug, Default)]
+pub struct PanelEventMoves {
+    pub claim: Vec<PanelEvent>,
+    pub release: Vec<PanelEvent>,
+    pub park: Vec<PanelEvent>,
+}
+
+/// Remove exactly these queued events; each must still be there, so two consumers can never
+/// both take one. The overflow notice (id 0) resets its panel's dropped count.
+fn apply_panel_claims(tx: &rusqlite::Transaction, events: &[PanelEvent]) -> anyhow::Result<()> {
+    for event in events {
+        if event.id == 0 {
+            tx.execute("UPDATE panels SET record=json_set(record,'$.dropped_events',0) WHERE id=?1", [event.panel_id])?;
+            continue;
+        }
+        let n = tx.execute("DELETE FROM panel_events WHERE id=?1 AND panel_id=?2", params![event.id, event.panel_id])?;
+        anyhow::ensure!(n == 1, "panel event {} is no longer queued", event.id);
+    }
+    Ok(())
+}
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
 /// approvals, session start/exit and system notices are the channel's history and are kept.
@@ -445,35 +471,101 @@ impl Store {
         Ok(())
     }
 
+    /// The panel's queued events in order, each with its stored id (parked events, already
+    /// announced by a placeholder, are left out). An `overflow` notice (id 0) leads when events
+    /// were dropped; the latest app context rides on the last event.
     pub fn panel_events(&self, panel: &Panel) -> anyhow::Result<Vec<PanelEvent>> {
         let conn = self.conn.lock();
-        let mut q = conn.prepare("SELECT record FROM panel_events WHERE panel_id=?1 ORDER BY id")?;
-        let rows = q.query_map([panel.id], |r| r.get::<_, String>(0))?;
-        let mut events: Vec<PanelEvent> = rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect::<anyhow::Result<_>>()?;
+        let mut q = conn.prepare("SELECT id, record FROM panel_events WHERE panel_id=?1 AND parked=0 ORDER BY id")?;
+        let rows = q.query_map([panel.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut events: Vec<PanelEvent> = rows.map(|r| {
+            let (id, record) = r?;
+            let mut event: PanelEvent = serde_json::from_str(&record)?;
+            event.id = id;
+            Ok(event)
+        }).collect::<anyhow::Result<_>>()?;
         if panel.dropped_events > 0 {
-            events.insert(0, PanelEvent { panel_id: panel.id, kind: "overflow".into(), payload: serde_json::json!({"dropped": panel.dropped_events}), at: now_ms(), context: None });
+            events.insert(0, PanelEvent { id: 0, panel_id: panel.id, kind: "overflow".into(), payload: serde_json::json!({"dropped": panel.dropped_events}), at: now_ms(), context: None });
         }
         if let Some(last) = events.last_mut() { last.context = panel.context.clone(); }
         Ok(events)
     }
 
-    /// Acknowledge a batch, optionally in the same transaction that enqueues its prompt.
-    pub fn ack_panel_events(&self, panels: &[Panel], queues: Option<&serde_json::Value>) -> anyhow::Result<()> {
+    /// One stored event of `panel` by id, queued or parked: `(event, parked)`.
+    pub fn panel_event(&self, panel: PanelId, id: i64) -> anyhow::Result<Option<(PanelEvent, bool)>> {
+        let row: Option<(String, bool)> = self.conn.lock().query_row(
+            "SELECT record, parked FROM panel_events WHERE panel_id=?1 AND id=?2", params![panel, id],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        row.map(|(record, parked)| {
+            let mut event: PanelEvent = serde_json::from_str(&record)?;
+            event.id = id;
+            Ok((event, parked))
+        }).transpose()
+    }
+
+    /// Acknowledge exactly these events (a wait returned them, or `panel_event` fetched a
+    /// parked one). By id, so events that arrived or returned meanwhile stay queued.
+    pub fn ack_panel_events(&self, events: &[PanelEvent]) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        if let Some(queues) = queues {
-            tx.execute("INSERT INTO runtime_state(key,record) VALUES ('prompt-queues',?1)
-                ON CONFLICT(key) DO UPDATE SET record=excluded.record", [queues.to_string()])?;
-        }
-        for panel in panels {
-            tx.execute("DELETE FROM panel_events WHERE panel_id=?1", [panel.id])?;
-            let mut saved = panel.clone();
-            saved.dropped_events = 0;
-            tx.execute("UPDATE panels SET record=?2 WHERE id=?1", params![panel.id, serde_json::to_string(&saved)?])?;
+        apply_panel_claims(&tx, events)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save the prompt queues together with the panel event moves their change implies, in one
+    /// transaction: a batch admitted to a queue leaves its panels' queues (`claim`), one dropped
+    /// before typing returns to them (`release`), and placeholder events of a typed batch stay
+    /// fetchable (`park`).
+    pub fn save_prompt_queues(&self, queues: &impl serde::Serialize, moves: &PanelEventMoves) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO runtime_state(key,record) VALUES ('prompt-queues',?1)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(queues)?])?;
+        apply_panel_claims(&tx, &moves.claim)?;
+        for (events, parked) in [(&moves.release, false), (&moves.park, true)] {
+            for event in events.iter() {
+                if event.id == 0 {
+                    if !parked {
+                        // The overflow count goes back on the panel. A concurrent save of an older
+                        // copy of the record can lose this count (a notice only, never an event).
+                        tx.execute("UPDATE panels SET record=json_set(record,'$.dropped_events',
+                            json_extract(record,'$.dropped_events') + ?2) WHERE id=?1",
+                            params![event.panel_id, event.payload["dropped"].as_u64().unwrap_or(0) as i64])?;
+                    }
+                    continue;
+                }
+                let mut stored = event.clone();
+                stored.context = None;
+                // A panel archived meanwhile takes its events with it.
+                tx.execute("INSERT OR IGNORE INTO panel_events(id,panel_id,record,parked)
+                    SELECT ?1,?2,?3,?4 WHERE EXISTS (SELECT 1 FROM panels WHERE id=?2)",
+                    params![event.id, event.panel_id, serde_json::to_string(&stored)?, parked])?;
+            }
         }
         tx.commit()?;
         Ok(())
     }
+
+    pub fn delete_panel(&self, id: PanelId) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM panel_events WHERE panel_id=?1", [id])?;
+        tx.execute("DELETE FROM panels WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Closed panels with nothing left to deliver or fetch.
+    pub fn idle_closed_panels(&self) -> anyhow::Result<Vec<PanelId>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id FROM panels WHERE closed=1
+            AND NOT EXISTS (SELECT 1 FROM panel_events e WHERE e.panel_id=panels.id)
+            AND COALESCE(json_extract(record,'$.dropped_events'),0)=0")?;
+        q.query_map([], |r| r.get(0))?.map(|r| Ok(r?)).collect()
+    }
+
+    pub fn panels_root(&self) -> std::path::PathBuf { self.directory.join("panels") }
 
     pub fn delete_channel_panels(&self, channel: ChannelId) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();

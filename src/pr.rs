@@ -194,8 +194,54 @@ fn media_dir_arg(cwd: &Path, dir: &Path) -> Result<String, String> {
     }
     if parts.is_empty() { return Err("--media-dir must name a new directory".into()) }
     let rel = parts.join("/");
-    if std::fs::symlink_metadata(cwd.join(&rel)).is_ok() { return Err(format!("--media-dir {rel} already exists; give a new directory")) }
+    let (parent, last) = parent_at(cwd, &rel)?;
+    if exists_at(&parent, &last) { return Err(format!("--media-dir {rel} already exists; give a new directory")) }
     Ok(rel)
+}
+
+fn c_name(name: &str) -> std::io::Result<std::ffi::CString> { std::ffi::CString::new(name).map_err(std::io::Error::other) }
+
+/// The current directory, opened once; everything below it is reached through descriptors.
+fn open_cwd(cwd: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC).open(cwd)
+}
+
+/// Opens directory `name` in `dir`, never through a symlink.
+fn open_dir_at(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c = c_name(name)?;
+    // SAFETY: a valid directory descriptor and NUL-terminated name; the new fd is owned below.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(std::io::Error::last_os_error()) }
+    // SAFETY: fd was just opened and is owned by nothing else.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Whether anything (a symlink included, even a dangling one) is called `name` in `dir`.
+fn exists_at(dir: &std::fs::File, name: &str) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(c) = c_name(name) else { return true };
+    // SAFETY: valid descriptor, NUL-terminated name and a zeroed stat buffer to fill.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0 }
+}
+
+/// The parent directory of `rel` (slash-separated, inside `cwd`), reached component by
+/// component without following any symlink, and `rel`'s last component. A symlinked parent
+/// can't move the picture directory outside the current directory.
+fn parent_at(cwd: &Path, rel: &str) -> Result<(std::fs::File, String), String> {
+    let mut dir = open_cwd(cwd).map_err(|e| format!("opening the current directory: {e}"))?;
+    let parts: Vec<&str> = rel.split('/').collect();
+    let (last, parents) = parts.split_last().ok_or("--media-dir must name a new directory")?;
+    for (i, p) in parents.iter().enumerate() {
+        let at = parts[..=i].join("/");
+        dir = open_dir_at(&dir, p).map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => format!("--media-dir: {at} is a symlink or not a directory"),
+            _ => format!("--media-dir: {at}: {e}"),
+        })?;
+    }
+    Ok((dir, last.to_string()))
 }
 
 // ----- running gh and curl -----
@@ -208,18 +254,26 @@ struct Captured {
     timed_out: bool,
 }
 
-/// Runs `program args` (no shell) with stdin closed, keeping at most `max_out` bytes of stdout
-/// (more kills it: `overflow`) and killing it after `timeout`.
-fn capture(program: &OsStr, args: &[String], timeout: Duration, max_out: usize) -> std::io::Result<Captured> {
+/// Runs `program args` (no shell), keeping at most `max_out` bytes of stdout (more kills it:
+/// `overflow`) and killing it after `timeout`. stdin is closed, or gets `input` and is then
+/// closed (how secrets reach a child without showing in its argv, `/proc/*/cmdline`).
+fn capture(program: &OsStr, args: &[String], input: Option<&[u8]>, timeout: Duration, max_out: usize) -> std::io::Result<Captured> {
     let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("NO_COLOR", "1")
         .spawn()?;
+    let in_t = match (input, child.stdin.take()) {
+        (Some(data), Some(mut sin)) => {
+            let data = data.to_vec();
+            Some(std::thread::spawn(move || { let _ = sin.write_all(&data); }))
+        }
+        _ => None,
+    };
     let overflow = Arc::new(AtomicBool::new(false));
     let (mut out, mut err) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
     let flag = overflow.clone();
@@ -252,6 +306,7 @@ fn capture(program: &OsStr, args: &[String], timeout: Duration, max_out: usize) 
     };
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
+    if let Some(t) = in_t { let _ = t.join(); }
     Ok(Captured { code: status.and_then(|s| s.code()), stdout, stderr, overflow: overflow.load(Ordering::SeqCst), timed_out })
 }
 
@@ -261,6 +316,8 @@ enum GhErr {
     Auth(String),
     NotFound(String),
     Failed(String),
+    /// GitHub refused to build the reply because it is too large (HTTP 406/422).
+    TooLarge(String),
     /// GitHub's rate limit: the detail, and when it resets (RFC 3339) if GitHub said.
     RateLimited(String, Option<String>),
 }
@@ -271,7 +328,7 @@ impl GhErr {
             GhErr::Missing => ("gh_missing", "gh (the GitHub CLI) is not installed or not on PATH; install it from https://cli.github.com".to_string()),
             GhErr::Auth(d) => ("gh_auth", format!("gh is not logged in to GitHub: run `gh auth login` ({d})")),
             GhErr::NotFound(d) => ("not_found", d),
-            GhErr::Failed(d) => ("gh_failed", d),
+            GhErr::Failed(d) | GhErr::TooLarge(d) => ("gh_failed", d),
             GhErr::RateLimited(d, reset_at) => {
                 let msg = match &reset_at { Some(r) => format!("{d}; it resets at {r}"), None => d.clone() };
                 return Outcome { code: 5, msg, json: Some(json!({"error": "rate_limited", "detail": d, "reset_at": reset_at})) };
@@ -288,12 +345,16 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
-fn classify(what: &str, code: Option<i32>, stderr: &str) -> GhErr {
+fn classify(what: &str, status: Option<u16>, code: Option<i32>, stderr: &str) -> GhErr {
     let detail = clip(stderr.trim(), 2000);
+    let lower = stderr.to_ascii_lowercase();
     if code == Some(4) || stderr.contains("gh auth login") || stderr.contains("HTTP 401") || stderr.contains("Bad credentials") {
         GhErr::Auth(detail)
     } else if stderr.contains("Could not resolve to") || stderr.contains("HTTP 404") {
         GhErr::NotFound(format!("{what}: {detail}"))
+    } else if matches!(status, Some(406 | 422)) || stderr.contains("HTTP 406") || stderr.contains("HTTP 422")
+        || lower.contains("too large") || lower.contains("too long to generate") || lower.contains("maximum number of") {
+        GhErr::TooLarge(format!("{what}: {detail}"))
     } else {
         let code = code.map_or("a signal".to_string(), |c| c.to_string());
         GhErr::Failed(format!("{what}: gh exited with {code}: {detail}"))
@@ -363,7 +424,7 @@ impl Tools {
         let mut attempt = 0;
         loop {
             let started = Instant::now();
-            let r = { let _slot = self.permit(); capture(&self.gh, &args, GH_TIMEOUT, MAX_GH_OUTPUT) };
+            let r = { let _slot = self.permit(); capture(&self.gh, &args, None, GH_TIMEOUT, MAX_GH_OUTPUT) };
             self.note(what, started);
             let c = r.map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { GhErr::Missing } else { GhErr::Failed(format!("running gh: {e}")) })?;
             if c.timed_out { return Err(GhErr::Failed(format!("{what}: gh took longer than {} s", GH_TIMEOUT.as_secs()))) }
@@ -385,7 +446,7 @@ impl Tools {
                     std::thread::sleep(self.wait_unit * wait as u32);
                     attempt += 1;
                 }
-                None => return Err(classify(what, c.code, &stderr)),
+                None => return Err(classify(what, reply.status, c.code, &stderr)),
             }
         }
     }
@@ -530,7 +591,9 @@ const SNAPSHOT_Q: &str = "query PrSnapshot($owner: String!, $name: String!, $num
 }";
 
 const HEAD_Q: &str = "query PrHead($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) { pullRequest(number: $number) { state headRefOid baseRefName baseRefOid } }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { state headRefOid baseRefName baseRefOid mergedAt closedAt mergeCommit { oid } }
+  }
 }";
 
 const CHECKS_Q: &str = "query PrChecks($owner: String!, $name: String!, $oid: GitObjectID!, $after: String) {
@@ -539,6 +602,7 @@ const CHECKS_Q: &str = "query PrChecks($owner: String!, $name: String!, $oid: Gi
       ... on Commit {
         statusCheckRollup {
           contexts(first: 100, after: $after) {
+            totalCount
             pageInfo { hasNextPage endCursor }
             nodes {
               __typename
@@ -599,9 +663,7 @@ pub fn snapshot(t: &Tools, cwd: &Path, a: &SnapshotArgs) -> Outcome {
         "base": base, "base_sha": base_sha, "head": s(pr, "headRefName"), "head_sha": head_sha,
     });
     if state != "OPEN" {
-        out["merged_at"] = pr.get("mergedAt").cloned().unwrap_or(Value::Null);
-        out["merge_commit"] = pr.pointer("/mergeCommit/oid").cloned().unwrap_or(Value::Null);
-        out["closed_at"] = pr.get("closedAt").cloned().unwrap_or(Value::Null);
+        closure(&mut out, pr);
         out["fetched_at"] = json!(rfc3339(SystemTime::now()));
         return Outcome { code: 4, json: Some(out), msg: format!("PR #{number} is {}, not open", state.to_lowercase()) };
     }
@@ -629,7 +691,7 @@ pub fn snapshot(t: &Tools, cwd: &Path, a: &SnapshotArgs) -> Outcome {
         e.outcome()
     };
     let (mut files, files_complete) = match files { Ok(f) => f, Err(e) => return fail(e) };
-    let (check_items, checks_total) = match checks { Ok(c) => c, Err(e) => return fail(e) };
+    let checks = match checks { Ok(c) => c, Err(e) => return fail(e) };
     truncate_diffs(&mut files, a.max_diff_bytes);
     let (media, more_skipped) = media.unwrap_or_default();
     skipped.extend(more_skipped);
@@ -653,8 +715,9 @@ pub fn snapshot(t: &Tools, cwd: &Path, a: &SnapshotArgs) -> Outcome {
     out["mergeable"] = json!(s(pr, "mergeable"));
     out["merge_method_default"] = json!(merge_default(r));
     out["delete_branch_default"] = json!(r.get("deleteBranchOnMerge").and_then(Value::as_bool).unwrap_or(false));
-    out["checks"] = json!({"state": checks_state(&check_items), "items": check_items});
-    if checks_total > MAX_CHECK_ITEMS { out["checks_total"] = json!(checks_total); }
+    out["checks"] = json!({"state": checks.state, "items": checks.items});
+    out["checks_complete"] = json!(checks.complete);
+    if checks.total > MAX_CHECK_ITEMS || !checks.complete { out["checks_total"] = json!(checks.total); }
     let reviews: Vec<Value> = pr.pointer("/latestReviews/nodes").and_then(Value::as_array).into_iter().flatten()
         .map(|r| json!({"author": login(r), "state": s(r, "state")})).collect();
     out["reviews"] = json!({"decision": s(pr, "reviewDecision"), "items": reviews});
@@ -667,12 +730,20 @@ pub fn snapshot(t: &Tools, cwd: &Path, a: &SnapshotArgs) -> Outcome {
     out["fetched_at"] = json!(rfc3339(SystemTime::now()));
     if state_now != "OPEN" {
         out["state"] = json!(state_now);
+        closure(&mut out, &now);
         if let Some(d) = &dir { d.remove(); }
         out["media"] = json!([]);
         out["media_dir"] = Value::Null;
         return Outcome { code: 4, json: Some(out), msg: format!("PR #{number} is {}, not open", state_now.to_lowercase()) };
     }
     Outcome::ok(out)
+}
+
+/// What exit 4 adds, from either read of a closed or merged PR.
+fn closure(out: &mut Value, pr: &Value) {
+    out["merged_at"] = pr.get("mergedAt").cloned().unwrap_or(Value::Null);
+    out["merge_commit"] = pr.pointer("/mergeCommit/oid").cloned().unwrap_or(Value::Null);
+    out["closed_at"] = pr.get("closedAt").cloned().unwrap_or(Value::Null);
 }
 
 // ----- checks -----
@@ -704,38 +775,59 @@ fn check_item(c: &Value) -> Value {
     item
 }
 
-/// `failing` if any check fails, else `pending` if any is pending, else `passing`; `none` without checks.
-fn checks_state(items: &[Value]) -> &'static str {
+/// `failing` if any check fails, else `pending` if any is pending, else `passing`; `none` without
+/// checks. From an incomplete list never `passing` (or `none`): `failing` if a failure is
+/// already known, else `pending`.
+fn checks_state(items: &[Value], complete: bool) -> &'static str {
     let any = |st: &str| items.iter().any(|i| s(i, "state") == st);
-    if items.is_empty() { "none" } else if any("fail") { "failing" } else if any("pending") { "pending" } else { "passing" }
+    if any("fail") { "failing" } else if !complete || any("pending") { "pending" } else if items.is_empty() { "none" } else { "passing" }
 }
 
-/// The head commit's checks (check runs and commit statuses), at most 1000, of which the 200
-/// that matter most are kept (failing, then pending, cancelled, passing, skipped), in order.
-fn fetch_checks(t: &Tools, owner: &str, name: &str, sha: &str) -> Result<(Vec<Value>, usize), GhErr> {
+/// Pages of 100 checks read at most (so at most this many requests for checks).
+const MAX_CHECK_PAGES: usize = 20;
+
+/// The head commit's checks: check runs and commit statuses.
+struct Checks {
+    /// At most [`MAX_CHECK_ITEMS`]: failing, then pending, cancelled, passing, skipped, in order.
+    items: Vec<Value>,
+    /// The state over every check read (see [`checks_state`]).
+    state: &'static str,
+    /// How many checks GitHub has for the commit.
+    total: usize,
+    /// False when they were not all read (more than [`MAX_CHECK_PAGES`] pages).
+    complete: bool,
+}
+
+fn fetch_checks(t: &Tools, owner: &str, name: &str, sha: &str) -> Result<Checks, GhErr> {
     let mut items = Vec::new();
-    let mut after: Option<String> = None;
-    for page in 0..10 {
+    let (mut after, mut total, mut complete) = (None::<String>, 0usize, true);
+    for page in 0..MAX_CHECK_PAGES {
         let mut strings = vec![("owner", owner), ("name", name), ("oid", sha)];
         if let Some(a) = &after { strings.push(("after", a.as_str())); }
         let d = t.graphql(&format!("checks (page {})", page + 1), CHECKS_Q, &strings, &[])?;
         let Some(ctx) = d.pointer("/repository/object/statusCheckRollup/contexts").filter(|c| !c.is_null()) else { break };
+        total = total.max(n(ctx, "totalCount") as usize);
         items.extend(ctx.get("nodes").and_then(Value::as_array).into_iter().flatten().map(check_item));
         match ctx.pointer("/pageInfo/endCursor").and_then(Value::as_str) {
-            Some(c) if ctx.pointer("/pageInfo/hasNextPage") == Some(&json!(true)) => after = Some(c.to_string()),
+            Some(c) if ctx.pointer("/pageInfo/hasNextPage") == Some(&json!(true)) => {
+                after = Some(c.to_string());
+                complete = page + 1 < MAX_CHECK_PAGES;
+            }
             _ => break,
         }
     }
-    let total = items.len();
-    if total > MAX_CHECK_ITEMS {
+    let total = total.max(items.len());
+    let complete = complete && items.len() >= total;
+    let state = checks_state(&items, complete);
+    if items.len() > MAX_CHECK_ITEMS {
         let rank = |i: &Value| ["fail", "pending", "cancel", "pass", "skipping"].iter().position(|st| *st == s(i, "state")).unwrap_or(5);
-        let mut idx: Vec<usize> = (0..total).collect();
+        let mut idx: Vec<usize> = (0..items.len()).collect();
         idx.sort_by_key(|&i| rank(&items[i]));
         let mut keep: Vec<usize> = idx.into_iter().take(MAX_CHECK_ITEMS).collect();
         keep.sort_unstable();
         items = keep.into_iter().map(|i| items[i].take()).collect();
     }
-    Ok((items, total))
+    Ok(Checks { items, state, total, complete })
 }
 
 // ----- the diff -----
@@ -750,6 +842,9 @@ pub struct FileDiff {
     pub binary: bool,
     pub diff: String,
     pub truncated: bool,
+    /// Why `diff` has no lines to show: a pure rename, a mode change, an empty file, a binary
+    /// file, or text GitHub left out.
+    pub note: Option<String>,
 }
 
 impl FileDiff {
@@ -757,20 +852,21 @@ impl FileDiff {
         let mut v = json!({"file": self.file, "status": self.status, "additions": self.additions, "deletions": self.deletions,
             "binary": self.binary, "diff": self.diff, "truncated": self.truncated});
         if let Some(p) = &self.previous_file { v["previous_file"] = json!(p); }
+        if let Some(note) = &self.note { v["note"] = json!(note); }
         v
     }
 }
 
 /// The files changed from the merge base of `base` to `head` (both SHAs), as one unified diff
-/// (`compare/base...head`, pinned to the SHAs, unlike `gh pr diff`). If GitHub refuses the
-/// diff (too large), its JSON form, which lists at most 300 files: `files_complete` is false
-/// when that cap may have been hit.
+/// (`compare/base...head`, pinned to the SHAs, unlike `gh pr diff`). Only if GitHub refuses
+/// the diff as too large, its JSON form, which lists at most 300 files: `files_complete` is
+/// false when that cap may have been hit. Every other error, a rate limit above all, stands.
 fn fetch_files(t: &Tools, repo: &str, base: &str, head: &str) -> Result<(Vec<FileDiff>, bool), GhErr> {
     let path = format!("repos/{repo}/compare/{base}...{head}");
     let raw = t.gh("diff", vec!["api".into(), path.clone(), "-H".into(), "Accept: application/vnd.github.diff".into()]);
     match raw {
         Ok(bytes) => Ok((parse_diff(&String::from_utf8_lossy(&bytes)), true)),
-        Err(e @ (GhErr::Missing | GhErr::Auth(_))) => Err(e),
+        Err(e) if !matches!(e, GhErr::TooLarge(_)) => Err(e),
         Err(_) => {
             let bytes = t.gh("changed files", vec!["api".into(), format!("{path}?per_page=1")])?;
             let v: Value = serde_json::from_slice(&bytes).map_err(|e| GhErr::Failed(format!("changed files: GitHub's reply is not JSON: {e}")))?;
@@ -781,23 +877,45 @@ fn fetch_files(t: &Tools, repo: &str, base: &str, head: &str) -> Result<(Vec<Fil
     }
 }
 
-/// One file of the compare API's JSON (`patch` is missing for binary files and huge diffs).
+/// What a file without diff lines is, by its status (`None` when it should have lines).
+fn structural_note(status: &str, previous: Option<&str>) -> Option<String> {
+    let prev = previous.unwrap_or("?");
+    match status {
+        "renamed" => Some(format!("renamed from {prev}, content unchanged")),
+        "copied" => Some(format!("copied from {prev}, content unchanged")),
+        "changed" => Some("file mode changed only".into()),
+        "added" => Some("new empty file".into()),
+        "removed" => Some("deleted empty file".into()),
+        _ => None,
+    }
+}
+
+/// One file of the compare API's JSON. `patch` is missing for binary files and huge diffs, and
+/// GitHub doesn't say which; it is also missing when there are no lines (a pure rename, a mode
+/// change, an empty file). So `binary` stays false here, a file with changed lines but no
+/// patch is `truncated`, and the others get a `note`.
 fn api_file(f: &Value) -> FileDiff {
     let file = s(f, "filename").to_string();
     let status = match s(f, "status") { "added" => "added", "removed" => "removed", "renamed" => "renamed", "copied" => "copied", "modified" => "modified", _ => "changed" };
-    let previous_file = f.get("previous_filename").and_then(Value::as_str).map(str::to_string);
-    let patch = f.get("patch").and_then(Value::as_str);
-    let binary = patch.is_none() && n(f, "changes") == 0 && status != "changed";
-    let diff = match patch {
+    let previous_file = f.get("previous_filename").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_string);
+    let patch = f.get("patch").and_then(Value::as_str).filter(|p| !p.is_empty());
+    let changed_lines = n(f, "changes") > 0 || n(f, "additions") > 0 || n(f, "deletions") > 0;
+    let (diff, truncated, note) = match patch {
         Some(p) => {
             let old = if status == "added" { "/dev/null".to_string() } else { format!("a/{}", previous_file.as_deref().unwrap_or(&file)) };
             let new = if status == "removed" { "/dev/null".to_string() } else { format!("b/{file}") };
-            format!("--- {old}\n+++ {new}\n{p}{}", if p.ends_with('\n') { "" } else { "\n" })
+            (format!("--- {old}\n+++ {new}\n{p}{}", if p.ends_with('\n') { "" } else { "\n" }), false, None)
         }
-        None => String::new(),
+        None if changed_lines => (String::new(), true, Some("GitHub left out this file's diff (too large)".to_string())),
+        None => {
+            let note = structural_note(status, previous_file.as_deref()).map(|n| match status {
+                "added" | "removed" | "modified" => format!("{n} (or a binary file: GitHub's file list doesn't say)"),
+                _ => n,
+            });
+            (String::new(), false, Some(note.unwrap_or_else(|| "no lines changed, or a binary file (GitHub's file list doesn't say)".into())))
+        }
     };
-    let truncated = patch.is_none() && !binary && n(f, "changes") > 0;
-    FileDiff { file, status, previous_file, additions: n(f, "additions"), deletions: n(f, "deletions"), binary, diff, truncated }
+    FileDiff { file, status, previous_file, additions: n(f, "additions"), deletions: n(f, "deletions"), binary: false, diff, truncated, note }
 }
 
 /// Git's C-style quoting of unusual file names (`"a/caf\303\251"`), undone.
@@ -897,7 +1015,10 @@ fn parse_file(chunk: &str) -> FileDiff {
     let file = plus.clone().or(to.clone()).or(minus.clone()).or_else(|| git_line_path(first)).unwrap_or_default();
     let status = status.unwrap_or(if !in_hunk && !binary && mode { "changed" } else { "modified" });
     let previous_file = matches!(status, "renamed" | "copied").then(|| from.or(minus)).flatten();
-    FileDiff { file, status, previous_file, additions, deletions, binary, diff: chunk.to_string(), truncated: false }
+    let note = if binary { Some("binary file: no text diff".to_string()) }
+        else if in_hunk { None }
+        else { structural_note(status, previous_file.as_deref()) };
+    FileDiff { file, status, previous_file, additions, deletions, binary, diff: chunk.to_string(), truncated: false, note }
 }
 
 /// Cuts the diffs to `budget` bytes in all, fairly: small files stay whole and the big ones
@@ -1079,13 +1200,33 @@ fn sniff(b: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Downloads one picture with curl: https only (redirects too), at most 1.5 MB and 20 s.
+/// A curl config line for `url` (curl's quoting: backslash escapes inside double quotes).
+fn curl_config(url: &str) -> String {
+    let mut q = String::with_capacity(url.len() + 10);
+    for c in url.chars() {
+        match c {
+            '\\' => q.push_str("\\\\"),
+            '"' => q.push_str("\\\""),
+            '\n' => q.push_str("\\n"),
+            '\r' => q.push_str("\\r"),
+            '\t' => q.push_str("\\t"),
+            c => q.push(c),
+        }
+    }
+    format!("url = \"{q}\"\n")
+}
+
+/// Downloads one picture with curl: https only (redirects too), at most 1.5 MB and 20 s. The
+/// URL (for an attachment, GitHub's signed link: a short-lived credential) goes to curl as a
+/// config on stdin (`-K -`), never in its argv, and never into an error message. `-q` comes
+/// first so no ~/.curlrc is read.
 fn download(t: &Tools, url: &str) -> Result<(&'static str, Vec<u8>), String> {
     let args: Vec<String> = ["-q", "-sS", "-f", "-L", "-g", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "5",
-        "--max-time", &IMAGE_TIMEOUT_SECS.to_string(), "--max-filesize", &MAX_IMAGE_BYTES.to_string(), "--", url]
+        "--max-time", &IMAGE_TIMEOUT_SECS.to_string(), "--max-filesize", &MAX_IMAGE_BYTES.to_string(), "-K", "-"]
         .iter().map(|a| a.to_string()).collect();
     let started = Instant::now();
-    let c = { let _slot = t.permit(); capture(&t.curl, &args, Duration::from_secs(IMAGE_TIMEOUT_SECS + 2), MAX_IMAGE_BYTES) };
+    let config = curl_config(url);
+    let c = { let _slot = t.permit(); capture(&t.curl, &args, Some(config.as_bytes()), Duration::from_secs(IMAGE_TIMEOUT_SECS + 2), MAX_IMAGE_BYTES) };
     t.note("picture", started);
     let c = c.map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { "curl is not installed".to_string() } else { format!("running curl: {e}") })?;
     if c.overflow { return Err("larger than 1.5 MB".into()) }
@@ -1096,11 +1237,19 @@ fn download(t: &Tools, url: &str) -> Result<(&'static str, Vec<u8>), String> {
         Some(28) => return Err(format!("took longer than {IMAGE_TIMEOUT_SECS} s")),
         Some(1) => return Err("redirected to a URL that is not https".into()),
         Some(47) => return Err("too many redirects".into()),
-        Some(22) => return Err(format!("the server refused it ({})", clip(String::from_utf8_lossy(&c.stderr).trim().trim_start_matches("curl: "), 200))),
+        Some(22) => return Err(format!("the server refused it ({})", curl_error(&c.stderr, url))),
         code => return Err(format!("download failed (curl exit {})", code.map_or("signal".into(), |c| c.to_string()))),
     }
     let kind = sniff(&c.stdout).ok_or("not a PNG, JPEG, GIF or WebP picture")?;
     Ok((kind, c.stdout))
+}
+
+/// curl's error line, without the URL or any query string (a signed link's token).
+fn curl_error(stderr: &[u8], url: &str) -> String {
+    let text = String::from_utf8_lossy(stderr).replace(url, "<url>");
+    let text = text.trim().trim_start_matches("curl: ");
+    if text.contains('?') || text.contains("jwt") { return "details withheld".into() }
+    clip(text, 200)
 }
 
 /// Downloads the first [`MAX_IMAGES`] pictures in parallel into `dir`, in body order.
@@ -1125,39 +1274,54 @@ fn download_all(t: &Tools, dir: &MediaDir, refs: &[ImageRef]) -> (Vec<Value>, Ve
     (media, skipped)
 }
 
-/// A fresh private directory for the pictures, inside the current directory. Files are
-/// created through its descriptor, exclusively and never through a symlink.
+/// A fresh private directory for the pictures, inside the current directory. It is created
+/// with `mkdirat` in a parent reached without symlinks ([`parent_at`]), and files are created
+/// through its descriptor, exclusively and never through a symlink.
 struct MediaDir {
     rel: String,
-    path: PathBuf,
+    parent: std::fs::File,
+    name: String,
     fd: std::fs::File,
     written: std::sync::Mutex<Vec<String>>,
 }
 
 impl MediaDir {
     fn create(cwd: &Path, given: Option<&str>) -> Result<MediaDir, String> {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-        let mut tries = 0;
-        let rel = loop {
-            let rel = match given { Some(g) => g.to_string(), None => format!(".muster-pr-{:08x}", rand::random::<u32>()) };
-            match std::fs::DirBuilder::new().mode(0o700).create(cwd.join(&rel)) {
-                Ok(()) => break rel,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && given.is_none() && tries < 8 => tries += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(format!("{rel} already exists")),
-                Err(e) => return Err(format!("creating {rel}: {e}")),
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let mkdir = |parent: &std::fs::File, name: &str| -> std::io::Result<()> {
+            let c = c_name(name)?;
+            // SAFETY: valid directory descriptor and NUL-terminated name.
+            if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        };
+        let (parent, rel, name) = match given {
+            Some(g) => {
+                let (parent, last) = parent_at(cwd, g)?;
+                mkdir(&parent, &last).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { format!("{g} already exists") } else { format!("creating {g}: {e}") })?;
+                (parent, g.to_string(), last)
+            }
+            None => {
+                let parent = open_cwd(cwd).map_err(|e| format!("opening the current directory: {e}"))?;
+                let mut tries = 0;
+                let name = loop {
+                    let name = format!(".muster-pr-{:08x}", rand::random::<u32>());
+                    match mkdir(&parent, &name) {
+                        Ok(()) => break name,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                        Err(e) => return Err(format!("creating {name}: {e}")),
+                    }
+                };
+                (parent, name.clone(), name)
             }
         };
-        let path = cwd.join(&rel);
-        let fd = std::fs::OpenOptions::new().read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path)
-            .map_err(|e| format!("opening {rel}: {e}"))?;
+        let fd = open_dir_at(&parent, &name).map_err(|e| format!("opening {rel}: {e}"))?;
         fd.set_permissions(std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("{rel}: {e}"))?;
-        Ok(MediaDir { rel, path, fd, written: Default::default() })
+        Ok(MediaDir { rel, parent, name, fd, written: Default::default() })
     }
 
     fn write(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd};
-        let c = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+        let c = c_name(name)?;
         // SAFETY: a valid directory descriptor and NUL-terminated name; the new fd is owned below.
         let fd = unsafe {
             libc::openat(self.fd.as_raw_fd(), c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600)
@@ -1178,7 +1342,10 @@ impl MediaDir {
                 unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) };
             }
         }
-        let _ = std::fs::remove_dir(&self.path);
+        if let Ok(c) = c_name(&self.name) {
+            // SAFETY: valid descriptor and NUL-terminated name; only an empty directory goes.
+            unsafe { libc::unlinkat(self.parent.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) };
+        }
     }
 }
 
@@ -1214,10 +1381,46 @@ mod tests {
     }
 
     #[test]
+    fn media_dir_never_follows_a_symlink() {
+        let root = std::env::temp_dir().join(format!("muster-pr-mlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (cwd, outside) = (root.join("cwd"), root.join("outside"));
+        std::fs::create_dir_all(cwd.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), cwd.join("dangling")).unwrap();
+        // A symlinked parent, a symlink as the directory itself, a dangling one.
+        assert!(media_dir_arg(&cwd, Path::new("link/new")).unwrap_err().contains("symlink"));
+        assert!(media_dir_arg(&cwd, Path::new("link")).unwrap_err().contains("already exists"));
+        assert!(media_dir_arg(&cwd, Path::new("dangling")).unwrap_err().contains("already exists"));
+        assert!(MediaDir::create(&cwd, Some("link/new")).is_err());
+        assert!(MediaDir::create(&cwd, Some("link")).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing was created outside");
+        // A real parent works, and removal takes the files and the directory.
+        let d = MediaDir::create(&cwd, Some("real/new")).unwrap();
+        d.write("1.png", b"x").unwrap();
+        assert!(d.write("1.png", b"y").is_err(), "never replaces a file");
+        assert!(cwd.join("real/new/1.png").is_file());
+        d.remove();
+        assert!(!cwd.join("real/new").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn curl_config_quotes_the_url() {
+        assert_eq!(curl_config("https://a/b?jwt=x.y"), "url = \"https://a/b?jwt=x.y\"\n");
+        assert_eq!(curl_config("https://a/\"x\\y\nz"), "url = \"https://a/\\\"x\\\\y\\nz\"\n");
+        assert_eq!(curl_error(b"curl: (22) The requested URL returned error: 404", "https://a"), "(22) The requested URL returned error: 404");
+        assert_eq!(curl_error(b"curl: (22) https://a/b?jwt=SECRET failed", "https://x"), "details withheld");
+    }
+
+    #[test]
     fn media_dir_must_be_new_and_inside() {
         let cwd = std::env::temp_dir().join(format!("muster-pr-mdir-{}", std::process::id()));
         std::fs::create_dir_all(cwd.join("exists")).unwrap();
+        std::fs::create_dir_all(cwd.join("x")).unwrap();
         assert_eq!(media_dir_arg(&cwd, Path::new("./shots")).unwrap(), "shots");
+        assert!(media_dir_arg(&cwd, Path::new("missing/y")).is_err(), "parents must exist");
         assert_eq!(media_dir_arg(&cwd, &cwd.join("x/y")).unwrap(), "x/y");
         assert!(media_dir_arg(&cwd, Path::new("exists")).is_err());
         assert!(media_dir_arg(&cwd, Path::new("../out")).is_err());
@@ -1294,13 +1497,18 @@ diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\25
             ("café.txt", "modified", None, 1, 1, false),
         ]);
         assert!(files[0].diff.starts_with("diff --git a/src/a.rs") && files[0].diff.ends_with(" ctx\n"));
+        let notes: Vec<Option<&str>> = files.iter().map(|f| f.note.as_deref()).collect();
+        assert_eq!(notes, [None, None, None, Some("renamed from old name.md, content unchanged"), Some("binary file: no text diff"),
+            Some("file mode changed only"), None]);
+        let empty = parse_diff("diff --git a/e.txt b/e.txt\nnew file mode 100644\nindex 0000000..e69de29\n");
+        assert_eq!((empty[0].status, empty[0].binary, empty[0].note.as_deref()), ("added", false, Some("new empty file")));
         assert_eq!(files.iter().map(|f| f.diff.len()).sum::<usize>(), diff.len());
     }
 
     fn fd(name: &str, size: usize) -> FileDiff {
         let line = "+0123456789\n";
         FileDiff { file: name.into(), status: "modified", previous_file: None, additions: 0, deletions: 0, binary: false,
-            diff: line.repeat(size / line.len()), truncated: false }
+            diff: line.repeat(size / line.len()), truncated: false, note: None }
     }
 
     #[test]
@@ -1332,9 +1540,14 @@ diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\25
         assert_eq!(run("IN_PROGRESS", "")["state"], "pending");
         let status = check_item(&json!({"__typename": "StatusContext", "context": "ci/legacy", "state": "ERROR", "targetUrl": "http://x"}));
         assert_eq!(status, json!({"name": "ci/legacy", "state": "fail"}));
-        assert_eq!(checks_state(&[]), "none");
-        assert_eq!(checks_state(&[run("COMPLETED", "SUCCESS"), run("QUEUED", "")]), "pending");
-        assert_eq!(checks_state(&[run("COMPLETED", "FAILURE"), run("QUEUED", "")]), "failing");
+        assert_eq!(checks_state(&[], true), "none");
+        assert_eq!(checks_state(&[run("COMPLETED", "SUCCESS")], true), "passing");
+        assert_eq!(checks_state(&[run("COMPLETED", "SUCCESS"), run("QUEUED", "")], true), "pending");
+        assert_eq!(checks_state(&[run("COMPLETED", "FAILURE"), run("QUEUED", "")], true), "failing");
+        // An incomplete list is never passing.
+        assert_eq!(checks_state(&[run("COMPLETED", "SUCCESS")], false), "pending");
+        assert_eq!(checks_state(&[], false), "pending");
+        assert_eq!(checks_state(&[run("COMPLETED", "FAILURE")], false), "failing");
         assert_eq!(rollup_checks(Some("EXPECTED")), "pending");
         assert_eq!(rollup_checks(None), "none");
     }
@@ -1354,7 +1567,7 @@ diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\25
         truncate_diffs(&mut files, DEFAULT_MAX_DIFF);
         crate::panel_apps::check_pr(&json!({"repo": "acme/api", "number": 812, "title": "T", "author": "dana",
             "url": "https://github.com/acme/api/pull/812", "base": "master", "head": "dana/x", "head_sha": "0123456789abcdef0123456789abcdef01234567",
-            "summary": "S", "risk": {"level": "low"}, "checks": {"state": checks_state(&items), "items": items},
+            "summary": "S", "risk": {"level": "low"}, "checks": {"state": checks_state(&items, true), "items": items},
             "reviews": {"decision": "", "items": [{"author": "lee", "state": "APPROVED"}]},
             "merge_method_default": merge_default(&json!({})), "delete_branch_default": false,
             "changes": [{"file": files[0].file, "note": "n", "diff": files[0].diff}]})).unwrap();
@@ -1412,11 +1625,13 @@ diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n--- \"a/caf\\303\\25
     #[test]
     fn capture_caps_output_and_time() {
         let args = |s: &str| vec!["-c".to_string(), s.to_string()];
-        let c = capture(OsStr::new("sh"), &args("head -c 5000 /dev/zero"), Duration::from_secs(10), 1000).unwrap();
+        let c = capture(OsStr::new("sh"), &args("head -c 5000 /dev/zero"), None, Duration::from_secs(10), 1000).unwrap();
         assert!(c.overflow && c.stdout.len() == 1000);
         let t0 = Instant::now();
-        let c = capture(OsStr::new("sh"), &args("sleep 5"), Duration::from_millis(200), 1000).unwrap();
+        let c = capture(OsStr::new("sh"), &args("sleep 5"), None, Duration::from_millis(200), 1000).unwrap();
         assert!(c.timed_out && t0.elapsed() < Duration::from_secs(3));
-        assert!(matches!(capture(OsStr::new("/nonexistent/gh"), &[], Duration::from_secs(1), 10), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+        let c = capture(OsStr::new("sh"), &args("cat"), Some(b"url = \"x\"\n"), Duration::from_secs(10), 1000).unwrap();
+        assert_eq!(c.stdout, b"url = \"x\"\n");
+        assert!(matches!(capture(OsStr::new("/nonexistent/gh"), &[], None, Duration::from_secs(1), 10), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
     }
 }

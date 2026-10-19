@@ -7,6 +7,7 @@ import {
   altHeld,
   confirmClose,
   focusedSession,
+  focusedTabId,
   focusedTask,
   hereIds,
   overlay,
@@ -21,6 +22,7 @@ import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { canCloseWindow, isNative } from "./native.ts";
 import { latencyMonitorOn, setLatencyMonitor } from "./latency_monitor.ts";
 import { isMac } from "./util.ts";
+import type { KeyChord, PanelKey } from "./panels/bridge.ts";
 
 export interface KeySpec {
   ctrl: boolean;
@@ -120,7 +122,8 @@ export function keyLabel(s: string): string[] {
   });
 }
 
-const hasTab = () => focusedSession.value !== null;
+const hasTab = () => focusedTabId.value !== null;
+const hasTerminal = () => focusedSession.value !== null;
 
 function onOff(on: boolean, onText: string, offText: string) {
   toast("info", on ? onText : offText);
@@ -254,7 +257,7 @@ export const commands: Command[] = [
     id: "rename-tab",
     title: "Rename",
     group: "Tab",
-    enabled: hasTab,
+    enabled: hasTerminal,
     run: () => {
       const s = focusedSession.value;
       if (s) A.startRename(s.id, "terminal");
@@ -272,7 +275,7 @@ export const commands: Command[] = [
     title: "Move tab to a new window",
     group: "Tab",
     enabled: () => hasTab() && windowsSupported.value && windowId.value !== null,
-    run: () => focusedSession.value && A.moveTabToWindow(focusedSession.value.id, "new"),
+    run: () => { if (focusedTabId.value !== null) A.moveTabToWindow(focusedTabId.value, "new"); },
   },
   {
     id: "close-tab",
@@ -290,7 +293,7 @@ export const commands: Command[] = [
       const s = focusedSession.value;
       if (s) A.restartSession(s.id);
     },
-    enabled: hasTab,
+    enabled: hasTerminal,
   },
   {
     id: "interrupt",
@@ -300,7 +303,7 @@ export const commands: Command[] = [
       const s = focusedSession.value;
       if (s) A.interruptSession(s.id);
     },
-    enabled: hasTab,
+    enabled: hasTerminal,
   },
   {
     id: "approve",
@@ -516,9 +519,8 @@ function isTextEditingAlt(k: KeySpec): boolean {
   return k.alt && !k.shift && !k.ctrl && !k.meta && /^(Key[A-Z]|Arrow)/.test(k.code);
 }
 
-export function findBinding(e: KeyboardEvent): Binding | null {
+export function findBinding(e: KeyboardEvent, ctx: KeyCtx = ctxOf(e)): Binding | null {
   if (e.type !== "keydown") return null;
-  const ctx = ctxOf(e);
   for (const b of bindings) {
     if (!matches(b.spec, e)) continue;
     // Let text fields keep Alt+letters and Alt+arrows (word motion, etc.).
@@ -543,6 +545,32 @@ function overlayAllows(b: Binding): boolean {
 /** A pending "Close?" only takes keys while its question is on screen in this window. */
 function pendingHere(sid: number): boolean {
   return hereIds.value.has(sid);
+}
+
+// Shortcuts that also work while a panel's app has focus (its frame swallows keys; the sandbox
+// helper hands these to us). Navigation only: an app can fake these messages, so nothing here
+// starts, approves, interrupts or types into anything. Close closes that panel itself.
+const PANEL_COMMANDS = new Set([
+  "jump", "palette", "next-needs-you", "next-tab", "prev-tab", "move-tab-left", "move-tab-right",
+  "close-tab", "agents-panel", "zoom", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
+  ...["left", "right", "up", "down"].map((d) => `focus-${d}`),
+]);
+const panelBindings = () => bindings.filter((b) => PANEL_COMMANDS.has(b.cmd.id));
+
+/** The chords a panel's sandbox should hand to the host (see web/panels/proxy.html). */
+export function panelChords(): KeyChord[] {
+  return panelBindings().map(({ spec }) => ({ ...spec, editAlt: isTextEditingAlt(spec) }));
+}
+
+/** A shortcut pressed inside panel tab `tab`'s app (the bridge checked the panel has focus). */
+export function runPanelKey(tab: number, k: PanelKey) {
+  const e = new KeyboardEvent("keydown", {
+    code: k.code, key: k.key, ctrlKey: k.ctrl, altKey: k.alt, shiftKey: k.shift, metaKey: k.meta,
+  });
+  const b = findBinding(e, { inTerminal: false, inInput: k.inInput });
+  if (!b || !PANEL_COMMANDS.has(b.cmd.id) || !overlayAllows(b)) return;
+  if (b.cmd.id === "close-tab") A.closeTab(tab);
+  else if (!b.cmd.enabled || b.cmd.enabled()) b.cmd.run();
 }
 
 export function installKeys() {

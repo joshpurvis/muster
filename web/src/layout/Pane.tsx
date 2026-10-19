@@ -2,7 +2,8 @@
 // (+ approval banner, exited bar, find bar). The top-right group's strip also carries the
 // window controls.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import type { PaneNode } from "./tree.ts";
+import { panelId, panelTab, type PaneNode } from "./tree.ts";
+import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
 import {
   accountProfiles,
   altHeld,
@@ -11,13 +12,14 @@ import {
   meta,
   renaming,
   sessions,
+  panels,
   sessionsByChannel,
   unread,
   windowId,
   windowsSupported,
   workspaceById,
 } from "../state.ts";
-import type { Channel, SessionInfo, SessionKind } from "../types.ts";
+import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
@@ -36,6 +38,7 @@ import {
   IconMaximize,
   IconMinimize,
   IconPlus,
+  IconPanel,
   IconRestart,
   IconShield,
   IconSpark,
@@ -220,8 +223,9 @@ export function Group(
   },
 ) {
   const all = sessions.value;
-  const tabs = pane.tabs.map((id) => all.get(id)).filter(Boolean) as SessionInfo[];
+  const tabs = pane.tabs.filter((id) => all.has(id) || panels.value.has(panelId(id) ?? -1));
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
+  const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
   const find = A.findOpen.value;
   const dragging = drag.value;
 
@@ -262,6 +266,7 @@ export function Group(
         )}
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
+        {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
         {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (
@@ -315,7 +320,7 @@ function newTabMenu(paneId: string): MenuItem[] {
 function TabStrip(
   { pane, tabs, focused, zoomed, controls }: {
     pane: PaneNode;
-    tabs: SessionInfo[];
+    tabs: number[];
     focused: boolean;
     zoomed: boolean;
     controls: boolean;
@@ -367,12 +372,12 @@ function TabStrip(
       moreRef.current!,
       [
         { header: `${tabs.length} tabs in this group` },
-        ...tabs.map((s, i): MenuItem => ({
-          label: tabText(labelOf(s)),
-          icon: <StateDot state={s.state} />,
+        ...tabs.map((id, i): MenuItem => ({
+          label: panels.value.get(panelId(id) ?? -1)?.title ?? tabText(labelOf(sessions.value.get(id)!)),
+          icon: panelId(id) !== null ? <IconPanel size={13} /> : <StateDot state={sessions.value.get(id)!.state} />,
           keys: focused && i < 9 ? `Alt+${i + 1}` : undefined,
-          checked: s.id === pane.active,
-          run: () => A.revealSession(s.id),
+          checked: id === pane.active,
+          run: () => A.revealSession(id),
         })),
       ],
       { alignRight: false, minWidth: 240 },
@@ -382,7 +387,7 @@ function TabStrip(
   // Roving focus: ←/→ (Home/End) select tabs, Enter goes to the terminal, F2 renames.
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.altKey || e.ctrlKey || e.metaKey || !(e.target as HTMLElement).matches?.(".tab")) return;
-    const i = tabs.findIndex((s) => s.id === pane.active);
+    const i = tabs.indexOf(pane.active ?? 0);
     let next = -1;
     if (e.key === "ArrowRight") next = (i + 1) % tabs.length;
     else if (e.key === "ArrowLeft") next = (i - 1 + tabs.length) % tabs.length;
@@ -399,9 +404,9 @@ function TabStrip(
     }
     if (next < 0 || !tabs[next]) return;
     e.preventDefault();
-    A.revealSession(tabs[next].id, false);
+    A.revealSession(tabs[next], false);
     requestAnimationFrame(() =>
-      tabsRef.current?.querySelector<HTMLElement>(`[data-tab-sid="${tabs[next].id}"]`)?.focus()
+      tabsRef.current?.querySelector<HTMLElement>(`[data-tab-sid="${tabs[next]}"]`)?.focus()
     );
   };
 
@@ -418,7 +423,11 @@ function TabStrip(
         onWheel={onWheel}
         onKeyDown={onKeyDown}
       >
-        {tabs.map((s, i) => (
+        {tabs.map((id, i) => {
+          const panel = panels.value.get(panelId(id) ?? -1);
+          if (panel) return <PanelTab key={id} panel={panel} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
+          const s = sessions.value.get(id)!;
+          return (
           <GroupTab
             key={s.id}
             paneId={pane.id}
@@ -428,7 +437,8 @@ function TabStrip(
             active={s.id === pane.active}
             groupFocused={focused}
           />
-        ))}
+          );
+        })}
       </div>
       {overflow && (
         <button
@@ -485,6 +495,38 @@ function TabStrip(
         </button>
       )}
       {controls && <WindowControls />}
+    </div>
+  );
+}
+
+function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
+  panel: Panel; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
+}) {
+  const id = panelTab(panel.id);
+  const menu: MenuItem[] = [
+    { label: "Reload panel", icon: <IconRestart size={14} />, run: () => reloadPanel(panel.id) },
+    { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
+    { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
+    { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
+    ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
+    "sep",
+    { label: "Close panel", keys: "Alt+W", run: () => A.closeTab(id) },
+  ];
+  return (
+    <div class={cx("tab", "panel-tab", active && "active", active && focused && "focused", drag.value?.sid === id && "dragging")}
+      role="tab" aria-selected={active} aria-label={panel.title} tabIndex={active ? 0 : -1}
+      data-tab-sid={id} data-tip={`${panel.title} · Panel`}
+      onPointerDown={(e) => {
+        if (!(e.target as HTMLElement).closest("button")) startTabDrag(e, { id, kind: "panel" }, panel.title, () => A.revealSession(id));
+      }}
+      onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); A.closeTab(id); } }}
+      onMouseDown={(e) => e.button === 1 && e.preventDefault()}
+      onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
+      {altHeld.value && focused && index < 9 && <span class="tab-num">{index + 1}</span>}
+      <IconPanel size={14} />
+      <span class="tab-name"><span class="tab-task">{panel.title}</span></span>
+      <button type="button" class="tab-close" aria-label={`Close ${panel.title}`} data-tip="Close panel"
+        onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>
     </div>
   );
 }

@@ -18,6 +18,9 @@ import {
   paneOfSession,
   panePx,
   paneRects,
+  panelTab,
+  panelId,
+  placePanel,
   parseLayout,
   reconcile,
   removeSession,
@@ -46,6 +49,31 @@ function near(a: number, b: number) {
 function focusedTabs(s: LayoutState) {
   return allPanes(s.root).find((p) => p.id === s.focus)!.tabs;
 }
+
+Deno.test("panel tabs preserve old numeric layouts and avoid the empty sentinel", () => {
+  const old = emptyLayout([1, 2]);
+  const loaded = parseLayout(JSON.parse(JSON.stringify(old)))!;
+  assertEquals(sig(loaded.root), "[1,2]");
+  assertEquals(panelTab(1), -2);
+  assertEquals(panelId(-2), 1);
+  assertEquals(panelId(-1), null);
+  assertEquals(panelId(1), null);
+  const next = placePanel(loaded, 1, 1);
+  assertEquals(sig(next.root), "row([1,2] [-2])");
+  assertEquals(sig(parseLayout(JSON.parse(JSON.stringify(next)))!.root), sig(next.root));
+});
+
+Deno.test("new panels join the opener's right group and move like terminal tabs", () => {
+  let s = splitPane(emptyLayout([1]), "right", 2);
+  s = placePanel(s, 10, 1);
+  assertEquals(sig(s.root), "row([1] [2,-11])");
+  const left = paneOfSession(s.root, 1)!;
+  s = moveTab(s, -11, left.id, "center");
+  assertEquals(sig(s.root), "row([1,-11] [2])");
+  assertEquals(sig(placePanel(s, 10, 1).root), sig(s.root), "reload must not re-place an existing panel");
+  s = reconcile(s, [1, 2]);
+  assertEquals(sig(s.root), "row([1] [2])");
+});
 
 Deno.test("emptyLayout has one pane", () => {
   const s = emptyLayout([1, 2]);

@@ -7,6 +7,52 @@ pub type WorkspaceId = i64;
 pub type ChannelId = i64;
 pub type SessionId = u32;
 pub type WindowId = i64;
+pub type PanelId = i64;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PanelCsp {
+    #[serde(default)]
+    pub resource_domains: Vec<String>,
+    #[serde(default)]
+    pub connect_domains: Vec<String>,
+    #[serde(default)]
+    pub frame_domains: Vec<String>,
+    #[serde(default)]
+    pub base_uri_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Panel {
+    pub id: PanelId,
+    pub channel_id: ChannelId,
+    pub session_id: SessionId,
+    pub window_id: Option<WindowId>,
+    pub title: String,
+    pub app: String,
+    pub csp: PanelCsp,
+    pub revision: i64,
+    pub html_revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub closed: bool,
+    pub context: Option<serde_json::Value>,
+    pub dropped_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelEvent {
+    /// The stored event's id (0 for the synthetic `overflow` notice). It stays the same when an
+    /// undelivered batch returns to its panel, and `panel_event` fetches an event by it.
+    #[serde(default)]
+    pub id: i64,
+    pub panel_id: PanelId,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -1,7 +1,8 @@
 // End-to-end smoke test for the muster daemon. Run through scripts/smoke.sh, which builds the
 // binary, makes a temp dir and passes scoped Deno permissions:
-//   deno run --allow-net=127.0.0.1:17433 --allow-read=<tmp>,<bin> --allow-write=<tmp> \
-//            --allow-run=<bin>,git scripts/smoke.ts <tmp> <bin>
+//   deno run --allow-net=127.0.0.1 --allow-read=<tmp>,<bin> --allow-write=<tmp> \
+//            --allow-run=<bin>,git,python3 scripts/smoke.ts <tmp> <bin>
+// The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
 // Never uses port 7433 or the default data dirs.
 
 const [BASE, BIN] = Deno.args;
@@ -15,6 +16,7 @@ const ENV = {
   MUSTER_DATA_DIR: DATA, MUSTER_RUNTIME_DIR: RUNTIME, MUSTER_PORT: String(PORT), SHELL: "/bin/bash",
   HOME: `${BASE}/home`, MUSTER_URL: "", MUSTER_TOKEN: "", MUSTER_BIN: "",
   MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "", MUSTER_RUN: "",
+  PATH: `${BASE}/bin:/usr/bin:/bin`, MUSTER_CODEX_HOOKS: "0",
 };
 
 let passed = 0;
@@ -192,6 +194,15 @@ async function rawHttp(req: string): Promise<string> {
 // ----- test -----
 
 async function main() {
+  // Stand-in only: renders an empty Codex composer, records input, never starts an agent.
+  await Deno.mkdir(`${BASE}/bin`, { recursive: true });
+  await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
+printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
+stty -echo -icanon min 1 time 0
+printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
+exec cat > '${BASE}/fake-input'
+`);
+  await Deno.chmod(`${BASE}/bin/codex`, 0o700);
   await Deno.mkdir(REPO, { recursive: true });
   await git(REPO, "init", "-q", "-b", "main");
   await Deno.writeTextFile(`${REPO}/README.md`, "smoke\n");
@@ -356,6 +367,90 @@ async function main() {
   const expect = `mu42ster:${sid}:${ch.port_base}:1`;
   await c.waitFor("echo output", () => c.terminal(sid).includes(expect));
   ok(true, `live 0x01 output contains ${expect}`);
+
+  // Panels: real MCP auth, persistence, separate proxy, waits and idle prompt delivery.
+  c.input(sid, `printf '%s' "$MUSTER_TOKEN" > '${BASE}/shell-token'\r`);
+  for (let n = 0; n < 100 && !(await exists(`${BASE}/shell-token`)); n++) await sleep(50);
+  const shellToken = await Deno.readTextFile(`${BASE}/shell-token`);
+  let mcpId = 0;
+  const mcp = async (token: string, name: string, args: Json = {}): Promise<any> => {
+    const response = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpId, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const result = await response.json();
+    if (!response.ok || result.error || result.result?.isError) throw new Error(`MCP ${name}: ${JSON.stringify(result)}`);
+    return JSON.parse(result.result.content[0].text);
+  };
+  const pid = (await mcp(shellToken, "panel_open", { title: "Smoke review", app: "markdown", data: { markdown: "# Hello" } })).panel_id;
+  const panelDir = `${DATA}/panels/${pid}`;
+  const panelRow = async () => {
+    const out = await new Deno.Command("python3", { args: ["-c",
+      "import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); r=c.execute('SELECT record FROM panels WHERE id=?',(sys.argv[2],)).fetchone(); print(r[0] if r else 'null')",
+      `${DATA}/muster.db`, String(pid)], stdout: "piped", stderr: "piped" }).output();
+    if (!out.success) throw new Error(dec.decode(out.stderr));
+    return JSON.parse(dec.decode(out.stdout));
+  };
+  ok((await panelRow()).channel_id === ch.id && (await exists(`${panelDir}/app-1.html`)), "MCP panel_open persists its row and app file");
+  ok(((await Deno.stat(`${panelDir}/data-1.json`)).mode! & 0o777) === 0o600, "panel input is private (0600)");
+  await mcp(shellToken, "panel_update", { panel_id: pid, data: { markdown: "# Revised" } });
+  ok((await panelRow()).revision === 2 && JSON.parse(await Deno.readTextFile(`${panelDir}/data-2.json`)).markdown === "# Revised", "panel_update commits revision and input");
+  const proxyOrigin = hello.panel_origin;
+  ok(proxyOrigin === `http://127.0.0.1:${JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`)).panel_port}` && !proxyOrigin.endsWith(`:${PORT}`), "discovery and hello agree on a separate panel origin");
+  const proxy = await fetch(`${proxyOrigin}/proxy`);
+  const proxyHtml = await proxy.text();
+  ok(proxy.status === 200 && proxy.headers.get("content-security-policy")?.includes("connect-src 'none'") && !proxyHtml.includes(d.token) && !proxy.headers.has("set-cookie"), "proxy has CSP and no client token or cookies");
+  const deniedRoutes = await Promise.all(["/", "/api/rpc", "/api/health", "/ws", "/mcp", "/hook/Stop"].map(async (path) => {
+    const response = await fetch(proxyOrigin + path); await response.body?.cancel(); return response.status;
+  }));
+  ok(deniedRoutes.every((status) => status === 404), "panel origin serves only /proxy");
+  await c.call("panel.context", { panel_id: pid, context: { structuredContent: { selection: 2 } } });
+  const waiting = mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 5 });
+  await sleep(150);
+  await c.call("panel.event", { panel_id: pid, kind: "approve", payload: { accepted: true } });
+  const received = await waiting;
+  ok(received.events.length === 1 && received.events[0].kind === "approve" && received.events[0].context.structuredContent.selection === 2, "UI event and latest context reach MCP wait");
+  ok((await mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 0 })).timed_out, "wait consumes the event once");
+  const cliPanels = await new Deno.Command(BIN, { args: ["panel", "list"], env: { ...ENV, MUSTER_SESSION_ID: String(sid) }, stdout: "piped", stderr: "piped" }).output();
+  ok(cliPanels.success && dec.decode(cliPanels.stdout).includes("Smoke review"), "panel CLI uses the same task-scoped backend");
+  const fake = await c.call("session.spawn", { channel_id: ch.id, kind: "codex" });
+  await c.waitFor("fake idle agent", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === fake.id && e.data.state === "idle"));
+  const fakeToken = await Deno.readTextFile(`${BASE}/fake-token`);
+  const fakePanel = (await mcp(fakeToken, "panel_open", { title: "Idle delivery", app: "markdown" })).panel_id;
+  // Registering a wait suppresses automatic injection even for an idle opener.
+  const idleWait = mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 5 });
+  await sleep(150);
+  await c.call("panel.event", { panel_id: fakePanel, kind: "waited", payload: {} });
+  ok((await idleWait).events[0].kind === "waited", "idle agent wait takes precedence over injection");
+  await sleep(600);
+  ok(!(await Deno.readTextFile(`${BASE}/fake-input`)).includes("waited"), "waited event is never injected");
+  await c.call("panel.event", { panel_id: fakePanel, kind: "approve", payload: { message: "approved from panel" } });
+  let injected = "";
+  for (let n = 0; n < 100; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (injected.includes("approved from panel")) break; await sleep(100); }
+  ok(injected.includes('[panel "Idle delivery" #') && injected.includes("approved from panel"), "idle agent stand-in receives the marked panel prompt");
+  ok((await mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 0 })).timed_out, "injected event is not returned again by wait");
+  // Three ~9 KiB comments exceed one 24 KiB prompt: each arrives whole, over two prompts.
+  const tails = [0, 1, 2].map((n) => `END-OF-COMMENT-${n}`);
+  for (const tail of tails) await c.call("panel.event", { panel_id: fakePanel, kind: "comment", payload: { text: "x".repeat(9000) + tail } });
+  for (let n = 0; n < 300; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (tails.every((t) => injected.includes(t))) break; await sleep(100); }
+  ok(tails.every((t) => injected.includes(`x${t}`)) && !injected.includes("truncated"), "long panel events reach the idle agent whole, none cut");
+  // Typed is not yet submitted: let the last prompt finish before moving its opener.
+  for (let n = 0; n < 200; n++) { if ((await c.call("hello")).sessions.find((x: Json) => x.id === fake.id).queued === 0) break; await sleep(100); }
+  // A wait is bound to its caller's task: moving the caller ends it, and the click stays queued.
+  const movedWait = mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 10 }).then(() => "returned", (e) => String(e));
+  await sleep(150);
+  await c.call("session.move", { id: fake.id, channel_id: ch2.id });
+  ok((await movedWait).includes("moved to another task"), "moving the caller cancels its panel wait");
+  await c.call("panel.event", { panel_id: fakePanel, kind: "after-move", payload: {} });
+  await sleep(1200);
+  ok(!(await Deno.readTextFile(`${BASE}/fake-input`)).includes("after-move"), "a moved opener gets no prompt for its old task's panel");
+  const collected = await mcp(shellToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 0 });
+  ok(collected.events[0]?.kind === "after-move", `the old task can still collect that event (${JSON.stringify(collected).slice(0, 300)})`);
+  const closing = (await mcp(shellToken, "panel_open", { title: "Closing", app: "markdown" })).panel_id;
+  await mcp(shellToken, "panel_close", { panel_id: closing });
+  ok(!(await exists(`${DATA}/panels/${closing}`)), "closing a panel deletes its app and data files");
+  await c.call("session.remove", { id: fake.id });
+  await c.call("panel.event", { panel_id: pid, kind: "durable", payload: { persisted: true } });
 
   // GET /api/events: NDJSON, client token only, JSON events without terminal output. The CLI
   // (`muster events --json`) reads the same stream; it keeps running until the SIGKILL below.
@@ -673,6 +768,8 @@ async function main() {
   let s = h.sessions.find((x: Json) => x.id === sid);
   ok(s.state !== "exited" && s.pid === beforeCrash.pid, "after backend crash: original terminal process survives");
   ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
+  ok(h.panels.some((p: Json) => p.id === pid && p.revision === 2), "panel survives backend restart");
+  ok((await mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 0 })).events[0].kind === "durable", "queued shell panel event survives backend restart");
   ok(canon(h.windows.find((w: Json) => w.id === 1).layout) === canon(layout) && s.window_id === 1, "window layouts and session windows persist");
   await c.call("session.attach", { id: sid });
   await c.waitFor("replay after restart", () => c.frames.some((f) => f.id === sid && f.type === 0x03));
@@ -734,6 +831,7 @@ async function main() {
 
   // archive with worktree removal (branch kept)
   await c.call("channel.archive", { id: ch.id, remove_worktree: true });
+  ok((await panelRow()) === null && !(await exists(panelDir)), "archive removes panel rows, events and files");
   ok(!(await exists(ch.cwd)), "archive removed the worktree dir");
   ok((await git(REPO, "branch", "--list", "muster/smoke-test")).includes("muster/smoke-test"), "branch kept after archive");
   h = await c.call("hello");

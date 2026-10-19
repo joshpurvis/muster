@@ -79,6 +79,28 @@ Output: human tables go to stdout, errors to stderr as `muster: <message>`. Exit
 every 250 ms), so a command that finishes at once is taken as started after about 1.5 s
 (agents: 10 s).
 
+## Panels
+
+Run inside a Muster session (`MUSTER_SESSION_ID` is required). Commands use the same
+task-scoped backend and limits as the MCP tools and print JSON.
+
+```sh
+muster panel open --title Review --app markdown --data '{"markdown":"# Review"}'
+muster panel open --title Preview --app custom --html-path ./review.html --data '{}'
+muster panel update 1 --data '{"markdown":"# Updated"}' --title 'Updated review'
+muster panel list
+muster panel wait 1 --timeout-seconds 300
+muster panel event 1 42
+muster panel close 1
+```
+
+Open/update also accept `--html '<html>…</html>'` instead of `--html-path`. Open accepts
+`--csp '{"resourceDomains":["https://cdn.example"]}'`; fetching remains blocked. HTML paths
+must stay in the task cwd. Omit the ID on `wait` for any panel in the task; timeout is 0–1800
+seconds (default 300). A timeout prints `{events: [], remaining: 0, timed_out: true}` and exits
+successfully; a wait fails if the session moves to another task or restarts. `event` fetches
+the full event that a panel prompt showed only as a placeholder (panel ID, then event ID).
+
 ## Claude profiles
 
 Profiles are Muster-owned names and references to existing Claude configuration directories.

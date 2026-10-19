@@ -385,7 +385,7 @@ async fn legacy_handshake() {
 
     assert_eq!(legacy(&st, "ping", json!(null)).await["result"], json!({}));
     let tools = legacy(&st, "tools/list", json!({})).await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 12);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), super::tools::TOOL_NAMES.len());
     assert!(tools["result"].get("resultType").is_none());
 
     let r = legacy(&st, "resources/list", json!({})).await;
@@ -492,7 +492,7 @@ async fn modern_era() {
     let res = &r.body.as_ref().unwrap()["result"];
     assert_eq!(res["cacheScope"], "private");
     assert!(res["ttlMs"].is_number());
-    assert_eq!(res["tools"].as_array().unwrap().len(), 12);
+    assert_eq!(res["tools"].as_array().unwrap().len(), super::tools::TOOL_NAMES.len());
 
     // Missing headers -> HeaderMismatch.
     let r = post(&st, &auth("tok1"), modern_body("tools/list", json!({}))).await;
@@ -1836,6 +1836,21 @@ async fn backend_replacement_preserves_rate_limits_and_refuses_unsaved_actions()
     let (message, error) = call(&replacement, "post_to_channel", json!({"text": "must not post"})).await;
     assert!(error && message.contains("persist MCP limits"), "{message}");
     assert!(m.d.lock().events.iter().all(|event| event.2 != EventKind::AgentPost));
+}
+
+#[tokio::test]
+async fn panel_opens_and_updates_share_the_durable_post_limit() {
+    let (m, mut original) = state();
+    original.limits.post_per_window = 1;
+    assert!(!call(&original, "post_to_channel", json!({"text":"first"})).await.1);
+    for name in ["panel_open", "panel_update"] {
+        let (message, error) = call(&original, name, json!({})).await;
+        assert!(error && message.contains("rate limit"), "{message}");
+    }
+    let mut replacement = McpState::new(m);
+    replacement.limits.post_per_window = 1;
+    let (message, error) = call(&replacement, "panel_open", json!({})).await;
+    assert!(error && message.contains("rate limit"), "{message}");
 }
 
 #[test]

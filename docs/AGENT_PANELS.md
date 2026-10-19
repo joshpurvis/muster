@@ -1,6 +1,17 @@
 # Agent panels
 
-Status: proposed, 2026-10-18; the user's decisions are recorded at the end. Nothing is built yet.
+Status: core built on `feature/agent-panels`, 2026-10-18. The remainder of this document is
+the approved broader plan; current tools and limits are in [MCP.md](MCP.md#panels).
+
+Core includes durable panels/events, task-scoped MCP and CLI, tab placement/movement, the
+two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Extra built-ins,
+fetch approval, placement options and preview servers remain later phases. Nested frames are
+blocked even for declared loopback dev servers: a child document's independent CSP would
+otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
+Each panel data revision is treated as a fresh tool input/result invocation in the same frame;
+the MCP Apps spec normally sends input once per invocation. The gesture rule is checked in the
+sandbox proxy and was verified in Chromium and in WebKitGTK 2.54 (run under GTK's Broadway
+backend): a tab click lets nothing through, one click inside the app lets at most 3 events through.
 
 Agents should be able to show things next to their terminal: images, charts, a rich diff with
 their notes on it, a live preview of the web app they are building, and interactive components
@@ -174,3 +185,12 @@ device scopes ([ANDROID.md](ANDROID.md)) decide whether it may send events or on
 Also settled: MCP Apps as the panel format; events reach the agent through
 `wait_for_panel_event` or, when it is idle, as a marked prompt; apps send events only on a user
 action; the phone comes last.
+
+## Known gaps
+
+- `wait_for_panel_event` and `panel_event` delete the events they return as the result is
+  built. If the backend dies, or the caller's connection drops, before the caller reads it,
+  those events are lost. Chosen over redelivering events the agent may already have acted on.
+- On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
+  afterwards, so swapping a parent directory for a symlink in between could copy a file from
+  outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.

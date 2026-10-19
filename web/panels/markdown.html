@@ -1,0 +1,100 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Markdown</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:light dark;font:15px/1.6 system-ui,sans-serif;background:#fff;color:#242424}
+:root[data-theme=dark]{background:#17191d;color:#e4e5e8}
+body{margin:0;padding:24px;overflow-wrap:anywhere}main{max-width:78ch;margin:auto}
+h1,h2,h3{line-height:1.25}pre{padding:14px;background:#8882;border-radius:4px;overflow:auto}code{font-family:monospace;background:#8882;padding:1px 3px}pre code{padding:0;background:none}
+a{color:#1a5fb4}:root[data-theme=dark] a{color:#6ea0f7}a:focus-visible{outline:2px solid currentColor;outline-offset:2px}table{border-collapse:collapse;display:block;overflow:auto}td,th{border:1px solid #8886;padding:6px 12px;text-align:left}
+.comment{max-width:78ch;margin:24px auto 0;border-top:1px solid #8884;padding-top:16px}label{display:block}textarea{box-sizing:border-box;display:block;width:100%;font:inherit;background:transparent;color:inherit;border:1px solid #8888;border-radius:4px;margin:6px 0;padding:8px}button{font:inherit;cursor:pointer}output{padding-left:10px}
+</style></head><body><main id="content"></main>
+<section class="comment"><label for="comment">Send a comment to the agent</label><textarea id="comment" rows="2" maxlength="8000"></textarea><button type="button">Send comment</button><output role="status"></output></section>
+<script>
+"use strict";
+(() => {
+  let sequence = 0;
+  const pending = new Map();
+  const notify = (method, params) => parent.postMessage({jsonrpc:"2.0",method,params}, "*");
+  const call = (method, params) => new Promise((resolve, reject) => {
+    const id = ++sequence;
+    pending.set(id, {resolve,reject});
+    parent.postMessage({jsonrpc:"2.0",id,method,params}, "*");
+  });
+  const element = (tag, text) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; return e; };
+  function inline(parentNode, text, depth = 0) {
+    if (depth > 4) { parentNode.append(document.createTextNode(text)); return; }
+    const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^\s)]+\))/g;
+    let start = 0;
+    for (const match of text.matchAll(re)) {
+      parentNode.append(document.createTextNode(text.slice(start, match.index)));
+      const token = match[0];
+      if (token[0] === "`") parentNode.append(element("code", token.slice(1,-1)));
+      else if (token[0] === "[") {
+        const cut = token.indexOf("](");
+        const url = token.slice(cut + 2,-1);
+        if (/^https?:\/\//i.test(url)) {
+          const a = element("a", token.slice(1,cut)); a.href = url;
+          a.addEventListener("click", (e) => { e.preventDefault(); call("ui/open-link", {url}).catch(() => {}); });
+          parentNode.append(a);
+        } else parentNode.append(document.createTextNode(token.slice(1,cut)));
+      } else {
+        const strong = token.startsWith("**");
+        const e = element(strong ? "strong" : "em"); inline(e, token.slice(strong ? 2 : 1,strong ? -2 : -1), depth + 1); parentNode.append(e);
+      }
+      start = match.index + token.length;
+    }
+    parentNode.append(document.createTextNode(text.slice(start)));
+  }
+  function render(text) {
+    const root = document.getElementById("content"); root.replaceChildren();
+    const lines = String(text || "").replace(/\r/g, "").split("\n");
+    let i = 0;
+    const cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((x) => x.trim());
+    while (i < lines.length) {
+      const line = lines[i++];
+      if (!line.trim()) continue;
+      if (/^\s*```/.test(line)) {
+        const block = [];
+        while (i < lines.length && !/^\s*```/.test(lines[i])) block.push(lines[i++]);
+        i++; const pre = element("pre"); pre.append(element("code", block.join("\n"))); root.append(pre); continue;
+      }
+      if (line.includes("|") && i < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i])) {
+        i++; const table = element("table"); const head = element("tr");
+        for (const cell of cells(line)) { const th = element("th"); inline(th, cell); head.append(th); } table.append(head);
+        while (i < lines.length && lines[i].includes("|")) { const row = element("tr"); for (const cell of cells(lines[i++])) { const td = element("td"); inline(td, cell); row.append(td); } table.append(row); }
+        root.append(table); continue;
+      }
+      const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+      if (heading) { const h = element("h" + heading[1].length); inline(h, heading[2]); root.append(h); continue; }
+      const list = /^\s*([-*+] |\d+\. )(.*)$/.exec(line);
+      if (list) {
+        const ul = element(/^\d/.test(list[1]) ? "ol" : "ul");
+        let value = list[2];
+        for (;;) { const li = element("li"); inline(li, value); ul.append(li); const next = /^\s*([-*+] |\d+\. )(.*)$/.exec(lines[i] || ""); if (!next) break; i++; value = next[2]; }
+        root.append(ul); continue;
+      }
+      const p = element("p"); const paragraph = [line];
+      while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|\s*```|\s*[-*+] |\s*\d+\. )/.test(lines[i])) paragraph.push(lines[i++]);
+      inline(p, paragraph.join("\n")); root.append(p);
+    }
+  }
+  const context = (ctx) => { if (ctx?.theme) document.documentElement.dataset.theme = ctx.theme; };
+  addEventListener("message", (event) => {
+    if (event.source !== parent || event.data?.jsonrpc !== "2.0") return;
+    const msg = event.data;
+    if (pending.has(msg.id)) { const p = pending.get(msg.id); pending.delete(msg.id); msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result); }
+    if (msg.method === "ui/notifications/tool-input") render(msg.params?.arguments?.markdown);
+    if (msg.method === "ui/notifications/host-context-changed") context(msg.params);
+    if (msg.method === "ui/resource-teardown") parent.postMessage({jsonrpc:"2.0",id:msg.id,result:{}}, "*");
+  });
+  document.querySelector("button").addEventListener("click", async () => {
+    const input = document.getElementById("comment"); const status = document.querySelector("output");
+    if (!input.value.trim()) return;
+    try { await call("ui/message", {role:"user",content:{type:"text",text:input.value}}); input.value = ""; status.textContent = "Sent"; }
+    catch (e) { status.textContent = e.message; }
+  });
+  call("ui/initialize", {protocolVersion:"2026-01-26",appInfo:{name:"Muster Markdown",version:"1.0.0"},appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then((result) => {
+    context(result.hostContext); notify("ui/notifications/initialized", {});
+    new ResizeObserver(() => notify("ui/notifications/size-changed", {width:innerWidth,height:document.body.scrollHeight})).observe(document.body);
+  });
+})();
+</script></body></html>

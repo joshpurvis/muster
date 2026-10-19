@@ -7,6 +7,11 @@
 
 export type Dir = "row" | "col";
 
+// Session ids are positive u32s. Panels use -(id + 1); -1 stays the internal empty-pane
+// sentinel. Keeping numeric tabs means existing saved layouts load without migration.
+export const panelTab = (id: number): number => -id - 1;
+export const panelId = (tab: number): number | null => Number.isSafeInteger(tab) && tab <= -2 ? -tab - 1 : null;
+
 export interface PaneNode {
   type: "pane";
   id: string;
@@ -269,6 +274,15 @@ export function reconcile(s: LayoutState, live: number[]): LayoutState {
     };
   }
   return finish(st);
+}
+
+/** A new panel joins the group immediately to its opener's right, or splits there. */
+export function placePanel(s: LayoutState, id: number, opener: number): LayoutState {
+  const tab = panelTab(id);
+  if (paneOfSession(s.root, tab)) return s;
+  const origin = paneOfSession(s.root, opener)?.id ?? s.focus;
+  const right = neighbour(s.root, origin, "right");
+  return right ? addTab(s, tab, right) : splitPane(s, "right", tab, origin);
 }
 
 // ---------- mutations ----------

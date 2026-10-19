@@ -61,6 +61,8 @@ impl<E: std::fmt::Display> From<E> for RpcError {
 
 type RpcResult = Result<Value, RpcError>;
 
+fn empty_object() -> Value { json!({}) }
+
 fn parse<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
     let params = if params.is_null() { json!({}) } else { params };
     serde_json::from_value(params).map_err(|e| RpcError(format!("invalid params: {e}")))
@@ -96,6 +98,8 @@ pub fn hello(hub: &Hub) -> Value {
         "account_profiles": hub.account_profiles().unwrap_or_default(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
+        "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
+        "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": default_shell(),
@@ -146,7 +150,71 @@ pub fn authorize(hub: &Hub, who: &Principal, method: &str, params: &Value) -> Re
 /// Callers check `authorize` first.
 pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
     match method {
-        "hello" => Ok(hello(hub)),
+        "hello" => {
+            let mut result = hello(hub);
+            if matches!(who, Principal::Device { .. }) {
+                if let Some(fields) = result.as_object_mut() {
+                    fields.remove("panels");
+                    fields.remove("panel_origin");
+                }
+            }
+            Ok(result)
+        }
+
+        "panel.open" | "panel.update" | "panel.close" | "panel.list" | "panel.wait" | "panel.fetch_event" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { from_session: SessionId, #[serde(default = "empty_object")] arguments: Value }
+            let p: P = parse(params)?;
+            let tool = match method {
+                "panel.open" => "panel_open", "panel.update" => "panel_update", "panel.close" => "panel_close",
+                "panel.list" => "list_panels", "panel.fetch_event" => "panel_event", _ => "wait_for_panel_event",
+            };
+            mcp_json(crate::mcp::call_as(hub, p.from_session, tool, p.arguments).await)
+        }
+        "panel.resource" => {
+            let p: IdParam<PanelId> = parse(params)?;
+            Ok(crate::panels::resource(hub, p.id)?)
+        }
+        "panel.event" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { panel_id: PanelId, kind: String, payload: Value }
+            let p: P = parse(params)?;
+            crate::panels::event(hub, p.panel_id, p.kind, p.payload)?;
+            Ok(json!({}))
+        }
+        "panel.context" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { panel_id: PanelId, context: Value }
+            let p: P = parse(params)?;
+            crate::panels::context(hub, p.panel_id, p.context)?;
+            Ok(json!({}))
+        }
+        "panel.dismiss" => {
+            let p: IdParam<PanelId> = parse(params)?;
+            crate::panels::close(hub, None, p.id, true)?;
+            Ok(json!({}))
+        }
+        "panel.move" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { id: PanelId, window_id: WindowId }
+            let p: P = parse(params)?;
+            crate::panels::move_to(hub, p.id, p.window_id)?;
+            Ok(json!({}))
+        }
+        "panel.tool" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { panel_id: PanelId, name: String, #[serde(default = "empty_object")] arguments: Value }
+            let p: P = parse(params)?;
+            if p.name != "get_diff" { return Err(RpcError("tool is not app-visible".into())) }
+            let panel = crate::panels::get(hub, p.panel_id)?;
+            if panel.closed { return Err(RpcError("panel is closed".into())) }
+            let ch = hub.channel(panel.channel_id).filter(|c| !c.archived).ok_or("panel task is gone")?;
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct A { max_bytes: Option<usize> }
+            let args: A = parse(p.arguments)?;
+            let max = args.max_bytes.unwrap_or(60_000).clamp(1000, 400_000);
+            let diff = crate::worktree::diff(std::path::Path::new(&ch.cwd), ch.base_branch.as_deref()).await?;
+            let text = crate::mcp::tools::truncate_str(&diff, max);
+            Ok(json!({"content":[{"type":"text","text":text}],"isError":false}))
+        }
 
         "daemon.reload" => {
             human_only(who, method, &params)?;
@@ -1125,6 +1193,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     && matches!(
                         ev,
                         ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
+                        | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
                     )
                 {
                     return None;
@@ -1361,7 +1430,7 @@ async fn handle_request(
             tokio::spawn(async move {
                 // A `session.wait` stops once the connection is gone. Other methods run to
                 // completion (cancelling one halfway could leave state behind).
-                let r = if req.method == "session.wait" {
+                let r = if matches!(req.method.as_str(), "session.wait" | "panel.wait") {
                     tokio::select! {
                         r = dispatch(&hub, &who, &req.method, req.params) => r,
                         _ = resp.closed() => return,

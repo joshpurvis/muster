@@ -1,6 +1,15 @@
 // Optional bottom line: the focused tab's task name, folder and branch (click copies), the number
 // of tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
-import { accountProfiles, focusedSession, focusedTask, meta, needsYou, windowSessions, workspaceById } from "../state.ts";
+import {
+  accountProfiles,
+  focusedSession,
+  focusedTask,
+  meta,
+  needsYou,
+  windowPanels,
+  windowSessions,
+  workspaceById,
+} from "../state.ts";
 import { profileName } from "../account_profiles.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -20,7 +29,8 @@ export function StatusLine() {
   const c = focusedTask.value;
   const n = needsYou.value.length;
   const status = connStatus.value;
-  const count = windowSessions.value.length;
+  // Terminal and panel tabs alike.
+  const count = windowSessions.value.length + windowPanels.value.length;
   const cwd = c?.cwd ?? "";
   // Only a real name: until one is derived the task is named after its folder, shown next to it.
   const name = c ? taskLabel(c, workspaceById.value.get(c.workspace_id)) : null;

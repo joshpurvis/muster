@@ -88,6 +88,12 @@ export const IconTerminal = (p: P) => (
     <path d="M12 17h7" />
   </Svg>
 );
+export const IconPanel = (p: P) => (
+  <Svg {...p}>
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <path d="M3 8h18M7 12h10M7 16h7" />
+  </Svg>
+);
 export const IconSpark = (p: P) => (
   <Svg {...p}>
     <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8" />

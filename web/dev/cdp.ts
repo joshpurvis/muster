@@ -2,7 +2,7 @@
 // Permissions: --allow-net=127.0.0.1 --allow-run=chromium --allow-write=<shots dir>
 
 export interface Browser {
-  send<T = any>(method: string, params?: Record<string, unknown>): Promise<T>;
+  send<T = any>(method: string, params?: Record<string, unknown>, sessionId?: string): Promise<T>;
   eval<T = any>(expr: string): Promise<T>;
   goto(url: string): Promise<void>;
   size(w: number, h: number, mobile?: boolean): Promise<void>;
@@ -103,11 +103,11 @@ export async function launch(port = 9333, userDir = "/tmp/muster-cdp"): Promise<
       );
     }
   };
-  const send = <T>(method: string, params: Record<string, unknown> = {}) =>
+  const send = <T>(method: string, params: Record<string, unknown> = {}, sessionId?: string) =>
     new Promise<T>((res, rej) => {
       const i = ++id;
       pending.set(i, { res, rej });
-      ws.send(JSON.stringify({ id: i, method, params }));
+      ws.send(JSON.stringify({ id: i, method, params, sessionId }));
     });
   await send("Runtime.enable");
   await send("Page.enable");

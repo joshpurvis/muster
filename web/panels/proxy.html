@@ -1,0 +1,119 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
+<style>html,body,iframe{margin:0;border:0;width:100%;height:100%;display:block;overflow:hidden}</style></head>
+<body><script>
+"use strict";
+(() => {
+  // Only ever a frame of the Muster UI. Loaded as a page of its own, it does nothing.
+  if (window === top) return;
+  const uiOrigins = __MUSTER_UI_ORIGINS__;
+  let hostOrigin = null;
+  let frame = null;
+  const reserved = "ui/notifications/sandbox-";
+  // The proxy's verdict on user activation; the host trusts it only on messages from this frame.
+  const verdict = "muster_user_activation";
+  // Messages that create an agent event or leave the sandbox need a real user action inside
+  // this panel. A click on the host's tab strip activates the host and its same-origin frames,
+  // never this cross-origin proxy; a click or key inside the app activates the app and its
+  // ancestors, this proxy included.
+  const gated = new Set(["ui/message", "ui/open-link"]);
+  const BUDGET = 3;
+  // Browsers keep transient activation for 5 s. Still active well after the first counted
+  // message means the user acted again since.
+  const WINDOW_MS = 5500;
+  let used = 0, since = 0, watch = 0;
+  const activated = () => {
+    const now = performance.now();
+    if (!(navigator.userActivation && navigator.userActivation.isActive)) { used = 0; return false; }
+    if (used && now - since > WINDOW_MS) used = 0;
+    if (used >= BUDGET) return false;
+    if (!used) {
+      since = now;
+      clearInterval(watch);
+      // Activation expired: the next one starts a fresh budget.
+      watch = setInterval(() => {
+        if (!navigator.userActivation.isActive) { used = 0; clearInterval(watch); }
+      }, 100);
+    }
+    used++;
+    return true;
+  };
+  const origins = (items) => (Array.isArray(items) ? items : []).filter((s) => {
+    if (typeof s !== "string" || !/^https?:\/\/[a-zA-Z0-9.*:[\]-]+\/?$/.test(s)) return false;
+    try { const u = new URL(s.replace("*.", "wildcard.")); return !u.username && !u.password && u.pathname === "/"; } catch { return false; }
+  }).join(" ");
+  // Muster's shortcuts (from the host) as {ctrl, alt, shift, meta, code, editAlt}.
+  const chords = (items) => (Array.isArray(items) ? items : []).filter((k) => k && typeof k === "object" &&
+    typeof k.code === "string" && /^[A-Za-z0-9]{1,20}$/.test(k.code) &&
+    ["ctrl", "alt", "shift", "meta", "editAlt"].every((f) => typeof k[f] === "boolean"))
+    .map((k) => ({ ctrl: k.ctrl, alt: k.alt, shift: k.shift, meta: k.meta, code: k.code, editAlt: k.editAlt }))
+    .slice(0, 200);
+  // Runs first inside the app document: hands Muster's own shortcuts to the host (an app frame
+  // otherwise swallows them) and reports startup errors. The app could fake these messages;
+  // the host only runs a few navigation commands from them, and only while this panel has focus.
+  const helper = (keys) => "(" + ((keys) => {
+    const post = (method, params) => { try { parent.postMessage({ jsonrpc: "2.0", method, params }, "*"); } catch (_) { /* gone */ } };
+    const editable = (t) => !!t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
+    addEventListener("keydown", (e) => {
+      if (!e.isTrusted || e.isComposing) return;
+      const inInput = editable(e.target);
+      const k = keys.find((k) => k.code === e.code && k.ctrl === e.ctrlKey && k.alt === e.altKey && k.shift === e.shiftKey && k.meta === e.metaKey);
+      if (!k || (k.editAlt && inInput)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      post("muster/key", { code: e.code, key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, inInput });
+    }, true);
+    let reports = 0;
+    const report = (text) => { if (reports++ < 5) post("muster/app-error", { message: String(text).slice(0, 300) }); };
+    addEventListener("error", (e) => {
+      if (e.target && e.target !== window) report("Could not load " + (e.target.tagName || "a resource").toLowerCase() + " " + (e.target.src || e.target.href || ""));
+      else report(e.message + (e.lineno ? " (line " + e.lineno + ")" : ""));
+    }, true);
+    addEventListener("unhandledrejection", (e) => report("Unhandled rejection: " + (e.reason && e.reason.message || e.reason)));
+    document.addEventListener("securitypolicyviolation", (e) => report("Blocked by the panel's content policy: " + e.effectiveDirective + " " + e.blockedURI));
+  }).toString().replace(/\n\s*/g, " ") + ")(" + JSON.stringify(keys).replace(/</g, "\\u003c") + ")";
+  let keys = [];
+  addEventListener("keydown", (e) => {
+    // Focus in this proxy itself (before the app frame exists, or between frames).
+    if (!e.isTrusted || !hostOrigin) return;
+    const k = keys.find((k) => k.code === e.code && k.ctrl === e.ctrlKey && k.alt === e.altKey && k.shift === e.shiftKey && k.meta === e.metaKey);
+    if (!k) return;
+    e.preventDefault();
+    parent.postMessage({ jsonrpc: "2.0", method: "muster/key", params: { code: e.code, key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, inInput: false } }, hostOrigin);
+  }, true);
+  // The host focuses this frame (selecting the tab); typing belongs to the app inside it.
+  addEventListener("focus", () => { if (frame) frame.focus(); });
+  addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0" || typeof msg !== "object") return;
+    if (event.source === parent && uiOrigins.includes(event.origin)) {
+      if (hostOrigin && event.origin !== hostOrigin) return;
+      hostOrigin = event.origin;
+      if (msg.method === "ui/notifications/sandbox-resource-ready") {
+        if (frame || typeof msg.params?.html !== "string") return;
+        const resources = origins(msg.params.csp?.resourceDomains);
+        keys = chords(msg.params.keys);
+        // Fetch approval and nested dev previews are deferred. External child documents
+        // would have their own CSP and could otherwise bypass the no-fetch policy.
+        const csp = `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
+        frame = document.createElement("iframe");
+        frame.title = "Panel app";
+        frame.sandbox = "allow-scripts";
+        frame.referrerPolicy = "no-referrer";
+        // One line before the app's own markup, so its error line numbers stay its own.
+        frame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="' + csp.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"><meta name="referrer" content="no-referrer"><script>' + helper(keys) + '<\/script>' + msg.params.html;
+        document.body.append(frame);
+        if (document.hasFocus()) frame.focus();
+      } else if (!msg.method?.startsWith(reserved)) {
+        frame?.contentWindow?.postMessage(msg, "*");
+      }
+    } else if (frame && event.source === frame.contentWindow && event.origin === "null" && hostOrigin && !msg.method?.startsWith(reserved)) {
+      delete msg[verdict];
+      if (gated.has(msg.method)) msg[verdict] = activated();
+      parent.postMessage(msg, hostOrigin);
+    }
+  });
+  // No tokens, cookies, daemon RPC or configurable parent origin enter this document.
+  for (const origin of uiOrigins) parent.postMessage({jsonrpc:"2.0",method:reserved + "proxy-ready",params:{}}, origin);
+})();
+</script></body></html>

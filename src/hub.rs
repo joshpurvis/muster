@@ -35,6 +35,8 @@ use crate::worktree;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ServerEvent {
+    PanelUpserted(Panel),
+    PanelRemoved { id: PanelId },
     AccountProfilesChanged(Vec<crate::account_profiles::AccountProfile>),
     WorkspaceUpserted(Workspace),
     WorkspaceRemoved {
@@ -399,6 +401,7 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 }
 
 pub struct Hub {
+    pub panels: crate::panels::Panels,
     cfg: HubConfig,
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
@@ -604,9 +607,10 @@ impl Hub {
                 },
             );
         }
+        let panels = store.load_panels()?;
         for w in store.load_windows()? {
             // Nothing holds a window at startup: ones without tabs or tasks are gone for good.
-            if window_unused(&inner, w.id) {
+            if window_unused(&inner, w.id) && !panels.iter().any(|p| !p.closed && p.window_id == Some(w.id)) {
                 if let Err(e) = store.delete_window(w.id) {
                     tracing::warn!(window = w.id, "deleting empty window: {e}");
                 }
@@ -640,6 +644,7 @@ impl Hub {
         let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let hub = Arc::new_cyclic(|weak| Hub {
+            panels: crate::panels::Panels::default(),
             cfg,
             devices,
             agents,
@@ -1971,7 +1976,8 @@ impl Hub {
                     let free = g
                         .windows
                         .iter()
-                        .find(|(wid, w)| w.holder.is_none() && has_sessions(&g, **wid))
+                        .find(|(wid, w)| w.holder.is_none() && (has_sessions(&g, **wid)
+                            || self.store.load_panels().is_ok_and(|ps| ps.iter().any(|p| !p.closed && p.window_id == Some(**wid)))))
                         .map(|(wid, _)| *wid);
                     match free {
                         Some(wid) => wid,
@@ -2037,6 +2043,7 @@ impl Hub {
             }
             window_view(&g, target).ok_or_else(|| anyhow::anyhow!("window {target} vanished"))?
         };
+        crate::panels::adopt_orphans(self, w.id)?;
         events.push(ServerEvent::WindowUpserted(w.clone()));
         for ev in events {
             self.emit(ev);
@@ -2081,10 +2088,17 @@ impl Hub {
         }
     }
 
+    pub(crate) fn panel_left_window(&self, id: WindowId) {
+        let mut events = Vec::new();
+        self.drop_if_unused_locked(&mut self.inner.lock(), id, &mut events);
+        for event in events { self.emit(event); }
+    }
+
     /// After a window lost a tab (session): delete it if nobody holds it and it has no tabs or
     /// tasks left. Returns whether it was deleted. (Its `Window` view is unchanged otherwise.)
     fn drop_if_unused_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) -> bool {
-        if !g.windows.get(&id).is_some_and(|w| w.holder.is_none()) || !window_unused(g, id) {
+        if !g.windows.get(&id).is_some_and(|w| w.holder.is_none()) || !window_unused(g, id)
+            || self.store.load_panels().map_or(true, |ps| ps.iter().any(|p| !p.closed && p.window_id == Some(id))) {
             return false;
         }
         if let Err(e) = self.store.delete_window(id) {
@@ -2262,6 +2276,7 @@ impl Hub {
             let _ = self.update_channel(id, true, |c| c.archived = false);
             return Err(error.context(format!("channel {id} was not archived")));
         }
+        crate::panels::archive(self, id)?;
         self.emit(ServerEvent::ChannelRemoved { id });
         if let Some(wid) = ch.window_id {
             let mut events = Vec::new();
@@ -2369,6 +2384,10 @@ impl Hub {
         };
         for ev in events {
             self.emit(ev);
+        }
+        // Outside `inner`: the task's panels, events and files go with it, as in `archive_channel`.
+        if let Err(e) = crate::panels::archive(self, id) {
+            tracing::warn!(channel = id, "removing an emptied task's panels (retried at startup): {e:#}");
         }
         Ok(true)
     }
@@ -3201,6 +3220,9 @@ impl Hub {
         channel_id: ChannelId,
         expect_from: Option<ChannelId>,
     ) -> anyhow::Result<(SessionInfo, ChannelId)> {
+        // Panel waits and panel prompts check their task under this lock: none can act for the
+        // old task once the move is visible.
+        let _panels = self.panels.operations.lock();
         let (info, from) = {
             let mut g = self.inner.lock();
             match g.channels.get(&channel_id) {
@@ -3250,6 +3272,8 @@ impl Hub {
             }
             (next, from)
         };
+        if from != channel_id { crate::inject::release_unbound_panel_batches(self, id); }
+        drop(_panels);
         self.rederive_name(from);
         self.rederive_name(channel_id);
         Ok((info, from))

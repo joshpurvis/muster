@@ -36,6 +36,31 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .layer(axum::middleware::from_fn_with_state(hub, classify)))
 }
 
+/// This listener has no Hub, credentials, sessions, middleware or daemon routes.
+pub fn panel_router(ui_port: u16) -> Router {
+    Router::new().route("/proxy", get(panel_proxy)).with_state(ui_port)
+}
+
+#[derive(Deserialize)]
+struct PanelProxyQuery { csp: Option<String> }
+
+async fn panel_proxy(State(ui_port): State<u16>, Query(query): Query<PanelProxyQuery>) -> Response {
+    let csp: crate::model::PanelCsp = match query.csp.as_deref().map(serde_json::from_str).transpose() {
+        Ok(csp) => csp.unwrap_or_default(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid CSP").into_response(),
+    };
+    if let Err(e) = crate::panels::validate_csp(&csp) { return (StatusCode::BAD_REQUEST, e.to_string()).into_response(); }
+    let origins = json!([format!("http://127.0.0.1:{ui_port}"), format!("http://localhost:{ui_port}")]);
+    let html = crate::panels::PROXY.replace("__MUSTER_UI_ORIGINS__", &origins.to_string());
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+         (header::CONTENT_SECURITY_POLICY, crate::panels::proxy_csp(&csp, ui_port)),
+         (header::CACHE_CONTROL, "no-store".to_string()),
+         (header::REFERRER_POLICY, "no-referrer".to_string()),
+         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string())], html,
+    ).into_response()
+}
+
 /// How a request reached the daemon (docs/ANDROID.md "Security model").
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -721,6 +746,11 @@ mod tests {
             let (st, _, body) = http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN, "X-Muster: 1"], hello);
             assert_eq!(st, 200);
             assert!(body.contains("\"result\""), "{body}");
+            let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(result["result"].get("panels").is_none() && result["result"].get("panel_origin").is_none());
+            let (_, _, body) = http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN, "X-Muster: 1"],
+                r#"{"id":4,"method":"panel.resource","params":{"id":1}}"#);
+            assert!(body.contains("not available to devices"), "{body}");
             let (_, _, body) = http(
                 port,
                 "POST",

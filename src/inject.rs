@@ -75,6 +75,76 @@ struct Item {
     draft_noticed: bool,
     /// Who it comes from: becomes the session's provenance when it is submitted (agents.rs).
     source: crate::agents::Source,
+    /// The panel events this prompt carries. Optional and skipped when absent, so the queue
+    /// format stays readable by a backend without panels (it ignores unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    panel: Option<PanelBatch>,
+}
+
+/// Panel events admitted to a prompt. They live here, not in `panel_events`, until the
+/// prompt's fate is known: dropped before typing, they return to their panels; once typing
+/// began they are never replayed (see `panel_moves`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PanelBatch {
+    id: u64,
+    /// The task the panels belong to: the prompt is typed only while its opener is in it.
+    channel_id: crate::model::ChannelId,
+    events: Vec<crate::model::PanelEvent>,
+    /// Events shown only as a placeholder (too long for a prompt): kept for `panel_event`.
+    #[serde(default)]
+    fetch: Vec<i64>,
+}
+
+/// What happens to the panel events of a batch removed from a queue before it was typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unsent {
+    /// Back to the panel queue (the opener exited, restarted, moved, or the task closed).
+    Release,
+    /// Gone (the human cleared the session's prompt queue).
+    Discard,
+}
+
+fn batches(queues: &HashMap<SessionId, SessQ>) -> HashMap<u64, (&PanelBatch, bool)> {
+    let mut out = HashMap::new();
+    for queue in queues.values() {
+        for item in &queue.items {
+            if let Some(batch) = &item.panel { out.insert(batch.id, (batch, false)); }
+        }
+        if let Some(active) = &queue.active
+            && let Some(batch) = &active.item.panel
+        {
+            out.insert(batch.id, (batch, active.stage != Stage::Selected));
+        }
+    }
+    out
+}
+
+/// The panel event moves implied by a queue change, saved in the same transaction. A new
+/// batch claims its events; a batch removed before typing started releases them (or
+/// discards them); a batch removed after typing started (submitted, reviewed as uncertain,
+/// or lost with its process) keeps only its placeholder events, for `panel_event`.
+fn panel_moves(previous: &HashMap<SessionId, SessQ>, next: &HashMap<SessionId, SessQ>, unsent: Unsent) -> crate::store::PanelEventMoves {
+    let (before, after) = (batches(previous), batches(next));
+    let mut moves = crate::store::PanelEventMoves::default();
+    for (id, (batch, _)) in &after {
+        if !before.contains_key(id) { moves.claim.extend(batch.events.iter().cloned()); }
+    }
+    for (id, (batch, started)) in &before {
+        if after.contains_key(id) { continue }
+        if *started {
+            moves.park.extend(batch.events.iter().filter(|e| batch.fetch.contains(&e.id)).cloned());
+        } else if unsent == Unsent::Release {
+            moves.release.extend(batch.events.iter().cloned());
+        }
+    }
+    moves
+}
+
+/// The opener may still receive this batch: it is in the batch's task, which is open.
+/// Callers hold the panels operation lock, which session moves also take.
+fn panel_bound(hub: &Hub, id: SessionId, batch: &PanelBatch) -> bool {
+    hub.session(id).is_some_and(|s| s.channel_id == batch.channel_id)
+        && hub.channel(batch.channel_id).is_some_and(|c| !c.archived)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +194,14 @@ impl Queues {
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
+        self.edit_with(id, Unsent::Release, change)
+    }
+
+    fn persist(&self, previous: &HashMap<SessionId, SessQ>, next: &HashMap<SessionId, SessQ>, unsent: Unsent) -> anyhow::Result<()> {
+        self.store.save_prompt_queues(next, &panel_moves(previous, next, unsent))
+    }
+
+    fn edit_with<T>(&self, id: SessionId, unsent: Unsent, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
         let mut guard = self.inner.lock();
         let previous = guard.get(&id).cloned().unwrap_or_default();
         let mut queue = previous.clone();
@@ -134,7 +212,7 @@ impl Queues {
             let persist = durable(&queue) != durable(&previous);
             let mut next = guard.clone();
             next.insert(id, queue);
-            if persist { self.store.save_runtime("prompt-queues", &next)?; }
+            if persist { self.persist(&guard, &next, unsent)?; }
             *guard = next;
         }
         Ok(result)
@@ -145,7 +223,7 @@ impl Queues {
         let mut next = guard.clone();
         let existed = next.remove(&id).is_some();
         if existed {
-            self.store.save_runtime("prompt-queues", &next)?;
+            self.persist(&guard, &next, Unsent::Release)?;
             *guard = next;
         }
         Ok(existed)
@@ -192,6 +270,7 @@ pub fn restore(hub: &Hub) -> anyhow::Result<()> {
     let queues = hub.injection.inner.lock().clone();
     for (id, queue) in queues {
         if !is_live(hub, id) || queue.generation != hub.pty_generation(id) {
+            note_lost_panel_batch(hub, id, &queue);
             hub.injection.remove(id)?;
         }
         sync_queued(hub, id);
@@ -269,6 +348,7 @@ pub async fn send(
         attempts: 0,
         draft_noticed: false,
         source,
+        panel: None,
     };
 
     if mode == SendMode::Interrupt {
@@ -277,8 +357,10 @@ pub async fn send(
             hub.write_input_generation(id, item.generation, &adapter.interrupt_bytes())?;
         }
         let generation = item.generation;
+        // Read before the queue lock: a start holds the hub lock while it locks the queue.
+        let current = hub.pty_generation(id);
         let n = hub.injection.edit(id, |q| {
-            anyhow::ensure!(hub.pty_generation(id) == generation, "the terminal run changed");
+            anyhow::ensure!(current == generation, "the terminal run changed");
             if q.generation != generation { *q = SessQ::default(); }
             q.generation = generation;
             q.items.push_front(item);
@@ -295,8 +377,9 @@ pub async fn send(
 
     // Deliver right away if nothing is ahead of us and the agent is ready.
     let generation = item.generation;
+    let current = hub.pty_generation(id);
     let deliver_now = hub.injection.edit(id, |q| {
-        anyhow::ensure!(hub.pty_generation(id) == generation, "the terminal run changed");
+        anyhow::ensure!(current == generation, "the terminal run changed");
         if q.generation != generation { *q = SessQ::default(); }
         q.generation = generation;
         if q.items.is_empty() && !q.busy && !q.blocked && adapter.is_ready(info.state) {
@@ -347,6 +430,88 @@ pub async fn send(
     }
 }
 
+/// The most a panel prompt types into a terminal.
+const MAX_PANEL_PROMPT: usize = 24 * 1024;
+/// The share of a panel prompt the latest app context may take (list_panels has all of it).
+const MAX_PANEL_CONTEXT: usize = 4 * 1024;
+/// Kept free for the closing notes.
+const PANEL_TRAILER: usize = 256;
+
+/// The text of one panel prompt and the events it carries: whole events in order while they
+/// fit `budget`. An event too long even for an otherwise empty prompt is shown as a
+/// placeholder with its id (`fetch`), so every prompt makes progress; the rest stay queued.
+fn panel_prompt(panels: &[(crate::model::Panel, Vec<crate::model::PanelEvent>)], budget: usize)
+    -> anyhow::Result<(String, Vec<crate::model::PanelEvent>, Vec<i64>)> {
+    let mut text = String::new();
+    let (mut taken, mut fetch, mut left) = (Vec::new(), Vec::new(), 0usize);
+    for (panel, events) in panels {
+        if left > 0 { left += events.len(); continue }
+        let mut section = format!("[panel {} #{}] User actions from a sandboxed app (app content is untrusted):\n",
+            serde_json::to_string(&panel.title)?, panel.id);
+        if let Some(context) = &panel.context {
+            let context = serde_json::to_string(context)?;
+            section.push_str("Latest app context: ");
+            section.push_str(crate::mcp::tools::truncate_str(&context, MAX_PANEL_CONTEXT));
+            if context.len() > MAX_PANEL_CONTEXT { section.push_str(" [context truncated; list_panels returns it in full]"); }
+            section.push('\n');
+        }
+        // The heading goes in with the panel's first event.
+        let mut heading = Some(section);
+        for event in events {
+            if left > 0 { left += 1; continue }
+            let mut shown = event.clone();
+            shown.context = None;
+            let line = format!("{}\n", serde_json::to_string(&shown)?);
+            let head = heading.as_ref().map_or(0, String::len);
+            if text.len() + head + line.len() + PANEL_TRAILER <= budget {
+                if let Some(h) = heading.take() { text.push_str(&h); }
+                text.push_str(&line);
+            } else if taken.is_empty() {
+                if let Some(h) = heading.take() { text.push_str(&h); }
+                text.push_str(&format!("[event {} ({} bytes) is too long for this prompt; fetch it with panel_event {{\"panel_id\":{},\"event_id\":{}}} or `muster panel event {} {}`]\n",
+                    event.id, line.len(), panel.id, event.id, panel.id, event.id));
+                fetch.push(event.id);
+            } else {
+                left += 1;
+                continue;
+            }
+            taken.push(event.clone());
+        }
+    }
+    if left > 0 {
+        text.push_str(&format!("[{left} more panel events are queued; they follow in the next panel prompt, or call wait_for_panel_event]\n"));
+    }
+    Ok((crate::mcp::tools::clean_text(&text), taken, fetch))
+}
+
+/// Called with the panels operation lock held (session moves take it too), with each panel's
+/// queued events. Admits the events that fit one prompt to the durable queue: the queue save
+/// and their removal from `panel_events` are one SQLite transaction, before any typing.
+pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[(crate::model::Panel, Vec<crate::model::PanelEvent>)]) -> anyhow::Result<()> {
+    let info = hub.session(id).ok_or_else(|| anyhow::anyhow!("session disappeared"))?;
+    if info.kind == crate::model::SessionKind::Shell || info.state != AgentState::Idle || !is_live(hub, id) { return Ok(()) }
+    let Some((first, _)) = panels.first() else { return Ok(()) };
+    anyhow::ensure!(panels.iter().all(|(p, _)| p.channel_id == info.channel_id && p.session_id == id),
+        "panel batch does not belong to session {id}'s task");
+    let (text, events, fetch) = panel_prompt(panels, MAX_PANEL_PROMPT)?;
+    if events.is_empty() { return Ok(()) }
+    let generation = hub.pty_generation(id);
+    let batch = PanelBatch { id: rand::random(), channel_id: info.channel_id, events, fetch };
+    // Human-origin at hop 0, as a `Chain`: older backends can still read this queue.
+    let source = crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None });
+    let item = Item { generation, text: text.clone(), clear_first: false, attempts: 0, draft_noticed: false,
+        source, panel: Some(batch) };
+    hub.injection.edit(id, |queue| {
+        if queue.generation != generation { *queue = SessQ::default(); }
+        queue.generation = generation;
+        queue.items.push_back(item);
+    })?;
+    sync_queued(hub, id);
+    log_prompt(hub, id, &text, &format!("panel:{}", first.id), true);
+    kick(hub.clone(), id);
+    Ok(())
+}
+
 fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyhow::Result<bool>) {
     if let Err(error) = hub.injection.edit(id, |q| {
         if q.generation != generation { return }
@@ -373,7 +538,7 @@ fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyho
 pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: String,
     source: crate::agents::Source) -> anyhow::Result<()> {
     let item = Item { generation: Some(generation), text, clear_first: false, attempts: 0,
-        draft_noticed: false, source };
+        draft_noticed: false, source, panel: None };
     hub.injection.edit(id, |q| {
         if q.generation != Some(generation) { *q = SessQ { generation: Some(generation), ..SessQ::default() }; }
         q.items.push_back(item);
@@ -408,14 +573,21 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
         let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
-        let selected = hub.injection.edit(id, |q| {
-            if q.generation != generation { return None }
-            let item = if is_ready { q.items.pop_front() } else { None };
-            if let Some(item) = &item {
-                q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
-            } else { q.busy = false; }
-            item
-        });
+        // Session moves take this lock: a panel batch is checked against its task as it is taken.
+        let selected = {
+            let _op = hub.panels.operations.lock();
+            let unbound = unbound_panel_batches(&hub, id);
+            hub.injection.edit(id, |q| {
+                if q.generation != generation { return None }
+                // A panel batch whose opener left its task returns to its panels (`panel_moves`).
+                q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)));
+                let item = if is_ready { q.items.pop_front() } else { None };
+                if let Some(item) = &item {
+                    q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
+                } else { q.busy = false; }
+                item
+            })
+        };
         match selected {
             Ok(Some(item)) => {
                 sync_queued(&hub, id);
@@ -433,7 +605,63 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     });
 }
 
+/// A panel prompt that was being typed or submitted when its run ended is not resent (the
+/// agent may have it), like any uncertain prompt; unlike one, say so, as its events are gone.
+fn note_lost_panel_batch(hub: &Hub, id: SessionId, queue: &SessQ) {
+    let Some(active) = queue.active.as_ref().filter(|a| a.stage != Stage::Selected) else { return };
+    let Some(batch) = &active.item.panel else { return };
+    let mut panels: Vec<_> = batch.events.iter().map(|e| e.panel_id).collect();
+    panels.dedup();
+    let panels = panels.iter().map(|p| format!("#{p}")).collect::<Vec<_>>().join(", ");
+    hub.notice("warn", format!(
+        "Session {id} ended while a prompt with {} user actions from panel {panels} was being delivered; it may not have arrived and is not resent.",
+        batch.events.len()));
+}
+
+/// Waiting panel batches of the session that may no longer be typed (`panel_bound`). Called
+/// under the panels operation lock and outside the queue lock (which a start takes while
+/// holding the hub lock), so the answer holds until the caller edits the queue.
+fn unbound_panel_batches(hub: &Hub, id: SessionId) -> Vec<u64> {
+    let waiting: Vec<PanelBatch> = hub.injection.inner.lock().get(&id)
+        .map(|q| q.items.iter().filter_map(|i| i.panel.clone()).collect()).unwrap_or_default();
+    waiting.into_iter().filter(|b| !panel_bound(hub, id, b)).map(|b| b.id).collect()
+}
+
+/// Return the session's not-yet-typed panel batches whose task it no longer is in to their
+/// panels. Called under the panels operation lock right after a session moves.
+pub(crate) fn release_unbound_panel_batches(hub: &Hub, id: SessionId) {
+    let unbound = unbound_panel_batches(hub, id);
+    if unbound.is_empty() { return }
+    match hub.injection.edit(id, |q| q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)))) {
+        Ok(()) => sync_queued(hub, id),
+        Err(error) => hub.notice("error", format!("Could not return panel events queued for session {id}: {error:#}")),
+    }
+}
+
+/// An event announced by a placeholder whose prompt is still in delivery (`panel_event` may
+/// race the injector's acknowledgement). Fetching it means it need not be parked afterwards.
+pub(crate) fn take_in_flight_panel_event(hub: &Hub, panel: crate::model::PanelId, event: i64) -> anyhow::Result<Option<crate::model::PanelEvent>> {
+    let found = hub.injection.inner.lock().iter().find_map(|(sid, q)| {
+        let batch = q.active.as_ref()?.item.panel.as_ref()?;
+        let e = batch.events.iter().find(|e| e.panel_id == panel && e.id == event && batch.fetch.contains(&event))?;
+        Some((*sid, e.clone()))
+    });
+    let Some((sid, found)) = found else { return Ok(None) };
+    hub.injection.edit(sid, |q| {
+        if let Some(batch) = q.active.as_mut().and_then(|a| a.item.panel.as_mut()) { batch.fetch.retain(|id| *id != event); }
+    })?;
+    Ok(Some(found))
+}
+
+/// Panels with events inside some prompt queue (their records must stay for a release).
+pub(crate) fn queued_panel_ids(hub: &Hub) -> std::collections::BTreeSet<crate::model::PanelId> {
+    batches(&hub.injection.inner.lock()).values()
+        .flat_map(|(batch, _)| batch.events.iter().map(|e| e.panel_id)).collect()
+}
+
 pub(crate) fn drop_queue(hub: &Hub, id: SessionId) {
+    let queue = hub.injection.inner.lock().get(&id).cloned();
+    if let Some(queue) = queue { note_lost_panel_batch(hub, id, &queue); }
     match hub.injection.remove(id) {
         Ok(true) => hub.set_queued(id, 0),
         Ok(false) => {},
@@ -609,8 +837,17 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
 
     // 2. Type, pause, submit.
     let bytes = adapter.prompt_bytes(&item.text);
-    mark_stage(hub, id, generation, Stage::Typing)?;
-    hub.write_input_generation(id, generation, &bytes)?;
+    {
+        // A panel batch is typed only while its opener is in the batch's task: checked under
+        // the lock session moves take, so a move cannot slip in before the keys are written.
+        let _op = item.panel.as_ref().map(|_| hub.panels.operations.lock());
+        if let Some(batch) = &item.panel && !panel_bound(hub, id, batch) {
+            mark_stage(hub, id, generation, Stage::Selected)?;
+            return Ok(false);
+        }
+        mark_stage(hub, id, generation, Stage::Typing)?;
+        hub.write_input_generation(id, generation, &bytes)?;
+    }
     hub.injection.edit(id, |q| {
         if q.generation == generation { q.last_sent = Some(item.text.clone()); }
     })?;
@@ -625,11 +862,21 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         }
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
-    // The prompt runs from here on: the session now handles a message from `source`.
-    hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;
-    mark_stage(hub, id, generation, Stage::Submitting)?;
-    let seq_before = hub.output_seq(id);
-    hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+    let seq_before = {
+        let _op = item.panel.as_ref().map(|_| hub.panels.operations.lock());
+        if let Some(batch) = &item.panel && !panel_bound(hub, id, batch) {
+            // Typed but not submitted: take the text back out; the events return to the panel.
+            if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
+            mark_stage(hub, id, generation, Stage::Selected)?;
+            return Ok(false);
+        }
+        // The prompt runs from here on: the session now handles a message from `source`.
+        hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;
+        mark_stage(hub, id, generation, Stage::Submitting)?;
+        let seq_before = hub.output_seq(id);
+        hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+        seq_before
+    };
 
     // 3. Verify. Submit once more only if our text demonstrably still sits in the input box
     //    (or the box is unreadable and nothing happened at all).
@@ -781,8 +1028,9 @@ pub fn interrupt(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
     hub.write_input(id, &adapter_for(info.kind).interrupt_bytes())
 }
 
+/// Queued panel batches are discarded with the rest: the human chose to drop them.
 pub fn clear_queue(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<()> {
-    hub.injection.edit(id, |q| {
+    hub.injection.edit_with(id, Unsent::Discard, |q| {
         q.items.clear();
         if !q.busy { q.active = None; q.blocked = false; }
     })?;
@@ -869,7 +1117,7 @@ mod tests {
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
-            source: crate::agents::Source::Human,
+            source: crate::agents::Source::Human, panel: None,
         };
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
@@ -889,7 +1137,7 @@ mod tests {
             let store = crate::store::Store::open_memory().unwrap();
             let queues = Queues::load(&store).unwrap();
             let item = Item { generation: Some(7), text: "run-once".into(), clear_first: false, attempts: 1,
-                draft_noticed: false, source: crate::agents::Source::Human };
+                draft_noticed: false, source: crate::agents::Source::Human, panel: None };
             queues.edit(1, |q| {
                 q.busy = true;
                 q.generation = Some(7);
@@ -928,12 +1176,12 @@ mod tests {
         queues.edit(1, |q| q.generation = Some(2)).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "obsolete".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human }).unwrap();
+            source: crate::agents::Source::Human, panel: None }).unwrap();
         assert!(queues.inner.lock()[&1].items.is_empty());
         queues.remove(1).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "removed".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human }).unwrap();
+            source: crate::agents::Source::Human, panel: None }).unwrap();
         assert!(queues.inner.lock().is_empty(), "late tasks cannot recreate deleted queues");
     }
 
@@ -942,7 +1190,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
         let item = Item { generation: Some(1), text: "later".into(), clear_first: false, attempts: 0,
-            draft_noticed: false, source: crate::agents::Source::Human };
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None };
         queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(item.clone()); }).unwrap();
         let count = || waiting(&queues.inner.lock()[&1]);
         assert_eq!(count(), 1);
@@ -969,5 +1217,171 @@ mod tests {
             probe("\n  hello world, this is a long first line\nx"),
             "hello world, this is a l"
         );
+    }
+
+    use crate::model::{Panel, PanelEvent};
+    use serde_json::json;
+
+    fn panel_store() -> (crate::store::Store, Panel) {
+        let store = crate::store::Store::open_memory().unwrap();
+        let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(),
+            app: "markdown".into(), csp: Default::default(), revision: 1, html_revision: 1, created_at: 0,
+            updated_at: 0, closed: false, context: None, dropped_events: 0 };
+        store.create_panel(&mut panel, |_| Ok(())).unwrap();
+        for n in 0..3 { push(&store, &mut panel, n); }
+        (store, panel)
+    }
+
+    fn push(store: &crate::store::Store, panel: &mut Panel, n: i64) {
+        store.push_panel_event(panel, &PanelEvent { id: 0, panel_id: panel.id, kind: "click".into(),
+            payload: json!(n), at: n, context: None }).unwrap();
+    }
+
+    fn panel_item(events: Vec<PanelEvent>, fetch: Vec<i64>) -> Item {
+        Item { generation: Some(1), text: "[panel]".into(), clear_first: false, attempts: 0, draft_noticed: false,
+            source: crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None }),
+            panel: Some(PanelBatch { id: rand::random(), channel_id: 1, events, fetch }) }
+    }
+
+    fn ids(store: &crate::store::Store, panel: &Panel) -> Vec<i64> {
+        let panel = store.load_panels().unwrap().into_iter().find(|p| p.id == panel.id).unwrap();
+        store.panel_events(&panel).unwrap().iter().map(|e| e.id).collect()
+    }
+
+    #[test]
+    fn panel_batches_return_to_their_panel_unless_typing_began() {
+        let (store, mut panel) = panel_store();
+        let queues = Queues::load(&store).unwrap();
+        let events = store.panel_events(&panel).unwrap();
+        assert_eq!(events.iter().map(|e| e.id).collect::<Vec<_>>(), [1, 2, 3]);
+        queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(panel_item(events, vec![])); }).unwrap();
+        assert!(ids(&store, &panel).is_empty(), "admitted events leave the panel queue");
+        push(&store, &mut panel, 3);
+        // The opener exited before the prompt was typed: the batch goes back, in order.
+        queues.remove(1).unwrap();
+        assert_eq!(ids(&store, &panel), [1, 2, 3, 4]);
+        // Typing began, then the prompt was resolved: only the placeholder event stays, parked.
+        let events = store.panel_events(&panel).unwrap();
+        queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(panel_item(events, vec![2])); }).unwrap();
+        queues.edit(1, |q| { let item = q.items.pop_front().unwrap(); q.active = Some(Active { item, stage: Stage::Typing }); }).unwrap();
+        queues.edit(1, |q| q.active = None).unwrap();
+        assert!(ids(&store, &panel).is_empty(), "typed events are never replayed");
+        assert!(store.panel_event(panel.id, 2).unwrap().is_some_and(|(e, parked)| parked && e.payload == json!(1)));
+        assert!(store.panel_event(panel.id, 1).unwrap().is_none());
+        // A cleared queue discards its batches.
+        push(&store, &mut panel, 5);
+        let events = store.panel_events(&panel).unwrap();
+        queues.edit(1, |q| q.items.push_back(panel_item(events, vec![]))).unwrap();
+        queues.edit_with(1, Unsent::Discard, |q| q.items.clear()).unwrap();
+        assert!(ids(&store, &panel).is_empty());
+    }
+
+    #[test]
+    fn overflow_counts_follow_their_batch() {
+        let (store, mut panel) = panel_store();
+        panel.dropped_events = 3;
+        store.save_panel(&panel).unwrap();
+        let queues = Queues::load(&store).unwrap();
+        let events = store.panel_events(&panel).unwrap();
+        assert_eq!((events[0].id, &events[0].kind), (0, &"overflow".to_string()));
+        queues.edit(1, |q| q.items.push_back(panel_item(events, vec![]))).unwrap();
+        assert_eq!(store.load_panels().unwrap()[0].dropped_events, 0);
+        queues.remove(1).unwrap();
+        assert_eq!(store.load_panels().unwrap()[0].dropped_events, 3);
+        assert_eq!(ids(&store, &panel), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_claim_fails_whole_when_an_event_was_taken_meanwhile() {
+        let (store, panel) = panel_store();
+        let queues = Queues::load(&store).unwrap();
+        let events = store.panel_events(&panel).unwrap();
+        store.ack_panel_events(&events[1..2]).unwrap();
+        assert!(queues.edit(1, |q| q.items.push_back(panel_item(events, vec![]))).is_err());
+        assert!(queues.inner.lock().is_empty());
+        assert_eq!(ids(&store, &panel), [1, 3]);
+    }
+
+    /// The queue as the backend before panels (master, 2026-10-18) declares it.
+    mod before_panels {
+        use std::collections::VecDeque;
+        use serde::Deserialize;
+        #[derive(Deserialize)] pub enum Source { Human, Chain(crate::agents::Prov) }
+        #[derive(Deserialize)] #[allow(dead_code)]
+        pub struct Item { pub generation: Option<u64>, pub text: String, pub clear_first: bool, pub attempts: u8, pub draft_noticed: bool, pub source: Source }
+        #[derive(Deserialize)] #[serde(rename_all = "snake_case")] #[allow(dead_code)] pub enum Stage { Selected, Typing, Submitting }
+        #[derive(Deserialize)] #[allow(dead_code)] pub struct Active { pub item: Item, pub stage: Stage }
+        #[derive(Deserialize)] #[allow(dead_code)]
+        pub struct SessQ { pub items: VecDeque<Item>, #[serde(skip)] pub busy: bool, pub last_sent: Option<String>, pub active: Option<Active>, pub blocked: bool, pub generation: Option<u64> }
+    }
+
+    #[test]
+    fn a_queued_panel_prompt_stays_readable_by_the_previous_backend() {
+        let (store, panel) = panel_store();
+        let queues = Queues::load(&store).unwrap();
+        let events = store.panel_events(&panel).unwrap();
+        queues.edit(1, |q| {
+            q.generation = Some(1);
+            q.items.push_back(panel_item(events.clone(), vec![]));
+            q.active = Some(Active { item: panel_item(vec![], vec![]), stage: Stage::Typing });
+        }).unwrap();
+        let old: HashMap<SessionId, before_panels::SessQ> = store.load_runtime("prompt-queues").unwrap().unwrap();
+        let item = &old[&1].items[0];
+        assert_eq!(item.text, "[panel]");
+        assert!(matches!(item.source, before_panels::Source::Chain(p) if p.origin == crate::agents::Origin::Human && p.hop == 0));
+        assert!(old[&1].active.is_some());
+        // And this backend reads its own format back with the batch intact.
+        let reloaded = Queues::load(&store).unwrap();
+        assert_eq!(reloaded.inner.lock()[&1].items[0].panel.as_ref().unwrap().events, events);
+    }
+
+    #[test]
+    fn panel_prompts_carry_whole_events_and_leave_the_rest_queued() {
+        let (_, panel) = panel_store();
+        let comment = |id: i64, n: usize| PanelEvent { id, panel_id: panel.id, kind: "comment".into(),
+            payload: json!({"text": "x".repeat(n)}), at: 0, context: None };
+        // Two 8,000-character comments do not fit one 12 KiB prompt: the first goes whole.
+        let (text, taken, fetch) = panel_prompt(&[(panel.clone(), vec![comment(1, 8000), comment(2, 7951)])], 12 * 1024).unwrap();
+        assert_eq!(taken.iter().map(|e| e.id).collect::<Vec<_>>(), [1]);
+        assert!(fetch.is_empty() && text.contains(&"x".repeat(8000)) && text.contains("1 more panel event"));
+        assert!(text.starts_with("[panel \"Review\" #1]"));
+        // An event too long for any prompt is shown as a fetchable placeholder.
+        let (text, taken, fetch) = panel_prompt(&[(panel.clone(), vec![comment(7, 4000), comment(8, 10)])], 2048).unwrap();
+        assert_eq!((taken.iter().map(|e| e.id).collect::<Vec<_>>(), fetch), (vec![7, 8], vec![7]));
+        assert!(text.contains("panel_event {\"panel_id\":1,\"event_id\":7}") && !text.contains(&"x".repeat(100)));
+        assert!(text.len() <= 2048);
+    }
+
+    fn hub_fixture() -> Arc<Hub> {
+        let store = crate::store::Store::open_memory().unwrap();
+        store.insert_workspace("test", "/tmp", false, 0).unwrap();
+        store.upsert_window(1, "1", 0, 0).unwrap();
+        for ch in 1..=2 {
+            let mut channel = crate::mcp::guard::test_channel(ch);
+            channel.window_id = Some(1);
+            store.insert_channel(&channel).unwrap();
+            let mut info = crate::mcp::guard::test_session(0, None);
+            info.channel_id = ch;
+            info.window_id = Some(1);
+            store.insert_session(&crate::store::StoredSession { info, extra_args: vec![] }).unwrap();
+        }
+        Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
+            muster_bin: "/bin/true".into(), terminal_host: None }, store).unwrap()
+    }
+
+    #[test]
+    fn moving_the_opener_returns_its_unsent_panel_batch() {
+        let hub = hub_fixture();
+        let id = crate::panels::open(&hub, 1, crate::panels::Open { title: "Review".into(), app: "markdown".into(),
+            data: None, html: None, html_path: None, csp: None }).unwrap();
+        crate::panels::event(&hub, id, "approve".into(), json!({})).unwrap();
+        let panel = crate::panels::get(&hub, id).unwrap();
+        let events = hub.store().panel_events(&panel).unwrap();
+        hub.injection.edit(1, |q| q.items.push_back(Item { generation: None, ..panel_item(events, vec![]) })).unwrap();
+        assert!(ids(hub.store(), &panel).is_empty());
+        hub.move_session(1, 2).unwrap();
+        assert_eq!(ids(hub.store(), &panel), [1], "the batch is back in task 1's panel");
+        assert!(hub.injection.inner.lock()[&1].items.is_empty());
+        crate::panels::archive(&hub, 1).unwrap();
     }
 }

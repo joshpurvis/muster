@@ -11,6 +11,7 @@
 // blocks `window.show` in the pages it drives, so it can never launch a window.
 import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
+import { panelChecks } from "./e2e_panels.ts";
 
 const [url, shots, repo, mode] = Deno.args;
 // `real`: against a real (isolated!) daemon. Agents are replaced by a named shell and the
@@ -957,6 +958,9 @@ try {
     await guard(a);
     ok("Ctrl+Shift+R reloaded the window");
   }
+
+  // ---- agent panels (dev/e2e_panels.ts)
+  if (!real) await panelChecks(a, { url, shots, hello, ok, check });
 
   // ---- light theme, shortcuts sheet
   await a.send("Emulation.setEmulatedMedia", {

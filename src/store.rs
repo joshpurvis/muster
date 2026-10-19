@@ -57,6 +57,7 @@ pub struct HookSession {
 #[derive(Clone)]
 pub struct Store {
     conn: std::sync::Arc<Mutex<Connection>>,
+    directory: std::path::PathBuf,
 }
 
 /// Reserve sequence ranges durably before publishing any values. Unused numbers are
@@ -299,7 +300,56 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN account_profile_id INTEGER;
     ALTER TABLE agents ADD COLUMN account_profile_id INTEGER;
     "#,
+    // v14: agent panels and their durable, bounded return channel.
+    r#"
+    CREATE TABLE panels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id INTEGER NOT NULL,
+        session_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        app TEXT NOT NULL,
+        csp TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        closed INTEGER NOT NULL DEFAULT 0,
+        record TEXT NOT NULL
+    );
+    CREATE INDEX panels_channel ON panels(channel_id);
+    CREATE TABLE panel_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        panel_id INTEGER NOT NULL,
+        record TEXT NOT NULL
+    );
+    CREATE INDEX panel_events_panel ON panel_events(panel_id, id);
+    "#,
+    // v15: events shown to an agent only as a placeholder stay fetchable by id (`panel_event`).
+    r#"
+    ALTER TABLE panel_events ADD COLUMN parked INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
+
+/// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
+#[derive(Debug, Default)]
+pub struct PanelEventMoves {
+    pub claim: Vec<PanelEvent>,
+    pub release: Vec<PanelEvent>,
+    pub park: Vec<PanelEvent>,
+}
+
+/// Remove exactly these queued events; each must still be there, so two consumers can never
+/// both take one. The overflow notice (id 0) resets its panel's dropped count.
+fn apply_panel_claims(tx: &rusqlite::Transaction, events: &[PanelEvent]) -> anyhow::Result<()> {
+    for event in events {
+        if event.id == 0 {
+            tx.execute("UPDATE panels SET record=json_set(record,'$.dropped_events',0) WHERE id=?1", [event.panel_id])?;
+            continue;
+        }
+        let n = tx.execute("DELETE FROM panel_events WHERE id=?1 AND panel_id=?2", params![event.id, event.panel_id])?;
+        anyhow::ensure!(n == 1, "panel event {} is no longer queued", event.id);
+    }
+    Ok(())
+}
 
 /// Event kinds retention may delete: high-volume machine noise. Notes, prompts, agent posts,
 /// approvals, session start/exit and system notices are the channel's history and are kept.
@@ -346,7 +396,7 @@ impl Store {
         for suffix in ["", "-wal", "-shm"] {
             crate::paths::make_private_file(std::path::Path::new(&format!("{}{suffix}", path.display())));
         }
-        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: path.parent().unwrap_or(Path::new(".")).to_path_buf() };
         store.migrate()?;
         Ok(store)
     }
@@ -355,6 +405,7 @@ impl Store {
     pub fn open_memory() -> anyhow::Result<Self> {
         let store = Store {
             conn: std::sync::Arc::new(Mutex::new(Connection::open_in_memory()?)),
+            directory: std::env::temp_dir().join(format!("muster-panel-unit-{}-{:x}", std::process::id(), rand::random::<u64>())),
         };
         store.migrate()?;
         Ok(store)
@@ -377,6 +428,153 @@ impl Store {
     }
 
     // ----- devices -----
+
+    pub fn panel_dir(&self, id: PanelId) -> std::path::PathBuf { self.directory.join("panels").join(id.to_string()) }
+
+    pub fn create_panel(&self, panel: &mut Panel, write_files: impl FnOnce(&Panel) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO panels(channel_id,session_id,title,app,csp,revision,created_at,updated_at,closed,record)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,0,'{}')",
+            params![panel.channel_id, panel.session_id, panel.title, panel.app, serde_json::to_string(&panel.csp)?, panel.revision, panel.created_at, panel.updated_at])?;
+        panel.id = tx.last_insert_rowid();
+        write_files(panel)?;
+        tx.execute("UPDATE panels SET record=?2 WHERE id=?1", params![panel.id, serde_json::to_string(panel)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn save_panel(&self, panel: &Panel) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE panels SET title=?2,csp=?3,revision=?4,updated_at=?5,closed=?6,record=?7 WHERE id=?1",
+            params![panel.id, panel.title, serde_json::to_string(&panel.csp)?, panel.revision, panel.updated_at, panel.closed, serde_json::to_string(panel)?])?;
+        Ok(())
+    }
+
+    pub fn load_panels(&self) -> anyhow::Result<Vec<Panel>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT record FROM panels ORDER BY id")?;
+        let rows = q.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+    }
+
+    /// Keep at most 200 events. The overflow count is delivered with the next batch.
+    pub fn push_panel_event(&self, panel: &mut Panel, event: &PanelEvent) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO panel_events(panel_id,record) VALUES (?1,?2)", params![panel.id, serde_json::to_string(event)?])?;
+        let dropped = tx.execute("DELETE FROM panel_events WHERE panel_id=?1 AND id NOT IN
+            (SELECT id FROM panel_events WHERE panel_id=?1 ORDER BY id DESC LIMIT 200)", [panel.id])?;
+        panel.dropped_events += dropped as u64;
+        tx.execute("UPDATE panels SET closed=?2,updated_at=?3,record=?4 WHERE id=?1",
+            params![panel.id, panel.closed, panel.updated_at, serde_json::to_string(panel)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The panel's queued events in order, each with its stored id (parked events, already
+    /// announced by a placeholder, are left out). An `overflow` notice (id 0) leads when events
+    /// were dropped; the latest app context rides on the last event.
+    pub fn panel_events(&self, panel: &Panel) -> anyhow::Result<Vec<PanelEvent>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id, record FROM panel_events WHERE panel_id=?1 AND parked=0 ORDER BY id")?;
+        let rows = q.query_map([panel.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut events: Vec<PanelEvent> = rows.map(|r| {
+            let (id, record) = r?;
+            let mut event: PanelEvent = serde_json::from_str(&record)?;
+            event.id = id;
+            Ok(event)
+        }).collect::<anyhow::Result<_>>()?;
+        if panel.dropped_events > 0 {
+            events.insert(0, PanelEvent { id: 0, panel_id: panel.id, kind: "overflow".into(), payload: serde_json::json!({"dropped": panel.dropped_events}), at: now_ms(), context: None });
+        }
+        if let Some(last) = events.last_mut() { last.context = panel.context.clone(); }
+        Ok(events)
+    }
+
+    /// One stored event of `panel` by id, queued or parked: `(event, parked)`.
+    pub fn panel_event(&self, panel: PanelId, id: i64) -> anyhow::Result<Option<(PanelEvent, bool)>> {
+        let row: Option<(String, bool)> = self.conn.lock().query_row(
+            "SELECT record, parked FROM panel_events WHERE panel_id=?1 AND id=?2", params![panel, id],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        row.map(|(record, parked)| {
+            let mut event: PanelEvent = serde_json::from_str(&record)?;
+            event.id = id;
+            Ok((event, parked))
+        }).transpose()
+    }
+
+    /// Acknowledge exactly these events (a wait returned them, or `panel_event` fetched a
+    /// parked one). By id, so events that arrived or returned meanwhile stay queued.
+    pub fn ack_panel_events(&self, events: &[PanelEvent]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        apply_panel_claims(&tx, events)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save the prompt queues together with the panel event moves their change implies, in one
+    /// transaction: a batch admitted to a queue leaves its panels' queues (`claim`), one dropped
+    /// before typing returns to them (`release`), and placeholder events of a typed batch stay
+    /// fetchable (`park`).
+    pub fn save_prompt_queues(&self, queues: &impl serde::Serialize, moves: &PanelEventMoves) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO runtime_state(key,record) VALUES ('prompt-queues',?1)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(queues)?])?;
+        apply_panel_claims(&tx, &moves.claim)?;
+        for (events, parked) in [(&moves.release, false), (&moves.park, true)] {
+            for event in events.iter() {
+                if event.id == 0 {
+                    if !parked {
+                        // The overflow count goes back on the panel. A concurrent save of an older
+                        // copy of the record can lose this count (a notice only, never an event).
+                        tx.execute("UPDATE panels SET record=json_set(record,'$.dropped_events',
+                            json_extract(record,'$.dropped_events') + ?2) WHERE id=?1",
+                            params![event.panel_id, event.payload["dropped"].as_u64().unwrap_or(0) as i64])?;
+                    }
+                    continue;
+                }
+                let mut stored = event.clone();
+                stored.context = None;
+                // A panel archived meanwhile takes its events with it.
+                tx.execute("INSERT OR IGNORE INTO panel_events(id,panel_id,record,parked)
+                    SELECT ?1,?2,?3,?4 WHERE EXISTS (SELECT 1 FROM panels WHERE id=?2)",
+                    params![event.id, event.panel_id, serde_json::to_string(&stored)?, parked])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_panel(&self, id: PanelId) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM panel_events WHERE panel_id=?1", [id])?;
+        tx.execute("DELETE FROM panels WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Closed panels with nothing left to deliver or fetch.
+    pub fn idle_closed_panels(&self) -> anyhow::Result<Vec<PanelId>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id FROM panels WHERE closed=1
+            AND NOT EXISTS (SELECT 1 FROM panel_events e WHERE e.panel_id=panels.id)
+            AND COALESCE(json_extract(record,'$.dropped_events'),0)=0")?;
+        q.query_map([], |r| r.get(0))?.map(|r| Ok(r?)).collect()
+    }
+
+    pub fn panels_root(&self) -> std::path::PathBuf { self.directory.join("panels") }
+
+    pub fn delete_channel_panels(&self, channel: ChannelId) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM panel_events WHERE panel_id IN (SELECT id FROM panels WHERE channel_id=?1)", [channel])?;
+        tx.execute("DELETE FROM panels WHERE channel_id=?1", [channel])?;
+        tx.commit()?;
+        Ok(())
+    }
 
     pub fn load_devices(&self) -> anyhow::Result<Vec<crate::devices::Device>> {
         let conn = self.conn.lock();
@@ -1453,7 +1651,7 @@ mod tests {
         conn.pragma_update(None, "user_version", 12).unwrap();
         conn.execute_batch("INSERT INTO sessions(id, channel_id, kind, name, cwd, state, state_since, cols, rows, created_at)
             VALUES (1, 1, 'claude', 'old', '/fixture', 'exited', 0, 80, 24, 0);").unwrap();
-        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let store = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: std::env::temp_dir().join(format!("muster-store-test-{:x}", rand::random::<u64>())) };
         store.migrate().unwrap();
         assert_eq!(store.load_sessions().unwrap()[0].info.account_profile_id, None);
         assert!(store.account_profiles().unwrap().is_empty());
@@ -1517,7 +1715,7 @@ mod tests {
     #[test]
     fn migration_v4_puts_live_channels_in_window_1() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: std::env::temp_dir().join(format!("muster-store-test-{:x}", rand::random::<u64>())) };
         // Apply v1..v3 only, add channels the old way, then run the rest.
         {
             let c = s.conn.lock();
@@ -1571,7 +1769,7 @@ mod tests {
     #[test]
     fn migration_v5_puts_sessions_in_their_channels_window() {
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: std::env::temp_dir().join(format!("muster-store-test-{:x}", rand::random::<u64>())) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..4] {
@@ -1625,7 +1823,7 @@ mod tests {
     fn migration_v7_creates_agent_tables() {
         use crate::agents::{Agent, AgentMessage, Origin};
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: std::env::temp_dir().join(format!("muster-store-test-{:x}", rand::random::<u64>())) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..6] {
@@ -1703,7 +1901,7 @@ mod tests {
     fn migration_v9_renames_bots_to_agents_on_a_populated_db() {
         use crate::agents::Origin;
         let conn = Connection::open_in_memory().unwrap();
-        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)) };
+        let s = Store { conn: std::sync::Arc::new(Mutex::new(conn)), directory: std::env::temp_dir().join(format!("muster-store-test-{:x}", rand::random::<u64>())) };
         {
             let c = s.conn.lock();
             for sql in &MIGRATIONS[..8] {

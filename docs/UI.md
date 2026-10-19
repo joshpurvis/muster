@@ -96,6 +96,43 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   current turn is lost and the program starts fresh.", with Cancel focused. Shells and idle
   agents don't ask, nor do the palette commands and shortcuts.
 
+### Agent panel tabs
+
+Agents open Markdown or custom MCP Apps beside their terminal. A new panel joins the group
+to the opener's right, or creates that split. Its tab has a panel icon, title and close button;
+dragging, splitting, moving between windows, keyboard tab selection and group zoom work as
+for terminals. The menu includes Reload panel and Close panel. Closing sends `closed` to the
+opening agent; archiving the task removes all its panels. The phone UI ignores panels.
+
+Panel input updates retain the frame; changed HTML and Reload panel replace it. A panel's app
+lives in one layer per window, drawn over its tab's place in the layout, so switching tabs,
+zooming, splitting and dragging the tab to another group keep the app and anything typed in it.
+Moving a panel to another window, reloading the window or a backend restart load the app again
+from its last input: state the app kept only in the page (an unsent comment) is lost there.
+Theme changes reach the app through the bridge. The built-in Markdown app renders text safely
+and includes a comment field for sending a user event.
+
+An app sends a message or opens a link only right after a real click or key inside it: the
+sandbox proxy checks its own user activation (selecting the tab or focusing the panel does not
+count) and passes at most 3 such requests per action; the host also rate-limits them. Links
+open in the host browser.
+
+While a panel has focus, Muster's navigation shortcuts still work: Jump (Ctrl+Space, Ctrl+K),
+the palette (Ctrl+Shift+P), Alt+J, tab switching (Alt+1..9, Ctrl+Tab, Alt+[ / ]), Alt+Shift+[ / ],
+Alt+arrows between groups, Alt+Z, Alt+G, Alt+/ and F1, and Alt+W, which closes that panel.
+In the app's text fields, Alt+letters and Alt+arrows stay with the field, as in Muster's own.
+Commands that act on an agent (approve, interrupt, new tabs) are not taken from a panel. Closing
+a focused panel, or the agent closing it, hands the keyboard to the tab that takes its place.
+
+A panel shows "Loading panel…" (with the app's first script error, if any) until the app
+completes the MCP Apps handshake. After 10 s it shows what stalled (the sandbox did not load,
+the app never sent `ui/initialize`, or it never sent `ui/notifications/initialized`) with the
+app's last error and Reload panel. A load cut off by a dropped connection retries on reconnect.
+Jump lists every panel by title (pulling one from another window), and the status line counts
+panel tabs with terminals.
+Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`;
+`-1` remains the internal empty-pane sentinel. Old session-only layouts need no migration.
+
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
 - Onto another group's body: left/right/top/bottom halves (outer 28%) split that group on that

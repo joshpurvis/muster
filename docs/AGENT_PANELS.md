@@ -1,0 +1,176 @@
+# Agent panels
+
+Status: proposed, 2026-10-18; the user's decisions are recorded at the end. Nothing is built yet.
+
+Agents should be able to show things next to their terminal: images, charts, a rich diff with
+their notes on it, a live preview of the web app they are building, and interactive components
+they write themselves. The user clicks, picks, comments or approves in the panel, and the agent
+gets that as a message. This serves the premise in [PLAN.md](../PLAN.md): every feature should
+reduce how often the human has to read a raw terminal.
+
+The first use case is getting through pull requests quickly: the agent reads the PR and shows
+only what the user needs to decide (what changed and why, the risk, the checks, the few changes
+worth looking at). The user clicks Merge, and the agent runs `gh pr merge`.
+
+## What a panel is
+
+- **A tab.** A panel is a new kind of tab in the existing split/tab layout ([UI.md](UI.md)),
+  next to terminal tabs. It can be split beside its agent's terminal, dragged to another group,
+  moved to another window or zoomed, with no new layout code. It belongs to a task (channel) and
+  remembers which session opened it. "Side panel" is just the default placement: a new panel
+  opens in a split to the right of its agent's terminal.
+- **An app.** Every panel's content is a small web page in the [MCP Apps](https://modelcontextprotocol.io/extensions/apps)
+  format (HTML served as `text/html;profile=mcp-app`, stable spec 2026-01-26, Apache-2.0 SDK
+  `@modelcontextprotocol/ext-apps`). Muster's built-in panels (image, chart, Markdown, diff
+  review) are apps Muster ships; an agent can also write its own. One runtime, one security
+  model, and agent-written apps also work in other hosts (Claude, ChatGPT, VS Code, Cursor).
+- **Muster is the host.** Claude Code and Codex are the MCP clients and render nothing. Muster
+  is the MCP server they call and also the UI, so it renders the apps its own tools return.
+  The spec does not cover a host that is not the model's client; the return path below is
+  Muster's own.
+
+## How an agent uses it
+
+New MCP tools (docs/MCP.md), with matching `muster panel ...` CLI commands for scripts:
+
+| Tool | What it does |
+|---|---|
+| `panel_open` | `{title, app, data?, placement?}` → `{panel_id}`. `app` is a built-in (`image`, `chart`, `markdown`, `table`, `diff`, `pr_decision`, `web_preview`) or the agent's own HTML (inline, or a file path in its worktree). `data` is the app's input (an image path, a Vega-Lite spec, a diff with notes). |
+| `panel_update` | `{panel_id, data? , html?}`: new input, or a new version of the app. The panel updates in place and keeps its scroll and focus where the app allows. |
+| `panel_close` | `{panel_id}` |
+| `wait_for_panel_event` | `{panel_id?, timeout_seconds?}`: blocks until the user does something in a panel, like `wait_for_state`. Returns the events. |
+| `list_panels` | The caller's task's panels. |
+
+Built-ins come first because they make the common cases fast and consistent: an agent passes data
+instead of writing UI every time. Agent-written apps cover everything else.
+
+## Getting the user's actions back to the agent
+
+A click in a panel becomes an event (`{panel_id, kind, payload}`, e.g. `approve_hunk`,
+`comment`, `submit_review`, or an app's own `ui/message` text). Events queue per panel and reach
+the agent one of two ways:
+
+- If the agent is waiting in `wait_for_panel_event`, the call returns them. This works mid-turn:
+  "open the review, then wait for the user's decisions".
+- If it isn't, Muster delivers them as a prompt through the existing injection queue once the
+  agent is idle, marked as coming from the panel: `[panel "PR #812 review"] approved 6 of 9
+  hunks; comments on src/auth.rs:40 ...`. The queue already handles busy agents, restarts and
+  backend reloads.
+
+An app can only send an event in direct response to the user (a click or key in the panel). A
+panel that renders a stranger's PR must not be able to type instructions to the agent on its own.
+
+## Security
+
+The panel's code is written by an agent, and may display text written by a stranger (a PR, an
+issue, a web page). Both must stay contained.
+
+- **Separate origin.** The UI on `127.0.0.1:<port>` holds the client token, which can do
+  anything (start agents, change permissions, shut down). Panels run on a second origin: a small
+  panel server on another port that serves only the sandbox proxy page and the apps, with the
+  CSP sent as an HTTP header. It holds no token and cannot reach the daemon's API. This is the
+  two-iframe "sandbox proxy" model the MCP Apps spec requires of web hosts.
+- **A narrow bridge.** Through `postMessage`, an app may: receive its input and updates, report
+  its size, send user events (above), open a link in the system browser, and call the few Muster
+  tools marked app-visible, scoped to its own task (e.g. read a file in the task's worktree,
+  `get_diff`). Nothing that starts, stops, messages or reconfigures sessions.
+- **Network.** By default (the MCP Apps default), an app loads nothing from the internet and
+  cannot `fetch`. An app declares the domains it needs (`_meta.ui.csp`). Scripts, styles, fonts
+  and images from declared domains (CDNs) load without asking. Fetching data (`connect-src`)
+  from a declared domain needs the user to allow it once per panel; until then those requests
+  are blocked and the panel shows what it asked for. Undeclared domains are always blocked.
+- **The native window.** WebKitGTK reports the top-level page's address for IPC messages from any
+  frame (see the note in src/gui.rs), so today a framed page could close the window or toggle its
+  title bar. Before panels ship, IPC must carry a capability that only the main page has.
+- **Agents.** Opening a panel is an MCP call like any other, rate-limited per caller, and
+  subject to the task's permission profile (a read-only agent can still open panels; it shows,
+  it doesn't change anything).
+
+## Showing web pages
+
+- **Local dev servers work in a frame.** An agent building a web app can show it running in a
+  `web_preview` panel (`http://localhost:5173`), live, beside its terminal. Most dev servers allow
+  framing.
+- **Most logged-in sites refuse to be framed.** github.com sends `X-Frame-Options: deny`, and so
+  do many others. A frame cannot show them.
+- **A real embedded browser is possible, in the native window only, and deferred.** wry can put extra native
+  webviews in the window (`build_gtk` with a `gtk::Fixed`, works on Wayland). Costs: it always
+  draws above Muster's own HTML (menus and dialogs can't overlap it), its position must follow
+  every layout change, it has its own cookie store to log into, and neither a browser tab nor the
+  phone can have one. An agent could drive it (navigate, read, screenshot).
+- **Everywhere else**, a page that can't be framed opens in the system browser.
+
+For PR review none of this is needed: Muster renders the diff from data, which is faster and
+lets the agent annotate it.
+
+## PR decision, end to end
+
+The goal is a decision in under a minute, not a line-by-line review.
+
+1. "Look at PR 812." The agent runs `gh pr view 812 --json ...`, `gh pr diff 812` and
+   `gh pr checks 812`, reads the changed code in its worktree, and decides what the user needs to
+   see.
+2. `panel_open {app: "pr_decision", title: "PR #812", data: {...}}`. The panel opens beside its
+   terminal and shows, top to bottom:
+   - the title, author, branch, and what will be merged into what;
+   - a plain summary: what changed and why;
+   - the agent's risk call (low / medium / high) and its reasons;
+   - checks: passing, failing or pending, and review state;
+   - only the changes worth looking at, as small diffs with the agent's note on each, and a
+     count of the rest ("31 more lines of tests and renames");
+   - the agent's open questions, if any.
+3. Actions, each one key: **Merge** (with the repo's merge method, e.g. squash, and whether to
+   delete the branch), **Request changes** (with a comment), **Ask** (a question; the answer
+   appears in the panel), **Open on GitHub** (system browser).
+4. On Merge, the panel shows the exact command first, then the agent, waiting in
+   `wait_for_panel_event`, runs it and reports the result in the panel:
+   `gh pr merge 812 --squash --delete-branch --match-head-commit <sha>`.
+   `--match-head-commit` binds the merge to the commit the user saw: if anyone pushed to the PR
+   after the panel opened, GitHub refuses the merge and the agent refreshes the panel instead.
+   The Merge button is disabled while checks are failing, unless the user holds Shift to merge
+   anyway.
+
+Merging is outward-facing and hard to undo, so the rule for this app is strict: the agent merges
+only on a Merge event from the panel, which only a user's click or key can send, and only with
+the head commit shown in that panel. The agent's own CLI may still ask for permission to run
+`gh`, depending on its permission profile; that is a second check, not a replacement.
+
+A Muster agent template ("PR reviewer") carries these instructions, so it works from one prompt.
+A full hunk-by-hunk `diff` app, for PRs that need real review, can follow.
+
+## Persistence
+
+A panel lives under the data directory per task: the app, its latest input, and its event queue.
+It survives window reloads and backend restarts, and closes with its task. Size limits per panel
+(input and app) keep a runaway agent from filling the disk. Keeping a few earlier versions, so the
+user can step back through what an agent showed, is cheap and can come later.
+
+## Phone
+
+Panels are web pages, so the phone PWA can show them too: review a PR from the phone. The phone's
+device scopes ([ANDROID.md](ANDROID.md)) decide whether it may send events or only view.
+
+## Phases
+
+1. Panel tabs, the second origin and sandbox, `panel_open`/`update`/`close`, built-in `image`,
+   `markdown`, `chart`, `table`. One way: the agent shows, the user looks.
+2. Events back to the agent (`wait_for_panel_event` and the idle prompt), the `pr_decision` app,
+   the PR reviewer template. This is the first use case, end to end. The `diff` app follows.
+3. Agent-written apps: arbitrary HTML/JS, declared network access, app-visible tools.
+4. `web_preview` for local dev servers; then, if wanted, the native embedded browser.
+5. Panels on the phone.
+
+## Decisions (user, 2026-10-18)
+
+1. **Placement:** panels are tabs in the existing layout, opening in a split to the right of the
+   agent's terminal, movable like any tab. (Not a fixed dock.)
+2. **Web pages:** local dev-server previews in frames, and the system browser for everything
+   else. The native embedded browser is deferred.
+3. **Network for agent-written apps:** scripts, styles, fonts and images from declared domains
+   load without asking; fetching data needs the user's OK once per panel.
+4. **First use case:** the `pr_decision` app (show what's needed to decide, then Merge runs
+   `gh pr merge --match-head-commit`), ahead of a full hunk-by-hunk review.
+
+Also settled: MCP Apps as the panel format; events reach the agent through
+`wait_for_panel_event` or, when it is idle, as a marked prompt; apps send events only on a user
+action; the phone comes last.

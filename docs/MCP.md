@@ -126,9 +126,12 @@ Only loopback HTTP frame declarations are accepted; base URI overrides are refus
 
 A custom app is an MCP Apps (2026-01-26) page talking JSON-RPC to its parent frame. Until it
 calls `ui/initialize` and then sends `ui/notifications/initialized`, the panel shows
-"Loading". Input arrives as `ui/notifications/tool-input` (`params.arguments` is the panel's
+"Loading"; after 10 s without it, the panel shows an error naming the stage that stalled, with
+Reload. Input arrives as `ui/notifications/tool-input` (`params.arguments` is the panel's
 `data`, again on every `panel_update`). A user action reaches the agent through `ui/message`,
-accepted only straight after a click or key in the panel; `_meta.muster.kind` names it.
+accepted only straight after a click or key inside the panel's content (checked by the sandbox
+proxy), at most 3 per user action (a 4th within about 5.5 s gets JSON-RPC error -32000), so
+send one message per deliberate action; `_meta.muster.kind` names it.
 A minimal app:
 
 ```html

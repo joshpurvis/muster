@@ -9,8 +9,9 @@ fetch approval, placement options and preview servers remain later phases. Neste
 blocked even for declared loopback dev servers: a child document's independent CSP would
 otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
 Each panel data revision is treated as a fresh tool input/result invocation in the same frame;
-the MCP Apps spec normally sends input once per invocation. Chromium exercises the gesture
-path; WebKitGTK activation remains unverified without opening a native window.
+the MCP Apps spec normally sends input once per invocation. The gesture rule is checked in the
+sandbox proxy and was verified in Chromium and in WebKitGTK 2.54 (run under GTK's Broadway
+backend): a tab click lets nothing through, one click inside the app lets at most 3 events through.
 
 Agents should be able to show things next to their terminal: images, charts, a rich diff with
 their notes on it, a live preview of the web app they are building, and interactive components

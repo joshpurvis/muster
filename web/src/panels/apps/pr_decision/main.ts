@@ -3,12 +3,17 @@
 import { openLink, sendEvent, startApp, typing } from "../shared/client.ts";
 import { h, mount, problems } from "../shared/dom.ts";
 import { diffStats, parseDiff } from "../shared/diff.ts";
+import { Gate } from "../shared/confirm.ts";
+import { actionForKey, type CustomAction, customEvent, outwardTarget } from "../shared/actions.ts";
+import { actionButton, outwardDrawer } from "../shared/actions_view.ts";
+import { renderChart } from "../chart/view.ts";
+import { formatBytes } from "../image/logic.ts";
 import {
-  askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, MAX_EVENT_BYTES, type Method, mergeBlocked, mergeCommand,
-  mergeEvent, METHODS, type Pr, requestChangesEvent, validatePr,
+  askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, type Method, mergeBlocked, mergeCommand,
+  mergeEvent, METHODS, type Pr, requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 
-type Mode = null | "confirm" | "request" | "ask";
+type Mode = null | "confirm" | "request" | "ask" | "outward";
 type Tone = "info" | "danger" | "warning" | "success";
 const root = document.getElementById("app")!;
 const MAX_DIFF_LINES = 400;
@@ -20,11 +25,20 @@ let method: Method = "squash";
 let deleteBranch = false;
 let mode: Mode = null;
 const gate = new ConfirmGate();
+/** The outward custom action being confirmed (mode "outward"), and its own armed gate. */
+let outward: CustomAction | null = null;
+const outGate = new Gate();
+/** Custom actions sent since the last update. */
+const sentCustom = new Set<string>();
+/** The media image shown enlarged, by its index in `pr.media`. */
+let enlarged: number | null = null;
+const chartTables = new Map<number, boolean>();
+let chartWidth = 0;
 let override = false;
 const drafts = { request: "", ask: "" };
 let shift = false;
 /** The decision sent and not yet answered by a panel update. */
-let sent: null | "merge" | "request_changes" | "ask" = null;
+let sent: null | "merge" | "request_changes" | "ask" | "skip" | "hold" = null;
 /** Feedback for the last action, shown beside the sticky actions so it is always in view. */
 let notice: { text: string; tone: Tone } | null = null;
 const answers: { question: string; text: string }[] = [];
@@ -32,7 +46,8 @@ let newAnswer = false;
 let mergeButton: HTMLButtonElement | null = null;
 
 const short = (sha: string) => sha.slice(0, 7);
-const triggers: Record<Exclude<Mode, null>, string> = { confirm: "merge", request: "request", ask: "ask" };
+const triggers: Record<Exclude<Mode, null | "outward">, string> = { confirm: "merge", request: "request", ask: "ask" };
+const triggerOf = (m: Exclude<Mode, null>) => m === "outward" ? `act-${outward?.id}` : triggers[m];
 
 function setNotice(text: string, tone: Tone = "info") { notice = { text, tone }; }
 
@@ -64,11 +79,74 @@ function openConfirm(withShift: boolean) {
 
 function closeMode() {
   const was = mode;
+  const back = was ? triggerOf(was) : null;
   if (mode === "confirm") gate.close();
+  if (mode === "outward") { outGate.close(); outward = null; }
   mode = null;
   render();
   // Hand the keyboard back to the action that opened the drawer.
-  if (was) (document.getElementById(triggers[was]) as HTMLButtonElement | null)?.focus();
+  if (back) (document.getElementById(back) as HTMLButtonElement | null)?.focus();
+}
+
+/** Skip and Hold: one event each; the agent moves on (Hold also marks it held in the overview). */
+function sendSimple(kind: "skip" | "hold") {
+  if (!pr || sent) return;
+  if (kind === "hold" && holdClosed(pr)) { setNotice(holdClosed(pr)!, "warning"); render(); return; }
+  if (mode) closeMode();
+  const event = kind === "skip" ? skipEvent(pr) : holdEvent(pr);
+  const result = sendEvent(event.kind, event.text, event.data);
+  sent = kind;
+  setNotice(kind === "skip" ? "Skipped: the agent moves on without changing this PR." : "Held: the agent puts this PR aside to come back to later.");
+  render();
+  document.getElementById(kind)?.focus();
+  result.catch((e) => { sent = null; setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
+}
+
+const holdClosed = (p: Pr) => p.status === "merged" ? "The PR is merged." : p.status === "queued" ? "The PR is queued to merge." : null;
+const target = (p: Pr) => ({ repo: p.repo, number: p.number, head_sha: p.head_sha });
+
+function runAction(a: CustomAction) {
+  if (!pr || sentCustom.has(a.id)) return;
+  if (a.outward) {
+    if (mode === "confirm") gate.close();
+    outward = a;
+    mode = "outward";
+    outGate.openTarget(outwardTarget(a, target(pr)));
+    notice = null;
+    render();
+    document.getElementById("confirm-outward")?.focus();
+    return;
+  }
+  sendCustom(a);
+}
+
+function sendCustom(a: CustomAction) {
+  const event = customEvent(a, target(pr!));
+  const result = sendEvent(event.kind, event.text, event.data);
+  sentCustom.add(a.id);
+  setNotice(`Sent: ${a.label}. The agent will ${a.description.replace(/^./, (c) => c.toLowerCase())}`);
+  render();
+  result.catch((e) => { sentCustom.delete(a.id); setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
+}
+
+function confirmOutward() {
+  if (!pr || mode !== "outward" || !outward) return;
+  const a = outward;
+  // Not yet armed: the key that opened it (or its repeat) is still held.
+  if (!outGate.canConfirmTarget(outwardTarget(a, target(pr)))) return;
+  outGate.close();
+  outward = null;
+  mode = null;
+  sendCustom(a);
+  document.getElementById(`act-${a.id}`)?.focus();
+}
+
+function enlarge(i: number | null) {
+  const was = enlarged;
+  enlarged = i;
+  render();
+  if (i !== null) document.getElementById("lightbox-close")?.focus();
+  else if (was !== null) document.getElementById(`media-${was}`)?.focus();
 }
 
 function confirmMerge() {
@@ -162,7 +240,8 @@ function diffView(diff: string) {
 }
 
 function statusBanner(p: Pr) {
-  if (p.status === "open") return null;
+  // An open PR's detail is the agent's note on what it did (e.g. for one of the user's actions).
+  if (p.status === "open") return p.status_detail ? h("div", { class: "status info note" }, h("span", { class: "detail" }, p.status_detail)) : null;
   const [label, tone] = statusText[p.status];
   return h("div", { class: `status ${tone}` },
     h("strong", null, label), p.status_detail ? h("span", { class: "detail" }, p.status_detail) : null);
@@ -180,6 +259,9 @@ function actionPanel(p: Pr) {
       h("div", { class: "row" },
         h("button", { type: "button", id: "confirm-merge", class: override ? "danger" : "primary", onclick: () => confirmMerge() }, "Confirm merge ", h("kbd", null, "Enter")),
         h("button", { type: "button", onclick: () => closeMode() }, "Cancel ", h("kbd", null, "Esc"))));
+  }
+  if (mode === "outward" && outward) {
+    return outwardDrawer(outward, `#${p.number}`, () => confirmOutward(), () => closeMode());
   }
   if (mode === "request" || mode === "ask") {
     const kind = mode;
@@ -207,6 +289,61 @@ function actionPanel(p: Pr) {
   return null;
 }
 
+function mediaSection(p: Pr) {
+  if (!p.media.length) return null;
+  const images = p.media.filter((m) => m.kind === "image").length;
+  return h("section", { class: "media", "aria-label": "Pictures and charts" },
+    h("h2", null, "Pictures and charts"),
+    h("div", { class: `media-grid${images === 1 ? " single" : ""}` }, p.media.map((m, i) => {
+      if (m.kind === "image") {
+        const img = m.image;
+        return h("figure", { class: "shot" },
+          h("button", { type: "button", class: "thumb", id: `media-${i}`, "aria-label": `Enlarge: ${img.alt}`, onclick: () => enlarge(i) },
+            h("img", { src: img.src, alt: img.alt, decoding: "async", draggable: "false" })),
+          img.caption ? h("figcaption", null, img.caption) : null);
+      }
+      return h("figure", { class: "media-chart" },
+        h("div", { class: "chart-view", "data-chart": i }),
+        m.caption ? h("figcaption", null, m.caption) : null);
+    })));
+}
+
+/** Charts need the laid-out width, so they are drawn after the rest is mounted (and on resize). */
+function drawCharts() {
+  if (!pr) return;
+  const p = pr;
+  for (const el of document.querySelectorAll<HTMLElement>("[data-chart]")) {
+    const i = Number(el.dataset.chart);
+    const m = p.media[i];
+    if (m?.kind !== "chart") continue;
+    chartWidth = el.clientWidth;
+    renderChart(el, m.spec, {
+      id: `chart-${i}`, width: el.clientWidth, minWidth: 220, maxHeight: 300, heading: "h3", showTable: chartTables.get(i) ?? false,
+      onToggle: () => { chartTables.set(i, !(chartTables.get(i) ?? false)); drawCharts(); },
+    });
+  }
+}
+
+function lightbox(p: Pr) {
+  if (enlarged === null) return null;
+  const m = p.media[enlarged];
+  if (m?.kind !== "image") return null;
+  const shots = p.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
+  const at = shots.indexOf(enlarged);
+  const step = (by: number) => enlarge(shots[(at + by + shots.length) % shots.length]);
+  return h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": m.image.alt, onclick: (e: Event) => { if (e.target === e.currentTarget) enlarge(null); } },
+    h("div", { class: "lb-bar" },
+      h("span", { class: "muted small lb-src", title: m.image.source }, m.image.source, m.image.bytes !== undefined ? ` · ${formatBytes(m.image.bytes)}` : ""),
+      shots.length > 1 ? [
+        h("button", { type: "button", "aria-label": "Previous picture", onclick: () => step(-1) }, "←"),
+        h("span", { class: "muted small" }, `${at + 1} / ${shots.length}`),
+        h("button", { type: "button", "aria-label": "Next picture", onclick: () => step(1) }, "→"),
+      ] : null,
+      h("button", { type: "button", id: "lightbox-close", onclick: () => enlarge(null) }, "Close ", h("kbd", null, "Esc"))),
+    h("div", { class: "lb-stage", onclick: () => enlarge(null) }, h("img", { src: m.image.src, alt: m.image.alt })),
+    m.image.caption ? h("p", { class: "lb-caption" }, m.image.caption) : null);
+}
+
 function render() {
   if (!pr) return;
   const p = pr;
@@ -218,12 +355,13 @@ function render() {
   const box = h("input", { type: "checkbox", id: "delete-branch", checked: deleteBranch, disabled: p.status === "merged" || p.status === "queued" }) as HTMLInputElement;
   box.addEventListener("change", () => { deleteBranch = box.checked; if (mode === "confirm") render(); });
   mergeButton = h("button", {
-    type: "button", id: "merge", class: "primary", "aria-describedby": "merge-hint",
+    type: "button", id: "merge", class: "primary", "aria-describedby": "merge-hint", "aria-keyshortcuts": "M",
     onclick: (e: Event) => openConfirm((e as MouseEvent).shiftKey || shift),
   }, h("span", { class: "label" }, "Merge"), " ", h("kbd", null, "M")) as HTMLButtonElement;
   const closed = formsClosed(p);
   const stats = p.changes.map((c) => diffStats(parseDiff(c.diff)));
-  const effective = notice ?? (p.status !== "open" ? { text: `${statusText[p.status][0]}${p.status_detail ? `: ${p.status_detail}` : ""}`, tone: statusText[p.status][1] as Tone } : null);
+  const effective = notice ?? (p.status !== "open" ? { text: `${statusText[p.status][0]}${p.status_detail ? `: ${p.status_detail}` : ""}`, tone: statusText[p.status][1] as Tone }
+    : p.status_detail ? { text: p.status_detail, tone: "info" as Tone } : null);
 
   mount(root,
     h("header", { class: "head" },
@@ -234,6 +372,7 @@ function render() {
     statusBanner(p),
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
     h("section", null, h("h2", null, "What changed"), h("p", { class: "prose" }, p.summary)),
+    mediaSection(p),
     h("section", { class: "grid" },
       h("div", null,
         h("h2", null, "Risk"),
@@ -273,12 +412,18 @@ function render() {
         h("div", { class: "merge-group" }, mergeButton, select,
           h("label", { class: "check" }, box, " Delete branch")),
         h("span", { class: "spacer" }),
-        h("button", { type: "button", id: "request", disabled: !!closed || sent === "request_changes", title: closed ?? null, onclick: () => setMode("request") }, "Request changes ", h("kbd", null, "R")),
-        h("button", { type: "button", id: "ask", disabled: !!closed, title: closed ?? null, onclick: () => setMode("ask") }, "Ask ", h("kbd", null, "A")),
-        h("button", { type: "button", id: "open", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
+        h("button", { type: "button", id: "request", "aria-keyshortcuts": "R", disabled: !!closed || sent === "request_changes", title: closed ?? null, onclick: () => setMode("request") }, "Request changes ", h("kbd", null, "R")),
+        h("button", { type: "button", id: "ask", "aria-keyshortcuts": "A", disabled: !!closed, title: closed ?? null, onclick: () => setMode("ask") }, "Ask ", h("kbd", null, "A")),
+        h("button", { type: "button", id: "open", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
+      h("div", { class: "row bar second" },
+        h("button", { type: "button", id: "skip", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
+        h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
+        p.actions.map((a) => actionButton(a, () => runAction(a), sentCustom.has(a.id)))),
       h("p", { id: "merge-hint", class: "hint small", "aria-live": "polite" }),
       closed ? h("p", { class: "hint small" }, `${closed} Request changes and Ask are off.`) : null),
+    lightbox(p),
   );
+  drawCharts();
   updateMergeButton();
   scrollTo(0, scroll);
   if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
@@ -291,8 +436,21 @@ function render() {
 addEventListener("keydown", (e) => {
   if (e.key === "Shift" && !shift) { shift = true; updateMergeButton(); }
   // A held key's auto-repeat never acts on an open confirm (nor activates its focused button).
+  const outRepeat = outGate.keyDown(e.code, e.key, e.repeat);
   if (gate.keyDown(e.code, e.key, e.repeat) && mode === "confirm") { e.preventDefault(); return; }
+  if (outRepeat && mode === "outward") { e.preventDefault(); return; }
   if (!pr) return;
+  if (enlarged !== null) {
+    // The enlarged picture takes the keyboard until it closes.
+    if (e.key === "Escape") { e.preventDefault(); enlarge(null); }
+    else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      const shots = pr.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
+      const at = shots.indexOf(enlarged);
+      e.preventDefault();
+      enlarge(shots[(at + (e.key === "ArrowRight" ? 1 : -1) + shots.length) % shots.length]);
+    }
+    return;
+  }
   if (typing(e)) {
     const target = e.target as HTMLElement;
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && (target.id === "request-text" || target.id === "ask-text")) {
@@ -304,6 +462,12 @@ addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   if (key === "Escape" && mode) { e.preventDefault(); closeMode(); return; }
+  if (key === "Enter" && mode === "outward") {
+    e.preventDefault();
+    if ((e.target as HTMLElement).id === "confirm-outward" || (e.target as HTMLElement).tagName !== "BUTTON") confirmOutward();
+    else (e.target as HTMLButtonElement).click();
+    return;
+  }
   if (key === "Enter" && mode === "confirm") {
     // Only an armed confirm may send; a focused Confirm button gets no native activation from
     // this key, so the same press is never handled twice.
@@ -317,15 +481,28 @@ addEventListener("keydown", (e) => {
   else if (key === "r" && !formsClosed(pr) && sent !== "request_changes") { e.preventDefault(); setMode("request"); }
   else if (key === "a" && !formsClosed(pr)) { e.preventDefault(); setMode("ask"); }
   else if (key === "o") { e.preventDefault(); openLink(pr.url).catch((err) => { setNotice(err.message, "danger"); render(); }); }
+  // With a confirm open, Skip, Hold and the user's actions wait until it is answered.
+  else if (mode === "confirm" || mode === "outward") return;
+  else if (key === "s") { e.preventDefault(); sendSimple("skip"); }
+  else if (key === "h") { e.preventDefault(); sendSimple("hold"); }
+  else {
+    const a = actionForKey(pr.actions, key);
+    if (a) { e.preventDefault(); runAction(a); }
+  }
 });
 addEventListener("keyup", (e) => {
   if (e.key === "Shift" && shift) { shift = false; updateMergeButton(); }
   gate.keyUp(e.code);
+  outGate.keyUp(e.code);
 });
+new ResizeObserver(() => {
+  const el = document.querySelector<HTMLElement>("[data-chart]");
+  if (el && Math.abs(el.clientWidth - chartWidth) > 4) drawCharts();
+}).observe(root);
 const pointer = (e: PointerEvent) => { if (e.shiftKey !== shift) { shift = e.shiftKey; updateMergeButton(); } };
 addEventListener("pointermove", pointer);
 addEventListener("pointerdown", pointer, true);
-addEventListener("blur", () => { gate.blur(); if (shift) { shift = false; updateMergeButton(); } });
+addEventListener("blur", () => { gate.blur(); outGate.blur(); if (shift) { shift = false; updateMergeButton(); } });
 
 startApp({
   name: "Muster PR decision",
@@ -334,7 +511,10 @@ startApp({
     if (!r.ok) {
       // Nothing may stay confirmed across invalid input; the user starts again from Merge.
       gate.input(null);
-      if (mode === "confirm") mode = null;
+      outGate.inputTarget(null);
+      outward = null;
+      enlarged = null;
+      if (mode === "confirm" || mode === "outward") mode = null;
       pr = null;
       mergeButton = null;
       problems(root, "This PR decision panel's input is invalid", r.errors);
@@ -347,18 +527,30 @@ startApp({
       mode = null;
       setNotice("The PR changed while you were confirming. Check it again, then Merge.", "warning");
     }
+    if (mode === "outward" && outward) {
+      const a = next.actions.find((x) => x.id === outward!.id);
+      if (outGate.inputTarget(a ? outwardTarget(a, target(next)) : null)) {
+        mode = null;
+        outward = null;
+        setNotice("The PR or the action changed while you were confirming. Check it, then try again.", "warning");
+      } else outward = a!;
+    }
+    if (enlarged !== null && next.media[enlarged]?.kind !== "image") enlarged = null;
     if (id !== identity) {
       identity = id;
       method = next.merge_method_default;
       deleteBranch = next.delete_branch_default;
       answers.length = 0;
+      chartTables.clear();
+      enlarged = null;
       if (mode === "confirm") mode = null;
       notice = null;
     } else if (changedSha) {
       setNotice(`The PR's head commit changed to ${short(next.head_sha)}. Check the changes again before merging.`, "warning");
-    } else if (sent) notice = null;
+    } else if (sent || sentCustom.size) notice = null;
     // Any update is the agent's reply to what was sent.
     sent = null;
+    sentCustom.clear();
     if (next.answer && !answers.some((a) => a.question === next.answer!.question && a.text === next.answer!.text)) {
       answers.push(next.answer);
       newAnswer = true;

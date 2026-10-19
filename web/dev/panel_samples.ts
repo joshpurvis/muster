@@ -89,3 +89,53 @@ export const tableSample = {
   ],
   sort: { key: "seconds", dir: "desc" },
 };
+
+/** The user's own actions, as an agent adds them when asked for "a Needs QA button". */
+export const actionsSample = [
+  { id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label to this PR on GitHub.", outward: true },
+  { id: "later", label: "Label later", key: "l", description: "Note this PR in your list to label later; nothing changes on GitHub." },
+];
+
+export const overviewSample = {
+  repo: "acme/api",
+  prs: [
+    {
+      number: 812, title: "Rate-limit failed logins per IP", author: "dana", url: "https://github.com/acme/api/pull/812",
+      created_at: "2026-10-15T09:00:00Z", additions: 182, deletions: 12, files: 6, checks: "passing", review: "REVIEW_REQUIRED",
+      labels: ["security"], risk: "medium", head_sha: HEAD_SHA,
+      summary: "Adds a per-IP limit of 5 failed logins per 10 minutes to POST /login; 429 with Retry-After.",
+    },
+    {
+      number: 815, title: "Fix a typo in the README", author: "lee", url: "https://github.com/acme/api/pull/815",
+      created_at: "2026-10-18T16:00:00Z", additions: 1, deletions: 1, files: 1, checks: "passing", review: "APPROVED",
+      labels: ["docs"], risk: "low", summary: "One word in the install section.",
+    },
+    {
+      number: 801, title: "Rewrite the session store on Redis streams", author: "sam", url: "https://github.com/acme/api/pull/801",
+      created_at: "2026-10-01T10:00:00Z", additions: 940, deletions: 455, files: 31, checks: "failing", review: "",
+      labels: ["refactor", "needs-design"], risk: "high", draft: true,
+      summary: "Replaces the session table with Redis streams; migrations for existing sessions are not in yet.",
+    },
+    {
+      number: 820, title: "Bump serde to 1.0.228", author: "renovate", url: "https://github.com/acme/api/pull/820",
+      created_at: "2026-10-19T07:30:00Z", additions: 6, deletions: 6, files: 2, checks: "pending", risk: "low",
+      summary: "Dependency bump; lockfile only.",
+    },
+  ],
+  actions: actionsSample,
+};
+
+/** prSample with pictures and a chart before the diffs (the path is a file in this repo). */
+export const prMediaSample = {
+  ...prSample,
+  media: [
+    { kind: "image", path: "web/m/icon-512.png", alt: "Login page after the change", caption: "429 page shown after 5 failed logins" },
+    { kind: "image", path: "web/m/icon-192.png", alt: "Retry-After countdown", caption: "The countdown on the login form" },
+    {
+      kind: "chart", caption: "Lines changed per area",
+      spec: { type: "bar", x: { label: "Area", values: ["src/auth", "tests", "config"] },
+        series: [{ name: "added", values: [124, 64, 2] }, { name: "removed", values: [9, 0, 3] }], y: { label: "Lines" } },
+    },
+  ],
+  actions: actionsSample,
+};

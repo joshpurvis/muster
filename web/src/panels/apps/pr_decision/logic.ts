@@ -1,6 +1,10 @@
 // `pr_decision` app: input checks, the merge command and the event payloads. Pure, so deno
 // tests cover it. docs/AGENT_PANELS.md "PR decision, end to end" is the contract.
 import { httpsUrl, Problems, type Result } from "../shared/validate.ts";
+import { Gate } from "../shared/confirm.ts";
+import { type CustomAction, validateActions } from "../shared/actions.ts";
+import { type ImageInput, validateImage } from "../image/logic.ts";
+import { type ChartSpec, validateChart } from "../chart/logic.ts";
 
 export const METHODS = ["squash", "merge", "rebase"] as const;
 export type Method = typeof METHODS[number];
@@ -12,6 +16,12 @@ export const STATUSES = ["open", "merging", "queued", "merged", "failed", "reque
 export type Status = typeof STATUSES[number];
 
 export interface Change { file: string; note: string; diff: string }
+/** Pictures and charts shown before the diffs. Muster reads an image `path` into `src`. */
+export type Media = { kind: "image"; image: ImageInput } | { kind: "chart"; spec: ChartSpec; caption?: string };
+export const MEDIA_KINDS = ["image", "chart"] as const;
+/** Same caps as src/panel_apps.rs: items, and image bytes in all. */
+export const MAX_MEDIA = 8;
+export const MAX_MEDIA_BYTES = 6 * 1024 * 1024;
 export interface Pr {
   repo: string;
   number: number;
@@ -33,6 +43,8 @@ export interface Pr {
   answer?: { question: string; text: string };
   status: Status;
   status_detail?: string;
+  media: Media[];
+  actions: CustomAction[];
 }
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -45,7 +57,8 @@ export function validatePr(data: unknown): Result<Pr> {
   const o = p.object(data, "data");
   if (!o) return p.result(null as never);
   p.known(o, "", ["repo", "number", "title", "author", "url", "base", "head", "head_sha", "merge_method_default",
-    "delete_branch_default", "summary", "risk", "checks", "reviews", "changes", "rest_note", "questions", "answer", "status", "status_detail"]);
+    "delete_branch_default", "summary", "risk", "checks", "reviews", "changes", "rest_note", "questions", "answer", "status", "status_detail",
+    "media", "actions"]);
   const repo = p.string(o, "repo", "", { required: true, max: 201 });
   if (repo !== undefined && !REPO.test(repo)) p.add("repo", "must look like owner/name");
   const number = p.number(o, "number", "", true);
@@ -146,11 +159,47 @@ export function validatePr(data: unknown): Result<Pr> {
   }
   const status = p.oneOf(o, "status", "", STATUSES) ?? "open";
   const status_detail = p.string(o, "status_detail", "", { max: 4000 });
+  const media = validateMedia(p, o);
+  const actions = validateActions(p, o);
   return p.result({
     repo: repo!, number: number!, title: title!, author: author!, url: url!, base: base!, head: head!, head_sha: head_sha!,
     merge_method_default, delete_branch_default, summary: summary!, risk: risk!, checks: checks!, reviews, changes,
-    rest_note, questions, answer, status, status_detail,
+    rest_note, questions, answer, status, status_detail, media, actions,
   });
+}
+
+/** Each item is checked by its own app's rules (image, chart), its problems prefixed with its place. */
+function validateMedia(p: Problems, o: Record<string, unknown>): Media[] {
+  const out: Media[] = [];
+  let bytes = 0;
+  p.array(o, "media", "", { max: MAX_MEDIA })?.forEach((m, i) => {
+    const at = `media[${i}]`;
+    const mo = p.object(m, at);
+    if (!mo) return;
+    const kind = p.oneOf(mo, "kind", at, MEDIA_KINDS, true);
+    const { kind: _, ...rest } = mo;
+    const nested = (errors: string[], warnings: string[]) => {
+      for (const e of errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
+      for (const w of warnings) p.warnings.push(`${at}.${w}`);
+    };
+    if (kind === "image") {
+      const r = validateImage(rest);
+      if (!r.ok) { nested(r.errors, []); return; }
+      nested([], r.warnings);
+      bytes += r.value.bytes ?? 0;
+      out.push({ kind, image: r.value });
+    } else if (kind === "chart") {
+      p.known(mo, at, ["kind", "spec", "caption"]);
+      const caption = p.string(mo, "caption", at, { max: 2000 });
+      if (mo.spec === undefined || mo.spec === null) { p.add(`${at}.spec`, "is required (a chart app spec)"); return; }
+      const r = validateChart(mo.spec);
+      if (!r.ok) { for (const e of r.errors) p.errors.push(`${at}.spec.${e.replace(/^data: /, "")}`); return; }
+      for (const w of r.warnings) p.warnings.push(`${at}.spec.${w}`);
+      out.push({ kind, spec: r.value, caption });
+    }
+  });
+  if (bytes > MAX_MEDIA_BYTES) p.add("media", `images total ${bytes} bytes; at most ${MAX_MEDIA_BYTES}`);
+  return out;
 }
 
 function strings(p: Problems, o: Record<string, unknown>, key: string, path: string, max: number, len: number): string[] {
@@ -211,6 +260,24 @@ export function askEvent(pr: Pr, question: string) {
   };
 }
 
+/** Skip: back to the list (or the next PR) without changing this one. */
+export function skipEvent(pr: Pr) {
+  return {
+    kind: "skip" as const,
+    text: `Skip PR #${pr.number} (${pr.repo}) for now: move on without changing it.`,
+    data: { action: "skip" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha },
+  };
+}
+
+/** Hold: put this PR aside to come back to later. */
+export function holdEvent(pr: Pr) {
+  return {
+    kind: "hold" as const,
+    text: `Hold PR #${pr.number} (${pr.repo}): put it aside to come back to later.`,
+    data: { action: "hold" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha },
+  };
+}
+
 /** Muster refuses events over 16 KiB of JSON; keep a margin for the envelope. */
 export const MAX_EVENT_BYTES = 15 * 1024;
 
@@ -247,59 +314,14 @@ export function confirmTarget(pr: Pr): string {
   return JSON.stringify([pr.repo, pr.number, pr.base, pr.head_sha, pr.checks.state, pr.merge_method_default]);
 }
 
-/** Keys that are only held to modify another (Shift for "merge anyway"); they never block arming. */
-export const MODIFIERS = new Set(["Shift", "Control", "Alt", "Meta", "AltGraph", "CapsLock"]);
-
 /**
- * The second step of Merge. It is armed only once no key is held, so the key press that opened
- * it, or its auto-repeat, can never also confirm; and any change to what it confirms, or an
- * invalid update, cancels it.
+ * The second step of Merge, bound to what it merges: any change to `confirmTarget(pr)` cancels
+ * it (shared/confirm.ts has the arming rule).
  */
-export class ConfirmGate {
-  private held = new Set<string>();
-  target: string | null = null;
-  armed = false;
+export class ConfirmGate extends Gate {
+  open(pr: Pr) { this.openTarget(confirmTarget(pr)); }
 
-  /** `code` is the physical key (KeyboardEvent.code), so Shift+M and its "m" keyup match.
-   * Returns true when the browser's default action must be prevented (a repeat while open). */
-  keyDown(code: string, key: string, repeat: boolean): boolean {
-    if (!MODIFIERS.has(key)) this.held.add(code);
-    return this.target !== null && repeat;
-  }
+  canConfirm(pr: Pr | null): boolean { return this.canConfirmTarget(pr ? confirmTarget(pr) : null); }
 
-  keyUp(code: string) {
-    this.held.delete(code);
-    if (this.target !== null && this.held.size === 0) this.armed = true;
-  }
-
-  /** Focus left the app: keyups may never come. */
-  blur() {
-    this.held.clear();
-    if (this.target !== null) this.armed = true;
-  }
-
-  open(pr: Pr) {
-    this.target = confirmTarget(pr);
-    this.armed = this.held.size === 0;
-  }
-
-  close() {
-    this.target = null;
-    this.armed = false;
-  }
-
-  get isOpen() { return this.target !== null; }
-
-  /** A confirm may send only when armed and still about the same PR state. */
-  canConfirm(pr: Pr | null): boolean {
-    return this.target !== null && this.armed && pr !== null && confirmTarget(pr) === this.target;
-  }
-
-  /** New input: returns true if it cancelled an open confirm. */
-  input(pr: Pr | null): boolean {
-    if (this.target === null) return false;
-    if (pr && confirmTarget(pr) === this.target) return false;
-    this.close();
-    return true;
-  }
+  input(pr: Pr | null): boolean { return this.inputTarget(pr ? confirmTarget(pr) : null); }
 }

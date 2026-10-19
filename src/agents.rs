@@ -2641,7 +2641,8 @@ mod tests {
         for want in ["pr_decision", "wait_for_panel_event", "remaining > 0", "panel_event {panel_id, event_id}",
             "gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>", "headRefOid",
             "compare/BS...H", "commits/H/check-runs", "payload._meta.muster.data", "--request-changes", "is status `queued`",
-            "Only if it succeeded", "head_sha must equal what your panel shows"] {
+            "Only if it succeeded", "head_sha must equal what your panel shows", "pr_overview", "`hold` `{repo, number, head_sha}`",
+            "`custom` `{id, repo, number, head_sha}`", "media"] {
             assert!(pr.contains(want), "PR reviewer persona mentions {want}");
         }
         // One source: the template is the skill's body under the persona header.

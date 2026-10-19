@@ -108,7 +108,7 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
 | `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
@@ -178,11 +178,13 @@ moves out, removes panels, files and events.
 Built-ins take only `data` (no `html`). Each follows the host theme and works by keyboard.
 `panel_open` and `panel_update` refuse input whose basic shape is wrong, naming the field:
 `image` (all of it, unknown fields included), `chart` (type, x values, series names and
-lengths), `table` (column keys, rows as objects) and `pr_decision` (`repo`, `number`,
+lengths), `table` (column keys, rows as objects), `pr_decision` (`repo`, `number`,
 `head_sha`, `base`, `head`, `url`, `title`, `author`, `summary`, `risk.level`, `checks`,
-`changes`, `merge_method_default`, `status`). The app then checks the rest and shows any
-problem as a list inside the panel; unknown fields of chart, table and pr_decision are only
-listed there as warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
+`changes`, `merge_method_default`, `status`, all of `media` and `actions`) and `pr_overview`
+(`repo`, each PR's number, title, author, enums, counts, `url` and `head_sha`, `current`,
+`sort`, `actions`). The app then checks the rest and shows any problem as a list inside the
+panel; unknown fields of chart, table, pr_decision and pr_overview are only listed there as
+warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
 `cd web && deno task panels`.
 
 **`image`**: `{path?, url?, alt?, caption?}`, exactly one of `path` or `url`. `path` is a file
@@ -241,7 +243,9 @@ filter box (`/`) matches every word in any column, and the header stays visible 
 | `changes` | `[{file, note, diff}]`: only the changes worth a look, each a unified diff (with or without the `diff --git` header; renames, mode changes and binary files show as a line) and the agent's note |
 | `rest_note?`, `questions?` | a line about what is not shown; the agent's open questions |
 | `answer?` | `{question, text}`: the agent's answer to an Ask, shown inline |
-| `status?`, `status_detail?` | `open` (default), `merging`, `queued` (in a merge queue or set to auto-merge), `merged`, `failed` or `requested_changes`, shown as a banner and beside the actions |
+| `status?`, `status_detail?` | `open` (default), `merging`, `queued` (in a merge queue or set to auto-merge), `merged`, `failed` or `requested_changes`, shown as a banner and beside the actions; with `open`, a `status_detail` shows as a note (e.g. what the agent did for a custom action) |
+| `media?` | up to 8 pictures and charts shown after the summary, before the diffs (below) |
+| `actions?` | the user's own actions ([below](#the-users-own-actions)) |
 
 Actions: **Merge** (M) with a method select and a delete-branch box shows the exact command
 `gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>`
@@ -253,7 +257,18 @@ says so beside it), and while the agent works (`merging`, `queued`, `merged`, or
 update after a sent decision). **Request changes** (R) and **Ask** (A) open a text box
 (Ctrl+Enter sends); text that would make the event exceed the 16 KiB event limit cannot be
 sent, and both are off once the PR is `merged`, `queued` or `requested_changes`. **Open on
-GitHub** (O) uses the host browser.
+GitHub** (O) uses the host browser. **Skip** (S) moves on without changing the PR; **Hold** (H)
+puts it aside for later (off once it is `merged` or `queued`). Each sends one event, and both
+are off until the agent's next update. The user's own actions follow them.
+
+`media` items are `{kind: "image", path? | url?, alt?, caption?}` or `{kind: "chart", spec,
+caption?}`. A picture follows the `image` app's rules: Muster reads a `path` (a file in the
+task worktree, PNG, JPEG, GIF, WebP or SVG) into a data URI, a `url` must be https and its
+origin joins `csp.resourceDomains` on `panel_open` (an update must keep to declared origins).
+At most 8 items and 6 MiB of image files in all; the agent's own JSON keeps the 1 MiB limit.
+A chart's `spec` is a `chart` app input, drawn by the same code. Pictures show as thumbnails
+(one alone shows larger); a click or Enter enlarges one inside the panel, arrows step through
+them, Esc or a click closes it.
 
 Events are sent with `ui/message`; the decision is in the event's `kind`, and its fields in
 `payload._meta.muster.data` (`payload.content.text` repeats it for people):
@@ -263,6 +278,9 @@ Events are sent with `ui/message`; the decision is in the event's `kind`, and it
 | `merge` | `{action: "merge", repo, number, base, method, delete_branch, head_sha}` |
 | `request_changes` | `{action: "request_changes", repo, number, head_sha, body}` |
 | `ask` | `{action: "ask", repo, number, question}` |
+| `skip` | `{action: "skip", repo, number, head_sha}` |
+| `hold` | `{action: "hold", repo, number, head_sha}` |
+| `custom` | `{action: "custom", id, repo, number, head_sha}`, one of the user's own actions |
 
 `--match-head-commit` binds the merge to the head only; the agent must also check that the
 PR's base and repo still match the event before running the command (the PR reviewer flow
@@ -280,11 +298,81 @@ does).
  "rest_note": "64 more lines of tests.", "questions": ["Is 5 per 10 minutes right?"]}
 ```
 
+With pictures and a chart (the paths are files in the task worktree):
+
+```json
+{"media": [{"kind": "image", "path": ".muster-pr/812/1.png", "alt": "Login page after 5 failed attempts", "caption": "From the PR description"},
+  {"kind": "chart", "caption": "Lines changed per area", "spec": {"type": "bar", "x": {"values": ["src/auth", "tests"]},
+    "series": [{"name": "added", "values": [124, 64]}, {"name": "removed", "values": [9, 0]}]}}]}
+```
+
+**`pr_overview`**: every open PR of one repo as a card, for going through them with the agent.
+
+| Field | |
+|---|---|
+| `repo` | `owner/name` |
+| `title?` | heading (default "Open pull requests") |
+| `prs` | up to 200 `{number, title, author, url?, created_at?, draft?, additions?, deletions?, files?, checks?, review?, labels?, risk?, summary?, status?, status_detail?, head_sha?}`; numbers unique |
+| `prs[].checks?` | `passing`, `failing`, `pending` or `none` |
+| `prs[].review?` | gh's `reviewDecision`: `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NONE` or `""` |
+| `prs[].risk?`, `prs[].summary?` | the agent's triage: `low`, `medium` or `high`, and one line (at most 500 characters) |
+| `prs[].status?` | the agent keeps it up to date: `new` (default), `reviewing`, `merged`, `queued`, `held`, `skipped`, `changes_requested` or `failed`; `status_detail` is a short note under the card |
+| `current?` | the PR the agent is on (marked "Now"; the selection follows it) |
+| `sort?` | the starting order: `risk` (riskiest first, default), `quick` (quick wins first: not a draft, checks passing, low risk, small) or `oldest` |
+| `actions?` | the user's own actions ([below](#the-users-own-actions)) |
+
+Cards show number, title, author, age, size (+/− lines, files), a draft flag, the checks,
+review and risk badges, labels, the summary and the status. A select changes the sort and a
+filter box (`/`, Esc clears) matches every word in the number, title, author, labels, summary
+or status. PRs still to review come first, then decided ones (merged, queued, changes
+requested), then held ones. Keys: J/K or ↓/↑ move, Enter or O opens the selected PR, H holds
+it, N goes through them in order; a double-click opens. Readable from about 400 px wide.
+
+| `kind` | `payload._meta.muster.data` |
+|---|---|
+| `open` | `{action: "open", repo, number}` |
+| `hold` | `{action: "hold", repo, number}` |
+| `next` | `{action: "next", repo, number, order}`: review `number` now, then the rest of `order` (the PRs still new or skipped, in the order the user sees, starting after `current`) |
+| `custom` | `{action: "custom", id, repo, number, head_sha?}` for the selected PR (`head_sha` when its card has one) |
+
+```json
+{"repo": "acme/api", "current": 812, "prs": [
+  {"number": 812, "title": "Rate-limit failed logins per IP", "author": "dana", "url": "https://github.com/acme/api/pull/812",
+   "created_at": "2026-10-15T09:00:00Z", "additions": 182, "deletions": 12, "files": 6, "checks": "passing",
+   "review": "REVIEW_REQUIRED", "labels": ["security"], "risk": "medium", "status": "reviewing",
+   "summary": "Per-IP limit of 5 failed logins per 10 minutes on POST /login."},
+  {"number": 815, "title": "Fix a typo in the README", "author": "lee", "additions": 1, "deletions": 1, "files": 1,
+   "checks": "passing", "review": "APPROVED", "risk": "low", "summary": "One word in the install section."}]}
+```
+
+##### The user's own actions
+
+Both PR apps take `actions: [{id, label, key?, description, outward?}]`, at most 8: buttons
+for options the user asked the agent for ("a Needs QA button"). `id` is lowercase letters,
+digits, `-` or `_` (at most 40), unique and not a built-in event name; `label` at most 40
+characters; `description` (at most 300) says exactly what the agent will do and is shown as
+the button's tooltip and in its confirm; `key` is one letter or digit, unique, and not one the apps use
+(M R A O S H J K N; Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain
+key never clashes). `outward: true` marks an action that changes GitHub or anything off this
+machine (comments, labels, closing, pushing): its button (marked ↗) first shows the
+description and needs Enter or "Confirm", armed only after the opening key is released, and
+any change to the action or the PR cancels it. Each sends one `custom` event; an action is off
+until the agent's next update. A custom action never merges: the agent merges only on a
+pr_decision `merge` event.
+
+```json
+{"actions": [{"id": "needs-qa", "label": "Needs QA", "key": "q", "description": "Add the needs-qa label to this PR on GitHub.", "outward": true},
+  {"id": "later", "label": "Label later", "key": "l", "description": "Note this PR in your list to label later; nothing changes on GitHub."}]}
+```
+
 The **PR reviewer** agent template (New agent) and the `muster-pr-review` skill (`muster skills
 install`, docs/CLI.md) share the agent side: review one immutable
 snapshot (head and base SHAs; diff and checks of that head), open this panel, wait for its
 events, re-check head and base before merging, merge only on its Merge event, and report
-`merged`, `queued` or `failed` from what GitHub says afterwards.
+`merged`, `queued` or `failed` from what GitHub says afterwards. For "help me review the open
+PRs" they list the open PRs with `gh pr list`, triage each briefly, open a `pr_overview`, and
+run that flow for each PR the user opens (or for each in turn on Next), updating its card
+after each decision.
 
 ### Agents
 

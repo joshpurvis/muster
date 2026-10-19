@@ -76,6 +76,34 @@ section { margin: 0 0 18px; }
 button kbd { margin-left: 2px; }
 button.primary kbd, button.danger kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
 @media (max-width: 520px) {
+  /* Narrow panels: natural-width buttons and no key hints (aria-keyshortcuts keeps them), so
+     the sticky bar stays three short rows. */
   .bar .spacer { display: none; }
-  .bar button { flex: 1 1 auto; }
+  .actions { padding: 8px 12px 10px; margin: 12px -16px 0; }
+  .row { gap: 6px; }
+  .bar button kbd { display: none; }
+  .bar.second { margin-top: 6px; }
 }
+.bar.second { margin-top: 8px; }
+button.outward { border-color: var(--color-text-warning); }
+button .out { color: var(--color-text-warning); }
+.outward-desc { margin: 0 0 6px; }
+/* Pictures and charts the agent added (media), before the diffs. */
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); gap: 12px; }
+.media-grid .media-chart, .media-grid.single .shot { grid-column: 1 / -1; }
+.media figure { margin: 0; min-width: 0; }
+.media figcaption { font-size: 12.5px; color: var(--color-text-secondary); margin-top: 4px; }
+.thumb { display: block; width: 100%; padding: 4px; min-height: 0; background: var(--color-background-secondary); cursor: zoom-in; }
+.thumb img { display: block; width: 100%; height: 150px; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.media-grid.single .thumb img { height: auto; max-height: 340px; }
+.media-chart { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; }
+.media-chart .chart-title { font-size: 14px; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+  background: var(--color-background-primary);
+}
+.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
+.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
+.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; cursor: zoom-out; }
+.lb-stage img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }

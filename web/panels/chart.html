@@ -98,37 +98,38 @@ textarea { display: block; width: 100%; resize: vertical; }
 .warnings { color: var(--color-text-warning); font-size: 12px; margin: 0 0 8px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
-h1 { margin-bottom: 8px; }
-.legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 8px; font-size: 13px; }
-.legend li { display: flex; align-items: center; gap: 6px; }
-.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
-.swatch.line { height: 3px; width: 14px; border-radius: 2px; }
-figure { position: relative; margin: 0; }
-figure svg { display: block; max-width: 100%; height: auto; overflow: visible; }
-figure svg:focus-visible { outline-offset: 4px; }
-.grid line { stroke: var(--color-border-secondary); stroke-width: 1; }
-.baseline { stroke: var(--color-border-primary); stroke-width: 1; }
-.axis text { fill: var(--color-text-secondary); font-size: 11.5px; font-family: var(--font-sans); }
-.axis.y text { font-family: var(--font-mono); font-size: 11px; }
-.axis-label { fill: var(--color-text-secondary); font-size: 12px; font-weight: 600; }
-.guide { stroke: var(--color-text-tertiary); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
-.focus { pointer-events: none; }
-.dot { fill-opacity: 0.85; }
-.tip {
+/* Scoped to .chart-view, so pr_decision can include it for its media charts. */
+.chart-view .chart-title { margin-bottom: 8px; }
+.chart-view .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 8px; font-size: 13px; }
+.chart-view .legend li { display: flex; align-items: center; gap: 6px; }
+.chart-view .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.chart-view .swatch.line { height: 3px; width: 14px; border-radius: 2px; }
+.chart-view figure { position: relative; margin: 0; }
+.chart-view figure svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+.chart-view figure svg:focus-visible { outline-offset: 4px; }
+.chart-view .grid line { stroke: var(--color-border-secondary); stroke-width: 1; }
+.chart-view .baseline { stroke: var(--color-border-primary); stroke-width: 1; }
+.chart-view .axis text { fill: var(--color-text-secondary); font-size: 11.5px; font-family: var(--font-sans); }
+.chart-view .axis.y text { font-family: var(--font-mono); font-size: 11px; }
+.chart-view .axis-label { fill: var(--color-text-secondary); font-size: 12px; font-weight: 600; }
+.chart-view .guide { stroke: var(--color-text-tertiary); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
+.chart-view .focus { pointer-events: none; }
+.chart-view .dot { fill-opacity: 0.85; }
+.chart-view .tip {
   position: absolute; pointer-events: none; min-width: 120px; max-width: 260px; z-index: 2;
   background: var(--color-background-secondary); border: 1px solid var(--color-border-primary);
   border-radius: var(--border-radius-md); padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
 }
-.tip-x { color: var(--color-text-secondary); margin-bottom: 2px; }
-.tip-row { display: flex; align-items: center; gap: 6px; }
-.tip-row b { margin-left: auto; padding-left: 10px; font-family: var(--font-mono); font-weight: 600; }
-.hint { font-size: 12px; margin-top: 6px; }
-.data-wrap { overflow-x: auto; }
-table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
-table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
-table.data th, table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
-table.data th[scope="row"], table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }
-.swatch-svg { flex: none; display: block; }
+.chart-view .tip-x { color: var(--color-text-secondary); margin-bottom: 2px; }
+.chart-view .tip-row { display: flex; align-items: center; gap: 6px; }
+.chart-view .tip-row b { margin-left: auto; padding-left: 10px; font-family: var(--font-mono); font-weight: 600; }
+.chart-view .hint { font-size: 12px; margin-top: 6px; }
+.chart-view .data-wrap { overflow-x: auto; }
+.chart-view table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
+.chart-view table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
+.chart-view table.data th, .chart-view table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
+.chart-view table.data th[scope="row"], .chart-view table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }
+.chart-view .swatch-svg { flex: none; display: block; }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -628,12 +629,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     return Math.max(1, Math.ceil(count / fit));
   }
 
-  // src/panels/apps/chart/main.ts
-  var root = document.getElementById("app");
-  var spec = null;
-  var warnings = [];
-  var showTable = false;
-  var lastWidth = 0;
+  // src/panels/apps/chart/view.ts
   var typeName = {
     bar: "Bar chart",
     line: "Line chart",
@@ -646,12 +642,12 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     const names = s.series.map((x) => x.name).join(", ");
     return `${typeName[s.type]} of ${s.series.length} series (${names}) over ${n} ${s.x.label ?? "x"} value${n === 1 ? "" : "s"}, from ${xText(s.x.values[0])} to ${xText(s.x.values[n - 1])}. ${s.y.label ?? "y"} axis from ${formatValue(y.min)} to ${formatValue(y.max)}.`;
   }
-  function hatchDefs(count) {
+  function hatchDefs(count, id) {
     return svg("defs", null, Array.from({
       length: count
     }, (_, i) => seriesStyle(i)).flatMap((st, i) => st.hatch ? [
       svg("pattern", {
-        id: `hatch-${i}`,
+        id: `${id}-hatch-${i}`,
         width: 6,
         height: 6,
         patternUnits: "userSpaceOnUse",
@@ -671,7 +667,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       }))
     ] : []));
   }
-  function swatch(i, type) {
+  function swatch(i, type, id) {
     const st = seriesStyle(i);
     const line = type === "line" || type === "scatter";
     return svg("svg", {
@@ -693,14 +689,14 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       width: 14,
       height: 10,
       rx: 2,
-      fill: st.hatch ? `url(#hatch-${i})` : st.color,
+      fill: st.hatch ? `url(#${id}-hatch-${i})` : st.color,
       stroke: st.hatch ? st.color : null
     }));
   }
-  function dataTable(s) {
+  function dataTable(s, o) {
     return h("div", {
-      class: showTable ? "data-wrap" : "sr-only",
-      id: "data"
+      class: o.showTable ? "data-wrap" : "sr-only",
+      id: `${o.id}-data`
     }, h("table", {
       class: "data"
     }, h("caption", null, `${s.title ?? "Chart"} data`), h("thead", null, h("tr", null, h("th", {
@@ -711,12 +707,9 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       scope: "row"
     }, xText(xv)), s.series.map((x) => h("td", null, formatValue(x.values[i] ?? null))))))));
   }
-  function render() {
-    if (!spec) return;
-    const s = spec;
-    const width = Math.max(260, root.clientWidth - 32);
-    lastWidth = root.clientWidth;
-    const height = Math.round(Math.min(460, Math.max(220, width * 0.55)));
+  function renderChart(container, s, o) {
+    const width = Math.max(o.minWidth ?? 260, o.width);
+    const height = Math.round(Math.min(o.maxHeight ?? 460, Math.max(220, width * 0.55)));
     const y = yScale(s, height < 300 ? 4 : 6);
     const numeric = numericX(s);
     const n = s.x.values.length;
@@ -767,7 +760,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     s.series.forEach((ser, si) => {
       const st = seriesStyle(si);
       const c = st.color;
-      const fill2 = st.hatch ? `url(#hatch-${si})` : c;
+      const fill2 = st.hatch ? `url(#${o.id}-hatch-${si})` : c;
       const dot = (cx, cy, r, cls) => st.hatch ? svg("rect", {
         x: cx - r,
         y: cy - r,
@@ -854,7 +847,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
     const focusRing = svg("g", {
       class: "focus"
     });
-    const titleId = "chart-title", descId = "chart-desc";
+    const titleId = `${o.id}-title`, descId = `${o.id}-desc`;
     const chart = svg("svg", {
       viewBox: `0 0 ${width} ${height}`,
       width,
@@ -865,7 +858,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       "aria-describedby": descId
     }, svg("title", {
       id: titleId
-    }, s.title ?? typeName[s.type]), hatchDefs(s.series.length), svg("desc", {
+    }, s.title ?? typeName[s.type]), hatchDefs(s.series.length, o.id), svg("desc", {
       id: descId
     }, describe(s, y)), svg("g", {
       class: "grid"
@@ -945,7 +938,7 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
         class: "tip-x"
       }, `${s.x.label ?? "x"}: ${xText(s.x.values[i])}`), s.series.map((ser, si) => h("div", {
         class: "tip-row"
-      }, swatch(si, s.type), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
+      }, swatch(si, s.type, o.id), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
       tip.hidden = false;
       const fw = figure.clientWidth;
       const left = (px ?? x) + 14;
@@ -985,26 +978,53 @@ table.data th[scope="row"], table.data thead th:first-child { text-align: left; 
       e.preventDefault();
       show(Math.max(-1, Math.min(n - 1, next)));
     });
+    const toggleId = `${o.id}-toggle`;
     const toggle = h("button", {
       type: "button",
       class: "link",
-      id: "toggle-data",
-      "aria-controls": "data",
-      "aria-expanded": String(showTable),
+      id: toggleId,
+      "aria-controls": `${o.id}-data`,
+      "aria-expanded": String(o.showTable),
       onclick: () => {
-        showTable = !showTable;
-        render();
-        document.getElementById("toggle-data")?.focus();
+        o.onToggle();
+        document.getElementById(toggleId)?.focus();
       }
-    }, showTable ? "Hide data table" : "Show data table");
-    mount(root, s.title ? h("h1", null, s.title) : null, warnings.length ? h("p", {
+    }, o.showTable ? "Hide data table" : "Show data table");
+    mount(container, s.title ? h(o.heading ?? "h1", {
+      class: "chart-title"
+    }, s.title) : null, o.warnings?.length ? h("p", {
       class: "warnings"
-    }, warnings.join("; ")) : null, h("ul", {
+    }, o.warnings.join("; ")) : null, h("ul", {
       class: "legend",
       "aria-label": "Series"
-    }, s.series.map((ser, si) => h("li", null, swatch(si, s.type), ser.name))), figure, h("p", {
+    }, s.series.map((ser, si) => h("li", null, swatch(si, s.type, o.id), ser.name))), figure, h("p", {
       class: "hint muted"
-    }, "Hover for values, or focus the chart and use the arrow keys. ", toggle), live, dataTable(s));
+    }, "Hover for values, or focus the chart and use the arrow keys. ", toggle), live, dataTable(s, o));
+  }
+
+  // src/panels/apps/chart/main.ts
+  var root = document.getElementById("app");
+  var spec = null;
+  var warnings = [];
+  var showTable = false;
+  var lastWidth = 0;
+  function render() {
+    if (!spec) return;
+    lastWidth = root.clientWidth;
+    const view = h("div", {
+      class: "chart-view"
+    });
+    root.replaceChildren(view);
+    renderChart(view, spec, {
+      id: "chart",
+      width: root.clientWidth - 32,
+      showTable,
+      warnings,
+      onToggle: () => {
+        showTable = !showTable;
+        render();
+      }
+    });
   }
   new ResizeObserver(() => {
     if (spec && Math.abs(root.clientWidth - lastWidth) > 4) render();

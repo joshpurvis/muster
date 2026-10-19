@@ -106,7 +106,8 @@ the full event that a panel prompt showed only as a placeholder (panel ID, then 
 
 Muster ships two agent skills (in `skills/`, embedded in the binary): `muster-pr-review`, the
 PR decision flow (review one snapshot, open a `pr_decision` panel, merge only on its Merge
-event), and `muster-panels`, a short guide to panels, the built-in apps and custom MCP Apps.
+event; for "help me review the open PRs", a `pr_overview` panel of every open PR first), and
+`muster-panels`, a short guide to panels, the built-in apps and custom MCP Apps.
 An agent loads one when the request matches its description ("review PR 812", "chart this").
 Both only work inside a Muster session and say so otherwise.
 

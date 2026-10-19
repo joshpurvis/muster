@@ -14,12 +14,25 @@ const DIST = new URL("../dist/", import.meta.url);
 const HOME = Deno.env.get("HOME") ?? "/tmp";
 const panelProxy = await Deno.readTextFile(new URL("../panels/proxy.html", import.meta.url));
 const builtinApps: Record<string, string> = {};
-for (const app of ["markdown", "image", "chart", "table", "pr_decision"]) {
+for (const app of ["markdown", "image", "chart", "table", "pr_decision", "pr_overview"]) {
   builtinApps[app] = await Deno.readTextFile(new URL(`../panels/${app}.html`, import.meta.url));
 }
-/** Like src/panel_apps.rs: an image `path` becomes a data URI; a `url` origin joins resourceDomains. */
+/** Like src/panel_apps.rs: an image `path` becomes a data URI; a `url` origin joins resourceDomains.
+ * The same goes for each picture in a pr_decision panel's `media`. */
 async function mockPanelData(app: string, cwd: string, data: any, csp: any, opening: boolean) {
+  if (app === "pr_decision" && Array.isArray(data?.media)) {
+    const media = [];
+    for (const m of data.media) {
+      if (m?.kind !== "image") { media.push(m); continue; }
+      const { kind: _, ...rest } = m;
+      media.push({ kind: "image", ...(await mockImage(cwd, rest, csp, opening)) });
+    }
+    return { ...data, media };
+  }
   if (app !== "image") return data;
+  return await mockImage(cwd, data, csp, opening);
+}
+async function mockImage(cwd: string, data: any, csp: any, opening: boolean) {
   const out = { ...data };
   if (typeof data.path === "string" && data.url === undefined) {
     const root = await Deno.realPath(cwd);

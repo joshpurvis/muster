@@ -98,6 +98,39 @@ textarea { display: block; width: 100%; resize: vertical; }
 .warnings { color: var(--color-text-warning); font-size: 12px; margin: 0 0 8px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
+/* Scoped to .chart-view, so pr_decision can include it for its media charts. */
+.chart-view .chart-title { margin-bottom: 8px; }
+.chart-view .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 8px; font-size: 13px; }
+.chart-view .legend li { display: flex; align-items: center; gap: 6px; }
+.chart-view .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.chart-view .swatch.line { height: 3px; width: 14px; border-radius: 2px; }
+.chart-view figure { position: relative; margin: 0; }
+.chart-view figure svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+.chart-view figure svg:focus-visible { outline-offset: 4px; }
+.chart-view .grid line { stroke: var(--color-border-secondary); stroke-width: 1; }
+.chart-view .baseline { stroke: var(--color-border-primary); stroke-width: 1; }
+.chart-view .axis text { fill: var(--color-text-secondary); font-size: 11.5px; font-family: var(--font-sans); }
+.chart-view .axis.y text { font-family: var(--font-mono); font-size: 11px; }
+.chart-view .axis-label { fill: var(--color-text-secondary); font-size: 12px; font-weight: 600; }
+.chart-view .guide { stroke: var(--color-text-tertiary); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
+.chart-view .focus { pointer-events: none; }
+.chart-view .dot { fill-opacity: 0.85; }
+.chart-view .tip {
+  position: absolute; pointer-events: none; min-width: 120px; max-width: 260px; z-index: 2;
+  background: var(--color-background-secondary); border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md); padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+.chart-view .tip-x { color: var(--color-text-secondary); margin-bottom: 2px; }
+.chart-view .tip-row { display: flex; align-items: center; gap: 6px; }
+.chart-view .tip-row b { margin-left: auto; padding-left: 10px; font-family: var(--font-mono); font-weight: 600; }
+.chart-view .hint { font-size: 12px; margin-top: 6px; }
+.chart-view .data-wrap { overflow-x: auto; }
+.chart-view table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
+.chart-view table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
+.chart-view table.data th, .chart-view table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
+.chart-view table.data th[scope="row"], .chart-view table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }
+.chart-view .swatch-svg { flex: none; display: block; }
+
 main { padding-bottom: 0; }
 .head h1 { font-size: 19px; }
 .head .num { color: var(--color-text-secondary); font-weight: 400; }
@@ -176,9 +209,37 @@ section { margin: 0 0 18px; }
 button kbd { margin-left: 2px; }
 button.primary kbd, button.danger kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
 @media (max-width: 520px) {
+  /* Narrow panels: natural-width buttons and no key hints (aria-keyshortcuts keeps them), so
+     the sticky bar stays three short rows. */
   .bar .spacer { display: none; }
-  .bar button { flex: 1 1 auto; }
+  .actions { padding: 8px 12px 10px; margin: 12px -16px 0; }
+  .row { gap: 6px; }
+  .bar button kbd { display: none; }
+  .bar.second { margin-top: 6px; }
 }
+.bar.second { margin-top: 8px; }
+button.outward { border-color: var(--color-text-warning); }
+button .out { color: var(--color-text-warning); }
+.outward-desc { margin: 0 0 6px; }
+/* Pictures and charts the agent added (media), before the diffs. */
+.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); gap: 12px; }
+.media-grid .media-chart, .media-grid.single .shot { grid-column: 1 / -1; }
+.media figure { margin: 0; min-width: 0; }
+.media figcaption { font-size: 12.5px; color: var(--color-text-secondary); margin-top: 4px; }
+.thumb { display: block; width: 100%; padding: 4px; min-height: 0; background: var(--color-background-secondary); cursor: zoom-in; }
+.thumb img { display: block; width: 100%; height: 150px; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.media-grid.single .thumb img { height: auto; max-height: 340px; }
+.media-chart { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; }
+.media-chart .chart-title { font-size: 14px; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+  background: var(--color-background-primary);
+}
+.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
+.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
+.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; cursor: zoom-out; }
+.lb-stage img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -325,6 +386,9 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
   function h(tag, attrs, ...children) {
     return fill(document.createElement(tag), attrs ?? null, children);
   }
+  function svg(tag, attrs, ...children) {
+    return fill(document.createElementNS("http://www.w3.org/2000/svg", tag), attrs ?? null, children);
+  }
   function mount(root2, ...children) {
     root2.replaceChildren();
     fill(root2, null, children);
@@ -455,6 +519,228 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     };
   }
 
+  // src/panels/apps/shared/confirm.ts
+  var MODIFIERS = /* @__PURE__ */ new Set([
+    "Shift",
+    "Control",
+    "Alt",
+    "Meta",
+    "AltGraph",
+    "CapsLock"
+  ]);
+  var Gate = class {
+    held = /* @__PURE__ */ new Set();
+    target = null;
+    armed = false;
+    /** `code` is the physical key (KeyboardEvent.code), so Shift+M and its "m" keyup match.
+     * Returns true when the browser's default action must be prevented (a repeat while open). */
+    keyDown(code, key, repeat) {
+      if (!MODIFIERS.has(key)) this.held.add(code);
+      return this.target !== null && repeat;
+    }
+    keyUp(code) {
+      this.held.delete(code);
+      if (this.target !== null && this.held.size === 0) this.armed = true;
+    }
+    /** Focus left the app: keyups may never come. */
+    blur() {
+      this.held.clear();
+      if (this.target !== null) this.armed = true;
+    }
+    openTarget(target2) {
+      this.target = target2;
+      this.armed = this.held.size === 0;
+    }
+    close() {
+      this.target = null;
+      this.armed = false;
+    }
+    get isOpen() {
+      return this.target !== null;
+    }
+    /** A confirm may send only when armed and still about the same thing. */
+    canConfirmTarget(target2) {
+      return this.target !== null && this.armed && target2 !== null && target2 === this.target;
+    }
+    /** New input: returns true if it cancelled an open confirm. */
+    inputTarget(target2) {
+      if (this.target === null) return false;
+      if (target2 !== null && target2 === this.target) return false;
+      this.close();
+      return true;
+    }
+  };
+
+  // src/panels/apps/shared/actions.ts
+  var RESERVED_KEYS = [
+    "m",
+    "r",
+    "a",
+    "o",
+    "s",
+    "h",
+    "j",
+    "k",
+    "n"
+  ];
+  var BUILTIN_IDS = [
+    "merge",
+    "request_changes",
+    "ask",
+    "open",
+    "skip",
+    "hold",
+    "next",
+    "custom",
+    "closed",
+    "overflow"
+  ];
+  var MAX_ACTIONS = 8;
+  var ID = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+  var KEY = /^[a-z0-9]$/;
+  function validateActions(p, o) {
+    const out = [];
+    const list = p.array(o, "actions", "", {
+      max: MAX_ACTIONS
+    });
+    const ids = /* @__PURE__ */ new Set(), keys = /* @__PURE__ */ new Set();
+    list?.forEach((a, i) => {
+      const at = `actions[${i}]`;
+      const ao = p.object(a, at);
+      if (!ao) return;
+      p.known(ao, at, [
+        "id",
+        "label",
+        "key",
+        "description",
+        "outward"
+      ]);
+      const id = p.string(ao, "id", at, {
+        required: true,
+        max: 40
+      });
+      if (id !== void 0) {
+        if (!ID.test(id)) {
+          p.add(`${at}.id`, "must be lowercase letters, digits, - or _ (at most 40)");
+          return;
+        }
+        if (BUILTIN_IDS.includes(id)) {
+          p.add(`${at}.id`, `"${id}" is a built-in action`);
+          return;
+        }
+        if (ids.has(id)) {
+          p.add(`${at}.id`, `"${id}" is used twice`);
+          return;
+        }
+        ids.add(id);
+      }
+      const label = p.string(ao, "label", at, {
+        required: true,
+        max: 40
+      });
+      const description = p.string(ao, "description", at, {
+        required: true,
+        max: 300
+      });
+      const rawKey = p.string(ao, "key", at, {
+        max: 1,
+        nonEmpty: true
+      });
+      let key;
+      if (rawKey !== void 0) {
+        const k = rawKey.toLowerCase();
+        if (!KEY.test(k)) p.add(`${at}.key`, "must be one letter or digit");
+        else if (RESERVED_KEYS.includes(k)) p.add(`${at}.key`, `"${k}" is a built-in key (${RESERVED_KEYS.join(" ")} are taken)`);
+        else if (keys.has(k)) p.add(`${at}.key`, `"${k}" is used twice`);
+        else {
+          keys.add(k);
+          key = k;
+        }
+      }
+      const outward2 = p.boolean(ao, "outward", at) ?? false;
+      if (id !== void 0 && label !== void 0 && description !== void 0) out.push({
+        id,
+        label,
+        key,
+        description,
+        outward: outward2
+      });
+    });
+    return out;
+  }
+  function customEvent(a, t) {
+    const data = {
+      action: "custom",
+      id: a.id,
+      repo: t.repo,
+      number: t.number
+    };
+    if (t.head_sha) data.head_sha = t.head_sha;
+    return {
+      kind: "custom",
+      text: `The user chose "${a.label}" (${a.id}) on PR #${t.number} (${t.repo}). Do exactly this and nothing else: ${a.description}`,
+      data
+    };
+  }
+  function actionForKey(actions, key) {
+    const k = key.length === 1 ? key.toLowerCase() : "";
+    return k ? actions.find((a) => a.key === k) : void 0;
+  }
+  function outwardTarget(a, t) {
+    return JSON.stringify([
+      a.id,
+      a.label,
+      a.description,
+      a.outward,
+      t.repo,
+      t.number,
+      t.head_sha ?? null
+    ]);
+  }
+
+  // src/panels/apps/shared/actions_view.ts
+  function actionButton(a, onclick, disabled = false) {
+    return h("button", {
+      type: "button",
+      id: `act-${a.id}`,
+      class: a.outward ? "custom outward" : "custom",
+      disabled,
+      title: `${a.description}${a.outward ? " (asks you to confirm first)" : ""}`,
+      "aria-keyshortcuts": a.key?.toUpperCase(),
+      onclick
+    }, a.label, a.outward ? h("span", {
+      class: "out",
+      "aria-hidden": "true"
+    }, " \u2197") : null, a.key ? [
+      " ",
+      h("kbd", null, a.key.toUpperCase())
+    ] : null);
+  }
+  function outwardDrawer(a, what, onConfirm, onCancel) {
+    return h("div", {
+      class: "drawer",
+      role: "group",
+      "aria-labelledby": "outward-title"
+    }, h("div", {
+      id: "outward-title",
+      class: "drawer-title"
+    }, `${a.label} on ${what}? The agent will:`), h("p", {
+      class: "prose outward-desc"
+    }, a.description), h("p", {
+      class: "muted small"
+    }, "This changes things outside this machine (GitHub or elsewhere)."), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "confirm-outward",
+      class: "primary",
+      onclick: onConfirm
+    }, `Confirm ${a.label} `, h("kbd", null, "Enter")), h("button", {
+      type: "button",
+      onclick: onCancel
+    }, "Cancel ", h("kbd", null, "Esc"))));
+  }
+
   // src/panels/apps/shared/validate.ts
   var Problems = class {
     errors = [];
@@ -573,6 +859,711 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     }
   }
 
+  // src/panels/apps/chart/logic.ts
+  var TYPES = [
+    "bar",
+    "line",
+    "scatter",
+    "area"
+  ];
+  var MAX_POINTS = 2e3;
+  var MAX_SERIES = 12;
+  var PALETTE = [
+    "#2f7fd0",
+    "#d0661a",
+    "#2a9450",
+    "#7f6ad8",
+    "#c94f7c",
+    "#18938f",
+    "#b07d12",
+    "#7a8296"
+  ];
+  var color = (i) => PALETTE[i % PALETTE.length];
+  var DASHES = [
+    "7 4",
+    "2 3",
+    "10 3 2 3",
+    "4 4"
+  ];
+  function seriesStyle(i) {
+    const second = i >= PALETTE.length;
+    return {
+      color: color(i),
+      dash: second ? DASHES[(i - PALETTE.length) % DASHES.length] : void 0,
+      hatch: second
+    };
+  }
+  function validateChart(data) {
+    const p = new Problems();
+    const o = p.object(data, "data");
+    if (!o) return p.result(null);
+    p.known(o, "", [
+      "type",
+      "title",
+      "x",
+      "series",
+      "y"
+    ]);
+    const type = p.oneOf(o, "type", "", TYPES, true);
+    const title = p.string(o, "title", "", {
+      max: 200
+    });
+    const xo = o.x === void 0 ? (p.add("x", "is required"), void 0) : p.object(o.x, "x");
+    let xValues = [];
+    let xLabel;
+    if (xo) {
+      p.known(xo, "x", [
+        "label",
+        "values"
+      ]);
+      xLabel = p.string(xo, "label", "x", {
+        max: 200
+      });
+      const values = p.array(xo, "values", "x", {
+        required: true,
+        max: MAX_POINTS,
+        min: 1
+      });
+      if (values) {
+        values.forEach((v, i) => {
+          if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || v.length > 200) {
+            p.add(`x.values[${i}]`, "must be a finite number or a string of at most 200 characters");
+          }
+        });
+        xValues = values;
+        if (type === "scatter" && values.some((v) => typeof v !== "number")) p.add("x.values", "must all be numbers for a scatter chart");
+      }
+    }
+    const series = [];
+    const list = p.array(o, "series", "", {
+      required: true,
+      max: MAX_SERIES,
+      min: 1
+    });
+    list?.forEach((s, i) => {
+      const so = p.object(s, `series[${i}]`);
+      if (!so) return;
+      p.known(so, `series[${i}]`, [
+        "name",
+        "values"
+      ]);
+      const name = p.string(so, "name", `series[${i}]`, {
+        required: true,
+        max: 100
+      });
+      const values = p.array(so, "values", `series[${i}]`, {
+        required: true,
+        max: MAX_POINTS
+      });
+      if (!values) return;
+      if (xo && values.length !== xValues.length) {
+        p.add(`series[${i}].values`, `has ${values.length} values but x.values has ${xValues.length}`);
+      }
+      values.forEach((v, j) => {
+        if (v !== null && (typeof v !== "number" || !Number.isFinite(v))) p.add(`series[${i}].values[${j}]`, "must be a finite number or null");
+      });
+      if (name !== void 0) series.push({
+        name,
+        values
+      });
+    });
+    const y = {};
+    if (o.y !== void 0) {
+      const yo = p.object(o.y, "y");
+      if (yo) {
+        p.known(yo, "y", [
+          "label",
+          "min",
+          "max"
+        ]);
+        y.label = p.string(yo, "label", "y", {
+          max: 200
+        });
+        y.min = p.number(yo, "min", "y");
+        y.max = p.number(yo, "max", "y");
+        if (y.min !== void 0 && y.max !== void 0 && y.min >= y.max) p.add("y", "min must be less than max");
+      }
+    }
+    return p.result({
+      type,
+      title,
+      x: {
+        label: xLabel,
+        values: xValues
+      },
+      series,
+      y
+    });
+  }
+  function niceStep(rough) {
+    if (!(rough > 0) || !Number.isFinite(rough)) return 1;
+    const exp = Math.floor(Math.log10(rough));
+    const f = rough / 10 ** exp;
+    const nice = f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10;
+    return nice * 10 ** exp;
+  }
+  function decimals(step) {
+    if (!(step > 0) || !Number.isFinite(step)) return 0;
+    for (let d = 0; d <= 20; d++) {
+      const x = step * 10 ** d;
+      if (Math.round(x) !== 0 && Math.abs(x - Math.round(x)) <= 1e-6 * x) return d;
+    }
+    return 20;
+  }
+  function niceTicks(min, max, count = 5) {
+    if (min > max) [min, max] = [
+      max,
+      min
+    ];
+    if (min === max) {
+      const pad = min === 0 ? 1 : Math.abs(min) * 0.1;
+      min -= min === 0 ? 0 : pad;
+      max += pad;
+    }
+    const step = niceStep((max - min) / Math.max(1, count));
+    const d = decimals(step);
+    const lo = Number((Math.floor(min / step + 1e-9) * step).toFixed(d));
+    const hi = Number((Math.ceil(max / step - 1e-9) * step).toFixed(d));
+    const ticks = [];
+    for (let i = 0; i <= 1e3; i++) {
+      const v = Number((lo + i * step).toFixed(d));
+      if (v > hi + step / 2) break;
+      ticks.push(v === 0 ? 0 : v);
+    }
+    if (ticks.length < 2 || ticks.some((t, i) => i && t <= ticks[i - 1]) || !(hi > lo)) {
+      return {
+        min,
+        max,
+        step: max - min,
+        ticks: [
+          min,
+          max
+        ]
+      };
+    }
+    return {
+      min: lo,
+      max: hi,
+      step,
+      ticks
+    };
+  }
+  function formatTick(v, step) {
+    const a = Math.abs(v);
+    for (const [at, div, suffix] of [
+      [
+        1e9,
+        1e9,
+        "B"
+      ],
+      [
+        1e6,
+        1e6,
+        "M"
+      ],
+      [
+        1e4,
+        1e3,
+        "k"
+      ]
+    ]) {
+      if (a >= at && step >= div / 100) {
+        return trim((v / div).toFixed(Math.min(2, decimals(step / div)))) + suffix;
+      }
+    }
+    const d = decimals(step);
+    if (d > 6 || a >= 1e15) {
+      if (v === 0) return "0";
+      const digits = Math.max(1, Math.min(6, Math.ceil(Math.log10(a / step)) + 1));
+      return v.toExponential(digits - 1).replace(/\.?0+e/, "e");
+    }
+    return trim(v.toFixed(d));
+  }
+  function formatValue(v) {
+    if (v === null) return "\u2013";
+    return String(Number(v.toPrecision(12)));
+  }
+  var trim = (s) => s.includes(".") ? s.replace(/\.?0+$/, "") : s;
+  function linear(d0, d1, r0, r1) {
+    const span = d1 - d0 || 1;
+    return (v) => r0 + (v - d0) / span * (r1 - r0);
+  }
+  function yScale(spec, count = 5) {
+    const all = spec.series.flatMap((s) => s.values.filter((v) => v !== null));
+    let lo = all.length ? Math.min(...all) : 0;
+    let hi = all.length ? Math.max(...all) : 1;
+    if (spec.type === "bar" || spec.type === "area") {
+      lo = Math.min(lo, 0);
+      hi = Math.max(hi, 0);
+    }
+    const span = Math.max(hi - lo, Math.abs(hi), Math.abs(lo)) || 1;
+    const { min: fixedMin, max: fixedMax } = spec.y;
+    if (fixedMin !== void 0) lo = fixedMin;
+    if (fixedMax !== void 0) hi = fixedMax;
+    if (hi <= lo) {
+      if (fixedMin !== void 0 && fixedMax === void 0) hi = lo + span;
+      else if (fixedMax !== void 0 && fixedMin === void 0) lo = hi - span;
+      else hi = lo + 1;
+    }
+    const t = niceTicks(lo, hi, count);
+    const min = fixedMin ?? t.min;
+    const max = fixedMax ?? t.max;
+    const eps = (max - min) * 1e-9;
+    return {
+      min,
+      max,
+      step: t.step,
+      ticks: t.ticks.filter((v) => v >= min - eps && v <= max + eps)
+    };
+  }
+  function numericX(spec) {
+    return spec.type === "scatter" || spec.type !== "bar" && spec.x.values.every((v) => typeof v === "number");
+  }
+  function labelEvery(count, width, labelWidth) {
+    if (count <= 0 || width <= 0) return 1;
+    const fit = Math.max(1, Math.floor(width / Math.max(1, labelWidth)));
+    return Math.max(1, Math.ceil(count / fit));
+  }
+
+  // src/panels/apps/chart/view.ts
+  var typeName = {
+    bar: "Bar chart",
+    line: "Line chart",
+    scatter: "Scatter plot",
+    area: "Area chart"
+  };
+  var xText = (v) => typeof v === "number" ? formatValue(v) : v;
+  function describe(s, y) {
+    const n = s.x.values.length;
+    const names = s.series.map((x) => x.name).join(", ");
+    return `${typeName[s.type]} of ${s.series.length} series (${names}) over ${n} ${s.x.label ?? "x"} value${n === 1 ? "" : "s"}, from ${xText(s.x.values[0])} to ${xText(s.x.values[n - 1])}. ${s.y.label ?? "y"} axis from ${formatValue(y.min)} to ${formatValue(y.max)}.`;
+  }
+  function hatchDefs(count, id) {
+    return svg("defs", null, Array.from({
+      length: count
+    }, (_, i) => seriesStyle(i)).flatMap((st, i) => st.hatch ? [
+      svg("pattern", {
+        id: `${id}-hatch-${i}`,
+        width: 6,
+        height: 6,
+        patternUnits: "userSpaceOnUse",
+        patternTransform: "rotate(45)"
+      }, svg("rect", {
+        width: 6,
+        height: 6,
+        fill: st.color,
+        "fill-opacity": 0.25
+      }), svg("line", {
+        x1: 0,
+        y1: 0,
+        x2: 0,
+        y2: 6,
+        stroke: st.color,
+        "stroke-width": 3
+      }))
+    ] : []));
+  }
+  function swatch(i, type, id) {
+    const st = seriesStyle(i);
+    const line = type === "line" || type === "scatter";
+    return svg("svg", {
+      class: "swatch-svg",
+      width: 16,
+      height: 10,
+      "aria-hidden": "true"
+    }, line ? svg("line", {
+      x1: 1,
+      y1: 5,
+      x2: 15,
+      y2: 5,
+      stroke: st.color,
+      "stroke-width": 3,
+      "stroke-dasharray": st.dash ? "4 2" : null
+    }) : svg("rect", {
+      x: 1,
+      y: 0,
+      width: 14,
+      height: 10,
+      rx: 2,
+      fill: st.hatch ? `url(#${id}-hatch-${i})` : st.color,
+      stroke: st.hatch ? st.color : null
+    }));
+  }
+  function dataTable(s, o) {
+    return h("div", {
+      class: o.showTable ? "data-wrap" : "sr-only",
+      id: `${o.id}-data`
+    }, h("table", {
+      class: "data"
+    }, h("caption", null, `${s.title ?? "Chart"} data`), h("thead", null, h("tr", null, h("th", {
+      scope: "col"
+    }, s.x.label ?? "x"), s.series.map((x) => h("th", {
+      scope: "col"
+    }, x.name)))), h("tbody", null, s.x.values.map((xv, i) => h("tr", null, h("th", {
+      scope: "row"
+    }, xText(xv)), s.series.map((x) => h("td", null, formatValue(x.values[i] ?? null))))))));
+  }
+  function renderChart(container, s, o) {
+    const width = Math.max(o.minWidth ?? 260, o.width);
+    const height = Math.round(Math.min(o.maxHeight ?? 460, Math.max(220, width * 0.55)));
+    const y = yScale(s, height < 300 ? 4 : 6);
+    const numeric = numericX(s);
+    const n = s.x.values.length;
+    const yLabels = y.ticks.map((t) => formatTick(t, y.step));
+    const m = {
+      top: 12,
+      right: 16,
+      bottom: 30 + (s.x.label ? 20 : 0),
+      left: 12 + Math.max(...yLabels.map((l) => l.length), 1) * 7.2 + (s.y.label ? 20 : 0)
+    };
+    const pw = width - m.left - m.right;
+    const ph = height - m.top - m.bottom;
+    const Y = linear(y.min, y.max, m.top + ph, m.top);
+    const clampY = (v) => Math.max(m.top, Math.min(m.top + ph, Y(v)));
+    let X;
+    let xTicks;
+    const band = pw / n;
+    if (numeric) {
+      const xs = s.x.values;
+      const lo = Math.min(...xs), hi = Math.max(...xs);
+      const t = niceTicks(lo, hi, Math.max(2, Math.floor(pw / 90)));
+      const [d0, d1] = s.type === "scatter" ? [
+        t.min,
+        t.max
+      ] : [
+        lo,
+        hi === lo ? lo + 1 : hi
+      ];
+      const XV = linear(d0, d1, m.left, m.left + pw);
+      X = (i) => XV(xs[i]);
+      xTicks = t.ticks.filter((v) => v >= d0 - 1e-9 && v <= d1 + 1e-9).map((v) => ({
+        at: XV(v),
+        label: formatTick(v, t.step)
+      }));
+    } else {
+      X = (i) => m.left + band * (i + 0.5);
+      const longest = Math.max(...s.x.values.map((v) => xText(v).length));
+      const every = labelEvery(n, pw, Math.min(longest, 18) * 7 + 12);
+      xTicks = s.x.values.flatMap((v, i) => i % every ? [] : [
+        {
+          at: X(i),
+          label: xText(v).length > 18 ? xText(v).slice(0, 17) + "\u2026" : xText(v)
+        }
+      ]);
+    }
+    const marks = [];
+    const zero = clampY(Math.max(y.min, Math.min(0, y.max)));
+    s.series.forEach((ser, si) => {
+      const st = seriesStyle(si);
+      const c = st.color;
+      const fill2 = st.hatch ? `url(#${o.id}-hatch-${si})` : c;
+      const dot = (cx, cy, r, cls) => st.hatch ? svg("rect", {
+        x: cx - r,
+        y: cy - r,
+        width: 2 * r,
+        height: 2 * r,
+        fill: c,
+        class: cls
+      }) : svg("circle", {
+        cx,
+        cy,
+        r,
+        fill: c,
+        class: cls
+      });
+      if (s.type === "bar") {
+        const inner = band * 0.8;
+        const bw = Math.max(1, inner / s.series.length);
+        ser.values.forEach((v, i) => {
+          if (v === null) return;
+          const x0 = m.left + band * i + band * 0.1 + bw * si;
+          const top = Math.min(clampY(v), zero), bottom = Math.max(clampY(v), zero);
+          marks.push(svg("rect", {
+            x: x0,
+            y: top,
+            width: Math.max(1, bw - (s.series.length > 1 ? 1 : 0)),
+            height: Math.max(v === 0 ? 0 : 1, bottom - top),
+            fill: fill2,
+            stroke: st.hatch ? c : null,
+            class: "bar",
+            "data-i": i
+          }));
+        });
+        return;
+      }
+      if (s.type === "scatter") {
+        ser.values.forEach((v, i) => {
+          if (v !== null) {
+            const d = dot(X(i), clampY(v), 4, "dot");
+            d.setAttribute("data-i", String(i));
+            marks.push(d);
+          }
+        });
+        return;
+      }
+      const runs = [];
+      let run = [];
+      ser.values.forEach((v, i) => {
+        if (v === null) {
+          if (run.length) runs.push(run);
+          run = [];
+        } else run.push(i);
+      });
+      if (run.length) runs.push(run);
+      for (const r of runs) {
+        const pts = r.map((i) => `${X(i).toFixed(1)},${clampY(ser.values[i]).toFixed(1)}`);
+        if (s.type === "area") {
+          marks.push(svg("path", {
+            d: `M${X(r[0]).toFixed(1)},${zero}L${pts.join("L")}L${X(r[r.length - 1]).toFixed(1)},${zero}Z`,
+            fill: fill2,
+            "fill-opacity": st.hatch ? 0.5 : 0.16,
+            stroke: "none"
+          }));
+        }
+        marks.push(svg("path", {
+          d: `M${pts.join("L")}`,
+          fill: "none",
+          stroke: c,
+          "stroke-width": 2,
+          "stroke-dasharray": st.dash ?? null,
+          "stroke-linejoin": "round",
+          "stroke-linecap": "round"
+        }));
+        if (n <= 60 || r.length === 1) for (const i of r) marks.push(dot(X(i), clampY(ser.values[i]), 2.5));
+      }
+    });
+    const guide = svg("line", {
+      class: "guide",
+      y1: m.top,
+      y2: m.top + ph,
+      x1: 0,
+      x2: 0,
+      visibility: "hidden"
+    });
+    const focusRing = svg("g", {
+      class: "focus"
+    });
+    const titleId = `${o.id}-title`, descId = `${o.id}-desc`;
+    const chart = svg("svg", {
+      viewBox: `0 0 ${width} ${height}`,
+      width,
+      height,
+      role: "img",
+      tabindex: "0",
+      "aria-labelledby": titleId,
+      "aria-describedby": descId
+    }, svg("title", {
+      id: titleId
+    }, s.title ?? typeName[s.type]), hatchDefs(s.series.length, o.id), svg("desc", {
+      id: descId
+    }, describe(s, y)), svg("g", {
+      class: "grid"
+    }, y.ticks.map((t) => svg("line", {
+      x1: m.left,
+      x2: m.left + pw,
+      y1: Y(t),
+      y2: Y(t)
+    }))), svg("g", {
+      class: "axis y"
+    }, y.ticks.map((t, i) => svg("text", {
+      x: m.left - 8,
+      y: Y(t),
+      "text-anchor": "end",
+      "dominant-baseline": "middle"
+    }, yLabels[i]))), svg("line", {
+      class: "baseline",
+      x1: m.left,
+      x2: m.left + pw,
+      y1: zero,
+      y2: zero
+    }), svg("g", {
+      class: "axis x"
+    }, xTicks.map((t) => svg("text", {
+      x: t.at,
+      y: m.top + ph + 18,
+      "text-anchor": "middle"
+    }, t.label))), s.x.label ? svg("text", {
+      class: "axis-label",
+      x: m.left + pw / 2,
+      y: height - 6,
+      "text-anchor": "middle"
+    }, s.x.label) : null, s.y.label ? svg("text", {
+      class: "axis-label",
+      transform: `translate(14 ${m.top + ph / 2}) rotate(-90)`,
+      "text-anchor": "middle"
+    }, s.y.label) : null, guide, svg("g", {
+      class: "marks"
+    }, marks), focusRing);
+    const tip = h("div", {
+      class: "tip",
+      hidden: true,
+      "aria-hidden": "true"
+    });
+    const live = h("div", {
+      class: "sr-only",
+      "aria-live": "polite"
+    });
+    const figure = h("figure", null, chart, tip);
+    let active = -1;
+    const show = (i, px, py) => {
+      if (i < 0 || i >= n) {
+        tip.hidden = true;
+        guide.setAttribute("visibility", "hidden");
+        focusRing.replaceChildren();
+        active = -1;
+        return;
+      }
+      active = i;
+      const x = X(i);
+      if (s.type !== "scatter") {
+        guide.setAttribute("x1", String(x));
+        guide.setAttribute("x2", String(x));
+        guide.setAttribute("visibility", "visible");
+      }
+      focusRing.replaceChildren(...s.series.flatMap((ser, si) => ser.values[i] === null || s.type === "bar" ? [] : [
+        svg("circle", {
+          cx: x,
+          cy: clampY(ser.values[i]),
+          r: 5,
+          fill: "none",
+          stroke: seriesStyle(si).color,
+          "stroke-width": 2
+        })
+      ]));
+      mount(tip, h("div", {
+        class: "tip-x"
+      }, `${s.x.label ?? "x"}: ${xText(s.x.values[i])}`), s.series.map((ser, si) => h("div", {
+        class: "tip-row"
+      }, swatch(si, s.type, o.id), h("span", null, ser.name), h("b", null, formatValue(ser.values[i] ?? null)))));
+      tip.hidden = false;
+      const fw = figure.clientWidth;
+      const left = (px ?? x) + 14;
+      tip.style.left = `${Math.min(left, fw - tip.offsetWidth - 4)}px`;
+      tip.style.top = `${Math.max(0, (py ?? m.top + 8) - 10)}px`;
+      live.textContent = `${xText(s.x.values[i])}: ` + s.series.map((ser) => `${ser.name} ${formatValue(ser.values[i] ?? null)}`).join(", ");
+    };
+    const nearest = (mx, my) => {
+      if (!numeric) return Math.floor((mx - m.left) / band);
+      let best = -1, dist = Infinity;
+      for (let i = 0; i < n; i++) {
+        let d = Math.abs(X(i) - mx);
+        if (s.type === "scatter") {
+          d = Math.min(...s.series.map((ser) => ser.values[i] === null ? Infinity : Math.hypot(X(i) - mx, clampY(ser.values[i]) - my)));
+        }
+        if (d < dist) {
+          dist = d;
+          best = i;
+        }
+      }
+      return s.type === "scatter" && dist > 24 ? -1 : best;
+    };
+    chart.addEventListener("pointermove", (e) => {
+      const r = chart.getBoundingClientRect();
+      const mx = (e.clientX - r.left) * (width / r.width), my = (e.clientY - r.top) * (height / r.height);
+      if (mx < m.left || mx > m.left + pw || my < m.top - 6 || my > m.top + ph + 6) {
+        show(-1);
+        return;
+      }
+      show(nearest(mx, my), mx, my);
+    });
+    chart.addEventListener("pointerleave", () => show(-1));
+    chart.addEventListener("blur", () => show(-1));
+    chart.addEventListener("keydown", (e) => {
+      const next = e.key === "ArrowRight" ? active + 1 : e.key === "ArrowLeft" ? active < 0 ? n - 1 : active - 1 : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : e.key === "Escape" ? -1 : null;
+      if (next === null) return;
+      e.preventDefault();
+      show(Math.max(-1, Math.min(n - 1, next)));
+    });
+    const toggleId = `${o.id}-toggle`;
+    const toggle = h("button", {
+      type: "button",
+      class: "link",
+      id: toggleId,
+      "aria-controls": `${o.id}-data`,
+      "aria-expanded": String(o.showTable),
+      onclick: () => {
+        o.onToggle();
+        document.getElementById(toggleId)?.focus();
+      }
+    }, o.showTable ? "Hide data table" : "Show data table");
+    mount(container, s.title ? h(o.heading ?? "h1", {
+      class: "chart-title"
+    }, s.title) : null, o.warnings?.length ? h("p", {
+      class: "warnings"
+    }, o.warnings.join("; ")) : null, h("ul", {
+      class: "legend",
+      "aria-label": "Series"
+    }, s.series.map((ser, si) => h("li", null, swatch(si, s.type, o.id), ser.name))), figure, h("p", {
+      class: "hint muted"
+    }, "Hover for values, or focus the chart and use the arrow keys. ", toggle), live, dataTable(s, o));
+  }
+
+  // src/panels/apps/image/logic.ts
+  var DATA_URI = /^data:image\/(png|jpeg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/]+=*$/;
+  function validateImage(data) {
+    const p = new Problems();
+    const o = p.object(data, "data");
+    if (!o) return p.result(null);
+    p.known(o, "", [
+      "path",
+      "url",
+      "alt",
+      "caption",
+      "src",
+      "mime",
+      "bytes"
+    ]);
+    const path = p.string(o, "path", "", {
+      max: 4096,
+      nonEmpty: true
+    });
+    const url = p.string(o, "url", "", {
+      max: 4096,
+      nonEmpty: true
+    });
+    const alt = p.string(o, "alt", "", {
+      max: 1e3
+    });
+    const caption = p.string(o, "caption", "", {
+      max: 2e3
+    });
+    const src = p.string(o, "src", "", {
+      max: 16 * 1024 * 1024
+    });
+    const bytes = p.number(o, "bytes", "");
+    let shown = "";
+    let source = "";
+    if (path !== void 0 && url !== void 0) p.add("data", "give path or url, not both");
+    else if (path !== void 0) {
+      if (src === void 0) p.add("path", "the image file was not loaded (Muster reads it when the panel opens)");
+      else if (!DATA_URI.test(src)) p.add("src", "is not a supported image data URI");
+      else {
+        shown = src;
+        source = path;
+      }
+    } else if (url !== void 0) {
+      const safe = httpsUrl(url);
+      if (!safe) p.add("url", "must be an https URL without a user name or password");
+      else {
+        shown = safe;
+        source = safe;
+      }
+    } else if (!p.errors.length) p.add("data", "needs path (a file in the task worktree) or url (https)");
+    const fallback = caption?.trim() || `Image: ${source.split(/[/\\]/).filter(Boolean).pop()?.split("?")[0] ?? "untitled"}`;
+    return p.result({
+      src: shown,
+      source,
+      alt: alt?.trim() ? alt : fallback,
+      caption,
+      bytes
+    });
+  }
+  function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${(n / 1024 / 1024).toFixed(1)} MiB`;
+  }
+
   // src/panels/apps/pr_decision/logic.ts
   var METHODS = [
     "squash",
@@ -605,6 +1596,12 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     "failed",
     "requested_changes"
   ];
+  var MEDIA_KINDS = [
+    "image",
+    "chart"
+  ];
+  var MAX_MEDIA = 8;
+  var MAX_MEDIA_BYTES = 6 * 1024 * 1024;
   var SHA = /^[0-9a-f]{40}$/;
   var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
   var branchOk = (b) => b.length > 0 && b.length <= 255 && ![
@@ -634,7 +1631,9 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
       "questions",
       "answer",
       "status",
-      "status_detail"
+      "status_detail",
+      "media",
+      "actions"
     ]);
     const repo = p.string(o, "repo", "", {
       required: true,
@@ -846,6 +1845,8 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
     const status_detail = p.string(o, "status_detail", "", {
       max: 4e3
     });
+    const media = validateMedia(p, o);
+    const actions = validateActions(p, o);
     return p.result({
       repo,
       number,
@@ -866,8 +1867,66 @@ button.primary kbd, button.danger kbd { color: inherit; border-color: currentCol
       questions,
       answer,
       status,
-      status_detail
+      status_detail,
+      media,
+      actions
     });
+  }
+  function validateMedia(p, o) {
+    const out = [];
+    let bytes = 0;
+    p.array(o, "media", "", {
+      max: MAX_MEDIA
+    })?.forEach((m, i) => {
+      const at = `media[${i}]`;
+      const mo = p.object(m, at);
+      if (!mo) return;
+      const kind = p.oneOf(mo, "kind", at, MEDIA_KINDS, true);
+      const { kind: _, ...rest } = mo;
+      const nested = (errors, warnings2) => {
+        for (const e of errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
+        for (const w of warnings2) p.warnings.push(`${at}.${w}`);
+      };
+      if (kind === "image") {
+        const r = validateImage(rest);
+        if (!r.ok) {
+          nested(r.errors, []);
+          return;
+        }
+        nested([], r.warnings);
+        bytes += r.value.bytes ?? 0;
+        out.push({
+          kind,
+          image: r.value
+        });
+      } else if (kind === "chart") {
+        p.known(mo, at, [
+          "kind",
+          "spec",
+          "caption"
+        ]);
+        const caption = p.string(mo, "caption", at, {
+          max: 2e3
+        });
+        if (mo.spec === void 0 || mo.spec === null) {
+          p.add(`${at}.spec`, "is required (a chart app spec)");
+          return;
+        }
+        const r = validateChart(mo.spec);
+        if (!r.ok) {
+          for (const e of r.errors) p.errors.push(`${at}.spec.${e.replace(/^data: /, "")}`);
+          return;
+        }
+        for (const w of r.warnings) p.warnings.push(`${at}.spec.${w}`);
+        out.push({
+          kind,
+          spec: r.value,
+          caption
+        });
+      }
+    });
+    if (bytes > MAX_MEDIA_BYTES) p.add("media", `images total ${bytes} bytes; at most ${MAX_MEDIA_BYTES}`);
+    return out;
   }
   function strings(p, o, key, path, max, len) {
     const out = [];
@@ -937,6 +1996,30 @@ ${question}`,
       }
     };
   }
+  function skipEvent(pr2) {
+    return {
+      kind: "skip",
+      text: `Skip PR #${pr2.number} (${pr2.repo}) for now: move on without changing it.`,
+      data: {
+        action: "skip",
+        repo: pr2.repo,
+        number: pr2.number,
+        head_sha: pr2.head_sha
+      }
+    };
+  }
+  function holdEvent(pr2) {
+    return {
+      kind: "hold",
+      text: `Hold PR #${pr2.number} (${pr2.repo}): put it aside to come back to later.`,
+      data: {
+        action: "hold",
+        repo: pr2.repo,
+        number: pr2.number,
+        head_sha: pr2.head_sha
+      }
+    };
+  }
   var MAX_EVENT_BYTES = 15 * 1024;
   function eventBytes(event) {
     const params = {
@@ -980,54 +2063,15 @@ ${question}`,
       pr2.merge_method_default
     ]);
   }
-  var MODIFIERS = /* @__PURE__ */ new Set([
-    "Shift",
-    "Control",
-    "Alt",
-    "Meta",
-    "AltGraph",
-    "CapsLock"
-  ]);
-  var ConfirmGate = class {
-    held = /* @__PURE__ */ new Set();
-    target = null;
-    armed = false;
-    /** `code` is the physical key (KeyboardEvent.code), so Shift+M and its "m" keyup match.
-     * Returns true when the browser's default action must be prevented (a repeat while open). */
-    keyDown(code, key, repeat) {
-      if (!MODIFIERS.has(key)) this.held.add(code);
-      return this.target !== null && repeat;
-    }
-    keyUp(code) {
-      this.held.delete(code);
-      if (this.target !== null && this.held.size === 0) this.armed = true;
-    }
-    /** Focus left the app: keyups may never come. */
-    blur() {
-      this.held.clear();
-      if (this.target !== null) this.armed = true;
-    }
+  var ConfirmGate = class extends Gate {
     open(pr2) {
-      this.target = confirmTarget(pr2);
-      this.armed = this.held.size === 0;
+      this.openTarget(confirmTarget(pr2));
     }
-    close() {
-      this.target = null;
-      this.armed = false;
-    }
-    get isOpen() {
-      return this.target !== null;
-    }
-    /** A confirm may send only when armed and still about the same PR state. */
     canConfirm(pr2) {
-      return this.target !== null && this.armed && pr2 !== null && confirmTarget(pr2) === this.target;
+      return this.canConfirmTarget(pr2 ? confirmTarget(pr2) : null);
     }
-    /** New input: returns true if it cancelled an open confirm. */
     input(pr2) {
-      if (this.target === null) return false;
-      if (pr2 && confirmTarget(pr2) === this.target) return false;
-      this.close();
-      return true;
+      return this.inputTarget(pr2 ? confirmTarget(pr2) : null);
     }
   };
 
@@ -1041,6 +2085,12 @@ ${question}`,
   var deleteBranch = false;
   var mode = null;
   var gate = new ConfirmGate();
+  var outward = null;
+  var outGate = new Gate();
+  var sentCustom = /* @__PURE__ */ new Set();
+  var enlarged = null;
+  var chartTables = /* @__PURE__ */ new Map();
+  var chartWidth = 0;
   var override = false;
   var drafts = {
     request: "",
@@ -1058,6 +2108,7 @@ ${question}`,
     request: "request",
     ask: "ask"
   };
+  var triggerOf = (m) => m === "outward" ? `act-${outward?.id}` : triggers[m];
   function setNotice(text, tone = "info") {
     notice = {
       text,
@@ -1099,10 +2150,84 @@ ${question}`,
   }
   function closeMode() {
     const was = mode;
+    const back = was ? triggerOf(was) : null;
     if (mode === "confirm") gate.close();
+    if (mode === "outward") {
+      outGate.close();
+      outward = null;
+    }
     mode = null;
     render();
-    if (was) document.getElementById(triggers[was])?.focus();
+    if (back) document.getElementById(back)?.focus();
+  }
+  function sendSimple(kind) {
+    if (!pr || sent) return;
+    if (kind === "hold" && holdClosed(pr)) {
+      setNotice(holdClosed(pr), "warning");
+      render();
+      return;
+    }
+    if (mode) closeMode();
+    const event = kind === "skip" ? skipEvent(pr) : holdEvent(pr);
+    const result = sendEvent(event.kind, event.text, event.data);
+    sent = kind;
+    setNotice(kind === "skip" ? "Skipped: the agent moves on without changing this PR." : "Held: the agent puts this PR aside to come back to later.");
+    render();
+    document.getElementById(kind)?.focus();
+    result.catch((e) => {
+      sent = null;
+      setNotice(`Not sent (${e.message}). Try again.`, "danger");
+      render();
+    });
+  }
+  var holdClosed = (p) => p.status === "merged" ? "The PR is merged." : p.status === "queued" ? "The PR is queued to merge." : null;
+  var target = (p) => ({
+    repo: p.repo,
+    number: p.number,
+    head_sha: p.head_sha
+  });
+  function runAction(a) {
+    if (!pr || sentCustom.has(a.id)) return;
+    if (a.outward) {
+      if (mode === "confirm") gate.close();
+      outward = a;
+      mode = "outward";
+      outGate.openTarget(outwardTarget(a, target(pr)));
+      notice = null;
+      render();
+      document.getElementById("confirm-outward")?.focus();
+      return;
+    }
+    sendCustom(a);
+  }
+  function sendCustom(a) {
+    const event = customEvent(a, target(pr));
+    const result = sendEvent(event.kind, event.text, event.data);
+    sentCustom.add(a.id);
+    setNotice(`Sent: ${a.label}. The agent will ${a.description.replace(/^./, (c) => c.toLowerCase())}`);
+    render();
+    result.catch((e) => {
+      sentCustom.delete(a.id);
+      setNotice(`Not sent (${e.message}). Try again.`, "danger");
+      render();
+    });
+  }
+  function confirmOutward() {
+    if (!pr || mode !== "outward" || !outward) return;
+    const a = outward;
+    if (!outGate.canConfirmTarget(outwardTarget(a, target(pr)))) return;
+    outGate.close();
+    outward = null;
+    mode = null;
+    sendCustom(a);
+    document.getElementById(`act-${a.id}`)?.focus();
+  }
+  function enlarge(i) {
+    const was = enlarged;
+    enlarged = i;
+    render();
+    if (i !== null) document.getElementById("lightbox-close")?.focus();
+    else if (was !== null) document.getElementById(`media-${was}`)?.focus();
   }
   function confirmMerge() {
     if (!pr || mode !== "confirm") return;
@@ -1289,7 +2414,11 @@ ${question}`,
     }, "No diff lines."));
   }
   function statusBanner(p) {
-    if (p.status === "open") return null;
+    if (p.status === "open") return p.status_detail ? h("div", {
+      class: "status info note"
+    }, h("span", {
+      class: "detail"
+    }, p.status_detail)) : null;
     const [label, tone] = statusText[p.status];
     return h("div", {
       class: `status ${tone}`
@@ -1327,6 +2456,9 @@ ${question}`,
         type: "button",
         onclick: () => closeMode()
       }, "Cancel ", h("kbd", null, "Esc"))));
+    }
+    if (mode === "outward" && outward) {
+      return outwardDrawer(outward, `#${p.number}`, () => confirmOutward(), () => closeMode());
     }
     if (mode === "request" || mode === "ask") {
       const kind = mode;
@@ -1376,6 +2508,112 @@ ${question}`,
     }
     return null;
   }
+  function mediaSection(p) {
+    if (!p.media.length) return null;
+    const images = p.media.filter((m) => m.kind === "image").length;
+    return h("section", {
+      class: "media",
+      "aria-label": "Pictures and charts"
+    }, h("h2", null, "Pictures and charts"), h("div", {
+      class: `media-grid${images === 1 ? " single" : ""}`
+    }, p.media.map((m, i) => {
+      if (m.kind === "image") {
+        const img = m.image;
+        return h("figure", {
+          class: "shot"
+        }, h("button", {
+          type: "button",
+          class: "thumb",
+          id: `media-${i}`,
+          "aria-label": `Enlarge: ${img.alt}`,
+          onclick: () => enlarge(i)
+        }, h("img", {
+          src: img.src,
+          alt: img.alt,
+          decoding: "async",
+          draggable: "false"
+        })), img.caption ? h("figcaption", null, img.caption) : null);
+      }
+      return h("figure", {
+        class: "media-chart"
+      }, h("div", {
+        class: "chart-view",
+        "data-chart": i
+      }), m.caption ? h("figcaption", null, m.caption) : null);
+    })));
+  }
+  function drawCharts() {
+    if (!pr) return;
+    const p = pr;
+    for (const el of document.querySelectorAll("[data-chart]")) {
+      const i = Number(el.dataset.chart);
+      const m = p.media[i];
+      if (m?.kind !== "chart") continue;
+      chartWidth = el.clientWidth;
+      renderChart(el, m.spec, {
+        id: `chart-${i}`,
+        width: el.clientWidth,
+        minWidth: 220,
+        maxHeight: 300,
+        heading: "h3",
+        showTable: chartTables.get(i) ?? false,
+        onToggle: () => {
+          chartTables.set(i, !(chartTables.get(i) ?? false));
+          drawCharts();
+        }
+      });
+    }
+  }
+  function lightbox(p) {
+    if (enlarged === null) return null;
+    const m = p.media[enlarged];
+    if (m?.kind !== "image") return null;
+    const shots = p.media.flatMap((x, i) => x.kind === "image" ? [
+      i
+    ] : []);
+    const at = shots.indexOf(enlarged);
+    const step = (by) => enlarge(shots[(at + by + shots.length) % shots.length]);
+    return h("div", {
+      class: "lightbox",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": m.image.alt,
+      onclick: (e) => {
+        if (e.target === e.currentTarget) enlarge(null);
+      }
+    }, h("div", {
+      class: "lb-bar"
+    }, h("span", {
+      class: "muted small lb-src",
+      title: m.image.source
+    }, m.image.source, m.image.bytes !== void 0 ? ` \xB7 ${formatBytes(m.image.bytes)}` : ""), shots.length > 1 ? [
+      h("button", {
+        type: "button",
+        "aria-label": "Previous picture",
+        onclick: () => step(-1)
+      }, "\u2190"),
+      h("span", {
+        class: "muted small"
+      }, `${at + 1} / ${shots.length}`),
+      h("button", {
+        type: "button",
+        "aria-label": "Next picture",
+        onclick: () => step(1)
+      }, "\u2192")
+    ] : null, h("button", {
+      type: "button",
+      id: "lightbox-close",
+      onclick: () => enlarge(null)
+    }, "Close ", h("kbd", null, "Esc"))), h("div", {
+      class: "lb-stage",
+      onclick: () => enlarge(null)
+    }, h("img", {
+      src: m.image.src,
+      alt: m.image.alt
+    })), m.image.caption ? h("p", {
+      class: "lb-caption"
+    }, m.image.caption) : null);
+  }
   function render() {
     if (!pr) return;
     const p = pr;
@@ -1409,6 +2647,7 @@ ${question}`,
       id: "merge",
       class: "primary",
       "aria-describedby": "merge-hint",
+      "aria-keyshortcuts": "M",
       onclick: (e) => openConfirm(e.shiftKey || shift)
     }, h("span", {
       class: "label"
@@ -1418,6 +2657,9 @@ ${question}`,
     const effective = notice ?? (p.status !== "open" ? {
       text: `${statusText[p.status][0]}${p.status_detail ? `: ${p.status_detail}` : ""}`,
       tone: statusText[p.status][1]
+    } : p.status_detail ? {
+      text: p.status_detail,
+      tone: "info"
     } : null);
     mount(root, h("header", {
       class: "head"
@@ -1431,7 +2673,7 @@ ${question}`,
       class: "warnings"
     }, warnings.join("; ")) : null, h("section", null, h("h2", null, "What changed"), h("p", {
       class: "prose"
-    }, p.summary)), h("section", {
+    }, p.summary)), mediaSection(p), h("section", {
       class: "grid"
     }, h("div", null, h("h2", null, "Risk"), badge(`${p.risk.level[0].toUpperCase()}${p.risk.level.slice(1)} risk`, {
       low: "success",
@@ -1499,29 +2741,49 @@ ${question}`,
     }), h("button", {
       type: "button",
       id: "request",
+      "aria-keyshortcuts": "R",
       disabled: !!closed || sent === "request_changes",
       title: closed ?? null,
       onclick: () => setMode("request")
     }, "Request changes ", h("kbd", null, "R")), h("button", {
       type: "button",
       id: "ask",
+      "aria-keyshortcuts": "A",
       disabled: !!closed,
       title: closed ?? null,
       onclick: () => setMode("ask")
     }, "Ask ", h("kbd", null, "A")), h("button", {
       type: "button",
       id: "open",
+      "aria-keyshortcuts": "O",
       onclick: () => openLink(p.url).catch((e) => {
         setNotice(e.message, "danger");
         render();
       })
-    }, "Open on GitHub ", h("kbd", null, "O"))), h("p", {
+    }, "Open on GitHub ", h("kbd", null, "O"))), h("div", {
+      class: "row bar second"
+    }, h("button", {
+      type: "button",
+      id: "skip",
+      "aria-keyshortcuts": "S",
+      disabled: !!sent,
+      title: "Move on without changing this PR",
+      onclick: () => sendSimple("skip")
+    }, "Skip ", h("kbd", null, "S")), h("button", {
+      type: "button",
+      id: "hold",
+      "aria-keyshortcuts": "H",
+      disabled: !!sent || !!holdClosed(p),
+      title: holdClosed(p) ?? "Put this PR aside to come back to later",
+      onclick: () => sendSimple("hold")
+    }, "Hold ", h("kbd", null, "H")), p.actions.map((a) => actionButton(a, () => runAction(a), sentCustom.has(a.id)))), h("p", {
       id: "merge-hint",
       class: "hint small",
       "aria-live": "polite"
     }), closed ? h("p", {
       class: "hint small"
-    }, `${closed} Request changes and Ask are off.`) : null));
+    }, `${closed} Request changes and Ask are off.`) : null), lightbox(p));
+    drawCharts();
     updateMergeButton();
     scrollTo(0, scroll);
     if (focusId) document.getElementById(focusId)?.focus({
@@ -1539,16 +2801,35 @@ ${question}`,
       shift = true;
       updateMergeButton();
     }
+    const outRepeat = outGate.keyDown(e.code, e.key, e.repeat);
     if (gate.keyDown(e.code, e.key, e.repeat) && mode === "confirm") {
       e.preventDefault();
       return;
     }
+    if (outRepeat && mode === "outward") {
+      e.preventDefault();
+      return;
+    }
     if (!pr) return;
-    if (typing(e)) {
-      const target = e.target;
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && (target.id === "request-text" || target.id === "ask-text")) {
+    if (enlarged !== null) {
+      if (e.key === "Escape") {
         e.preventDefault();
-        submit(target.id === "request-text" ? "request" : "ask");
+        enlarge(null);
+      } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        const shots = pr.media.flatMap((x, i) => x.kind === "image" ? [
+          i
+        ] : []);
+        const at = shots.indexOf(enlarged);
+        e.preventDefault();
+        enlarge(shots[(at + (e.key === "ArrowRight" ? 1 : -1) + shots.length) % shots.length]);
+      }
+      return;
+    }
+    if (typing(e)) {
+      const target2 = e.target;
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && (target2.id === "request-text" || target2.id === "ask-text")) {
+        e.preventDefault();
+        submit(target2.id === "request-text" ? "request" : "ask");
       } else if (e.key === "Escape" && mode) {
         e.preventDefault();
         closeMode();
@@ -1560,6 +2841,12 @@ ${question}`,
     if (key === "Escape" && mode) {
       e.preventDefault();
       closeMode();
+      return;
+    }
+    if (key === "Enter" && mode === "outward") {
+      e.preventDefault();
+      if (e.target.id === "confirm-outward" || e.target.tagName !== "BUTTON") confirmOutward();
+      else e.target.click();
       return;
     }
     if (key === "Enter" && mode === "confirm") {
@@ -1584,6 +2871,19 @@ ${question}`,
         setNotice(err.message, "danger");
         render();
       });
+    } else if (mode === "confirm" || mode === "outward") return;
+    else if (key === "s") {
+      e.preventDefault();
+      sendSimple("skip");
+    } else if (key === "h") {
+      e.preventDefault();
+      sendSimple("hold");
+    } else {
+      const a = actionForKey(pr.actions, key);
+      if (a) {
+        e.preventDefault();
+        runAction(a);
+      }
     }
   });
   addEventListener("keyup", (e) => {
@@ -1592,7 +2892,12 @@ ${question}`,
       updateMergeButton();
     }
     gate.keyUp(e.code);
+    outGate.keyUp(e.code);
   });
+  new ResizeObserver(() => {
+    const el = document.querySelector("[data-chart]");
+    if (el && Math.abs(el.clientWidth - chartWidth) > 4) drawCharts();
+  }).observe(root);
   var pointer = (e) => {
     if (e.shiftKey !== shift) {
       shift = e.shiftKey;
@@ -1603,6 +2908,7 @@ ${question}`,
   addEventListener("pointerdown", pointer, true);
   addEventListener("blur", () => {
     gate.blur();
+    outGate.blur();
     if (shift) {
       shift = false;
       updateMergeButton();
@@ -1614,7 +2920,10 @@ ${question}`,
       const r = validatePr(data);
       if (!r.ok) {
         gate.input(null);
-        if (mode === "confirm") mode = null;
+        outGate.inputTarget(null);
+        outward = null;
+        enlarged = null;
+        if (mode === "confirm" || mode === "outward") mode = null;
         pr = null;
         mergeButton = null;
         problems(root, "This PR decision panel's input is invalid", r.errors);
@@ -1627,17 +2936,29 @@ ${question}`,
         mode = null;
         setNotice("The PR changed while you were confirming. Check it again, then Merge.", "warning");
       }
+      if (mode === "outward" && outward) {
+        const a = next.actions.find((x) => x.id === outward.id);
+        if (outGate.inputTarget(a ? outwardTarget(a, target(next)) : null)) {
+          mode = null;
+          outward = null;
+          setNotice("The PR or the action changed while you were confirming. Check it, then try again.", "warning");
+        } else outward = a;
+      }
+      if (enlarged !== null && next.media[enlarged]?.kind !== "image") enlarged = null;
       if (id !== identity) {
         identity = id;
         method = next.merge_method_default;
         deleteBranch = next.delete_branch_default;
         answers.length = 0;
+        chartTables.clear();
+        enlarged = null;
         if (mode === "confirm") mode = null;
         notice = null;
       } else if (changedSha) {
         setNotice(`The PR's head commit changed to ${short(next.head_sha)}. Check the changes again before merging.`, "warning");
-      } else if (sent) notice = null;
+      } else if (sent || sentCustom.size) notice = null;
       sent = null;
+      sentCustom.clear();
       if (next.answer && !answers.some((a) => a.question === next.answer.question && a.text === next.answer.text)) {
         answers.push(next.answer);
         newAnswer = true;

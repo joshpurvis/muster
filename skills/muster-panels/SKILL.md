@@ -40,7 +40,7 @@ apps", and in the `panel_open` tool description.
   y?: {label?, min?, max?}}`; one value per x value, `null` for a gap, up to 12 series.
 - `table`: `{title?, columns: [{key, label?, align?}], rows: [{key: value}], sort?: {key, dir}}`;
   the user can sort and filter.
-- `pr_decision`: see the muster-pr-review skill.
+- `pr_decision` and `pr_overview`: see the muster-pr-review skill.
 
 ## Your own app
 

@@ -1,12 +1,13 @@
 // Built-in panel apps against the MOCK daemon: image, chart, table and pr_decision open with
 // sample data, react to real clicks and keys, and pr_decision's Merge → confirm sends exactly
-// the event the panel showed. Screenshots of each app, dark and light, go to <shots>.
+// the event the panel showed; then the open-PRs flow: pr_overview → open → pr_decision with
+// pictures and a chart → hold → the user's own outward action, confirmed → back to the overview. Screenshots of each app, dark and light, go to <shots>.
 // Part of dev/e2e.ts; also runs alone (same flags as e2e.ts):
 //
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src,dev,panels \
 //     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo>
 import { type Browser, launch } from "./cdp.ts";
-import { chartSample, HEAD_SHA, lineSample, prSample, tableSample } from "./panel_samples.ts";
+import { chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prSample, tableSample } from "./panel_samples.ts";
 
 const M = "globalThis.__muster";
 type Check = (cond: unknown, msg: string) => void;
@@ -292,6 +293,142 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.size(1440, 900);
     await close(p.pid);
     ok("pr_decision: readable about 400 px wide");
+  }
+
+  // ---- open PRs: overview → open → decision with media → hold → custom outward action → back
+  {
+    const ov = await open("pr_overview", "Open PRs", overviewSample);
+    await ov.waitIn(`document.querySelectorAll('.card').length === 4`);
+    const order = () => ov.inApp(`[...document.querySelectorAll('.card')].map((c) => Number(c.id.slice(3)))`);
+    const selectedNow = () => ov.inApp(`Number(document.querySelector('.card.selected')?.id.slice(3))`);
+    check(JSON.stringify(await order()) === "[801,812,820,815]", `riskiest first: ${await order()}`);
+    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'quick'; s.dispatchEvent(new Event('change')); })()`);
+    check(JSON.stringify(await order()) === "[815,812,820,801]", `quick wins first: ${await order()}`);
+    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'oldest'; s.dispatchEvent(new Event('change')); })()`);
+    check(JSON.stringify(await order()) === "[801,812,815,820]", `oldest first: ${await order()}`);
+    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'risk'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("h1");
+    await a.key("/");
+    check(await ov.inApp(`document.activeElement?.id === 'filter'`), "/ focuses the filter");
+    await a.type("login");
+    await ov.waitIn(`document.querySelectorAll('.card').length === 1`);
+    await a.key("Escape");
+    await ov.waitIn(`document.querySelectorAll('.card').length === 4`);
+    await ov.click("h1");
+    check((await selectedNow()) === 812, "the filter's match stays selected after clearing it");
+    await a.key("k");
+    check((await selectedNow()) === 801 && await ov.inApp(`document.activeElement?.id === 'pr-801'`), "K moves up and focuses the card");
+    await a.key("j");
+    await a.key("Down");
+    await a.key("Up");
+    check((await selectedNow()) === 812, "J and the arrows move too");
+    check((await ov.inApp(`document.querySelector('#pr-801 .chips').textContent`)).includes("Checks failing"), "checks badge");
+    check((await ov.inApp(`document.querySelector('#pr-801 .meta').textContent`)).includes("Draft"), "draft flag");
+    check((await events(ov.pid)).length === 0, "moving sends nothing");
+    await ov.shots2("pr-overview");
+    await ov.click("#pr-812 .title");
+    await a.key("Enter");
+    let got = await events(ov.pid);
+    check(got.length === 1 && got[0].kind === "open" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "open", repo: "acme/api", number: 812 }), `open event: ${JSON.stringify(got)}`);
+    const status = (n: number, st: string, detail?: string) => ({ ...overviewSample, current: 812,
+      prs: overviewSample.prs.map((p) => p.number === n ? { ...p, status: st, status_detail: detail } : p) });
+    await call("panel.update", { panel_id: ov.pid, data: status(812, "reviewing") });
+    await ov.waitIn(`document.querySelector('#pr-812 .badge.status')?.textContent === 'Reviewing' && document.querySelector('#pr-812 .badge.now')`);
+    ok("pr_overview: cards sort riskiest / quick wins / oldest, filter with /, J/K move; Enter sends open; the agent's status shows on the card");
+
+    const d = await open("pr_decision", "PR #812", prMediaSample);
+    await d.waitIn(`document.querySelectorAll('.media .thumb img').length === 2 && [...document.querySelectorAll('.media .thumb img')].every((i) => i.naturalWidth > 0)`);
+    check(await d.inApp(`document.querySelector('.media').compareDocumentPosition(document.querySelector('.change')) & Node.DOCUMENT_POSITION_FOLLOWING`), "media before the diffs");
+    await d.waitIn(`document.querySelector('.media-chart svg[role=img]')`);
+    check((await d.inApp(`document.querySelectorAll('.media-chart rect.bar').length`)) === 6, "media chart drawn with the chart app's code");
+    check((await d.inApp(`document.querySelector('.media-chart svg title').textContent`)) === "Bar chart", "chart title");
+    // Clear of the sticky action bar at the bottom.
+    await d.inApp(`document.querySelector('#media-0').scrollIntoView({ block: 'center' })`);
+    await d.click("#media-0");
+    await d.waitIn(`document.querySelector('.lightbox img')?.naturalWidth === 512 && document.activeElement?.id === 'lightbox-close'`);
+    await a.key("Right");
+    await d.waitIn(`document.querySelector('.lightbox img')?.alt === 'Retry-After countdown'`);
+    await d.shots2("pr-decision-enlarged");
+    await a.key("Escape");
+    await d.waitIn(`!document.querySelector('.lightbox') && document.activeElement?.id === 'media-1'`);
+    check((await events(d.pid)).length === 0, "looking at pictures sends nothing");
+    check(await d.inApp(`!!document.querySelector('#skip') && !!document.querySelector('#hold') && !!document.querySelector('#act-needs-qa')`), "Skip, Hold and the user's actions show");
+    await d.shots2("pr-decision-media");
+    ok("pr_decision: pictures and a chart before the diffs; a click enlarges a picture in the panel, arrows step, Esc closes");
+
+    await d.click("h1");
+    await a.key("h");
+    got = await events(d.pid);
+    check(got.length === 1 && got[0].kind === "hold" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "hold", repo: "acme/api", number: 812, head_sha: HEAD_SHA }), `hold event: ${JSON.stringify(got)}`);
+    check(await d.inApp(`document.querySelector('#merge').disabled && document.querySelector('#skip').disabled`), "the agent has the decision: actions wait");
+    await close(d.pid);
+    await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held", "Put aside from the decision panel."), current: undefined } });
+    await ov.waitIn(`document.querySelector('.group.g-held') && [...document.querySelectorAll('.card')].pop()?.id === 'pr-812'`);
+    check((await ov.inApp(`document.querySelector('.repo').textContent`)).includes("1 held"), "header counts the held PR");
+    ok("pr_decision: H sends one hold event; the overview groups the held PR at the end");
+
+    // The user's own actions: outward ones ask first, showing what the agent will do.
+    await ov.click("h1");
+    check((await selectedNow()) === 812, "still on the held PR");
+    await a.key("Up");
+    check((await selectedNow()) === 815, `the keys reach a card at the bottom (above the sticky bar): ${await selectedNow()}`);
+    check(await ov.inApp(`document.querySelector('#pr-815').getBoundingClientRect().bottom <= document.querySelector('.actions').getBoundingClientRect().top`), "the selected card is not under the action bar");
+    await a.key("q");
+    await ov.waitIn(`document.querySelector('.drawer .outward-desc')?.textContent === 'Add the needs-qa label to this PR on GitHub.' && document.activeElement?.id === 'confirm-outward'`);
+    check((await events(ov.pid)).length === 0, "an outward action sends nothing before the confirm");
+    await ov.shots2("pr-overview-confirm");
+    await ov.inApp(`document.querySelector('#confirm-outward').focus()`);
+    await a.key("Enter");
+    got = await events(ov.pid);
+    check(got.length === 1 && got[0].kind === "custom" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "custom", id: "needs-qa", repo: "acme/api", number: 815 }), `custom event: ${JSON.stringify(got)}`);
+    check(String(got[0].payload.content.text).includes("Add the needs-qa label"), "the event text says what to do");
+    await ov.click("#act-later");
+    got = await events(ov.pid);
+    check(got.length === 1 && got[0].payload._meta.muster.data.id === "later", `a local action sends at once: ${JSON.stringify(got)}`);
+    await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), prs: status(812, "held").prs.map((p) => p.number === 815 ? { ...p, status_detail: "Labelled needs-qa." } : p), current: undefined } });
+    await ov.waitIn(`document.querySelector('#pr-815 .detail')?.textContent === 'Labelled needs-qa.'`);
+    ok("custom actions: an outward one shows its description and needs Enter on Confirm; a local one sends at once; the agent's note shows on the card");
+
+    // The proxy lets 3 messages through per ~5.5 s of activity: start a fresh budget.
+    await a.sleep(5600);
+    await ov.click("h1");
+    await a.key("n");
+    got = await events(ov.pid);
+    check(got.length === 1 && got[0].kind === "next" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "next", repo: "acme/api", number: 801, order: [801, 820, 815] }), `next event: ${JSON.stringify(got)} ${await ov.inApp(`document.querySelector('.notice')?.textContent + '|' + document.activeElement?.id`)}`);
+    await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), current: undefined } });
+    await ov.waitIn(`!document.querySelector('.notice')`);
+    // About 400 px of app.
+    await ov.zoom("fullscreen");
+    await a.sleep(300);
+    const share = (await ov.inApp("innerWidth")) / 1440;
+    await a.size(Math.ceil(400 / share), 900);
+    await a.sleep(400);
+    const narrow: number = await ov.inApp("innerWidth");
+    check(narrow < 440, `narrow width reached: ${narrow}`);
+    check(await ov.inApp(`document.documentElement.scrollWidth <= innerWidth + 1`), `overview narrow: no sideways scroll at ${narrow} px`);
+    for (const theme of ["dark", "light"]) {
+      await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
+      await ov.waitIn(`document.documentElement.dataset.theme === '${theme}'`);
+      await a.sleep(250);
+      await a.shot(`${shots}/panel-pr-overview-narrow-${theme}.png`, (await a.rect(`[data-panel-view="${ov.pid}"]`))!);
+    }
+    await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+    await ov.zoom("inline");
+    await a.size(1440, 900);
+    await a.sleep(300);
+    const d2 = await open("pr_decision", "PR #801", { ...prMediaSample, number: 801 });
+    await d2.waitIn(`document.querySelector('.media-chart svg[role=img]')`);
+    await d2.zoom("fullscreen");
+    await a.sleep(300);
+    await a.size(Math.ceil(400 / share), 900);
+    await a.sleep(400);
+    check(await d2.inApp(`document.documentElement.scrollWidth <= innerWidth + 1`), `decision with media narrow: no sideways scroll`);
+    await a.shot(`${shots}/panel-pr-decision-media-narrow-dark.png`, (await a.rect(`[data-panel-view="${d2.pid}"]`))!);
+    await d2.zoom("inline");
+    await a.size(1440, 900);
+    await close(d2.pid);
+    await close(ov.pid);
+    ok("pr_overview: N sends next with the rest in the shown order; overview and decision with media are readable about 400 px wide");
   }
   await R("channel.archive", { id: ch.id }).catch(() => {});
   void hello;

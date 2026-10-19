@@ -487,7 +487,7 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 #[derive(clap::Subcommand)]
 pub enum PanelCmd {
-    /// Show an app beside this session: markdown, image, chart, table, pr_decision or custom. JSON data is passed with --data.
+    /// Show an app beside this session: markdown, image, chart, table, pr_decision, pr_overview or custom. JSON data is passed with --data.
     Open {
         #[arg(long)] title: String,
         #[arg(long, default_value = "markdown")] app: String,

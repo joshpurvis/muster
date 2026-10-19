@@ -43,3 +43,12 @@ export function problems(root: Element, title: string, errors: string[]) {
       errors.length > 20 ? h("p", null, `…and ${errors.length - 20} more`) : null),
   );
 }
+
+/** Scroll `el` into view above a sticky bottom bar (scrollIntoView alone can leave it under it). */
+export function reveal(el: Element | null, bar: Element | null) {
+  if (!el) return;
+  const r = el.getBoundingClientRect();
+  const bottom = innerHeight - (bar ? bar.getBoundingClientRect().height : 0) - 8;
+  if (r.top < 8) scrollBy(0, r.top - 8);
+  else if (r.bottom > bottom) scrollBy(0, Math.min(r.bottom - bottom, r.top - 8));
+}

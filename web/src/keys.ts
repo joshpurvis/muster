@@ -7,6 +7,7 @@ import {
   altHeld,
   confirmClose,
   focusedSession,
+  focusedTabId,
   focusedTask,
   hereIds,
   overlay,
@@ -120,7 +121,8 @@ export function keyLabel(s: string): string[] {
   });
 }
 
-const hasTab = () => focusedSession.value !== null;
+const hasTab = () => focusedTabId.value !== null;
+const hasTerminal = () => focusedSession.value !== null;
 
 function onOff(on: boolean, onText: string, offText: string) {
   toast("info", on ? onText : offText);
@@ -254,7 +256,7 @@ export const commands: Command[] = [
     id: "rename-tab",
     title: "Rename",
     group: "Tab",
-    enabled: hasTab,
+    enabled: hasTerminal,
     run: () => {
       const s = focusedSession.value;
       if (s) A.startRename(s.id, "terminal");
@@ -272,7 +274,7 @@ export const commands: Command[] = [
     title: "Move tab to a new window",
     group: "Tab",
     enabled: () => hasTab() && windowsSupported.value && windowId.value !== null,
-    run: () => focusedSession.value && A.moveTabToWindow(focusedSession.value.id, "new"),
+    run: () => { if (focusedTabId.value !== null) A.moveTabToWindow(focusedTabId.value, "new"); },
   },
   {
     id: "close-tab",
@@ -290,7 +292,7 @@ export const commands: Command[] = [
       const s = focusedSession.value;
       if (s) A.restartSession(s.id);
     },
-    enabled: hasTab,
+    enabled: hasTerminal,
   },
   {
     id: "interrupt",
@@ -300,7 +302,7 @@ export const commands: Command[] = [
       const s = focusedSession.value;
       if (s) A.interruptSession(s.id);
     },
-    enabled: hasTab,
+    enabled: hasTerminal,
   },
   {
     id: "approve",

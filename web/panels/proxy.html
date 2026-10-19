@@ -1,0 +1,43 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
+<style>html,body,iframe{margin:0;border:0;width:100%;height:100%;display:block;overflow:hidden}</style></head>
+<body><script>
+"use strict";
+(() => {
+  const uiOrigins = __MUSTER_UI_ORIGINS__;
+  let hostOrigin = null;
+  let frame = null;
+  const reserved = "ui/notifications/sandbox-";
+  const origins = (items) => (Array.isArray(items) ? items : []).filter((s) => {
+    if (typeof s !== "string" || !/^https?:\/\/[a-zA-Z0-9.*:[\]-]+\/?$/.test(s)) return false;
+    try { const u = new URL(s.replace("*.", "wildcard.")); return !u.username && !u.password && u.pathname === "/"; } catch { return false; }
+  }).join(" ");
+  addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0" || typeof msg !== "object") return;
+    if (event.source === parent && uiOrigins.includes(event.origin)) {
+      if (hostOrigin && event.origin !== hostOrigin) return;
+      hostOrigin = event.origin;
+      if (msg.method === "ui/notifications/sandbox-resource-ready") {
+        if (frame || typeof msg.params?.html !== "string") return;
+        const resources = origins(msg.params.csp?.resourceDomains);
+        // Fetch approval and nested dev previews are deferred. External child documents
+        // would have their own CSP and could otherwise bypass the no-fetch policy.
+        const csp = `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
+        frame = document.createElement("iframe");
+        frame.title = "Panel app";
+        frame.sandbox = "allow-scripts";
+        frame.referrerPolicy = "no-referrer";
+        frame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="' + csp.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"><meta name="referrer" content="no-referrer">' + msg.params.html;
+        document.body.append(frame);
+      } else if (!msg.method?.startsWith(reserved)) {
+        frame?.contentWindow?.postMessage(msg, "*");
+      }
+    } else if (frame && event.source === frame.contentWindow && event.origin === "null" && hostOrigin && !msg.method?.startsWith(reserved)) {
+      parent.postMessage(msg, hostOrigin);
+    }
+  });
+  // No tokens, cookies, daemon RPC or configurable parent origin enter this document.
+  for (const origin of uiOrigins) parent.postMessage({jsonrpc:"2.0",method:reserved + "proxy-ready",params:{}}, origin);
+})();
+</script></body></html>

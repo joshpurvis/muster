@@ -6,10 +6,36 @@
 //
 // Not part of the production bundle.
 
+import type { Panel, PanelResource } from "../src/types.ts";
+
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
 const DIST = new URL("../dist/", import.meta.url);
 const HOME = Deno.env.get("HOME") ?? "/tmp";
+const panelProxy = await Deno.readTextFile(new URL("../panels/proxy.html", import.meta.url));
+const markdownApp = await Deno.readTextFile(new URL("../panels/markdown.html", import.meta.url));
+const panels = new Map<number, PanelResource>();
+const panelEvents: any[] = [];
+let panelSeq = 0;
+const panelServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, (req) => {
+  const u = new URL(req.url);
+  if (u.pathname !== "/proxy" || !["GET", "HEAD"].includes(req.method)) return new Response("Not found", { status: 404 });
+  const csp = JSON.parse(u.searchParams.get("csp") || "{}");
+  const resources = (csp.resourceDomains ?? []).filter((s: unknown) => typeof s === "string" && /^https?:\/\/[\w.*:[\]-]+\/?$/.test(s)).join(" ");
+  return new Response(panelProxy.replace("__MUSTER_UI_ORIGINS__", JSON.stringify([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`])), {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:${PORT} http://localhost:${PORT}`,
+    },
+  });
+});
+const panelOrigin = `http://127.0.0.1:${panelServer.addr.port}`;
+
+// The test runner owns this mock and its fake terminals; never leave them running on exit.
+for (const signal of ["SIGTERM", "SIGINT"] as const) Deno.addSignalListener(signal, () => {
+  for (const id of procs.keys()) kill(id);
+  setTimeout(() => Deno.exit(0), 500);
+});
 
 type Kind = "claude" | "codex" | "shell";
 interface Session {
@@ -96,7 +122,7 @@ function newWindow(id?: number, name?: string): Win {
 }
 
 const liveTasks = (w: Win) => w.channel_ids.filter((id) => channels.some((c) => c.id === id && !c.archived));
-const hasTabs = (w: Win) => [...sessions.values()].some((s) => s.window_id === w.id);
+const hasTabs = (w: Win) => [...sessions.values()].some((s) => s.window_id === w.id) || [...panels.values()].some((r) => !r.panel.closed && r.panel.window_id === w.id);
 const winById = (id: number | null | undefined) => windows.find((x) => x.id === id);
 
 function upsertWindow(w: Win) {
@@ -760,12 +786,77 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   }
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   switch (method) {
+    case "panel.open": {
+      const s = sessions.get(p.from_session);
+      if (!s) throw new Error("calling session not found");
+      const args = p.arguments;
+      if (!["markdown", "custom"].includes(args.app)) throw new Error("unknown app");
+      const id = ++panelSeq;
+      const panel: Panel = { id, title: args.title, app: args.app, channel_id: s.channel_id, session_id: s.id,
+        window_id: s.window_id, csp: args.csp ?? {}, revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
+      panels.set(id, { panel, html: args.app === "markdown" ? markdownApp : args.html, data: args.data ?? {} });
+      broadcast("panel_upserted", panel);
+      return { panel_id: id };
+    }
+    case "panel.resource": {
+      const resource = panels.get(p.id);
+      if (!resource || resource.panel.closed) throw new Error("panel not found");
+      return resource;
+    }
+    case "panel.update": {
+      const args = p.arguments;
+      const resource = panels.get(args.panel_id);
+      if (!resource || resource.panel.closed) throw new Error("panel not found");
+      if (resource.panel.channel_id !== sessions.get(p.from_session)?.channel_id) throw new Error("panel belongs to another task");
+      resource.panel.revision++;
+      if (args.html !== undefined && args.html !== resource.html) { resource.html = args.html; resource.panel.html_revision = resource.panel.revision; }
+      if (args.data !== undefined) resource.data = args.data;
+      if (args.title !== undefined) resource.panel.title = args.title;
+      broadcast("panel_upserted", resource.panel);
+      return {};
+    }
+    case "panel.dismiss":
+    case "panel.close": {
+      const id = p.id ?? p.arguments?.panel_id;
+      const resource = panels.get(id);
+      if (!resource) throw new Error("panel not found");
+      if (!resource.panel.closed && method === "panel.dismiss") panelEvents.push({ panel_id: id, kind: "closed", payload: {}, at: now() });
+      resource.panel.closed = true;
+      broadcast("panel_upserted", resource.panel);
+      return {};
+    }
+    case "panel.move": {
+      const r = panels.get(p.id);
+      if (!r || r.panel.closed || !winById(p.window_id)) throw new Error("panel or window not found");
+      const prev = winById(r.panel.window_id);
+      r.panel.window_id = p.window_id;
+      broadcast("panel_upserted", r.panel);
+      removeWindowIfEmpty(prev);
+      return {};
+    }
+    case "panel.event":
+      if (!panels.has(p.panel_id)) throw new Error("panel not found");
+      panelEvents.push({ ...p, at: now() });
+      return {};
+    case "panel.context": return {};
+    case "panel.tool":
+      if (p.name !== "get_diff" || p.arguments?.channel_id !== undefined) throw new Error("tool not allowed");
+      return { content: [{ type: "text", text: "Mock diff" }], isError: false };
+    case "panel.list": return { panels: [...panels.values()].map((r) => r.panel).filter((x) => !x.closed && x.channel_id === sessions.get(p.from_session)?.channel_id) };
+    case "panel.wait": {
+      const wanted = (e: any) => panels.get(e.panel_id)?.panel.channel_id === sessions.get(p.from_session)?.channel_id && (p.arguments?.panel_id === undefined || p.arguments.panel_id === e.panel_id);
+      const found = panelEvents.filter(wanted);
+      for (let i = panelEvents.length - 1; i >= 0; i--) if (wanted(panelEvents[i])) panelEvents.splice(i, 1);
+      return { events: found, timed_out: !found.length };
+    }
     case "hello":
       return {
         version: "0.0.0-mock",
         workspaces,
         channels: channels.filter((c) => !c.archived),
         sessions: [...sessions.values()],
+        panels: [...panels.values()].map((r) => r.panel).filter((p) => !p.closed),
+        panel_origin: panelOrigin,
         windows,
         home: HOME,
         default_shell: "/bin/bash",
@@ -945,6 +1036,10 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const c = channels.find((c) => c.id === p.id);
       if (!c) return {};
       c.archived = true;
+      for (const [id, r] of panels) if (r.panel.channel_id === c.id) {
+        panels.delete(id);
+        broadcast("panel_removed", { id });
+      }
       const left = new Set<Win | undefined>();
       for (const s of [...sessions.values()].filter((s) => s.channel_id === c.id)) {
         kill(s.id);

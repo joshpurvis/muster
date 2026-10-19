@@ -11,6 +11,7 @@ import type {
   Channel,
   ChannelId,
   HelloResult,
+  Panel,
   ServerEvent,
   SessionId,
   SessionInfo,
@@ -33,6 +34,9 @@ import {
   type LayoutState,
   type PaneNode,
   parseLayout,
+  panelTab,
+  panelId,
+  placePanel,
   reconcile,
 } from "./layout/tree.ts";
 import {
@@ -59,6 +63,8 @@ export const accountProfiles = signal<AccountProfile[]>([]);
 export const accountProfilesSupported = signal(false);
 export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
+export const panels = signal<Map<number, Panel>>(new Map());
+export const panelOrigin = signal("");
 
 /** Every window the daemon knows (all clients). */
 export const windows = signal<Win[]>([]);
@@ -94,7 +100,12 @@ export const windowSessions = computed((): SessionInfo[] => {
   return w ? sessionsOfWindow(w, sessions.value.values(), channels.value) : [];
 });
 
-export const hereIds = computed(() => new Set(windowSessions.value.map((s) => s.id)));
+export const windowPanels = computed(() => [...panels.value.values()].filter((p) =>
+  !p.closed && channelById.value.has(p.channel_id) && (!windowsSupported.value || p.window_id === windowId.value)
+));
+export const hereIds = computed(() => new Set([
+  ...windowSessions.value.map((s) => s.id), ...windowPanels.value.map((p) => panelTab(p.id)),
+]));
 
 // ---------------- updates, shared window prefs, shutdown ----------------
 
@@ -365,8 +376,13 @@ export const focusedSession = computed((): SessionInfo | null => {
 /** The focused tab's task. */
 export const focusedTask = computed((): Channel | null => {
   const s = focusedSession.value;
-  return s ? channelById.value.get(s.channel_id) ?? null : null;
+  const tab = focusedGroup.value?.active;
+  const id = tab == null ? null : panelId(tab);
+  const p = id === null ? null : panels.value.get(id);
+  return channelById.value.get(s?.channel_id ?? p?.channel_id ?? -1) ?? null;
 });
+
+export const focusedTabId = computed(() => focusedGroup.value?.active ?? null);
 
 /** The focused tab's session id: changes only when focus moves, not when its metadata does. */
 export const focusedSessionId = computed(() => focusedSession.value?.id ?? null);
@@ -397,7 +413,17 @@ export function releaseNewSessions() {
 }
 
 /** Session ids the layout shows: this window's, minus held ones, in joining order. */
-const liveIds = computed(() => windowSessions.value.filter((s) => !held.value.has(s.id)).map((s) => s.id));
+const liveIds = computed(() => [...hereIds.value].filter((id) => !held.value.has(id)));
+
+function reconcileTabs(s: LayoutState, ids: number[]): LayoutState {
+  const terminalIds = ids.filter((id) => panelId(id) === null);
+  const existing = allSessions(s.root).filter((id) => ids.includes(id));
+  let next = reconcile(s, [...new Set([...terminalIds, ...existing])]);
+  for (const p of windowPanels.peek()) {
+    if (ids.includes(panelTab(p.id))) next = placePanel(next, p.id, p.session_id);
+  }
+  return next;
+}
 
 /** The session ids of the layout in on-screen order (groups, then their strips). */
 export const layoutOrder = computed(() => (layout.value ? allSessions(layout.value.root) : []));
@@ -422,7 +448,7 @@ export function updateLayout(fn: (l: LayoutState) => LayoutState, place: Session
       for (const id of place) h.delete(id);
       held.value = h;
     }
-    const next = reconcile(fn(cur), liveIds.peek());
+    const next = reconcileTabs(fn(cur), liveIds.peek());
     if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
   });
 }
@@ -444,7 +470,7 @@ effect(() => {
   layoutOwner = owner;
   lastSaved = stored ? JSON.stringify(w!.layout) : "";
   clearTimeout(saveTimer);
-  layout.value = reconcile(stored ?? emptyLayout([]), liveIds.peek());
+  layout.value = reconcileTabs(stored ?? emptyLayout([]), liveIds.peek());
 });
 
 // Every change to this window's sessions reconciles the layout: new ones join the focused group,
@@ -453,7 +479,7 @@ effect(() => {
   const ids = liveIds.value;
   const cur = layout.peek();
   if (!cur) return;
-  const next = reconcile(cur, ids);
+  const next = reconcileTabs(cur, ids);
   if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
 });
 
@@ -561,6 +587,8 @@ export function applyHello(h: HelloResult) {
     const prev = sessions.value;
     versions.bumpAll();
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
+    panels.value = new Map((h.panels ?? []).filter((p) => !p.closed).map((p) => [p.id, p]));
+    panelOrigin.value = h.panel_origin ?? "";
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
     }
@@ -579,6 +607,19 @@ export function applyHello(h: HelloResult) {
 
 export function applyEvent(ev: ServerEvent) {
   switch (ev.event) {
+    case "panel_upserted": {
+      const next = new Map(panels.value);
+      if (ev.data.closed) next.delete(ev.data.id);
+      else next.set(ev.data.id, ev.data);
+      panels.value = next;
+      break;
+    }
+    case "panel_removed": {
+      const next = new Map(panels.value);
+      next.delete(ev.data.id);
+      panels.value = next;
+      break;
+    }
     case "account_profiles_changed":
       accountProfiles.value = ev.data;
       break;
@@ -717,7 +758,10 @@ export function firstSessionOf(ch: ChannelId, ms: number): Promise<SessionInfo |
 }
 
 function removeChannel(id: ChannelId) {
-  channels.value = channels.value.filter((c) => c.id !== id);
+  batch(() => {
+    channels.value = channels.value.filter((c) => c.id !== id);
+    panels.value = new Map([...panels.value].filter(([, p]) => p.channel_id !== id));
+  });
 }
 
 // ---------------- read tracking ----------------

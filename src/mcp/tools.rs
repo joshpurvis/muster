@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 12] = [
+pub const TOOL_NAMES: [&str; 17] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -34,6 +34,7 @@ pub const TOOL_NAMES: [&str; 12] = [
     "get_diff",
     "list_agents",
     "ask_agent",
+    "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -53,6 +54,7 @@ fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bo
         "title": title,
         "description": description,
         "inputSchema": schema,
+        "_meta": {"ui": {"visibility": if name == "get_diff" { vec!["model", "app"] } else { vec!["model"] }}},
         "annotations": {
             "title": title,
             "readOnlyHint": read_only,
@@ -68,7 +70,7 @@ fn empty_schema() -> Value {
 
 pub fn tool_definitions() -> Vec<Value> {
     let session_id = json!({"type": "integer", "minimum": 1, "description": "Target session id (see list_sessions)."});
-    vec![
+    let mut tools = vec![
         tool(
             "whoami",
             "Who am I",
@@ -238,7 +240,25 @@ pub fn tool_definitions() -> Vec<Value> {
             }),
             false,
         ),
-    ]
+    ];
+    let csp = json!({"type":"object", "properties": {
+        "resourceDomains":{"type":"array","items":{"type":"string"}},
+        "connectDomains":{"type":"array","items":{"type":"string"}},
+        "frameDomains":{"type":"array","items":{"type":"string"}},
+        "baseUriDomains":{"type":"array","items":{"type":"string"}}
+    },"additionalProperties":false});
+    tools.extend([
+        tool("panel_open", "Open panel", "Open a sandboxed MCP App beside your terminal, scoped to your task. Built-in: markdown with data {markdown}. Custom: html or html_path inside the task cwd. HTML/data limit 1 MiB each. Declared resource domains may load assets; fetching and nested frames stay blocked.",
+            json!({"type":"object","properties":{"title":{"type":"string"},"app":{"type":"string","enum":["markdown","custom"]},"data":{"type":"object"},"html":{"type":"string"},"html_path":{"type":"string"},"csp":csp},"required":["title","app"],"additionalProperties":false}), false),
+        tool("panel_update", "Update panel", "Update a panel in your task. Data changes are sent to its app in place; changed HTML reloads the app. Each update advances the revision.",
+            json!({"type":"object","properties":{"panel_id":{"type":"integer"},"title":{"type":"string"},"data":{"type":"object"},"html":{"type":"string"},"html_path":{"type":"string"}},"required":["panel_id"],"additionalProperties":false}), false),
+        tool("panel_close", "Close panel", "Close a panel belonging to your task; queued user events remain available until the task is archived.",
+            json!({"type":"object","properties":{"panel_id":{"type":"integer"}},"required":["panel_id"],"additionalProperties":false}), false),
+        tool("list_panels", "List panels", "List the open panels belonging to your task, including their revision, title and opener.", empty_schema(), true),
+        tool("wait_for_panel_event", "Wait for panel event", "Wait for queued user events in your task's panels. While waiting, matching events are returned here instead of injected into the opener. Otherwise events reach an idle agent as a marked panel prompt. Shells and exited sessions retain queued events.",
+            json!({"type":"object","properties":{"panel_id":{"type":"integer"},"timeout_seconds":{"type":"integer","minimum":0,"maximum":1800,"default":300}},"additionalProperties":false}), true),
+    ]);
+    tools
 }
 
 // ----- argument helpers -----
@@ -426,6 +446,7 @@ pub async fn call_tool<B: Backend>(
         // accepted (same guards), not listed.
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
+        "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" => panel_tool(st, caller, name, map).await,
         _ => return Err(()),
     };
     Ok(match res {
@@ -444,6 +465,20 @@ fn caller_session<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<Ses
     st.backend
         .session(caller)
         .ok_or_else(|| "calling session no longer exists".to_string())
+}
+
+async fn panel_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: &Map<String, Value>) -> TResult {
+    let me = caller_session(st, caller)?;
+    open_channel(st, me.channel_id)?;
+    if matches!(name, "panel_open" | "panel_update") {
+        if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+            caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+        ))? {
+            return Err(format!("rate limit: at most {} panel opens/updates or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
+        }
+    }
+    st.backend.panel_tool(caller, name, Value::Object(args.clone())).await
+        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 
 fn target_session<B: Backend>(st: &McpState<B>, id: SessionId) -> Result<SessionInfo, String> {

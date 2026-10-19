@@ -206,6 +206,8 @@ export interface AgentTemplate {
 }
 
 export type ServerEvent =
+  | { event: "panel_upserted"; data: Panel }
+  | { event: "panel_removed"; data: { id: number } }
   | { event: "account_profiles_changed"; data: AccountProfile[] }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
@@ -233,6 +235,8 @@ export interface WindowPrefs {
 }
 
 export interface HelloResult {
+  panels?: Panel[];
+  panel_origin?: string;
   account_profiles?: AccountProfile[];
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
@@ -248,6 +252,34 @@ export interface HelloResult {
   updates?: UpdateStatus;
   /** Missing from backends without shared window preferences. */
   prefs?: WindowPrefs;
+}
+
+export interface PanelCsp {
+  resourceDomains?: string[];
+  connectDomains?: string[];
+  frameDomains?: string[];
+  baseUriDomains?: string[];
+}
+
+export interface Panel {
+  id: number;
+  channel_id: ChannelId;
+  session_id: SessionId;
+  window_id: WindowId | null;
+  title: string;
+  app: "markdown" | "custom";
+  csp: PanelCsp;
+  revision: number;
+  html_revision: number;
+  created_at: number;
+  updated_at: number;
+  closed: boolean;
+}
+
+export interface PanelResource {
+  panel: Panel;
+  html: string;
+  data: Record<string, unknown>;
 }
 
 export type Decision = "approve" | "approve_always" | "deny";

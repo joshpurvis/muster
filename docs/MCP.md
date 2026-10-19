@@ -100,6 +100,36 @@ and targets in them are refused.
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
 
+### Panels
+
+Panels always belong to the caller's **task**, even when cross-workspace access is enabled.
+Only `get_diff` is app-visible (`_meta.ui.visibility: ["app", "model"]`); the other tools
+are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the panel's task.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `panel_open` | `title`, `app` (`markdown` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
+| `panel_update` | `panel_id`, `data?`, `html?`, `html_path?`, `title?` | `{}`; advances the revision |
+| `panel_close` | `panel_id` | `{}` |
+| `list_panels` | `{}` | `{panels: [...]}`; open panels in this task |
+| `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], timed_out}`; consumes queued events |
+
+`markdown` takes `data: {markdown: "# Review"}`. `custom` requires either inline `html` or
+`html_path`, resolved inside the task cwd; symlinks escaping it are refused. HTML and JSON
+input each have a 1 MiB limit; data must be an object. Open/update share the post rate limit.
+`csp` uses MCP Apps fields (`resourceDomains`, `connectDomains`, `frameDomains`,
+`baseUriDomains`): declared asset origins work, fetching and nested frames stay blocked.
+Only loopback HTTP frame declarations are accepted; base URI overrides are refused.
+
+Events contain `{panel_id, kind, payload, at}`. The latest app context accompanies the last
+event in each panel batch. The durable queue keeps 200 events per panel, adding an `overflow`
+event with the dropped count. An active wait takes precedence over idle-agent delivery.
+Otherwise the opener receives a marked prompt (at most about 24 KiB, with truncation notes),
+through the durable injection queue. The queue records `Panel(id)` provenance and the timeline
+records `panel:<id>`; a user action starts a human-origin turn at hop 0. Shell, exited and
+moved-to-another-task openers keep events queued. A human closing a tab queues `closed`;
+agent `panel_close` does not. Archiving the task removes panels, files and events.
+
 ### Agents
 
 A named agent (PLAN.md §10) is a persistent agent session with a home dir, its own tab and a

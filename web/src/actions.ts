@@ -13,6 +13,8 @@ import {
   focusedGroup,
   focusedSession,
   focusedTask,
+  focusedTabId,
+  panels,
   hereIds,
   holdNewSessions,
   knowAgent,
@@ -46,6 +48,7 @@ import {
   workspaces,
 } from "./state.ts";
 import * as native from "./native.ts";
+import { panelId } from "./layout/tree.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import type {
   Agent,
@@ -246,7 +249,9 @@ async function pullHere(sid: SessionId): Promise<boolean> {
 /** Move a tab of this window to another window, or to a new one (which then opens). */
 export async function moveTabToWindow(sid: SessionId, target: WindowId | "new") {
   const s = sessions.value.get(sid);
-  if (!s) return;
+  const pid = panelId(sid);
+  const panel = pid === null ? undefined : panels.value.get(pid);
+  if (!s && !panel) return;
   try {
     let to: WindowId;
     if (target === "new") {
@@ -254,7 +259,8 @@ export async function moveTabToWindow(sid: SessionId, target: WindowId | "new") 
       knowWindow(w);
       to = w.id;
     } else to = target;
-    await setSessionWindow(s, to, windowId.value);
+    if (panel) await rpc.call("panel.move", { id: panel.id, window_id: to });
+    else if (s) await setSessionWindow(s, to, windowId.value);
     const w = windows.value.find((x) => x.id === to);
     if (target === "new" || (w && !w.open)) openClientWindow(to);
     else toast("info", `Moved to ${windowLabel(w ?? { id: to, name: String(to) })}`, 2500);
@@ -315,6 +321,11 @@ export function focusActiveTerminalSoon() {
       if (overlay.value || typingElsewhere()) return;
       const s = focusedSession.value;
       if (s) terms.focusTerminal(s.id);
+      else {
+        const tab = focusedTabId.value;
+        const id = tab === null ? null : panelId(tab);
+        if (id !== null) document.querySelector<HTMLIFrameElement>(`iframe[data-panel-id="${id}"]`)?.focus();
+      }
     })
   );
 }
@@ -355,21 +366,21 @@ export function gotoTabIndex(n: number) {
 
 /** Alt+Shift+[ / ]: move the focused tab within its group. */
 export function shiftFocusedTab(delta: number) {
-  const s = focusedSession.value;
-  if (s) updateLayout((l) => shiftTab(l, s.id, delta));
+  const id = focusedTabId.value;
+  if (id !== null) updateLayout((l) => shiftTab(l, id, delta));
 }
 
 /** Ctrl+Alt+arrow: move the focused tab to the neighbouring group (a new split at the edge). */
 export function moveFocusedTab(dir: Direction) {
-  const s = focusedSession.value;
+  const id = focusedTabId.value;
   const l = layout.value;
-  if (!s || !l) return;
-  const from = paneOfSession(l.root, s.id);
+  if (id === null || !l) return;
+  const from = paneOfSession(l.root, id);
   if (!from) return;
   if (!neighbour(l.root, from.id, dir)) {
     if (from.tabs.length < 2 || !canSplit(sideOf(dir), from.id)) return;
   }
-  withLayout((x) => moveTabToNeighbour(x, s.id, dir));
+  withLayout((x) => moveTabToNeighbour(x, id, dir));
 }
 
 /** A tab dropped on a group (its strip at `index`, its body's center, or an edge: a new split). */
@@ -523,6 +534,11 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
  * daemons are asked to). A busy session gets an inline "Close? ⏎ / Esc" first.
  */
 export function closeTab(sid: SessionId, force = false) {
+  const pid = panelId(sid);
+  if (pid !== null) {
+    rpc.call("panel.dismiss", { id: pid }).catch(fail("Close failed")).catch(() => {});
+    return;
+  }
   const s = sessions.value.get(sid);
   if (!s) return;
   if (!force && BUSY_STATES.has(s.state)) {
@@ -540,8 +556,8 @@ export function closeTab(sid: SessionId, force = false) {
 
 /** Alt+W: close the focused tab. */
 export function closeFocused() {
-  const s = focusedSession.value;
-  if (s) closeTab(s.id);
+  const id = focusedTabId.value;
+  if (id !== null) closeTab(id);
 }
 
 /** Close a task (all its tabs) and delete its worktree (asks first: uncommitted work is lost). */

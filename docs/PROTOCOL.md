@@ -1,8 +1,9 @@
 # Muster client protocol (v1)
 
-The daemon serves everything on one localhost port (default 7433, else a free port).
+The daemon serves its UI and API on one localhost port (default 7433, else a free port).
+Panels use a second, ephemeral `127.0.0.1` listener serving only `GET /proxy`.
 Discovery file: `$XDG_RUNTIME_DIR/muster/daemon.json` (fallback `~/.local/state/muster/daemon.json`),
-mode 0600: `{"pid": 123, "port": 7433, "token": "<client token>", "version": "0.1.0"}`.
+mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client token>", "version": "0.1.0"}`.
 
 | Route | Auth | Purpose |
 |---|---|---|
@@ -114,7 +115,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], account_profiles[], home, default_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, windows[], account_profiles[], home, default_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -219,6 +220,45 @@ markers are stored; `session.remove` keeps them (in a pending-reap record) until
 confirmed. At the next daemon start, leftovers of earlier runs are killed (only processes in
 that session whose environment carries every marker), and the start waits until they are gone
 (up to about 4 s); records of processes that survive are kept for the next start.
+
+## Agent panels
+
+These methods require the desktop client token; device clients cannot call them and receive
+neither panel records nor panel events. The proxy listener has no daemon routes or credentials.
+
+| Method | Params | Result |
+|---|---|---|
+| `panel.open/update/close/list/wait` | `{from_session, arguments}` | Corresponding MCP tool result; same task scope and guards |
+| `panel.resource` | `{id}` | `{panel, html, data}` |
+| `panel.event` | `{panel_id, kind, payload}` | `{}`; 16 KiB payload limit, 30 events/minute/panel |
+| `panel.context` | `{panel_id, context}` | `{}`; latest context, 16 KiB limit |
+| `panel.dismiss` | `{id}` | `{}`; close with a human `closed` event |
+| `panel.move` | `{id, window_id}` | `{}` |
+| `panel.tool` | `{panel_id, name: "get_diff", arguments: {max_bytes?}}` | MCP tool result for the panel's task |
+
+WebSocket pushes: `panel_upserted` carries a full panel, `panel_removed` carries `{id}`.
+`hello.panels` contains open panels and `panel_origin` is `http://127.0.0.1:<panel_port>`.
+Records contain `id`, `channel_id`, `session_id` (opener), `window_id`, `title`, `app`, `csp`,
+`revision`, `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
+Schema v14 stores records in `panels` and queued events in `panel_events`. Immutable revision
+files under `<data>/panels/<id>/` are written atomically, mode 0600, before the row is committed.
+
+The UI embeds `/proxy?csp=<JSON>` on the separate origin, with sandbox permissions
+`allow-scripts allow-same-origin`. The proxy creates an opaque `srcdoc` app with only
+`allow-scripts`, validating exact parent origin and frame source in both directions. Its HTTP
+CSP and the app's prepended meta CSP block connections, forms, objects and nested app frames.
+Asset sources extend only script/style/image/font/media directives. `connectDomains` are
+stored for future per-panel approval and grant no access. No token enters either frame.
+
+The bridge speaks MCP Apps 2026-01-26 JSON-RPC: sandbox-ready/resource-ready handshake,
+initialize/initialized, tool-input/result, host-context-changed, size-changed, open-link,
+message, update-model-context, request-display-mode, resource-teardown and ping. Each data
+revision sends fresh tool-input/result in the existing frame; changed HTML creates a frame.
+Fullscreen zooms the group; pip keeps the current mode. Unknown methods/tools are refused.
+Events use `ui/message` with user text; `_meta.muster.kind` optionally names a custom action.
+The host checks transient user activation synchronously, plus a visible, focused panel frame,
+before accepting a message or opening an HTTP(S) link. Context updates alone do not inject.
+Native IPC also requires a random per-window secret injected only into the main UI frame.
 
 ## Windows, tabs and naming
 

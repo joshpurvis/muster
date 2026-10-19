@@ -18,43 +18,34 @@ const MIN_PX = 120;
 const GUTTER = 1; // visible px; hit area is widened in CSS
 
 export function SplitView({ layout }: { layout: LayoutState }) {
-  if (layout.zoom) {
-    const p = findPane(layout.root, layout.zoom);
-    if (p) {
-      return (
-        <div class="split-root">
-          <Group pane={p} focused zoomed multi controls />
-        </div>
-      );
-    }
-  }
-  const corner = topRightPane(layout.root);
+  // Hide other groups during zoom without unmounting apps or losing their local state.
+  const corner = layout.zoom ?? topRightPane(layout.root);
   return (
     <div class="split-root">
-      <Node node={layout.root} path={[]} focus={layout.focus} corner={corner} />
+      <Node node={layout.root} path={[]} focus={layout.focus} corner={corner} zoom={layout.zoom} />
     </div>
   );
 }
 
 function Node(
-  { node, path, focus, corner }: { node: Layout; path: number[]; focus: string; corner: string },
+  { node, path, focus, corner, zoom }: { node: Layout; path: number[]; focus: string; corner: string; zoom: string | null },
 ) {
   if (node.type === "pane") {
     return (
       <Group
         pane={node}
         focused={node.id === focus}
-        zoomed={false}
+        zoomed={node.id === zoom}
         multi={path.length > 0}
         controls={node.id === corner}
       />
     );
   }
-  return <Split node={node} path={path} focus={focus} corner={corner} />;
+  return <Split node={node} path={path} focus={focus} corner={corner} zoom={zoom} />;
 }
 
 function Split(
-  { node, path, focus, corner }: { node: SplitNode; path: number[]; focus: string; corner: string },
+  { node, path, focus, corner, zoom }: { node: SplitNode; path: number[]; focus: string; corner: string; zoom: string | null },
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const out = [];
@@ -65,12 +56,12 @@ function Split(
       <div
         key={key}
         class="split-child"
-        style={{ flex: `${node.sizes[i]} 1 0px` }}
+        style={{ flex: `${node.sizes[i]} 1 0px`, display: zoom && !findPane(c, zoom) ? "none" : undefined }}
       >
-        <Node node={c} path={[...path, i]} focus={focus} corner={corner} />
+        <Node node={c} path={[...path, i]} focus={focus} corner={corner} zoom={zoom} />
       </div>,
     );
-    if (i < node.children.length - 1) {
+    if (!zoom && i < node.children.length - 1) {
       out.push(
         <Gutter
           key={"g" + key}

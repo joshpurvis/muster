@@ -132,6 +132,8 @@ pub fn write_private(p: &Path, data: &[u8]) -> std::io::Result<()> {
 pub struct Discovery {
     pub pid: u32,
     pub port: u16,
+    #[serde(default)]
+    pub panel_port: Option<u16>,
     pub token: String,
     pub version: String,
 }
@@ -216,6 +218,7 @@ mod tests {
         let d = super::Discovery {
             pid: 1,
             port: 7433,
+            panel_port: None,
             token: "t".into(),
             version: "0".into(),
         };

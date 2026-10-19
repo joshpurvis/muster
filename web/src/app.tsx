@@ -21,6 +21,7 @@ import {
   prefs,
   removedSessionListeners,
   sessions,
+  panels,
   toast,
   updateLayout,
   windowId,
@@ -142,6 +143,7 @@ rpc.start();
   rpc,
   layout,
   sessions,
+  panels,
   windowSessions,
   windowId,
   focusedSession,
@@ -311,7 +313,7 @@ function App() {
       <div class="app-body">
         {agentsPanelOpen.value && <AgentsPanel />}
         <main class="content">
-          {l && windowSessions.value.length
+          {l && hereIds.value.size
             ? (
               <div class="panes">
                 <SplitView layout={l} />

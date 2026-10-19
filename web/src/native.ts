@@ -3,7 +3,7 @@
 // understands (`parse_ipc`); windows opened by older builds, and browsers, have none.
 
 const g = globalThis as unknown as {
-  __musterNative?: { ipc?: number };
+  __musterNative?: { ipc?: number; secret?: string };
   ipc?: { postMessage?: (body: string) => void };
 };
 
@@ -13,7 +13,7 @@ export const isNative = (g.__musterNative?.ipc ?? 0) >= 1 && typeof g.ipc?.postM
 function post(msg: Record<string, unknown>): boolean {
   if (!isNative) return false;
   try {
-    g.ipc!.postMessage!(JSON.stringify(msg));
+    g.ipc!.postMessage!(JSON.stringify({ ...msg, secret: g.__musterNative?.secret }));
     return true;
   } catch {
     return false;

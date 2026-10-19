@@ -1,6 +1,16 @@
 # Agent panels
 
-Status: proposed, 2026-10-18; the user's decisions are recorded at the end. Nothing is built yet.
+Status: core built on `feature/agent-panels`, 2026-10-18. The remainder of this document is
+the approved broader plan; current tools and limits are in [MCP.md](MCP.md#panels).
+
+Core includes durable panels/events, task-scoped MCP and CLI, tab placement/movement, the
+two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Extra built-ins,
+fetch approval, placement options and preview servers remain later phases. Nested frames are
+blocked even for declared loopback dev servers: a child document's independent CSP would
+otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
+Each panel data revision is treated as a fresh tool input/result invocation in the same frame;
+the MCP Apps spec normally sends input once per invocation. Chromium exercises the gesture
+path; WebKitGTK activation remains unverified without opening a native window.
 
 Agents should be able to show things next to their terminal: images, charts, a rich diff with
 their notes on it, a live preview of the web app they are building, and interactive components

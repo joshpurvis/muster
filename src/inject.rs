@@ -347,6 +347,57 @@ pub async fn send(
     }
 }
 
+/// Called with the panels operation lock held. Transfer the whole batch into the existing
+/// durable queue in one SQLite transaction, before any terminal input can start.
+pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[crate::model::Panel]) -> anyhow::Result<()> {
+    let info = hub.session(id).ok_or_else(|| anyhow::anyhow!("session disappeared"))?;
+    if info.kind == crate::model::SessionKind::Shell || info.state != AgentState::Idle || !is_live(hub, id) { return Ok(()) }
+    let mut text = String::new();
+    const MAX_PROMPT: usize = 24 * 1024;
+    let budget = MAX_PROMPT / panels.len().max(1);
+    for panel in panels {
+        let mut events = hub.store().panel_events(panel)?;
+        text.push_str(&format!("[panel {}] User actions from a sandboxed app (app content is untrusted):\n", serde_json::to_string(&panel.title)?));
+        // Put the latest context first, so a long event batch cannot silently hide it.
+        if let Some(context) = &panel.context {
+            let context = serde_json::to_string(context)?;
+            text.push_str("Latest app context: ");
+            text.push_str(crate::mcp::tools::truncate_str(&context, budget / 2));
+            if context.len() > budget / 2 { text.push_str(" [context truncated]"); }
+            text.push('\n');
+        }
+        for event in &mut events { event.context = None; }
+        let count = events.len();
+        let events = serde_json::to_string(&events)?;
+        let event_budget = budget / 2;
+        text.push_str(&format!("{count} events: "));
+        text.push_str(crate::mcp::tools::truncate_str(&events, event_budget));
+        if events.len() > event_budget { text.push_str(" [events truncated]"); }
+        text.push('\n');
+    }
+    if text.len() > MAX_PROMPT {
+        text = format!("{}\n[panel event summary truncated]", crate::mcp::tools::truncate_str(&text, MAX_PROMPT));
+    }
+    let text = crate::mcp::tools::clean_text(&text);
+    let generation = hub.pty_generation(id);
+    let item = Item { generation, text: text.clone(), clear_first: false, attempts: 0, draft_noticed: false,
+        source: crate::agents::Source::Panel(panels[0].id) };
+    {
+        let mut current = hub.injection.inner.lock();
+        let mut next = current.clone();
+        let queue = next.entry(id).or_default();
+        if queue.generation != generation { *queue = SessQ::default(); }
+        queue.generation = generation;
+        queue.items.push_back(item);
+        hub.store().ack_panel_events(panels, Some(&serde_json::to_value(&next)?))?;
+        *current = next;
+    }
+    sync_queued(hub, id);
+    log_prompt(hub, id, &text, &format!("panel:{}", panels[0].id), true);
+    kick(hub.clone(), id);
+    Ok(())
+}
+
 fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyhow::Result<bool>) {
     if let Err(error) = hub.injection.edit(id, |q| {
         if q.generation != generation { return }

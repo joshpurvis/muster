@@ -14,6 +14,7 @@ mod hub;
 mod inject;
 mod mcp;
 mod model;
+mod panels;
 mod notify;
 mod paths;
 mod renderer;
@@ -55,6 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Open and manage agent panels in this session's task.
+    Panel {
+        #[command(subcommand)]
+        action: cli::PanelCmd,
+    },
     /// Run the daemon (detaches into the background unless --foreground).
     Daemon {
         #[arg(long)]
@@ -523,6 +529,7 @@ fn main() -> ExitCode {
 /// Commands that act on sessions (docs/CLI.md).
 fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
+        Cmd::Panel { action } => cli::panel(d, action),
         Cmd::Read {
             target,
             lines,
@@ -1018,6 +1025,8 @@ async fn daemon_main() -> anyhow::Result<()> {
     let host_pid = terminal_host.client.hello.pid;
     let listener = bind().await?;
     let port = listener.local_addr()?.port();
+    let panel_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let panel_port = panel_listener.local_addr()?.port();
     let client_token = load_client_token()?;
     let store = store::Store::open(&paths::db_path())?;
     let hook_inbox = hook_inbox::Inbox::open(&hook_inbox::path())?;
@@ -1046,11 +1055,17 @@ async fn daemon_main() -> anyhow::Result<()> {
     });
     hook_inbox::spawn(&hub, hook_inbox)?;
     hub::spawn_input_attribution(&hub)?;
+    hub.panels.port.store(panel_port, std::sync::atomic::Ordering::Relaxed);
+    // Finish interrupted archive cleanup before publishing any panel to a UI.
+    for panel in panels::list(&hub)? {
+        if hub.channel(panel.channel_id).is_none_or(|c| c.archived) { panels::archive(&hub, panel.channel_id)?; }
+    }
     let app = server::router(hub.clone())?;
     // Publish the helper only after application recovery succeeds. Existing
     // terminals keep this path even when the original build directory is removed.
     release.activate()?;
     inject::spawn_tasks(hub.clone());
+    panels::spawn(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
     // Agents with autostart on (their homes were moved above, before anything could start).
@@ -1117,6 +1132,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     paths::write_discovery(&Discovery {
         pid: std::process::id(),
         port,
+        panel_port: Some(panel_port),
         token: client_token,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
@@ -1129,6 +1145,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     let r: anyhow::Result<()> = async {
         tokio::select! {
             r = serve => r.context("server failed"),
+            r = axum::serve(panel_listener, server::panel_router(port)) => r.context("panel server failed"),
             _ = term.recv() => { tracing::info!("SIGTERM: shutting down"); Ok(()) }
             _ = int.recv() => { tracing::info!("SIGINT: shutting down"); Ok(()) }
             _ = async { loop { hup.recv().await; tracing::info!("ignoring SIGHUP"); } } => Ok(()),

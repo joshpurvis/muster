@@ -96,6 +96,21 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   current turn is lost and the program starts fresh.", with Cancel focused. Shells and idle
   agents don't ask, nor do the palette commands and shortcuts.
 
+### Agent panel tabs
+
+Agents open Markdown or custom MCP Apps beside their terminal. A new panel joins the group
+to the opener's right, or creates that split. Its tab has a panel icon, title and close button;
+dragging, splitting, moving between windows, keyboard tab selection and group zoom work as
+for terminals. The menu includes Reload panel and Close panel. Closing sends `closed` to the
+opening agent; archiving the task removes all its panels. The phone UI ignores panels.
+
+Panel input updates retain the frame; changed HTML and Reload panel replace it. Inactive tabs
+and group zoom keep app state. Theme changes reach the app through the bridge. The built-in
+Markdown app renders text safely and includes a comment field for sending a user event.
+Panel messages require a real click or key in the visible app; links use the host browser.
+Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`;
+`-1` remains the internal empty-pane sentinel. Old session-only layouts need no migration.
+
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
 - Onto another group's body: left/right/top/bottom halves (outer 28%) split that group on that

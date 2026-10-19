@@ -8,7 +8,7 @@ import { type DropZone, isNoopMove, splitFits } from "./tree.ts";
 import { layout } from "../state.ts";
 import { dropTab, moveTabToWindow, revealSession } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
-import { KindIcon } from "../icons.tsx";
+import { IconPanel, KindIcon } from "../icons.tsx";
 
 export interface Target {
   paneId: string;
@@ -23,7 +23,7 @@ export interface Target {
 interface DragState {
   sid: number;
   label: string;
-  kind: SessionInfo["kind"];
+  kind: SessionInfo["kind"] | "panel";
   x: number;
   y: number;
   target: Target | null;
@@ -36,7 +36,7 @@ export const drag = signal<DragState | null>(null);
 const THRESHOLD = 5;
 
 /** Call from a tab's pointerdown. A press without movement is a click (`onClick`). */
-export function startTabDrag(e: PointerEvent, s: SessionInfo, label: string, onClick: () => void) {
+export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["kind"] }, label: string, onClick: () => void) {
   if (e.button !== 0) return;
   const sx = e.clientX;
   const sy = e.clientY;
@@ -206,7 +206,7 @@ function DropMarker({ t }: { t: Target | null }) {
 }
 
 /** The dragged tab's label, following the pointer but kept inside the window. */
-function Ghost({ x, y, kind, label }: { x: number; y: number; kind: SessionInfo["kind"]; label: string }) {
+function Ghost({ x, y, kind, label }: { x: number; y: number; kind: DragState["kind"]; label: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 160, h: 26 });
   useLayoutEffect(() => {
@@ -221,7 +221,7 @@ function Ghost({ x, y, kind, label }: { x: number; y: number; kind: SessionInfo[
   top = Math.max(4, Math.min(top, innerHeight - size.h - 4));
   return (
     <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
-      <KindIcon kind={kind} size={13} />
+      {kind === "panel" ? <IconPanel size={13} /> : <KindIcon kind={kind} size={13} />}
       <span>{label}</span>
     </div>
   );

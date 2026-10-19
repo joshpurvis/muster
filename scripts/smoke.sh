@@ -16,8 +16,8 @@ cleanup() {
 }
 trap cleanup EXIT
 deno run \
-  --allow-net=127.0.0.1:17433 \
+  --allow-net=127.0.0.1 \
   --allow-read="$TMP,$BIN" \
   --allow-write="$TMP" \
-  --allow-run="$BIN,git" \
+  --allow-run="$BIN,git,python3" \
   scripts/smoke.ts "$TMP" "$BIN"

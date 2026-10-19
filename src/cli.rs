@@ -485,6 +485,57 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 // ----- commands -----
 
+#[derive(clap::Subcommand)]
+pub enum PanelCmd {
+    /// Show an app beside this session. JSON data is passed with --data.
+    Open {
+        #[arg(long)] title: String,
+        #[arg(long, default_value = "markdown")] app: String,
+        #[arg(long)] data: Option<String>,
+        #[arg(long, conflicts_with = "html_path")] html: Option<String>,
+        #[arg(long)] html_path: Option<String>,
+        #[arg(long)] csp: Option<String>,
+    },
+    /// Update input, HTML or title of a panel in this task.
+    Update {
+        panel_id: i64,
+        #[arg(long)] title: Option<String>,
+        #[arg(long)] data: Option<String>,
+        #[arg(long, conflicts_with = "html_path")] html: Option<String>,
+        #[arg(long)] html_path: Option<String>,
+    },
+    /// Close a panel in this task.
+    Close { panel_id: i64 },
+    /// List the task's open panels.
+    List,
+    /// Consume queued user events, or wait for them (0–1800 seconds).
+    Wait {
+        panel_id: Option<i64>,
+        #[arg(long, default_value_t = 300)] timeout_seconds: u64,
+    },
+}
+
+pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
+    let session = env_session().context("panel commands must run inside a Muster session (MUSTER_SESSION_ID)")?;
+    let parse = |s: Option<String>| -> anyhow::Result<Value> {
+        s.map(|s| serde_json::from_str(&s).context("invalid JSON argument")).transpose().map(|v| v.unwrap_or(Value::Null))
+    };
+    let (method, mut args, timeout) = match cmd {
+        PanelCmd::Open { title, app, data, html, html_path, csp } => ("panel.open",
+            json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?}), 30),
+        PanelCmd::Update { panel_id, title, data, html, html_path } => ("panel.update",
+            json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"html":html,"html_path":html_path}), 30),
+        PanelCmd::Close { panel_id } => ("panel.close", json!({"panel_id":panel_id}), 30),
+        PanelCmd::List => ("panel.list", json!({}), 30),
+        PanelCmd::Wait { panel_id, timeout_seconds } => {
+            anyhow::ensure!(timeout_seconds <= 1800, "timeout_seconds must be at most 1800");
+            ("panel.wait", json!({"panel_id":panel_id,"timeout_seconds":timeout_seconds}), timeout_seconds + 10)
+        },
+    };
+    args.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+    print_json(&client::rpc_with_timeout(d, method, json!({"from_session":session,"arguments":args}), Duration::from_secs(timeout))?)
+}
+
 /// `muster pair`: start a pairing, print how to reach the daemon from the phone (the
 /// `tailscale serve` lines when it isn't set up), a QR code and the short code, then wait for
 /// the phone.
@@ -2084,6 +2135,7 @@ mod tests {
         Discovery {
             pid: 0,
             port,
+            panel_port: None,
             token: "t".into(),
             version: "test".into(),
         }

@@ -7,7 +7,9 @@
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src,dev,panels \
 //     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo>
 import { type Browser, launch } from "./cdp.ts";
-import { chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prSample, tableSample } from "./panel_samples.ts";
+import {
+  actionsSample, chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA, tableSample,
+} from "./panel_samples.ts";
 
 const M = "globalThis.__muster";
 type Check = (cond: unknown, msg: string) => void;
@@ -243,7 +245,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     got = await events(p.pid);
     check(got.length === 1 && got[0].kind === "merge", `one merge event: ${JSON.stringify(got)} ${await p.inApp(`document.querySelector('.notice')?.textContent + '|' + !!document.querySelector('.drawer')`)}`);
     const data = got[0].payload._meta.muster.data;
-    check(JSON.stringify(data) === JSON.stringify({ action: "merge", repo: "acme/api", number: 812, base: "master", method: "squash", delete_branch: true, head_sha: HEAD_SHA }), `merge payload: ${JSON.stringify(data)}`);
+    check(JSON.stringify(data) === JSON.stringify({ action: "merge", repo: "acme/api", number: 812, base: "master", method: "squash", delete_branch: true, head_sha: HEAD_SHA, answers: {}, options: [] }), `merge payload: ${JSON.stringify(data)}`);
     check(String(got[0].payload.content.text).endsWith(command), "event text carries the command");
     check(await p.inApp(`document.querySelector('#merge').disabled`), "Merge disabled while the agent works");
     ok("pr_decision: Merge shows the exact gh command; a refused send keeps the confirm for a retry; Confirm sends one merge event with that PR, method, branch flag and head SHA");
@@ -301,6 +303,198 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.size(1440, 900);
     await close(p.pid);
     ok("pr_decision: readable about 400 px wide");
+  }
+
+  // ---- pr_decision: verdict first; the agent's questions answered in place by keys; an option
+  // toggled on; Merge's confirm shows what rides along and sends one event; Send answers
+  {
+    await a.sleep(5600);
+    const data = { ...prQuestionsSample, actions: actionsSample };
+    const p = await open("pr_decision", "PR #812", data);
+    await p.waitIn(`document.querySelectorAll('.question').length === 3`);
+    const pos = (x: string, y: string) => p.inApp(`!!(document.querySelector('${x}').compareDocumentPosition(document.querySelector('${y}')) & Node.DOCUMENT_POSITION_FOLLOWING)`);
+    check((await p.inApp(`document.querySelector('.verdict-text')?.textContent`)) === data.verdict, "the verdict shows");
+    check((await p.inApp(`document.querySelector('.undo')?.textContent`)).includes(data.undo), "the undo line shows under it");
+    check(await pos(".verdict", ".questions-form") && await pos(".grid", ".questions-form") && await pos(".questions-form", ".change"),
+      "verdict first; questions after the risk and checks, before the diffs");
+    check(await p.inApp(`document.querySelector('#q-limit-o0').getAttribute('aria-checked') === 'true' && /Recommended/.test(document.querySelector('#q-limit-o0').textContent)`),
+      "the recommended answer is picked and marked");
+    check((await p.inApp(`document.querySelector('#draft-row').textContent`)).includes("2 of 3 answered"), "two recommendations count as answers");
+    await p.inApp(`document.querySelector('#q-limit-o0').focus()`);
+    await a.key("2");
+    await p.waitIn(`document.querySelector('#q-limit-o1').getAttribute('aria-checked') === 'true' && document.activeElement?.id === 'q-limit-o1'`);
+    await a.key("Tab");
+    check(await p.inApp(`document.activeElement?.id === 'q-proxy-o0'`), `Tab moves to the next question: ${await p.inApp(`document.activeElement?.id`)}`);
+    await a.key("3");
+    await p.waitIn(`document.querySelector('#q-proxy-o2').getAttribute('aria-checked') === 'true'`);
+    await a.key("Tab");
+    check(await p.inApp(`document.activeElement?.id === 'q-note-text'`), "Tab reaches the text answer");
+    await a.type("Thanks, nice work");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('3 of 3 answered')`);
+    await a.key("Shift+Tab");
+    check(await p.inApp(`document.activeElement?.id === 'q-proxy-o2'`), "Shift+Tab goes back a question");
+    check((await events(p.pid)).length === 0, "answering sends nothing");
+    // The user's options: L (local) switches on at once; Q (outward) asks first, then switches on.
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await a.key("q");
+    await p.waitIn(`document.querySelector('.drawer .outward-desc')?.textContent === 'Add the needs-qa label to this PR on GitHub.' && document.activeElement?.id === 'confirm-outward'`);
+    check((await p.inApp(`document.querySelector('.drawer-title').textContent`)).includes("With your next send"), "the toggle confirm says when it happens");
+    await a.key("Enter");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Needs QA')`);
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`!document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    check((await events(p.pid)).length === 0, "switching options on and off sends nothing");
+    await p.shots2("pr-questions");
+    await p.zoom("fullscreen");
+    await a.sleep(300);
+    const share = (await p.inApp("innerWidth")) / 1440;
+    await a.size(Math.ceil(400 / share), 900);
+    await a.sleep(400);
+    check(await p.inApp(`document.documentElement.scrollWidth <= innerWidth + 1`), "questions narrow: no sideways scroll");
+    check(await p.inApp(`document.querySelector('.actions').offsetHeight <= innerHeight * 0.35`), `questions narrow: the action bar takes at most about a third: ${await p.inApp(`document.querySelector('.actions').offsetHeight + '/' + innerHeight`)}`);
+    await p.inApp(`document.querySelector('.questions-form').scrollIntoView({ block: 'start' })`);
+    for (const theme of ["dark", "light"]) {
+      await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
+      await p.waitIn(`document.documentElement.dataset.theme === '${theme}'`);
+      await a.sleep(250);
+      await a.shot(`${shots}/panel-pr-questions-narrow-${theme}.png`, (await a.rect(`[data-panel-view="${p.pid}"]`))!);
+    }
+    await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+    await p.zoom("inline");
+    await a.size(1440, 900);
+    await a.sleep(300);
+    ok("pr_decision: verdict and undo first; questions answered in place (recommended picked, 2 and 3 pick, Tab moves, text typed); L and Q switch options on (Q after a confirm), nothing sent");
+
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.querySelector('.drawer .draft-summary')`);
+    const summary: string = await p.inApp(`document.querySelector('.drawer .draft-summary').textContent`);
+    for (const want of ["No", "The whole office as one visitor", "Thanks, nice work", "Needs QA", "Add the needs-qa label", "Label later",
+      "When many people share one office network, how should they be counted?"]) check(summary.includes(want), `merge confirm summary has ${want} in full: ${summary}`);
+    await p.shots2("pr-questions-confirm");
+    await p.waitIn(`document.querySelector('.drawer .draft-summary')`);
+    // Changing an answer while confirming cancels the confirm: it never sends what it did not show.
+    await p.inApp(`document.querySelector('#q-limit-o0').click()`);
+    await p.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
+    await p.inApp(`document.querySelector('#q-limit-o1').click()`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    // Send answers waits while Merge is being confirmed (the draft goes with the merge), and
+    // the confirm keeps working.
+    check(await p.inApp(`document.querySelector('#send-answers').disabled`), "Send answers is off during the confirm");
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Confirm or cancel the merge first') && document.querySelector('.drawer .draft-summary')`);
+    check((await events(p.pid)).length === 0, "Ctrl+Enter during the confirm sent nothing");
+    await p.inApp(`document.querySelector('#confirm-merge').focus()`);
+    await a.key("Enter");
+    let got = await events(p.pid);
+    check(got.length === 1 && got[0].kind === "merge", `one merge event: ${JSON.stringify(got)}`);
+    const want = { action: "merge", repo: "acme/api", number: 812, base: "master", method: "squash", delete_branch: true, head_sha: HEAD_SHA,
+      answers: { limit: "no", proxy: "none", note: "Thanks, nice work" }, options: ["needs-qa", "later"] };
+    check(JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify(want), `merge carries the answers and options: ${JSON.stringify(got[0].payload._meta.muster.data)}`);
+    check(String(got[0].payload.content.text).endsWith(`--match-head-commit ${HEAD_SHA}`), "the command stays last in the text");
+    check(!(await p.inApp(`document.querySelector('#draft-row').textContent`)).includes("Needs QA"), "options went with the merge and switch off");
+    ok("pr_decision: Merge's confirm lists the answers and options; a changed answer cancels it; Confirm sends one merge event carrying them");
+
+    // The agent answers (any update); the user changes an answer and sends the answers alone.
+    await call("panel.update", { panel_id: p.pid, data: { ...data, status: "failed", status_detail: "Not merged in this test." } });
+    await p.waitIn(`document.querySelector('.status.danger')`);
+    check((await p.inApp(`document.querySelector('#q-note-text').value`)) === "Thanks, nice work", "answers survive the agent's update");
+    await p.inApp(`document.querySelector('#q-limit-o1').focus()`);
+    await a.key("1");
+    await p.waitIn(`document.querySelector('#q-limit-o0').getAttribute('aria-checked') === 'true'`);
+    await a.key("Ctrl+Enter");
+    got = await events(p.pid);
+    check(got.length === 1 && got[0].kind === "answers" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "answers", repo: "acme/api",
+      number: 812, head_sha: HEAD_SHA, answers: { limit: "yes", proxy: "none", note: "Thanks, nice work" }, options: [] }), `answers event: ${JSON.stringify(got)}`);
+    await p.waitIn(`document.querySelector('#send-answers').disabled && document.querySelector('#send-answers').textContent.includes('sent')`);
+    ok("pr_decision: Ctrl+Enter sends the answers alone (one answers event); the button then says they were sent");
+
+    // A required question without an answer holds Merge and takes the user to it.
+    await call("panel.update", { panel_id: p.pid, data: { ...data, questions: [{ id: "owner", text: "Who looks after this code now?", kind: "text", required: true }] } });
+    await p.waitIn(`document.querySelectorAll('.question').length === 1`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Answer question 1 first') && document.activeElement?.id === 'q-owner-text'`);
+    check(!(await p.inApp(`!!document.querySelector('.drawer')`)) && (await events(p.pid)).length === 0, "no confirm, nothing sent");
+    // A required question arriving while Merge is being confirmed cancels the confirm.
+    await call("panel.update", { panel_id: p.pid, data: { ...data, questions: [] } });
+    await p.waitIn(`document.querySelectorAll('.question').length === 0`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    await call("panel.update", { panel_id: p.pid, data: { ...data, questions: [{ id: "owner", text: "Who looks after this code now?", kind: "text", required: true }] } });
+    await p.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Answer question 1 first')`);
+    check((await events(p.pid)).length === 0, "a new required question during the confirm: nothing sent");
+    // The header button (and G) takes the user to the questions.
+    await p.click("h1");
+    await a.key("g");
+    check(await p.inApp(`document.activeElement?.id === 'q-owner-text'`), "G goes to the first unanswered question");
+    ok("pr_decision: a required question holds Merge, also when it arrives during the confirm; G jumps to the questions");
+
+    // A refused send undoes only its own effects, and only if nothing happened since. Hold the
+    // host's refusals in the app's own page, then release them after an update or an edit.
+    await p.inApp(`(() => { const s = document.createElement('script'); s.textContent = ${JSON.stringify(`
+      const real = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data');
+      const pass = new WeakSet(), seen = new WeakSet(), held = [];
+      Object.defineProperty(MessageEvent.prototype, 'data', { configurable: true, get() {
+        const d = real.get.call(this);
+        if (pass.has(this) || !d || d.jsonrpc !== '2.0' || !d.error || typeof d.id !== 'number') return d;
+        if (!seen.has(this)) { seen.add(this); held.push(d); }
+        return null;
+      } });
+      document.addEventListener('e2e-release', () => { for (const d of held.splice(0)) { const ev = new MessageEvent('message', { data: d, source: parent }); pass.add(ev); dispatchEvent(ev); } });
+      document.documentElement.dataset.e2eHold = '1';`)}; document.head.append(s); })()`);
+    await p.waitIn(`document.documentElement.dataset.e2eHold === '1'`);
+    const release = () => p.inApp(`document.dispatchEvent(new Event('e2e-release'))`);
+    const exhaust = async () => { await a.sleep(5600); await p.click("h1"); for (let i = 0; i < 3; i++) await a.key("o"); };
+    await call("panel.update", { panel_id: p.pid, data });
+    await p.waitIn(`document.querySelectorAll('.question').length === 3`);
+    // Case 1: the action changes in an update before the refusal arrives.
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await exhaust();
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`!document.querySelector('#draft-row').textContent.includes('Label later')`).catch(async (e) => {
+      throw new Error(`${e.message}: ${await p.inApp(`document.querySelector('.notice')?.textContent + ' | ' + document.querySelector('#draft-row').textContent + ' | ' + document.activeElement?.id`)}`);
+    });
+    const changed = { ...data, actions: [actionsSample[0], { ...actionsSample[1], description: "Note this PR in your list for Friday; nothing changes on GitHub." }] };
+    await call("panel.update", { panel_id: p.pid, data: changed });
+    await p.waitIn(`document.querySelector('#act-later')?.title.includes('Friday') || document.querySelector('#your-actions')`);
+    await release();
+    await p.waitIn(`document.querySelector('.notice.danger')?.textContent.includes('Things changed since')`);
+    check(!(await p.inApp(`document.querySelector('#draft-row').textContent`)).includes("Label later"), "the changed action is not switched back on");
+    // Case 2: the user switches on another option before the refusal arrives.
+    await call("panel.update", { panel_id: p.pid, data });
+    await p.waitIn(`!document.querySelector('#act-later')?.title.includes('Friday')`);
+    await p.click("h1");
+    await a.key("q");
+    await p.waitIn(`document.activeElement?.id === 'confirm-outward'`);
+    await a.key("Enter");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Needs QA')`);
+    await exhaust();
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`!document.querySelector('#draft-row').textContent.includes('Needs QA') && document.querySelector('.notice.info')?.textContent.includes('Sent to the agent')`);
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await release();
+    await p.waitIn(`document.querySelector('.notice.danger')?.textContent.includes('Things changed since')`);
+    const row: string = await p.inApp(`document.querySelector('#draft-row').textContent`);
+    check(row.includes("Label later") && !row.includes("Needs QA"), `the newer pick stays and the refused one is not put back: ${row}`);
+    check((await events(p.pid)).every((ev: any) => ev.kind !== "answers"), "nothing was sent");
+    await close(p.pid);
+    ok("pr_decision: a late refusal never brings back an option after an update or a newer edit");
   }
 
   // ---- open PRs: overview → open → decision with media → hold → custom outward action → back
@@ -414,7 +608,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await d.click("h1");
     await a.key("h");
     got = await events(d.pid);
-    check(got.length === 1 && got[0].kind === "hold" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "hold", repo: "acme/api", number: 812, head_sha: HEAD_SHA }), `hold event: ${JSON.stringify(got)}`);
+    check(got.length === 1 && got[0].kind === "hold" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "hold", repo: "acme/api", number: 812, head_sha: HEAD_SHA, answers: {}, options: [] }), `hold event: ${JSON.stringify(got)}`);
     check(await d.inApp(`document.querySelector('#merge').disabled && document.querySelector('#skip').disabled`), "the agent has the decision: actions wait");
     await close(d.pid);
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held", "Put aside from the decision panel."), current: undefined } });
@@ -436,7 +630,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await ov.inApp(`document.querySelector('#confirm-outward').focus()`);
     await a.key("Enter");
     got = await events(ov.pid);
-    check(got.length === 1 && got[0].kind === "custom" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "custom", id: "needs-qa", repo: "acme/api", number: 815 }), `custom event: ${JSON.stringify(got)}`);
+    check(got.length === 1 && got[0].kind === "custom" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "custom", id: "needs-qa", repo: "acme/api", number: 815, head_sha: QUICK_SHA }), `custom event: ${JSON.stringify(got)}`);
     check(String(got[0].payload.content.text).includes("Add the needs-qa label"), "the event text says what to do");
     if (await ov.inApp(`!!document.querySelector('#your-actions')`)) await ov.click("#your-actions");
     await ov.click("#act-later");
@@ -452,6 +646,42 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("n");
     got = await events(ov.pid);
     check(got.length === 1 && got[0].kind === "next" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "next", repo: "acme/api", number: 801, order: [820, 815] }), `next event: ${JSON.stringify(got)} ${await ov.inApp(`document.querySelector('.notice')?.textContent + '|' + document.activeElement?.id`)}`);
+    // Quick wins: a reviewed card merges from here, behind the same confirm and exact command.
+    await a.sleep(5600);
+    await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), current: undefined } });
+    await ov.waitIn(`document.querySelector('#pr-815 .badge.quick') && document.querySelector('#quick-only')?.textContent === 'Quick wins (1)'`);
+    await ov.click("#quick-only");
+    await ov.waitIn(`document.querySelectorAll('.card').length === 1 && document.querySelector('#pr-815')`);
+    await ov.click("#pr-815 .title");
+    check(await ov.inApp(`!!document.querySelector('#merge')`), "a selected quick win shows Merge");
+    await a.key("m");
+    await ov.waitIn(`document.querySelector('.drawer pre.command') && document.activeElement?.id === 'confirm-merge'`);
+    const qcmd: string = await ov.inApp(`document.querySelector('.drawer pre.command').textContent`);
+    check(qcmd === `gh pr merge 815 --repo acme/api --squash --delete-branch --match-head-commit ${QUICK_SHA}`, `exact command: ${qcmd}`);
+    check((await ov.inApp(`document.querySelector('.drawer .verdict-line').textContent`)).includes("Safe to merge"), "the verdict shows in the confirm");
+    check((await events(ov.pid)).length === 0, "Merge alone sends nothing");
+    await ov.shots2("pr-overview-quick-confirm");
+    await ov.waitIn(`document.querySelector('.drawer pre.command')`);
+    // Any change to the card cancels the confirm.
+    const quick = (patch: Record<string, unknown>) => ({ ...status(812, "held"), current: undefined,
+      prs: status(812, "held").prs.map((p) => p.number === 815 ? { ...p, ...patch } : p) });
+    await call("panel.update", { panel_id: ov.pid, data: quick({ verdict: "Safe to merge: one word in the docs; checks pass again." }) });
+    await ov.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
+    check((await events(ov.pid)).length === 0, "a cancelled confirm sent nothing");
+    await ov.click("#pr-815 .title");
+    await a.key("m");
+    await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    await a.key("Enter");
+    got = await events(ov.pid);
+    check(got.length === 1 && got[0].kind === "merge" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "merge", repo: "acme/api",
+      number: 815, base: "master", method: "squash", delete_branch: true, head_sha: QUICK_SHA, answers: {}, options: [] }), `quick merge event: ${JSON.stringify(got)}`);
+    check(String(got[0].payload.content.text).endsWith(qcmd), "the event text ends with the command");
+    check(await ov.inApp(`document.querySelector('#merge').disabled`), "Merge waits for the agent");
+    await call("panel.update", { panel_id: ov.pid, data: quick({ status: "merged", status_detail: "Merged as 4c2e1aa." }) });
+    await ov.waitIn(`!document.querySelector('#pr-815') || document.querySelector('#pr-815 .badge.status')?.textContent === 'Merged'`);
+    await ov.click("#quick-only");
+    await ov.waitIn(`document.querySelectorAll('.card').length === 4`);
+    ok("pr_overview: Quick wins filter; M on a quick win shows the exact command and verdict; a card change cancels; Enter sends one merge event of pr_decision's shape");
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), current: undefined } });
     await ov.waitIn(`!document.querySelector('.notice')`);
     // About 400 px of app.

@@ -234,22 +234,60 @@ filter box (`/`) matches every word in any column, and the header stays visible 
 | `base`, `head`, `head_sha` | branches, and the full 40-hex head commit (`headRefOid`) |
 | `merge_method_default?`, `delete_branch_default?` | `squash` (default), `merge` or `rebase`; `false` |
 | `summary` | what changed and why, plain text |
+| `verdict?`, `undo?` | one line each (at most 300 characters, no line breaks): the agent's call in one plain sentence ("Safe to merge: small bug fix, tests pass"), shown first and prominently, and how to back it out ("If this goes wrong: revert the merge commit"), shown under it |
 | `risk` | `{level: low\|medium\|high, reasons?: [string]}` |
 | `checks` | `{state: passing\|failing\|pending\|none, items?: [{name, state: pass\|fail\|pending\|skipping\|cancel, url?}]}`, the checks of `head_sha`. With items, the badge comes from them (any `fail`: failing; else any `pending`: pending; else passing) and a contradicting `state` is a warning |
 | `reviews?` | `{decision?: "APPROVED"…, items?: [{author, state}]}` |
 | `changes` | `[{file, note, diff}]`: only the changes worth a look, each a unified diff (with or without the `diff --git` header; renames, mode changes and binary files show as a line) and the agent's note |
-| `rest_note?`, `questions?` | a line about what is not shown; the agent's open questions |
+| `rest_note?` | a line about what is not shown |
+| `questions?` | up to 20 questions the user answers in place (below); a plain string is the old form, read as a `text` question with id `q1`, `q2`… by its place |
 | `answer?` | `{question, text}`: the agent's answer to an Ask, shown inline |
 | `status?`, `status_detail?` | `open` (default), `merging`, `queued` (in a merge queue or set to auto-merge), `merged`, `failed` or `requested_changes`, shown as a banner and beside the actions; with `open`, a `status_detail` shows as a note (e.g. what the agent did for a custom action) |
 | `media?` | up to 8 pictures and charts, shown after the risk, checks and reviews and before the diffs (below) |
 | `actions?` | the user's own actions ([below](#the-users-own-actions)) |
 
+Questions are `{id, text, why?, kind, options?, recommended?, required?}`: `id` is lowercase
+letters, digits, `-` or `_` (at most 40, unique); `text` at most 500 characters and `why` (one
+line on what depends on the answer) at most 300; `kind` is `yes_no`, `choice` or `text`. A
+`choice` has `options: [{label, value}]`, 2 to 9, labels at most 80 and unique values at most
+100 characters; `yes_no` has its own Yes and No (values `yes`, `no`) and `text` takes no
+options. `recommended` is one of the values (for `text`, a suggested answer of at most 1000
+characters); it starts picked and is marked "Recommended". `required: true` makes Merge wait
+until the question is answered (M then says which one and focuses it). They show in "The agent
+asks", after the risk, checks and reviews and before the pictures and diffs: buttons for the
+options (number keys 1–9 pick in the focused question, arrows step), a short text box for
+`text` (at most 1000 characters), and Tab or Shift+Tab (Enter in a text box) moves between
+questions. A button under the header ("Answer 2 questions", or "Review 3 answers" once all
+have one) and the key G jump to the first unanswered question, so the questions are one step
+away in a narrow panel too; the "n of m answered" count in the bar does the same. Required
+questions are marked "Needed to merge" and carry `aria-required`. Answers stay a local draft,
+kept across updates by id, until an event carries them.
+
+The user's draft is the answers plus the toggle actions they switched on ([below](#the-users-own-actions)).
+A line above the actions says what goes with the next decision. **Merge**, **Request
+changes**, **Hold** and **Skip** carry the whole draft (`answers`, `options`) in their one
+event; **Send answers** (Ctrl+Enter; labelled "Send options" or "Send answers and options" by
+what it carries) sends it alone while the user is not deciding yet, and is off while a Merge
+confirm is open (the draft goes with that merge). Each send is one message. Answers stay
+after a send (the button then reads "Answers sent ✓" until one changes); options are one-shot
+and switch off once sent. If the host refuses a send, the panel puts back only what that send
+took (its options, the "sent" mark, a typed comment, the open confirm), and only if nothing
+happened since: no update from the agent, no other send and no edit; otherwise it says so and
+leaves the user's newer state alone. An option counts only while its action is still the one
+the user switched on (and, if outward, confirmed). An event that would exceed the 16
+KiB limit with the typed answers is not sent ("shorten your typed answers"). The draft is off
+once the PR is `merged`, `queued` or `requested_changes`.
+
 Actions: **Merge** (M) with a method select and a delete-branch box shows the exact command
-`gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>`
+`gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>`,
+then everything that goes with it (each answer and each option with what the agent will do),
 and sends only after Enter or "Confirm merge". The confirm arms only once the key that opened
 it is released (a held or repeated key never confirms), and any update that changes `repo`,
-`number`, `base`, `head_sha`, the checks state or `merge_method_default`, or any invalid
-update, cancels it. Merge is disabled while checks fail unless Shift is held (Shift+M; a hint
+`number`, `base`, `head_sha`, the checks state or `merge_method_default`, any change to the
+questions (a new required one, a changed kind, option or text), to the answers or options or
+to an option's action while it is open, or any invalid update, cancels it. Merge also checks
+right before sending that every required question has an answer. The confirm shows each
+question and answer in full. Merge is disabled while checks fail unless Shift is held (Shift+M; a hint
 says so beside it), and while the agent works (`merging`, `queued`, `merged`, or until the next
 update after a sent decision). **Request changes** (R) and **Ask** (A) open a text box
 (Ctrl+Enter sends); text that would make the event exceed the 16 KiB event limit cannot be
@@ -277,12 +315,20 @@ Events are sent with `ui/message`; the decision is in the event's `kind`, and it
 
 | `kind` | `payload._meta.muster.data` |
 |---|---|
-| `merge` | `{action: "merge", repo, number, base, method, delete_branch, head_sha}` |
-| `request_changes` | `{action: "request_changes", repo, number, head_sha, body}` |
+| `merge` | `{action: "merge", repo, number, base, method, delete_branch, head_sha, answers, options}` |
+| `request_changes` | `{action: "request_changes", repo, number, head_sha, body, answers, options}` |
+| `answers` | `{action: "answers", repo, number, head_sha, answers, options}`: Send answers, nothing decided |
 | `ask` | `{action: "ask", repo, number, question}` |
-| `skip` | `{action: "skip", repo, number, head_sha}` |
-| `hold` | `{action: "hold", repo, number, head_sha}` |
-| `custom` | `{action: "custom", id, repo, number, head_sha}`, one of the user's own actions |
+| `skip` | `{action: "skip", repo, number, head_sha, answers, options}` |
+| `hold` | `{action: "hold", repo, number, head_sha, answers, options}` |
+| `custom` | `{action: "custom", id, repo, number, head_sha}`, one of the user's own `now` actions |
+
+`answers` is `{<question id>: <value>}` for every answered question: `"yes"` or `"no"`, a
+choice's `value`, or the typed text (trimmed); the recommended answer counts until the user
+changes it. `options` lists the ids of the toggle actions switched on, in the panel's order.
+Both are always present (`{}` and `[]` when empty), and `payload.content.text` repeats them for
+people (`Answers: [limit] No; …. Also do, for this PR: needs-qa (…).`; the merge text still
+ends with the exact command).
 
 `--match-head-commit` binds the merge to the head only; the agent must also check that the
 PR's base and repo still match the event before running the command (the PR reviewer flow
@@ -293,11 +339,28 @@ does).
  "url": "https://github.com/acme/api/pull/812", "base": "master", "head": "dana/login-limit",
  "head_sha": "3f9c2b7e41d0a8c6e5f4b3a2918d7c6b5a493827", "merge_method_default": "squash",
  "delete_branch_default": true, "summary": "Adds a per-IP limit to POST /login.",
+ "verdict": "Worth a careful look: it changes how login works, but the tests pass.",
+ "undo": "If this goes wrong: revert the merge commit; no data needs fixing.",
  "risk": {"level": "medium", "reasons": ["Changes the login path"]},
  "checks": {"state": "passing", "items": [{"name": "test", "state": "pass"}]},
  "changes": [{"file": "src/auth/login.rs", "note": "Checked before the password hash.",
    "diff": "@@ -41,3 +41,6 @@\n     let ip = client_ip(&req);\n+    if let Some(wait) = app.limiter.blocked(ip).await? {\n+        return too_many(wait);\n+    }"}],
- "rest_note": "64 more lines of tests.", "questions": ["Is 5 per 10 minutes right?"]}
+ "rest_note": "64 more lines of tests.",
+ "questions": [{"id": "limit", "text": "Keep the limit at 5 failed logins per 10 minutes?",
+   "why": "Support asked for 10 per hour last year; 5 is stricter.", "kind": "yes_no", "recommended": "yes"},
+  {"id": "proxy", "text": "Which addresses should count as one visitor?", "kind": "choice",
+   "options": [{"label": "Trust only our own proxies", "value": "ours"}, {"label": "Ignore proxies", "value": "none"}],
+   "recommended": "ours"},
+  {"id": "note", "text": "Anything to tell the author?", "kind": "text"}]}
+```
+
+The merge event that panel sends after the user picked No, kept the second recommendation,
+typed a note and switched on Needs QA:
+
+```json
+{"action": "merge", "repo": "acme/api", "number": 812, "base": "master", "method": "squash", "delete_branch": true,
+ "head_sha": "3f9c2b7e41d0a8c6e5f4b3a2918d7c6b5a493827",
+ "answers": {"limit": "no", "proxy": "ours", "note": "Thanks, nice work"}, "options": ["needs-qa"]}
 ```
 
 With pictures and a chart (the paths are files in the task worktree):
@@ -314,29 +377,41 @@ With pictures and a chart (the paths are files in the task worktree):
 |---|---|
 | `repo` | `owner/name` |
 | `title?` | heading (default "Open pull requests") |
-| `prs` | up to 200 `{number, title, author, url?, created_at?, draft?, additions?, deletions?, files?, checks?, review?, labels?, risk?, summary?, status?, status_detail?, head_sha?}`; numbers unique |
+| `prs` | up to 200 `{number, title, author, url?, created_at?, draft?, additions?, deletions?, files?, checks?, review?, labels?, risk?, summary?, status?, status_detail?, head_sha?, base?, quick_win?, verdict?, merge_method_default?, delete_branch_default?}`; numbers unique. `muster pr list` prints its PRs in this shape |
 | `prs[].checks?` | `passing`, `failing`, `pending` or `none` |
 | `prs[].review?` | gh's `reviewDecision`: `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NONE` or `""` |
 | `prs[].risk?`, `prs[].summary?` | the agent's triage: `low`, `medium` or `high`, and one line (at most 500 characters) |
-| `prs[].status?` | the agent keeps it up to date: `new` (default), `reviewing`, `merged`, `queued`, `held`, `skipped`, `changes_requested` or `failed`; `status_detail` is a short note under the card |
+| `prs[].status?` | the agent keeps it up to date: `new` (default), `ready` (the agent has prepared its review; shown as "Review ready", whatever its verdict), `reviewing`, `merging`, `merged`, `queued`, `held`, `skipped`, `changes_requested` or `failed`; `status_detail` is a short note under the card |
+| `prs[].quick_win?`, `prs[].verdict?` | `quick_win: true` only after the agent's full one-snapshot review found it small, green and low risk; such a card needs `head_sha` and `base` (from that snapshot), a `verdict` (one line, at most 300 characters), checks `passing` and not `draft`, and can be merged from the overview. `verdict` shows on any card |
+| `prs[].base?`, `prs[].merge_method_default?`, `prs[].delete_branch_default?` | the branch it merges into, and the quick-win Merge's method (`squash` by default) and delete-branch flag (`false`) |
 | `current?` | the PR the agent is on (marked "Now"); the selection follows it, unless the user is on a card, whose selection then stays |
-| `sort?` | the starting order: `risk` (riskiest first, default), `quick` (quick wins first: not a draft, checks passing, low risk, small) or `oldest` |
+| `sort?` | the starting order: `risk` (riskiest first, default), `quick` (quick wins first: cards marked `quick_win`, then not a draft, checks passing, low risk, small) or `oldest` |
 | `actions?` | the user's own actions ([below](#the-users-own-actions)) |
 
 Cards show number, title, author, age, size (+/− lines, files), a draft flag, the checks,
 review and risk badges, labels, the summary and the status. A select changes the sort and a
 filter box (`/`, Esc clears) matches every word in the number, title, author, labels, summary,
-status or badges ("failing", "approved", "review required"). PRs still to review come first,
+status, verdict or badges ("failing", "approved", "review required", "quick win"); a "Quick
+wins (n)" button, shown when there are any, keeps only the quick wins. PRs still to review come first,
 then decided ones (merged, queued, changes requested), then held ones; held and decided cards
 use a quieter surface with full-contrast text. Keys: J/K or ↓/↑ move, Enter or O opens the
-focused PR, H holds it, N goes through them in order, `?` lists the keys; a double-click
-opens. Keys always act on the card that has focus. Readable from about 400 px wide.
+focused PR, M merges it if it is a quick win, H holds it, N goes through them in order, `?`
+lists the keys; a double-click opens. Keys always act on the card that has focus. Readable
+from about 400 px wide.
+
+**Merge** on a quick win (M, or the "Merge #n" button for the selected card) works like
+pr_decision's: it shows the exact command for the card's repo, number, `merge_method_default`,
+`delete_branch_default` and `head_sha` with its verdict, and sends only after Enter or "Confirm
+merge", armed once the opening key is released. Any change to that card (or the repo) cancels
+the confirm. It is off unless the card is a quick win with checks passing, not a draft, and
+`new`, `ready`, `skipped`, `held` or `failed`, and until the agent's next update after a send.
 
 | `kind` | `payload._meta.muster.data` |
 |---|---|
 | `open` | `{action: "open", repo, number}` |
 | `hold` | `{action: "hold", repo, number}` |
-| `next` | `{action: "next", repo, number, order}`: review `number` now, then `order`, the PRs after it that are still new or skipped, in the order the user sees (starting after `current`; it never repeats `number`) |
+| `next` | `{action: "next", repo, number, order}`: review `number` now, then `order`, the PRs after it that are still new, ready or skipped, in the order the user sees (starting after `current`; it never repeats `number`) |
+| `merge` | `{action: "merge", repo, number, base, method, delete_branch, head_sha, answers: {}, options: []}`, pr_decision's shape, for a quick-win card (the text ends with the exact command) |
 | `custom` | `{action: "custom", id, repo, number, head_sha?}` for the selected PR (`head_sha` when its card has one) |
 
 ```json
@@ -351,38 +426,54 @@ opens. Keys always act on the card that has focus. Readable from about 400 px wi
 
 ##### The user's own actions
 
-Both PR apps take `actions: [{id, label, key?, description, outward}]`, at most 8: buttons
-for options the user asked the agent for ("a Needs QA button"). `id` is lowercase letters,
+Both PR apps take `actions: [{id, label, key?, description, outward, mode?}]`, at most 8:
+buttons for options the user asked the agent for ("a Needs QA button"). `id` is lowercase letters,
 digits, `-` or `_` (at most 40), unique and not a built-in event name; `label` at most 40
 characters and not a built-in button's name (Merge, Request changes, Ask, Open, Open on
-GitHub, Skip, Hold, Next, Confirm, Cancel; compared trimmed and case-insensitive);
+GitHub, Skip, Hold, Next, Confirm, Cancel, Send answers; compared trimmed and case-insensitive);
 `description` (at most 300) says exactly what the agent will do and is shown as the button's
 tooltip and in its confirm; `key` is one letter or digit, unique, and not one the apps use (M R
-A O S H J K N; Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain key
+A O S H J K N G; Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain key
 never clashes). `outward` is required: `true` for an action that changes GitHub or anything
 off this machine (comments, labels, closing, pushing), `false` only for one that stays on it
 (should an app ever get one without it, it treats it as `true`). An outward button (marked ↗)
 first shows the description and needs Enter or "Confirm", armed only after the opening key is
 released; any change to the action or the PR (its head, base or status) cancels it. The
 actions show as their own group, "Your actions", apart from the built-in buttons; in a small
-panel the group folds behind one button, and their keys work either way. Each sends one
-`custom` event; an action is off until the agent's next update. A custom action never merges:
-the agent merges only on a pr_decision `merge` event.
+panel the group folds behind one button, and their keys work either way.
+
+`mode` is `toggle` (default) or `now`. In pr_decision a toggle is an option: its button (or
+key) switches it on or off (✓ when on), an outward one asks to confirm before it is switched
+on (saying it goes with the next send), and the ids of those switched on ride along as
+`options` with the next Merge, Request changes, Hold, Skip or Send answers, then switch off.
+A toggle switched on is switched off again if the agent changes that action. A `now` action
+sends one `custom` event at once and is off until the agent's next update. In pr_overview
+every action sends a `custom` event at once for the selected PR, whatever its mode. A custom
+action never merges: the agent merges only on a `merge` event.
 
 ```json
 {"actions": [{"id": "needs-qa", "label": "Needs QA", "key": "q", "description": "Add the needs-qa label to this PR on GitHub.", "outward": true},
-  {"id": "later", "label": "Label later", "key": "l", "description": "Note this PR in your list to label later; nothing changes on GitHub.", "outward": false}]}
+  {"id": "later", "label": "Label later", "key": "l", "description": "Note this PR in your list to label later; nothing changes on GitHub.", "outward": false},
+  {"id": "ping", "label": "Ping the author", "description": "Post a comment asking the author for an update.", "outward": true, "mode": "now"}]}
 ```
 
 The **PR reviewer** agent template (New agent) and the `muster-pr-review` skill (`muster skills
 install`, docs/CLI.md) share the agent side: review one immutable
-snapshot (head and base SHAs; diff and checks of that head), open this panel, wait for its
-events, re-check head and base before merging, merge only on its Merge event, and report
-`merged`, `queued` or `failed` from what GitHub says afterwards. For "help me review the open
-PRs" they list the open PRs with `gh pr list`, triage each briefly, open a `pr_overview`, and
-run that flow for each PR the user opens (or for each in turn on Next), updating its card
-after each decision. They download pictures only from GitHub's own image hosts, extracted by
-`grep` so no PR text is ever part of a command, into a fresh `mktemp -d` directory.
+snapshot (`muster pr snapshot`, or the gh recipe on an older Muster: head and base SHAs; diff
+and checks of that head), write everything in plain English with a verdict, an undo line and
+questions the user can answer in place, open this panel, wait for its events, re-check head
+and base before merging, merge only on a Merge event (from this panel, or from a quick-win
+card), and report `merged`, `queued` or `failed` from what GitHub says afterwards. They act
+on the `options` an event carries and take its `answers` in, never letting either change a
+merge. For "help me review the open PRs" they list the open PRs with `muster pr list` (or `gh
+pr list`), triage each briefly, open a `pr_overview`, and run that flow for each PR the user
+opens (or for each in turn on Next), updating its card after each decision. While the user
+reads, they prepare the next PRs (cards marked `ready`, small green ones as quick wins), and
+for 6 or more PRs they may start helper sessions (a faster model) that only write draft
+judgements to files; the agent treats those as untrusted, takes every fact from a snapshot
+it runs itself, and never marks a quick win from a helper's work. They download pictures only from
+GitHub's own image hosts (`muster pr snapshot` does this itself), with no PR text ever part of
+a command, into a fresh private directory.
 
 ### Agents
 

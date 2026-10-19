@@ -3,11 +3,12 @@
 import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { Gate } from "../shared/confirm.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
+import { branchOk, type Method, METHODS, type MergeEvent, mergeCommand, mergeEventFor, REPO, SHA } from "../shared/merge.ts";
+import { type Draft, draftSig, draftText, EMPTY_DRAFT, type Question, toggleSig, validateQuestions } from "../shared/questions.ts";
 import { type ImageInput, validateImage } from "../image/logic.ts";
 import { type ChartSpec, validateChart } from "../chart/logic.ts";
 
-export const METHODS = ["squash", "merge", "rebase"] as const;
-export type Method = typeof METHODS[number];
+export { type Method, METHODS, type MergeEvent, mergeCommand };
 export const RISKS = ["low", "medium", "high"] as const;
 export const CHECKS = ["passing", "failing", "pending", "none"] as const;
 /** `gh pr checks --json bucket` values. */
@@ -34,12 +35,16 @@ export interface Pr {
   merge_method_default: Method;
   delete_branch_default: boolean;
   summary: string;
+  /** One plain sentence: the agent's call, shown first. */
+  verdict?: string;
+  /** One line: how to undo it if it goes wrong. */
+  undo?: string;
   risk: { level: typeof RISKS[number]; reasons: string[] };
   checks: { state: typeof CHECKS[number]; items: { name: string; state: typeof CHECK_ITEMS[number]; url?: string }[] };
   reviews?: { decision?: string; items: { author: string; state: string }[] };
   changes: Change[];
   rest_note?: string;
-  questions: string[];
+  questions: Question[];
   answer?: { question: string; text: string };
   status: Status;
   status_detail?: string;
@@ -47,17 +52,22 @@ export interface Pr {
   actions: CustomAction[];
 }
 
-const SHA = /^[0-9a-f]{40}$/;
-const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
-/** Git ref rules that matter here: no spaces, control characters or ~^:?*[\\. */
-const branchOk = (b: string) => b.length > 0 && b.length <= 255 && ![...b].some((c) => c.charCodeAt(0) < 33 || c.charCodeAt(0) === 127 || "~^:?*[\\".includes(c));
+/** `verdict` and `undo`: one line each, at most this many characters (as in src/panel_apps.rs). */
+export const MAX_LINE = 300;
+
+/** An optional one-line string (no line breaks) of at most `max` characters. */
+export function oneLine(p: Problems, o: Record<string, unknown>, key: string, path: string, max: number): string | undefined {
+  const v = p.string(o, key, path, { max });
+  if (v !== undefined && /[\r\n]/.test(v)) { p.add(path ? `${path}.${key}` : key, "must be one line"); return undefined; }
+  return v?.trim() ? v : undefined;
+}
 
 export function validatePr(data: unknown): Result<Pr> {
   const p = new Problems();
   const o = p.object(data, "data");
   if (!o) return p.result(null as never);
   p.known(o, "", ["repo", "number", "title", "author", "url", "base", "head", "head_sha", "merge_method_default",
-    "delete_branch_default", "summary", "risk", "checks", "reviews", "changes", "rest_note", "questions", "answer", "status", "status_detail",
+    "delete_branch_default", "summary", "verdict", "undo", "risk", "checks", "reviews", "changes", "rest_note", "questions", "answer", "status", "status_detail",
     "media", "actions"]);
   const repo = p.string(o, "repo", "", { required: true, max: 201 });
   if (repo !== undefined && !REPO.test(repo)) p.add("repo", "must look like owner/name");
@@ -76,6 +86,8 @@ export function validatePr(data: unknown): Result<Pr> {
   const merge_method_default = p.oneOf(o, "merge_method_default", "", METHODS) ?? "squash";
   const delete_branch_default = p.boolean(o, "delete_branch_default", "") ?? false;
   const summary = p.string(o, "summary", "", { required: true, max: 20_000 });
+  const verdict = oneLine(p, o, "verdict", "", MAX_LINE);
+  const undo = oneLine(p, o, "undo", "", MAX_LINE);
 
   let risk: Pr["risk"] | undefined;
   if (o.risk === undefined) p.add("risk", "is required ({level, reasons})");
@@ -146,7 +158,7 @@ export function validatePr(data: unknown): Result<Pr> {
     if (file !== undefined && note !== undefined && diff !== undefined) changes.push({ file, note, diff });
   });
   const rest_note = p.string(o, "rest_note", "", { max: 2000 });
-  const questions = strings(p, o, "questions", "", 20, 2000);
+  const questions = validateQuestions(p, o);
   let answer: Pr["answer"];
   if (o.answer !== undefined && o.answer !== null) {
     const ao = p.object(o.answer, "answer");
@@ -163,7 +175,7 @@ export function validatePr(data: unknown): Result<Pr> {
   const actions = validateActions(p, o);
   return p.result({
     repo: repo!, number: number!, title: title!, author: author!, url: url!, base: base!, head: head!, head_sha: head_sha!,
-    merge_method_default, delete_branch_default, summary: summary!, risk: risk!, checks: checks!, reviews, changes,
+    merge_method_default, delete_branch_default, summary: summary!, verdict, undo, risk: risk!, checks: checks!, reviews, changes,
     rest_note, questions, answer, status, status_detail, media, actions,
   });
 }
@@ -228,34 +240,18 @@ export function deriveChecks(items: { state: typeof CHECK_ITEMS[number] }[]): ty
   return "passing";
 }
 
-/** The exact command the agent runs on Merge (docs/AGENT_PANELS.md). `--repo` pins the target
- * even when the agent's environment sets GH_REPO; `--match-head-commit` pins the commit. */
-export function mergeCommand(repo: string, number: number, method: Method, deleteBranch: boolean, headSha: string): string {
-  if (!REPO.test(repo)) throw new Error("invalid repo");
-  if (!Number.isSafeInteger(number) || number < 1) throw new Error("invalid PR number");
-  if (!METHODS.includes(method)) throw new Error("invalid merge method");
-  if (!SHA.test(headSha)) throw new Error("invalid head SHA");
-  return `gh pr merge ${number} --repo ${repo} --${method}${deleteBranch ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
+/** The draft as event text: the answers and the options that ride along. */
+const extra = (pr: Pr, d: Draft) => draftText(pr.questions, pr.actions, d);
+
+export function mergeEvent(pr: Pr, method: Method, deleteBranch: boolean, draft: Draft = EMPTY_DRAFT): { kind: "merge"; text: string; data: MergeEvent } {
+  return mergeEventFor(pr, method, deleteBranch, draft, extra(pr, draft));
 }
 
-export interface MergeEvent {
-  action: "merge"; repo: string; number: number; base: string; method: Method; delete_branch: boolean; head_sha: string;
-}
-
-export function mergeEvent(pr: Pr, method: Method, deleteBranch: boolean): { kind: "merge"; text: string; data: MergeEvent } {
-  const command = mergeCommand(pr.repo, pr.number, method, deleteBranch, pr.head_sha);
-  return {
-    kind: "merge",
-    text: `Merge PR #${pr.number} (${pr.repo}) into ${pr.base}. Run exactly: ${command}`,
-    data: { action: "merge", repo: pr.repo, number: pr.number, base: pr.base, method, delete_branch: deleteBranch, head_sha: pr.head_sha },
-  };
-}
-
-export function requestChangesEvent(pr: Pr, body: string) {
+export function requestChangesEvent(pr: Pr, body: string, draft: Draft = EMPTY_DRAFT) {
   return {
     kind: "request_changes" as const,
-    text: `Request changes on PR #${pr.number} (${pr.repo}) with this review comment:\n${body}`,
-    data: { action: "request_changes" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha, body },
+    text: `Request changes on PR #${pr.number} (${pr.repo}).${extra(pr, draft)} The review comment:\n${body}`,
+    data: { action: "request_changes" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha, body, answers: { ...draft.answers }, options: [...draft.options] },
   };
 }
 
@@ -268,20 +264,29 @@ export function askEvent(pr: Pr, question: string) {
 }
 
 /** Skip: back to the list (or the next PR) without changing this one. */
-export function skipEvent(pr: Pr) {
+export function skipEvent(pr: Pr, draft: Draft = EMPTY_DRAFT) {
   return {
     kind: "skip" as const,
-    text: `Skip PR #${pr.number} (${pr.repo}) for now: move on without changing it.`,
-    data: { action: "skip" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha },
+    text: `Skip PR #${pr.number} (${pr.repo}) for now: move on without changing it.${extra(pr, draft)}`,
+    data: { action: "skip" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha, answers: { ...draft.answers }, options: [...draft.options] },
   };
 }
 
 /** Hold: put this PR aside to come back to later. */
-export function holdEvent(pr: Pr) {
+export function holdEvent(pr: Pr, draft: Draft = EMPTY_DRAFT) {
   return {
     kind: "hold" as const,
-    text: `Hold PR #${pr.number} (${pr.repo}): put it aside to come back to later.`,
-    data: { action: "hold" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha },
+    text: `Hold PR #${pr.number} (${pr.repo}): put it aside to come back to later.${extra(pr, draft)}`,
+    data: { action: "hold" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha, answers: { ...draft.answers }, options: [...draft.options] },
+  };
+}
+
+/** Send answers: the draft now, while the user is not deciding yet. */
+export function answersEvent(pr: Pr, draft: Draft) {
+  return {
+    kind: "answers" as const,
+    text: `The user's answers on PR #${pr.number} (${pr.repo}); nothing is decided yet.${extra(pr, draft)}`,
+    data: { action: "answers" as const, repo: pr.repo, number: pr.number, head_sha: pr.head_sha, answers: { ...draft.answers }, options: [...draft.options] },
   };
 }
 
@@ -316,9 +321,13 @@ export function formsClosed(pr: Pr): string | null {
   return null;
 }
 
-/** What a confirmation is bound to: any change to these cancels it. */
-export function confirmTarget(pr: Pr): string {
-  return JSON.stringify([pr.repo, pr.number, pr.base, pr.head_sha, pr.checks.state, pr.merge_method_default]);
+/** What a confirmation is bound to: any change to these, to the questions, or to the draft
+ * that rides along, cancels it. */
+export function confirmTarget(pr: Pr, draft: Draft = EMPTY_DRAFT): string {
+  // The questions as defined (ids, kinds, options, required flags, texts) and each option's
+  // action as described: a new required question, or a changed option, cancels the confirm.
+  const options = draft.options.map((id) => { const a = pr.actions.find((x) => x.id === id); return a ? toggleSig(a) : id; });
+  return JSON.stringify([pr.repo, pr.number, pr.base, pr.head_sha, pr.checks.state, pr.merge_method_default, pr.questions, draftSig(draft), options]);
 }
 
 /**
@@ -326,9 +335,9 @@ export function confirmTarget(pr: Pr): string {
  * it (shared/confirm.ts has the arming rule).
  */
 export class ConfirmGate extends Gate {
-  open(pr: Pr) { this.openTarget(confirmTarget(pr)); }
+  open(pr: Pr, draft: Draft = EMPTY_DRAFT) { this.openTarget(confirmTarget(pr, draft)); }
 
-  canConfirm(pr: Pr | null): boolean { return this.canConfirmTarget(pr ? confirmTarget(pr) : null); }
+  canConfirm(pr: Pr | null, draft: Draft = EMPTY_DRAFT): boolean { return this.canConfirmTarget(pr ? confirmTarget(pr, draft) : null); }
 
-  input(pr: Pr | null): boolean { return this.inputTarget(pr ? confirmTarget(pr) : null); }
+  input(pr: Pr | null, draft: Draft = EMPTY_DRAFT): boolean { return this.inputTarget(pr ? confirmTarget(pr, draft) : null); }
 }

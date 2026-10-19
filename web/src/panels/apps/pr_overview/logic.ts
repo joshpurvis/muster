@@ -3,12 +3,14 @@
 // docs/MCP.md "Built-in apps" is the contract; src/panel_apps.rs checks the same shape.
 import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
+import { branchOk, type Method, METHODS, mergeEventFor, REPO, SHA } from "../shared/merge.ts";
+import { EMPTY_DRAFT } from "../shared/questions.ts";
 
 export const RISKS = ["low", "medium", "high"] as const;
 export const CHECKS = ["passing", "failing", "pending", "none"] as const;
 /** gh's `reviewDecision` values; "" (no decision) reads as NONE. */
 export const REVIEWS = ["APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED", "NONE"] as const;
-export const STATUSES = ["new", "reviewing", "merged", "queued", "held", "skipped", "changes_requested", "failed"] as const;
+export const STATUSES = ["new", "ready", "reviewing", "merging", "merged", "queued", "held", "skipped", "changes_requested", "failed"] as const;
 export type Status = typeof STATUSES[number];
 export const SORTS = ["risk", "quick", "oldest"] as const;
 export type Sort = typeof SORTS[number];
@@ -35,6 +37,14 @@ export interface Item {
   status: Status;
   status_detail?: string;
   head_sha?: string;
+  base?: string;
+  /** The agent ran the full one-snapshot review and found it small, green and low-risk: the
+   * card can be merged from here. Such a card has head_sha, base and verdict. */
+  quick_win: boolean;
+  /** One plain sentence: the agent's call. */
+  verdict?: string;
+  merge_method_default: Method;
+  delete_branch_default: boolean;
 }
 
 export interface Overview {
@@ -46,10 +56,10 @@ export interface Overview {
   actions: CustomAction[];
 }
 
-const SHA = /^[0-9a-f]{40}$/;
 /** What gh prints, and what Muster's backend accepts (`date_ok`). */
 const DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
-const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+/** A card's `verdict`: one line, as in pr_decision and src/panel_apps.rs. */
+export const MAX_VERDICT = 300;
 
 function count(p: Problems, o: Record<string, unknown>, key: string, at: string): number | undefined {
   const v = p.number(o, key, at);
@@ -72,7 +82,8 @@ export function validateOverview(data: unknown): Result<Overview> {
     const io = p.object(it, at);
     if (!io) return;
     p.known(io, at, ["number", "title", "author", "url", "created_at", "draft", "additions", "deletions", "files", "checks",
-      "review", "labels", "risk", "summary", "status", "status_detail", "head_sha"]);
+      "review", "labels", "risk", "summary", "status", "status_detail", "head_sha", "base", "quick_win", "verdict", "merge_method_default",
+      "delete_branch_default"]);
     const number = p.number(io, "number", at, true);
     if (number !== undefined && (!Number.isSafeInteger(number) || number < 1)) { p.add(`${at}.number`, "must be a positive whole number"); return; }
     if (number !== undefined && seen.has(number)) { p.add(`${at}.number`, `#${number} is listed twice`); return; }
@@ -104,10 +115,26 @@ export function validateOverview(data: unknown): Result<Overview> {
     const status_detail = p.string(io, "status_detail", at, { max: 500 });
     const head_sha = p.string(io, "head_sha", at, { max: 40 });
     if (head_sha !== undefined && !SHA.test(head_sha)) p.add(`${at}.head_sha`, "must be the full lowercase commit SHA (40 hex characters)");
+    const base = p.string(io, "base", at, { max: 255 });
+    if (base !== undefined && !branchOk(base)) p.add(`${at}.base`, "is not a valid branch name");
+    const quick_win = p.boolean(io, "quick_win", at) ?? false;
+    let verdict = p.string(io, "verdict", at, { max: MAX_VERDICT });
+    if (verdict !== undefined && /[\r\n]/.test(verdict)) { p.add(`${at}.verdict`, "must be one line"); verdict = undefined; }
+    const merge_method_default = p.oneOf(io, "merge_method_default", at, METHODS) ?? "squash";
+    const delete_branch_default = p.boolean(io, "delete_branch_default", at) ?? false;
+    if (quick_win) {
+      // Merge from the overview needs what the merge command and its checks are built from.
+      if (io.head_sha === undefined || io.head_sha === null) p.add(`${at}.head_sha`, "is required for a quick win (the head the review saw)");
+      if (io.base === undefined || io.base === null) p.add(`${at}.base`, "is required for a quick win (the branch it merges into)");
+      if (!verdict?.trim()) p.add(`${at}.verdict`, "is required for a quick win (one plain sentence)");
+      if (checks !== "passing") p.add(`${at}.quick_win`, "needs checks passing");
+      if (draft) p.add(`${at}.quick_win`, "cannot be a draft");
+    }
     if (number !== undefined && t !== undefined && author !== undefined) {
       prs.push({
         number, title: t, author, url, created_at, created: Number.isFinite(created) ? created : undefined, draft, additions, deletions, files,
-        checks, review, labels, risk, summary: summary?.trim() ? summary : undefined, status, status_detail, head_sha,
+        checks, review, labels, risk, summary: summary?.trim() ? summary : undefined, status, status_detail, head_sha, base, quick_win,
+        verdict: verdict?.trim() ? verdict : undefined, merge_method_default, delete_branch_default,
       });
     }
   });
@@ -137,8 +164,9 @@ function compare(sort: Sort): (a: Item, b: Item) => number {
     return by((x) => x.risk ? RISK_RANK[x.risk] : 3, (x) => x.checks ? CHECK_RANK[x.checks] : 2, (x) => -size(x));
   }
   if (sort === "quick") {
-    // Ready to go first: not a draft, checks not failing, low risk, small.
-    return by((x) => x.draft ? 1 : 0, (x) => x.checks === "failing" ? 2 : x.checks === "pending" ? 1 : 0,
+    // Quick wins (reviewed: small, green, low risk) first; then ready to go: not a draft, checks
+    // not failing, low risk, small.
+    return by((x) => x.quick_win ? 0 : 1, (x) => x.draft ? 1 : 0, (x) => x.checks === "failing" ? 2 : x.checks === "pending" ? 1 : 0,
       (x) => x.risk ? 2 - RISK_RANK[x.risk] : 1, (x) => known(x) ? size(x) : Number.MAX_SAFE_INTEGER);
   }
   return by((x) => x.created ?? Number.MAX_SAFE_INTEGER);
@@ -153,7 +181,7 @@ export const GROUP_LABELS: Record<Group, string> = { todo: "To review", done: "D
 
 export function groupOf(pr: Item): Group {
   if (pr.status === "held") return "held";
-  if (pr.status === "merged" || pr.status === "queued" || pr.status === "changes_requested") return "done";
+  if (pr.status === "merged" || pr.status === "merging" || pr.status === "queued" || pr.status === "changes_requested") return "done";
   return "todo";
 }
 
@@ -167,19 +195,19 @@ export function matches(pr: Item, filter: string): boolean {
   if (!words.length) return true;
   const hay = [`#${pr.number}`, pr.title, pr.author, ...pr.labels, pr.summary ?? "", pr.status.replace(/_/g, " "),
     pr.draft ? "draft" : "", pr.risk ? `${pr.risk} risk` : "", pr.checks ? CHECK_WORDS[pr.checks] : "",
-    pr.review ? REVIEW_WORDS[pr.review] : ""].join("\n").toLowerCase();
+    pr.review ? REVIEW_WORDS[pr.review] : "", pr.quick_win ? "quick win" : "", pr.verdict ?? ""].join("\n").toLowerCase();
   return words.every((w) => hay.includes(w));
 }
 
-/** The shown cards: filtered, sorted, held ones grouped at the end. */
-export function arrange(prs: Item[], sort: Sort, filter: string): { group: Group; items: Item[] }[] {
-  const shown = sortPrs(prs.filter((pr) => matches(pr, filter)), sort);
+/** The shown cards: filtered (only quick wins, if asked), sorted, held ones grouped at the end. */
+export function arrange(prs: Item[], sort: Sort, filter: string, quickOnly = false): { group: Group; items: Item[] }[] {
+  const shown = sortPrs(prs.filter((pr) => matches(pr, filter) && (!quickOnly || pr.quick_win)), sort);
   return (["todo", "done", "held"] as const).map((group) => ({ group, items: shown.filter((pr) => groupOf(pr) === group) }))
     .filter((g) => g.items.length);
 }
 
 /**
- * What "Next" goes through: the PRs still to review (new or skipped) in the shown order,
+ * What "Next" goes through: the PRs still to review (new, ready or skipped) in the shown order,
  * starting after `current` and wrapping, so a skipped PR (status unchanged) is not offered
  * again straight away. Held and decided PRs are left out.
  */
@@ -188,7 +216,7 @@ export function queue(ordered: Item[], current?: number): Item[] {
   const out: Item[] = [];
   for (let i = 1; i <= ordered.length; i++) {
     const pr = ordered[(at + i + ordered.length) % ordered.length];
-    if ((pr.status === "new" || pr.status === "skipped") && pr.number !== current) out.push(pr);
+    if ((pr.status === "new" || pr.status === "ready" || pr.status === "skipped") && pr.number !== current) out.push(pr);
   }
   return out;
 }
@@ -255,3 +283,32 @@ export function followCurrent(selected: number | null, before: number | undefine
 
 /** Whether Hold makes sense for this PR now. */
 export const canHold = (pr: Item) => groupOf(pr) === "todo";
+
+// ----- quick wins: merge from the overview -----
+
+/** Statuses from which a quick-win card can be merged here. */
+const MERGEABLE: readonly Status[] = ["new", "ready", "skipped", "held", "failed"];
+
+/** Why this card cannot be merged from the overview now, or null. */
+export function quickMergeBlocked(pr: Item, sent: boolean): string | null {
+  if (!pr.quick_win) return "Not a quick win: open it to review it.";
+  if (sent) return "Waiting for the agent.";
+  if (!MERGEABLE.includes(pr.status)) return `#${pr.number} is ${pr.status.replace(/_/g, " ")}.`;
+  if (pr.checks !== "passing" || pr.draft || !pr.head_sha || !pr.base) return "Not ready to merge: open it to review it.";
+  return null;
+}
+
+export const quickWins = (prs: Item[]) => prs.filter((p) => p.quick_win && !quickMergeBlocked(p, false));
+
+/** The merge event for a quick-win card: the same shape as pr_decision's, with the card's
+ * repo, base and head commit, and nothing riding along. */
+export function quickMergeEvent(repo: string, pr: Item) {
+  if (!pr.head_sha || !pr.base) throw new Error("a quick win needs head_sha and base");
+  return mergeEventFor({ repo, number: pr.number, base: pr.base, head_sha: pr.head_sha }, pr.merge_method_default, pr.delete_branch_default, EMPTY_DRAFT,
+    " (a quick win, from the overview)");
+}
+
+/** What a quick-win Merge confirm is bound to: any change to the card (or the repo) cancels it. */
+export function quickTarget(repo: string, pr: Item): string {
+  return JSON.stringify([repo, pr]);
+}

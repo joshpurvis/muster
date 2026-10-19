@@ -9,7 +9,10 @@ two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Built on
 `pr_decision` app and the PR reviewer template (schemas in [MCP.md](MCP.md#built-in-apps)).
 Built on `feature/pr-overview`: the `pr_overview` app (all open PRs of a repo), pictures and
 charts in `pr_decision` (`media`), Skip and Hold, and the user's own actions in both
-(["Open PRs, end to end"](#open-prs-end-to-end)).
+(["Open PRs, end to end"](#open-prs-end-to-end)). Built on `feature/pr-flow-ux`: questions
+answered in place, one event carrying the answers and options, a verdict and undo line,
+quick-win merging from the overview, and a skill that prepares PRs ahead
+(["Fewer round trips"](#fewer-round-trips)).
 The `diff` app, fetch approval, placement options and preview servers remain later phases. Nested frames are
 blocked even for declared loopback dev servers: a child document's independent CSP would
 otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
@@ -134,7 +137,7 @@ The goal is a decision in under a minute, not a line-by-line review.
    - checks: passing, failing or pending, and review state;
    - only the changes worth looking at, as small diffs with the agent's note on each, and a
      count of the rest ("31 more lines of tests and renames");
-   - the agent's open questions, if any.
+   - the agent's open questions, if any, answered in place (see "Fewer round trips" below).
 3. Actions, each one key: **Merge** (with the repo's merge method, e.g. squash, and whether to
    delete the branch), **Request changes** (with a comment), **Ask** (a question; the answer
    appears in the panel), **Open on GitHub** (system browser).
@@ -185,8 +188,47 @@ merge, hold (put it aside to come back to later), or options they asked for at t
    label may not copy a built-in button's name. The agent does exactly that and reports it on
    the card.
 
-The merge rules above are unchanged: only a pr_decision Merge event merges, with the head
-commit that panel showed; overview events, Skip, Hold and custom actions never merge.
+The merge rules above are unchanged: only a Merge event merges, with the head commit the
+panel showed; Skip, Hold, custom actions and the overview's other events never merge. Since
+`feature/pr-flow-ux` a quick-win card in the overview can send that Merge event too (below).
+
+## Fewer round trips
+
+The user's feedback (2026-10-19): answering the agent's questions took too much friction (they
+sat at the bottom, and the user had to open Ask and type them out), custom buttons went to the
+agent one by one, each PR took minutes to build, and the questions were often so full of
+jargon that the user had to ask what they meant. Decided:
+
+1. **Questions answered in place.** `questions` are `{id, text, why?, kind: yes_no | choice |
+   text, options?, recommended?, required?}` (a plain string still works, as a `text`
+   question). Each shows as a small form after the risk, checks and reviews: buttons for the
+   options with the recommended one picked and marked, number keys to pick, Tab to the next
+   question, a short text box only for `text`. Answers are a local draft.
+2. **One event carries everything.** Merge, Request changes, Hold and Skip send the draft's
+   `answers` and `options` with them; Send answers (Ctrl+Enter) sends the draft alone. The
+   user's own actions gain `mode`: `toggle` (default) options switch on and ride along with
+   the next send, `now` actions send at once as before (outward ones still confirm first;
+   an outward toggle confirms before it is switched on). Merge's confirm lists what goes
+   with it, and a change to the draft cancels it. One message per send keeps every action
+   within the 3-messages-per-click budget. Ask stays for the user's own questions.
+3. **Plain English.** The skill requires plain, short, jargon-free text everywhere, one
+   sentence per question with a one-line `why`, choices with a recommendation whenever
+   possible, and "Writing for the user" examples.
+4. **Verdict and undo first.** `verdict` (one sentence: "Safe to merge: small bug fix, tests
+   pass") and `undo` ("If this goes wrong: revert the merge commit") open the panel.
+5. **Quick wins.** After the full one-snapshot review of a PR finds it small, green and low
+   risk, the agent marks its overview card `quick_win` with that snapshot's `head_sha`,
+   `base` and a `verdict`. The card then has Merge, with the same confirm, exact command and
+   event shape as pr_decision; any change to the card cancels the confirm, and the agent runs
+   every pre-merge re-check. "Quick wins" filters and sorts them first.
+6. **Speed.** The skill uses `muster pr list` and `muster pr snapshot` (one read-only command
+   each instead of many `gh` calls; the gh recipe stays for older Muster), prepares the next
+   PRs while the user reads (cards marked `ready`), and for 6 or more PRs may start helper
+   sessions on a faster model that only write draft judgements to files. Those are one
+   untrusted source: the main agent runs `muster pr snapshot` itself for every PR before
+   using one, checks the draft against it, and marks quick wins only from its own snapshot and
+   a complete diff (no truncated files, complete file list and checks); helpers never act on
+   GitHub.
 
 ## Persistence
 
@@ -235,3 +277,7 @@ action; the phone comes last.
 - On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
   afterwards, so swapping a parent directory for a symlink in between could copy a file from
   outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.
+
+## Tools
+
+- `muster pr list` / `muster pr snapshot` (docs/CLI.md, "PR snapshots"): read-only, parallel GitHub fetches whose JSON fits `pr_overview` and `pr_decision` as is, so the agent adds only its judgement.

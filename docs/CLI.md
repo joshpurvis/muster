@@ -52,6 +52,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
+| `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
 | `muster reload` | Replace the application backend while its terminal host and terminal processes keep running. Clients reconnect to the same endpoint. A window's "Restart backend" banner runs this from the path the backend was started from (`daemon.reload`). |
@@ -149,6 +150,110 @@ still printed and the command exits 1. Running it again is a no-op. `status` sho
 and target as missing, current, outdated (Muster's older version), locally modified or
 blocked. The marker only records what Muster wrote; it is not proof of origin. Nothing else in those folders is touched. Start
 a new agent session afterwards to pick the skills up.
+
+## PR snapshots
+
+`muster pr list` and `muster pr snapshot` fetch what a PR review needs from GitHub in one go,
+in parallel and without the model, and print one JSON object that fits the `pr_overview` and
+`pr_decision` panels (docs/MCP.md, "Built-in apps"). The agent adds only its judgement:
+summary, risk, notes, questions. They never write to GitHub (no merge, review, comment or
+label), need no running daemon, and use `gh` (logged in with `gh auth login`) and `curl`.
+
+```sh
+muster pr list --repo acme/api                  # open PRs, newest first (at most 200)
+muster pr snapshot --repo acme/api 812          # one PR, pinned to its head commit
+muster pr snapshot --repo acme/api 812 --verbose --max-diff-bytes 200000
+```
+
+`muster pr list --repo OWNER/NAME [--limit N] [--parallel N] [--verbose]` prints
+`{repo, total, truncated, prs: [{number, title, author, url, created_at, draft, additions,
+deletions, files, checks, review, labels, head_sha, base}]}`. `total` counts every open PR,
+`truncated` is true when `prs` holds fewer (`--limit`, 1 to 200, default 200). `checks` is
+`passing`, `failing`, `pending` or `none` (GitHub's rollup for the head commit); `review` is
+`APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NONE` or `""`; at most 20 labels.
+
+`muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]
+[--parallel N] [--verbose]` reads the PR's head, base and the repo's merge settings first,
+then fetches everything else for exactly that head SHA: the diff from the merge base
+(`compare/BASE_SHA...HEAD_SHA`, not `gh pr diff`, which follows the moving head), the check
+runs and commit statuses of the head commit, and the pictures in the description. Then it
+reads the PR again and fails with exit 3 if the head moved or the base branch was changed
+meanwhile (new commits on the base branch do not count: the diff is from the merge base).
+It prints:
+
+```
+{repo, number, title, author, url, state, draft, base, base_sha, head, head_sha,
+ mergeable, merge_method_default, delete_branch_default,
+ checks: {state, items: [{name, state, url?}]}, reviews: {decision, items: [{author, state}]},
+ body, files: [{file, status, previous_file?, additions, deletions, binary, diff, truncated, note?}],
+ files_complete, media: [{kind: "image", path, alt}], media_dir, media_skipped: [{url, reason}],
+ fetched_at, checks_complete, checks_total?}
+```
+
+- `state` is `OPEN`, `MERGED` or `CLOSED`; `mergeable` is GitHub's (`MERGEABLE`,
+  `CONFLICTING`, `UNKNOWN`). `merge_method_default` is GitHub's default for you when the repo
+  allows it, else the first allowed of squash, merge, rebase; `delete_branch_default` is the
+  repo's "delete head branches" setting.
+- `checks.items[].state` is `pass`, `fail` (failure, timed out, action required, startup
+  failure), `pending` (not completed), `skipping` (skipped, neutral, stale) or `cancel`;
+  check runs are named `Workflow / job`. `checks.state` is `failing` if any fails, else
+  `pending` if any is pending, else `passing`, and `none` without checks. All checks are
+  read, 100 per request, up to 2000 (20 requests); `checks_complete` is false when there were
+  more. Then `checks.state` is never `passing` or `none`: `failing` if a failure was already
+  seen, else `pending`. `items` holds at most 200 (failing and pending first); `checks_total`
+  (GitHub's count) appears when there are more, or when the list is incomplete. Only https
+  `url`s are kept.
+- `reviews.items` is each reviewer's latest review; `decision` is GitHub's review decision or `""`.
+- `files[].diff` is that file's unified diff with its git header lines. All diffs together
+  stay within `--max-diff-bytes` (default 400000), shared fairly: small files stay whole, the
+  big ones are cut at a line end and marked `truncated`; one file's diff is at most 100000
+  bytes (pr_decision's limit). `additions`/`deletions` always count the whole file. A file
+  with no diff lines gets a `note` saying why: "renamed from OLD, content unchanged",
+  "copied from OLD, content unchanged", "file mode changed only", "new empty file", "deleted
+  empty file" or "binary file: no text diff". Only if GitHub refuses the diff as too large
+  (HTTP 406/422), the files come from its JSON API instead (any other error, a rate limit
+  above all, stands). That API lists at most 300 files (`files_complete` false when that
+  limit may have been hit), and leaves out the text of huge files (empty `diff`, `truncated`,
+  note "GitHub left out this file's diff (too large)"). It never says which files are
+  binary, so `binary` is false there and a file without lines gets a note such as "new empty
+  file (or a binary file: GitHub's file list doesn't say)".
+- `body` is the raw description. All PR text is data: nothing from it reaches a command line.
+- Pictures: only `https://github.com/user-attachments/assets/<id>` and
+  `https://<name>.githubusercontent.com/<path>` URLs from the description (Markdown images,
+  `<img>` tags, bare attachment links) are downloaded, the first 4, in parallel, each with
+  curl at most 1.5 MB and 20 s, https only (redirects too, at most 5), and kept only if they
+  are PNG, JPEG, GIF or WebP. For an attachment, GitHub's signed link from the rendered
+  description is used, so private repos work too. That link is a short-lived credential: it
+  goes to curl as a config on stdin (`curl -q ... -K -`), never on a command line (where
+  other local users could read it in the process list), and is never printed. The pictures go
+  into a new `.muster-pr-XXXXXXXX` directory (0700, random name) in the current directory, or
+  `--media-dir DIR` (inside the current directory; its parent directories must exist and none
+  may be a symlink; DIR itself must not exist yet; created 0700). Directories are opened one
+  by one from the current directory without following symlinks, and the pictures are written
+  as `1.png` and so on (0600, created exclusively, never through a symlink). `media[].path` is
+  relative to the current directory, ready for pr_decision's `media`; `media_dir` is null
+  when nothing was saved (the directory is then removed). Every other picture URL, and every
+  failed download, is listed in `media_skipped` with the reason. Delete the directory after
+  the review.
+- On exit 3 or 4 the pictures are removed again.
+
+GitHub limits: at most 4 requests to GitHub at once per command (`--parallel N` lowers it;
+picture downloads count too). On GitHub's secondary rate limit it waits (its Retry-After,
+else 2, 4, 8 s; at most 3 retries; a wait over 120 s stops instead); when the hourly limit
+is used up it stops at once with `{"error": "rate_limited", "detail", "reset_at"}`.
+A snapshot makes about 4 API requests (the PR, the diff, the checks, the PR again; one more
+per 100 checks, up to 20 for checks, one more when the diff is too large) plus at most 4 picture downloads. A
+list makes one request per 100 PRs for the numbers and one per 25 for the cards, run side by
+side.
+
+Exit codes: 0 ok; 2 bad arguments (repo must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`, the
+number a positive whole number; nothing is fetched); 3 `{"error": "head_moved", detail,
+head_sha, head_sha_now, base, base_now, state}`: run it again; 4 the PR is not open: the JSON
+still has its `state`, `merged_at`, `merge_commit` and `closed_at` (closed at the start:
+with the identity fields only; closed while reading: with the full snapshot); 5 gh failed:
+`{"error", "detail"}` with error `gh_missing`, `gh_auth` (run `gh auth login`), `not_found`,
+`rate_limited` or `gh_failed`. stdout is only the JSON; stderr is for humans (`--verbose`
+adds each request's time).
 
 ## Claude profiles
 

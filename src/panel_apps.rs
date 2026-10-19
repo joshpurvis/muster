@@ -31,12 +31,23 @@ pub const MAX_MEDIA_BYTES: usize = 6 * 1024 * 1024;
 pub const MAX_PR_DATA: usize = crate::panels::MAX_FILE + MAX_MEDIA_BYTES.div_ceil(3) * 4 + 64 * 1024;
 /// The user's own actions (`actions`) in the PR apps.
 pub const MAX_ACTIONS: usize = 8;
-/// Single keys the PR apps use themselves (pr_decision: M R A O S H; pr_overview: J K O H N).
+/// Single keys the PR apps use themselves (pr_decision: M R A O S H G; pr_overview: J K O H N M).
 /// Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain letter or digit
 /// never clashes with them.
-pub const RESERVED_KEYS: &str = "mraoshjkn";
+pub const RESERVED_KEYS: &str = "mraoshjkng";
 /// Built-in event names, which a custom action id may not reuse.
-const BUILTIN_IDS: &[&str] = &["merge", "request_changes", "ask", "open", "skip", "hold", "next", "custom", "closed", "overflow"];
+const BUILTIN_IDS: &[&str] = &["merge", "request_changes", "ask", "answers", "open", "skip", "hold", "next", "custom", "closed", "overflow"];
+/// `pr_decision` `questions` (web/src/panels/apps/shared/questions.ts has the same limits).
+pub const MAX_QUESTIONS: usize = 20;
+const MAX_QUESTION: usize = 500;
+/// An old plain-string question may be longer.
+const MAX_LEGACY_QUESTION: usize = 2000;
+const MAX_WHY: usize = 300;
+const MAX_QUESTION_OPTIONS: usize = 9;
+/// A `text` question's suggested answer (the user's typed answer has the same limit).
+const MAX_ANSWER: usize = 1000;
+/// `verdict` and `undo` (pr_decision) and a card's `verdict` (pr_overview): one line each.
+const MAX_LINE: usize = 300;
 
 pub fn html(app: &str) -> Option<&'static str> {
     Some(match app {
@@ -251,12 +262,12 @@ pub fn check_pr(data: &Value) -> anyhow::Result<()> {
         "pr_decision `head_sha` must be the full 40-character lowercase commit SHA (headRefOid)");
     for key in ["base", "head"] {
         let b = text(o, app, key)?;
-        ensure!(b.len() <= 255 && !b.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c)),
-            "pr_decision `{key}` is not a valid branch name");
+        ensure!(branch_ok(b), "pr_decision `{key}` is not a valid branch name");
     }
     let url = text(o, app, "url")?;
     ensure!(https_ok(url) && url.chars().count() <= 2000, "pr_decision `url` must be an https URL");
     for (key, max) in [("title", 500), ("author", 100), ("summary", 20_000)] { req_text(o, app, key, max)?; }
+    for key in ["verdict", "undo"] { one_line(o, app, key, MAX_LINE)?; }
     let risk = object(field(o, app, "risk")?, "pr_decision `risk`")?;
     one_of(risk, "pr_decision risk", "level", &["low", "medium", "high"], true)?;
     opt_strings(risk, "pr_decision risk", "reasons", 20, 2000)?;
@@ -286,7 +297,7 @@ pub fn check_pr(data: &Value) -> anyhow::Result<()> {
         }
     }
     opt_text(o, app, "rest_note", 2000)?;
-    opt_strings(o, app, "questions", 20, 2000)?;
+    check_questions(o)?;
     if let Some(answer) = o.get("answer").filter(|v| !v.is_null()) {
         let answer = object(answer, "pr_decision `answer`")?;
         req_text(answer, "pr_decision answer", "question", 8000)?;
@@ -297,6 +308,82 @@ pub fn check_pr(data: &Value) -> anyhow::Result<()> {
     one_of(o, app, "merge_method_default", &["squash", "merge", "rebase"], false)?;
     one_of(o, app, "status", &["open", "merging", "queued", "merged", "failed", "requested_changes"], false)?;
     check_actions(o, app)?;
+    Ok(())
+}
+
+/// An optional one-line string (no line breaks) of at most `max` characters.
+fn one_line(o: &serde_json::Map<String, Value>, at: &str, key: &str, max: usize) -> anyhow::Result<()> {
+    opt_text(o, at, key, max)?;
+    if let Some(s) = o.get(key).and_then(Value::as_str) { ensure!(!s.contains(['\n', '\r']), "{at} `{key}` must be one line"); }
+    Ok(())
+}
+
+/// Git ref rules that matter here: no spaces, control characters or ~^:?*[\.
+fn branch_ok(b: &str) -> bool {
+    !b.is_empty() && b.len() <= 255 && !b.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c))
+}
+
+fn id_ok(id: &str) -> bool {
+    (1..=40).contains(&id.len()) && id.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
+/// `pr_decision` `questions`: plain strings (the old form, read as kind `text` with ids q1, q2…
+/// by place) or `{id, text, why?, kind: yes_no|choice|text, options?, recommended?, required?}`.
+/// A `choice` has 2 to 9 options `{label, value}` with unique values; `recommended` is one of
+/// the values (yes_no: "yes" or "no"), or for `text` a suggested answer.
+fn check_questions(o: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    let Some(list) = o.get("questions").filter(|v| !v.is_null()) else { return Ok(()) };
+    let list = list.as_array().context("pr_decision `questions` must be an array")?;
+    ensure!(list.len() <= MAX_QUESTIONS, "pr_decision `questions` has {} items; at most {MAX_QUESTIONS}", list.len());
+    let mut ids: Vec<String> = Vec::new();
+    for (i, q) in list.iter().enumerate() {
+        let at = format!("pr_decision `questions[{i}]`");
+        if let Some(s) = q.as_str() {
+            ensure!(s.chars().count() <= MAX_LEGACY_QUESTION, "{at} is longer than {MAX_LEGACY_QUESTION} characters");
+            if s.trim().is_empty() { continue }
+            let id = format!("q{}", i + 1);
+            ensure!(!ids.contains(&id), "{at} id {id:?} is used twice");
+            ids.push(id);
+            continue;
+        }
+        let q = q.as_object().with_context(|| format!("{at} must be a string or an object"))?;
+        let id = q.get("id").and_then(Value::as_str).with_context(|| format!("{at} needs a string `id`"))?;
+        ensure!(id_ok(id), "{at}.id must be lowercase letters, digits, - or _ (at most 40; got {id:?})");
+        ensure!(!ids.iter().any(|x| x == id), "{at}.id {id:?} is used twice");
+        ids.push(id.to_string());
+        let item = format!("pr_decision questions[{i}]");
+        req_text(q, &item, "text", MAX_QUESTION)?;
+        opt_text(q, &item, "why", MAX_WHY)?;
+        one_of(q, &item, "kind", &["yes_no", "choice", "text"], true)?;
+        opt_bool(q, &item, "required")?;
+        let kind = q.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let mut values: Vec<&str> = Vec::new();
+        if kind == "choice" {
+            let options = opt_objects(q, &item, "options", MAX_QUESTION_OPTIONS, true)?;
+            ensure!(options.len() >= 2, "{at}.options needs at least 2 options");
+            for (j, c) in options.into_iter().enumerate() {
+                let oat = format!("pr_decision questions[{i}].options[{j}]");
+                req_text(c, &oat, "label", 80)?;
+                let v = req_text(c, &oat, "value", 100)?;
+                ensure!(!values.contains(&v), "{oat} `value` {v:?} is used twice");
+                values.push(v);
+            }
+        } else {
+            ensure!(q.get("options").is_none_or(Value::is_null), "{at}.options: {}",
+                if kind == "yes_no" { "a yes_no question has its own Yes and No; use kind choice for other options" } else { "a text question takes no options" });
+            if kind == "yes_no" { values = vec!["yes", "no"]; }
+        }
+        if let Some(r) = q.get("recommended").filter(|v| !v.is_null()) {
+            let r = r.as_str().with_context(|| format!("{at}.recommended must be a string"))?;
+            if kind == "text" {
+                ensure!(!r.trim().is_empty() && r.chars().count() <= MAX_ANSWER, "{at}.recommended must be 1 to {MAX_ANSWER} characters");
+            } else {
+                ensure!(values.contains(&r), "{at}.recommended must be one of the option values ({})",
+                    values.iter().map(|v| format!("{v:?}")).collect::<Vec<_>>().join(", "));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -326,7 +413,7 @@ fn date_ok(s: &str) -> bool {
 
 /// Visible names of the apps' own buttons: a custom label may not look like one of them.
 const BUILTIN_LABELS: &[&str] = &["merge", "merge anyway", "confirm merge", "request changes", "ask", "open", "open on github",
-    "github", "skip", "hold", "next", "cancel", "confirm"];
+    "github", "skip", "hold", "next", "cancel", "confirm", "send answers"];
 
 /// A label as the user reads it: trimmed, spaces collapsed, lowercase, without a trailing
 /// "…", "." or "!" and without a leading "#".
@@ -335,7 +422,8 @@ pub fn label_key(label: &str) -> String {
     words.join(" ").to_lowercase().trim_end_matches(['…', '.', '!', ':']).trim_start_matches('#').trim().to_string()
 }
 
-/// The user's own actions (`actions`, both PR apps): buttons that send a `custom` event. Ids and
+/// The user's own actions (`actions`, both PR apps): buttons that send a `custom` event, or in
+/// pr_decision (`mode` `toggle`, the default) options that ride along with the next event. Ids and
 /// keys must be unique, keys one letter or digit not used by the apps, labels must not look like
 /// a built-in button, every action must say what the agent will do (`description`) and say
 /// whether it reaches outside this machine (`outward`, required): those ask the user to
@@ -349,9 +437,7 @@ pub fn check_actions(o: &serde_json::Map<String, Value>, app: &str) -> anyhow::R
         let at = format!("{app} `actions[{i}]`");
         let a = object(a, &at)?;
         let id = a.get("id").and_then(Value::as_str).with_context(|| format!("{at} needs a string `id`"))?;
-        ensure!((1..=40).contains(&id.len()) && id.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            && id.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'),
-            "{at}.id must be lowercase letters, digits, - or _ (at most 40; got {id:?})");
+        ensure!(id_ok(id), "{at}.id must be lowercase letters, digits, - or _ (at most 40; got {id:?})");
         ensure!(!BUILTIN_IDS.contains(&id), "{at}.id {id:?} is a built-in action");
         ensure!(!ids.contains(&id), "{at}.id {id:?} is used twice");
         ids.push(id);
@@ -364,12 +450,13 @@ pub fn check_actions(o: &serde_json::Map<String, Value>, app: &str) -> anyhow::R
         if let Some(k) = a.get("key").filter(|v| !v.is_null()) {
             let k = k.as_str().filter(|k| k.len() == 1 && k.bytes().all(|c| c.is_ascii_alphanumeric()))
                 .with_context(|| format!("{at}.key must be one letter or digit"))?.to_ascii_lowercase();
-            ensure!(!RESERVED_KEYS.contains(&k), "{at}.key {k:?} is a built-in key (m r a o s h j k n are taken)");
+            ensure!(!RESERVED_KEYS.contains(&k), "{at}.key {k:?} is a built-in key (m r a o s h j k n g are taken)");
             ensure!(!keys.contains(&k), "{at}.key {k:?} is used twice");
             keys.push(k);
         }
         ensure!(a.get("outward").is_some_and(Value::is_boolean),
             "{at}.outward is required: true if the action changes GitHub or anything off this machine (comments, labels, closing, pushing), else false");
+        one_of(a, &at, "mode", &["toggle", "now"], false)?;
     }
     Ok(())
 }
@@ -399,7 +486,7 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
         let item = format!("pr_overview prs[{i}]");
         one_of(p, &item, "checks", &["passing", "failing", "pending", "none"], false)?;
         one_of(p, &item, "risk", &["low", "medium", "high"], false)?;
-        one_of(p, &item, "status", &["new", "reviewing", "merged", "queued", "held", "skipped", "changes_requested", "failed"], false)?;
+        one_of(p, &item, "status", &["new", "ready", "reviewing", "merging", "merged", "queued", "held", "skipped", "changes_requested", "failed"], false)?;
         if p.get("review").and_then(Value::as_str) != Some("") {
             one_of(p, &item, "review", &["APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED", "NONE"], false)?;
         }
@@ -417,6 +504,22 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
             ensure!(date.as_str().is_some_and(date_ok), "{at}.created_at must be a date such as 2026-10-18T09:30:00Z");
         }
         for (key, max) in [("summary", 500), ("status_detail", 500)] { opt_text(p, &item, key, max)?; }
+        one_line(p, &item, "verdict", MAX_LINE)?;
+        if let Some(base) = p.get("base").filter(|v| !v.is_null()) {
+            ensure!(base.as_str().is_some_and(branch_ok), "{at}.base is not a valid branch name");
+        }
+        one_of(p, &item, "merge_method_default", &["squash", "merge", "rebase"], false)?;
+        opt_bool(p, &item, "delete_branch_default")?;
+        opt_bool(p, &item, "quick_win")?;
+        if p.get("quick_win").and_then(Value::as_bool) == Some(true) {
+            // Merge from the overview needs what the merge command and its checks are built from:
+            // the agent marks a quick win only after the full one-snapshot review.
+            for (key, what) in [("head_sha", "the head the review saw"), ("base", "the branch it merges into"), ("verdict", "one plain sentence")] {
+                ensure!(p.get(key).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()), "{at}.{key} is required for a quick win ({what})");
+            }
+            ensure!(p.get("checks").and_then(Value::as_str) == Some("passing"), "{at}.quick_win needs checks passing");
+            ensure!(p.get("draft").and_then(Value::as_bool) != Some(true), "{at}.quick_win cannot be a draft");
+        }
         if let Some(labels) = p.get("labels").filter(|v| !v.is_null()) {
             let labels = labels.as_array().with_context(|| format!("{at}.labels must be an array of strings"))?;
             ensure!(labels.len() <= 20 && labels.iter().all(|l| l.as_str().is_some_and(|s| !s.trim().is_empty() && s.chars().count() <= 100)),
@@ -722,6 +825,81 @@ mod tests {
         let mut o = overview_sample();
         o["actions"][0]["key"] = json!("j");
         assert!(check_overview(&o).unwrap_err().to_string().contains("pr_overview `actions[0]`.key \"j\" is a built-in key"));
+    }
+
+    #[test]
+    fn questions_verdict_undo_and_toggles_are_checked_like_the_app() {
+        let with = |f: &dyn Fn(&mut Value)| { let mut d = pr_sample(); f(&mut d); d };
+        let good = with(&|d| {
+            d["verdict"] = json!("Safe to merge: small bug fix, tests pass.");
+            d["undo"] = json!("If this goes wrong: revert the merge commit.");
+            d["questions"] = json!([
+                {"id":"limit","text":"Keep 5 per 10 minutes?","why":"Support asked for 10 per hour.","kind":"yes_no","recommended":"yes","required":true},
+                {"id":"proxy","text":"Which proxies?","kind":"choice","options":[{"label":"Only ours","value":"ours"},{"label":"Any","value":"any"}],"recommended":"ours"},
+                {"id":"note","text":"Anything for the author?","kind":"text","recommended":"Nice work"},
+                "An old plain question", " "]);
+            d["actions"] = json!([{"id":"qa","label":"Needs QA","description":"Add the label.","outward":true,"mode":"toggle"},
+                {"id":"ping","label":"Ping","description":"Tell them.","outward":true,"mode":"now"}]);
+        });
+        check_pr(&good).unwrap();
+        // 20 questions of 500 emoji fit (characters, as the app counts).
+        check_pr(&with(&|d| d["questions"] = json!((0..20).map(|i| json!({"id":format!("q{i}x"),"text":"😀".repeat(500),"kind":"text"})).collect::<Vec<_>>()))).unwrap();
+        let q = |patch: Value| with(&|d| {
+            let mut base = json!({"id":"proxy","text":"Which proxies?","kind":"choice","options":[{"label":"Only ours","value":"ours"},{"label":"Any","value":"any"}]});
+            for (k, v) in patch.as_object().unwrap() { if v.is_null() { base.as_object_mut().unwrap().remove(k); } else { base[k] = v.clone(); } }
+            d["questions"] = json!([base]);
+        });
+        for (data, why) in [
+            (with(&|d| d["verdict"] = json!("x".repeat(301))), "`verdict` is longer than 300"),
+            (with(&|d| d["undo"] = json!("revert\nthen redeploy")), "`undo` must be one line"),
+            (with(&|d| d["verdict"] = json!(5)), "`verdict` must be a string"),
+            (with(&|d| d["questions"] = json!([1])), "`questions[0]` must be a string or an object"),
+            (with(&|d| d["questions"] = json!(["x".repeat(2001)])), "`questions[0]` is longer than 2000"),
+            (with(&|d| d["questions"] = json!((0..21).map(|i| json!(format!("q{i}"))).collect::<Vec<_>>())), "has 21 items; at most 20"),
+            (with(&|d| d["questions"] = json!(["a", {"id":"q1","text":"t","kind":"text"}])), "\"q1\" is used twice"),
+            (q(json!({"id":"Bad Id"})), "`questions[0]`.id must be lowercase"),
+            (q(json!({"kind":"multi"})), "questions[0] `kind` must be one of yes_no, choice, text"),
+            (q(json!({"kind":null})), "questions[0] data needs `kind`"),
+            (q(json!({"text":"x".repeat(501)})), "questions[0] `text` is longer than 500"),
+            (q(json!({"text":" "})), "questions[0] `text` must not be empty"),
+            (q(json!({"why":"x".repeat(301)})), "questions[0] `why` is longer than 300"),
+            (q(json!({"options":[{"label":"A","value":"a"}]})), "options needs at least 2"),
+            (q(json!({"options":null})), "questions[0] data needs `options`"),
+            (q(json!({"options":(0..10).map(|i| json!({"label":"L","value":format!("v{i}")})).collect::<Vec<_>>()})), "has 10 items; at most 9"),
+            (q(json!({"options":[{"label":"A","value":"a"},{"label":"B","value":"a"}]})), "`value` \"a\" is used twice"),
+            (q(json!({"options":[{"label":"x".repeat(81),"value":"a"},{"label":"B","value":"b"}]})), "`label` is longer than 80"),
+            (q(json!({"recommended":"maybe"})), "recommended must be one of the option values"),
+            (q(json!({"kind":"yes_no","options":null,"recommended":"Yes"})), "must be one of the option values (\"yes\", \"no\")"),
+            (q(json!({"kind":"yes_no"})), "a yes_no question has its own Yes and No"),
+            (q(json!({"kind":"text"})), "a text question takes no options"),
+            (q(json!({"kind":"text","options":null,"recommended":"x".repeat(1001)})), "recommended must be 1 to 1000"),
+            (q(json!({"required":"yes"})), "`required` must be true or false"),
+            (with(&|d| d["actions"] = json!([{"id":"qa","label":"QA","description":"d","outward":false,"mode":"later"}])), "`mode` must be one of toggle, now"),
+            (with(&|d| d["actions"] = json!([{"id":"answers","label":"QA","description":"d","outward":false}])), "is a built-in action"),
+            (with(&|d| d["actions"] = json!([{"id":"x","label":"Send answers","description":"d","outward":false}])), "looks like a built-in button"),
+        ] {
+            let e = format!("{:#}", check_pr(&data).unwrap_err());
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        // Quick wins in the overview: only with what the merge is built from, green, not a draft.
+        let win = json!({"number":815,"title":"Typo","author":"lee","checks":"passing","risk":"low","quick_win":true,"status":"ready",
+            "head_sha":"0123456789abcdef0123456789abcdef01234567","base":"master","verdict":"Safe to merge: one word in the docs.",
+            "merge_method_default":"rebase","delete_branch_default":true});
+        check_overview(&json!({"repo":"a/b","prs":[win.clone()]})).unwrap();
+        let card = |patch: Value| { let mut w = win.clone(); for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() { w.as_object_mut().unwrap().remove(k); } else { w[k] = v.clone(); } } json!({"repo":"a/b","prs":[w]}) };
+        check_overview(&card(json!({"quick_win":false,"verdict":null,"base":null,"head_sha":null,"checks":"failing"}))).unwrap();
+        for (data, why) in [
+            (card(json!({"head_sha":null})), ".head_sha is required for a quick win"), (card(json!({"base":null})), ".base is required for a quick win"),
+            (card(json!({"verdict":null})), ".verdict is required for a quick win"), (card(json!({"verdict":" "})), ".verdict is required for a quick win"),
+            (card(json!({"verdict":"a\nb"})), "`verdict` must be one line"), (card(json!({"checks":"pending"})), "quick_win needs checks passing"),
+            (card(json!({"draft":true})), "quick_win cannot be a draft"), (card(json!({"base":"ma ster"})), ".base is not a valid branch name"),
+            (card(json!({"merge_method_default":"ff"})), "`merge_method_default` must be one of squash"), (card(json!({"quick_win":"yes"})), "`quick_win` must be true or false"),
+            (card(json!({"status":"done"})), "`status` must be one of new, ready"),
+        ] {
+            let e = format!("{:#}", check_overview(&data).unwrap_err());
+            assert!(e.contains(why), "{why}: {e}");
+        }
     }
 
     #[test]

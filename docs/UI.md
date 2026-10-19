@@ -115,15 +115,22 @@ and includes a comment field for sending a user event.
 The other built-ins follow the theme and work by keyboard: Image toggles fit/actual size
 (Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
 Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
-has Merge (M), Request changes (R), Ask (A), Open on GitHub (O), Skip (S), Hold (H) and the
-user's own actions (their key on the button, in a separate "Your actions" group that folds in
-small panels), and its pictures enlarge on click or Enter in a modal view (Z for actual size,
-drag to pan, arrows step, Esc closes); PR overview moves with J/K or the arrows, opens with
-Enter (or O, or a double-click), holds with H, goes through the PRs in order with N, and
-filters with `/`. In both, `?` lists the keys. An outward custom action (marked ↗) shows what
-the agent will do and needs Enter or Confirm, like Merge. Merge first shows the
-exact `gh pr merge` command and needs a fresh Enter or "Confirm merge" (a held key never
-confirms; a change to the PR cancels the step); with failing checks it is disabled unless
+shows the agent's verdict and undo line first, has Merge (M), Request changes (R), Ask (A),
+Open on GitHub (O), Skip (S), Hold (H), Send answers (Ctrl+Enter) and the user's own actions
+(their key on the button, in a separate "Your actions" group that folds in small panels;
+toggle actions switch on or off and go with the next send), answers the agent's questions in
+place (G or the button under the header jumps to them, number keys 1–9 pick in the focused
+question, arrows step, Tab and Shift+Tab move between questions, the recommended answer starts
+picked; a line above the actions says what goes with the next decision, and Send answers is
+off while Merge is being confirmed), and its pictures enlarge on click or Enter in a modal view (Z
+for actual size, drag to pan, arrows step, Esc closes); PR overview moves with J/K or the
+arrows, opens with Enter (or O, or a double-click), merges a quick win with M (after the same
+confirm as Merge), holds with H, goes through the PRs in order with N, filters with `/`, and
+can show only the quick wins. In both, `?` lists the keys. An outward custom action (marked ↗) shows what
+the agent will do and needs Enter or Confirm, like Merge (a toggle one, before it is switched
+on). Merge first shows the exact `gh pr merge` command and the answers and options that go
+with it, and needs a fresh Enter or "Confirm merge" (a held key never confirms; a change to
+the PR, or to the answers or options, cancels the step); with failing checks it is disabled unless
 Shift is held (Shift+M), and a hint beside it says so. Esc closes the confirm or a comment
 box and returns to its button; Ctrl+Enter sends a comment or question. The latest action's
 result shows above the action bar.

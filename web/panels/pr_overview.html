@@ -186,6 +186,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
 @media (max-height: 559px), (max-width: 520px) {
   .keys { display: none; }
 }
+/* Quick wins: reviewed, small, green and low risk; merged from here after the same confirm. */
+.verdict-line { margin: 6px 0 0; font-size: 13px; font-weight: 600; }
+.drawer .verdict-line { margin: 0 0 6px; font-weight: 400; }
+.command { margin: 0 0 8px; padding: 8px 10px; background: var(--color-background-primary); border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+button.quick-toggle { flex: none; }
+button.quick-toggle.on { border-color: var(--accent-fill); background: var(--color-background-info); font-weight: 600; }
+button.merge-quick { border-color: var(--color-text-success); }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -403,6 +410,10 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   };
 
   // src/panels/apps/shared/actions.ts
+  var ACTION_MODES = [
+    "toggle",
+    "now"
+  ];
   var RESERVED_KEYS = [
     "m",
     "r",
@@ -412,12 +423,14 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     "h",
     "j",
     "k",
-    "n"
+    "n",
+    "g"
   ];
   var BUILTIN_IDS = [
     "merge",
     "request_changes",
     "ask",
+    "answers",
     "open",
     "skip",
     "hold",
@@ -440,7 +453,8 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     "hold",
     "next",
     "cancel",
-    "confirm"
+    "confirm",
+    "send answers"
   ];
   function labelKey(label) {
     return label.split(/\s+/).filter(Boolean).join(" ").toLowerCase().replace(/[….!:]+$/u, "").replace(/^#+/, "").trim();
@@ -462,7 +476,8 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         "label",
         "key",
         "description",
-        "outward"
+        "outward",
+        "mode"
       ]);
       const id = p.string(ao, "id", at, {
         required: true,
@@ -510,12 +525,14 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         }
       }
       const outward2 = p.boolean(ao, "outward", at) ?? true;
+      const mode = p.oneOf(ao, "mode", at, ACTION_MODES) ?? "toggle";
       if (id !== void 0 && label !== void 0 && description !== void 0) out.push({
         id,
         label,
         key,
         description,
-        outward: outward2
+        outward: outward2,
+        mode
       });
     });
     return out;
@@ -553,16 +570,28 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   }
 
   // src/panels/apps/shared/actions_view.ts
-  function actionButton(a, onclick, disabled = false) {
+  function actionButton(a, onclick, disabled = false, pressed) {
+    const toggle = pressed !== void 0;
+    const cls = [
+      "custom",
+      a.outward ? "outward" : "",
+      toggle ? "toggle" : "",
+      pressed ? "on" : ""
+    ].filter(Boolean).join(" ");
+    const asks = a.outward ? toggle ? " (asks you to confirm before it is switched on)" : " (asks you to confirm first)" : "";
     return h("button", {
       type: "button",
       id: `act-${a.id}`,
-      class: a.outward ? "custom outward" : "custom",
+      class: cls,
       disabled,
-      title: `${a.description}${a.outward ? " (asks you to confirm first)" : ""}`,
+      "aria-pressed": toggle ? String(pressed) : null,
+      title: `${a.description}${asks}${toggle ? " Switched on, it goes with your next send." : ""}`,
       "aria-keyshortcuts": a.key?.toUpperCase(),
       onclick
-    }, a.label, a.outward ? h("span", {
+    }, toggle ? h("span", {
+      class: "tick",
+      "aria-hidden": "true"
+    }, pressed ? "\u2713 " : "+ ") : null, a.label, a.outward ? h("span", {
       class: "out",
       "aria-hidden": "true"
     }, " \u2197") : null, a.key ? [
@@ -570,7 +599,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       h("kbd", null, a.key.toUpperCase())
     ] : null);
   }
-  function outwardDrawer(a, what, onConfirm, onCancel) {
+  function outwardDrawer(a, what, onConfirm, onCancel, toggle = false) {
     return h("div", {
       class: "drawer",
       role: "group",
@@ -578,7 +607,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     }, h("div", {
       id: "outward-title",
       class: "drawer-title"
-    }, `${a.label} on ${what}? The agent will:`), h("p", {
+    }, toggle ? `Switch on ${a.label} for ${what}? With your next send (Merge, Request changes, Hold, Skip or Send answers), the agent will:` : `${a.label} on ${what}? The agent will:`), h("p", {
       class: "prose outward-desc"
     }, a.description), h("p", {
       class: "muted small"
@@ -589,13 +618,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       id: "confirm-outward",
       class: "primary",
       onclick: onConfirm
-    }, `Confirm ${a.label} `, h("kbd", null, "Enter")), h("button", {
+    }, toggle ? "Switch on " : `Confirm ${a.label} `, h("kbd", null, "Enter")), h("button", {
       type: "button",
       onclick: onCancel
     }, "Cancel ", h("kbd", null, "Esc"))));
   }
   var roomy = () => innerHeight >= 560 && innerWidth > 520;
-  function actionsGroup(actions, run, off, open2, toggle) {
+  function actionsGroup(actions, run, off, open2, toggle, pressed) {
     if (!actions.length) return null;
     const folds = !roomy();
     const shown = !folds || open2;
@@ -614,14 +643,14 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     }, `Your actions (${actions.length})`), shown ? " \u25B4" : " \u25BE") : h("span", {
       id: "your-actions-label",
       class: "group-label"
-    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a))) : null);
+    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a), pressed?.(a))) : null);
   }
-  function shortcutsDrawer(rows, actions, onClose) {
+  function shortcutsDrawer(rows, actions, onClose, toggles = false) {
     const all = [
       ...rows,
       ...actions.filter((a) => a.key).map((a) => [
         a.key.toUpperCase(),
-        `${a.label} (your action${a.outward ? ", asks first" : ""})`
+        `${a.label} (your action${toggles && a.mode === "toggle" ? ", switches on or off for your next send" : ""}${a.outward ? ", asks first" : ""})`
       ])
     ];
     return h("div", {
@@ -780,6 +809,53 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     }
   }
 
+  // src/panels/apps/shared/merge.ts
+  var METHODS = [
+    "squash",
+    "merge",
+    "rebase"
+  ];
+  var SHA = /^[0-9a-f]{40}$/;
+  var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+  var branchOk = (b) => b.length > 0 && b.length <= 255 && ![
+    ...b
+  ].some((c) => c.charCodeAt(0) < 33 || c.charCodeAt(0) === 127 || "~^:?*[\\".includes(c));
+  function mergeCommand(repo, number, method, deleteBranch, headSha) {
+    if (!REPO.test(repo)) throw new Error("invalid repo");
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error("invalid PR number");
+    if (!METHODS.includes(method)) throw new Error("invalid merge method");
+    if (!SHA.test(headSha)) throw new Error("invalid head SHA");
+    return `gh pr merge ${number} --repo ${repo} --${method}${deleteBranch ? " --delete-branch" : ""} --match-head-commit ${headSha}`;
+  }
+  function mergeEventFor(t, method, deleteBranch, draft, extra = "") {
+    const command = mergeCommand(t.repo, t.number, method, deleteBranch, t.head_sha);
+    return {
+      kind: "merge",
+      text: `Merge PR #${t.number} (${t.repo}) into ${t.base}.${extra} Run exactly: ${command}`,
+      data: {
+        action: "merge",
+        repo: t.repo,
+        number: t.number,
+        base: t.base,
+        method,
+        delete_branch: deleteBranch,
+        head_sha: t.head_sha,
+        answers: {
+          ...draft.answers
+        },
+        options: [
+          ...draft.options
+        ]
+      }
+    };
+  }
+
+  // src/panels/apps/shared/questions.ts
+  var EMPTY_DRAFT = {
+    answers: {},
+    options: []
+  };
+
   // src/panels/apps/pr_overview/logic.ts
   var RISKS = [
     "low",
@@ -800,7 +876,9 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   ];
   var STATUSES = [
     "new",
+    "ready",
     "reviewing",
+    "merging",
     "merged",
     "queued",
     "held",
@@ -819,9 +897,8 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     oldest: "Oldest first"
   };
   var MAX_PRS = 200;
-  var SHA = /^[0-9a-f]{40}$/;
   var DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
-  var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+  var MAX_VERDICT = 300;
   function count(p, o, key, at) {
     const v = p.number(o, key, at);
     if (v !== void 0 && (!Number.isSafeInteger(v) || v < 0)) {
@@ -876,7 +953,12 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         "summary",
         "status",
         "status_detail",
-        "head_sha"
+        "head_sha",
+        "base",
+        "quick_win",
+        "verdict",
+        "merge_method_default",
+        "delete_branch_default"
       ]);
       const number = p.number(io, "number", at, true);
       if (number !== void 0 && (!Number.isSafeInteger(number) || number < 1)) {
@@ -933,6 +1015,27 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         max: 40
       });
       if (head_sha !== void 0 && !SHA.test(head_sha)) p.add(`${at}.head_sha`, "must be the full lowercase commit SHA (40 hex characters)");
+      const base = p.string(io, "base", at, {
+        max: 255
+      });
+      if (base !== void 0 && !branchOk(base)) p.add(`${at}.base`, "is not a valid branch name");
+      const quick_win = p.boolean(io, "quick_win", at) ?? false;
+      let verdict = p.string(io, "verdict", at, {
+        max: MAX_VERDICT
+      });
+      if (verdict !== void 0 && /[\r\n]/.test(verdict)) {
+        p.add(`${at}.verdict`, "must be one line");
+        verdict = void 0;
+      }
+      const merge_method_default = p.oneOf(io, "merge_method_default", at, METHODS) ?? "squash";
+      const delete_branch_default = p.boolean(io, "delete_branch_default", at) ?? false;
+      if (quick_win) {
+        if (io.head_sha === void 0 || io.head_sha === null) p.add(`${at}.head_sha`, "is required for a quick win (the head the review saw)");
+        if (io.base === void 0 || io.base === null) p.add(`${at}.base`, "is required for a quick win (the branch it merges into)");
+        if (!verdict?.trim()) p.add(`${at}.verdict`, "is required for a quick win (one plain sentence)");
+        if (checks !== "passing") p.add(`${at}.quick_win`, "needs checks passing");
+        if (draft) p.add(`${at}.quick_win`, "cannot be a draft");
+      }
       if (number !== void 0 && t !== void 0 && author !== void 0) {
         prs.push({
           number,
@@ -952,7 +1055,12 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
           summary: summary?.trim() ? summary : void 0,
           status,
           status_detail,
-          head_sha
+          head_sha,
+          base,
+          quick_win,
+          verdict: verdict?.trim() ? verdict : void 0,
+          merge_method_default,
+          delete_branch_default
         });
       }
     });
@@ -994,7 +1102,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       return by((x) => x.risk ? RISK_RANK[x.risk] : 3, (x) => x.checks ? CHECK_RANK[x.checks] : 2, (x) => -size(x));
     }
     if (sort === "quick") {
-      return by((x) => x.draft ? 1 : 0, (x) => x.checks === "failing" ? 2 : x.checks === "pending" ? 1 : 0, (x) => x.risk ? 2 - RISK_RANK[x.risk] : 1, (x) => known(x) ? size(x) : Number.MAX_SAFE_INTEGER);
+      return by((x) => x.quick_win ? 0 : 1, (x) => x.draft ? 1 : 0, (x) => x.checks === "failing" ? 2 : x.checks === "pending" ? 1 : 0, (x) => x.risk ? 2 - RISK_RANK[x.risk] : 1, (x) => known(x) ? size(x) : Number.MAX_SAFE_INTEGER);
     }
     return by((x) => x.created ?? Number.MAX_SAFE_INTEGER);
   }
@@ -1010,7 +1118,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   };
   function groupOf(pr) {
     if (pr.status === "held") return "held";
-    if (pr.status === "merged" || pr.status === "queued" || pr.status === "changes_requested") return "done";
+    if (pr.status === "merged" || pr.status === "merging" || pr.status === "queued" || pr.status === "changes_requested") return "done";
     return "todo";
   }
   var CHECK_WORDS = {
@@ -1038,12 +1146,14 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       pr.draft ? "draft" : "",
       pr.risk ? `${pr.risk} risk` : "",
       pr.checks ? CHECK_WORDS[pr.checks] : "",
-      pr.review ? REVIEW_WORDS[pr.review] : ""
+      pr.review ? REVIEW_WORDS[pr.review] : "",
+      pr.quick_win ? "quick win" : "",
+      pr.verdict ?? ""
     ].join("\n").toLowerCase();
     return words.every((w) => hay.includes(w));
   }
-  function arrange(prs, sort, filter2) {
-    const shown = sortPrs(prs.filter((pr) => matches(pr, filter2)), sort);
+  function arrange(prs, sort, filter2, quickOnly2 = false) {
+    const shown = sortPrs(prs.filter((pr) => matches(pr, filter2) && (!quickOnly2 || pr.quick_win)), sort);
     return [
       "todo",
       "done",
@@ -1058,7 +1168,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     const out = [];
     for (let i = 1; i <= ordered2.length; i++) {
       const pr = ordered2[(at + i + ordered2.length) % ordered2.length];
-      if ((pr.status === "new" || pr.status === "skipped") && pr.number !== current) out.push(pr);
+      if ((pr.status === "new" || pr.status === "ready" || pr.status === "skipped") && pr.number !== current) out.push(pr);
     }
     return out;
   }
@@ -1122,6 +1232,36 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     return after;
   }
   var canHold = (pr) => groupOf(pr) === "todo";
+  var MERGEABLE = [
+    "new",
+    "ready",
+    "skipped",
+    "held",
+    "failed"
+  ];
+  function quickMergeBlocked(pr, sent2) {
+    if (!pr.quick_win) return "Not a quick win: open it to review it.";
+    if (sent2) return "Waiting for the agent.";
+    if (!MERGEABLE.includes(pr.status)) return `#${pr.number} is ${pr.status.replace(/_/g, " ")}.`;
+    if (pr.checks !== "passing" || pr.draft || !pr.head_sha || !pr.base) return "Not ready to merge: open it to review it.";
+    return null;
+  }
+  var quickWins = (prs) => prs.filter((p) => p.quick_win && !quickMergeBlocked(p, false));
+  function quickMergeEvent(repo, pr) {
+    if (!pr.head_sha || !pr.base) throw new Error("a quick win needs head_sha and base");
+    return mergeEventFor({
+      repo,
+      number: pr.number,
+      base: pr.base,
+      head_sha: pr.head_sha
+    }, pr.merge_method_default, pr.delete_branch_default, EMPTY_DRAFT, " (a quick win, from the overview)");
+  }
+  function quickTarget(repo, pr) {
+    return JSON.stringify([
+      repo,
+      pr
+    ]);
+  }
 
   // src/panels/apps/pr_overview/main.ts
   var root = document.getElementById("app");
@@ -1131,13 +1271,16 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   var filter = "";
   var selected = null;
   var notice = null;
-  var sent = /* @__PURE__ */ new Set();
+  var sent = /* @__PURE__ */ new Map();
+  var sendSeq = 0;
   var outward = null;
+  var merging = null;
+  var quickOnly = false;
   var actionsOpen = false;
   var showKeys = false;
   var gate = new Gate();
   var sortNow = () => userSort ?? view?.sort ?? "risk";
-  var ordered = () => view ? arrange(view.prs, sortNow(), filter).flatMap((g) => g.items) : [];
+  var ordered = () => view ? arrange(view.prs, sortNow(), filter, quickOnly).flatMap((g) => g.items) : [];
   var selectedPr = () => view?.prs.find((p) => p.number === selected) ?? null;
   var target = (pr, repo = view.repo) => ({
     repo,
@@ -1161,6 +1304,10 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     [
       "Enter / O",
       "Open the PR: the agent reviews it"
+    ],
+    [
+      "M",
+      "Merge a quick win (shows the exact command first)"
     ],
     [
       "H",
@@ -1239,8 +1386,16 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       "",
       "muted"
     ],
+    ready: [
+      "Review ready",
+      "info"
+    ],
     reviewing: [
       "Reviewing",
+      "info"
+    ],
+    merging: [
+      "Merging\u2026",
       "info"
     ],
     merged: [
@@ -1275,14 +1430,15 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   }
   function send(ev, key, ok) {
     const result = sendEvent(ev.kind, ev.text, ev.data);
-    sent.add(key);
+    const mine = ++sendSeq;
+    sent.set(key, mine);
     notice = {
       text: ok,
       tone: "info"
     };
     render();
     result.catch((e) => {
-      sent.delete(key);
+      if (sent.get(key) === mine) sent.delete(key);
       notice = {
         text: `Not sent (${e.message}). Try again.`,
         tone: "danger"
@@ -1324,6 +1480,72 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     selected = pr.number;
     send(nextEvent(view.repo, todo), `next:${pr.number}`, `Sent: go through ${todo.length} PR${todo.length === 1 ? "" : "s"} in order, starting with #${pr.number}.`);
   }
+  function openMerge(pr) {
+    if (!view || !pr) return;
+    const blocked = quickMergeBlocked(pr, sent.has(`merge:${pr.number}`));
+    if (blocked) {
+      notice = {
+        text: blocked,
+        tone: "warning"
+      };
+      render();
+      return;
+    }
+    outward = null;
+    merging = pr;
+    gate.openTarget(quickTarget(view.repo, pr));
+    notice = null;
+    render();
+    document.getElementById("confirm-merge")?.focus();
+  }
+  function confirmMerge() {
+    if (!view || !merging) return;
+    const pr = merging;
+    if (!gate.canConfirmTarget(quickTarget(view.repo, pr))) return;
+    const blocked = quickMergeBlocked(pr, sent.has(`merge:${pr.number}`));
+    if (blocked) {
+      cancelConfirm();
+      notice = {
+        text: blocked,
+        tone: "warning"
+      };
+      render();
+      return;
+    }
+    const event = quickMergeEvent(view.repo, pr);
+    merging = null;
+    gate.close();
+    send(event, `merge:${pr.number}`, `Merge #${pr.number} sent to the agent: it checks the PR is unchanged, runs ${mergeCommand(view.repo, pr.number, pr.merge_method_default, pr.delete_branch_default, pr.head_sha)} and reports on the card.`);
+    document.getElementById(`pr-${pr.number}`)?.focus();
+  }
+  function mergeDrawer(repo, pr) {
+    const command = mergeCommand(repo, pr.number, pr.merge_method_default, pr.delete_branch_default, pr.head_sha);
+    return h("div", {
+      class: "drawer",
+      role: "group",
+      "aria-labelledby": "confirm-title"
+    }, h("div", {
+      id: "confirm-title",
+      class: "drawer-title"
+    }, `Merge #${pr.number} into ${pr.base} in ${repo}? The agent will run exactly:`), h("pre", {
+      class: "command",
+      "aria-label": "Merge command"
+    }, h("code", null, command)), pr.verdict ? h("p", {
+      class: "verdict-line"
+    }, h("strong", null, "Quick win: "), pr.verdict) : null, h("p", {
+      class: "muted small"
+    }, `--match-head-commit ties the merge to ${pr.head_sha.slice(0, 7)}, the commit the agent reviewed: if anyone pushed since, GitHub refuses. The agent re-checks the PR first.`), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "confirm-merge",
+      class: "primary",
+      onclick: () => confirmMerge()
+    }, "Confirm merge ", h("kbd", null, "Enter")), h("button", {
+      type: "button",
+      onclick: () => cancelConfirm()
+    }, "Cancel ", h("kbd", null, "Esc"))));
+  }
   function runAction(a) {
     const pr = selectedPr();
     if (!view || !pr) {
@@ -1336,6 +1558,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     }
     if (sent.has(`custom:${a.id}:${pr.number}`)) return;
     if (a.outward) {
+      merging = null;
       outward = {
         action: a,
         pr
@@ -1357,12 +1580,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     send(customEvent(action, target(pr)), `custom:${action.id}:${pr.number}`, `Sent: ${action.label} on #${pr.number}.`);
     document.getElementById(`act-${action.id}`)?.focus();
   }
-  function cancelOutward() {
-    const id = outward?.action.id;
+  function cancelConfirm() {
+    const back = outward ? `act-${outward.action.id}` : merging ? "merge" : null;
     outward = null;
+    merging = null;
     gate.close();
     render();
-    if (id) document.getElementById(`act-${id}`)?.focus();
+    if (back) document.getElementById(back)?.focus();
   }
   function select(n, focus = true) {
     const old = selected;
@@ -1451,9 +1675,11 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       }, "Draft")
     ] : null), h("div", {
       class: "chips"
-    }, pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1]) : null, pr.checks ? badge(checksText[pr.checks][0], checksText[pr.checks][1]) : null, pr.review ? badge(reviewText[pr.review][0], reviewText[pr.review][1]) : null, pr.labels.map((l) => h("span", {
+    }, pr.quick_win ? badge("Quick win", "success", "quick") : null, pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1]) : null, pr.checks ? badge(checksText[pr.checks][0], checksText[pr.checks][1]) : null, pr.review ? badge(reviewText[pr.review][0], reviewText[pr.review][1]) : null, pr.labels.map((l) => h("span", {
       class: "label"
-    }, l))), pr.summary ? h("p", {
+    }, l))), pr.verdict ? h("p", {
+      class: "verdict-line"
+    }, pr.verdict) : null, pr.summary ? h("p", {
       class: "summary"
     }, pr.summary) : null, pr.status_detail ? h("p", {
       class: "detail muted"
@@ -1464,9 +1690,10 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     const pr = selectedPr();
     const nextUp = nextPr(ordered(), v.current);
     const busy = (k) => !!pr && sent.has(`${k}:${pr.number}`);
+    const mergeOff = pr ? quickMergeBlocked(pr, busy("merge")) : "Select a PR first.";
     return h("div", {
-      class: `actions${outward || showKeys ? " has-drawer" : ""}`
-    }, showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null, outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelOutward()) : null, notice ? h("div", {
+      class: `actions${outward || merging || showKeys ? " has-drawer" : ""}`
+    }, showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null, outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelConfirm()) : null, merging ? mergeDrawer(v.repo, merging) : null, notice ? h("div", {
       class: `notice ${notice.tone}`,
       role: notice.tone === "danger" ? "alert" : "status"
     }, notice.text) : null, h("div", {
@@ -1478,7 +1705,15 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       "aria-keyshortcuts": "Enter O",
       disabled: !pr || busy("open"),
       onclick: () => open(selectedPr())
-    }, pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")), h("button", {
+    }, pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")), pr?.quick_win ? h("button", {
+      type: "button",
+      id: "merge",
+      class: "merge-quick",
+      "aria-keyshortcuts": "M",
+      disabled: !!mergeOff || !!merging,
+      title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`,
+      onclick: () => openMerge(selectedPr())
+    }, `Merge #${pr.number}`, " ", h("kbd", null, "M")) : null, h("button", {
       type: "button",
       id: "hold",
       "aria-keyshortcuts": "H",
@@ -1508,7 +1743,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       document.getElementById("your-actions")?.focus();
     }), h("p", {
       class: "keys muted small"
-    }, "J/K move \xB7 Enter open \xB7 H hold \xB7 N next \xB7 / filter \xB7 ? keys"));
+    }, `J/K move \xB7 Enter open${quickWins(v.prs).length ? " \xB7 M merge a quick win" : ""} \xB7 H hold \xB7 N next \xB7 / filter \xB7 ? keys`));
   }
   function render() {
     if (!view) return;
@@ -1520,7 +1755,8 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       active.selectionStart,
       active.selectionEnd
     ] : null;
-    const groups = arrange(v.prs, sortNow(), filter);
+    const groups = arrange(v.prs, sortNow(), filter, quickOnly);
+    const wins = quickWins(v.prs).length;
     const shown = groups.flatMap((g) => g.items);
     if (!shown.some((p) => p.number === selected)) selected = shown[0]?.number ?? null;
     const counts = tally(v.prs);
@@ -1557,11 +1793,21 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       class: "warnings"
     }, warnings.join("; ")) : null, h("div", {
       class: "tools"
-    }, sortSelect, filterBox), v.prs.length === 0 ? h("p", {
+    }, sortSelect, filterBox, wins || quickOnly ? h("button", {
+      type: "button",
+      id: "quick-only",
+      class: `quick-toggle${quickOnly ? " on" : ""}`,
+      "aria-pressed": String(quickOnly),
+      title: "Show only the quick wins: reviewed, small, green and low risk; each can be merged from here",
+      onclick: () => {
+        quickOnly = !quickOnly;
+        render();
+      }
+    }, `Quick wins (${wins})`) : null), v.prs.length === 0 ? h("p", {
       class: "empty muted"
     }, "No open pull requests.") : null, v.prs.length && !shown.length ? h("p", {
       class: "empty muted"
-    }, `No PR matches \u201C${filter}\u201D.`) : null, shown.length ? h("div", {
+    }, quickOnly && !filter ? "No quick wins right now." : `No PR matches \u201C${filter}\u201D.`) : null, shown.length ? h("div", {
       class: "list",
       role: "listbox",
       "aria-label": "Pull requests",
@@ -1580,7 +1826,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     if (caret) filterBox.setSelectionRange(caret[0], caret[1]);
   }
   addEventListener("keydown", (e) => {
-    if (gate.keyDown(e.code, e.key, e.repeat) && outward) {
+    if (gate.keyDown(e.code, e.key, e.repeat) && (outward || merging)) {
       e.preventDefault();
       return;
     }
@@ -1604,14 +1850,17 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
-    if (outward) {
+    if (outward || merging) {
       if (key === "Escape") {
         e.preventDefault();
-        cancelOutward();
+        cancelConfirm();
       } else if (key === "Enter") {
         e.preventDefault();
-        if (t.id === "confirm-outward" || t.tagName !== "BUTTON") confirmOutward();
-        else t.click();
+        const id = merging ? "confirm-merge" : "confirm-outward";
+        if (t.id === id || t.tagName !== "BUTTON") {
+          if (merging) confirmMerge();
+          else confirmOutward();
+        } else t.click();
       }
       return;
     }
@@ -1659,6 +1908,9 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     } else if (key === "h") {
       e.preventDefault();
       hold(selectedPr());
+    } else if (key === "m") {
+      e.preventDefault();
+      openMerge(selectedPr());
     } else if (key === "n") {
       e.preventDefault();
       next();
@@ -1685,6 +1937,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       if (!r.ok) {
         view = null;
         outward = null;
+        merging = null;
         gate.inputTarget(null);
         problems(root, "This PR overview panel's input is invalid", r.errors);
         return;
@@ -1712,6 +1965,15 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
           action: a,
           pr
         };
+      } else if (merging) {
+        const pr = next2.prs.find((x) => x.number === merging.number);
+        if (gate.inputTarget(pr && next2.repo === view?.repo ? quickTarget(next2.repo, pr) : null)) {
+          merging = null;
+          notice = {
+            text: "The PR changed while you were confirming. Check it, then Merge again.",
+            tone: "warning"
+          };
+        } else if (pr) merging = pr;
       } else if (sent.size) notice = null;
       sent.clear();
       view = next2;

@@ -1,22 +1,27 @@
 // The user's own actions on a PR (`actions` in pr_overview and pr_decision): buttons the agent
-// adds for options the user asked for ("a Needs QA button"). Each sends one `custom` event; an
-// `outward` one (it changes GitHub or anything off this machine) needs a second, armed confirm
-// that shows what the agent will do. Custom actions never merge: the agent merges only on a
-// pr_decision `merge` event. src/panel_apps.rs checks the same rules at panel_open/update.
+// adds for options the user asked for ("a Needs QA button"). In pr_decision a `toggle` action
+// (the default `mode`) is an option switched on or off that rides along with the next event
+// sent (shared/questions.ts); a `now` action, and every action in pr_overview, sends one
+// `custom` event at once. An `outward` one (it changes GitHub or anything off this machine)
+// needs a second, armed confirm that shows what the agent will do, before it is sent or
+// switched on. Custom actions never merge: the agent merges only on a `merge` event.
+// src/panel_apps.rs checks the same rules at panel_open/update.
 import type { Problems } from "./validate.ts";
 
-export interface CustomAction { id: string; label: string; key?: string; description: string; outward: boolean }
+export const ACTION_MODES = ["toggle", "now"] as const;
+export type ActionMode = typeof ACTION_MODES[number];
+export interface CustomAction { id: string; label: string; key?: string; description: string; outward: boolean; mode: ActionMode }
 
-/** Single keys the built-in PR apps use (pr_decision: M R A O S H; pr_overview: J K O H N).
+/** Single keys the built-in PR apps use (pr_decision: M R A O S H G; pr_overview: J K O H N M).
  * Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain letter or digit
  * never clashes with them. */
-export const RESERVED_KEYS = ["m", "r", "a", "o", "s", "h", "j", "k", "n"] as const;
+export const RESERVED_KEYS = ["m", "r", "a", "o", "s", "h", "j", "k", "n", "g"] as const;
 /** Event names of the built-in actions; a custom id may not reuse one. */
-export const BUILTIN_IDS = ["merge", "request_changes", "ask", "open", "skip", "hold", "next", "custom", "closed", "overflow"] as const;
+export const BUILTIN_IDS = ["merge", "request_changes", "ask", "answers", "open", "skip", "hold", "next", "custom", "closed", "overflow"] as const;
 export const MAX_ACTIONS = 8;
 /** Visible names of the apps' own buttons: a custom label may not look like one of them. */
 export const BUILTIN_LABELS = ["merge", "merge anyway", "confirm merge", "request changes", "ask", "open", "open on github",
-  "github", "skip", "hold", "next", "cancel", "confirm"] as const;
+  "github", "skip", "hold", "next", "cancel", "confirm", "send answers"] as const;
 
 /** A label as the user reads it (same as src/panel_apps.rs `label_key`). */
 export function labelKey(label: string): string {
@@ -33,7 +38,7 @@ export function validateActions(p: Problems, o: Record<string, unknown>): Custom
     const at = `actions[${i}]`;
     const ao = p.object(a, at);
     if (!ao) return;
-    p.known(ao, at, ["id", "label", "key", "description", "outward"]);
+    p.known(ao, at, ["id", "label", "key", "description", "outward", "mode"]);
     const id = p.string(ao, "id", at, { required: true, max: 40 });
     if (id !== undefined) {
       if (!ID.test(id)) { p.add(`${at}.id`, "must be lowercase letters, digits, - or _ (at most 40)"); return; }
@@ -57,7 +62,8 @@ export function validateActions(p: Problems, o: Record<string, unknown>): Custom
     }
     // Required (Muster refuses an action without it); missing here means "ask first", the safe side.
     const outward = p.boolean(ao, "outward", at) ?? true;
-    if (id !== undefined && label !== undefined && description !== undefined) out.push({ id, label, key, description, outward });
+    const mode = p.oneOf(ao, "mode", at, ACTION_MODES) ?? "toggle";
+    if (id !== undefined && label !== undefined && description !== undefined) out.push({ id, label, key, description, outward, mode });
   });
   return out;
 }

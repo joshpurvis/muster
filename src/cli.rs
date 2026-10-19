@@ -1108,6 +1108,7 @@ pub fn rename(d: &Discovery, t: &str, name: &str, tab: bool) -> anyhow::Result<(
 }
 
 pub struct NewOpts {
+    pub profile: Option<String>,
     pub path: std::path::PathBuf,
     pub kind: String,
     pub worktree: bool,
@@ -1122,6 +1123,8 @@ pub struct NewOpts {
 
 /// `muster new`: `workspace.add`, `channel.create`, then `hello` for the new session.
 pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
+    anyhow::ensure!(o.profile.is_none() || o.kind == "claude", "--profile needs --kind claude");
+    let profile = o.profile.as_deref().map(|p| profile_choice(d, p)).transpose()?;
     let abs = std::fs::canonicalize(&o.path).with_context(|| format!("{}", o.path.display()))?;
     if o.kind == "none" && o.prompt.is_some() {
         anyhow::bail!("--prompt needs an agent (not --kind none)");
@@ -1149,6 +1152,7 @@ pub fn new(d: &Discovery, o: NewOpts) -> anyhow::Result<()> {
         },
     };
     let mut p = json!({ "workspace_id": ws_id, "worktree": o.worktree });
+    if let Some(profile) = profile { p["account_profile"] = profile; }
     let set = |p: &mut Value, k: &str, v: Value| {
         p.as_object_mut().expect("object").insert(k.into(), v);
     };
@@ -1486,7 +1490,57 @@ pub fn events(d: &Discovery, as_json: bool, session: Option<&str>, tab: Option<&
 // ----- agents (PLAN.md §10) -----
 
 /// `muster agent new` / `edit` options.
+fn profile_records(d: &Discovery) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
+    Ok(serde_json::from_value(client::rpc(d, "account_profile.list", json!({}))?)?)
+}
+
+fn profile_choice(d: &Discovery, input: &str) -> anyhow::Result<Value> {
+    if input.eq_ignore_ascii_case("default") { return Ok(json!("default")); }
+    let profile = profile_records(d)?.into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(input) || p.id.to_string() == input)
+        .with_context(|| format!("no Claude profile named {input}; see `muster profile ls`"))?;
+    Ok(json!(profile.id))
+}
+
+pub fn profile_list(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
+    let profiles = profile_records(d)?;
+    if json_output { println!("{}", serde_json::to_string_pretty(&profiles)?); }
+    else if profiles.is_empty() { println!("No Claude profiles registered. Set up a directory in Claude Code, then use `muster profile add NAME DIRECTORY`."); }
+    else {
+        for p in profiles { println!("{}\t{}\t{}\t{}", p.id, p.name, if p.enabled { "enabled" } else { "disabled" }, p.config_dir); }
+    }
+    Ok(())
+}
+
+pub fn profile_add(d: &Discovery, name: &str, directory: &std::path::Path) -> anyhow::Result<()> {
+    // Only resolve the directory itself; its contents are Claude Code's responsibility.
+    let directory = crate::paths::expand_tilde(&directory.to_string_lossy());
+    let directory = crate::account_profiles::config_directory(&if directory.is_absolute() {
+        directory.to_string_lossy().into_owned()
+    } else { std::env::current_dir()?.join(directory).to_string_lossy().into_owned() })?;
+    let p = client::rpc(d, "account_profile.create", json!({"name": name, "config_dir": directory}))?;
+    println!("Registered {} ({}). Sign in and verify the account inside Claude Code; Muster has not checked or changed authentication.", p["name"].as_str().unwrap_or(name), p["id"]);
+    Ok(())
+}
+
+pub fn profile_update(d: &Discovery, profile: &str, name: Option<String>, enabled: Option<bool>) -> anyhow::Result<()> {
+    let id = profile_choice(d, profile)?.as_i64().context("Default is inherited behavior, not an editable profile")?;
+    let p = client::rpc(d, "account_profile.update", json!({"id": id, "name": name, "enabled": enabled}))?;
+    println!("{}: {}. Running sessions are unchanged.", p["name"].as_str().unwrap_or(profile), if p["enabled"] == true { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+pub fn profile_default(d: &Discovery, path: &std::path::Path, profile: &str) -> anyhow::Result<()> {
+    let choice = profile_choice(d, profile)?;
+    let path = std::fs::canonicalize(path)?;
+    let ws = client::rpc(d, "workspace.add", json!({"path": path}))?;
+    client::rpc(d, "workspace.set_account_profile", json!({"id": ws["id"], "account_profile": choice}))?;
+    println!("New Claude sessions in {} will default to {profile}. Existing sessions retain their selection.", path.display());
+    Ok(())
+}
+
 pub struct AgentOpts {
+    pub profile: Option<String>,
     pub name: String,
     pub kind: Option<String>,
     pub model: Option<String>,
@@ -1553,7 +1607,10 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
 
 /// `muster agent new`.
 pub fn agent_new(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
-    let b = client::rpc(d, "agent.create", o.params(&Value::Null)?)?;
+    anyhow::ensure!(o.profile.is_none() || o.kind.as_deref().unwrap_or("claude") == "claude", "--profile needs --kind claude");
+    let mut params = o.params(&Value::Null)?;
+    if let Some(profile) = &o.profile { params["account_profile"] = profile_choice(d, profile)?; }
+    let b = client::rpc(d, "agent.create", params)?;
     print_agent("agent", &b, &o.name);
     Ok(())
 }

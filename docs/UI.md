@@ -202,6 +202,24 @@ of the same kind arrives; the next waiting update shows meanwhile.
 - **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
   bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
 
+### Claude profiles
+
+**Settings and more → Claude profiles** registers existing Claude configuration directories,
+renames their labels, enables/disables them, and sets workspace defaults. Setup and login
+happen in the official Claude CLI, never in Muster. The dialog does not inspect authentication
+or settings files. Directory bindings are fixed; disabling does not stop running sessions.
+
+New Tab shows a Claude profile selector for Claude only. Its initial choice is the workspace
+default; explicit **Default** preserves the ordinary inherited Claude environment. New tabs
+and splits opened directly from a Claude tab inherit that tab's selection, including Default.
+The tab tooltip identifies the profile; a named profile also appears in the optional status
+line. These are user labels for directories, not verified account identities.
+
+New Agent can pin a Claude profile. Edit Agent shows the fixed selection without allowing
+it to change, so its saved conversation never accidentally resumes under another profile.
+The account itself is verified with `/status` in Claude Code. Backend versions without
+profile support do not show these controls.
+
 ## Agents panel
 
 Named agents (PLAN.md §10) get a left dock, about 220px wide, in any window. **Alt+G** (or

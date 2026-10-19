@@ -29,11 +29,12 @@ import {
   unattendedWarning,
   upsertMessage,
 } from "../agents.ts";
-import type { Agent, AgentMessage, AgentTemplate, Origin, Permissions } from "../types.ts";
+import type { Agent, AgentMessage, AgentTemplate, Origin, Permissions, ProfileChoice } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
 import { openMenu } from "./Menu.tsx";
 import { PermissionsSection } from "./Permissions.tsx";
+import { ProfileSelect } from "./AccountProfiles.tsx";
 import {
   IconAgents,
   IconChevron,
@@ -314,6 +315,7 @@ const EFFORTS: Record<Agent["kind"], string[]> = {
 };
 
 interface Draft {
+  account_profile: ProfileChoice;
   name: string;
   kind: Agent["kind"];
   model: string;
@@ -326,6 +328,7 @@ interface Draft {
 
 function fromTemplate(t: AgentTemplate): Draft {
   return {
+    account_profile: "default",
     name: t.name,
     kind: t.kind,
     model: t.model ?? "",
@@ -339,6 +342,7 @@ function fromTemplate(t: AgentTemplate): Draft {
 
 function fromAgent(a: Agent): Draft {
   return {
+    account_profile: a.account_profile_id ?? "default",
     name: a.name,
     kind: a.kind,
     model: a.model ?? "",
@@ -351,6 +355,7 @@ function fromAgent(a: Agent): Draft {
 }
 
 const BLANK: Draft = {
+  account_profile: "default",
   name: "",
   kind: "claude",
   model: "",
@@ -422,6 +427,7 @@ export function AgentDialog(
         const a = await rpc.call<Agent>("agent.create", {
           name: d.name.trim(),
           kind: d.kind,
+          account_profile: d.kind === "claude" ? d.account_profile : undefined,
           model: d.model.trim() || undefined,
           effort: d.effort.trim() || undefined,
           persona: d.persona,
@@ -590,6 +596,10 @@ export function AgentDialog(
                 </div>
               </div>
             )}
+            {d.kind === "claude" && <>
+              <ProfileSelect value={d.account_profile} onChange={(choice) => set({ account_profile: choice ?? "default" })} disabled={editing} />
+              {editing && <span class="field-hint">This agent keeps its profile and conversation together. Create a new agent to use another profile.</span>}
+            </>}
             <div class="field-row">
               <label class="field">
                 <span class="field-label">

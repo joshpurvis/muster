@@ -25,10 +25,11 @@ import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
 import { IconBranch, IconCheck, IconCodex, IconFolder, IconSpark, IconTerminal, IconX } from "../icons.tsx";
-import type { Permissions, SessionKind } from "../types.ts";
+import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { AccountProfilesDialog, ProfileSelect, workspaceProfileLabel } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
 import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
@@ -127,6 +128,8 @@ export function Overlays() {
   const o = overlay.value;
   if (!o) return null;
   switch (o.kind) {
+    case "account_profiles":
+      return <AccountProfilesDialog Modal={Modal} close={close} />;
     case "jump":
       return <Jump key={o.initial} initial={o.initial} />;
     case "new_tab":
@@ -436,6 +439,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const home = meta.value.home;
   const [folder, setFolder] = useState(tildify(cwd ?? A.defaultFolder(), home));
   const [agent, setAgent] = useState<SessionKind>(A.lastKind());
+  const [profile, setProfile] = useState<ProfileChoice | undefined>(undefined);
   const [worktree, setWorktree] = useState(!!wtInit);
   const [base, setBase] = useState("");
   const [name, setName] = useState("");
@@ -463,6 +467,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
         worktree: worktree && !notGit,
         base: worktree ? base.trim() || undefined : undefined,
         agent,
+        account_profile: agent === "claude" ? profile : undefined,
         prompt: agent === "claude" || agent === "codex" ? prompt.trim() || undefined : undefined,
         permissions,
       });
@@ -532,6 +537,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
               ))}
             </div>
           </div>
+          {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} inheritLabel={workspaceProfileLabel(known)} />}
           <label class={cx("toggle", notGit && "disabled")}>
             <input
               type="checkbox"

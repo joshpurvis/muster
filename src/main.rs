@@ -1,3 +1,4 @@
+mod account_profiles;
 mod adapters;
 mod agents;
 mod assets;
@@ -190,6 +191,9 @@ muster new --kind claude -- --model haiku")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,
+        /// Claude profile name/id, or "default" for ordinary inherited login behavior.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
         /// What to start in the tab (none: an empty tab). `--agent` is an older alias.
         #[arg(long, alias = "agent", default_value = "claude", value_parser = ["claude", "codex", "shell", "none"])]
         kind: String,
@@ -292,6 +296,11 @@ See docs/ANDROID.md.")]
         #[command(subcommand)]
         action: AgentCmd,
     },
+    /// Manage Muster's references to existing Claude configuration directories. Never logs in.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCmd,
+    },
     /// Ask an agent something and print its reply (starts the agent if needed).
     #[command(after_help = "Examples:\n  muster ask reviewer is the diff in fix-auth safe to merge?\n  git log -5 | muster ask scout -\n\n\
 Exit codes: 0 replied, 1 error or refused, 124 timeout. Inside a muster session the message\n\
@@ -329,11 +338,34 @@ enum DevicesCmd {
 }
 
 #[derive(Subcommand)]
+enum ProfileCmd {
+    /// List registered directories. Account identity is checked in Claude Code with /status.
+    #[command(visible_alias = "list")]
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a directory already set up through the official Claude Code CLI.
+    Add { name: String, directory: PathBuf },
+    /// Change only the display name; the directory binding cannot change.
+    Rename { profile: String, name: String },
+    /// Allow new starts on this profile again.
+    Enable { profile: String },
+    /// Prevent new starts, including restarts. Running processes continue normally.
+    Disable { profile: String },
+    /// Select a workspace's default for new Claude sessions. PROFILE may be "default".
+    Default { path: PathBuf, profile: String },
+}
+
+#[derive(Subcommand)]
 enum AgentCmd {
     /// Create an agent: its home folder (persona file, memory/) under the data dir.
     New {
         /// Agent name: letters, digits, `-`, `_` (unique, case-insensitive).
         name: String,
+        /// Pin this Claude agent to a profile name/id, or "default". Fixed after creation.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
         kind: String,
         /// Model for the agent CLI.
@@ -528,6 +560,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Move { target, window } => cli::move_to_window(d, &target, window),
         Cmd::New {
             path,
+            profile,
             kind,
             worktree,
             base,
@@ -540,6 +573,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             d,
             cli::NewOpts {
                 path: path.unwrap_or_else(|| PathBuf::from(".")),
+                profile,
                 kind,
                 worktree,
                 base,
@@ -553,6 +587,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Agent { action } => match action {
             AgentCmd::New {
                 name,
+                profile,
                 kind,
                 model,
                 effort,
@@ -565,6 +600,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 d,
                 cli::AgentOpts {
                     name,
+                    profile,
                     kind: Some(kind),
                     model,
                     effort,
@@ -589,6 +625,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 cli::AgentOpts {
                     name,
                     kind: None,
+                    profile: None,
                     model,
                     effort,
                     persona: read_persona(persona, persona_file)?,
@@ -601,6 +638,14 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             AgentCmd::Ls { json } => cli::agent_ls(d, json),
             AgentCmd::Rm { name } => cli::agent_rm(d, &name),
             AgentCmd::Start { name, fresh } => cli::agent_start(d, &name, fresh),
+        },
+        Cmd::Profile { action } => match action {
+            ProfileCmd::Ls { json } => cli::profile_list(d, json),
+            ProfileCmd::Add { name, directory } => cli::profile_add(d, &name, &directory),
+            ProfileCmd::Rename { profile, name } => cli::profile_update(d, &profile, Some(name), None),
+            ProfileCmd::Enable { profile } => cli::profile_update(d, &profile, None, Some(true)),
+            ProfileCmd::Disable { profile } => cli::profile_update(d, &profile, None, Some(false)),
+            ProfileCmd::Default { path, profile } => cli::profile_default(d, &path, &profile),
         },
         Cmd::Ask {
             agent,

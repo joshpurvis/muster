@@ -4,6 +4,7 @@
 
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
+  AccountProfile,
   Agent,
   AgentMessage,
   AgentState,
@@ -54,6 +55,8 @@ import {
 export const helloDone = signal(false);
 export const meta = signal({ version: "", home: "", default_shell: "" });
 export const workspaces = signal<Workspace[]>([]);
+export const accountProfiles = signal<AccountProfile[]>([]);
+export const accountProfilesSupported = signal(false);
 export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 
@@ -269,6 +272,7 @@ export function pushRecentFolder(path: string) {
 
 // Overlays (only one modal at a time).
 export type Overlay =
+  | { kind: "account_profiles" }
   | { kind: "jump"; initial: string }
   | { kind: "new_tab"; worktree?: boolean; cwd?: string }
   | { kind: "shortcuts" }
@@ -549,6 +553,8 @@ export function applyHello(h: HelloResult) {
     updateStatus.value = h.updates ?? null;
     windowPrefs.value = h.prefs ?? null;
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
+    accountProfiles.value = h.account_profiles ?? [];
+    accountProfilesSupported.value = Array.isArray(h.account_profiles);
     channels.value = h.channels.filter((c) => !c.archived);
     windowsSupported.value = Array.isArray(h.windows);
     windows.value = [...(h.windows ?? [])].sort((a, b) => a.id - b.id);
@@ -573,6 +579,9 @@ export function applyHello(h: HelloResult) {
 
 export function applyEvent(ev: ServerEvent) {
   switch (ev.event) {
+    case "account_profiles_changed":
+      accountProfiles.value = ev.data;
+      break;
     case "workspace_upserted":
       workspaces.value = upsertBy(workspaces.value, ev.data);
       break;

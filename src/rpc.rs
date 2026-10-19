@@ -93,6 +93,7 @@ pub fn hello(hub: &Hub) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "ui_protocol": crate::assets::UI_PROTOCOL,
         "workspaces": hub.workspaces(),
+        "account_profiles": hub.account_profiles().unwrap_or_default(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
         "windows": hub.windows(),
@@ -177,6 +178,34 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
             let p: P = parse(params)?;
             to_value(hub.add_workspace(p.path, p.name).await?)
+        }
+        "account_profile.list" => {
+            require_local(who, method)?;
+            to_value(hub.account_profiles()?)
+        }
+        "account_profile.create" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { name: String, config_dir: String }
+            let p: P = parse(params)?;
+            to_value(hub.add_account_profile(&p.name, &p.config_dir)?)
+        }
+        "account_profile.update" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { id: i64, name: Option<String>, enabled: Option<bool> }
+            let p: P = parse(params)?;
+            to_value(hub.update_account_profile(p.id, p.name, p.enabled)?)
+        }
+        "workspace.set_account_profile" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { id: WorkspaceId, account_profile: crate::account_profiles::ProfileChoice }
+            let p: P = parse(params)?;
+            to_value(hub.set_workspace_account_profile(p.id, p.account_profile.id())?)
         }
         "workspace.remove" => {
             let p: IdParam<WorkspaceId> = parse(params)?;
@@ -1461,6 +1490,7 @@ mod tests {
         crate::agents::create(
             hub,
             NewAgent {
+                account_profile: None,
                 name: name.into(),
                 kind: None,
                 model: None,

@@ -38,7 +38,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster keys <target> KEY...` | Send keys: `enter`, `esc`, `tab`, `space`, `backspace`, `up/down/left/right`, `ctrl+<x>`, `alt+<x>` (a character or key name), `shift+tab`, `home`, `end`, `delete`, `pageup`, `pagedown`, modified cursor keys (`ctrl+left`, `alt+up`, `ctrl+shift+end`: xterm `CSI 1;m X`), a single character (itself), or `text:<literal>`. Names are case-insensitive. All keys go in one `session.input` with `keys: true`, so unmodified cursor keys follow the terminal's cursor mode. |
 | `muster approve <target> [--always \| --deny]` | Answer the permission prompt. |
 | `muster interrupt <target>` | Interrupt (Esc for agents, Ctrl-C for shells). |
-| `muster new [PATH] [--kind claude\|codex\|shell\|none] [--worktree] [--base REF] [--name NAME] [--window N] [--prompt TEXT] [--json] [-- AGENT_ARGS...]` | New tab in PATH (default: cwd), default kind claude (`--agent` is the flag's old name, still accepted), no worktree unless `--worktree` (`--base` needs it). No `--name`: auto-named. `--window N` puts the tab (the task's first session) in window N, which must exist. No `--window`: inside a muster session, that session's window, else the daemon's default. `--kind none` creates a task without a session: it has no tab, so no window shows it until a session starts in it; the daemon closes a task when its last session is removed, never one that never had one. Arguments after `--` go to the agent CLI of the tab's first session, after muster's permission flags (`channel.create` `extra_args`), and again on its restarts: `muster new . --kind codex --prompt "hi" -- -m gpt-6-sol -c model_reasoning_effort=xhigh`. They need an agent (not `--kind none`), and only an allowlist of flags is accepted (model, effort, resume and similar; see docs/PROTOCOL.md "Channel permissions"): anything that could change the agent's permissions is refused, set the tab's permissions instead. Prints the new session id; `--json` prints `{channel, session}`. |
+| `muster new [PATH] [--profile PROFILE] [--kind claude\|codex\|shell\|none] [--worktree] [--base REF] [--name NAME] [--window N] [--prompt TEXT] [--json] [-- AGENT_ARGS...]` | New tab in PATH (default: cwd), default kind claude (`--agent` is the flag's old name, still accepted), no worktree unless `--worktree` (`--base` needs it). No `--name`: auto-named. `--window N` puts the tab (the task's first session) in window N, which must exist. No `--window`: inside a muster session, that session's window, else the daemon's default. `--kind none` creates a task without a session: it has no tab, so no window shows it until a session starts in it; the daemon closes a task when its last session is removed, never one that never had one. Arguments after `--` go to the agent CLI of the tab's first session, after muster's permission flags (`channel.create` `extra_args`), and again on its restarts: `muster new . --kind codex --prompt "hi" -- -m gpt-6-sol -c model_reasoning_effort=xhigh`. They need an agent (not `--kind none`), and only an allowlist of flags is accepted (model, effort, resume and similar; see docs/PROTOCOL.md "Channel permissions"): anything that could change the agent's permissions is refused, set the tab's permissions instead. Prints the new session id; `--json` prints `{channel, session}`. |
 | `muster move <target> --window N` | Show the session (tab) in window N (`session.set_window`, with `from_window_id` so a concurrent move isn't overridden). Window N must exist. The session stays in its tab (task); the task's window follows once all its sessions are in N (or none is left in the task's window). Prints `id  tab/name: window A -> N`. The window isn't opened or raised. |
 | `muster rename <target> <name> [--tab]` | Rename the session, or its tab with `--tab`. |
 | `muster kill <target>` / `muster restart <target>` | Kill or restart the session. |
@@ -46,7 +46,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster pair [--name N] [--scope view\|interact\|manage] [--ttl SECS] [--url URL]` | Pair a phone (docs/ANDROID.md). Prints the `tailscale serve` commands when tailscale doesn't already proxy to this daemon's port, a QR code of `https://<host>/m/#pair=<code>` (needs `qrencode`), and the short code, then waits: `paired: <name> (device N)` and exit 0, or exit 1 when the code is burnt (three wrong codes), replaced or expired. Default scope `interact` (approve, prompt, keys); `manage` also opens and closes tabs. `--url` overrides the tailscale name. |
 | `muster devices [--json]` | Paired devices: `ID  NAME  ACCESS  LAST`. Never starts the daemon. |
 | `muster devices revoke <id\|name>` / `--all` | Revoke: the device's connections close at once and it must pair again. |
-| `muster agent new <name> [--kind claude\|codex] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Create an agent (PLAN.md §10, `agent.create`): its home dir `<data>/agents/<name>/` with `CLAUDE.md` / `AGENTS.md` from the persona and `memory/`. Default kind claude. `--accepts` is a comma list of `human`, `schedule`, `webhook` (default: `human` for claude, all three for codex). `--autostart`: start it whenever the daemon starts. `--claude-mode plan\|default\|accept_edits\|bypass` / `--codex-sandbox read_only\|workspace_write\|workspace_write_network\|full_access`: its tab's profile (the other half keeps its default). Prints `agent NAME (KIND, accepts …): home DIR`. |
+| `muster agent new <name> [--profile PROFILE] [--kind claude\|codex] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Create an agent (PLAN.md §10, `agent.create`): its home dir `<data>/agents/<name>/` with `CLAUDE.md` / `AGENTS.md` from the persona and `memory/`. Default kind claude. `--accepts` is a comma list of `human`, `schedule`, `webhook` (default: `human` for claude, all three for codex). `--autostart`: start it whenever the daemon starts. `--claude-mode plan\|default\|accept_edits\|bypass` / `--codex-sandbox read_only\|workspace_write\|workspace_write_network\|full_access`: its tab's profile (the other half keeps its default). Prints `agent NAME (KIND, accepts …): home DIR`. |
 | `muster agent edit <name> [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart on\|off] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Change an agent (`agent.update`): only the given fields change; an empty `--model ""` / `--effort ""` clears it. A new persona rewrites its persona file (memory/ untouched). One permission flag keeps the other half as it is. Model, effort and permissions apply from its next start. Prints `updated NAME (…)`. |
 | `muster agent ls [--json]` (alias `list`) | `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`. `--json` prints `agent.list`. |
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
@@ -78,3 +78,50 @@ Output: human tables go to stdout, errors to stderr as `muster: <message>`. Exit
 `send --wait` on a shell: shells only show as working while a foreground job runs (sampled
 every 250 ms), so a command that finishes at once is taken as started after about 1.5 s
 (agents: 10 s).
+
+## Claude profiles
+
+Profiles are Muster-owned names and references to existing Claude configuration directories.
+Muster never logs in, opens authentication files, copies configuration, or deletes a profile
+directory. Set up each subscription login directly in the official Claude Code CLI first:
+
+```sh
+CLAUDE_CONFIG_DIR="$HOME/.claude-personal" claude
+CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude
+```
+
+Then register and select the directories:
+
+```sh
+muster profile add Personal "$HOME/.claude-personal"
+muster profile add Work "$HOME/.claude-work"
+muster profile ls --json
+muster new . --profile Work
+muster profile default . Personal
+muster new . --profile default
+muster agent new reviewer --profile Work
+```
+
+`--profile` accepts an exact name (case-insensitive), numeric profile ID, or `default`.
+Without it, `muster new` inherits the calling Claude session's profile before the workspace
+default. Outside a Claude session it uses the workspace default, or the ordinary inherited
+Claude environment. `--profile default` explicitly selects that ordinary environment. The
+flag is only valid for Claude. Named agents default to the ordinary environment and keep
+one fixed profile for their lifetime, including fresh conversations and replacement sessions.
+
+| Command | Meaning |
+|---|---|
+| `muster profile ls [--json]` | List references, including disabled profiles. Does not check login status. |
+| `muster profile add NAME DIRECTORY` | Register an existing directory. Relative CLI paths are resolved locally; duplicate canonical paths are refused. |
+| `muster profile rename PROFILE NAME` | Change the display label. Directory and session bindings stay fixed. |
+| `muster profile disable PROFILE` | Prevent new launches and restarts; running sessions remain usable. |
+| `muster profile enable PROFILE` | Allow new launches again. |
+| `muster profile default PATH PROFILE` | Set a workspace default for future Claude tasks; `default` clears it. |
+
+Use `/status` inside Claude Code to verify the actual account. A profile label identifies a
+directory, not a checked identity. Known authentication or endpoint environment overrides
+block named-profile launches with an explanation; no values are printed and nothing is
+silently unset. Existing/default sessions preserve their original environment behavior.
+Profile bindings survive session restart and backend recovery. Changing workspace defaults
+never changes an existing session. To use a different directory, create a new session or agent.
+Usage reporting, automatic placement, and account handoff are not implemented yet.

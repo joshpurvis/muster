@@ -101,6 +101,7 @@ impl Mock {
         d.workspaces.insert(
             1,
             Workspace {
+                account_profile_id: None,
                 id: 1,
                 name: "repo".into(),
                 path: "/repo".into(),
@@ -1405,6 +1406,7 @@ fn add_shell_and_other_workspace(m: &Mock) {
     d.workspaces.insert(
         2,
         Workspace {
+            account_profile_id: None,
             id: 2,
             name: "other".into(),
             path: "/other".into(),
@@ -1632,6 +1634,7 @@ fn with_agents(m: &Mock) {
     d.workspaces.insert(
         2,
         Workspace {
+            account_profile_id: None,
             id: 2,
             name: "agents".into(),
             path: "/data/agents".into(),
@@ -1650,6 +1653,7 @@ fn with_agents(m: &Mock) {
         d.live.insert(id);
         d.tokens.insert(tok.into(), id);
         d.agents.push(Agent {
+            account_profile_id: None,
             id: id as i64,
             name: name.into(),
             kind,

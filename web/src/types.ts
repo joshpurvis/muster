@@ -8,6 +8,18 @@ export type SessionId = number;
 
 export type SessionKind = "claude" | "codex" | "shell";
 
+/** A reference to a directory managed exclusively by Claude Code. */
+export interface AccountProfile {
+  id: number;
+  name: string;
+  config_dir: string;
+  enabled: boolean;
+  created_at: number;
+}
+
+/** Omitted: inherit. "default": explicitly use the ordinary inherited Claude environment. */
+export type ProfileChoice = number | "default";
+
 export type AgentState =
   | "starting"
   | "working"
@@ -19,6 +31,7 @@ export type AgentState =
   | "exited";
 
 export interface Workspace {
+  account_profile_id?: number | null;
   id: WorkspaceId;
   name: string;
   path: string;
@@ -79,6 +92,7 @@ export const DEFAULT_PERMISSIONS: Permissions = {
 };
 
 export interface SessionInfo {
+  account_profile_id?: number | null;
   id: SessionId;
   channel_id: ChannelId;
   kind: SessionKind;
@@ -135,6 +149,7 @@ export type Origin = "human" | "schedule" | "webhook";
 
 /** A named agent (`agent.list`, `agent_upserted`; src/agents.rs `agent_json`). */
 export interface Agent {
+  account_profile_id?: number | null;
   id: number;
   name: string;
   kind: "claude" | "codex";
@@ -191,6 +206,7 @@ export interface AgentTemplate {
 }
 
 export type ServerEvent =
+  | { event: "account_profiles_changed"; data: AccountProfile[] }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
   | { event: "channel_upserted"; data: Channel }
@@ -217,6 +233,7 @@ export interface WindowPrefs {
 }
 
 export interface HelloResult {
+  account_profiles?: AccountProfile[];
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
   version: string;

@@ -1,6 +1,7 @@
 // Optional bottom line: the focused tab's task name, folder and branch (click copies), the number
 // of tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
-import { focusedTask, meta, needsYou, windowSessions, workspaceById } from "../state.ts";
+import { accountProfiles, focusedSession, focusedTask, meta, needsYou, windowSessions, workspaceById } from "../state.ts";
+import { profileName } from "../account_profiles.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { IconBranch, IconFolder } from "../icons.tsx";
@@ -60,6 +61,11 @@ export function StatusLine() {
         </button>
       )}
       {count > 0 && <span class="sl-item sl-count">{count === 1 ? "1 tab" : `${count} tabs`}</span>}
+      {focusedSession.value?.kind === "claude" && focusedSession.value.account_profile_id != null && (
+        <span class="sl-item" data-tip="Claude configuration profile · verify the account with /status in Claude Code">
+          {profileName(accountProfiles.value, focusedSession.value.account_profile_id)}
+        </span>
+      )}
       <span class="sl-space" />
       {n > 0 && (
         <button

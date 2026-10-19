@@ -3,6 +3,7 @@
 // dragged, the focused strip shows "→ Window N / → New window" drop targets (MoveTargets).
 import { useRef } from "preact/hooks";
 import {
+  accountProfilesSupported,
   focusedSession,
   overlay,
   prefs,
@@ -40,6 +41,9 @@ function moreMenu(): MenuItem[] {
       })),
     },
     { label: "Status line", checked: p.statusLine, run: () => A.toggleStatusLine() },
+    ...(accountProfilesSupported.value
+      ? [{ label: "Claude profiles…", run: () => (overlay.value = { kind: "account_profiles" }) }]
+      : []),
     {
       label: "Terminal gets Alt keys",
       checked: p.altToTerminal,

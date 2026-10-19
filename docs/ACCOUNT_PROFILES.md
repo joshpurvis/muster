@@ -1,6 +1,7 @@
 # Claude account profiles and machine placement
 
-Status: proposed, 2026-10-18. Implementation is deferred; this expands the account and
+Status: local profiles implemented, 2026-10-18. Usage reporting,
+placement suggestions and handoff remain deferred. This expands the account and
 quota-aware scheduling ideas in [PLAN.md](../PLAN.md). The existing terminal backend remains
 the starting point.
 
@@ -12,6 +13,52 @@ offer a deliberate handoff when an account reaches a limit.
 Keep machine selection separate from account selection. A second machine is useful for
 execution capacity and environment differences, but is not required to use a second account.
 Neither an inference proxy nor an Agent SDK migration is required for this plan.
+
+Implementation constraint: run the official Claude Code normally. Muster manages only its
+own profile labels and directory references, and selects a directory through the child
+process environment. It never opens authentication files, invokes login or logout, or
+creates, copies, edits, deletes, refreshes, or inspects provider credentials. The human signs
+in and verifies the active account inside Claude Code. A profile identifies a configuration
+directory, not a verified account identity.
+
+## Local implementation
+
+- Register an **existing** configuration directory through `muster profile add NAME DIR` or
+  **Settings and more → Claude profiles**. Muster stores its canonical path, label, enabled
+  state and ID in its own database. Directory contents are never opened. Duplicate paths
+  (including symlink aliases) are refused. Renaming changes only the label; changing the path
+  requires registering a new profile. Disable retains historical references and never stops
+  a running process. There is no profile-directory deletion operation.
+- Select a profile with `muster new --profile NAME`, the New Tab dialog, or
+  `muster agent new NAME --profile PROFILE`. Named-agent profile bindings are fixed at
+  creation, including for replacement sessions and `--fresh`. Create another named agent
+  to use another profile; switching an existing agent is part of the deferred handoff work.
+- New Claude sessions resolve selection in this order: explicit choice, calling/parent
+  Claude session, workspace default, ordinary inherited Claude environment. Named agents
+  always supply their own pinned choice. `"default"` explicitly chooses the ordinary
+  environment; an omitted/null API field inherits. Non-Claude sessions reject a profile
+  choice and do not apply workspace profile defaults.
+- The resolved profile ID is persisted on the session. Restart, backend recovery and moving
+  a session to another workspace do not re-resolve it. A disabled, missing or redirected
+  directory blocks a launch; restart checks before interrupting the previous run. An
+  already running named agent remains usable after its profile is disabled.
+- Known inherited authentication/endpoint overrides are refused for named-profile launches,
+  with errors containing variable names only. Muster never unsets them silently or reads
+  settings files to determine effective authentication. Explicit Default preserves existing
+  behavior. Profile/project/managed settings and external login changes still belong to
+  Claude Code: the human verifies the active account with `/status`.
+
+The supported isolation target is a Claude subscription login in each directory. Claude's
+documentation notes that **keyless Console sign-ins are not isolated by `CLAUDE_CONFIG_DIR`**.
+Muster does not claim to verify which authentication method or account a directory uses.
+
+Implementation: `src/account_profiles.rs`, store migration v13, the shared hub launch path,
+CLI/RPC and desktop controls. The terminal-host protocol is unchanged. Tests use only empty
+or synthetic profile directories and fake Claude processes. Run
+`bash scripts/isolated.sh python3 scripts/account-profiles-smoke.py --browser` after building
+the workspace binaries and web assets; it creates its own backend, data, home and port.
+
+The rest of this document describes the full roadmap, including deferred features.
 
 ## Account profiles
 
@@ -55,6 +102,9 @@ continue to work through the existing launch path.
 An account group is optional initially. It becomes useful if the same account is configured
 on multiple machines: those profiles share account limits and must not appear as independent
 capacity. Associate them explicitly rather than inspecting credential files.
+Add this association before capacity recommendations: two profiles on the same machine can
+also use the same account. A user-reported login change must invalidate its usage observations
+and account-group membership; a directory binding is not proof of account identity.
 
 Persist the selected profile on the session so restarting it does not silently change
 accounts. A disabled or missing profile requires a visible selection or setup action. Existing
@@ -85,11 +135,20 @@ Consequently:
 - An elapsed reset invalidates the old window; it does not establish fresh zero usage.
 - Reports from sessions using the same account are not added together. Use the newest
   applicable observation, preserving each window's timestamp when reports are partial.
+  Store callback receipt time separately from evidence of fresh provider data. A cached
+  redraw from an idle session must not replace a newer observation or renew its freshness.
+  If the source cannot establish freshness, retain that uncertainty instead of labeling it
+  as newly fetched data. Attribute callbacks to the specific run as well as its session.
 - Percentages express headroom within a plan, not interchangeable token balances across
   plans. Model-specific limits and activity outside Muster can affect availability.
 
 An unused profile may have no current observation. Accept that limitation in the first
 version instead of extracting OAuth tokens or making background inference calls to probe it.
+
+Before adding the reporter, prototype composition with existing status-line commands and
+settings precedence. Preserve their stdin and visible output, bound reporting time, handle
+cancellation, and keep reporter failure from breaking the user's status line. Coalesce
+duplicate telemetry and keep it out of agent activity-state detection.
 
 ## Choosing where a new task runs
 
@@ -132,6 +191,12 @@ and an explicit handoff:
    model response from the exhausted account to create this context.
 3. Launch Claude Code under the selected profile in the same worktree and provide the
    handoff context. Link the old and new sessions and record the account change.
+
+Implement these as durable, retryable states: context prepared, original run stopped and
+verified, replacement launch pending, replacement confirmed. An interrupted turn is not
+proof that background processes have exited. Reuse the existing process-cleanup checks and
+retain an uncertain launch for reconciliation instead of retrying it as a second process.
+A failed replacement leaves the files and handoff context available for deliberate retry.
 
 Separate profiles have separate conversation histories. Do not assume `--resume` can move a
 conversation between accounts, or copy profile directories to make it work. Full transcript

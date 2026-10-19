@@ -4,6 +4,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { PaneNode } from "./tree.ts";
 import {
+  accountProfiles,
   altHeld,
   channelById,
   confirmClose,
@@ -17,6 +18,7 @@ import {
   workspaceById,
 } from "../state.ts";
 import type { Channel, SessionInfo, SessionKind } from "../types.ts";
+import { profileName } from "../account_profiles.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -521,6 +523,7 @@ function GroupTab(
   const home = meta.value.home;
   const tip = [
     tabText(label),
+    s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
     s.state_detail || STATE_LABEL[s.state],

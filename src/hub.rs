@@ -35,6 +35,7 @@ use crate::worktree;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ServerEvent {
+    AccountProfilesChanged(Vec<crate::account_profiles::AccountProfile>),
     WorkspaceUpserted(Workspace),
     WorkspaceRemoved {
         id: WorkspaceId,
@@ -81,6 +82,9 @@ pub enum ServerEvent {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateChannel {
+    /// Omitted: inherit from the calling Claude session, then workspace. "default": opt out.
+    #[serde(default)]
+    pub account_profile: Option<crate::account_profiles::ProfileChoice>,
     pub workspace_id: WorkspaceId,
     /// None or blank: auto-named (see `derive_name`).
     #[serde(default)]
@@ -129,6 +133,8 @@ fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permi
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpawnSession {
+    #[serde(default)]
+    pub account_profile: Option<crate::account_profiles::ProfileChoice>,
     pub channel_id: ChannelId,
     pub kind: SessionKind,
     pub name: Option<String>,
@@ -814,6 +820,74 @@ impl Hub {
 
     // ----- queries -----
 
+    pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
+        self.store.account_profiles()
+    }
+
+    pub fn account_profile(&self, id: i64) -> anyhow::Result<crate::account_profiles::AccountProfile> {
+        self.account_profiles()?.into_iter().find(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no such Claude profile: {id}; choose an available profile explicitly"))
+    }
+
+    pub fn add_account_profile(&self, name: &str, directory: &str) -> anyhow::Result<crate::account_profiles::AccountProfile> {
+        let name = crate::account_profiles::clean_name(name)?;
+        let directory = crate::account_profiles::config_directory(directory)?;
+        let id = self.store.insert_account_profile(&name, &directory)?;
+        self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        self.account_profile(id)
+    }
+
+    pub fn update_account_profile(&self, id: i64, name: Option<String>, enabled: Option<bool>) -> anyhow::Result<crate::account_profiles::AccountProfile> {
+        let name = name.as_deref().map(crate::account_profiles::clean_name).transpose()?;
+        self.store.update_account_profile(id, name.as_deref(), enabled)?;
+        self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        self.account_profile(id)
+    }
+
+    pub fn apply_account_profile(&self, id: Option<i64>, env: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
+        if let Some(id) = id { crate::account_profiles::apply_environment(&self.account_profile(id)?, env)?; }
+        Ok(())
+    }
+
+    pub fn check_account_profile(&self, id: Option<i64>) -> anyhow::Result<()> {
+        self.apply_account_profile(id, &mut std::env::vars().collect())
+    }
+
+    /// Resolve exactly once at creation. Restarts use SessionInfo's pinned ID; no fallback.
+    /// Named agents pass their own explicit pinned choice, including Default.
+    pub fn resolve_account_profile(&self, kind: SessionKind,
+        choice: Option<crate::account_profiles::ProfileChoice>, parent: Option<SessionId>, workspace: WorkspaceId,
+    ) -> anyhow::Result<Option<i64>> {
+        if kind != SessionKind::Claude {
+            anyhow::ensure!(choice.is_none(), "account_profile is only supported for Claude sessions");
+            return Ok(None);
+        }
+        let inherited = parent.and_then(|id| self.session(id))
+            .filter(|s| s.kind == SessionKind::Claude)
+            .map(|s| s.account_profile_id);
+        let id = choice.map(|c| c.id()).or(inherited)
+            .unwrap_or_else(|| self.workspace(workspace).and_then(|w| w.account_profile_id));
+        self.check_account_profile(id)?;
+        Ok(id)
+    }
+
+    pub fn set_workspace_account_profile(&self, id: WorkspaceId, profile: Option<i64>) -> anyhow::Result<Workspace> {
+        // Default selection may be saved while the profile needs login, but it must exist
+        // and be enabled. Directory metadata and launch environment are checked at launch.
+        if let Some(profile) = profile {
+            anyhow::ensure!(self.account_profile(profile)?.enabled, "Claude profile is disabled");
+        }
+        let ws = {
+            let mut inner = self.inner.lock();
+            let ws = inner.workspaces.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such workspace: {id}"))?;
+            self.store.set_workspace_account_profile(id, profile)?;
+            ws.account_profile_id = profile;
+            ws.clone()
+        };
+        self.emit(ServerEvent::WorkspaceUpserted(ws.clone()));
+        Ok(ws)
+    }
+
     pub fn workspaces(&self) -> Vec<Workspace> {
         self.inner.lock().workspaces.values().cloned().collect()
     }
@@ -1439,6 +1513,7 @@ impl Hub {
                 None => self.store.insert_workspace(&name, &path_s, is_git, created_at)?,
             };
             let ws = Workspace {
+                account_profile_id: None,
                 id,
                 name,
                 path: path_s,
@@ -1490,6 +1565,14 @@ impl Hub {
         let ws = self
             .workspace(req.workspace_id)
             .ok_or_else(|| anyhow::anyhow!("no such workspace: {}", req.workspace_id))?;
+        // Validate and pin before creating any channel or worktree.
+        let account_profile = match req.agent {
+            Some(kind) => self.resolve_account_profile(kind, req.account_profile, req.from_session, ws.id)?,
+            None => {
+                anyhow::ensure!(req.account_profile.is_none(), "account_profile needs a Claude agent");
+                None
+            }
+        };
         if let Some(w) = req.window_id
             && !self.inner.lock().windows.contains_key(&w)
         {
@@ -1626,6 +1709,7 @@ impl Hub {
         }
         if let Some(kind) = req.agent {
             let spawn = SpawnSession {
+                account_profile: (kind == SessionKind::Claude).then(|| crate::account_profiles::ProfileChoice::pinned(account_profile)),
                 channel_id: ch.id,
                 kind,
                 name: None,
@@ -1637,7 +1721,7 @@ impl Hub {
                 parent_id: None,
                 // The channel's window (just placed above).
                 window_id: None,
-                from_session: None,
+                from_session: req.from_session,
                 prov: req.prov,
                 agent_id: None,
             };
@@ -2332,6 +2416,8 @@ impl Hub {
         let ch = self
             .channel(req.channel_id)
             .ok_or_else(|| anyhow::anyhow!("no such channel: {}", req.channel_id))?;
+        let account_profile_id = self.resolve_account_profile(req.kind, req.account_profile,
+            req.parent_id.or(req.from_session), ch.workspace_id)?;
         crate::adapters::check_extra_args(req.kind, &req.extra_args)?;
         if ch.archived {
             anyhow::bail!("channel {} is archived", ch.id);
@@ -2387,6 +2473,7 @@ impl Hub {
                 id: 0,
                 channel_id: ch.id,
                 kind: req.kind,
+                account_profile_id,
                 name,
                 cwd: cwd.to_string_lossy().to_string(),
                 state: AgentState::Starting,
@@ -2464,6 +2551,7 @@ impl Hub {
                     serde_json::json!({
                         "session_id": id,
                         "kind": req.kind,
+                        "account_profile_id": info.account_profile_id,
                         "name": info.name,
                         "parent_id": req.parent_id,
                     }),
@@ -2627,6 +2715,7 @@ impl Hub {
         let mut complete_env: BTreeMap<String, String> = std::env::vars().collect();
         for key in INHERITED_SESSION_MARKERS { complete_env.remove(*key); }
         complete_env.extend(env);
+        self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
         let launch = SpawnSpec {
             run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
             env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
@@ -2775,6 +2864,9 @@ impl Hub {
     /// The replay buffer is cleared.
     pub async fn restart_session(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
         self.ensure_not_shutting_down()?;
+        // Fail before interrupting a live process if its selected profile cannot start.
+        let info = self.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        self.check_account_profile(info.account_profile_id)?;
         {
             let mut g = self.inner.lock();
             let e = g
@@ -2875,6 +2967,7 @@ impl Hub {
                     serde_json::json!({
                         "session_id": id,
                         "kind": info.kind,
+                        "account_profile_id": info.account_profile_id,
                         "name": info.name,
                         "parent_id": info.parent_id,
                         "restart": true,

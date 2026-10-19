@@ -114,10 +114,10 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], home, default_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], windows[], account_profiles[], home, default_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running or starting session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. From that re-check until the delete finishes, the directory is reserved: starting or restarting a session whose cwd is inside it fails. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
@@ -128,7 +128,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.post` | `{id, text}` | `Event` (a `note`) |
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
 | `channel.diff` | `{id}` | `{diff: string}` |
-| `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?, from_session?}` | `SessionInfo`. `from_session` (as for `channel.create`): the new session starts with that session's provenance; a Claude session from a non-human chain is refused. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
+| `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?, from_session?, account_profile?}` | `SessionInfo`. `from_session` (as for `channel.create`): the new session starts with that session's provenance; a Claude session from a non-human chain is refused. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
 | `session.attach` | `{id, replay_bytes?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start (the phone asks for 256 KiB instead of the whole 2 MiB buffer); the replays that follow a restart or a lagging client use the same limit. |
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
@@ -394,6 +394,44 @@ and Codex notify's `thread-id` (the agent's conversation id), UserPromptSubmit's
 `[muster msg …]` envelope) and the turn's final message (Stop `last_assistant_message`, Codex
 notify `last-assistant-message`), which is stored as the reply in `agent_messages`. `muster hook`
 cuts payload strings at 4000 bytes, those final-message fields at 64 KiB.
+
+## Claude account profiles
+
+`AccountProfile` is `{id, name, config_dir, enabled, created_at}`. It references an existing
+canonical directory, never credentials. `hello.account_profiles` and
+`account_profiles_changed` carry the complete list. These fields are additive; older clients
+may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nullable
+`account_profile_id`. Migration v13 leaves all existing records null.
+
+| Method | Params | Result |
+|---|---|---|
+| `account_profile.list` | `{}` | `AccountProfile[]` |
+| `account_profile.create` | `{name, config_dir}` | `AccountProfile`; requires an existing directory, rejects duplicate canonical paths and case-insensitive duplicate names |
+| `account_profile.update` | `{id, name?, enabled?}` | `AccountProfile`; the directory is immutable; disabling leaves running processes alone |
+| `workspace.set_account_profile` | `{id, account_profile}` | `Workspace`; profile ID or `"default"`; affects only future selection |
+
+These management methods are local-client-only (not available to paired devices or MCP).
+There is no login, token, configuration-file copy, or directory deletion API.
+
+`channel.create`, `session.spawn`, and `agent.create` accept `account_profile?: number |
+"default"`. It is valid only for Claude. For new sessions, absent/null inherits from a Claude
+parent/caller, then the workspace default; explicit `"default"` bypasses inheritance.
+`agent.create` instead defaults to ordinary inherited Claude behavior and permanently pins
+its choice on the agent record. `agent.update` cannot change it.
+
+Selection is resolved before creation and saved on the session. Restarts never re-resolve
+workspace defaults. Named-agent replacement sessions use the agent's pinned selection and
+resume ID. Missing/disabled profiles, unavailable or redirected directories, and known
+inherited authentication/endpoint conflicts fail rather than falling back. Restart performs
+this preflight before interrupting the previous run. Error messages name conflicting
+environment variables without their values. Default/null-pinned sessions retain the legacy
+environment behavior, including any inherited `CLAUDE_CONFIG_DIR`.
+
+The launcher sets only `CLAUDE_CONFIG_DIR` in the selected child's existing environment and
+uses the ordinary adapter arguments. It never opens profile contents or invokes Claude auth
+commands. Configuration and account changes made outside Muster remain Claude Code's
+responsibility; a profile ID is not a verified account identity. The terminal host's complete
+environment field already carries the selection, so no host wire change is needed.
 
 ## Session environment
 

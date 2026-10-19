@@ -161,6 +161,10 @@ CLAUDE_CONFIG_DIR="$HOME/.claude-personal" claude
 CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude
 ```
 
+For the default `~/.claude` folder, sign in with plain `claude` (or `env -u CLAUDE_CONFIG_DIR
+claude`) instead: Muster starts that profile's sessions without `CLAUDE_CONFIG_DIR`, and setting
+it, even to `~/.claude`, makes Claude Code keep a separate `~/.claude/.claude.json`.
+
 Then register and select the directories:
 
 ```sh

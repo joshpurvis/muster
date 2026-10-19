@@ -144,9 +144,8 @@ pub fn apply_environment(
     );
     // Claude Code keeps its state file in $HOME/.claude.json only while CLAUDE_CONFIG_DIR is
     // unset; set (even to the default folder) it moves to $CLAUDE_CONFIG_DIR/.claude.json. So a
-    // profile at the default folder launches exactly like Default, minus any inherited value.
-    let home = env.get("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from);
-    if is_default_folder(&canonical, home.as_deref()) {
+    // profile at the default folder launches with the variable removed (any inherited one too).
+    if launch_home(env).is_some_and(|home| is_default_folder(&canonical, &home)) {
         env.remove("CLAUDE_CONFIG_DIR");
     } else {
         env.insert("CLAUDE_CONFIG_DIR".into(), profile.config_dir.clone());
@@ -154,12 +153,27 @@ pub fn apply_environment(
     Ok(())
 }
 
+/// The HOME a child launched with `env` resolves `~/.claude` against: its own HOME, or the
+/// daemon user's home when the variable is unset. None when that HOME is empty or relative:
+/// the child would resolve it against its own working directory, which differs from the
+/// daemon's, so such a HOME never identifies the default folder.
+pub fn launch_home(env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+    let home = match env.get("HOME") {
+        Some(home) => std::path::PathBuf::from(home),
+        None => crate::paths::home_dir(),
+    };
+    home.is_absolute().then_some(home)
+}
+
 /// Whether `dir` is the folder Claude Code uses when CLAUDE_CONFIG_DIR is unset:
-/// `$HOME/.claude` (`home`, else the daemon's home), compared as canonical paths so a symlink
-/// or trailing slash still matches. A CLAUDE_CONFIG_DIR in the daemon's own environment does
-/// not count: Claude Code's state file only stays in $HOME when the variable is unset.
-pub fn is_default_folder(dir: &Path, home: Option<&Path>) -> bool {
-    let home = home.map(Path::to_path_buf).unwrap_or_else(crate::paths::home_dir);
+/// `home/.claude`, compared as canonical paths so a symlink or trailing slash still matches.
+/// `home` must be absolute (see [`launch_home`]); a relative one never matches. A
+/// CLAUDE_CONFIG_DIR in the daemon's own environment does not count: Claude Code's state file
+/// only stays in $HOME when the variable is unset.
+pub fn is_default_folder(dir: &Path, home: &Path) -> bool {
+    if !home.is_absolute() {
+        return false;
+    }
     match (std::fs::canonicalize(dir), std::fs::canonicalize(home.join(".claude"))) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -297,8 +311,28 @@ mod tests {
         // The default folder of a different HOME is just another folder.
         let env = launch(&profile(&default), other_home.0.display().to_string());
         assert_eq!(env["CLAUDE_CONFIG_DIR"], default.canonicalize().unwrap().to_str().unwrap());
-        assert!(is_default_folder(&default, Some(&home.0)));
-        assert!(!is_default_folder(&home.0.join("missing"), Some(&home.0)));
+        assert!(is_default_folder(&default, &home.0));
+        assert!(!is_default_folder(&home.0.join("missing"), &home.0));
+
+        // A relative or empty HOME never identifies the default folder, whatever the cwd it
+        // would resolve against: the profile keeps its explicit CLAUDE_CONFIG_DIR.
+        let p = profile(&default);
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let relative = format!("{up}{}", h.trim_start_matches('/'));
+        assert_eq!(std::fs::canonicalize(std::path::Path::new(&relative).join(".claude")).unwrap(),
+            std::fs::canonicalize(&default).unwrap(), "the relative HOME resolves to the fixture from this cwd");
+        for home in [relative, "home".into(), ".".into(), String::new()] {
+            assert_eq!(launch(&p, home.clone())["CLAUDE_CONFIG_DIR"], p.config_dir, "HOME {home:?}");
+        }
+        assert!(!is_default_folder(&default, Path::new(".")));
+        // Unset HOME falls back to the daemon user's (absolute) home, which is not the fixture.
+        let mut env = BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), "/previous".to_string())]);
+        apply_environment(&p, &mut env).unwrap();
+        assert_eq!(env["CLAUDE_CONFIG_DIR"], p.config_dir);
+        assert!(launch_home(&BTreeMap::new()).is_none_or(|h| h.is_absolute()));
+        assert_eq!(launch_home(&BTreeMap::from([("HOME".to_string(), "rel".to_string())])), None);
+        assert_eq!(launch_home(&BTreeMap::from([("HOME".to_string(), String::new())])), None);
     }
 
     #[test]

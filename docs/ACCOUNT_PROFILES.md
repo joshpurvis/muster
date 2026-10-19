@@ -87,10 +87,14 @@ accounts at the same time.
 
 A profile whose folder is Claude Code's default, `$HOME/.claude` (compared as canonical paths,
 so a symlink or trailing slash still matches), is the exception: its sessions start with
-`CLAUDE_CONFIG_DIR` removed, exactly like Default. Setting it, even to `~/.claude`, makes Claude
-Code keep a separate state file at `~/.claude/.claude.json` instead of `~/.claude.json`. A
-`CLAUDE_CONFIG_DIR` in the daemon's own environment does not make its folder "the default":
-a profile there gets the same value set, which already matches what Default inherits.
+`CLAUDE_CONFIG_DIR` removed, including any value the daemon inherited, so Claude Code uses
+`~/.claude` and `~/.claude.json`. Setting it, even to `~/.claude`, makes Claude Code keep a
+separate state file at `~/.claude/.claude.json` instead. Sign in to that folder with plain
+`claude` (or `env -u CLAUDE_CONFIG_DIR claude`), not `CLAUDE_CONFIG_DIR=~/.claude claude`. HOME is
+the session's own (else the daemon user's home); an empty or relative HOME never counts, and
+the profile then keeps its explicit `CLAUDE_CONFIG_DIR`. A `CLAUDE_CONFIG_DIR` in the daemon's
+own environment does not make its folder "the default": a profile there gets the same value
+set.
 
 Preserve the credential boundary in PLAN.md: Muster never reads, copies, stores, refreshes,
 or proxies Claude credentials or tokens. Claude Code owns authentication. Profile setup

@@ -280,7 +280,8 @@ does).
  "rest_note": "64 more lines of tests.", "questions": ["Is 5 per 10 minutes right?"]}
 ```
 
-The **PR reviewer** agent template (New agent) carries the agent side: review one immutable
+The **PR reviewer** agent template (New agent) and the `muster-pr-review` skill (`muster skills
+install`, docs/CLI.md) share the agent side: review one immutable
 snapshot (head and base SHAs; diff and checks of that head), open this panel, wait for its
 events, re-check head and base before merging, merge only on its Merge event, and report
 `merged`, `queued` or `failed` from what GitHub says afterwards.

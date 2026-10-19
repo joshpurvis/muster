@@ -148,7 +148,11 @@ only on a Merge event from the panel, which only a user's click or key can send,
 the head commit shown in that panel. The agent's own CLI may still ask for permission to run
 `gh`, depending on its permission profile; that is a second check, not a replacement.
 
-A Muster agent template ("PR reviewer") carries these instructions, so it works from one prompt.
+Agents get these instructions two ways, from one source text (`skills/muster-pr-review/SKILL.md`):
+the `muster-pr-review` skill (`muster skills install`), which any Claude Code or Codex session
+loads when asked to "review PR 812", and the "PR reviewer" agent template, which is that text
+under a short persona. A skill keeps the PR's text in the current agent's context; a fresh
+template agent isolates it from other work. A `muster-panels` skill covers the other apps.
 A full hunk-by-hunk `diff` app, for PRs that need real review, can follow.
 
 ## Persistence

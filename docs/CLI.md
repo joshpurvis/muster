@@ -102,6 +102,30 @@ seconds (default 300). A timeout prints `{events: [], remaining: 0, timed_out: t
 successfully; a wait fails if the session moves to another task or restarts. `event` fetches
 the full event that a panel prompt showed only as a placeholder (panel ID, then event ID).
 
+## Agent skills
+
+Muster ships two agent skills (in `skills/`, embedded in the binary): `muster-pr-review`, the
+PR decision flow (review one snapshot, open a `pr_decision` panel, merge only on its Merge
+event), and `muster-panels`, a short guide to panels, the built-in apps and custom MCP Apps.
+An agent loads one when the request matches its description ("review PR 812", "chart this").
+Both only work inside a Muster session and say so otherwise.
+
+```sh
+muster skills install            # Claude Code and Codex
+muster skills install --claude   # or --codex; --dry-run shows the changes, writes nothing
+muster skills status
+```
+
+Targets: Claude Code `$CLAUDE_CONFIG_DIR/skills`, else `~/.claude/skills`; Codex
+`$CODEX_HOME/skills`, else `~/.codex/skills` (where Codex's own skill-creator puts user skills).
+Each skill is `<target>/<name>/SKILL.md`, written through a temporary file and a rename, with a
+`.muster-installed` marker beside it holding the hash of what Muster wrote. `install` lists
+each file as new, updated, unchanged or locally modified. If any file was edited since Muster
+wrote it (or Muster did not write it), it writes nothing and exits 1; `--force` replaces it.
+Running it again is a no-op. `status` shows each skill and target as missing, current, outdated
+(Muster's older version) or locally modified. Nothing else in those folders is touched. Start
+a new agent session afterwards to pick the skills up.
+
 ## Claude profiles
 
 Profiles are Muster-owned names and references to existing Claude configuration directories.

@@ -3332,6 +3332,39 @@ textarea {
   gap: 6px;
 }
 
+.profile-select {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+/* WebKitGTK's native select adds theme padding inside our fixed-height fields.
+   Paint the closed control ourselves; keep native options and keyboard behavior. */
+.field .profile-select select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: auto;
+  min-height: 32px;
+  padding: 6px 32px 6px 9px;
+  font: inherit;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+}
+
+.profile-select > .icon {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.profile-select select:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
 .profile-row {
   display: flex;
   flex-direction: column;

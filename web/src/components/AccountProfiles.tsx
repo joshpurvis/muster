@@ -1,14 +1,14 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { accountProfiles, accountProfilesSupported, toast, workspaces } from "../state.ts";
+import { accountProfiles, accountProfilesSupported, toast } from "../state.ts";
 import { rpc } from "../rpc.ts";
-import type { AccountProfile, ProfileChoice, Workspace } from "../types.ts";
-import { parseProfileChoice, profileName } from "../account_profiles.ts";
+import type { AccountProfile, ProfileChoice } from "../types.ts";
+import { parseProfileChoice } from "../account_profiles.ts";
+import { IconChevronDown } from "../icons.tsx";
 
-export function ProfileSelect({ value, onChange, inheritLabel, disabled = false }: {
+export function ProfileSelect({ value, onChange, disabled = false }: {
   value: ProfileChoice | undefined;
   onChange: (choice: ProfileChoice | undefined) => void;
-  inheritLabel?: string;
   disabled?: boolean;
 }) {
   if (!accountProfilesSupported.value) return null;
@@ -17,21 +17,23 @@ export function ProfileSelect({ value, onChange, inheritLabel, disabled = false 
   return (
     <label class="field">
       <span class="field-label">Claude profile</span>
-      <select
-        value={value ?? ""}
-        disabled={disabled}
-        onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
-      >
-        {inheritLabel && <option value="">{inheritLabel}</option>}
-        <option value="default">Default · ordinary Claude environment</option>
-        {missing && <option value={value} disabled>Unavailable profile #{value}</option>}
-        {profiles.map((p) => (
-          <option key={p.id} value={p.id} disabled={!p.enabled}>
-            {p.name}
-            {p.enabled ? "" : " (disabled)"}
-          </option>
-        ))}
-      </select>
+      <span class="profile-select">
+        <select
+          value={value ?? "default"}
+          disabled={disabled}
+          onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
+        >
+          <option value="default">Default · ordinary Claude environment</option>
+          {missing && <option value={value} disabled>Unavailable profile #{value}</option>}
+          {profiles.map((p) => (
+            <option key={p.id} value={p.id} disabled={!p.enabled}>
+              {p.name}
+              {p.enabled ? "" : " (disabled)"}
+            </option>
+          ))}
+        </select>
+        <IconChevronDown size={14} />
+      </span>
       <span class="field-hint">Verify your account with /status inside Claude Code.</span>
     </label>
   );
@@ -92,34 +94,6 @@ function ProfileRow({ profile }: { profile: AccountProfile }) {
       )}
       {error && <p class="field-hint field-bad" role="alert">{error}</p>}
     </form>
-  );
-}
-
-function WorkspaceDefault({ workspace }: { workspace: Workspace }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const choose = async (choice: ProfileChoice | undefined) => {
-    setBusy(true);
-    setError("");
-    try {
-      const next = await rpc.call<Workspace>("workspace.set_account_profile", {
-        id: workspace.id,
-        account_profile: choice ?? "default",
-      });
-      workspaces.value = workspaces.value.map((w) => w.id === next.id ? next : w);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div class="profile-row">
-      <strong>{workspace.name}</strong>
-      <code class="profile-directory">{workspace.path}</code>
-      <ProfileSelect value={workspace.account_profile_id ?? "default"} onChange={choose} disabled={busy} />
-      {error && <p class="field-hint field-bad" role="alert">{error}</p>}
-    </div>
   );
 }
 
@@ -195,24 +169,10 @@ export function AccountProfilesDialog({ Modal, close }: { Modal: ModalT; close: 
             {busy ? "Registering…" : "Register profile"}
           </button>
         </form>
-        {workspaces.value.length > 0 && (
-          <>
-            <h3>Workspace defaults</h3>
-            <p class="field-hint">
-              Used for new Claude tasks. Tabs opened from another Claude tab keep its profile. Existing
-              sessions and named agents keep their selection.
-            </p>
-            {workspaces.value.map((w) => <WorkspaceDefault key={w.id} workspace={w} />)}
-          </>
-        )}
       </div>
       <div class="dlg-foot">
         <button class="btn" type="button" onClick={close}>Done</button>
       </div>
     </Modal>
   );
-}
-
-export function workspaceProfileLabel(workspace: Workspace | undefined): string {
-  return `Workspace default · ${profileName(accountProfiles.value, workspace?.account_profile_id)}`;
 }

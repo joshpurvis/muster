@@ -44,6 +44,12 @@ try {
   await b.click('[aria-label="Settings and more"]');
   await clickText('[role="menuitem"]', "Claude profiles…");
   await b.wait(`!!document.querySelector('[role="dialog"][aria-label="Claude profiles"]')`);
+  check(
+    await b.eval(
+      `!document.querySelector('[aria-label="Claude profiles"]').textContent.includes('Workspace defaults')`,
+    ),
+    "Profile management must not expose saved workspace history",
+  );
   await b.sleep(200);
   await b.shot(`${base}/profiles-desktop.png`);
   await fill('input[placeholder="Personal or Work"]', "UI profile");
@@ -70,6 +76,23 @@ try {
   await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
   await fill('[aria-label="New tab"] input', `${base}/repo`);
   await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
+  check(
+    await b.eval(`document.querySelector('[aria-label="New tab"] select').value === 'default'`),
+    "New Tab must explicitly select Default even when the folder has a saved profile",
+  );
+  await clickText('[aria-label="New tab"] button[type="submit"]', "Open tab");
+  await b.wait(
+    `${M}.focusedSession.value?.kind === 'claude' && !document.querySelector('[role="dialog"][aria-label="New tab"]')`,
+    15000,
+  );
+  check(
+    await b.eval(`${M}.focusedSession.value.account_profile_id == null`),
+    "New Tab silently inherited a hidden workspace profile instead of its visible Default choice",
+  );
+  await b.key("Alt+Shift+N");
+  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
+  await fill('[aria-label="New tab"] input', `${base}/repo`);
+  await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
   await b.eval(`(() => {
     const label = [...document.querySelectorAll('[aria-label="New tab"] label')].find(e => e.querySelector('.field-label')?.textContent === 'Claude profile');
     const select = label.querySelector('select');
@@ -78,6 +101,12 @@ try {
   })()`);
   await b.sleep(200);
   await b.shot(`${base}/profile-selection.png`);
+  await b.size(520, 800);
+  await b.sleep(100);
+  await b.shot(`${base}/profile-selection-narrow.png`);
+  await b.eval(`document.documentElement.dataset.theme = 'light'`);
+  await b.shot(`${base}/profile-selection-light.png`);
+  await b.eval(`document.documentElement.dataset.theme = 'dark'`);
   await clickText('[aria-label="New tab"] button[type="submit"]', "Open tab");
   await b.wait(`${M}.focusedSession.value?.account_profile_id === ${profile.id}`, 15000);
   check(

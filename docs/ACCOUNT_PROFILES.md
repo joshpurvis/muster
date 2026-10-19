@@ -33,6 +33,9 @@ directory, not a verified account identity.
   `muster agent new NAME --profile PROFILE`. Named-agent profile bindings are fixed at
   creation, including for replacement sessions and `--fresh`. Create another named agent
   to use another profile; switching an existing agent is part of the deferred handoff work.
+  The New Tab dialog starts with explicit **Default**; choose the profile for each new
+  session. Profile settings do not show the backend's saved workspace history. Workspace
+  defaults remain available through the CLI for launches that omit an explicit choice.
 - New Claude sessions resolve selection in this order: explicit choice, calling/parent
   Claude session, workspace default, ordinary inherited Claude environment. Named agents
   always supply their own pinned choice. `"default"` explicitly chooses the ordinary

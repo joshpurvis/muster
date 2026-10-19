@@ -205,12 +205,13 @@ of the same kind arrives; the next waiting update shows meanwhile.
 ### Claude profiles
 
 **Settings and more → Claude profiles** registers existing Claude configuration directories,
-renames their labels, enables/disables them, and sets workspace defaults. Setup and login
+renames their labels, and enables/disables them. Saved workspaces are not listed here. Setup and login
 happen in the official Claude CLI, never in Muster. The dialog does not inspect authentication
 or settings files. Directory bindings are fixed; disabling does not stop running sessions.
 
-New Tab shows a Claude profile selector for Claude only. Its initial choice is the workspace
-default; explicit **Default** preserves the ordinary inherited Claude environment. New tabs
+New Tab shows a Claude profile selector for Claude only. Its initial choice is explicit
+**Default**, which preserves the ordinary inherited Claude environment, regardless of saved
+CLI workspace defaults. Choose a registered profile for that new session. New tabs
 and splits opened directly from a Claude tab inherit that tab's selection, including Default.
 The tab tooltip identifies the profile; a named profile also appears in the optional status
 line. These are user labels for directories, not verified account identities.

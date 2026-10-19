@@ -29,7 +29,7 @@ import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
-import { AccountProfilesDialog, ProfileSelect, workspaceProfileLabel } from "./AccountProfiles.tsx";
+import { AccountProfilesDialog, ProfileSelect } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
 import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
@@ -439,7 +439,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const home = meta.value.home;
   const [folder, setFolder] = useState(tildify(cwd ?? A.defaultFolder(), home));
   const [agent, setAgent] = useState<SessionKind>(A.lastKind());
-  const [profile, setProfile] = useState<ProfileChoice | undefined>(undefined);
+  const [profile, setProfile] = useState<ProfileChoice | undefined>("default");
   const [worktree, setWorktree] = useState(!!wtInit);
   const [base, setBase] = useState("");
   const [name, setName] = useState("");
@@ -537,7 +537,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
               ))}
             </div>
           </div>
-          {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} inheritLabel={workspaceProfileLabel(known)} />}
+          {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} />}
           <label class={cx("toggle", notGit && "disabled")}>
             <input
               type="checkbox"

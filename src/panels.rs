@@ -110,7 +110,7 @@ fn input_html(cwd: &Path, inline: Option<String>, path: Option<String>) -> anyho
     Ok(html)
 }
 
-fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
     ensure!(data.is_object(), "panel data must be an object");
     let data = serde_json::to_vec(data)?;
     ensure!(data.len() <= MAX_FILE, "data exceeds 1 MiB");
@@ -139,13 +139,14 @@ fn own(hub: &Hub, session: SessionId, id: PanelId) -> anyhow::Result<Panel> {
 pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId> {
     let _op = hub.panels.operations.lock();
     let (s, ch) = caller(hub, session)?;
-    ensure!(matches!(args.app.as_str(), "markdown" | "custom"), "unknown app (use markdown or custom)");
+    let builtin = crate::panel_apps::html(&args.app);
+    ensure!(args.app == "custom" || builtin.is_some(), "unknown app (use {} or custom)", crate::panel_apps::BUILTINS);
     let supplied = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
-    let html = if args.app == "custom" { supplied.context("custom apps need html or html_path")? }
-        else { ensure!(supplied.is_none(), "markdown does not accept custom HTML"); MARKDOWN.to_string() };
-    let csp = args.csp.unwrap_or_default();
+    let html = match builtin { None => supplied.context("custom apps need html or html_path")?,
+        Some(html) => { ensure!(supplied.is_none(), "{} does not accept custom HTML", args.app); html.to_string() } };
+    let mut csp = args.csp.unwrap_or_default();
+    let data = crate::panel_apps::data(&args.app, Path::new(&ch.cwd), args.data.unwrap_or_else(|| json!({})), &mut csp, true)?;
     validate_csp(&csp)?;
-    let data = data_bytes(&args.data.unwrap_or_else(|| json!({})))?;
     let now = now_ms();
     let mut panel = Panel { id: 0, channel_id: ch.id, session_id: s.id, window_id: s.window_id.or(ch.window_id),
         title: title(&args.title)?, app: args.app, csp, revision: 1, html_revision: 1,
@@ -168,7 +169,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     ensure!(html.is_none() || p.app == "custom", "only custom apps accept HTML updates");
     if let Some(t) = args.title { p.title = title(&t)?; }
     let old = p.clone();
-    let data = match args.data { Some(d) => data_bytes(&d)?, None => std::fs::read(dir(hub, p.id).join(format!("data-{}.json", p.revision)))? };
+    let data = match args.data { Some(d) => crate::panel_apps::data(&p.app, Path::new(&ch.cwd), d, &mut p.csp.clone(), false)?, None => std::fs::read(dir(hub, p.id).join(format!("data-{}.json", p.revision)))? };
     p.revision += 1;
     p.updated_at = now_ms();
     if let Some(html) = html {

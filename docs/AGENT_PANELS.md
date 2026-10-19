@@ -4,8 +4,10 @@ Status: core built on `feature/agent-panels`, 2026-10-18. The remainder of this 
 the approved broader plan; current tools and limits are in [MCP.md](MCP.md#panels).
 
 Core includes durable panels/events, task-scoped MCP and CLI, tab placement/movement, the
-two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Extra built-ins,
-fetch approval, placement options and preview servers remain later phases. Nested frames are
+two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Built on
+`feature/panel-apps`: the phase 1 `image`, `chart` and `table` apps, the phase 2
+`pr_decision` app and the PR reviewer template (schemas in [MCP.md](MCP.md#built-in-apps)).
+The `diff` app, fetch approval, placement options and preview servers remain later phases. Nested frames are
 blocked even for declared loopback dev servers: a child document's independent CSP would
 otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
 Each panel data revision is treated as a fresh tool input/result invocation in the same frame;
@@ -163,9 +165,11 @@ device scopes ([ANDROID.md](ANDROID.md)) decide whether it may send events or on
 ## Phases
 
 1. Panel tabs, the second origin and sandbox, `panel_open`/`update`/`close`, built-in `image`,
-   `markdown`, `chart`, `table`. One way: the agent shows, the user looks.
+   `markdown`, `chart`, `table`. One way: the agent shows, the user looks. (Built; the apps
+   on `feature/panel-apps`.)
 2. Events back to the agent (`wait_for_panel_event` and the idle prompt), the `pr_decision` app,
    the PR reviewer template. This is the first use case, end to end. The `diff` app follows.
+   (Built except `diff`; `pr_decision` and the template on `feature/panel-apps`.)
 3. Agent-written apps: arbitrary HTML/JS, declared network access, app-visible tools.
 4. `web_preview` for local dev servers; then, if wanted, the native embedded browser.
 5. Panels on the phone.

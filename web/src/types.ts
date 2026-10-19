@@ -267,7 +267,7 @@ export interface Panel {
   session_id: SessionId;
   window_id: WindowId | null;
   title: string;
-  app: "markdown" | "custom";
+  app: "markdown" | "image" | "chart" | "table" | "pr_decision" | "custom";
   csp: PanelCsp;
   revision: number;
   html_revision: number;

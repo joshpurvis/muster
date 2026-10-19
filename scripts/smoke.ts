@@ -395,6 +395,14 @@ exec cat > '${BASE}/fake-input'
   ok(((await Deno.stat(`${panelDir}/data-1.json`)).mode! & 0o777) === 0o600, "panel input is private (0600)");
   await mcp(shellToken, "panel_update", { panel_id: pid, data: { markdown: "# Revised" } });
   ok((await panelRow()).revision === 2 && JSON.parse(await Deno.readTextFile(`${panelDir}/data-2.json`)).markdown === "# Revised", "panel_update commits revision and input");
+  // Built-in image app: Muster reads a worktree file into a data URI and refuses escapes.
+  await Deno.writeFile(`${ch.cwd}/smoke-shot.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]));
+  const imagePid = (await mcp(shellToken, "panel_open", { title: "Smoke image", app: "image", data: { path: "smoke-shot.png", alt: "x" } })).panel_id;
+  const imageData = JSON.parse(await Deno.readTextFile(`${DATA}/panels/${imagePid}/data-1.json`));
+  ok(imageData.src === "data:image/png;base64,iVBORw0KGgoAAAAN" && imageData.bytes === 12 && (await Deno.readTextFile(`${DATA}/panels/${imagePid}/app-1.html`)).includes("Muster image"), "image panel_open reads a worktree file into a data URI");
+  ok(await mcp(shellToken, "panel_open", { title: "Escape", app: "image", data: { path: "/etc/passwd" } }).then(() => false, (e) => String(e).includes("inside the task worktree")), "image paths cannot leave the worktree");
+  await mcp(shellToken, "panel_close", { panel_id: imagePid });
+  await Deno.remove(`${ch.cwd}/smoke-shot.png`);
   const proxyOrigin = hello.panel_origin;
   ok(proxyOrigin === `http://127.0.0.1:${JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`)).panel_port}` && !proxyOrigin.endsWith(`:${PORT}`), "discovery and hello agree on a separate panel origin");
   const proxy = await fetch(`${proxyOrigin}/proxy`);
@@ -853,7 +861,7 @@ exec cat > '${BASE}/fake-input'
   await c.waitFor("agent_upserted event", () => c.events.some((e) => e.event === "agent_upserted" && e.data.name === "Ada" && e.data.autostart));
   ok(true, "agent_upserted reaches clients");
   const tpl = await c.call("agent.templates");
-  ok(tpl.map((t: Json) => t.id).join() === "blank,orchestrator,researcher,reviewer,worker", "agent.templates");
+  ok(tpl.map((t: Json) => t.id).join() === "blank,orchestrator,researcher,reviewer,pr_reviewer,worker", "agent.templates");
   await c.call("agent.memory.write", { name: "ada", path: "people/me.md", text: "likes short reviews" });
   ok((await Deno.readTextFile(`${DATA}/agents/ada/memory/people/me.md`)) === "likes short reviews", "agent.memory.write");
   ok((await c.call("agent.memory.read", { name: "ada", path: "people/me.md" })).text === "likes short reviews", "agent.memory.read");

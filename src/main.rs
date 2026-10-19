@@ -15,6 +15,7 @@ mod inject;
 mod mcp;
 mod model;
 mod panels;
+mod panel_apps;
 mod notify;
 mod paths;
 mod renderer;

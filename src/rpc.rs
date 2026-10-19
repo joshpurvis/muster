@@ -1679,7 +1679,7 @@ mod tests {
         assert!(call(&hub, "agent.update", json!({"name": "rpc-eve", "effort": "--evil"})).await.is_err());
         assert!(call(&hub, "agent.update", json!({"name": "nobody"})).await.unwrap_err().contains("no agent named"));
         let t = call(&hub, "agent.templates", json!({})).await.unwrap();
-        assert_eq!(t.as_array().unwrap().len(), 5);
+        assert_eq!(t.as_array().unwrap().len(), 6);
         call(&hub, "agent.remove", json!({"name": "rpc-eve"})).await.unwrap();
         assert_eq!(drain(&mut rx, "agent_removed")[0]["name"], "rpc-eve");
     }

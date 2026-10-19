@@ -98,7 +98,8 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 
 ### Agent panel tabs
 
-Agents open Markdown or custom MCP Apps beside their terminal. A new panel joins the group
+Agents open built-in apps (Markdown, Image, Chart, Table, PR decision) or custom MCP Apps
+beside their terminal; the strip above the frame names which ("Panel · Chart"). A new panel joins the group
 to the opener's right, or creates that split. Its tab has a panel icon, title and close button;
 dragging, splitting, moving between windows, keyboard tab selection and group zoom work as
 for terminals. The menu includes Reload panel and Close panel. Closing sends `closed` to the
@@ -107,6 +108,13 @@ opening agent; archiving the task removes all its panels. The phone UI ignores p
 Panel input updates retain the frame; changed HTML and Reload panel replace it. Inactive tabs
 and group zoom keep app state. Theme changes reach the app through the bridge. The built-in
 Markdown app renders text safely and includes a comment field for sending a user event.
+The other built-ins follow the theme and work by keyboard: Image toggles fit/actual size
+(Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
+Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
+has Merge (M), Request changes (R), Ask (A) and Open on GitHub (O). Merge first shows the
+exact `gh pr merge` command and needs Enter or "Confirm merge"; with failing checks it is
+disabled unless Shift is held (Shift+M). Esc closes the confirm or a comment box;
+Ctrl+Enter sends a comment or question.
 Panel messages require a real click or key in the visible app; links use the host browser.
 Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`;
 `-1` remains the internal empty-pane sentinel. Old session-only layouts need no migration.
@@ -260,7 +268,7 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
 
 **New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
 
-- New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, Background worker, from
+- New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the template's one-line description; picking one fills every field
   (a name you typed is kept). Name and kind (Claude · Codex).
 - Model and effort (optional, effort suggests the CLI's levels), persona (monospace textarea,

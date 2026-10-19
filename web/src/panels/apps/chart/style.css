@@ -1,0 +1,30 @@
+h1 { margin-bottom: 8px; }
+.legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 8px; font-size: 13px; }
+.legend li { display: flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.swatch.line { height: 3px; width: 14px; border-radius: 2px; }
+figure { position: relative; margin: 0; }
+figure svg { display: block; max-width: 100%; height: auto; overflow: visible; }
+figure svg:focus-visible { outline-offset: 4px; }
+.grid line { stroke: var(--color-border-secondary); stroke-width: 1; }
+.baseline { stroke: var(--color-border-primary); stroke-width: 1; }
+.axis text { fill: var(--color-text-secondary); font-size: 11.5px; font-family: var(--font-sans); }
+.axis.y text { font-family: var(--font-mono); font-size: 11px; }
+.axis-label { fill: var(--color-text-secondary); font-size: 12px; font-weight: 600; }
+.guide { stroke: var(--color-text-tertiary); stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; }
+.focus { pointer-events: none; }
+.dot { fill-opacity: 0.85; }
+.tip {
+  position: absolute; pointer-events: none; min-width: 120px; max-width: 260px; z-index: 2;
+  background: var(--color-background-secondary); border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md); padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+.tip-x { color: var(--color-text-secondary); margin-bottom: 2px; }
+.tip-row { display: flex; align-items: center; gap: 6px; }
+.tip-row b { margin-left: auto; padding-left: 10px; font-family: var(--font-mono); font-weight: 600; }
+.hint { font-size: 12px; margin-top: 6px; }
+.data-wrap { overflow-x: auto; }
+table.data { border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
+table.data caption { text-align: left; color: var(--color-text-secondary); padding-bottom: 4px; }
+table.data th, table.data td { border: 1px solid var(--color-border-secondary); padding: 3px 8px; text-align: right; font-family: var(--font-mono); }
+table.data th[scope="row"], table.data thead th:first-child { text-align: left; font-family: var(--font-sans); }

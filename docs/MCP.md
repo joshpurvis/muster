@@ -108,13 +108,13 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
-| `panel_update` | `panel_id`, `data?`, `html?`, `html_path?`, `title?` | `{}`; advances the revision |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
+| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task |
 | `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], timed_out}`; consumes queued events |
 
-`markdown` takes `data: {markdown: "# Review"}`. `custom` requires either inline `html` or
+`markdown` takes `data: {markdown: "# Review"}`; the other built-ins are below. `custom` requires either inline `html` or
 `html_path`, resolved inside the task cwd; symlinks escaping it are refused. HTML and JSON
 input each have a 1 MiB limit; data must be an object. Open/update share the post rate limit.
 `csp` uses MCP Apps fields (`resourceDomains`, `connectDomains`, `frameDomains`,
@@ -129,6 +129,100 @@ through the durable injection queue. The queue records `Panel(id)` provenance an
 records `panel:<id>`; a user action starts a human-origin turn at hop 0. Shell, exited and
 moved-to-another-task openers keep events queued. A human closing a tab queues `closed`;
 agent `panel_close` does not. Archiving the task removes panels, files and events.
+
+#### Built-in apps
+
+Built-ins take only `data` (no `html`). Each follows the host theme, works by keyboard, and
+shows invalid input as a list of problems inside the panel (the tool call itself succeeds,
+except for `image`, whose path and URL Muster checks at open/update time). Unknown fields are
+listed as warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
+`cd web && deno task panels`.
+
+**`image`**: `{path?, url?, alt?, caption?}`, exactly one of `path` or `url`. `path` is a file
+in the task worktree (the task cwd): Muster reads it when the panel opens or updates, refuses
+`..` and symlink escapes, non-regular files and files over 8 MiB, accepts PNG, JPEG, GIF,
+WebP and SVG (by content; SVG also needs the `.svg` extension), and stores it as a data URI
+(`src`, `mime`, `bytes` are added by Muster; an agent may not pass them). SVG is shown with
+`<img>`, so its scripts never run. `url` must be https without credentials; `panel_open` adds
+its origin to `csp.resourceDomains`, and a later update must keep to an origin already
+declared. Z or the button toggles zoom to fit / actual size.
+
+```json
+{"path": "shots/login.png", "alt": "Login page after the fix", "caption": "Chromium, 1280 px"}
+```
+
+**`chart`**: `{type, title?, x: {label?, values}, series: [{name, values}], y?: {label?, min?, max?}}`.
+`type` is `bar`, `line`, `scatter` or `area`; `x.values` are 1–2000 numbers or strings
+(numbers only for `scatter`; all-number x gives `line`/`area` a linear axis); 1–12 series,
+each with one value per x value (a number, or `null` for a gap). Bars and areas include zero;
+`y.min`/`y.max` fix the axis. Drawn as SVG with an accessible title and description, a
+legend, hover and arrow-key tooltips, and a data table (hidden until "Show data table").
+
+```json
+{"type": "bar", "title": "CI minutes per day", "x": {"label": "Day", "values": ["Mon", "Tue", "Wed"]},
+ "series": [{"name": "master", "values": [42, 55, 38]}, {"name": "PRs", "values": [80, 96, null]}],
+ "y": {"label": "Minutes"}}
+```
+
+**`table`**: `{title?, columns: [{key, label?, align?}], rows: [{<key>: value}], sort?: {key, dir?}}`.
+1–50 columns (`align`: `left`, `right` or `center`), up to 5000 rows whose values are
+strings, numbers, booleans or null. Columns holding only numbers are right-aligned in
+monospace. Header click sorts (text naturally, numbers numerically, empty cells last), the
+filter box (`/`) matches every word in any column, and the header stays visible on scroll.
+`sort.dir` is `asc` (default) or `desc`.
+
+```json
+{"title": "Slowest tests", "columns": [{"key": "test", "label": "Test"}, {"key": "seconds", "label": "Seconds"}],
+ "rows": [{"test": "export_large_csv", "seconds": 27.05}, {"test": "session_survives_restart", "seconds": 12.4}],
+ "sort": {"key": "seconds", "dir": "desc"}}
+```
+
+**`pr_decision`** ([AGENT_PANELS.md](AGENT_PANELS.md#pr-decision-end-to-end)):
+
+| Field | |
+|---|---|
+| `repo`, `number`, `title`, `author`, `url` | `owner/name`, PR number, https PR URL |
+| `base`, `head`, `head_sha` | branches, and the full 40-hex head commit (`headRefOid`) |
+| `merge_method_default?`, `delete_branch_default?` | `squash` (default), `merge` or `rebase`; `false` |
+| `summary` | what changed and why, plain text |
+| `risk` | `{level: low\|medium\|high, reasons: [string]}` |
+| `checks` | `{state: passing\|failing\|pending\|none, items?: [{name, state: pass\|fail\|pending\|skipping\|cancel, url?}]}` (`gh pr checks --json name,bucket,link`) |
+| `reviews?` | `{decision?: "APPROVED"…, items?: [{author, state}]}` |
+| `changes` | `[{file, note, diff}]`: only the changes worth a look, each a unified diff (with or without the `diff --git` header) and the agent's note |
+| `rest_note?`, `questions?` | a line about what is not shown; the agent's open questions |
+| `answer?` | `{question, text}`: the agent's answer to an Ask, shown inline |
+| `status?`, `status_detail?` | `open` (default), `merging`, `merged`, `failed` or `requested_changes`, shown as a banner |
+
+Actions: **Merge** (M) with a method select and a delete-branch box shows the exact command
+`gh pr merge <number> --<method> [--delete-branch] --match-head-commit <head_sha>` and sends
+only after Enter or "Confirm merge"; it is disabled while checks fail unless Shift is held, and
+while the agent works (`merging`, or until the next update after a sent decision). **Request
+changes** (R) and **Ask** (A) open a text box (Ctrl+Enter sends). **Open on GitHub** (O) uses
+the host browser. A new `head_sha` in an update closes an open confirm.
+
+Events are sent with `ui/message`; the decision is in the event's `kind`, and its fields in
+`payload._meta.muster.data` (`payload.content.text` repeats it for people):
+
+| `kind` | `payload._meta.muster.data` |
+|---|---|
+| `merge` | `{action: "merge", number, method, delete_branch, head_sha}` |
+| `request_changes` | `{action: "request_changes", number, head_sha, body}` |
+| `ask` | `{action: "ask", number, question}` |
+
+```json
+{"repo": "acme/api", "number": 812, "title": "Rate-limit failed logins per IP", "author": "dana",
+ "url": "https://github.com/acme/api/pull/812", "base": "master", "head": "dana/login-limit",
+ "head_sha": "3f9c2b7e41d0a8c6e5f4b3a2918d7c6b5a493827", "merge_method_default": "squash",
+ "delete_branch_default": true, "summary": "Adds a per-IP limit to POST /login.",
+ "risk": {"level": "medium", "reasons": ["Changes the login path"]},
+ "checks": {"state": "passing", "items": [{"name": "test", "state": "pass"}]},
+ "changes": [{"file": "src/auth/login.rs", "note": "Checked before the password hash.",
+   "diff": "@@ -41,3 +41,6 @@\n     let ip = client_ip(&req);\n+    if let Some(wait) = app.limiter.blocked(ip).await? {\n+        return too_many(wait);\n+    }"}],
+ "rest_note": "64 more lines of tests.", "questions": ["Is 5 per 10 minutes right?"]}
+```
+
+The **PR reviewer** agent template (New agent) carries the agent side: gather with `gh`, open
+this panel, wait for its events, merge only on its Merge event with that head commit.
 
 ### Agents
 

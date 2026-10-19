@@ -6,7 +6,8 @@ export interface Browser {
   eval<T = any>(expr: string): Promise<T>;
   goto(url: string): Promise<void>;
   size(w: number, h: number, mobile?: boolean): Promise<void>;
-  shot(path: string): Promise<void>;
+  /** The viewport, or only `clip` (CSS px) when given. */
+  shot(path: string, clip?: { x: number; y: number; w: number; h: number }): Promise<void>;
   key(combo: string): Promise<void>;
   type(text: string): Promise<void>;
   click(sel: string, opts?: { button?: "left" | "middle" | "right"; count?: number }): Promise<void>;
@@ -143,10 +144,12 @@ export async function launch(port = 9333, userDir = "/tmp/muster-cdp"): Promise<
       });
       await send("Emulation.setTouchEmulationEnabled", { enabled: mobile, maxTouchPoints: mobile ? 2 : 1 });
     },
-    async shot(path) {
+    async shot(path, clip) {
       const r: any = await send("Page.captureScreenshot", {
         format: "png",
-        clip: { x: 0, y: 0, width: W, height: H, scale: 1 },
+        clip: clip
+          ? { x: clip.x, y: clip.y, width: clip.w, height: clip.h, scale: 1 }
+          : { x: 0, y: 0, width: W, height: H, scale: 1 },
       });
       await Deno.writeFile(path, Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0)));
     },

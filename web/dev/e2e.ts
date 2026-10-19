@@ -1,7 +1,7 @@
 // End-to-end UI walkthrough against the MOCK daemon (dev only). Two headless browsers act as two
 // client windows. Covers the v2 layout: a window split into groups, each with its own tab strip;
 // a tab is one session. Also the agents panel (Alt+G, start-and-pull, the message log, New
-// agent from a template, Edit ▸ Memory).
+// agent from a template, Edit ▸ Memory), agent panels and the built-in panel apps.
 //
 //   deno task build:dev && MOCK_PORT=17761 deno task mock &
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src \
@@ -11,6 +11,7 @@
 // blocks `window.show` in the pages it drives, so it can never launch a window.
 import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
+import { panelApps } from "./panel_apps_e2e.ts";
 
 const [url, shots, repo, mode] = Deno.args;
 // `real`: against a real (isolated!) daemon. Agents are replaced by a named shell and the
@@ -1047,6 +1048,9 @@ try {
     check(closed.events.length === 1 && closed.events[0].kind === "closed", "tab close queues closed event");
     ok("panel updates preserve the frame, theme follows the host, and closing delivers closed");
   }
+
+  // ---- built-in panel apps (dev/panel_apps_e2e.ts)
+  if (!real) await panelApps({ a, repo, shots, ok, check });
 
   // ---- light theme, shortcuts sheet
   await a.send("Emulation.setEmulatedMedia", {

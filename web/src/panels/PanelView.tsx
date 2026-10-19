@@ -6,6 +6,8 @@ import { focusGroup } from "../actions.ts";
 import type { Panel, PanelResource } from "../types.ts";
 import { PanelBridge } from "./bridge.ts";
 
+const APP_NAMES: Record<string, string> = { markdown: "Markdown", image: "Image", chart: "Chart", table: "Table", pr_decision: "PR decision" };
+
 export const panelReloads = signal<ReadonlyMap<number, number>>(new Map());
 export function reloadPanel(id: number) {
   const next = new Map(panelReloads.value);
@@ -119,7 +121,7 @@ export function PanelView({ panel, paneId, active }: { panel: Panel; paneId: str
   useLayoutEffect(() => { bridge.current?.contextChanged(); }, [zoomed, active]);
   return (
     <div class="panel-view" hidden={!active} data-panel-view={panel.id}>
-      <div class="panel-sandbox-label">Panel · {panel.app === "markdown" ? "Markdown" : "Custom app"}</div>
+      <div class="panel-sandbox-label">Panel · {APP_NAMES[panel.app] ?? "Custom app"}</div>
       <div class="panel-frame-host" ref={ref} />
       {error && <div class="panel-status" role="alert">{error}<button type="button" onClick={() => reloadPanel(panel.id)}>Reload panel</button></div>}
       {!error && !ready && <div class="panel-status" role="status">Loading panel…</div>}

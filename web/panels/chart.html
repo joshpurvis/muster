@@ -255,6 +255,13 @@ textarea { display: block; width: 100%; resize: vertical; }
   }
 
   // src/panels/apps/shared/validate.ts
+  function chars(v) {
+    if (v.length < 2) return v.length;
+    let n = 0;
+    for (const _ of v) n++;
+    return n;
+  }
+  var fits = (v, max) => v.length <= max || chars(v) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
@@ -283,7 +290,7 @@ textarea { display: block; width: 100%; resize: vertical; }
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (v.length > max) {
+      if (!fits(v, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }
@@ -430,7 +437,7 @@ textarea { display: block; width: 100%; resize: vertical; }
       });
       if (values) {
         values.forEach((v, i) => {
-          if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || v.length > 200) {
+          if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || !fits(v, 200)) {
             p.add(`x.values[${i}]`, "must be a finite number or a string of at most 200 characters");
           }
         });

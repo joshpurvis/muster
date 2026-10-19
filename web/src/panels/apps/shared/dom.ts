@@ -52,3 +52,20 @@ export function reveal(el: Element | null, bar: Element | null) {
   if (r.top < 8) scrollBy(0, r.top - 8);
   else if (r.bottom > bottom) scrollBy(0, Math.min(r.bottom - bottom, r.top - 8));
 }
+
+/** The next focus target when Tab is pressed inside a trap of `count` items (wraps around). */
+export function cycle(count: number, at: number, back: boolean): number {
+  if (count <= 0) return -1;
+  if (at < 0) return back ? count - 1 : 0;
+  return (at + (back ? -1 : 1) + count) % count;
+}
+
+/** Keep Tab inside `box` (a modal view): returns true when it handled the key. */
+export function trapTab(box: Element, e: KeyboardEvent): boolean {
+  if (e.key !== "Tab") return false;
+  const items = [...box.querySelectorAll<HTMLElement>("button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex='-1'])")];
+  e.preventDefault();
+  const next = cycle(items.length, items.indexOf(document.activeElement as HTMLElement), e.shiftKey);
+  if (next >= 0) items[next].focus();
+  return true;
+}

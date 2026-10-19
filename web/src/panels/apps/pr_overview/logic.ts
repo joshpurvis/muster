@@ -1,7 +1,7 @@
 // `pr_overview` app: every open PR of a repo as a card the agent keeps up to date, with sorting,
 // a filter and the events that send the user's pick back. Pure, so deno tests cover it.
 // docs/MCP.md "Built-in apps" is the contract; src/panel_apps.rs checks the same shape.
-import { httpsUrl, Problems, type Result } from "../shared/validate.ts";
+import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
 
 export const RISKS = ["low", "medium", "high"] as const;
@@ -47,6 +47,8 @@ export interface Overview {
 }
 
 const SHA = /^[0-9a-f]{40}$/;
+/** What gh prints, and what Muster's backend accepts (`date_ok`). */
+const DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 
 function count(p: Problems, o: Record<string, unknown>, key: string, at: string): number | undefined {
@@ -81,7 +83,7 @@ export function validateOverview(data: unknown): Result<Overview> {
     const url = rawUrl === undefined ? undefined : httpsUrl(rawUrl);
     if (rawUrl !== undefined && !url) p.add(`${at}.url`, "must be an https URL");
     const created_at = p.string(io, "created_at", at, { max: 40 });
-    const created = created_at === undefined ? undefined : Date.parse(created_at);
+    const created = created_at === undefined ? undefined : DATE.test(created_at) ? Date.parse(created_at) : NaN;
     if (created_at !== undefined && !Number.isFinite(created)) p.add(`${at}.created_at`, "must be a date such as 2026-10-18T09:30:00Z");
     const draft = p.boolean(io, "draft", at) ?? false;
     const additions = count(p, io, "additions", at);
@@ -93,7 +95,7 @@ export function validateOverview(data: unknown): Result<Overview> {
     else review = p.oneOf(io, "review", at, REVIEWS);
     const labels: string[] = [];
     p.array(io, "labels", at, { max: 20 })?.forEach((l, j) => {
-      if (typeof l !== "string" || !l.trim() || l.length > 100) p.add(`${at}.labels[${j}]`, "must be a label name (1 to 100 characters)");
+      if (typeof l !== "string" || !l.trim() || !fits(l, 100)) p.add(`${at}.labels[${j}]`, "must be a label name (1 to 100 characters)");
       else labels.push(l);
     });
     const risk = p.oneOf(io, "risk", at, RISKS);
@@ -155,12 +157,17 @@ export function groupOf(pr: Item): Group {
   return "todo";
 }
 
-/** Every word must match the number, title, author, a label, the summary or the status. */
+/** What the checks and review badges say, so the filter finds what the user sees. */
+export const CHECK_WORDS: Record<typeof CHECKS[number], string> = { passing: "checks passing", failing: "checks failing", pending: "checks pending", none: "no checks" };
+export const REVIEW_WORDS: Record<typeof REVIEWS[number], string> = { APPROVED: "approved", CHANGES_REQUESTED: "changes requested", REVIEW_REQUIRED: "review required", NONE: "no review" };
+
+/** Every word must match the number, title, author, a label, the summary, the status or a badge. */
 export function matches(pr: Item, filter: string): boolean {
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return true;
   const hay = [`#${pr.number}`, pr.title, pr.author, ...pr.labels, pr.summary ?? "", pr.status.replace(/_/g, " "),
-    pr.draft ? "draft" : "", pr.risk ? `${pr.risk} risk` : ""].join("\n").toLowerCase();
+    pr.draft ? "draft" : "", pr.risk ? `${pr.risk} risk` : "", pr.checks ? CHECK_WORDS[pr.checks] : "",
+    pr.review ? REVIEW_WORDS[pr.review] : ""].join("\n").toLowerCase();
   return words.every((w) => hay.includes(w));
 }
 
@@ -225,15 +232,25 @@ export function holdEvent(repo: string, pr: Item) {
   };
 }
 
-/** `number` is the PR to review now and `order` the rest to go through after it, in the order
- * the user sees (see queue). */
+/** `number` is the PR to review now and `order` the ones after it (never `number` again), in
+ * the order the user sees (see queue). */
 export function nextEvent(repo: string, todo: Item[]) {
   const [pr, ...rest] = todo;
   return {
     kind: "next" as const,
     text: `Go through the PRs in this order: review PR #${pr.number} (${repo}) now${rest.length ? `, then ${rest.map((x) => `#${x.number}`).join(", ")}` : ""}.`,
-    data: { action: "next" as const, repo, number: pr.number, order: todo.map((x) => x.number) },
+    data: { action: "next" as const, repo, number: pr.number, order: rest.map((x) => x.number) },
   };
+}
+
+/**
+ * The selection after an update. While the user is moving through the cards (a card has focus)
+ * their pick stays: the agent moving on must not change what Enter or H act on under them.
+ * Otherwise the selection follows the agent to its new `current`.
+ */
+export function followCurrent(selected: number | null, before: number | undefined, after: number | undefined, userOnCard: boolean): number | null {
+  if (after === undefined || after === before || userOnCard) return selected;
+  return after;
 }
 
 /** Whether Hold makes sense for this PR now. */

@@ -208,16 +208,31 @@ section { margin: 0 0 18px; }
 .warn { color: var(--color-text-warning); font-weight: 600; margin: 0 0 6px; }
 button kbd { margin-left: 2px; }
 button.primary kbd, button.danger kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
+.title-row { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.title-row h1 { flex: 1 1 240px; min-width: 0; }
+.title-row h1:focus { outline: none; }
+.open-gh { white-space: nowrap; font-size: 13px; }
+/* The sticky bar never takes more than about a third of a small panel; a drawer (a confirm or
+   a text box) may take more, so what it confirms is always in view. */
+.actions { max-height: 34vh; overflow-y: auto; }
+.actions.has-drawer { max-height: 85vh; }
+.custom-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--color-border-primary); }
+.group-label, .fold { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-text-secondary); }
+.fold { min-height: 28px; padding: 2px 8px; }
+button.help { min-width: 32px; padding: 5px 8px; font-weight: 700; }
+.shortcuts dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 8px; font-size: 13px; }
+.shortcuts dt { text-align: right; }
+.shortcuts dd { margin: 0; }
 @media (max-width: 520px) {
-  /* Narrow panels: natural-width buttons and no key hints (aria-keyshortcuts keeps them), so
-     the sticky bar stays three short rows. */
+  /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts
+     keeps them for assistive tech), so the sticky bar stays short. */
   .bar .spacer { display: none; }
   .actions { padding: 8px 12px 10px; margin: 12px -16px 0; }
-  .row { gap: 6px; }
-  .bar button kbd { display: none; }
-  .bar.second { margin-top: 6px; }
+  .row, .custom-group { gap: 6px; }
+  .bar button kbd, .custom-group button kbd, .open-gh kbd { display: none; }
+  .merge-group select { max-width: 112px; }
+  .merge-group .check { font-size: 12.5px; }
 }
-.bar.second { margin-top: 8px; }
 button.outward { border-color: var(--color-text-warning); }
 button .out { color: var(--color-text-warning); }
 .outward-desc { margin: 0 0 6px; }
@@ -237,8 +252,11 @@ button .out { color: var(--color-text-warning); }
 }
 .lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
 .lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
-.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; cursor: zoom-out; }
-.lb-stage img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; }
+.lb-stage img { margin: auto; display: block; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+.lb-stage.actual img { max-width: none; max-height: none; flex: none; cursor: grab; }
+.lb-stage.actual:active img { cursor: grabbing; }
 .lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
 </style></head><body><main id="app"></main>
 <script>
@@ -398,6 +416,21 @@ button .out { color: var(--color-text-warning); }
       class: "error",
       role: "alert"
     }, h("strong", null, title), h("ul", null, errors.slice(0, 20).map((e) => h("li", null, e))), errors.length > 20 ? h("p", null, `\u2026and ${errors.length - 20} more`) : null));
+  }
+  function cycle(count, at, back) {
+    if (count <= 0) return -1;
+    if (at < 0) return back ? count - 1 : 0;
+    return (at + (back ? -1 : 1) + count) % count;
+  }
+  function trapTab(box, e) {
+    if (e.key !== "Tab") return false;
+    const items = [
+      ...box.querySelectorAll("button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex='-1'])")
+    ];
+    e.preventDefault();
+    const next = cycle(items.length, items.indexOf(document.activeElement), e.shiftKey);
+    if (next >= 0) items[next].focus();
+    return true;
   }
 
   // src/panels/apps/shared/diff.ts
@@ -596,6 +629,24 @@ button .out { color: var(--color-text-warning); }
     "overflow"
   ];
   var MAX_ACTIONS = 8;
+  var BUILTIN_LABELS = [
+    "merge",
+    "merge anyway",
+    "confirm merge",
+    "request changes",
+    "ask",
+    "open",
+    "open on github",
+    "github",
+    "skip",
+    "hold",
+    "next",
+    "cancel",
+    "confirm"
+  ];
+  function labelKey(label) {
+    return label.split(/\s+/).filter(Boolean).join(" ").toLowerCase().replace(/[….!:]+$/u, "").replace(/^#+/, "").trim();
+  }
   var ID = /^[a-z0-9][a-z0-9_-]{0,39}$/;
   var KEY = /^[a-z0-9]$/;
   function validateActions(p, o) {
@@ -638,6 +689,9 @@ button .out { color: var(--color-text-warning); }
         required: true,
         max: 40
       });
+      if (label !== void 0 && BUILTIN_LABELS.includes(labelKey(label))) {
+        p.add(`${at}.label`, `"${label}" looks like a built-in button; name what it does instead`);
+      }
       const description = p.string(ao, "description", at, {
         required: true,
         max: 300
@@ -657,7 +711,7 @@ button .out { color: var(--color-text-warning); }
           key = k;
         }
       }
-      const outward2 = p.boolean(ao, "outward", at) ?? false;
+      const outward2 = p.boolean(ao, "outward", at) ?? true;
       if (id !== void 0 && label !== void 0 && description !== void 0) out.push({
         id,
         label,
@@ -694,7 +748,9 @@ button .out { color: var(--color-text-warning); }
       a.outward,
       t.repo,
       t.number,
-      t.head_sha ?? null
+      t.head_sha ?? null,
+      t.base ?? null,
+      t.status ?? null
     ]);
   }
 
@@ -740,8 +796,75 @@ button .out { color: var(--color-text-warning); }
       onclick: onCancel
     }, "Cancel ", h("kbd", null, "Esc"))));
   }
+  var roomy = () => innerHeight >= 560 && innerWidth > 520;
+  function actionsGroup(actions, run, off, open, toggle) {
+    if (!actions.length) return null;
+    const folds = !roomy();
+    const shown = !folds || open;
+    return h("div", {
+      class: "custom-group",
+      role: "group",
+      "aria-labelledby": "your-actions-label"
+    }, folds ? h("button", {
+      type: "button",
+      id: "your-actions",
+      class: "fold",
+      "aria-expanded": String(shown),
+      onclick: toggle
+    }, h("span", {
+      id: "your-actions-label"
+    }, `Your actions (${actions.length})`), shown ? " \u25B4" : " \u25BE") : h("span", {
+      id: "your-actions-label",
+      class: "group-label"
+    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a))) : null);
+  }
+  function shortcutsDrawer(rows, actions, onClose) {
+    const all = [
+      ...rows,
+      ...actions.filter((a) => a.key).map((a) => [
+        a.key.toUpperCase(),
+        `${a.label} (your action${a.outward ? ", asks first" : ""})`
+      ])
+    ];
+    return h("div", {
+      class: "drawer shortcuts",
+      role: "group",
+      "aria-labelledby": "shortcuts-title"
+    }, h("div", {
+      id: "shortcuts-title",
+      class: "drawer-title"
+    }, "Keyboard shortcuts"), h("dl", null, all.map(([k, what]) => [
+      h("dt", null, h("kbd", null, k)),
+      h("dd", null, what)
+    ])), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "shortcuts-close",
+      onclick: onClose
+    }, "Close ", h("kbd", null, "Esc"))));
+  }
+  function helpButton(onclick, open) {
+    return h("button", {
+      type: "button",
+      id: "keys-help",
+      class: "help",
+      "aria-label": "Keyboard shortcuts",
+      "aria-expanded": String(open),
+      "aria-keyshortcuts": "?",
+      title: "Keyboard shortcuts (?)",
+      onclick
+    }, "?");
+  }
 
   // src/panels/apps/shared/validate.ts
+  function chars(v) {
+    if (v.length < 2) return v.length;
+    let n = 0;
+    for (const _ of v) n++;
+    return n;
+  }
+  var fits = (v, max) => v.length <= max || chars(v) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
@@ -770,7 +893,7 @@ button .out { color: var(--color-text-warning); }
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (v.length > max) {
+      if (!fits(v, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }
@@ -926,7 +1049,7 @@ button .out { color: var(--color-text-warning); }
       });
       if (values) {
         values.forEach((v, i) => {
-          if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || v.length > 200) {
+          if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || !fits(v, 200)) {
             p.add(`x.values[${i}]`, "must be a finite number or a string of at most 200 characters");
           }
         });
@@ -1872,6 +1995,22 @@ button .out { color: var(--color-text-warning); }
       actions
     });
   }
+  var MEDIA_FIELDS = {
+    image: [
+      "kind",
+      "path",
+      "alt",
+      "caption",
+      "src",
+      "mime",
+      "bytes"
+    ],
+    chart: [
+      "kind",
+      "spec",
+      "caption"
+    ]
+  };
   function validateMedia(p, o) {
     const out = [];
     let bytes = 0;
@@ -1882,29 +2021,25 @@ button .out { color: var(--color-text-warning); }
       const mo = p.object(m, at);
       if (!mo) return;
       const kind = p.oneOf(mo, "kind", at, MEDIA_KINDS, true);
-      const { kind: _, ...rest } = mo;
-      const nested = (errors, warnings2) => {
-        for (const e of errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
-        for (const w of warnings2) p.warnings.push(`${at}.${w}`);
-      };
+      if (!kind) return;
+      for (const k of Object.keys(mo)) {
+        if (k === "url" && kind === "image") p.add(`${at}.url`, "pictures come from a path only: download it into the task directory");
+        else if (!MEDIA_FIELDS[kind].includes(k)) p.add(`${at}.${k}`, "unknown field");
+      }
       if (kind === "image") {
+        const { kind: _, ...rest } = mo;
+        if (rest.url !== void 0) return;
         const r = validateImage(rest);
         if (!r.ok) {
-          nested(r.errors, []);
+          for (const e of r.errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
           return;
         }
-        nested([], r.warnings);
         bytes += r.value.bytes ?? 0;
         out.push({
           kind,
           image: r.value
         });
-      } else if (kind === "chart") {
-        p.known(mo, at, [
-          "kind",
-          "spec",
-          "caption"
-        ]);
+      } else {
         const caption = p.string(mo, "caption", at, {
           max: 2e3
         });
@@ -1935,7 +2070,7 @@ button .out { color: var(--color-text-warning); }
     })?.forEach((v, i) => {
       const at = `${path ? path + "." : ""}${key}[${i}]`;
       if (typeof v !== "string") p.add(at, "must be a string");
-      else if (v.length > len) p.add(at, `is longer than ${len} characters`);
+      else if (!fits(v, len)) p.add(at, `is longer than ${len} characters`);
       else if (v.trim()) out.push(v);
     });
     return out;
@@ -2089,6 +2224,10 @@ ${question}`,
   var outGate = new Gate();
   var sentCustom = /* @__PURE__ */ new Set();
   var enlarged = null;
+  var enlargedSrc = "";
+  var actualSize = false;
+  var actionsOpen = false;
+  var showKeys = false;
   var chartTables = /* @__PURE__ */ new Map();
   var chartWidth = 0;
   var override = false;
@@ -2134,7 +2273,7 @@ ${question}`,
     if (hint) hint.textContent = blocked && mode !== "confirm" && checksBlock(pr) && blocked.includes("Shift+M") ? blocked : "";
   }
   function openConfirm(withShift) {
-    if (!pr) return;
+    if (enlarged !== null || !pr) return;
     const blocked = mergeBlocked(pr, withShift, !!sent);
     if (blocked) {
       setNotice(blocked, "warning");
@@ -2161,7 +2300,7 @@ ${question}`,
     if (back) document.getElementById(back)?.focus();
   }
   function sendSimple(kind) {
-    if (!pr || sent) return;
+    if (enlarged !== null || !pr || sent) return;
     if (kind === "hold" && holdClosed(pr)) {
       setNotice(holdClosed(pr), "warning");
       render();
@@ -2184,10 +2323,12 @@ ${question}`,
   var target = (p) => ({
     repo: p.repo,
     number: p.number,
-    head_sha: p.head_sha
+    head_sha: p.head_sha,
+    base: p.base,
+    status: p.status
   });
   function runAction(a) {
-    if (!pr || sentCustom.has(a.id)) return;
+    if (enlarged !== null || !pr || sentCustom.has(a.id)) return;
     if (a.outward) {
       if (mode === "confirm") gate.close();
       outward = a;
@@ -2213,7 +2354,7 @@ ${question}`,
     });
   }
   function confirmOutward() {
-    if (!pr || mode !== "outward" || !outward) return;
+    if (enlarged !== null || !pr || mode !== "outward" || !outward) return;
     const a = outward;
     if (!outGate.canConfirmTarget(outwardTarget(a, target(pr)))) return;
     outGate.close();
@@ -2224,13 +2365,24 @@ ${question}`,
   }
   function enlarge(i) {
     const was = enlarged;
+    if (i !== null && pr?.media[i]?.kind !== "image") i = null;
+    if (i !== null && (mode === "confirm" || mode === "outward")) {
+      gate.close();
+      outGate.close();
+      outward = null;
+      mode = null;
+      setNotice("The confirm was closed while you look at the pictures. Start it again when you are ready.", "warning");
+    }
+    if (i !== was) actualSize = false;
     enlarged = i;
+    const m = i === null ? void 0 : pr?.media[i];
+    enlargedSrc = m?.kind === "image" ? m.image.src : "";
     render();
     if (i !== null) document.getElementById("lightbox-close")?.focus();
-    else if (was !== null) document.getElementById(`media-${was}`)?.focus();
+    else if (was !== null) (document.getElementById(`media-${was}`) ?? document.querySelector("h1"))?.focus();
   }
   function confirmMerge() {
-    if (!pr || mode !== "confirm") return;
+    if (enlarged !== null || !pr || mode !== "confirm") return;
     if (!gate.canConfirm(pr)) return;
     const blocked = mergeBlocked(pr, override, !!sent);
     if (blocked) {
@@ -2260,7 +2412,7 @@ ${question}`,
     return kind === "request" ? requestChangesEvent(pr, text) : askEvent(pr, text);
   }
   function submit(kind) {
-    if (!pr) return;
+    if (enlarged !== null || !pr) return;
     const closed = formsClosed(pr);
     if (closed) {
       setNotice(`Not sent: ${closed}`, "warning");
@@ -2298,6 +2450,7 @@ ${question}`,
     });
   }
   function setMode(next) {
+    if (enlarged !== null) return;
     mode = next;
     render();
     focusMode();
@@ -2573,14 +2726,41 @@ ${question}`,
     ] : []);
     const at = shots.indexOf(enlarged);
     const step = (by) => enlarge(shots[(at + by + shots.length) % shots.length]);
+    const img = h("img", {
+      src: m.image.src,
+      alt: m.image.alt,
+      draggable: "false"
+    });
+    const stage = h("div", {
+      class: `lb-stage ${actualSize ? "actual" : "fit"}`,
+      tabindex: "0",
+      "aria-label": "Picture; Z toggles actual size, drag or arrow keys scroll"
+    }, img);
+    let drag = null;
+    stage.addEventListener("pointerdown", (e) => {
+      drag = {
+        x: e.clientX,
+        y: e.clientY,
+        moved: false
+      };
+    });
+    stage.addEventListener("pointermove", (e) => {
+      if (!drag || !actualSize || !(e.buttons & 1)) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+      stage.scrollBy(-dx, -dy);
+      drag.x = e.clientX;
+      drag.y = e.clientY;
+    });
+    img.addEventListener("click", () => {
+      if (!drag?.moved) toggleSize();
+      drag = null;
+    });
     return h("div", {
       class: "lightbox",
       role: "dialog",
       "aria-modal": "true",
-      "aria-label": m.image.alt,
-      onclick: (e) => {
-        if (e.target === e.currentTarget) enlarge(null);
-      }
+      "aria-label": m.image.alt
     }, h("div", {
       class: "lb-bar"
     }, h("span", {
@@ -2602,18 +2782,68 @@ ${question}`,
       }, "\u2192")
     ] : null, h("button", {
       type: "button",
+      id: "lightbox-zoom",
+      "aria-pressed": String(actualSize),
+      onclick: () => toggleSize()
+    }, actualSize ? "Fit" : "Actual size", " ", h("kbd", null, "Z")), h("button", {
+      type: "button",
       id: "lightbox-close",
       onclick: () => enlarge(null)
-    }, "Close ", h("kbd", null, "Esc"))), h("div", {
-      class: "lb-stage",
-      onclick: () => enlarge(null)
-    }, h("img", {
-      src: m.image.src,
-      alt: m.image.alt
-    })), m.image.caption ? h("p", {
+    }, "Close ", h("kbd", null, "Esc"))), stage, m.image.caption ? h("p", {
       class: "lb-caption"
     }, m.image.caption) : null);
   }
+  function setKeys(on) {
+    showKeys = on;
+    render();
+    document.getElementById(on ? "shortcuts-close" : "keys-help")?.focus();
+  }
+  function toggleSize() {
+    actualSize = !actualSize;
+    const focus = document.activeElement?.id;
+    render();
+    if (focus) document.getElementById(focus)?.focus({
+      preventScroll: true
+    });
+  }
+  var KEYS = [
+    [
+      "M",
+      "Merge (shows the exact command first; Shift+M with failing checks)"
+    ],
+    [
+      "R",
+      "Request changes"
+    ],
+    [
+      "A",
+      "Ask the agent"
+    ],
+    [
+      "O",
+      "Open on GitHub"
+    ],
+    [
+      "S",
+      "Skip: move on, change nothing"
+    ],
+    [
+      "H",
+      "Hold: put aside for later"
+    ],
+    [
+      "Enter",
+      "Confirm, in a confirm step"
+    ],
+    [
+      "Esc",
+      "Close a confirm, a box or a picture"
+    ],
+    [
+      "?",
+      "These shortcuts"
+    ]
+  ];
   function render() {
     if (!pr) return;
     const p = pr;
@@ -2661,128 +2891,150 @@ ${question}`,
       text: p.status_detail,
       tone: "info"
     } : null);
-    mount(root, h("header", {
-      class: "head"
-    }, h("h1", null, p.title, " ", h("span", {
-      class: "num"
-    }, `#${p.number}`)), h("p", {
-      class: "meta muted"
-    }, `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} \xB7 head `, h("code", {
-      title: p.head_sha
-    }, short(p.head_sha)))), statusBanner(p), warnings.length ? h("p", {
-      class: "warnings"
-    }, warnings.join("; ")) : null, h("section", null, h("h2", null, "What changed"), h("p", {
-      class: "prose"
-    }, p.summary)), mediaSection(p), h("section", {
-      class: "grid"
-    }, h("div", null, h("h2", null, "Risk"), badge(`${p.risk.level[0].toUpperCase()}${p.risk.level.slice(1)} risk`, {
-      low: "success",
-      medium: "warning",
-      high: "danger"
-    }[p.risk.level]), p.risk.reasons.length ? h("ul", {
-      class: "reasons"
-    }, p.risk.reasons.map((r) => h("li", null, r))) : null), h("div", null, h("h2", null, "Checks"), badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1]), p.checks.items.length ? h("ul", {
-      class: "checks"
-    }, p.checks.items.map((c) => {
-      const [icon, tone] = checkIcon[c.state];
-      return h("li", null, h("span", {
-        class: `icon ${tone}`,
-        "aria-hidden": "true"
-      }, icon), c.url ? link(c.url, c.name) : h("span", null, c.name), h("span", {
-        class: "muted state"
-      }, c.state));
-    })) : null), h("div", null, h("h2", null, "Reviews"), p.reviews?.decision ? badge(words(p.reviews.decision), reviewTone(p.reviews.decision)) : h("span", {
-      class: "muted"
-    }, "No review decision"), p.reviews?.items.length ? h("ul", {
-      class: "checks"
-    }, p.reviews.items.map((r) => h("li", null, h("span", null, r.author), h("span", {
-      class: `state ${reviewTone(r.state)}`
-    }, words(r.state))))) : null)), h("section", null, h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"), p.changes.length ? null : h("p", {
-      class: "muted"
-    }, "The agent picked no changes to show."), p.changes.map((c, i) => h("article", {
-      class: "change"
-    }, h("header", null, h("code", {
-      class: "file"
-    }, c.file), h("span", {
-      class: "stat"
-    }, h("span", {
-      class: "plus"
-    }, `+${stats[i].added}`), " ", h("span", {
-      class: "minus"
-    }, `\u2212${stats[i].removed}`))), h("p", {
-      class: "note"
-    }, c.note), diffView(c.diff))), p.rest_note ? h("p", {
-      class: "rest muted"
-    }, p.rest_note) : null), p.questions.length ? h("section", null, h("h2", null, "The agent's open questions"), h("ol", {
-      class: "questions"
-    }, p.questions.map((q) => h("li", null, q))), h("p", {
-      class: "muted small"
-    }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null, answers.length ? h("section", {
-      id: "answers"
-    }, h("h2", null, "Answers"), answers.map((a) => h("div", {
-      class: "answer"
-    }, h("p", {
-      class: "q muted"
-    }, a.question), h("p", {
-      class: "prose"
-    }, a.text)))) : null, h("div", {
-      class: "actions"
-    }, actionPanel(p), effective ? h("div", {
-      class: `notice ${effective.tone}`,
-      role: effective.tone === "danger" ? "alert" : "status"
-    }, effective.text) : null, h("div", {
-      class: "row bar"
-    }, h("div", {
-      class: "merge-group"
-    }, mergeButton, select, h("label", {
-      class: "check"
-    }, box, " Delete branch")), h("span", {
-      class: "spacer"
-    }), h("button", {
-      type: "button",
-      id: "request",
-      "aria-keyshortcuts": "R",
-      disabled: !!closed || sent === "request_changes",
-      title: closed ?? null,
-      onclick: () => setMode("request")
-    }, "Request changes ", h("kbd", null, "R")), h("button", {
-      type: "button",
-      id: "ask",
-      "aria-keyshortcuts": "A",
-      disabled: !!closed,
-      title: closed ?? null,
-      onclick: () => setMode("ask")
-    }, "Ask ", h("kbd", null, "A")), h("button", {
-      type: "button",
-      id: "open",
-      "aria-keyshortcuts": "O",
-      onclick: () => openLink(p.url).catch((e) => {
-        setNotice(e.message, "danger");
+    mount(
+      root,
+      h("header", {
+        class: "head"
+      }, h("div", {
+        class: "title-row"
+      }, h("h1", {
+        tabindex: "-1"
+      }, p.title, " ", h("span", {
+        class: "num"
+      }, `#${p.number}`)), h("button", {
+        type: "button",
+        id: "open",
+        class: "link open-gh",
+        "aria-keyshortcuts": "O",
+        onclick: () => openLink(p.url).catch((e) => {
+          setNotice(e.message, "danger");
+          render();
+        })
+      }, "Open on GitHub ", h("kbd", null, "O"))), h("p", {
+        class: "meta muted"
+      }, `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} \xB7 head `, h("code", {
+        title: p.head_sha
+      }, short(p.head_sha)))),
+      statusBanner(p),
+      warnings.length ? h("p", {
+        class: "warnings"
+      }, warnings.join("; ")) : null,
+      h("section", null, h("h2", null, "What changed"), h("p", {
+        class: "prose"
+      }, p.summary)),
+      // The decision signals come before the pictures: they must never be scrolled away by them.
+      h("section", {
+        class: "grid"
+      }, h("div", null, h("h2", null, "Risk"), badge(`${p.risk.level[0].toUpperCase()}${p.risk.level.slice(1)} risk`, {
+        low: "success",
+        medium: "warning",
+        high: "danger"
+      }[p.risk.level]), p.risk.reasons.length ? h("ul", {
+        class: "reasons"
+      }, p.risk.reasons.map((r) => h("li", null, r))) : null), h("div", null, h("h2", null, "Checks"), badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1]), p.checks.items.length ? h("ul", {
+        class: "checks"
+      }, p.checks.items.map((c) => {
+        const [icon, tone] = checkIcon[c.state];
+        return h("li", null, h("span", {
+          class: `icon ${tone}`,
+          "aria-hidden": "true"
+        }, icon), c.url ? link(c.url, c.name) : h("span", null, c.name), h("span", {
+          class: "muted state"
+        }, c.state));
+      })) : null), h("div", null, h("h2", null, "Reviews"), p.reviews?.decision ? badge(words(p.reviews.decision), reviewTone(p.reviews.decision)) : h("span", {
+        class: "muted"
+      }, "No review decision"), p.reviews?.items.length ? h("ul", {
+        class: "checks"
+      }, p.reviews.items.map((r) => h("li", null, h("span", null, r.author), h("span", {
+        class: `state ${reviewTone(r.state)}`
+      }, words(r.state))))) : null)),
+      mediaSection(p),
+      h("section", null, h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"), p.changes.length ? null : h("p", {
+        class: "muted"
+      }, "The agent picked no changes to show."), p.changes.map((c, i) => h("article", {
+        class: "change"
+      }, h("header", null, h("code", {
+        class: "file"
+      }, c.file), h("span", {
+        class: "stat"
+      }, h("span", {
+        class: "plus"
+      }, `+${stats[i].added}`), " ", h("span", {
+        class: "minus"
+      }, `\u2212${stats[i].removed}`))), h("p", {
+        class: "note"
+      }, c.note), diffView(c.diff))), p.rest_note ? h("p", {
+        class: "rest muted"
+      }, p.rest_note) : null),
+      p.questions.length ? h("section", null, h("h2", null, "The agent's open questions"), h("ol", {
+        class: "questions"
+      }, p.questions.map((q) => h("li", null, q))), h("p", {
+        class: "muted small"
+      }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null,
+      answers.length ? h("section", {
+        id: "answers"
+      }, h("h2", null, "Answers"), answers.map((a) => h("div", {
+        class: "answer"
+      }, h("p", {
+        class: "q muted"
+      }, a.question), h("p", {
+        class: "prose"
+      }, a.text)))) : null,
+      h("div", {
+        class: `actions${mode || showKeys ? " has-drawer" : ""}`
+      }, showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false)) : null, actionPanel(p), effective ? h("div", {
+        class: `notice ${effective.tone}`,
+        role: effective.tone === "danger" ? "alert" : "status"
+      }, effective.text) : null, h("div", {
+        class: "row bar"
+      }, h("div", {
+        class: "merge-group"
+      }, mergeButton, select, h("label", {
+        class: "check"
+      }, box, " Delete branch")), h("span", {
+        class: "spacer"
+      }), h("button", {
+        type: "button",
+        id: "request",
+        "aria-keyshortcuts": "R",
+        disabled: !!closed || sent === "request_changes",
+        title: closed ?? null,
+        onclick: () => setMode("request")
+      }, "Request changes ", h("kbd", null, "R")), h("button", {
+        type: "button",
+        id: "ask",
+        "aria-keyshortcuts": "A",
+        disabled: !!closed,
+        title: closed ?? null,
+        onclick: () => setMode("ask")
+      }, "Ask ", h("kbd", null, "A")), h("button", {
+        type: "button",
+        id: "skip",
+        "aria-keyshortcuts": "S",
+        disabled: !!sent,
+        title: "Move on without changing this PR",
+        onclick: () => sendSimple("skip")
+      }, "Skip ", h("kbd", null, "S")), h("button", {
+        type: "button",
+        id: "hold",
+        "aria-keyshortcuts": "H",
+        disabled: !!sent || !!holdClosed(p),
+        title: holdClosed(p) ?? "Put this PR aside to come back to later",
+        onclick: () => sendSimple("hold")
+      }, "Hold ", h("kbd", null, "H")), helpButton(() => setKeys(!showKeys), showKeys)), actionsGroup(p.actions, runAction, (a) => sentCustom.has(a.id), actionsOpen, () => {
+        actionsOpen = !actionsOpen;
         render();
-      })
-    }, "Open on GitHub ", h("kbd", null, "O"))), h("div", {
-      class: "row bar second"
-    }, h("button", {
-      type: "button",
-      id: "skip",
-      "aria-keyshortcuts": "S",
-      disabled: !!sent,
-      title: "Move on without changing this PR",
-      onclick: () => sendSimple("skip")
-    }, "Skip ", h("kbd", null, "S")), h("button", {
-      type: "button",
-      id: "hold",
-      "aria-keyshortcuts": "H",
-      disabled: !!sent || !!holdClosed(p),
-      title: holdClosed(p) ?? "Put this PR aside to come back to later",
-      onclick: () => sendSimple("hold")
-    }, "Hold ", h("kbd", null, "H")), p.actions.map((a) => actionButton(a, () => runAction(a), sentCustom.has(a.id)))), h("p", {
-      id: "merge-hint",
-      class: "hint small",
-      "aria-live": "polite"
-    }), closed ? h("p", {
-      class: "hint small"
-    }, `${closed} Request changes and Ask are off.`) : null), lightbox(p));
+        document.getElementById("your-actions")?.focus();
+      }), h("p", {
+        id: "merge-hint",
+        class: "hint small",
+        "aria-live": "polite"
+      }), closed ? h("p", {
+        class: "hint small"
+      }, `${closed} Request changes and Ask are off.`) : null),
+      lightbox(p)
+    );
+    for (const el of root.children) el.inert = enlarged !== null && !el.classList.contains("lightbox");
     drawCharts();
     updateMergeButton();
     scrollTo(0, scroll);
@@ -2812,17 +3064,23 @@ ${question}`,
     }
     if (!pr) return;
     if (enlarged !== null) {
+      const box = document.querySelector(".lightbox");
+      if (box && trapTab(box, e)) return;
+      const onStage = e.target.classList?.contains("lb-stage");
       if (e.key === "Escape") {
         e.preventDefault();
         enlarge(null);
-      } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      } else if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        toggleSize();
+      } else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && !(onStage && actualSize)) {
         const shots = pr.media.flatMap((x, i) => x.kind === "image" ? [
           i
         ] : []);
         const at = shots.indexOf(enlarged);
         e.preventDefault();
         enlarge(shots[(at + (e.key === "ArrowRight" ? 1 : -1) + shots.length) % shots.length]);
-      }
+      } else if (!box?.contains(e.target)) e.preventDefault();
       return;
     }
     if (typing(e)) {
@@ -2838,6 +3096,16 @@ ${question}`,
     }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (key === "Escape" && showKeys) {
+      e.preventDefault();
+      setKeys(false);
+      return;
+    }
+    if (key === "?") {
+      e.preventDefault();
+      setKeys(!showKeys);
+      return;
+    }
     if (key === "Escape" && mode) {
       e.preventDefault();
       closeMode();
@@ -2930,6 +3198,7 @@ ${question}`,
         return;
       }
       const next = r.value;
+      let closedView = false;
       const id = `${next.repo}#${next.number}`;
       const changedSha = !!pr && pr.head_sha !== next.head_sha;
       if (gate.input(next) && mode === "confirm") {
@@ -2944,7 +3213,13 @@ ${question}`,
           setNotice("The PR or the action changed while you were confirming. Check it, then try again.", "warning");
         } else outward = a;
       }
-      if (enlarged !== null && next.media[enlarged]?.kind !== "image") enlarged = null;
+      const still = enlarged === null ? void 0 : next.media[enlarged];
+      if (enlarged !== null && (still?.kind !== "image" || still.image.src !== enlargedSrc)) {
+        enlarged = null;
+        enlargedSrc = "";
+        actualSize = false;
+        closedView = true;
+      }
       if (id !== identity) {
         identity = id;
         method = next.merge_method_default;
@@ -2966,6 +3241,7 @@ ${question}`,
       pr = next;
       warnings = r.warnings;
       render();
+      if (closedView) document.querySelector("h1")?.focus();
     }
   });
 })();

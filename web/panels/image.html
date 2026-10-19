@@ -245,6 +245,13 @@ main { padding: 0; max-width: none; display: flex; flex-direction: column; heigh
   }
 
   // src/panels/apps/shared/validate.ts
+  function chars(v) {
+    if (v.length < 2) return v.length;
+    let n = 0;
+    for (const _ of v) n++;
+    return n;
+  }
+  var fits = (v, max) => v.length <= max || chars(v) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
@@ -273,7 +280,7 @@ main { padding: 0; max-width: none; display: flex; flex-direction: column; heigh
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (v.length > max) {
+      if (!fits(v, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }

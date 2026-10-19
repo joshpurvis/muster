@@ -170,16 +170,20 @@ merge, hold (put it aside to come back to later), or options they asked for at t
    risk and summary, sortable (riskiest, quick wins, oldest) and filterable.
 2. The user opens a PR (Enter), or presses Next (N) to go through them in the order they see.
    The agent marks it `reviewing`, runs the one-snapshot review above and opens its
-   `pr_decision` panel, now with `media` when it helps: images from the PR description
-   (downloaded into the task directory), a screenshot of a UI change's preview, a small chart
-   of lines changed per area.
+   `pr_decision` panel, now with `media` when it helps: images from the PR description, a
+   screenshot of a UI change's preview, a small chart of lines changed per area. Pictures are
+   files: the agent downloads them from GitHub's own image hosts only, with the URLs taken from
+   the PR body by `grep` (never typed into a command), into a fresh private `mktemp -d`
+   directory that it deletes afterwards. The risk, checks and reviews stay above the pictures.
 3. The user merges, requests changes, skips (S) or holds (H). The agent updates the PR's card
    (`merged`, `queued`, `changes_requested`, `held`), closes the decision panel and returns to
    the overview, or, after Next, goes on to the next PR. Held PRs gather at the end.
 4. Options the user asked for at the start ("also give me a Needs QA button") become
-   `actions` in both panels: a button (and key) with a plain description of what the agent
-   will do. One that changes GitHub or anything off the machine is `outward` and asks to
-   confirm, showing that description. The agent does exactly that and reports it on the card.
+   `actions` in both panels, shown apart as "Your actions": a button (and key) with a plain
+   description of what the agent will do. Every action says whether it is `outward` (changes
+   GitHub or anything off the machine); those ask to confirm, showing that description. A
+   label may not copy a built-in button's name. The agent does exactly that and reports it on
+   the card.
 
 The merge rules above are unchanged: only a pr_decision Merge event merges, with the head
 commit that panel showed; overview events, Skip, Hold and custom actions never merge.

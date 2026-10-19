@@ -1,6 +1,6 @@
 // `pr_decision` app: input checks, the merge command and the event payloads. Pure, so deno
 // tests cover it. docs/AGENT_PANELS.md "PR decision, end to end" is the contract.
-import { httpsUrl, Problems, type Result } from "../shared/validate.ts";
+import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { Gate } from "../shared/confirm.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
 import { type ImageInput, validateImage } from "../image/logic.ts";
@@ -168,7 +168,11 @@ export function validatePr(data: unknown): Result<Pr> {
   });
 }
 
-/** Each item is checked by its own app's rules (image, chart), its problems prefixed with its place. */
+/** Each item is checked by its own app's rules (image, chart), its problems prefixed with its
+ * place. Like Muster's backend, media is strict: pictures come from a path only (Muster has read
+ * them into `src`) and unknown fields are errors, not warnings. */
+const MEDIA_FIELDS = { image: ["kind", "path", "alt", "caption", "src", "mime", "bytes"], chart: ["kind", "spec", "caption"] };
+
 function validateMedia(p: Problems, o: Record<string, unknown>): Media[] {
   const out: Media[] = [];
   let bytes = 0;
@@ -177,19 +181,22 @@ function validateMedia(p: Problems, o: Record<string, unknown>): Media[] {
     const mo = p.object(m, at);
     if (!mo) return;
     const kind = p.oneOf(mo, "kind", at, MEDIA_KINDS, true);
-    const { kind: _, ...rest } = mo;
-    const nested = (errors: string[], warnings: string[]) => {
-      for (const e of errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
-      for (const w of warnings) p.warnings.push(`${at}.${w}`);
-    };
+    if (!kind) return;
+    for (const k of Object.keys(mo)) {
+      if (k === "url" && kind === "image") p.add(`${at}.url`, "pictures come from a path only: download it into the task directory");
+      else if (!MEDIA_FIELDS[kind].includes(k)) p.add(`${at}.${k}`, "unknown field");
+    }
     if (kind === "image") {
+      const { kind: _, ...rest } = mo;
+      if (rest.url !== undefined) return;
       const r = validateImage(rest);
-      if (!r.ok) { nested(r.errors, []); return; }
-      nested([], r.warnings);
+      if (!r.ok) {
+        for (const e of r.errors) p.errors.push(e.startsWith("data: ") ? `${at}: ${e.slice(6)}` : `${at}.${e}`);
+        return;
+      }
       bytes += r.value.bytes ?? 0;
       out.push({ kind, image: r.value });
-    } else if (kind === "chart") {
-      p.known(mo, at, ["kind", "spec", "caption"]);
+    } else {
       const caption = p.string(mo, "caption", at, { max: 2000 });
       if (mo.spec === undefined || mo.spec === null) { p.add(`${at}.spec`, "is required (a chart app spec)"); return; }
       const r = validateChart(mo.spec);
@@ -207,7 +214,7 @@ function strings(p: Problems, o: Record<string, unknown>, key: string, path: str
   p.array(o, key, path, { max })?.forEach((v, i) => {
     const at = `${path ? path + "." : ""}${key}[${i}]`;
     if (typeof v !== "string") p.add(at, "must be a string");
-    else if (v.length > len) p.add(at, `is longer than ${len} characters`);
+    else if (!fits(v, len)) p.add(at, `is longer than ${len} characters`);
     else if (v.trim()) out.push(v);
   });
   return out;

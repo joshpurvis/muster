@@ -184,14 +184,14 @@ Deno.test("media: pictures (as Muster read them) and charts, each checked by its
   bad([{ kind: "video" }], "media[0].kind: must be one of image, chart");
   bad([{ path: "a.png" }], "media[0].kind: is required");
   bad([{ kind: "image", path: "a.png" }], "media[0].path: the image file was not loaded");
-  bad([{ kind: "image", url: "http://x.example/a.png" }], "media[0].url: must be an https URL");
+  bad([{ kind: "image", url: "https://x.example/a.png" }], "media[0].url: pictures come from a path only");
   bad([{ kind: "image" }], "media[0]: needs path");
   bad([{ kind: "chart" }], "media[0].spec: is required");
   bad([{ kind: "chart", spec: { ...chartSpec, type: "pie" } }], "media[0].spec.type: must be one of bar");
   bad(Array.from({ length: 9 }, () => ({ kind: "chart", spec: chartSpec })), "media: has 9 items; at most 8");
   bad([1, 2].map(() => ({ kind: "image", path: "a.png", src: PNG_URI, bytes: 4 * 1024 * 1024 })), "media: images total");
-  const w = validatePr({ ...samplePr, media: [{ kind: "chart", spec: chartSpec, extra: 1 }] });
-  check(w.ok && w.warnings.some((x) => x.startsWith("media[0].extra")), JSON.stringify(w));
+  bad([{ kind: "chart", spec: chartSpec, extra: 1 }], "media[0].extra: unknown field");
+  bad([{ kind: "image", path: "a.png", src: PNG_URI, extra: 1 }], "media[0].extra: unknown field");
 });
 
 Deno.test("skip and hold are one event each, about the PR shown", () => {
@@ -205,6 +205,7 @@ Deno.test("skip and hold are one event each, about the PR shown", () => {
 
 Deno.test("actions: the user's own buttons are validated with the PR", () => {
   const pr = valid({ ...samplePr, actions: [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }] });
+  eq(valid({ ...samplePr, actions: [{ id: "x", label: "X", description: "d" }] }).actions[0].outward, true, "a missing outward asks first");
   eq(pr.actions, [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }]);
   const e = errorsOf(validatePr({ ...samplePr, actions: [{ id: "x", label: "X", key: "m", description: "d" }] }));
   check(e.some((x) => x.startsWith("actions[0].key: \"m\" is a built-in key")), e.join("\n"));

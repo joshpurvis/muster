@@ -10,13 +10,16 @@ function run(actions: unknown) {
 }
 
 const qa = { id: "needs-qa", label: "Needs QA", key: "Q", description: "Add the needs-qa label on GitHub.", outward: true };
-const later = { id: "later", label: "Label later", description: "Note this PR in your list to label later; nothing on GitHub." };
+const later = { id: "later", label: "Label later", description: "Note this PR in your list to label later; nothing on GitHub.", outward: false };
 
 Deno.test("actions: valid ones come back normalised", () => {
   const r = run([qa, later]);
   eq(r.errors, []);
-  eq(r.out, [{ ...qa, key: "q" }, { ...later, key: undefined, outward: false }]);
+  eq(r.out, [{ ...qa, key: "q" }, { ...later, key: undefined }]);
   eq(run(undefined).out, []);
+  // Muster refuses an action without `outward`; should one get here, it asks first.
+  eq(run([{ id: "x", label: "X", description: "d" }]).out[0].outward, true);
+  eq(run([{ id: "x", label: "X", description: "d", outward: null }]).out[0].outward, true);
 });
 
 Deno.test("actions: keys never clash with the apps' own keys or each other; ids are unique and not built-in", () => {
@@ -34,6 +37,13 @@ Deno.test("actions: keys never clash with the apps' own keys or each other; ids 
   bad([{ ...later, description: " " }], "actions[0].description: must not be empty");
   bad([{ id: "x", label: "X" }], "actions[0].description: is required");
   bad([{ ...later, outward: "yes" }], "actions[0].outward: must be true or false");
+  for (const label of ["Hold", " merge ", "Open on  GitHub…", "Request changes.", "SKIP!", "Next", "Confirm merge"]) {
+    bad([{ ...later, label }], "actions[0].label:");
+  }
+  eq(run([{ ...later, label: "Hold for QA" }]).errors, [], "only an exact look-alike is refused");
+  // Lengths are characters (code points), as Muster's backend counts them.
+  eq(run([{ ...later, label: "😀".repeat(40), description: "🚀".repeat(300) }]).errors, []);
+  bad([{ ...later, label: "😀".repeat(41) }], "actions[0].label: is longer than 40");
   bad(Array.from({ length: 9 }, (_, i) => ({ ...later, id: `a${i}` })), "actions: has 9 items; at most 8");
   check(run([{ ...later, extra: 1 }]).warnings.some((w) => w.startsWith("actions[0].extra")));
 });
@@ -64,6 +74,11 @@ Deno.test("outward confirm: armed only after the opening key is released; a chan
   check(!g.isOpen);
   g.openTarget(outwardTarget(a, t));
   check(g.inputTarget(outwardTarget(a, { ...t, number: 813 })), "another PR cancels");
+  for (const change of [{ base: "release" }, { status: "merged" }, { head_sha: "e".repeat(40) }]) {
+    const t2 = { ...t, base: "master", status: "open" };
+    g.openTarget(outwardTarget(a, t2));
+    check(g.inputTarget(outwardTarget(a, { ...t2, ...change })), `a changed ${Object.keys(change)[0]} cancels`);
+  }
   g.openTarget(outwardTarget(a, t));
   check(g.inputTarget(null), "the action removed (or invalid input) cancels");
 });

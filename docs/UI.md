@@ -116,11 +116,12 @@ The other built-ins follow the theme and work by keyboard: Image toggles fit/act
 (Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
 Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
 has Merge (M), Request changes (R), Ask (A), Open on GitHub (O), Skip (S), Hold (H) and the
-user's own actions (their key on the button), and its pictures enlarge on click or Enter
-(arrows step, Esc closes); PR overview moves with J/K or the arrows, opens with Enter (or
-O, or a double-click), holds with H, goes through the PRs in order with N, and filters with `/`.
-An outward custom action (marked ↗) shows what the agent will do and needs Enter or Confirm,
-like Merge. Merge first shows the
+user's own actions (their key on the button, in a separate "Your actions" group that folds in
+small panels), and its pictures enlarge on click or Enter in a modal view (Z for actual size,
+drag to pan, arrows step, Esc closes); PR overview moves with J/K or the arrows, opens with
+Enter (or O, or a double-click), holds with H, goes through the PRs in order with N, and
+filters with `/`. In both, `?` lists the keys. An outward custom action (marked ↗) shows what
+the agent will do and needs Enter or Confirm, like Merge. Merge first shows the
 exact `gh pr merge` command and needs a fresh Enter or "Confirm merge" (a held key never
 confirms; a change to the PR cancels the step); with failing checks it is disabled unless
 Shift is held (Shift+M), and a hint beside it says so. Esc closes the confirm or a comment

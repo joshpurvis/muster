@@ -1,5 +1,5 @@
 // `chart` app: input checks, scales and ticks. Pure, so deno tests cover it.
-import { Problems, type Result } from "../shared/validate.ts";
+import { fits, Problems, type Result } from "../shared/validate.ts";
 
 export const TYPES = ["bar", "line", "scatter", "area"] as const;
 export type ChartType = typeof TYPES[number];
@@ -42,7 +42,7 @@ export function validateChart(data: unknown): Result<ChartSpec> {
     const values = p.array(xo, "values", "x", { required: true, max: MAX_POINTS, min: 1 });
     if (values) {
       values.forEach((v, i) => {
-        if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || v.length > 200) {
+        if (typeof v === "number" ? !Number.isFinite(v) : typeof v !== "string" || !fits(v, 200)) {
           p.add(`x.values[${i}]`, "must be a finite number or a string of at most 200 characters");
         }
       });

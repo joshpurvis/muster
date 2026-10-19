@@ -402,7 +402,9 @@ mod tests {
         }
         let flow = get("muster-pr-review").text;
         for want in ["no --repo, so they use explicit", "contents/PATH?ref=H", "MERGED or CLOSED", "three times",
-            "gh pr list --repo R --state open", "app `pr_overview`", "`next` `{repo, number, order}`", "`outward: true`",
+            "gh pr list --repo R --state open", "app `pr_overview`", "`next` `{repo, number, order}`", "`outward` is required",
+            "into a command, not even quoted", "mktemp -d ./.muster-pr-XXXXXXXX", "-- \"$u\"",
+            "--limit 201", "with no `panel_id`", "it never repeats `number`", "--body-file <that file>",
             "A custom action never merges", "an overview or custom event"] {
             assert!(flow.contains(want), "{want}");
         }

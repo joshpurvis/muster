@@ -93,7 +93,7 @@ export const tableSample = {
 /** The user's own actions, as an agent adds them when asked for "a Needs QA button". */
 export const actionsSample = [
   { id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label to this PR on GitHub.", outward: true },
-  { id: "later", label: "Label later", key: "l", description: "Note this PR in your list to label later; nothing changes on GitHub." },
+  { id: "later", label: "Label later", key: "l", description: "Note this PR in your list to label later; nothing changes on GitHub.", outward: false },
 ];
 
 export const overviewSample = {

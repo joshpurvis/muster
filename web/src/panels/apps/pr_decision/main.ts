@@ -1,11 +1,11 @@
 // The PR decision panel: show what the user needs to decide, then send exactly one decision.
 // Every event is sent synchronously from the click or key handler that caused it.
 import { openLink, sendEvent, startApp, typing } from "../shared/client.ts";
-import { h, mount, problems } from "../shared/dom.ts";
+import { h, mount, problems, trapTab } from "../shared/dom.ts";
 import { diffStats, parseDiff } from "../shared/diff.ts";
 import { Gate } from "../shared/confirm.ts";
 import { actionForKey, type CustomAction, customEvent, outwardTarget } from "../shared/actions.ts";
-import { actionButton, outwardDrawer } from "../shared/actions_view.ts";
+import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
 import { renderChart } from "../chart/view.ts";
 import { formatBytes } from "../image/logic.ts";
 import {
@@ -30,8 +30,15 @@ let outward: CustomAction | null = null;
 const outGate = new Gate();
 /** Custom actions sent since the last update. */
 const sentCustom = new Set<string>();
-/** The media image shown enlarged, by its index in `pr.media`. */
+/** The media image shown enlarged (a modal view), by its index in `pr.media`, and its source:
+ * an update that replaces that picture closes the view. */
 let enlarged: number | null = null;
+let enlargedSrc = "";
+/** The enlarged picture at actual size (scroll or drag to pan) instead of fitted. */
+let actualSize = false;
+/** "Your actions" unfolded in a small panel; the shortcut list shown. */
+let actionsOpen = false;
+let showKeys = false;
 const chartTables = new Map<number, boolean>();
 let chartWidth = 0;
 let override = false;
@@ -66,7 +73,8 @@ function updateMergeButton() {
 }
 
 function openConfirm(withShift: boolean) {
-  if (!pr) return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr) return;
   const blocked = mergeBlocked(pr, withShift, !!sent);
   if (blocked) { setNotice(blocked, "warning"); render(); return; }
   override = checksBlock(pr);
@@ -90,7 +98,8 @@ function closeMode() {
 
 /** Skip and Hold: one event each; the agent moves on (Hold also marks it held in the overview). */
 function sendSimple(kind: "skip" | "hold") {
-  if (!pr || sent) return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr || sent) return;
   if (kind === "hold" && holdClosed(pr)) { setNotice(holdClosed(pr)!, "warning"); render(); return; }
   if (mode) closeMode();
   const event = kind === "skip" ? skipEvent(pr) : holdEvent(pr);
@@ -103,10 +112,11 @@ function sendSimple(kind: "skip" | "hold") {
 }
 
 const holdClosed = (p: Pr) => p.status === "merged" ? "The PR is merged." : p.status === "queued" ? "The PR is queued to merge." : null;
-const target = (p: Pr) => ({ repo: p.repo, number: p.number, head_sha: p.head_sha });
+const target = (p: Pr) => ({ repo: p.repo, number: p.number, head_sha: p.head_sha, base: p.base, status: p.status });
 
 function runAction(a: CustomAction) {
-  if (!pr || sentCustom.has(a.id)) return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr || sentCustom.has(a.id)) return;
   if (a.outward) {
     if (mode === "confirm") gate.close();
     outward = a;
@@ -130,7 +140,8 @@ function sendCustom(a: CustomAction) {
 }
 
 function confirmOutward() {
-  if (!pr || mode !== "outward" || !outward) return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr || mode !== "outward" || !outward) return;
   const a = outward;
   // Not yet armed: the key that opened it (or its repeat) is still held.
   if (!outGate.canConfirmTarget(outwardTarget(a, target(pr)))) return;
@@ -141,16 +152,30 @@ function confirmOutward() {
   document.getElementById(`act-${a.id}`)?.focus();
 }
 
+/** Open (or step) the enlarged picture, a modal view: everything behind it is inert, and an
+ * open Merge or outward confirm is closed first, so nothing can be confirmed unseen. */
 function enlarge(i: number | null) {
   const was = enlarged;
+  if (i !== null && pr?.media[i]?.kind !== "image") i = null;
+  if (i !== null && (mode === "confirm" || mode === "outward")) {
+    gate.close();
+    outGate.close();
+    outward = null;
+    mode = null;
+    setNotice("The confirm was closed while you look at the pictures. Start it again when you are ready.", "warning");
+  }
+  if (i !== was) actualSize = false;
   enlarged = i;
+  const m = i === null ? undefined : pr?.media[i];
+  enlargedSrc = m?.kind === "image" ? m.image.src : "";
   render();
   if (i !== null) document.getElementById("lightbox-close")?.focus();
-  else if (was !== null) document.getElementById(`media-${was}`)?.focus();
+  else if (was !== null) (document.getElementById(`media-${was}`) ?? document.querySelector("h1"))?.focus();
 }
 
 function confirmMerge() {
-  if (!pr || mode !== "confirm") return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr || mode !== "confirm") return;
   // Not yet armed: the key that opened the confirm (or its repeat) is still held.
   if (!gate.canConfirm(pr)) return;
   const blocked = mergeBlocked(pr, override, !!sent);
@@ -181,7 +206,8 @@ function formEvent(kind: "request" | "ask", text: string) {
 }
 
 function submit(kind: "request" | "ask") {
-  if (!pr) return;
+  // Nothing acts while a picture covers the panel.
+  if (enlarged !== null || !pr) return;
   const closed = formsClosed(pr);
   if (closed) { setNotice(`Not sent: ${closed}`, "warning"); render(); return; }
   const text = drafts[kind].trim();
@@ -199,6 +225,7 @@ function submit(kind: "request" | "ask") {
 }
 
 function setMode(next: Exclude<Mode, null | "confirm">) {
+  if (enlarged !== null) return;
   mode = next;
   render();
   focusMode();
@@ -331,7 +358,21 @@ function lightbox(p: Pr) {
   const shots = p.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
   const at = shots.indexOf(enlarged);
   const step = (by: number) => enlarge(shots[(at + by + shots.length) % shots.length]);
-  return h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": m.image.alt, onclick: (e: Event) => { if (e.target === e.currentTarget) enlarge(null); } },
+  const img = h("img", { src: m.image.src, alt: m.image.alt, draggable: "false" });
+  const stage = h("div", { class: `lb-stage ${actualSize ? "actual" : "fit"}`, tabindex: "0", "aria-label": "Picture; Z toggles actual size, drag or arrow keys scroll" }, img);
+  // At actual size, drag to pan; a click without a drag toggles the size.
+  let drag: { x: number; y: number; moved: boolean } | null = null;
+  stage.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, y: e.clientY, moved: false }; });
+  stage.addEventListener("pointermove", (e) => {
+    if (!drag || !actualSize || !(e.buttons & 1)) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+    stage.scrollBy(-dx, -dy);
+    drag.x = e.clientX;
+    drag.y = e.clientY;
+  });
+  img.addEventListener("click", () => { if (!drag?.moved) toggleSize(); drag = null; });
+  return h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": m.image.alt },
     h("div", { class: "lb-bar" },
       h("span", { class: "muted small lb-src", title: m.image.source }, m.image.source, m.image.bytes !== undefined ? ` · ${formatBytes(m.image.bytes)}` : ""),
       shots.length > 1 ? [
@@ -339,10 +380,29 @@ function lightbox(p: Pr) {
         h("span", { class: "muted small" }, `${at + 1} / ${shots.length}`),
         h("button", { type: "button", "aria-label": "Next picture", onclick: () => step(1) }, "→"),
       ] : null,
+      h("button", { type: "button", id: "lightbox-zoom", "aria-pressed": String(actualSize), onclick: () => toggleSize() },
+        actualSize ? "Fit" : "Actual size", " ", h("kbd", null, "Z")),
       h("button", { type: "button", id: "lightbox-close", onclick: () => enlarge(null) }, "Close ", h("kbd", null, "Esc"))),
-    h("div", { class: "lb-stage", onclick: () => enlarge(null) }, h("img", { src: m.image.src, alt: m.image.alt })),
+    stage,
     m.image.caption ? h("p", { class: "lb-caption" }, m.image.caption) : null);
 }
+
+function setKeys(on: boolean) {
+  showKeys = on;
+  render();
+  document.getElementById(on ? "shortcuts-close" : "keys-help")?.focus();
+}
+
+function toggleSize() {
+  actualSize = !actualSize;
+  const focus = document.activeElement?.id;
+  render();
+  if (focus) document.getElementById(focus)?.focus({ preventScroll: true });
+}
+
+const KEYS: [string, string][] = [["M", "Merge (shows the exact command first; Shift+M with failing checks)"], ["R", "Request changes"],
+  ["A", "Ask the agent"], ["O", "Open on GitHub"], ["S", "Skip: move on, change nothing"], ["H", "Hold: put aside for later"],
+  ["Enter", "Confirm, in a confirm step"], ["Esc", "Close a confirm, a box or a picture"], ["?", "These shortcuts"]];
 
 function render() {
   if (!pr) return;
@@ -365,14 +425,16 @@ function render() {
 
   mount(root,
     h("header", { class: "head" },
-      h("h1", null, p.title, " ", h("span", { class: "num" }, `#${p.number}`)),
+      h("div", { class: "title-row" },
+        h("h1", { tabindex: "-1" }, p.title, " ", h("span", { class: "num" }, `#${p.number}`)),
+        h("button", { type: "button", id: "open", class: "link open-gh", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
       h("p", { class: "meta muted" },
         `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} · head `,
         h("code", { title: p.head_sha }, short(p.head_sha)))),
     statusBanner(p),
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
     h("section", null, h("h2", null, "What changed"), h("p", { class: "prose" }, p.summary)),
-    mediaSection(p),
+    // The decision signals come before the pictures: they must never be scrolled away by them.
     h("section", { class: "grid" },
       h("div", null,
         h("h2", null, "Risk"),
@@ -391,6 +453,7 @@ function render() {
         p.reviews?.decision ? badge(words(p.reviews.decision), reviewTone(p.reviews.decision)) : h("span", { class: "muted" }, "No review decision"),
         p.reviews?.items.length ? h("ul", { class: "checks" }, p.reviews.items.map((r) =>
           h("li", null, h("span", null, r.author), h("span", { class: `state ${reviewTone(r.state)}` }, words(r.state))))) : null)),
+    mediaSection(p),
     h("section", null,
       h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"),
       p.changes.length ? null : h("p", { class: "muted" }, "The agent picked no changes to show."),
@@ -405,7 +468,8 @@ function render() {
       h("p", { class: "muted small" }, "Answer with Ask (A), or say what should change with Request changes (R).")) : null,
     answers.length ? h("section", { id: "answers" }, h("h2", null, "Answers"),
       answers.map((a) => h("div", { class: "answer" }, h("p", { class: "q muted" }, a.question), h("p", { class: "prose" }, a.text)))) : null,
-    h("div", { class: "actions" },
+    h("div", { class: `actions${mode || showKeys ? " has-drawer" : ""}` },
+      showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false)) : null,
       actionPanel(p),
       effective ? h("div", { class: `notice ${effective.tone}`, role: effective.tone === "danger" ? "alert" : "status" }, effective.text) : null,
       h("div", { class: "row bar" },
@@ -414,15 +478,16 @@ function render() {
         h("span", { class: "spacer" }),
         h("button", { type: "button", id: "request", "aria-keyshortcuts": "R", disabled: !!closed || sent === "request_changes", title: closed ?? null, onclick: () => setMode("request") }, "Request changes ", h("kbd", null, "R")),
         h("button", { type: "button", id: "ask", "aria-keyshortcuts": "A", disabled: !!closed, title: closed ?? null, onclick: () => setMode("ask") }, "Ask ", h("kbd", null, "A")),
-        h("button", { type: "button", id: "open", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
-      h("div", { class: "row bar second" },
         h("button", { type: "button", id: "skip", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
         h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
-        p.actions.map((a) => actionButton(a, () => runAction(a), sentCustom.has(a.id)))),
+        helpButton(() => setKeys(!showKeys), showKeys)),
+      actionsGroup(p.actions, runAction, (a) => sentCustom.has(a.id), actionsOpen, () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); }),
       h("p", { id: "merge-hint", class: "hint small", "aria-live": "polite" }),
       closed ? h("p", { class: "hint small" }, `${closed} Request changes and Ask are off.`) : null),
     lightbox(p),
   );
+  // The enlarged picture is modal: everything behind it is inert (no focus, no clicks).
+  for (const el of root.children) (el as HTMLElement).inert = enlarged !== null && !el.classList.contains("lightbox");
   drawCharts();
   updateMergeButton();
   scrollTo(0, scroll);
@@ -441,14 +506,18 @@ addEventListener("keydown", (e) => {
   if (outRepeat && mode === "outward") { e.preventDefault(); return; }
   if (!pr) return;
   if (enlarged !== null) {
-    // The enlarged picture takes the keyboard until it closes.
+    // The enlarged picture is modal: it takes the keyboard (Tab stays inside it) until it closes.
+    const box = document.querySelector(".lightbox");
+    if (box && trapTab(box, e)) return;
+    const onStage = (e.target as HTMLElement).classList?.contains("lb-stage");
     if (e.key === "Escape") { e.preventDefault(); enlarge(null); }
-    else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+    else if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); toggleSize(); }
+    else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && !(onStage && actualSize)) {
       const shots = pr.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
       const at = shots.indexOf(enlarged);
       e.preventDefault();
       enlarge(shots[(at + (e.key === "ArrowRight" ? 1 : -1) + shots.length) % shots.length]);
-    }
+    } else if (!box?.contains(e.target as Node)) e.preventDefault();
     return;
   }
   if (typing(e)) {
@@ -461,6 +530,8 @@ addEventListener("keydown", (e) => {
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (key === "Escape" && showKeys) { e.preventDefault(); setKeys(false); return; }
+  if (key === "?" ) { e.preventDefault(); setKeys(!showKeys); return; }
   if (key === "Escape" && mode) { e.preventDefault(); closeMode(); return; }
   if (key === "Enter" && mode === "outward") {
     e.preventDefault();
@@ -521,6 +592,7 @@ startApp({
       return;
     }
     const next = r.value;
+    let closedView = false;
     const id = `${next.repo}#${next.number}`;
     const changedSha = !!pr && pr.head_sha !== next.head_sha;
     if (gate.input(next) && mode === "confirm") {
@@ -535,7 +607,9 @@ startApp({
         setNotice("The PR or the action changed while you were confirming. Check it, then try again.", "warning");
       } else outward = a!;
     }
-    if (enlarged !== null && next.media[enlarged]?.kind !== "image") enlarged = null;
+    // The enlarged picture was replaced or removed: close the view rather than show another.
+    const still = enlarged === null ? undefined : next.media[enlarged];
+    if (enlarged !== null && (still?.kind !== "image" || still.image.src !== enlargedSrc)) { enlarged = null; enlargedSrc = ""; actualSize = false; closedView = true; }
     if (id !== identity) {
       identity = id;
       method = next.merge_method_default;
@@ -558,5 +632,6 @@ startApp({
     pr = next;
     warnings = r.warnings;
     render();
+    if (closedView) document.querySelector<HTMLElement>("h1")?.focus();
   },
 });

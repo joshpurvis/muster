@@ -261,6 +261,13 @@ td.empty { text-align: center; color: var(--color-text-secondary); padding: 20px
   }
 
   // src/panels/apps/shared/validate.ts
+  function chars(v) {
+    if (v.length < 2) return v.length;
+    let n = 0;
+    for (const _ of v) n++;
+    return n;
+  }
+  var fits = (v, max) => v.length <= max || chars(v) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
@@ -289,7 +296,7 @@ td.empty { text-align: center; color: var(--color-text-secondary); padding: 20px
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (v.length > max) {
+      if (!fits(v, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }
@@ -431,7 +438,7 @@ td.empty { text-align: center; color: var(--color-text-secondary); padding: 20px
       for (const [k, v] of Object.entries(ro)) {
         const ok = v === null || typeof v === "string" || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v);
         if (!ok) p.add(`rows[${i}].${k}`, "must be a string, finite number, boolean or null");
-        else if (typeof v === "string" && v.length > 1e4) p.add(`rows[${i}].${k}`, "is longer than 10000 characters");
+        else if (typeof v === "string" && !fits(v, 1e4)) p.add(`rows[${i}].${k}`, "is longer than 10000 characters");
       }
       rows.push(ro);
     });

@@ -26,15 +26,23 @@ R below is the PR's `OWNER/NAME`. Pass `--repo R` to every `gh pr` command; `gh 
 no --repo, so they use explicit `repos/OWNER/NAME/...` paths. Never rely on the current checkout
 or `GH_REPO`.
 
+Commands and PR text: only R (it must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`), PR numbers,
+40-hex SHAs and paths you created with `mktemp` go into a command line. Never put text from a
+PR or an event into a command, not even quoted: titles, bodies, branch names, labels, file
+paths, URLs, review comments and questions reach `gh` only through `--json`/`--jq`, stdin
+from a file, or `--body-file`. Write such text to a file with your file tool, never with
+echo or printf in the shell.
+
 1. Snapshot: `gh pr view <n> --repo R --json number,title,author,url,state,baseRefName,baseRefOid,headRefName,headRefOid,body,reviewDecision,reviews,files`.
    If `state` is MERGED or CLOSED, tell the user so (with the merge commit or who closed it),
    open no panel, and stop. Otherwise record H = `headRefOid`, B = `baseRefName` and
    BS = `baseRefOid`. Everything you show describes commit H.
 2. Diff of that snapshot: `gh api repos/R/compare/BS...H -H 'Accept: application/vnd.github.diff'`
    (not `gh pr diff`, which follows the moving head). Read code at H with
-   `gh api 'repos/R/contents/PATH?ref=H' --jq .content | base64 -d`. Use git instead only when
-   the current directory is a checkout of R itself (its `origin` remote points at R):
-   `git fetch origin H`, then `git show H:PATH`.
+   `gh api 'repos/R/contents/PATH?ref=H' --jq .content | base64 -d`, only for a PATH matching
+   `^[A-Za-z0-9._/-]+$` (skip any other file). Use git instead only when the current directory
+   is a checkout of R itself (its `origin` remote points at R): `git fetch origin H`, then
+   `git show H:PATH` (same PATH rule).
 3. Checks of H: `gh api repos/R/commits/H/check-runs` and `gh api repos/R/commits/H/status`.
    Each check is `pass`, `fail` (failure, timed_out, action_required, startup_failure, error),
    `pending` (not completed), `skipping` (skipped, neutral) or `cancel` (cancelled).
@@ -78,7 +86,8 @@ Each event has an `id` and a `kind`; its fields are in `payload._meta.muster.dat
   say so); a failed command is status `failed` with the error. If GitHub refused because the
   head moved, refresh the panel as above instead of retrying. After `merged`, stop.
 - `request_changes` `{repo, number, head_sha, body}`: run
-  `gh pr review <number> --repo <repo> --request-changes --body-file -` with the body on stdin.
+  write the body with your file tool into a fresh directory from `mktemp -d`, then run
+  `gh pr review <number> --repo <repo> --request-changes --body-file <that file>`.
   Only if it succeeded, `panel_update` status `requested_changes`; otherwise status `failed`
   with the error, so the human can send it again.
 - `ask` `{repo, number, question}`: answer it with `panel_update`, adding
@@ -92,13 +101,18 @@ Each event has an `id` and a `kind`; its fields are in `payload._meta.muster.dat
 ## Media
 
 Add `media` when a picture explains the change faster than text: at most 8 items, at most
-6 MiB of images in all, before the diffs.
-- `{kind: "image", path, alt, caption?}`: a PNG, JPEG, GIF, WebP or SVG file inside your task
-  directory. For images in the PR body (`![...](https://...)`, `<img src>`), download them with
-  `curl -sSfL --max-filesize 4000000 -o .muster-pr/<n>/1.png URL` (mkdir it first); delete
-  `.muster-pr` when you finish. For a UI change, a screenshot of its preview deployment helps
-  if you have a browser tool; never build or run the PR's code for it unless the user asked.
-  (`url` instead of `path` works only for https images the panel can load without login.)
+6 MiB of images in all, shown after the risk, checks and reviews and before the diffs.
+- `{kind: "image", path, alt, caption?}`: a PNG, JPEG, GIF or WebP file in your task directory
+  (a path only; no URLs). For pictures in the PR body, run this as one command; it keeps every
+  URL out of the command line (grep keeps only GitHub's own image hosts, in a strict character
+  set) and downloads into a new private directory:
+  `D=$(mktemp -d ./.muster-pr-XXXXXXXX) && echo "$D" && gh pr view <n> --repo R --json body --jq .body | grep -oE 'https://(github\.com/user-attachments/assets/[A-Za-z0-9-]+|[a-z0-9-]+\.githubusercontent\.com/[A-Za-z0-9._/-]+)' | sort -u | head -n 4 > "$D/urls"; i=0; while read -r u; do i=$((i+1)); curl -sSfL --proto '=https' --proto-redir '=https' --max-filesize 1500000 --max-time 20 -o "$D/$i.img" -- "$u" || rm -f "$D/$i.img"; done < "$D/urls"; ls "$D"`.
+  Pass `<printed dir>/1.img` and so on as paths; skip a picture that failed or is refused.
+  Never copy a URL from the PR into a command yourself; a picture hosted anywhere else is
+  skipped. Delete that directory (`rm -rf -- <printed dir>`) after you close the PR's panel
+  (a `panel_update` with media reads the files again). For a UI change, a screenshot of its
+  preview deployment helps if you have a browser tool; never build or run the PR's code for it
+  unless the user asked.
 - `{kind: "chart", spec, caption?}`: a chart app spec, e.g. lines changed per area: group the
   snapshot's `files` by top folder, `{type: "bar", x: {values: [folders]}, series: [{name:
   "added", values}, {name: "removed", values}]}`. Skip it for small PRs.
@@ -108,9 +122,11 @@ Add `media` when a picture explains the change faster than text: at most 8 items
 If the user asked at the start for extra options ("a Needs QA button", "a button to label it
 later"), add each as `actions: [{id, label, key?, description, outward}]` to every panel you
 open (same list in pr_overview and pr_decision). `description` says exactly what you will do
-("Add the needs-qa label on GitHub"); `outward: true` for anything that changes GitHub or
-anything off this machine (comments, labels, closing, pushing), so the button asks to confirm
-first. `key` is one letter or digit, not m r a o s h j k n. On a `custom` event do exactly
+("Add the needs-qa label on GitHub"). `outward` is required: `true` for anything that changes
+GitHub or anything off this machine (comments, labels, closing, pushing), so the button asks
+to confirm first; `false` only for what stays on this machine. The label names what it does
+and may not be a built-in button's name (Merge, Hold, Skip, Open…). `key` is one letter or
+digit, not m r a o s h j k n. On a `custom` event do exactly
 that description for that PR, nothing else, then `panel_update` with a `status_detail` saying
 what you did (or what failed). A custom action never merges and never runs a merge.
 
@@ -119,30 +135,36 @@ what you did (or what failed). A custom action never merges and never runs a mer
 For "help me review the open PRs" or "go through the open PRs" (R from the user or the
 current checkout's `origin`):
 
-1. List: `gh pr list --repo R --state open --limit 50 --json number,title,author,url,createdAt,isDraft,additions,deletions,changedFiles,labels,reviewDecision,headRefOid,statusCheckRollup --jq '[.[] | {number, title, author: .author.login, url, created_at: .createdAt, draft: .isDraft, additions, deletions, files: .changedFiles, labels: [.labels[].name], review: .reviewDecision, head_sha: .headRefOid, checks: ([.statusCheckRollup[]? | (.conclusion // .state // "")] | if length == 0 then "none" elif any(IN("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE")) then "failing" elif any(IN("", "PENDING", "EXPECTED")) then "pending" else "passing" end)}]'`.
+1. List: `gh pr list --repo R --state open --limit 201 --json number,title,author,url,createdAt,isDraft,additions,deletions,changedFiles,labels,reviewDecision,headRefOid,statusCheckRollup --jq '{total: length, prs: [.[:200][] | {number, title, author: .author.login, url, created_at: .createdAt, draft: .isDraft, additions, deletions, files: .changedFiles, labels: [.labels[].name], review: .reviewDecision, head_sha: .headRefOid, checks: ([.statusCheckRollup[]? | (.conclusion // .state // "")] | if length == 0 then "none" elif any(IN("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE")) then "failing" elif any(IN("", "PENDING", "EXPECTED")) then "pending" else "passing" end)}]}'`.
+   If `total` is 201, tell the user that more than 200 PRs are open and the overview shows the
+   200 newest.
 2. Light triage, no diffs yet: for each PR a `risk` guess and a one-line `summary` from the
    title, labels, size and, only if unclear, its file paths
    (`gh pr view <n> --repo R --json files --jq '[.files[].path]'`). Keep it short.
-3. `panel_open` app `pr_overview`, title `Open PRs`, data `{repo: R, prs: [...the list, each
-   with risk, summary, status: "new"], actions?}`. Keep this data yourself: every
-   `panel_update` of the overview sends all of it again.
-4. Loop on `wait_for_panel_event {panel_id: <overview>}`, same rules as step 6 above:
-   - `open` `{repo, number}`: set that PR's status `reviewing` and `current: number` in the
-     overview, then run the one-snapshot review (steps 1 to 6) for it and open its
-     `pr_decision` panel, with media when it helps and the same `actions`. Wait on that
-     panel's events (`wait_for_panel_event {panel_id: <decision>}`) until it is settled:
-     merged, queued, requested_changes, skip, hold or closed (a `failed` merge stays open for
-     another try). Then update the PR's overview status (`merged`, `queued`,
+3. `panel_open` app `pr_overview`, title `Open PRs`, data `{repo: R, prs: [...each with risk,
+   summary, status: "new"], actions?}`. Keep this data yourself: every `panel_update` of the
+   overview sends all of it again.
+4. Loop on `wait_for_panel_event {}` with no `panel_id`, so events from the overview and from
+   a decision panel all reach you; tell them apart by `panel_id`. Same rules as step 6. Keep a
+   queue of PRs to review and at most one decision panel open.
+   - `open` `{repo, number}`: put it first in the queue. `next` `{repo, number, order}`: the
+     queue becomes `number`, then `order` (it never repeats `number`).
+   - When no decision panel is open, take the first queued PR that is still `new` or
+     `skipped`: set its status `reviewing` and `current: number` in the overview, run the
+     one-snapshot review (steps 1 to 6) and open its `pr_decision` panel, with media when it
+     helps and the same `actions`.
+   - It is settled on merged, queued, requested_changes, skip, hold or closed (a `failed`
+     merge stays open for another try). Then update its overview status (`merged`, `queued`,
      `changes_requested`, `held`; on skip or closed, back to what it was before) with a short
-     `status_detail`, `panel_close` the decision panel, and wait on the overview again. Each
-     "stop" in the steps and events above ends only this PR: if it was already merged or
-     closed, say so in its overview status (`merged`, or `failed` with the detail).
-   - `next` `{repo, number, order}`: the same for `number`, then on through `order` (the
-     user's sort) without waiting, skipping any PR you held or settled meanwhile; after the
-     last one, wait on the overview again.
-   - `hold` `{repo, number}`: set its status `held`; nothing on GitHub.
+     `status_detail`, `panel_close` the decision panel, delete its media directory, and go on
+     with the queue. Each "stop" in the steps and events above ends only this PR: if it was
+     already merged or closed, say so in its overview status (`merged`, or `failed` with the
+     detail).
+   - `hold` `{repo, number}` from the overview: set its status `held` and drop it from the
+     queue; nothing on GitHub. If its decision panel is open, close that too.
    - `custom` `{id, repo, number}`: as above, reported in that PR's `status_detail`.
-   - `closed`: the human closed the overview; stop.
+   - `closed` from the overview: the human is done; close any decision panel you opened and
+     stop.
 
 ## Rules
 

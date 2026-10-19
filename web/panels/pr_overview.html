@@ -122,7 +122,11 @@ main { padding-bottom: 0; }
 .card.selected.risk-high { border-left-color: var(--color-text-danger); }
 .card.selected.risk-medium { border-left-color: var(--color-text-warning); }
 .card.selected.risk-low { border-left-color: var(--color-text-success); }
-.card.g-merged, .card.g-queued, .card.g-changes_requested, .card.g-held { opacity: 0.78; }
+/* Held and decided cards step back by their surface, never by fading text: badges keep full
+   contrast (4.5:1 or more) in both themes. */
+.card.g-merged, .card.g-queued, .card.g-changes_requested, .card.g-held {
+  background: var(--color-background-secondary); border-style: dashed; border-left-style: solid;
+}
 .card.g-merged .title { text-decoration: line-through; text-decoration-color: var(--color-text-tertiary); }
 .top { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .num { font-family: var(--font-mono); font-size: 12.5px; color: var(--color-text-secondary); flex: none; }
@@ -157,7 +161,15 @@ main { padding-bottom: 0; }
   background: var(--color-background-primary); border-top: 1px solid var(--color-border-primary);
 }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.custom-row { margin-top: 8px; }
+.actions { max-height: 34vh; overflow-y: auto; }
+.actions.has-drawer { max-height: 85vh; }
+.custom-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--color-border-primary); }
+.group-label, .fold { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-text-secondary); }
+.fold { min-height: 28px; padding: 2px 8px; }
+button.help { min-width: 32px; padding: 5px 8px; font-weight: 700; }
+.shortcuts dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 8px; font-size: 13px; }
+.shortcuts dt { text-align: right; }
+.shortcuts dd { margin: 0; }
 .keys { margin: 6px 0 0; }
 .drawer { border: 1px solid var(--color-border-primary); background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; margin-bottom: 10px; }
 .drawer-title { display: block; font-weight: 600; margin-bottom: 6px; }
@@ -167,8 +179,12 @@ button kbd { margin-left: 2px; }
 button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
 @media (max-width: 520px) {
   .actions { padding: 8px 12px; }
-  .row { gap: 6px; }
-  .bar button kbd { display: none; }
+  .bar button kbd, .custom-group button kbd { display: none; }
+  .row, .custom-group { gap: 6px; }
+}
+/* Small panels: the key line goes (? lists the keys), so the bar stays short. */
+@media (max-height: 559px), (max-width: 520px) {
+  .keys { display: none; }
 }
 </style></head><body><main id="app"></main>
 <script>
@@ -411,6 +427,24 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     "overflow"
   ];
   var MAX_ACTIONS = 8;
+  var BUILTIN_LABELS = [
+    "merge",
+    "merge anyway",
+    "confirm merge",
+    "request changes",
+    "ask",
+    "open",
+    "open on github",
+    "github",
+    "skip",
+    "hold",
+    "next",
+    "cancel",
+    "confirm"
+  ];
+  function labelKey(label) {
+    return label.split(/\s+/).filter(Boolean).join(" ").toLowerCase().replace(/[….!:]+$/u, "").replace(/^#+/, "").trim();
+  }
   var ID = /^[a-z0-9][a-z0-9_-]{0,39}$/;
   var KEY = /^[a-z0-9]$/;
   function validateActions(p, o) {
@@ -453,6 +487,9 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         required: true,
         max: 40
       });
+      if (label !== void 0 && BUILTIN_LABELS.includes(labelKey(label))) {
+        p.add(`${at}.label`, `"${label}" looks like a built-in button; name what it does instead`);
+      }
       const description = p.string(ao, "description", at, {
         required: true,
         max: 300
@@ -472,7 +509,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
           key = k;
         }
       }
-      const outward2 = p.boolean(ao, "outward", at) ?? false;
+      const outward2 = p.boolean(ao, "outward", at) ?? true;
       if (id !== void 0 && label !== void 0 && description !== void 0) out.push({
         id,
         label,
@@ -509,7 +546,9 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       a.outward,
       t.repo,
       t.number,
-      t.head_sha ?? null
+      t.head_sha ?? null,
+      t.base ?? null,
+      t.status ?? null
     ]);
   }
 
@@ -555,8 +594,75 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       onclick: onCancel
     }, "Cancel ", h("kbd", null, "Esc"))));
   }
+  var roomy = () => innerHeight >= 560 && innerWidth > 520;
+  function actionsGroup(actions, run, off, open2, toggle) {
+    if (!actions.length) return null;
+    const folds = !roomy();
+    const shown = !folds || open2;
+    return h("div", {
+      class: "custom-group",
+      role: "group",
+      "aria-labelledby": "your-actions-label"
+    }, folds ? h("button", {
+      type: "button",
+      id: "your-actions",
+      class: "fold",
+      "aria-expanded": String(shown),
+      onclick: toggle
+    }, h("span", {
+      id: "your-actions-label"
+    }, `Your actions (${actions.length})`), shown ? " \u25B4" : " \u25BE") : h("span", {
+      id: "your-actions-label",
+      class: "group-label"
+    }, "Your actions"), shown ? actions.map((a) => actionButton(a, () => run(a), off(a))) : null);
+  }
+  function shortcutsDrawer(rows, actions, onClose) {
+    const all = [
+      ...rows,
+      ...actions.filter((a) => a.key).map((a) => [
+        a.key.toUpperCase(),
+        `${a.label} (your action${a.outward ? ", asks first" : ""})`
+      ])
+    ];
+    return h("div", {
+      class: "drawer shortcuts",
+      role: "group",
+      "aria-labelledby": "shortcuts-title"
+    }, h("div", {
+      id: "shortcuts-title",
+      class: "drawer-title"
+    }, "Keyboard shortcuts"), h("dl", null, all.map(([k, what]) => [
+      h("dt", null, h("kbd", null, k)),
+      h("dd", null, what)
+    ])), h("div", {
+      class: "row"
+    }, h("button", {
+      type: "button",
+      id: "shortcuts-close",
+      onclick: onClose
+    }, "Close ", h("kbd", null, "Esc"))));
+  }
+  function helpButton(onclick, open2) {
+    return h("button", {
+      type: "button",
+      id: "keys-help",
+      class: "help",
+      "aria-label": "Keyboard shortcuts",
+      "aria-expanded": String(open2),
+      "aria-keyshortcuts": "?",
+      title: "Keyboard shortcuts (?)",
+      onclick
+    }, "?");
+  }
 
   // src/panels/apps/shared/validate.ts
+  function chars(v) {
+    if (v.length < 2) return v.length;
+    let n = 0;
+    for (const _ of v) n++;
+    return n;
+  }
+  var fits = (v, max) => v.length <= max || chars(v) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
@@ -585,7 +691,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (v.length > max) {
+      if (!fits(v, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }
@@ -714,6 +820,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   };
   var MAX_PRS = 200;
   var SHA = /^[0-9a-f]{40}$/;
+  var DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
   var REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
   function count(p, o, key, at) {
     const v = p.number(o, key, at);
@@ -797,7 +904,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       const created_at = p.string(io, "created_at", at, {
         max: 40
       });
-      const created = created_at === void 0 ? void 0 : Date.parse(created_at);
+      const created = created_at === void 0 ? void 0 : DATE.test(created_at) ? Date.parse(created_at) : NaN;
       if (created_at !== void 0 && !Number.isFinite(created)) p.add(`${at}.created_at`, "must be a date such as 2026-10-18T09:30:00Z");
       const draft = p.boolean(io, "draft", at) ?? false;
       const additions = count(p, io, "additions", at);
@@ -811,7 +918,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       p.array(io, "labels", at, {
         max: 20
       })?.forEach((l, j) => {
-        if (typeof l !== "string" || !l.trim() || l.length > 100) p.add(`${at}.labels[${j}]`, "must be a label name (1 to 100 characters)");
+        if (typeof l !== "string" || !l.trim() || !fits(l, 100)) p.add(`${at}.labels[${j}]`, "must be a label name (1 to 100 characters)");
         else labels.push(l);
       });
       const risk = p.oneOf(io, "risk", at, RISKS);
@@ -906,6 +1013,18 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     if (pr.status === "merged" || pr.status === "queued" || pr.status === "changes_requested") return "done";
     return "todo";
   }
+  var CHECK_WORDS = {
+    passing: "checks passing",
+    failing: "checks failing",
+    pending: "checks pending",
+    none: "no checks"
+  };
+  var REVIEW_WORDS = {
+    APPROVED: "approved",
+    CHANGES_REQUESTED: "changes requested",
+    REVIEW_REQUIRED: "review required",
+    NONE: "no review"
+  };
   function matches(pr, filter2) {
     const words = filter2.toLowerCase().split(/\s+/).filter(Boolean);
     if (!words.length) return true;
@@ -917,7 +1036,9 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       pr.summary ?? "",
       pr.status.replace(/_/g, " "),
       pr.draft ? "draft" : "",
-      pr.risk ? `${pr.risk} risk` : ""
+      pr.risk ? `${pr.risk} risk` : "",
+      pr.checks ? CHECK_WORDS[pr.checks] : "",
+      pr.review ? REVIEW_WORDS[pr.review] : ""
     ].join("\n").toLowerCase();
     return words.every((w) => hay.includes(w));
   }
@@ -992,9 +1113,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         action: "next",
         repo,
         number: pr.number,
-        order: todo.map((x) => x.number)
+        order: rest.map((x) => x.number)
       }
     };
+  }
+  function followCurrent(selected2, before, after, userOnCard) {
+    if (after === void 0 || after === before || userOnCard) return selected2;
+    return after;
   }
   var canHold = (pr) => groupOf(pr) === "todo";
 
@@ -1008,15 +1133,57 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
   var notice = null;
   var sent = /* @__PURE__ */ new Set();
   var outward = null;
+  var actionsOpen = false;
+  var showKeys = false;
   var gate = new Gate();
   var sortNow = () => userSort ?? view?.sort ?? "risk";
   var ordered = () => view ? arrange(view.prs, sortNow(), filter).flatMap((g) => g.items) : [];
   var selectedPr = () => view?.prs.find((p) => p.number === selected) ?? null;
-  var target = (pr) => ({
-    repo: view.repo,
+  var target = (pr, repo = view.repo) => ({
+    repo,
     number: pr.number,
-    head_sha: pr.head_sha
+    head_sha: pr.head_sha,
+    status: pr.status
   });
+  var focusedCard = () => {
+    const el = document.activeElement;
+    return el?.getAttribute("role") === "option" && el.id.startsWith("pr-") ? Number(el.id.slice(3)) : null;
+  };
+  var KEYS = [
+    [
+      "J / \u2193",
+      "Next card"
+    ],
+    [
+      "K / \u2191",
+      "Previous card"
+    ],
+    [
+      "Enter / O",
+      "Open the PR: the agent reviews it"
+    ],
+    [
+      "H",
+      "Hold: put aside for later"
+    ],
+    [
+      "N",
+      "Go through the PRs in this order"
+    ],
+    [
+      "/",
+      "Filter (Esc clears)"
+    ],
+    [
+      "?",
+      "These shortcuts"
+    ]
+  ];
+  function setKeys(on) {
+    showKeys = on;
+    render();
+    document.getElementById(on ? "shortcuts-close" : "keys-help")?.focus();
+  }
   var riskText = {
     high: [
       "High risk",
@@ -1298,8 +1465,8 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
     const nextUp = nextPr(ordered(), v.current);
     const busy = (k) => !!pr && sent.has(`${k}:${pr.number}`);
     return h("div", {
-      class: "actions"
-    }, outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelOutward()) : null, notice ? h("div", {
+      class: `actions${outward || showKeys ? " has-drawer" : ""}`
+    }, showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null, outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelOutward()) : null, notice ? h("div", {
       class: `notice ${notice.tone}`,
       role: notice.tone === "danger" ? "alert" : "status"
     }, notice.text) : null, h("div", {
@@ -1324,7 +1491,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       disabled: !nextUp,
       title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review",
       onclick: () => next()
-    }, "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")), pr?.url ? h("button", {
+    }, "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")), helpButton(() => setKeys(!showKeys), showKeys), pr?.url ? h("button", {
       type: "button",
       id: "github",
       class: "link",
@@ -1335,13 +1502,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         };
         render();
       })
-    }, "GitHub") : null), v.actions.length ? h("div", {
-      class: "row bar custom-row",
-      role: "group",
-      "aria-label": "Your actions"
-    }, v.actions.map((a) => actionButton(a, () => runAction(a), !pr || sent.has(`custom:${a.id}:${pr.number}`)))) : null, h("p", {
+    }, "GitHub") : null), actionsGroup(v.actions, runAction, (a) => !pr || sent.has(`custom:${a.id}:${pr.number}`), actionsOpen, () => {
+      actionsOpen = !actionsOpen;
+      render();
+      document.getElementById("your-actions")?.focus();
+    }), h("p", {
       class: "keys muted small"
-    }, "J/K move \xB7 Enter open \xB7 H hold \xB7 N next \xB7 / filter"));
+    }, "J/K move \xB7 Enter open \xB7 H hold \xB7 N next \xB7 / filter \xB7 ? keys"));
   }
   function render() {
     if (!view) return;
@@ -1449,6 +1616,25 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       return;
     }
     if (key === "Enter" && t.tagName === "BUTTON") return;
+    if (key === "Escape" && showKeys) {
+      e.preventDefault();
+      setKeys(false);
+      return;
+    }
+    if (key === "?") {
+      e.preventDefault();
+      setKeys(!showKeys);
+      return;
+    }
+    const onCard = focusedCard();
+    if (onCard !== null && onCard !== selected && ![
+      "j",
+      "k",
+      "ArrowDown",
+      "ArrowUp",
+      "Home",
+      "End"
+    ].includes(key)) select(onCard, false);
     if (e.repeat && ![
       "j",
       "k",
@@ -1509,15 +1695,13 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
         filter = "";
         selected = null;
       }
-      if (next2.current !== void 0 && next2.current !== view?.current) selected = next2.current;
+      const before = selected;
+      selected = followCurrent(selected, view?.current, next2.current, focusedCard() !== null);
+      const moved = selected !== before;
       if (outward) {
         const a = next2.actions.find((x) => x.id === outward.action.id);
         const pr = next2.prs.find((x) => x.number === outward.pr.number);
-        const t = a && pr && next2.repo === view?.repo ? outwardTarget(a, {
-          repo: next2.repo,
-          number: pr.number,
-          head_sha: pr.head_sha
-        }) : null;
+        const t = a && pr && next2.repo === view?.repo ? outwardTarget(a, target(pr, next2.repo)) : null;
         if (gate.inputTarget(t)) {
           outward = null;
           notice = {
@@ -1533,6 +1717,7 @@ button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
       view = next2;
       warnings = r.warnings;
       render();
+      if (moved && selected !== null) reveal(document.getElementById(`pr-${selected}`), document.querySelector(".actions"));
     }
   });
 })();

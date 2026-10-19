@@ -75,16 +75,31 @@ section { margin: 0 0 18px; }
 .warn { color: var(--color-text-warning); font-weight: 600; margin: 0 0 6px; }
 button kbd { margin-left: 2px; }
 button.primary kbd, button.danger kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
+.title-row { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.title-row h1 { flex: 1 1 240px; min-width: 0; }
+.title-row h1:focus { outline: none; }
+.open-gh { white-space: nowrap; font-size: 13px; }
+/* The sticky bar never takes more than about a third of a small panel; a drawer (a confirm or
+   a text box) may take more, so what it confirms is always in view. */
+.actions { max-height: 34vh; overflow-y: auto; }
+.actions.has-drawer { max-height: 85vh; }
+.custom-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--color-border-primary); }
+.group-label, .fold { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-text-secondary); }
+.fold { min-height: 28px; padding: 2px 8px; }
+button.help { min-width: 32px; padding: 5px 8px; font-weight: 700; }
+.shortcuts dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 8px; font-size: 13px; }
+.shortcuts dt { text-align: right; }
+.shortcuts dd { margin: 0; }
 @media (max-width: 520px) {
-  /* Narrow panels: natural-width buttons and no key hints (aria-keyshortcuts keeps them), so
-     the sticky bar stays three short rows. */
+  /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts
+     keeps them for assistive tech), so the sticky bar stays short. */
   .bar .spacer { display: none; }
   .actions { padding: 8px 12px 10px; margin: 12px -16px 0; }
-  .row { gap: 6px; }
-  .bar button kbd { display: none; }
-  .bar.second { margin-top: 6px; }
+  .row, .custom-group { gap: 6px; }
+  .bar button kbd, .custom-group button kbd, .open-gh kbd { display: none; }
+  .merge-group select { max-width: 112px; }
+  .merge-group .check { font-size: 12.5px; }
 }
-.bar.second { margin-top: 8px; }
 button.outward { border-color: var(--color-text-warning); }
 button .out { color: var(--color-text-warning); }
 .outward-desc { margin: 0 0 6px; }
@@ -104,6 +119,9 @@ button .out { color: var(--color-text-warning); }
 }
 .lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
 .lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
-.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; cursor: zoom-out; }
-.lb-stage img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; }
+.lb-stage img { margin: auto; display: block; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.lb-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+.lb-stage.actual img { max-width: none; max-height: none; flex: none; cursor: grab; }
+.lb-stage.actual:active img { cursor: grabbing; }
 .lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }

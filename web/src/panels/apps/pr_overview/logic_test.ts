@@ -1,5 +1,5 @@
 import {
-  age, arrange, canHold, holdEvent, type Item, matches, nextEvent, nextPr, openEvent, type Overview, queue, sortPrs, tally, validateOverview,
+  age, arrange, followCurrent, canHold, holdEvent, type Item, matches, nextEvent, nextPr, openEvent, type Overview, queue, sortPrs, tally, validateOverview,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
@@ -46,6 +46,9 @@ Deno.test("overview input: names the bad field", () => {
   bad(pr({ review: "LGTM" }), "prs[0].review");
   bad(pr({ additions: -1 }), "prs[0].additions");
   bad(pr({ created_at: "last week" }), "prs[0].created_at");
+  bad(pr({ created_at: "2026-10-15" }), "prs[0].created_at", );
+  bad(pr({ title: "😀".repeat(501) }), "prs[0].title: is longer than 500");
+  check(validateOverview({ ...sampleOverview, ...pr({ title: "😀".repeat(500), created_at: "2026-10-15T09:00:00.5+02:00" }) }).ok, "500 emoji fit, as in the backend");
   bad(pr({ url: "http://github.com/x" }), "prs[0].url: must be an https URL");
   bad(pr({ head_sha: "abc" }), "prs[0].head_sha");
   bad(pr({ labels: [""] }), "prs[0].labels[0]");
@@ -73,6 +76,9 @@ Deno.test("groups: held at the end, decided before it; filter matches every word
   eq(nums(arrange(o.prs, "risk", "session sam").flatMap((x) => x.items)), [801]);
   eq(nums(arrange(o.prs, "risk", "SECURITY").flatMap((x) => x.items)), [812], "labels, case-insensitive");
   check(matches(o.prs[2], "#801 draft") && matches(o.prs[2], "high risk") && !matches(o.prs[2], "nope"));
+  eq(nums(arrange(o.prs, "risk", "failing").flatMap((x) => x.items)), [801], "checks words");
+  eq(nums(arrange(o.prs, "risk", "approved").flatMap((x) => x.items)), [815], "review words");
+  eq(nums(arrange(o.prs, "risk", "review required").flatMap((x) => x.items)), [812]);
   eq(arrange(o.prs, "risk", "zzz"), []);
 });
 
@@ -97,7 +103,15 @@ Deno.test("age and events", () => {
   eq(openEvent("acme/api", pr).data, { action: "open", repo: "acme/api", number: 812 });
   eq(holdEvent("acme/api", pr).data, { action: "hold", repo: "acme/api", number: 812 });
   const [, b] = valid(sampleOverview).prs;
-  eq(nextEvent("acme/api", [pr, b]).data, { action: "next", repo: "acme/api", number: 812, order: [812, 815] });
+  eq(nextEvent("acme/api", [pr, b]).data, { action: "next", repo: "acme/api", number: 812, order: [815] }, "order never repeats number");
+  eq(nextEvent("acme/api", [pr]).data.order, []);
   check(nextEvent("acme/api", [pr, b]).text.includes("#812 (acme/api) now, then #815"));
   eq([openEvent("a/b", pr).kind, holdEvent("a/b", pr).kind, nextEvent("a/b", [pr]).kind], ["open", "hold", "next"]);
+});
+
+Deno.test("selection: the agent moving on never retargets a card the user is on", () => {
+  eq(followCurrent(812, 812, 815, false), 815, "follows the agent when the user is not on a card");
+  eq(followCurrent(801, 812, 815, true), 801, "keeps the user's pick while they navigate");
+  eq(followCurrent(801, 812, 812, false), 801, "no change of current: no change");
+  eq(followCurrent(801, 812, undefined, false), 801);
 });

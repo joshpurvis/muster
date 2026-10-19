@@ -5,9 +5,9 @@ import { openLink, sendEvent, startApp, typing } from "../shared/client.ts";
 import { h, mount, problems, reveal } from "../shared/dom.ts";
 import { Gate } from "../shared/confirm.ts";
 import { actionForKey, type CustomAction, customEvent, outwardTarget } from "../shared/actions.ts";
-import { actionButton, outwardDrawer } from "../shared/actions_view.ts";
+import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
 import {
-  age, arrange, canHold, GROUP_LABELS, holdEvent, type Item, nextEvent, nextPr, openEvent, type Overview, queue, type Sort,
+  age, arrange, canHold, followCurrent, GROUP_LABELS, holdEvent, type Item, nextEvent, nextPr, openEvent, type Overview, queue, type Sort,
   SORT_LABELS, SORTS, size, tally, validateOverview,
 } from "./logic.ts";
 
@@ -24,12 +24,29 @@ let notice: { text: string; tone: Tone } | null = null;
 /** `kind:number` of events sent since the last update: not sent twice before the agent answers. */
 const sent = new Set<string>();
 let outward: { action: CustomAction; pr: Item } | null = null;
+/** "Your actions" unfolded in a small panel; the shortcut list shown. */
+let actionsOpen = false;
+let showKeys = false;
 const gate = new Gate();
 
 const sortNow = () => userSort ?? view?.sort ?? "risk";
 const ordered = () => view ? arrange(view.prs, sortNow(), filter).flatMap((g) => g.items) : [];
 const selectedPr = () => view?.prs.find((p) => p.number === selected) ?? null;
-const target = (pr: Item) => ({ repo: view!.repo, number: pr.number, head_sha: pr.head_sha });
+/** The one place a PR's target is built: what its events name, and what a confirm is bound to. */
+const target = (pr: Item, repo = view!.repo) => ({ repo, number: pr.number, head_sha: pr.head_sha, status: pr.status });
+/** The card that has the keyboard, if any: keys act on it, never on a selection moved elsewhere. */
+const focusedCard = () => {
+  const el = document.activeElement as HTMLElement | null;
+  return el?.getAttribute("role") === "option" && el.id.startsWith("pr-") ? Number(el.id.slice(3)) : null;
+};
+const KEYS: [string, string][] = [["J / ↓", "Next card"], ["K / ↑", "Previous card"], ["Enter / O", "Open the PR: the agent reviews it"],
+  ["H", "Hold: put aside for later"], ["N", "Go through the PRs in this order"], ["/", "Filter (Esc clears)"], ["?", "These shortcuts"]];
+
+function setKeys(on: boolean) {
+  showKeys = on;
+  render();
+  document.getElementById(on ? "shortcuts-close" : "keys-help")?.focus();
+}
 
 const riskText = { high: ["High risk", "danger"], medium: ["Medium risk", "warning"], low: ["Low risk", "success"] } as const;
 const checksText = { passing: ["✓ Checks", "success"], failing: ["✕ Checks failing", "danger"], pending: ["● Checks pending", "warning"], none: ["No checks", "muted"] } as const;
@@ -175,7 +192,8 @@ function actionBar() {
   const pr = selectedPr();
   const nextUp = nextPr(ordered(), v.current);
   const busy = (k: string) => !!pr && sent.has(`${k}:${pr.number}`);
-  return h("div", { class: "actions" },
+  return h("div", { class: `actions${outward || showKeys ? " has-drawer" : ""}` },
+    showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null,
     outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelOutward()) : null,
     notice ? h("div", { class: `notice ${notice.tone}`, role: notice.tone === "danger" ? "alert" : "status" }, notice.text) : null,
     h("div", { class: "row bar" },
@@ -184,10 +202,11 @@ function actionBar() {
       h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !pr || !canHold(pr) || busy("hold"), onclick: () => hold(selectedPr()) }, "Hold ", h("kbd", null, "H")),
       h("button", { type: "button", id: "next", "aria-keyshortcuts": "N", disabled: !nextUp, title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review", onclick: () => next() },
         "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")),
+      helpButton(() => setKeys(!showKeys), showKeys),
       pr?.url ? h("button", { type: "button", id: "github", class: "link", onclick: () => openLink(pr.url!).catch((e) => { notice = { text: e.message, tone: "danger" }; render(); }) }, "GitHub") : null),
-    v.actions.length ? h("div", { class: "row bar custom-row", role: "group", "aria-label": "Your actions" },
-      v.actions.map((a) => actionButton(a, () => runAction(a), !pr || sent.has(`custom:${a.id}:${pr.number}`)))) : null,
-    h("p", { class: "keys muted small" }, "J/K move · Enter open · H hold · N next · / filter"));
+    actionsGroup(v.actions, runAction, (a) => !pr || sent.has(`custom:${a.id}:${pr.number}`), actionsOpen,
+      () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); }),
+    h("p", { class: "keys muted small" }, "J/K move · Enter open · H hold · N next · / filter · ? keys"));
 }
 
 function render() {
@@ -256,6 +275,11 @@ addEventListener("keydown", (e) => {
     return;
   }
   if (key === "Enter" && t.tagName === "BUTTON") return; // the button's own click
+  if (key === "Escape" && showKeys) { e.preventDefault(); setKeys(false); return; }
+  if (key === "?") { e.preventDefault(); setKeys(!showKeys); return; }
+  // Keys act on the card that has focus; if the selection moved (the agent went on), take it back.
+  const onCard = focusedCard();
+  if (onCard !== null && onCard !== selected && !["j", "k", "ArrowDown", "ArrowUp", "Home", "End"].includes(key)) select(onCard, false);
   if (e.repeat && !["j", "k", "ArrowDown", "ArrowUp"].includes(key)) return;
   if (key === "j" || key === "ArrowDown") { e.preventDefault(); move(1); }
   else if (key === "k" || key === "ArrowUp") { e.preventDefault(); move(-1); }
@@ -287,12 +311,15 @@ startApp({
     }
     const next = r.value;
     if (view && view.repo !== next.repo) { userSort = null; filter = ""; selected = null; }
-    // The agent moved on to a PR: follow it, so the list shows where the review is.
-    if (next.current !== undefined && next.current !== view?.current) selected = next.current;
+    // The agent moved on to a PR: follow it, unless the user is on a card (then their pick stays,
+    // so Enter and H never act on a PR they did not choose).
+    const before = selected;
+    selected = followCurrent(selected, view?.current, next.current, focusedCard() !== null);
+    const moved = selected !== before;
     if (outward) {
       const a = next.actions.find((x) => x.id === outward!.action.id);
       const pr = next.prs.find((x) => x.number === outward!.pr.number);
-      const t = a && pr && next.repo === view?.repo ? outwardTarget(a, { repo: next.repo, number: pr.number, head_sha: pr.head_sha }) : null;
+      const t = a && pr && next.repo === view?.repo ? outwardTarget(a, target(pr, next.repo)) : null;
       if (gate.inputTarget(t)) { outward = null; notice = { text: "The PR or the action changed while you were confirming. Check it, then try again.", tone: "warning" }; }
       else if (a && pr) outward = { action: a, pr };
     } else if (sent.size) notice = null;
@@ -301,5 +328,7 @@ startApp({
     view = next;
     warnings = r.warnings;
     render();
+    // Show where the selection went (focus stays where the user left it).
+    if (moved && selected !== null) reveal(document.getElementById(`pr-${selected}`), document.querySelector(".actions"));
   },
 });

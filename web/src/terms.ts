@@ -58,6 +58,8 @@ interface Entry {
   sentCols: number;
   sentRows: number;
   sizeOwner?: string | null;
+  /** Removes the latency probe's listeners from this terminal. */
+  probeOff?: () => void;
 }
 
 const entries = new Map<number, Entry>();
@@ -65,6 +67,44 @@ let park: HTMLDivElement | null = null;
 let fontSize = 13;
 let shortcutMatcher: (e: KeyboardEvent) => boolean = () => false;
 let focusListener: (sid: number) => void = () => {};
+
+/** The typing latency monitor's hooks (latency_monitor.ts). Null while it is off: then no
+ * listener is installed and each hook point costs one null check. */
+export interface LatencyProbe {
+  keydown(sid: number, ev: KeyboardEvent, webgl: boolean): void;
+  /** A user's input bytes were handed to the WebSocket. */
+  sent(sid: number): void;
+  /** A live output frame arrived; returns a write callback when a key waits on it. */
+  output(sid: number): (() => void) | undefined;
+  render(sid: number): void;
+  /** The terminal is gone: forget its keys. */
+  dispose(sid: number): void;
+}
+let probe: LatencyProbe | null = null;
+
+export function setLatencyProbe(p: LatencyProbe | null) {
+  probe = p;
+  for (const e of entries.values()) probeEntry(e);
+}
+
+function probeEntry(e: Entry) {
+  e.probeOff?.();
+  e.probeOff = undefined;
+  const p = probe;
+  const ta = e.term.textarea;
+  if (!p || !ta) return;
+  // On the terminal's element, capturing: xterm's own keydown listener on the textarea sends
+  // the bytes, and a listener there would run after it.
+  const onKey = (ev: KeyboardEvent) => {
+    if (ev.target === ta) p.keydown(e.sid, ev, !!e.webgl);
+  };
+  e.el.addEventListener("keydown", onKey, true);
+  const r = e.term.onRender(() => p.render(e.sid));
+  e.probeOff = () => {
+    e.el.removeEventListener("keydown", onKey, true);
+    r.dispose();
+  };
+}
 
 export function setShortcutMatcher(f: (e: KeyboardEvent) => boolean) {
   shortcutMatcher = f;
@@ -257,7 +297,8 @@ function create(sid: number): Entry {
   let userInput = false;
   // onData also carries query answers. Only a user's bytes should take the grid back.
   // Private API: without it only focus takes the grid back.
-  (term as any)._core?.coreService?.onUserInput?.(() => userInput = true);
+  const userFlag = typeof (term as any)._core?.coreService?.onUserInput === "function";
+  if (userFlag) (term as any)._core.coreService.onUserInput(() => userInput = true);
   const dropReport = rightButtonFilter(term);
   term.onData((d) => {
     const user = userInput;
@@ -266,6 +307,8 @@ function create(sid: number): Entry {
     if (user) takeSizeBack(entry);
     if (inputPaused(sid)) return;
     rpc.sendInput(sid, enc.encode(d));
+    // Only a user's bytes, never query answers (all bytes if xterm can't tell them apart).
+    if (user || !userFlag) probe?.sent(sid);
   });
   term.onBinary((d) => {
     if (dropReport(d)) return;
@@ -302,6 +345,7 @@ function create(sid: number): Entry {
     sentRows: 0,
   };
   entries.set(sid, entry);
+  probeEntry(entry);
   return entry;
 }
 
@@ -571,6 +615,8 @@ export function dispose(sid: number) {
     e.evictTimer =
       0;
   if (e.host) ro.unobserve(e.host);
+  e.probeOff?.();
+  probe?.dispose(sid);
   disableWebgl(e);
   e.term.dispose();
   e.el.remove();
@@ -588,7 +634,7 @@ rpc.onBinary = (type, sid, payload) => {
   // output for our own animation frame cost a whole extra frame on every echo: the write
   // then landed inside a rAF callback, so xterm's render request waited for the next one.
   // Copy: the underlying buffer may be reused.
-  e.term.write(payload.slice());
+  e.term.write(payload.slice(), probe?.output(sid));
 };
 
 export function focusTerminal(sid: number): boolean {

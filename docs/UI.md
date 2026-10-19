@@ -141,6 +141,8 @@ truncated with an ellipsis, the full name in the tooltip, click copies), its fol
 from the left, click copies), branch (click copies) and the number of tabs in the window. Right:
 "needs you: N" (same as Alt+J) and a connection dot.
 
+**Typing latency monitor** (palette, off by default, not kept across reloads): a small overlay above the status line timing each key typed into a terminal by stage, from keydown to the next animation frame after the first output that follows it (an estimate: output is not matched to keys, and the real paint time is not measured), with Copy (plain-text report) and Clear (`web/src/latency_monitor.ts`).
+
 ### Updates
 A banner in the toast stack (bottom right, above the toasts; it stays until acted on or
 dismissed) offers one waiting update at a time (`hello.updates`, `updates_changed`; see

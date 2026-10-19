@@ -19,6 +19,7 @@ import {
 } from "./state.ts";
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { canCloseWindow, isNative } from "./native.ts";
+import { latencyMonitorOn, setLatencyMonitor } from "./latency_monitor.ts";
 import { isMac } from "./util.ts";
 
 export interface KeySpec {
@@ -469,6 +470,14 @@ export const commands: Command[] = [
         "Jump pulls tabs from other windows into this one",
       );
     },
+  },
+  {
+    id: "latency-monitor",
+    get title() {
+      return `Typing latency monitor: ${latencyMonitorOn() ? "on (turn off)" : "off (turn on)"}`;
+    },
+    group: "View",
+    run: () => setLatencyMonitor(!latencyMonitorOn()),
   },
   {
     id: "shortcuts",

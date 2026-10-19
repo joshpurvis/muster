@@ -57,7 +57,7 @@ import {
 // ---------------- server state ----------------
 
 export const helloDone = signal(false);
-export const meta = signal({ version: "", home: "", default_shell: "" });
+export const meta = signal({ version: "", home: "", default_shell: "", login_shell: "" });
 export const workspaces = signal<Workspace[]>([]);
 export const accountProfiles = signal<AccountProfile[]>([]);
 export const accountProfilesSupported = signal(false);
@@ -291,6 +291,8 @@ export type Overlay =
   | { kind: "shortcuts" }
   | { kind: "permissions"; channelId: number }
   | { kind: "rename_window" }
+  /** "Shell for new terminals…": the shell new shell tabs run. */
+  | { kind: "shell" }
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
   | { kind: "shutdown" }
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
@@ -577,7 +579,12 @@ function withHolds(fn: () => void) {
 export function applyHello(h: HelloResult) {
   batch(() => {
     const before = hereIds.peek();
-    meta.value = { version: h.version, home: h.home, default_shell: h.default_shell };
+    meta.value = {
+      version: h.version,
+      home: h.home,
+      default_shell: h.default_shell,
+      login_shell: h.login_shell ?? h.default_shell,
+    };
     updateStatus.value = h.updates ?? null;
     windowPrefs.value = h.prefs ?? null;
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);

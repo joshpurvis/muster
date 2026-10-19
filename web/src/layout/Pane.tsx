@@ -94,7 +94,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
     items.push(
       { label: "Permissions…", icon: <IconShield size={14} />, run: () => A.openPermissions(c.id) },
       "sep",
-      { label: "Copy path", run: () => A.copy(s.cwd || c.cwd, "Path copied") },
+      { label: "Copy path", run: () => A.copy(s.live_cwd || s.cwd || c.cwd, "Path copied") },
     );
     if (c.branch) {
       items.push({

@@ -304,6 +304,10 @@ exec cat > '${BASE}/fake-input'
   const plain = await c.call("channel.create", { workspace_id: ws.id, name: "no tree" });
   ok(!plain.owns_worktree && plain.cwd === ws.path && plain.branch === "main", "worktree is off by default");
   await c.call("channel.archive", { id: plain.id, remove_worktree: false });
+  // Shell tabs default to the account's login shell (fish for some): pin a POSIX one for the
+  // `$((...))` below, through the same preference the UI sets.
+  const pinned = await c.call("prefs.set", { shell: "bash" });
+  ok(typeof pinned.shell === "string" && pinned.shell.endsWith("/bash"), "prefs.set shell resolves a name on PATH");
   const ch = await c.call("channel.create", { workspace_id: ws.id, name: "Smoke Test!", agent: "shell", worktree: true });
   ok(ch.branch === "muster/smoke-test" && ch.owns_worktree, "channel.create made branch muster/smoke-test");
   ok(ch.cwd.endsWith(`/${ch.id}`), "worktree directory is keyed by the channel id");
@@ -366,6 +370,12 @@ exec cat > '${BASE}/fake-input'
   c.input(sid, "echo mu$((6*7))ster:$MUSTER_SESSION_ID:$PORT:$MUSTER\r");
   const expect = `mu42ster:${sid}:${ch.port_base}:1`;
   await c.waitFor("echo output", () => c.terminal(sid).includes(expect));
+  c.input(sid, "echo shell:$SHELL; cd /\r");
+  await c.waitFor("shell output", () => c.terminal(sid).includes(`shell:${pinned.shell}`));
+  ok(true, "the shell runs the chosen shell, with SHELL set to it");
+  await c.waitFor("live folder", () =>
+    c.events.some((e) => e.event === "session_upserted" && e.data.id === sid && e.data.live_cwd === "/"));
+  ok(true, "cd moves the session's live_cwd");
   ok(true, `live 0x01 output contains ${expect}`);
 
   // Panels: real MCP auth, persistence, separate proxy, waits and idle prompt delivery.

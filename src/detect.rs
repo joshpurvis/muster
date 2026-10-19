@@ -32,6 +32,8 @@ const IDLE_SETTLE_MS: i64 = 1200;
 pub const STUCK_AFTER_MS: i64 = 10 * 60 * 1000;
 
 const CHECKPOINT: &str = "detector-progress-v1";
+/// How often each session's process folder (`/proc/<pid>/cwd`) is read.
+const CWD_EVERY_MS: i64 = 1000;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Track {
@@ -40,6 +42,8 @@ struct Track {
     seq: u64,
     #[serde(skip)]
     last_eval: i64,
+    #[serde(skip)]
+    cwd_checked: i64,
     screen_hash: [u8; 32],
     /// Last meaningful screen change (or entry into Working).
     changed_at: i64,
@@ -85,6 +89,15 @@ pub fn spawn(hub: Arc<Hub>) {
                 let before = t.progress();
                 t.for_generation(terminal.generation, now);
                 dirty |= t.progress() != before;
+                if now - t.cwd_checked >= CWD_EVERY_MS {
+                    t.cwd_checked = now;
+                    let marker = hub.run_marker(id, terminal.generation);
+                    let cwd = info.pid.zip(marker).and_then(|(pid, run)| process_cwd(pid, &run))
+                        .map(|live| aliased(&live, &info.cwd));
+                    if info.live_cwd != cwd {
+                        hub.note_live_cwd(id, terminal.generation, cwd);
+                    }
+                }
                 if seq == t.seq && now - t.last_eval < FORCE_EVERY_MS {
                     continue;
                 }
@@ -112,6 +125,30 @@ pub fn spawn(hub: Arc<Hub>) {
             }
         }
     });
+}
+
+/// The folder process `pid` is in, if it is still the process of the run marked `run` (a
+/// pid can be reused once the session's process is gone) and the folder still exists.
+fn process_cwd(pid: u32, run: &str) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let marker = format!("MUSTER_RUN={run}");
+    if !env.split(|b| *b == 0).any(|kv| kv == marker.as_bytes()) {
+        return None;
+    }
+    let p = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    // A deleted folder reads as "<path> (deleted)"; is_dir() is false for it.
+    p.is_dir().then(|| p.to_string_lossy().into_owned())
+}
+
+/// `live` (a physical path, as /proc gives it) spelled from `launch` when it is that folder or
+/// inside it, so a symlinked launch folder still compares equal to where the process is.
+fn aliased(live: &str, launch: &str) -> String {
+    let Ok(root) = std::fs::canonicalize(launch) else { return live.to_string() };
+    match std::path::Path::new(live).strip_prefix(&root) {
+        Ok(rest) if rest.as_os_str().is_empty() => launch.to_string(),
+        Ok(rest) => std::path::Path::new(launch).join(rest).to_string_lossy().into_owned(),
+        Err(_) => live.to_string(),
+    }
 }
 
 fn hash_screen(screen: &ScreenSnapshot) -> [u8; 32] {
@@ -210,6 +247,45 @@ mod tests {
     use super::*;
     use crate::adapters::tui::testutil::snap;
 
+    #[test]
+    fn process_cwd_checks_the_run_marker() {
+        let dir = std::env::temp_dir().join(format!("muster-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").current_dir(&dir)
+            .env("MUSTER_RUN", "run-a").spawn().unwrap();
+        let canon = std::fs::canonicalize(&dir).unwrap().to_string_lossy().into_owned();
+        // spawn() can return before the child's exec has replaced its environment.
+        let mut seen = None;
+        for _ in 0..100 {
+            seen = process_cwd(child.id(), "run-a");
+            if seen.is_some() { break }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(seen, Some(canon));
+        // Same pid, another run's marker (a reused pid): not this session's folder.
+        assert_eq!(process_cwd(child.id(), "run-b"), None);
+        assert_eq!(process_cwd(u32::MAX, "run-a"), None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn live_folders_keep_the_launch_spelling() {
+        let base = std::env::temp_dir().join(format!("muster-alias-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon = std::fs::canonicalize(&real).unwrap();
+        let (l, c) = (link.to_string_lossy(), canon.to_string_lossy());
+        assert_eq!(aliased(&c, &l), l);
+        assert_eq!(aliased(&format!("{c}/sub"), &l), format!("{l}/sub"));
+        assert_eq!(aliased("/", &l), "/");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     fn info(kind: SessionKind, state: AgentState, since: i64) -> SessionInfo {
         SessionInfo {
             account_profile_id: None,
@@ -231,6 +307,7 @@ mod tests {
             subagents: 0,
             size_owner: None,
             input_interrupted: false,
+            live_cwd: None,
             state_seq: 0,
             created_at: 0,
             window_id: None,

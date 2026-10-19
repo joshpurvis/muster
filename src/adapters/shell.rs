@@ -1,17 +1,78 @@
-//! Plain shell adapter: the user's `$SHELL` (fallback `/bin/bash`) as a login, interactive
-//! shell. State comes from the PTY's foreground process group: Working while a job owns the
+//! Plain shell adapter: the user's shell (see `user_shell`) as a login, interactive shell.
+//! State comes from the PTY's foreground process group: Working while a job owns the
 //! terminal, Idle otherwise.
+
+use std::path::Path;
+
+use parking_lot::RwLock;
 
 use crate::adapters::*;
 use crate::model::*;
 
 pub struct ShellAdapter;
 
-fn user_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.trim().is_empty() && std::path::Path::new(s).exists())
+/// The shell chosen in the window preferences (`prefs.set {shell}`), if any. Set by the hub
+/// at start and on every change.
+static CONFIGURED: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_configured_shell(shell: Option<String>) {
+    *CONFIGURED.write() = shell;
+}
+
+fn usable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    Path::new(path).is_absolute()
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The account's login shell from the password database.
+fn login_shell() -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(libc::getuid(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pw.pw_shell.is_null() {
+        return None;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(pw.pw_shell) }.to_string_lossy().into_owned();
+    Some(s)
+}
+
+/// The shell new shell sessions run: the configured one, else the account's login shell,
+/// else `$SHELL`, else `/bin/bash`. The login shell comes before `$SHELL` because the daemon
+/// inherits `$SHELL` from whoever started it last, often an agent's own tool shell after a
+/// `muster reload`, not the user's terminal.
+pub fn user_shell() -> String {
+    let configured = CONFIGURED.read().clone();
+    configured.filter(|s| usable(s)).unwrap_or_else(fallback_shell)
+}
+
+/// The shell used when none is configured (or the configured one is gone).
+pub fn fallback_shell() -> String {
+    login_shell()
+        .into_iter()
+        .chain(std::env::var("SHELL").ok())
+        .find(|s| usable(s))
         .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
+/// A shell the user typed (`/usr/bin/fish`, `~/bin/nu` or a bare `fish` on `PATH`) as an
+/// absolute path to an executable, or an error saying why not.
+pub fn resolve_shell(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    anyhow::ensure!(!input.is_empty(), "no shell given");
+    let path = if input.contains('/') {
+        crate::paths::expand_tilde(input).to_string_lossy().into_owned()
+    } else {
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .map(|dir| dir.join(input).to_string_lossy().into_owned())
+            .find(|p| usable(p))
+            .ok_or_else(|| anyhow::anyhow!("no {input} found on PATH"))?
+    };
+    anyhow::ensure!(usable(&path), "{path} isn't an executable file (give an absolute path)");
+    Ok(path)
 }
 
 fn shell_name(path: &str) -> String {
@@ -59,10 +120,12 @@ impl Adapter for ShellAdapter {
         let shell = user_shell();
         let mut args = vec!["-l".to_string()];
         args.extend(ctx.extra_args.iter().cloned());
+        // What a login sets: programs run from this shell see the shell it really is.
+        let env = [("SHELL".to_string(), shell.clone())].into();
         Ok(CommandSpec {
             program: shell,
             args,
-            env: Default::default(),
+            env,
             consumed_initial_prompt: false,
         })
     }

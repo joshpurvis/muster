@@ -19,6 +19,7 @@ import {
   toasts,
   windowById,
   windowOfSession,
+  windowPrefs,
   windows,
   workspaces,
 } from "../state.ts";
@@ -138,6 +139,8 @@ export function Overlays() {
       return <NewTab worktree={o.worktree} cwd={o.cwd} />;
     case "rename_window":
       return <RenameWindow />;
+    case "shell":
+      return <ShellDialog />;
     case "shutdown":
       return <Shutdown />;
     case "shortcuts":
@@ -673,6 +676,61 @@ function RenameWindow() {
         <div class="dlg-foot">
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!name.trim()}>Rename</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+function ShellDialog() {
+  const configured = windowPrefs.value?.shell ?? "";
+  const [shell, setShell] = useState(configured);
+  const [busy, setBusy] = useState(false);
+  const ref = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, []);
+  const save = async (value: string) => {
+    setBusy(true);
+    const saved = await A.setShell(value);
+    // Dismissed meanwhile (Esc, Cancel): leave whatever is open now alone.
+    if (overlay.value?.kind !== "shell") return;
+    if (saved) close();
+    else setBusy(false);
+  };
+  const login = meta.value.login_shell || "your login shell";
+  return (
+    <Modal class="dialog confirm-dlg" label="Shell for new terminals">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          save(shell);
+        }}
+      >
+        <div class="dlg-head">
+          <h2>Shell for new terminals</h2>
+          <span class="muted">
+            New shell tabs and restarted ones use it. Leave it empty to use your login shell, <code>{login}</code>.
+          </span>
+        </div>
+        <div class="dlg-body">
+          <label class="field">
+            <span class="field-label">Shell</span>
+            <input
+              ref={ref}
+              value={shell}
+              placeholder={login}
+              spellcheck={false}
+              onInput={(e) => setShell((e.target as HTMLInputElement).value)}
+            />
+          </label>
+        </div>
+        <div class="dlg-foot">
+          <button type="button" class="btn" onClick={close}>Cancel</button>
+          <button type="submit" class="btn btn-primary" disabled={busy || shell.trim() === configured}>
+            {shell.trim() ? "Use this shell" : "Use login shell"}
+          </button>
         </div>
       </form>
     </Modal>

@@ -509,8 +509,15 @@ impl Hub {
         if let Some(d) = change.decorations {
             p.decorations = d;
         }
+        if let Some(shell) = change.shell {
+            p.shell = match shell.trim() {
+                "" => None,
+                s => Some(crate::adapters::shell::resolve_shell(s)?),
+            };
+        }
         p.revision += 1;
         self.store.save_runtime(UI_PREFS_KEY, &p)?;
+        crate::adapters::shell::set_configured_shell(p.shell.clone());
         self.emit(ServerEvent::PrefsChanged(p.clone()));
         Ok(p)
     }
@@ -691,6 +698,7 @@ impl Hub {
             tracing::warn!("terminal retirement will retry after startup: {error:#}");
         }
         crate::inject::restore(&hub)?;
+        crate::adapters::shell::set_configured_shell(hub.ui_prefs().shell);
         Ok(hub)
     }
 
@@ -955,6 +963,39 @@ impl Hub {
 
     fn pty(&self, id: SessionId) -> Option<Arc<PtySession>> {
         self.inner.lock().sessions.get(&id).and_then(|e| e.pty.clone())
+    }
+
+    /// The program run `generation` of session `id` was launched with (None without a
+    /// terminal host record, as in some tests).
+    pub(crate) fn launched_program(&self, id: SessionId, generation: u64) -> Option<String> {
+        self.terminal_records.lock().get(&id)
+            .filter(|r| !r.retired && r.spec.run.generation == generation)
+            .map(|r| r.spec.program.clone())
+    }
+
+    /// The `MUSTER_RUN` marker in run `generation`'s environment: tells its process apart
+    /// from an unrelated one that got the same pid later. The terminal host sets it, as
+    /// `<host instance>-<session id>-<generation>` (crates/terminal-host `spawn`).
+    pub(crate) fn run_marker(&self, id: SessionId, generation: u64) -> Option<String> {
+        self.terminal_records.lock().get(&id)
+            .filter(|r| !r.retired && r.spec.run.generation == generation)
+            .map(|r| format!("{}-{id}-{generation}", r.host_instance))
+    }
+
+    /// Record the folder session `id`'s process is in now (`SessionInfo::live_cwd`; None:
+    /// unknown, e.g. the folder was deleted), for the run `generation`; tells clients only when
+    /// it changed. Not persisted.
+    pub(crate) fn note_live_cwd(&self, id: SessionId, generation: u64, cwd: Option<String>) {
+        let info = {
+            let mut g = self.inner.lock();
+            let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return };
+            if e.info.live_cwd == cwd {
+                return;
+            }
+            e.info.live_cwd = cwd;
+            e.info.clone()
+        };
+        self.emit(ServerEvent::SessionUpserted(info));
     }
 
     /// Capture application state and its exact terminal together. A detector can
@@ -2508,6 +2549,7 @@ impl Hub {
                 subagents: 0,
                 size_owner: None,
                 input_interrupted: false,
+                live_cwd: None,
                 state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),

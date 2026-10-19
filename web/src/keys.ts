@@ -351,6 +351,13 @@ export const commands: Command[] = [
     run: () => A.setDecorations(windowPrefs.value?.decorations === false),
   },
   {
+    id: "shell",
+    title: "Shell for new terminals…",
+    group: "Window",
+    enabled: () => windowPrefs.value !== null,
+    run: () => (overlay.value = { kind: "shell" }),
+  },
+  {
     id: "shutdown",
     title: "Shut down Muster…",
     group: "Window",

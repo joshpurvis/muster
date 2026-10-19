@@ -341,6 +341,11 @@ pub struct SessionInfo {
     /// Not a session column; the interrupted runs are saved separately.
     #[serde(default)]
     pub input_interrupted: bool,
+    /// The folder the process is in now (`/proc/<pid>/cwd`): follows a shell's `cd` and
+    /// Claude's `/cd`, while `cwd` stays the folder it was launched in (restarts use that).
+    /// Runtime only: sampled every second or so, None until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_cwd: Option<String>,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).
@@ -411,13 +416,17 @@ pub const UI_PREFS_KEY: &str = "ui-prefs";
 pub struct UiPrefs {
     /// Native windows show the system title bar.
     pub decorations: bool,
+    /// Absolute path of the shell new shell sessions run. None: the account's login shell
+    /// (`adapters::shell::user_shell`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     /// Raised by every `prefs.set`, so a client can tell a stale reply from a newer change.
     pub revision: u64,
 }
 
 impl Default for UiPrefs {
     fn default() -> Self {
-        Self { decorations: true, revision: 0 }
+        Self { decorations: true, shell: None, revision: 0 }
     }
 }
 
@@ -426,6 +435,8 @@ impl Default for UiPrefs {
 #[serde(deny_unknown_fields)]
 pub struct UiPrefsChange {
     pub decorations: Option<bool>,
+    /// A path or a name on `PATH`; "" goes back to the login shell.
+    pub shell: Option<String>,
 }
 
 pub fn now_ms() -> i64 {

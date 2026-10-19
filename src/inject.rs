@@ -836,7 +836,12 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     item.attempts += 1;
 
     // 2. Type, pause, submit.
-    let bytes = adapter.prompt_bytes(&item.text);
+    // A shell's encoding follows the shell this run started, not the shell preference now.
+    let launched = generation.and_then(|g| hub.launched_program(id, g));
+    let bytes = match launched.filter(|_| info.kind == crate::model::SessionKind::Shell) {
+        Some(shell) => crate::adapters::shell::prompt_bytes_for(&shell, &item.text),
+        None => adapter.prompt_bytes(&item.text),
+    };
     {
         // A panel batch is typed only while its opener is in the batch's task: checked under
         // the lock session moves take, so a move cannot slip in before the keys are written.

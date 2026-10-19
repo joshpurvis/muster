@@ -112,6 +112,8 @@ export interface SessionInfo {
   /** Typing is paused: earlier input may not have reached the terminal. Cleared by
    * `session.continue_input` (or a new run). */
   input_interrupted?: boolean;
+  /** The folder the process is in now (follows `cd` and Claude's `/cd`); `cwd` is where it started. */
+  live_cwd?: string;
   /** Changes with every state/detail change and answered prompt (stale-approval guard). */
   state_seq?: number;
   queued: number;
@@ -230,6 +232,8 @@ export type ServerEvent =
 export interface WindowPrefs {
   /** Native windows show the system title bar. */
   decorations: boolean;
+  /** Shell new shell tabs run; absent: the account's login shell (`hello.login_shell`). */
+  shell?: string;
   /** Raised by every `prefs.set` (missing from the first builds that had prefs). */
   revision?: number;
 }
@@ -248,6 +252,8 @@ export interface HelloResult {
   windows?: Win[];
   home: string;
   default_shell: string;
+  /** The shell used when none is set: the account's login shell, else `$SHELL`. */
+  login_shell?: string;
   /** Missing from backends that don't watch for updates. */
   updates?: UpdateStatus;
   /** Missing from backends without shared window preferences. */

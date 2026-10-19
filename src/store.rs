@@ -1266,6 +1266,7 @@ impl Store {
                     subagents: 0,
                     size_owner: None,
                     input_interrupted: false,
+                    live_cwd: None,
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,

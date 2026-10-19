@@ -83,13 +83,6 @@ struct Rename<T> {
     name: String,
 }
 
-pub fn default_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string())
-}
-
 pub fn hello(hub: &Hub) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -102,7 +95,8 @@ pub fn hello(hub: &Hub) -> Value {
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
-        "default_shell": default_shell(),
+        "default_shell": crate::adapters::shell::user_shell(),
+        "login_shell": crate::adapters::shell::fallback_shell(),
         "paused_deliveries": inject::paused(hub),
         "terminal_host": hub.terminal_host_info(),
         "updates": hub.updates().status(),
@@ -234,6 +228,10 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "prefs.get" => to_value(hub.ui_prefs()),
         "prefs.set" => {
+            if params.get("shell").is_some() {
+                // It names a program the backend runs: chosen on this computer only.
+                human_only(who, "prefs.set shell", &params)?;
+            }
             let p: UiPrefsChange = parse(params)?;
             to_value(hub.set_ui_prefs(p)?)
         }
@@ -1778,5 +1776,27 @@ mod tests {
         // Fields not given stay (each write still counts); unknown ones are refused.
         assert_eq!(call(&hub, "prefs.set", json!({})).await.unwrap(), json!({"decorations": false, "revision": 2}));
         assert!(call(&hub, "prefs.set", json!({"theme": "dark"})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_pref_resolves_validates_and_clears() {
+        let (hub, _st) = fixture();
+        let sh = crate::adapters::shell::resolve_shell("sh").unwrap();
+        assert!(sh.starts_with('/') && sh.ends_with("/sh"), "{sh}");
+        let set = call(&hub, "prefs.set", json!({"shell": "sh"})).await.unwrap();
+        assert_eq!(set["shell"], json!(sh));
+        // Not a program: refused, and the stored choice stays.
+        for bad in ["/etc/hostname-not-here", "/etc", "no-such-shell-xyz"] {
+            assert!(call(&hub, "prefs.set", json!({"shell": bad})).await.is_err(), "{bad}");
+        }
+        assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap()["shell"], json!(sh));
+        // "" goes back to the login shell: the field disappears.
+        let cleared = call(&hub, "prefs.set", json!({"shell": ""})).await.unwrap();
+        assert_eq!(cleared, json!({"decorations": true, "revision": 2}));
+        let hello = call(&hub, "hello", json!({})).await.unwrap();
+        assert!(hello["login_shell"].as_str().is_some_and(|s| s.starts_with('/')));
+        // A program the backend runs: never chosen from a paired device.
+        let e = dispatch(&hub, &Principal::Device { id: 1 }, "prefs.set", json!({"shell": "sh"})).await.unwrap_err();
+        assert!(e.0.contains("only available on this computer"), "{}", e.0);
     }
 }

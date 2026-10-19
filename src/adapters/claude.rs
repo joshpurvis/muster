@@ -333,6 +333,21 @@ impl Adapter for ClaudeAdapter {
             .get("tool_name")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // A subagent's hooks carry its `agent_id`. Its tool calls say nothing about the main
+        // agent: they arrive while the main agent waits at its prompt or asks the human a
+        // question, and setting Working there made the state flip back and forth with the
+        // screen parser every second or so. Only its requests for the human still count: a
+        // permission request, or a notification that it needs input.
+        let subagent = payload.get("agent_id").and_then(|v| v.as_str()).is_some_and(|a| !a.is_empty());
+        let wants_human = event == "PermissionRequest"
+            || event == "Notification"
+                && matches!(
+                    payload.get("notification_type").and_then(|v| v.as_str()),
+                    Some("elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input")
+                );
+        if subagent && !wants_human {
+            return None;
+        }
         match event {
             // SessionStart fires after a positional initial prompt may already be running, so
             // it can't mean Idle; the screen parser moves Starting -> Idle when the box renders.
@@ -662,6 +677,30 @@ mod tests {
             AgentState::Error
         );
         assert_eq!(a.on_hook("SubagentStop", &json!({})), None);
+    }
+
+    /// A background subagent's tool calls (payloads captured from Claude Code, which adds
+    /// `agent_id`) must not pull the main agent out of its question or its idle prompt.
+    #[test]
+    fn subagent_hooks_leave_the_state_alone() {
+        let a = ClaudeAdapter;
+        let sub = json!({"tool_name":"Bash","tool_input":{"command":"ls"},
+            "agent_id":"a8c3f099539c46aa2","agent_type":"general-purpose"});
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PreCompact", "Stop"] {
+            assert_eq!(a.on_hook(event, &sub), None, "{event}");
+        }
+        assert_eq!(
+            a.on_hook("PermissionRequest", &sub),
+            Some(StateUpdate::with(AgentState::NeedsApproval, "Bash: ls"))
+        );
+        let ask = json!({"notification_type":"elicitation_url_dialog","message":"Sign in",
+            "agent_id":"a8c3f099539c46aa2"});
+        assert_eq!(a.on_hook("Notification", &ask).unwrap().state, AgentState::AskingQuestion);
+        let idle = json!({"notification_type":"idle_prompt","agent_id":"a8c3f099539c46aa2"});
+        assert_eq!(a.on_hook("Notification", &idle), None);
+        // The main agent's own hooks have no agent_id (or an empty one).
+        let main = json!({"tool_name":"Bash","tool_input":{"command":"ls"},"agent_id":""});
+        assert_eq!(a.on_hook("PreToolUse", &main).unwrap().state, AgentState::Working);
     }
 
     #[test]

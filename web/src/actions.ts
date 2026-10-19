@@ -809,9 +809,10 @@ function sessionOfGroup(group?: string): SessionInfo | undefined {
 }
 
 /**
- * `+` / Alt+T: a new tab in `group` (default focused), in the folder of that group's active tab,
- * with the last agent kind and no worktree. Ctrl+Shift+N (`worktree`): a worktree tab with the
- * focused tab's agent. No tab to take a folder from: the New tab dialog.
+ * `+` / Alt+T: a new tab in `group` (default focused), in the folder of that group's active tab
+ * (its project, or where it has `cd`'d to outside it), with the last agent kind and no
+ * worktree. Ctrl+Shift+N (`worktree`): a worktree tab with the focused tab's agent. No tab to
+ * take a folder from: the New tab dialog.
  */
 export function newTabHere(opts: { worktree?: boolean; agent?: SessionKind; group?: string } = {}) {
   const c = taskOfGroup(opts.group);
@@ -825,26 +826,39 @@ export function newTabHere(opts: { worktree?: boolean; agent?: SessionKind; grou
     return;
   }
   const agent = opts.agent ?? (opts.worktree ? agentOf(c.id) ?? lastKind() : lastKind());
+  const s = sessionOfGroup(opts.group);
+  // The tab has left its project (`cd` in a shell, `/cd` in Claude): open where it is now.
+  const moved = opts.worktree ? null : movedFolder(s, c, ws);
   createTab({
-    workspace_id: c.workspace_id,
-    path: ws?.path,
+    workspace_id: moved ? undefined : c.workspace_id,
+    path: moved ?? ws?.path,
     agent,
-    account_profile: inheritedProfile(agent, sessionOfGroup(opts.group)),
+    account_profile: inheritedProfile(agent, s),
     worktree: !!opts.worktree,
     group: opts.group,
   })
     .catch((e) => toast("error", `Couldn't open a tab: ${errText(e)}`));
 }
 
+/** Tab `s`'s current folder if it is outside its task's folder and the task's project. */
+export function movedFolder(s: SessionInfo | undefined, c: Channel, ws: Workspace | undefined): string | null {
+  const live = s?.channel_id === c.id ? s.live_cwd : undefined;
+  if (!live) return null;
+  const inside = (root?: string) => !!root && (live === root || live.startsWith(root.replace(/\/$/, "") + "/"));
+  return inside(c.cwd) || inside(ws?.path) ? null : live;
+}
+
 export function newTabDialog(worktree?: boolean) {
   overlay.value = { kind: "new_tab", worktree };
 }
 
-/** Default folder for new tabs: the focused tab's, else the last used, else home. */
+/** Default folder for new tabs: the focused tab's (where it has moved to, as for `+`), else
+ * the last used, else home. */
 export function defaultFolder(): string {
   const c = focusedTask.value;
   const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;
-  return ws?.path ?? prefs.value.recentFolders[0] ?? workspaces.value[workspaces.value.length - 1]?.path ??
+  const moved = c ? movedFolder(focusedSession.value ?? undefined, c, ws) : null;
+  return moved ?? ws?.path ?? prefs.value.recentFolders[0] ?? workspaces.value[workspaces.value.length - 1]?.path ??
     meta.value.home ?? "~";
 }
 
@@ -948,6 +962,22 @@ export function setDecorations(on: boolean) {
       if (windowPrefs.value === mine) windowPrefs.value = prev;
       toast("error", `Couldn't change the title bar: ${errText(e)}`);
     });
+}
+
+/** The shell new shell tabs run: a path or a name on PATH, "" for the login shell. False if
+ * the backend refused it (the toast says why). */
+export async function setShell(shell: string): Promise<boolean> {
+  try {
+    const p = await rpc.call<WindowPrefs>("prefs.set", { shell: shell.trim() });
+    if (newerPrefs(windowPrefs.value, p)) windowPrefs.value = p;
+    const now = p.shell ?? meta.value.login_shell;
+    meta.value = { ...meta.value, default_shell: now };
+    toast("info", `New shell tabs will run ${now}`);
+    return true;
+  } catch (e) {
+    toast("error", `Couldn't change the shell: ${errText(e)}`);
+    return false;
+  }
 }
 
 /** A backend restart is under way (from the update banner), until the new backend answers. */

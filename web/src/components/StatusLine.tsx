@@ -31,7 +31,14 @@ export function StatusLine() {
   const status = connStatus.value;
   // Terminal and panel tabs alike.
   const count = windowSessions.value.length + windowPanels.value.length;
-  const cwd = c?.cwd ?? "";
+  const s = focusedSession.value;
+  // Where the focused tab is now: a shell's `cd` or Claude's `/cd` moves it off the task folder.
+  const live = s && c && s.channel_id === c.id ? s.live_cwd : undefined;
+  const cwd = live ?? c?.cwd ?? "";
+  const moved = !!c && cwd !== c.cwd;
+  // Left the task's project altogether: its branch says nothing about this folder.
+  const away = !!c && !!A.movedFolder(s ?? undefined, c, workspaceById.value.get(c.workspace_id));
+  const taskFolder = c ? tildify(c.cwd, meta.value.home) : "";
   // Only a real name: until one is derived the task is named after its folder, shown next to it.
   const name = c ? taskLabel(c, workspaceById.value.get(c.workspace_id)) : null;
   return (
@@ -50,7 +57,10 @@ export function StatusLine() {
         <button
           type="button"
           class="sl-item sl-path"
-          data-tip={`Copy path · ports ${c.port_base}–${c.port_base + 9}`}
+          data-tip={`Copy path${moved ? ` · task folder ${taskFolder}` : ""} · ports ${
+            c.port_base
+          }–${c.port_base + 9}`}
+          aria-label={`Copy path ${tildify(cwd, meta.value.home)}${moved ? `, task folder ${taskFolder}` : ""}`}
           onClick={() => A.copy(cwd, "Path copied")}
         >
           <IconFolder size={12} />
@@ -59,7 +69,7 @@ export function StatusLine() {
           </span>
         </button>
       )}
-      {c?.branch && (
+      {c?.branch && !away && (
         <button
           type="button"
           class="sl-item sl-branch"

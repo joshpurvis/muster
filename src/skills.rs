@@ -389,7 +389,8 @@ mod tests {
             assert!(!body(s.text).starts_with("---") && body(s.text).starts_with('#'));
         }
         let pr = frontmatter(get("muster-pr-review").text).into_iter().find(|(k, _)| k == "description").unwrap().1;
-        for phrase in ["review PR 812", "look at this PR", "can I merge #812", "go through these PRs", "Muster session"] {
+        for phrase in ["review PR 812", "look at this PR", "can I merge #812", "go through these PRs", "help me review the open PRs",
+            "go through the open PRs", "pr_overview", "Muster session"] {
             assert!(pr.contains(phrase), "{phrase} survives YAML parsing: {pr}");
         }
         assert!(pr.contains("not when a PR link is only mentioned"), "{pr}");
@@ -400,7 +401,11 @@ mod tests {
             assert!(panels.contains(want), "{want}");
         }
         let flow = get("muster-pr-review").text;
-        for want in ["no --repo, so they use explicit", "contents/PATH?ref=H", "MERGED or CLOSED", "three times"] {
+        for want in ["no --repo, so they use explicit", "contents/PATH?ref=H", "MERGED or CLOSED", "three times",
+            "gh pr list --repo R --state open", "app `pr_overview`", "`next` `{repo, number, order}`", "`outward` is required",
+            "into a command, not even quoted", "mktemp -d ./.muster-pr-XXXXXXXX", "-- \"$u\"",
+            "--limit 201", "with no `panel_id`", "it never repeats `number`", "--body-file <that file>",
+            "A custom action never merges", "an overview or custom event"] {
             assert!(flow.contains(want), "{want}");
         }
     }

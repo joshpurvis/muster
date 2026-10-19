@@ -11,7 +11,7 @@ import { paneOfSession, panelTab } from "../layout/tree.ts";
 import type { Panel, PanelResource } from "../types.ts";
 import { ACTIVATION, PanelBridge } from "./bridge.ts";
 
-const APP_NAMES: Record<string, string> = { markdown: "Markdown", image: "Image", chart: "Chart", table: "Table", pr_decision: "PR decision" };
+const APP_NAMES: Record<string, string> = { markdown: "Markdown", image: "Image", chart: "Chart", table: "Table", pr_decision: "PR decision", pr_overview: "PR overview" };
 
 export const panelReloads = signal<ReadonlyMap<number, number>>(new Map());
 export function reloadPanel(id: number) {

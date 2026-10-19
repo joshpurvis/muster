@@ -7,6 +7,9 @@ Core includes durable panels/events, task-scoped MCP and CLI, tab placement/move
 two-frame MCP Apps bridge, native IPC capability, and the Markdown app. Built on
 `feature/panel-apps`: the phase 1 `image`, `chart` and `table` apps, the phase 2
 `pr_decision` app and the PR reviewer template (schemas in [MCP.md](MCP.md#built-in-apps)).
+Built on `feature/pr-overview`: the `pr_overview` app (all open PRs of a repo), pictures and
+charts in `pr_decision` (`media`), Skip and Hold, and the user's own actions in both
+(["Open PRs, end to end"](#open-prs-end-to-end)).
 The `diff` app, fetch approval, placement options and preview servers remain later phases. Nested frames are
 blocked even for declared loopback dev servers: a child document's independent CSP would
 otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
@@ -154,6 +157,36 @@ loads when asked to "review PR 812", and the "PR reviewer" agent template, which
 under a short persona. A skill keeps the PR's text in the current agent's context; a fresh
 template agent isolates it from other work. A `muster-panels` skill covers the other apps.
 A full hunk-by-hunk `diff` app, for PRs that need real review, can follow.
+
+## Open PRs, end to end
+
+"Help me review the open PRs" (the user's words, 2026-10-19): the agent pulls pictures and
+writes descriptions so the changes are quick to take in, and the user decides with a click:
+merge, hold (put it aside to come back to later), or options they asked for at the start.
+
+1. The agent lists the open PRs (`gh pr list --json ...`, shaped by `--jq` to the panel's
+   fields), adds a risk guess and a one-line summary to each without reading diffs, and opens
+   a `pr_overview` panel: one card per PR with its size, age, checks, review state, labels,
+   risk and summary, sortable (riskiest, quick wins, oldest) and filterable.
+2. The user opens a PR (Enter), or presses Next (N) to go through them in the order they see.
+   The agent marks it `reviewing`, runs the one-snapshot review above and opens its
+   `pr_decision` panel, now with `media` when it helps: images from the PR description, a
+   screenshot of a UI change's preview, a small chart of lines changed per area. Pictures are
+   files: the agent downloads them from GitHub's own image hosts only, with the URLs taken from
+   the PR body by `grep` (never typed into a command), into a fresh private `mktemp -d`
+   directory that it deletes afterwards. The risk, checks and reviews stay above the pictures.
+3. The user merges, requests changes, skips (S) or holds (H). The agent updates the PR's card
+   (`merged`, `queued`, `changes_requested`, `held`), closes the decision panel and returns to
+   the overview, or, after Next, goes on to the next PR. Held PRs gather at the end.
+4. Options the user asked for at the start ("also give me a Needs QA button") become
+   `actions` in both panels, shown apart as "Your actions": a button (and key) with a plain
+   description of what the agent will do. Every action says whether it is `outward` (changes
+   GitHub or anything off the machine); those ask to confirm, showing that description. A
+   label may not copy a built-in button's name. The agent does exactly that and reports it on
+   the card.
+
+The merge rules above are unchanged: only a pr_decision Merge event merges, with the head
+commit that panel showed; overview events, Skip, Hold and custom actions never merge.
 
 ## Persistence
 

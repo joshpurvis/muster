@@ -1,6 +1,6 @@
 import {
-  askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, MAX_EVENT_BYTES, mergeBlocked, mergeCommand, mergeEvent, type Pr,
-  requestChangesEvent, validatePr,
+  askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, mergeBlocked, mergeCommand, mergeEvent, type Pr,
+  requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
@@ -163,4 +163,50 @@ Deno.test("failing checks block Merge unless Shift; status and pending sends blo
   check(mergeBlocked(valid({ ...samplePr, status: "merging" }), true, false)!.includes("Waiting"));
   check(mergeBlocked(valid({ ...samplePr, status: "merged" }), true, false)!.includes("merged"));
   eq(mergeBlocked(valid({ ...samplePr, status: "failed" }), false, false), null);
+});
+
+const PNG_URI = "data:image/png;base64,iVBORw0KGgo=";
+const chartSpec = { type: "bar", x: { values: ["src", "tests"] }, series: [{ name: "lines", values: [120, 64] }] };
+
+Deno.test("media: pictures (as Muster read them) and charts, each checked by its own app's rules", () => {
+  const pr = valid({ ...samplePr, media: [
+    { kind: "image", path: "shots/login.png", src: PNG_URI, mime: "image/png", bytes: 8, caption: "After" },
+    { kind: "chart", spec: chartSpec, caption: "Lines changed per area" },
+  ] });
+  eq(pr.media.length, 2);
+  check(pr.media[0].kind === "image" && pr.media[0].image.src === PNG_URI && pr.media[0].image.alt === "After", JSON.stringify(pr.media[0]));
+  check(pr.media[1].kind === "chart" && pr.media[1].spec.series[0].name === "lines" && pr.media[1].caption === "Lines changed per area");
+  eq(valid(samplePr).media, []);
+  const bad = (media: unknown, want: string) => {
+    const e = errorsOf(validatePr({ ...samplePr, media }));
+    check(e.some((x) => x.startsWith(want)), `${want}\n${e.join("\n")}`);
+  };
+  bad([{ kind: "video" }], "media[0].kind: must be one of image, chart");
+  bad([{ path: "a.png" }], "media[0].kind: is required");
+  bad([{ kind: "image", path: "a.png" }], "media[0].path: the image file was not loaded");
+  bad([{ kind: "image", url: "https://x.example/a.png" }], "media[0].url: pictures come from a path only");
+  bad([{ kind: "image" }], "media[0]: needs path");
+  bad([{ kind: "chart" }], "media[0].spec: is required");
+  bad([{ kind: "chart", spec: { ...chartSpec, type: "pie" } }], "media[0].spec.type: must be one of bar");
+  bad(Array.from({ length: 9 }, () => ({ kind: "chart", spec: chartSpec })), "media: has 9 items; at most 8");
+  bad([1, 2].map(() => ({ kind: "image", path: "a.png", src: PNG_URI, bytes: 4 * 1024 * 1024 })), "media: images total");
+  bad([{ kind: "chart", spec: chartSpec, extra: 1 }], "media[0].extra: unknown field");
+  bad([{ kind: "image", path: "a.png", src: PNG_URI, extra: 1 }], "media[0].extra: unknown field");
+});
+
+Deno.test("skip and hold are one event each, about the PR shown", () => {
+  const pr = valid(samplePr);
+  eq(skipEvent(pr).kind, "skip");
+  eq(skipEvent(pr).data, { action: "skip", repo: "acme/api", number: 812, head_sha: sha });
+  eq(holdEvent(pr).kind, "hold");
+  eq(holdEvent(pr).data, { action: "hold", repo: "acme/api", number: 812, head_sha: sha });
+  check(holdEvent(pr).text.includes("come back to later"));
+});
+
+Deno.test("actions: the user's own buttons are validated with the PR", () => {
+  const pr = valid({ ...samplePr, actions: [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }] });
+  eq(valid({ ...samplePr, actions: [{ id: "x", label: "X", description: "d" }] }).actions[0].outward, true, "a missing outward asks first");
+  eq(pr.actions, [{ id: "needs-qa", label: "Needs QA", key: "q", description: "Add the needs-qa label on GitHub.", outward: true }]);
+  const e = errorsOf(validatePr({ ...samplePr, actions: [{ id: "x", label: "X", key: "m", description: "d" }] }));
+  check(e.some((x) => x.startsWith("actions[0].key: \"m\" is a built-in key")), e.join("\n"));
 });

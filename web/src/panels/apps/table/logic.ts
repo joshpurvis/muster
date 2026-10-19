@@ -1,5 +1,5 @@
 // `table` app: input checks, sorting and filtering. Pure, so deno tests cover it.
-import { Problems, type Result } from "../shared/validate.ts";
+import { fits, Problems, type Result } from "../shared/validate.ts";
 
 export type Cell = string | number | boolean | null;
 export type Row = Record<string, Cell>;
@@ -38,7 +38,7 @@ export function validateTable(data: unknown): Result<TableSpec> {
     for (const [k, v] of Object.entries(ro)) {
       const ok = v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v));
       if (!ok) p.add(`rows[${i}].${k}`, "must be a string, finite number, boolean or null");
-      else if (typeof v === "string" && v.length > 10_000) p.add(`rows[${i}].${k}`, "is longer than 10000 characters");
+      else if (typeof v === "string" && !fits(v, 10_000)) p.add(`rows[${i}].${k}`, "is longer than 10000 characters");
     }
     rows.push(ro as Row);
   });

@@ -1,6 +1,18 @@
 // Input checks for built-in panel apps: collect every problem with its path, so the panel can
 // show the agent's mistakes all at once instead of a blank screen.
 
+/** Length in Unicode code points, the way Muster's backend counts (Rust `chars().count()`), so
+ * text the backend accepted is never refused here. UTF-16 `.length` is never smaller. */
+export function chars(v: string): number {
+  if (v.length < 2) return v.length;
+  let n = 0;
+  for (const _ of v) n++;
+  return n;
+}
+
+/** Whether `v` is at most `max` code points (cheap when its UTF-16 length already fits). */
+export const fits = (v: string, max: number) => v.length <= max || chars(v) <= max;
+
 export type Result<T> = { ok: true; value: T; warnings: string[] } | { ok: false; errors: string[] };
 
 export class Problems {
@@ -26,7 +38,7 @@ export class Problems {
     if (typeof v !== "string") { this.add(at, "must be a string"); return undefined; }
     if ((opt.nonEmpty ?? opt.required) && !v.trim()) { this.add(at, "must not be empty"); return undefined; }
     const max = opt.max ?? 10_000;
-    if (v.length > max) { this.add(at, `is longer than ${max} characters`); return undefined; }
+    if (!fits(v, max)) { this.add(at, `is longer than ${max} characters`); return undefined; }
     return v;
   }
 

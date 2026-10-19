@@ -257,14 +257,24 @@ until the question is answered (M then says which one and focuses it). They show
 asks", after the risk, checks and reviews and before the pictures and diffs: buttons for the
 options (number keys 1–9 pick in the focused question, arrows step), a short text box for
 `text` (at most 1000 characters), and Tab or Shift+Tab (Enter in a text box) moves between
-questions. Answers stay a local draft, kept across updates by id, until an event carries them.
+questions. A button under the header ("Answer 2 questions", or "Review 3 answers" once all
+have one) and the key G jump to the first unanswered question, so the questions are one step
+away in a narrow panel too; the "n of m answered" count in the bar does the same. Required
+questions are marked "Needed to merge" and carry `aria-required`. Answers stay a local draft,
+kept across updates by id, until an event carries them.
 
 The user's draft is the answers plus the toggle actions they switched on ([below](#the-users-own-actions)).
 A line above the actions says what goes with the next decision. **Merge**, **Request
 changes**, **Hold** and **Skip** carry the whole draft (`answers`, `options`) in their one
-event; **Send answers** (Ctrl+Enter) sends it alone while the user is not deciding yet. Each
-send is one message. Answers stay after a send (the button then reads "Answers sent ✓" until
-one changes); options are one-shot and switch off once sent. An event that would exceed the 16
+event; **Send answers** (Ctrl+Enter; labelled "Send options" or "Send answers and options" by
+what it carries) sends it alone while the user is not deciding yet, and is off while a Merge
+confirm is open (the draft goes with that merge). Each send is one message. Answers stay
+after a send (the button then reads "Answers sent ✓" until one changes); options are one-shot
+and switch off once sent. If the host refuses a send, the panel puts back only what that send
+took (its options, the "sent" mark, a typed comment, the open confirm), and only if nothing
+happened since: no update from the agent, no other send and no edit; otherwise it says so and
+leaves the user's newer state alone. An option counts only while its action is still the one
+the user switched on (and, if outward, confirmed). An event that would exceed the 16
 KiB limit with the typed answers is not sent ("shorten your typed answers"). The draft is off
 once the PR is `merged`, `queued` or `requested_changes`.
 
@@ -274,7 +284,10 @@ then everything that goes with it (each answer and each option with what the age
 and sends only after Enter or "Confirm merge". The confirm arms only once the key that opened
 it is released (a held or repeated key never confirms), and any update that changes `repo`,
 `number`, `base`, `head_sha`, the checks state or `merge_method_default`, any change to the
-answers or options while it is open, or any invalid update, cancels it. Merge is disabled while checks fail unless Shift is held (Shift+M; a hint
+questions (a new required one, a changed kind, option or text), to the answers or options or
+to an option's action while it is open, or any invalid update, cancels it. Merge also checks
+right before sending that every required question has an answer. The confirm shows each
+question and answer in full. Merge is disabled while checks fail unless Shift is held (Shift+M; a hint
 says so beside it), and while the agent works (`merging`, `queued`, `merged`, or until the next
 update after a sent decision). **Request changes** (R) and **Ask** (A) open a text box
 (Ctrl+Enter sends); text that would make the event exceed the 16 KiB event limit cannot be
@@ -368,7 +381,7 @@ With pictures and a chart (the paths are files in the task worktree):
 | `prs[].checks?` | `passing`, `failing`, `pending` or `none` |
 | `prs[].review?` | gh's `reviewDecision`: `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NONE` or `""` |
 | `prs[].risk?`, `prs[].summary?` | the agent's triage: `low`, `medium` or `high`, and one line (at most 500 characters) |
-| `prs[].status?` | the agent keeps it up to date: `new` (default), `ready` (the agent has prepared its review), `reviewing`, `merging`, `merged`, `queued`, `held`, `skipped`, `changes_requested` or `failed`; `status_detail` is a short note under the card |
+| `prs[].status?` | the agent keeps it up to date: `new` (default), `ready` (the agent has prepared its review; shown as "Review ready", whatever its verdict), `reviewing`, `merging`, `merged`, `queued`, `held`, `skipped`, `changes_requested` or `failed`; `status_detail` is a short note under the card |
 | `prs[].quick_win?`, `prs[].verdict?` | `quick_win: true` only after the agent's full one-snapshot review found it small, green and low risk; such a card needs `head_sha` and `base` (from that snapshot), a `verdict` (one line, at most 300 characters), checks `passing` and not `draft`, and can be merged from the overview. `verdict` shows on any card |
 | `prs[].base?`, `prs[].merge_method_default?`, `prs[].delete_branch_default?` | the branch it merges into, and the quick-win Merge's method (`squash` by default) and delete-branch flag (`false`) |
 | `current?` | the PR the agent is on (marked "Now"); the selection follows it, unless the user is on a card, whose selection then stays |
@@ -420,7 +433,7 @@ characters and not a built-in button's name (Merge, Request changes, Ask, Open, 
 GitHub, Skip, Hold, Next, Confirm, Cancel, Send answers; compared trimmed and case-insensitive);
 `description` (at most 300) says exactly what the agent will do and is shown as the button's
 tooltip and in its confirm; `key` is one letter or digit, unique, and not one the apps use (M R
-A O S H J K N; Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain key
+A O S H J K N G; Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain key
 never clashes). `outward` is required: `true` for an action that changes GitHub or anything
 off this machine (comments, labels, closing, pushing), `false` only for one that stays on it
 (should an app ever get one without it, it treats it as `true`). An outward button (marked ↗)
@@ -456,8 +469,9 @@ merge. For "help me review the open PRs" they list the open PRs with `muster pr 
 pr list`), triage each briefly, open a `pr_overview`, and run that flow for each PR the user
 opens (or for each in turn on Next), updating its card after each decision. While the user
 reads, they prepare the next PRs (cards marked `ready`, small green ones as quick wins), and
-for 6 or more PRs they may start helper sessions (a faster model) that only write their
-judgement to files, which the agent checks before showing. They download pictures only from
+for 6 or more PRs they may start helper sessions (a faster model) that only write draft
+judgements to files; the agent treats those as untrusted, takes every fact from a snapshot
+it runs itself, and never marks a quick win from a helper's work. They download pictures only from
 GitHub's own image hosts (`muster pr snapshot` does this itself), with no PR text ever part of
 a command, into a fresh private directory.
 

@@ -31,10 +31,10 @@ pub const MAX_MEDIA_BYTES: usize = 6 * 1024 * 1024;
 pub const MAX_PR_DATA: usize = crate::panels::MAX_FILE + MAX_MEDIA_BYTES.div_ceil(3) * 4 + 64 * 1024;
 /// The user's own actions (`actions`) in the PR apps.
 pub const MAX_ACTIONS: usize = 8;
-/// Single keys the PR apps use themselves (pr_decision: M R A O S H; pr_overview: J K O H N).
+/// Single keys the PR apps use themselves (pr_decision: M R A O S H G; pr_overview: J K O H N M).
 /// Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain letter or digit
 /// never clashes with them.
-pub const RESERVED_KEYS: &str = "mraoshjkn";
+pub const RESERVED_KEYS: &str = "mraoshjkng";
 /// Built-in event names, which a custom action id may not reuse.
 const BUILTIN_IDS: &[&str] = &["merge", "request_changes", "ask", "answers", "open", "skip", "hold", "next", "custom", "closed", "overflow"];
 /// `pr_decision` `questions` (web/src/panels/apps/shared/questions.ts has the same limits).
@@ -450,7 +450,7 @@ pub fn check_actions(o: &serde_json::Map<String, Value>, app: &str) -> anyhow::R
         if let Some(k) = a.get("key").filter(|v| !v.is_null()) {
             let k = k.as_str().filter(|k| k.len() == 1 && k.bytes().all(|c| c.is_ascii_alphanumeric()))
                 .with_context(|| format!("{at}.key must be one letter or digit"))?.to_ascii_lowercase();
-            ensure!(!RESERVED_KEYS.contains(&k), "{at}.key {k:?} is a built-in key (m r a o s h j k n are taken)");
+            ensure!(!RESERVED_KEYS.contains(&k), "{at}.key {k:?} is a built-in key (m r a o s h j k n g are taken)");
             ensure!(!keys.contains(&k), "{at}.key {k:?} is used twice");
             keys.push(k);
         }

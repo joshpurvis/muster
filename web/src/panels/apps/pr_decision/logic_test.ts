@@ -3,6 +3,7 @@ import {
   requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
+import { missingRequired } from "../shared/questions.ts";
 
 const sha = "0123456789abcdef0123456789abcdef01234567";
 export const samplePr = {
@@ -257,4 +258,29 @@ Deno.test("confirm gate: a changed answer or option while confirming cancels it"
   check(g.input(pr, { ...d, answers: { ...d.answers, limit: "yes" } }) && !g.isOpen, "an answer changed: cancelled");
   g.open(pr, d);
   check(!g.input(pr, { answers: { note: "Use 10", limit: "no" }, options: ["needs-qa"] }), "the same draft keeps it");
+});
+
+Deno.test("confirm gate: a new required question, or any change to the questions, cancels it (reproduced)", () => {
+  // Confirm with no questions, then the same PR gains an unanswered required question: the
+  // draft is empty both times, yet the confirm must not survive.
+  const before = valid(samplePr);
+  const g = new ConfirmGate();
+  g.open(before);
+  const after = valid({ ...samplePr, questions: [{ id: "owner", text: "Who looks after this code now?", kind: "text", required: true }] });
+  check(g.input(after) && !g.canConfirm(after), "cancelled");
+  eq(missingRequired(after.questions, {}).map((q) => q.id), ["owner"], "and Merge then waits for the answer");
+  const q = (patch: Record<string, unknown>) => valid({ ...samplePr, questions: [{ id: "limit", text: "Keep 5?", kind: "yes_no", recommended: "yes", ...patch }] });
+  for (const patch of [{ required: true }, { kind: "text", recommended: undefined }, { text: "Keep 10?" }, { recommended: "no" }]) {
+    const c = new ConfirmGate();
+    const base = q({});
+    c.open(base, { answers: { limit: "yes" }, options: [] });
+    check(c.input(q(patch), { answers: { limit: "yes" }, options: [] }), JSON.stringify(patch));
+  }
+  // An option's action changing under the same id cancels it too.
+  const acts = [{ id: "qa", label: "Needs QA", description: "Add the label.", outward: true }];
+  const a1 = valid({ ...samplePr, actions: acts });
+  const a2 = valid({ ...samplePr, actions: [{ ...acts[0], description: "Close the PR." }] });
+  const c = new ConfirmGate();
+  c.open(a1, { answers: {}, options: ["qa"] });
+  check(c.input(a2, { answers: {}, options: ["qa"] }));
 });

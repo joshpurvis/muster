@@ -119,9 +119,10 @@ shows the agent's verdict and undo line first, has Merge (M), Request changes (R
 Open on GitHub (O), Skip (S), Hold (H), Send answers (Ctrl+Enter) and the user's own actions
 (their key on the button, in a separate "Your actions" group that folds in small panels;
 toggle actions switch on or off and go with the next send), answers the agent's questions in
-place (number keys 1–9 pick in the focused question, arrows step, Tab and Shift+Tab move
-between questions, the recommended answer starts picked; a line above the actions says what
-goes with the next decision), and its pictures enlarge on click or Enter in a modal view (Z
+place (G or the button under the header jumps to them, number keys 1–9 pick in the focused
+question, arrows step, Tab and Shift+Tab move between questions, the recommended answer starts
+picked; a line above the actions says what goes with the next decision, and Send answers is
+off while Merge is being confirmed), and its pictures enlarge on click or Enter in a modal view (Z
 for actual size, drag to pan, arrows step, Esc closes); PR overview moves with J/K or the
 arrows, opens with Enter (or O, or a double-click), merges a quick win with M (after the same
 confirm as Merge), holds with H, goes through the PRs in order with N, filters with `/`, and

@@ -374,7 +374,8 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("m");
     await p.waitIn(`document.querySelector('.drawer .draft-summary')`);
     const summary: string = await p.inApp(`document.querySelector('.drawer .draft-summary').textContent`);
-    for (const want of ["No", "Ignore proxies", "Thanks, nice work", "Needs QA", "Add the needs-qa label", "Label later"]) check(summary.includes(want), `merge confirm summary has ${want}: ${summary}`);
+    for (const want of ["No", "The whole office as one visitor", "Thanks, nice work", "Needs QA", "Add the needs-qa label", "Label later",
+      "When many people share one office network, how should they be counted?"]) check(summary.includes(want), `merge confirm summary has ${want} in full: ${summary}`);
     await p.shots2("pr-questions-confirm");
     await p.waitIn(`document.querySelector('.drawer .draft-summary')`);
     // Changing an answer while confirming cancels the confirm: it never sends what it did not show.
@@ -384,6 +385,13 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.click("h1");
     await a.key("m");
     await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    // Send answers waits while Merge is being confirmed (the draft goes with the merge), and
+    // the confirm keeps working.
+    check(await p.inApp(`document.querySelector('#send-answers').disabled`), "Send answers is off during the confirm");
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Confirm or cancel the merge first') && document.querySelector('.drawer .draft-summary')`);
+    check((await events(p.pid)).length === 0, "Ctrl+Enter during the confirm sent nothing");
+    await p.inApp(`document.querySelector('#confirm-merge').focus()`);
     await a.key("Enter");
     let got = await events(p.pid);
     check(got.length === 1 && got[0].kind === "merge", `one merge event: ${JSON.stringify(got)}`);
@@ -415,8 +423,78 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("m");
     await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Answer question 1 first') && document.activeElement?.id === 'q-owner-text'`);
     check(!(await p.inApp(`!!document.querySelector('.drawer')`)) && (await events(p.pid)).length === 0, "no confirm, nothing sent");
+    // A required question arriving while Merge is being confirmed cancels the confirm.
+    await call("panel.update", { panel_id: p.pid, data: { ...data, questions: [] } });
+    await p.waitIn(`document.querySelectorAll('.question').length === 0`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    await call("panel.update", { panel_id: p.pid, data: { ...data, questions: [{ id: "owner", text: "Who looks after this code now?", kind: "text", required: true }] } });
+    await p.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
+    await p.click("h1");
+    await a.key("m");
+    await p.waitIn(`document.querySelector('.notice')?.textContent.includes('Answer question 1 first')`);
+    check((await events(p.pid)).length === 0, "a new required question during the confirm: nothing sent");
+    // The header button (and G) takes the user to the questions.
+    await p.click("h1");
+    await a.key("g");
+    check(await p.inApp(`document.activeElement?.id === 'q-owner-text'`), "G goes to the first unanswered question");
+    ok("pr_decision: a required question holds Merge, also when it arrives during the confirm; G jumps to the questions");
+
+    // A refused send undoes only its own effects, and only if nothing happened since. Hold the
+    // host's refusals in the app's own page, then release them after an update or an edit.
+    await p.inApp(`(() => { const s = document.createElement('script'); s.textContent = ${JSON.stringify(`
+      const real = Object.getOwnPropertyDescriptor(MessageEvent.prototype, 'data');
+      const pass = new WeakSet(), seen = new WeakSet(), held = [];
+      Object.defineProperty(MessageEvent.prototype, 'data', { configurable: true, get() {
+        const d = real.get.call(this);
+        if (pass.has(this) || !d || d.jsonrpc !== '2.0' || !d.error || typeof d.id !== 'number') return d;
+        if (!seen.has(this)) { seen.add(this); held.push(d); }
+        return null;
+      } });
+      document.addEventListener('e2e-release', () => { for (const d of held.splice(0)) { const ev = new MessageEvent('message', { data: d, source: parent }); pass.add(ev); dispatchEvent(ev); } });
+      document.documentElement.dataset.e2eHold = '1';`)}; document.head.append(s); })()`);
+    await p.waitIn(`document.documentElement.dataset.e2eHold === '1'`);
+    const release = () => p.inApp(`document.dispatchEvent(new Event('e2e-release'))`);
+    const exhaust = async () => { await a.sleep(5600); await p.click("h1"); for (let i = 0; i < 3; i++) await a.key("o"); };
+    await call("panel.update", { panel_id: p.pid, data });
+    await p.waitIn(`document.querySelectorAll('.question').length === 3`);
+    // Case 1: the action changes in an update before the refusal arrives.
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await exhaust();
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`!document.querySelector('#draft-row').textContent.includes('Label later')`).catch(async (e) => {
+      throw new Error(`${e.message}: ${await p.inApp(`document.querySelector('.notice')?.textContent + ' | ' + document.querySelector('#draft-row').textContent + ' | ' + document.activeElement?.id`)}`);
+    });
+    const changed = { ...data, actions: [actionsSample[0], { ...actionsSample[1], description: "Note this PR in your list for Friday; nothing changes on GitHub." }] };
+    await call("panel.update", { panel_id: p.pid, data: changed });
+    await p.waitIn(`document.querySelector('#act-later')?.title.includes('Friday') || document.querySelector('#your-actions')`);
+    await release();
+    await p.waitIn(`document.querySelector('.notice.danger')?.textContent.includes('Things changed since')`);
+    check(!(await p.inApp(`document.querySelector('#draft-row').textContent`)).includes("Label later"), "the changed action is not switched back on");
+    // Case 2: the user switches on another option before the refusal arrives.
+    await call("panel.update", { panel_id: p.pid, data });
+    await p.waitIn(`!document.querySelector('#act-later')?.title.includes('Friday')`);
+    await p.click("h1");
+    await a.key("q");
+    await p.waitIn(`document.activeElement?.id === 'confirm-outward'`);
+    await a.key("Enter");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Needs QA')`);
+    await exhaust();
+    await a.key("Ctrl+Enter");
+    await p.waitIn(`!document.querySelector('#draft-row').textContent.includes('Needs QA') && document.querySelector('.notice.info')?.textContent.includes('Sent to the agent')`);
+    await p.click("h1");
+    await a.key("l");
+    await p.waitIn(`document.querySelector('#draft-row').textContent.includes('Label later')`);
+    await release();
+    await p.waitIn(`document.querySelector('.notice.danger')?.textContent.includes('Things changed since')`);
+    const row: string = await p.inApp(`document.querySelector('#draft-row').textContent`);
+    check(row.includes("Label later") && !row.includes("Needs QA"), `the newer pick stays and the refused one is not put back: ${row}`);
+    check((await events(p.pid)).every((ev: any) => ev.kind !== "answers"), "nothing was sent");
     await close(p.pid);
-    ok("pr_decision: a required question without an answer holds Merge and focuses it");
+    ok("pr_decision: a late refusal never brings back an option after an update or a newer edit");
   }
 
   // ---- open PRs: overview → open → decision with media → hold → custom outward action → back

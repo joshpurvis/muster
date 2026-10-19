@@ -423,7 +423,8 @@ button.merge-quick { border-color: var(--color-text-success); }
     "h",
     "j",
     "k",
-    "n"
+    "n",
+    "g"
   ];
   var BUILTIN_IDS = [
     "merge",
@@ -1270,7 +1271,8 @@ button.merge-quick { border-color: var(--color-text-success); }
   var filter = "";
   var selected = null;
   var notice = null;
-  var sent = /* @__PURE__ */ new Set();
+  var sent = /* @__PURE__ */ new Map();
+  var sendSeq = 0;
   var outward = null;
   var merging = null;
   var quickOnly = false;
@@ -1385,7 +1387,7 @@ button.merge-quick { border-color: var(--color-text-success); }
       "muted"
     ],
     ready: [
-      "Ready",
+      "Review ready",
       "info"
     ],
     reviewing: [
@@ -1428,14 +1430,15 @@ button.merge-quick { border-color: var(--color-text-success); }
   }
   function send(ev, key, ok) {
     const result = sendEvent(ev.kind, ev.text, ev.data);
-    sent.add(key);
+    const mine = ++sendSeq;
+    sent.set(key, mine);
     notice = {
       text: ok,
       tone: "info"
     };
     render();
     result.catch((e) => {
-      sent.delete(key);
+      if (sent.get(key) === mine) sent.delete(key);
       notice = {
         text: `Not sent (${e.message}). Try again.`,
         tone: "danger"

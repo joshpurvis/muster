@@ -22,8 +22,10 @@ let userSort: Sort | null = null;
 let filter = "";
 let selected: number | null = null;
 let notice: { text: string; tone: Tone } | null = null;
-/** `kind:number` of events sent since the last update: not sent twice before the agent answers. */
-const sent = new Set<string>();
+/** `kind:number` of events sent since the last update (with the send that set it): not sent
+ * twice before the agent answers. */
+const sent = new Map<string, number>();
+let sendSeq = 0;
 let outward: { action: CustomAction; pr: Item } | null = null;
 /** The quick-win card whose Merge is being confirmed (the same armed gate as outward actions). */
 let merging: Item | null = null;
@@ -57,7 +59,7 @@ const riskText = { high: ["High risk", "danger"], medium: ["Medium risk", "warni
 const checksText = { passing: ["✓ Checks", "success"], failing: ["✕ Checks failing", "danger"], pending: ["● Checks pending", "warning"], none: ["No checks", "muted"] } as const;
 const reviewText = { APPROVED: ["Approved", "success"], CHANGES_REQUESTED: ["Changes requested", "danger"], REVIEW_REQUIRED: ["Review required", "muted"], NONE: ["No review", "muted"] } as const;
 const statusText = {
-  new: ["", "muted"], ready: ["Ready", "info"], reviewing: ["Reviewing", "info"], merging: ["Merging…", "info"], merged: ["Merged", "success"],
+  new: ["", "muted"], ready: ["Review ready", "info"], reviewing: ["Reviewing", "info"], merging: ["Merging…", "info"], merged: ["Merged", "success"],
   queued: ["Queued", "info"], held: ["Held", "warning"],
   skipped: ["Skipped", "muted"], changes_requested: ["Changes requested", "warning"], failed: ["Failed", "danger"],
 } as const;
@@ -67,10 +69,12 @@ function badge(text: string, tone: string, extra = "") { return h("span", { clas
 function send(ev: { kind: string; text: string; data: object }, key: string, ok: string) {
   // Synchronous post inside the user's click or key handler.
   const result = sendEvent(ev.kind, ev.text, ev.data);
-  sent.add(key);
+  const mine = ++sendSeq;
+  sent.set(key, mine);
   notice = { text: ok, tone: "info" };
   render();
-  result.catch((e) => { sent.delete(key); notice = { text: `Not sent (${e.message}). Try again.`, tone: "danger" }; render(); });
+  // A late refusal frees only its own mark: never one a later send set after an update.
+  result.catch((e) => { if (sent.get(key) === mine) sent.delete(key); notice = { text: `Not sent (${e.message}). Try again.`, tone: "danger" }; render(); });
 }
 
 function open(pr: Item | null) {

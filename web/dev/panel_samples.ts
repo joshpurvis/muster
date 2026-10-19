@@ -16,15 +16,15 @@ export const prSample = {
   head_sha: HEAD_SHA,
   merge_method_default: "squash",
   delete_branch_default: true,
-  verdict: "Worth a careful look: it changes how login works, but the tests pass.",
-  undo: "If this goes wrong: revert the merge commit; no data needs fixing.",
+  verdict: "Safe to merge: it slows down people guessing passwords, and the tests pass.",
+  undo: "If this goes wrong: undo it with one revert on GitHub; no data needs fixing.",
   summary:
-    "Adds a sliding-window limit of 5 failed logins per IP per 10 minutes to POST /login, returning 429 with Retry-After. Successful logins reset the window. The limiter lives in a new module and reuses the existing Redis pool.",
+    "After 5 wrong passwords in 10 minutes from one place, logging in from there pauses and the page says when to try again. A correct password clears the count. It keeps the count in the data store the app already uses, so nothing new needs setting up.",
   risk: {
     level: "medium",
     reasons: [
-      "Changes the login path: a bug here locks real users out.",
-      "Behind a proxy every client shares one IP unless X-Forwarded-For is trusted; the PR trusts it only from the configured proxy list.",
+      "It changes how people log in: a mistake here could lock real people out.",
+      "People in one office can look like a single visitor; the change only believes our own servers about who is who.",
     ],
   },
   checks: {
@@ -39,12 +39,12 @@ export const prSample = {
   changes: [
     {
       file: "src/auth/login.rs",
-      note: "The limit is checked before the password hash, so a locked-out IP costs no bcrypt time. The reset on success is the line to look at.",
+      note: "The limit is checked before the password, so a blocked visitor costs the server no extra work. The line that clears the count after a good login is the one to look at.",
       diff: "@@ -41,9 +41,16 @@ pub async fn login(State(app): State<App>, req: LoginRequest) -> Response {\n     let ip = client_ip(&req, &app.config.trusted_proxies);\n+    if let Some(wait) = app.limiter.blocked(ip).await? {\n+        return too_many(wait);\n+    }\n     let user = match app.users.find(&req.email).await? {\n         Some(u) => u,\n-        None => return unauthorized(),\n+        None => { app.limiter.fail(ip).await?; return unauthorized() }\n     };\n     if !verify(&req.password, &user.hash)? {\n-        return unauthorized();\n+        app.limiter.fail(ip).await?;\n+        return unauthorized();\n     }\n+    app.limiter.reset(ip).await?;\n     session::start(&app, user).await",
     },
     {
       file: "src/auth/limiter.rs",
-      note: "New: a Redis sorted set per IP, trimmed to the window on every call.",
+      note: "New: keeps a short list of recent wrong tries for each place, and forgets ones older than 10 minutes.",
       diff: "@@ -0,0 +1,8 @@\n+pub struct Limiter { redis: Pool, max: usize, window: Duration }\n+\n+impl Limiter {\n+    pub async fn blocked(&self, ip: IpAddr) -> Result<Option<Duration>> {\n+        let key = format!(\"login-fail:{ip}\");\n+        let count = self.redis.zcount_since(&key, self.window).await?;\n+        Ok((count >= self.max).then(|| self.window))\n+    }",
     },
   ],
@@ -56,10 +56,12 @@ export const prSample = {
 export const prQuestionsSample = {
   ...prSample,
   questions: [
-    { id: "limit", text: "Keep the limit at 5 failed logins per 10 minutes?", why: "Support asked for 10 per hour last year; 5 is stricter.",
-      kind: "yes_no", recommended: "yes" },
-    { id: "proxy", text: "Which addresses should count as one visitor?", why: "Behind a proxy, everyone can look like one visitor.", kind: "choice",
-      options: [{ label: "Trust only our own proxies", value: "ours" }, { label: "Trust any proxy", value: "any" }, { label: "Ignore proxies", value: "none" }],
+    { id: "limit", text: "Keep the limit at 5 wrong passwords in 10 minutes?",
+      why: "Support asked for 10 an hour last year; 5 stops attacks sooner but also locks out forgetful people sooner.", kind: "yes_no", recommended: "yes" },
+    { id: "proxy", text: "When many people share one office network, how should they be counted?",
+      why: "They can look like one visitor, so one person's mistakes could lock out the whole office.", kind: "choice",
+      options: [{ label: "Each person, as our own servers report", value: "ours" }, { label: "Each person, as any network reports (easy to fake)", value: "any" },
+        { label: "The whole office as one visitor", value: "none" }],
       recommended: "ours" },
     { id: "note", text: "Anything to tell the author?", kind: "text" },
   ],
@@ -120,7 +122,7 @@ export const overviewSample = {
       number: 812, title: "Rate-limit failed logins per IP", author: "dana", url: "https://github.com/acme/api/pull/812",
       created_at: "2026-10-15T09:00:00Z", additions: 182, deletions: 12, files: 6, checks: "passing", review: "REVIEW_REQUIRED",
       labels: ["security"], risk: "medium", head_sha: HEAD_SHA,
-      summary: "Adds a per-IP limit of 5 failed logins per 10 minutes to POST /login; 429 with Retry-After.",
+      summary: "Pauses logins from one place after 5 wrong passwords in 10 minutes, and says when to try again.",
     },
     {
       number: 815, title: "Fix a typo in the README", author: "lee", url: "https://github.com/acme/api/pull/815",

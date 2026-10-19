@@ -12,10 +12,10 @@ export const ACTION_MODES = ["toggle", "now"] as const;
 export type ActionMode = typeof ACTION_MODES[number];
 export interface CustomAction { id: string; label: string; key?: string; description: string; outward: boolean; mode: ActionMode }
 
-/** Single keys the built-in PR apps use (pr_decision: M R A O S H; pr_overview: J K O H N).
+/** Single keys the built-in PR apps use (pr_decision: M R A O S H G; pr_overview: J K O H N M).
  * Muster's own shortcuts all need Ctrl, Alt or a function key, so a plain letter or digit
  * never clashes with them. */
-export const RESERVED_KEYS = ["m", "r", "a", "o", "s", "h", "j", "k", "n"] as const;
+export const RESERVED_KEYS = ["m", "r", "a", "o", "s", "h", "j", "k", "n", "g"] as const;
 /** Event names of the built-in actions; a custom id may not reuse one. */
 export const BUILTIN_IDS = ["merge", "request_changes", "ask", "answers", "open", "skip", "hold", "next", "custom", "closed", "overflow"] as const;
 export const MAX_ACTIONS = 8;

@@ -162,3 +162,9 @@ button.toggle .tick { font-weight: 700; }
   .q-why, .q-options, .q-text-row { margin-left: 0; }
   .draft-row button kbd { display: none; }
 }
+/* The way to the questions from the top, wherever they are. */
+.q-chip { margin: 0 0 10px; min-height: 28px; padding: 2px 10px; font-size: 13px; border-radius: 999px; }
+.q-chip.open { border-color: var(--color-text-warning); background: var(--color-background-warning); font-weight: 600; }
+.q-chip kbd { margin-left: 2px; }
+.draft-summary li { white-space: pre-wrap; }
+.draft-what .link { font-size: inherit; }

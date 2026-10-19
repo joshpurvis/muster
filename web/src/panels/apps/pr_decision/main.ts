@@ -6,9 +6,10 @@ import { diffStats, parseDiff } from "../shared/diff.ts";
 import { Gate } from "../shared/confirm.ts";
 import { actionForKey, type CustomAction, customEvent, outwardTarget } from "../shared/actions.ts";
 import {
-  answerLabel, answerOf, type Choices, type Draft, draftAnswers, draftEmpty, draftOptions, draftSig, isRecommended, MAX_ANSWER,
-  missingRequired, optionsOf, pruneChoices, type Question, toggleSig, valueForDigit,
+  answerLabel, answerOf, type Draft, draftEmpty, draftSig, isRecommended, MAX_ANSWER, missingRequired, optionsOf, type Question,
+  valueForDigit,
 } from "../shared/questions.ts";
+import { DraftState } from "../shared/draft.ts";
 import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
 import { renderChart } from "../chart/view.ts";
 import { formatBytes } from "../image/logic.ts";
@@ -33,7 +34,7 @@ const gate = new ConfirmGate();
 let outward: CustomAction | null = null;
 const outGate = new Gate();
 /** Custom actions sent since the last update. */
-const sentCustom = new Set<string>();
+
 /** The media image shown enlarged (a modal view), by its index in `pr.media`, and its source:
  * an update that replaces that picture closes the view. */
 let enlarged: number | null = null;
@@ -55,15 +56,17 @@ let notice: { text: string; tone: Tone } | null = null;
 const answers: { question: string; text: string }[] = [];
 let newAnswer = false;
 let mergeButton: HTMLButtonElement | null = null;
-/** The user's answers to the agent's questions (their own picks and typed text, by id): a
- * local draft that rides along with the next event sent. */
-let choices: Choices = {};
-/** Toggle actions switched on, with the action as it was when switched on (toggleSig). */
-const toggles = new Map<string, string>();
+/** The user's answers to the agent's questions and the toggle options switched on: a local
+ * draft that rides along with the next event sent (shared/draft.ts). */
+const ds = new DraftState();
 /** The outward drawer is for switching a toggle on, not for sending a `now` action. */
 let outwardToggle = false;
-/** The answers last sent (draftSig of the answers alone): Send answers shows "Sent" until they change. */
-let sentAnswers: string | null = null;
+/** Counts the agent's updates and the sends: a refused send may only undo what is still its
+ * own (it never re-enables, reopens or restores anything after an update or a later send). */
+let inputGen = 0;
+let sendSeq = 0;
+/** `now` actions sent, by id, with the send that sent them. */
+const sentNow = new Map<string, number>();
 
 const short = (sha: string) => sha.slice(0, 7);
 const triggers: Record<Exclude<Mode, null | "outward">, string> = { confirm: "merge", request: "request", ask: "ask" };
@@ -71,9 +74,7 @@ const triggerOf = (m: Exclude<Mode, null>) => m === "outward" ? `act-${outward?.
 
 function setNotice(text: string, tone: Tone = "info") { notice = { text, tone }; }
 
-const draft = (p: Pr | null = pr): Draft => p
-  ? { answers: draftAnswers(p.questions, choices), options: draftOptions(p.actions, new Set(toggles.keys())) }
-  : { answers: {}, options: [] };
+const draft = (p: Pr | null = pr): Draft => p ? ds.draft(p.questions, p.actions) : { answers: {}, options: [] };
 const answersSig = (d: Draft) => draftSig({ answers: d.answers, options: [] });
 /** A decision (not a question) was sent and the agent has not answered with an update yet. */
 const deciding = () => sent !== null && sent !== "ask";
@@ -93,22 +94,21 @@ function draftChanged(full = true) {
 }
 
 /** A send carried the draft: its options went with it (they are one-shot) and switch off; the
- * answers stay as they are. Returns how to put it back if the send is refused. */
-function spendDraft(d: Draft): () => void {
-  const before = new Map(toggles);
-  const was = sentAnswers;
-  for (const id of d.options) toggles.delete(id);
-  if (Object.keys(d.answers).length) sentAnswers = answersSig(d);
-  return () => {
-    toggles.clear();
-    for (const [k, v] of before) toggles.set(k, v);
-    sentAnswers = was;
-  };
+ * answers stay. Returns the refusal handler's undo: it restores exactly what this send spent,
+ * only while nothing changed since, and says whether it did. */
+function spendDraft(d: Draft): () => boolean {
+  const rollback = ds.spend(d);
+  return () => rollback(pr?.actions ?? []);
 }
+
+/** The notice for a refused send; `back` says whether the draft was put back as it was. */
+const refused = (e: Error, back: boolean) => back || !pr
+  ? `Not sent (${e.message}). Try again.`
+  : `Not sent (${e.message}). Things changed since, so check your answers and options, then send again.`;
 
 function pick(q: Question, value: string) {
   if (enlarged !== null || !pr || formsClosed(pr)) return;
-  choices = { ...choices, [q.id]: value };
+  ds.setChoice(q.id, value);
   draftChanged();
   focusQuestion(q.id);
 }
@@ -135,19 +135,24 @@ function moveQuestion(from: string, by: number): boolean {
 function sendAnswers() {
   // Nothing acts while a picture covers the panel.
   if (enlarged !== null || !pr || deciding()) return;
+  // While Merge is being confirmed the draft goes with the merge: sending it now would change
+  // what the confirm shows under it.
+  if (mode === "confirm") { setNotice("Confirm or cancel the merge first: your answers and options go with it.", "warning"); render(); return; }
   const closed = formsClosed(pr);
   if (closed) { setNotice(`Not sent: ${closed}`, "warning"); render(); return; }
   const d = draft();
   if (draftEmpty(d)) { setNotice("Nothing to send yet: answer a question or switch on one of your options.", "warning"); render(); return; }
-  if (!d.options.length && sentAnswers === answersSig(d)) { setNotice("These answers were sent already.", "info"); render(); return; }
+  if (!d.options.length && ds.sentAnswers === answersSig(d)) { setNotice("These answers were sent already.", "info"); render(); return; }
   const event = answersEvent(pr, d);
   if (tooBig(event)) { setNotice("Too long to send: shorten your typed answers.", "warning"); render(); return; }
   // Synchronous post inside the user's click or key handler.
   const result = sendEvent(event.kind, event.text, event.data);
+  sendSeq++;
   const undo = spendDraft(d);
-  setNotice(`Sent to the agent: ${summaryWords(d)}. Nothing is decided yet.`);
+  const acts = d.options.length ? ` The agent will now do: ${summaryWords({ answers: {}, options: d.options })}.` : "";
+  setNotice(`Sent to the agent: ${summaryWords(d)}.${acts} The PR is not decided yet.`);
   render();
-  result.catch((e) => { undo(); setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
+  result.catch((e) => { setNotice(refused(e, undo()), "danger"); draftChanged(); });
 }
 
 /** "2 answers and Needs QA" */
@@ -161,7 +166,7 @@ function summaryWords(d: Draft): string {
 /** Switch a toggle action on or off; an outward one asks first before it is switched on. */
 function toggleAction(a: CustomAction) {
   if (!pr || formsClosed(pr)) { if (pr) { setNotice(`${formsClosed(pr)} Options can no longer be sent.`, "warning"); render(); } return; }
-  if (toggles.has(a.id)) { toggles.delete(a.id); draftChanged(); document.getElementById(`act-${a.id}`)?.focus(); return; }
+  if (ds.isOn(a)) { ds.switchOff(a.id); draftChanged(); document.getElementById(`act-${a.id}`)?.focus(); return; }
   if (a.outward) {
     if (mode === "confirm") gate.close();
     outward = a;
@@ -173,7 +178,7 @@ function toggleAction(a: CustomAction) {
     document.getElementById("confirm-outward")?.focus();
     return;
   }
-  toggles.set(a.id, toggleSig(a));
+  ds.switchOn(a);
   draftChanged();
   document.getElementById(`act-${a.id}`)?.focus();
 }
@@ -197,19 +202,25 @@ function openConfirm(withShift: boolean) {
   if (enlarged !== null || !pr) return;
   const blocked = mergeBlocked(pr, withShift, !!sent);
   if (blocked) { setNotice(blocked, "warning"); render(); return; }
-  const missing = missingRequired(pr.questions, choices);
-  if (missing.length) {
-    setNotice(`Answer question ${pr.questions.indexOf(missing[0]) + 1} first: the agent needs it before merging.`, "warning");
-    render();
-    focusQuestion(missing[0].id);
-    return;
-  }
+  if (holdForRequired(pr)) return;
   override = checksBlock(pr);
   mode = "confirm";
   gate.open(pr, draft());
   notice = null;
   render();
   document.getElementById("confirm-merge")?.focus();
+}
+
+/** A required question without an answer holds Merge: say which, and take the user to it.
+ * Checked when Merge opens and again right before it sends. */
+function holdForRequired(p: Pr): boolean {
+  const missing = missingRequired(p.questions, ds.choices);
+  if (!missing.length) return false;
+  if (mode === "confirm") { gate.close(); mode = null; }
+  setNotice(`Answer question ${p.questions.indexOf(missing[0]) + 1} first: the agent needs it before merging.`, "warning");
+  render();
+  focusQuestion(missing[0].id);
+  return true;
 }
 
 function closeMode() {
@@ -234,12 +245,13 @@ function sendSimple(kind: "skip" | "hold") {
   if (tooBig(event)) { setNotice("Too long to send: shorten your typed answers.", "warning"); render(); return; }
   const result = sendEvent(event.kind, event.text, event.data);
   sent = kind;
+  const mine = ++sendSeq;
   const undo = spendDraft(d);
   const withDraft = draftEmpty(d) ? "" : ` With it: ${summaryWords(d)}.`;
   setNotice(kind === "skip" ? `Skipped: the agent moves on without deciding this PR.${withDraft}` : `Held: the agent puts this PR aside to come back to later.${withDraft}`);
   render();
   document.getElementById(kind)?.focus();
-  result.catch((e) => { sent = null; undo(); setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
+  result.catch((e) => { if (sendSeq === mine) sent = null; setNotice(refused(e, undo()), "danger"); draftChanged(); });
 }
 
 const holdClosed = (p: Pr) => p.status === "merged" ? "The PR is merged." : p.status === "queued" ? "The PR is queued to merge." : null;
@@ -249,7 +261,7 @@ function runAction(a: CustomAction) {
   // Nothing acts while a picture covers the panel.
   if (enlarged !== null || !pr) return;
   if (a.mode === "toggle") { toggleAction(a); return; }
-  if (sentCustom.has(a.id)) return;
+  if (sentNow.has(a.id)) return;
   if (a.outward) {
     if (mode === "confirm") gate.close();
     outward = a;
@@ -267,10 +279,12 @@ function runAction(a: CustomAction) {
 function sendCustom(a: CustomAction) {
   const event = customEvent(a, target(pr!));
   const result = sendEvent(event.kind, event.text, event.data);
-  sentCustom.add(a.id);
+  const mine = ++sendSeq;
+  sentNow.set(a.id, mine);
   setNotice(`Sent: ${a.label}. The agent will ${a.description.replace(/^./, (c) => c.toLowerCase())}`);
   render();
-  result.catch((e) => { sentCustom.delete(a.id); setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
+  // Only this send's own mark comes off: never one a later send (after an update) set.
+  result.catch((e) => { if (sentNow.get(a.id) === mine) sentNow.delete(a.id); setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); });
 }
 
 function confirmOutward() {
@@ -284,7 +298,7 @@ function confirmOutward() {
   mode = null;
   if (outwardToggle) {
     outwardToggle = false;
-    toggles.set(a.id, toggleSig(a));
+    ds.switchOn(a);
     setNotice(`${a.label} is on: it goes with your next send.`);
     render();
   } else sendCustom(a);
@@ -321,6 +335,8 @@ function confirmMerge() {
   if (!gate.canConfirm(pr, d)) return;
   const blocked = mergeBlocked(pr, override, !!sent);
   if (blocked) { setNotice(blocked, "warning"); closeMode(); return; }
+  // The questions may have changed since Merge opened (that cancels the confirm too): check again.
+  if (holdForRequired(pr)) return;
   const event = mergeEvent(pr, method, deleteBranch, d);
   if (tooBig(event)) { setNotice("Too long to send: shorten your typed answers.", "warning"); render(); return; }
   // Synchronous post inside the user's click or key handler.
@@ -328,19 +344,23 @@ function confirmMerge() {
   sent = "merge";
   mode = null;
   gate.close();
+  const mine = ++sendSeq;
+  const ig = inputGen;
   const undo = spendDraft(d);
   setNotice(`Merge sent to the agent${draftEmpty(d) ? "" : ` with ${summaryWords(d)}`}: it checks the PR is unchanged, runs ${mergeCommand(pr.repo, pr.number, method, deleteBranch, pr.head_sha)} and reports here.`);
   render();
   // Refused (e.g. too many actions in a few seconds): keep the confirm open to try again.
   result.catch((e) => {
-    sent = null;
-    undo();
-    if (pr && pr.head_sha === event.data.head_sha && pr.base === event.data.base && !mergeBlocked(pr, override, false)) {
+    if (sendSeq === mine) sent = null;
+    const back = undo();
+    // Reopen the confirm only if nothing happened since: no update, no other send, no edit.
+    if (back && sendSeq === mine && inputGen === ig && mode === null && pr && pr.head_sha === event.data.head_sha && pr.base === event.data.base
+      && !mergeBlocked(pr, override, false) && !missingRequired(pr.questions, ds.choices).length) {
       mode = "confirm";
       gate.open(pr, draft());
     }
-    setNotice(`Not sent (${e.message}). Try again.`, "danger");
-    render();
+    setNotice(refused(e, back), "danger");
+    draftChanged();
     focusMode();
   });
 }
@@ -362,11 +382,22 @@ function submit(kind: "request" | "ask") {
   sent = event.kind;
   mode = null;
   drafts[kind] = "";
-  const undo = event.kind === "request_changes" ? spendDraft(event.data as unknown as Draft) : () => {};
+  const mine = ++sendSeq;
+  const ig = inputGen;
+  const undo = event.kind === "request_changes" ? spendDraft(event.data as unknown as Draft) : () => true;
   setNotice(kind === "request" ? "Request for changes sent to the agent." : "Question sent; the answer will appear here.");
   render();
   document.getElementById(triggers[kind])?.focus();
-  result.catch((e) => { sent = null; undo(); drafts[kind] = text; mode = kind; setNotice(`Not sent (${e.message}). Try again.`, "danger"); render(); focusMode(); });
+  result.catch((e) => {
+    if (sendSeq === mine) sent = null;
+    const back = undo();
+    // The text comes back only into the same PR, with nothing sent or updated since and no new
+    // text started; otherwise the notice says it was not sent.
+    if (sendSeq === mine && inputGen === ig && mode === null && !drafts[kind] && pr && !formsClosed(pr)) { drafts[kind] = text; mode = kind; }
+    setNotice(refused(e, back), "danger");
+    draftChanged();
+    focusMode();
+  });
 }
 
 function setMode(next: Exclude<Mode, null | "confirm">) {
@@ -462,8 +493,6 @@ function actionPanel(p: Pr) {
   return null;
 }
 
-const clip = (t: string, n: number) => [...t].length > n ? `${[...t].slice(0, n - 1).join("")}…` : t;
-
 /** In the Merge confirm: exactly what goes with the merge. */
 function draftSummary(p: Pr, d: Draft) {
   if (!p.questions.length && !hasToggles(p)) return null;
@@ -473,8 +502,8 @@ function draftSummary(p: Pr, d: Draft) {
   return h("div", { class: "draft-summary", "aria-label": "Also sent with the merge" },
     h("p", { class: "drawer-sub" }, "Also sent with it:"),
     h("ul", null,
-      answered.map((q) => h("li", null, h("span", { class: "muted" }, `${p.questions.indexOf(q) + 1}. ${clip(q.text, 90)} `),
-        h("strong", null, clip(answerLabel(q, d.answers[q.id]), 120)), isRecommended(q, choices) ? h("span", { class: "muted small" }, " (recommended)") : null)),
+      answered.map((q) => h("li", null, h("span", { class: "muted" }, `${p.questions.indexOf(q) + 1}. ${q.text} `),
+        h("strong", null, answerLabel(q, d.answers[q.id])), isRecommended(q, ds.choices) ? h("span", { class: "muted small" }, " (recommended)") : null)),
       opts.map((a) => h("li", null, h("strong", null, a.label), a.outward ? h("span", { class: "out" }, " ↗") : null, h("span", { class: "muted" }, `: ${a.description}`)))));
 }
 
@@ -492,25 +521,28 @@ function questionsSection(p: Pr) {
 }
 
 function questionView(q: Question, i: number, closed: boolean) {
-  const answer = answerOf(q, choices);
+  const answer = answerOf(q, ds.choices);
   const label = `q-${q.id}-label`;
   const head = h("div", { class: "q-head" },
     h("span", { class: "q-num", "aria-hidden": "true" }, String(i + 1)),
     h("span", { class: "q-text", id: label }, q.text),
-    q.required ? h("span", { class: "badge warning q-req" }, "Needed to merge") : null);
+    q.required ? h("span", { class: "badge warning q-req", id: `q-${q.id}-req` }, "Needed to merge") : null);
+  const described = [q.why ? `q-${q.id}-why` : "", q.required ? `q-${q.id}-req` : ""].filter(Boolean).join(" ") || null;
   const why = q.why ? h("p", { class: "q-why muted", id: `q-${q.id}-why` }, q.why) : null;
   let body: HTMLElement;
   if (q.kind === "text") {
     const input = h("input", { type: "text", id: `q-${q.id}-text`, class: "q-input", maxlength: MAX_ANSWER, autocomplete: "off",
-      "aria-labelledby": label, "aria-describedby": q.why ? `q-${q.id}-why` : null, placeholder: "A short answer", disabled: closed }) as HTMLInputElement;
-    input.value = Object.hasOwn(choices, q.id) ? choices[q.id] : q.recommended ?? "";
-    input.addEventListener("input", () => { choices = { ...choices, [q.id]: input.value }; draftChanged(false); });
+      "aria-labelledby": label, "aria-describedby": described, "aria-required": q.required ? "true" : null, required: q.required,
+      placeholder: "A short answer", disabled: closed }) as HTMLInputElement;
+    input.value = Object.hasOwn(ds.choices, q.id) ? ds.choices[q.id] : q.recommended ?? "";
+    input.addEventListener("input", () => { ds.setChoice(q.id, input.value); draftChanged(false); });
     body = h("div", { class: "q-text-row" }, input,
-      q.recommended ? h("span", { class: "muted small" }, isRecommended(q, choices) ? "Suggested by the agent" : "") : null);
+      q.recommended ? h("span", { class: "muted small" }, isRecommended(q, ds.choices) ? "Suggested by the agent" : "") : null);
   } else {
     const opts = optionsOf(q);
     const at = opts.findIndex((o) => o.value === answer);
-    body = h("div", { class: "q-options", role: "radiogroup", "aria-labelledby": label, "aria-describedby": q.why ? `q-${q.id}-why` : null },
+    body = h("div", { class: "q-options", role: "radiogroup", "aria-labelledby": label, "aria-describedby": described,
+      "aria-required": q.required ? "true" : null },
       opts.map((o, j) => h("button", {
         type: "button", role: "radio", id: `q-${q.id}-o${j}`, class: `q-opt${j === at ? " on" : ""}`, "aria-checked": String(j === at),
         tabindex: j === (at < 0 ? 0 : at) ? 0 : -1, disabled: closed, "aria-keyshortcuts": j < 9 ? String(j + 1) : null,
@@ -521,6 +553,22 @@ function questionView(q: Question, i: number, closed: boolean) {
   return h("div", { class: `question${answer !== undefined ? " answered" : ""}`, id: `q-${q.id}`, "data-q": q.id }, head, why, body);
 }
 
+/** In the header: the agent's questions are one click (or G) away, however far down they are. */
+function questionsChip(p: Pr) {
+  if (!p.questions.length) return null;
+  const open = p.questions.filter((q) => answerOf(q, ds.choices) === undefined).length;
+  const n = p.questions.length;
+  return h("button", { type: "button", id: "to-questions", class: `q-chip${open ? " open" : ""}`, "aria-keyshortcuts": "G", onclick: () => toQuestions() },
+    open ? `Answer ${open} question${open === 1 ? "" : "s"}` : `Review ${n} answer${n === 1 ? "" : "s"}`, " ↓ ", h("kbd", null, "G"));
+}
+
+/** Go to the first question still without an answer, else the first one. */
+function toQuestions() {
+  if (!pr?.questions.length || enlarged !== null) return;
+  const q = pr.questions.find((x) => answerOf(x, ds.choices) === undefined) ?? pr.questions[0];
+  focusQuestion(q.id);
+}
+
 /** In the sticky bar: what goes with the next decision, and Send answers. */
 function draftRow(p: Pr) {
   if (!p.questions.length && !hasToggles(p)) return null;
@@ -528,14 +576,19 @@ function draftRow(p: Pr) {
   const closed = formsClosed(p);
   const n = Object.keys(d.answers).length;
   const labels = d.options.map((id) => p.actions.find((a) => a.id === id)).filter((a): a is CustomAction => !!a);
-  const done = !d.options.length && n > 0 && sentAnswers === answersSig(d);
-  const what = [p.questions.length ? `${n} of ${p.questions.length} answered` : "", ...labels.map((a) => `${a.label}${a.outward ? " ↗" : ""}`)].filter(Boolean);
+  const done = !d.options.length && n > 0 && ds.sentAnswers === answersSig(d);
+  const opts = labels.map((a) => `${a.label}${a.outward ? " ↗" : ""}`);
+  // What the button sends, by name: answers, the options switched on (which the agent then does), or both.
+  const label = done ? "Answers sent ✓" : n && labels.length ? "Send answers and options" : labels.length ? "Send options" : "Send answers";
   return h("div", { class: "row draft-row", id: "draft-row" },
     h("span", { class: "draft-what small" }, h("span", { class: "muted" }, closed ? "Draft: " : "With your next decision: "),
-      what.length ? what.join(" · ") : "nothing yet"),
+      p.questions.length ? h("button", { type: "button", class: "link", id: "draft-count", title: "Go to the questions (G)", onclick: () => toQuestions() },
+        `${n} of ${p.questions.length} answered`) : null,
+      opts.length ? `${p.questions.length ? " · " : ""}${opts.join(" · ")}` : p.questions.length ? "" : "nothing yet"),
     h("button", { type: "button", id: "send-answers", "aria-keyshortcuts": "Control+Enter",
-      disabled: !!closed || deciding() || draftEmpty(d) || done, title: "Send your answers and options now, without deciding",
-      onclick: () => sendAnswers() }, done ? "Answers sent ✓" : "Send answers", " ", h("kbd", null, "Ctrl+Enter")));
+      disabled: !!closed || deciding() || draftEmpty(d) || done || mode === "confirm",
+      title: mode === "confirm" ? "They go with the merge you are confirming" : "Send your answers, and the options switched on for the agent to do, now; the PR stays undecided",
+      onclick: () => sendAnswers() }, label, " ", h("kbd", null, "Ctrl+Enter")));
 }
 
 function refreshDraftRow() {
@@ -639,8 +692,8 @@ function toggleSize() {
 
 const KEYS: [string, string][] = [["M", "Merge (shows the exact command first; Shift+M with failing checks)"], ["R", "Request changes"],
   ["A", "Ask the agent"], ["O", "Open on GitHub"], ["S", "Skip: move on, change nothing"], ["H", "Hold: put aside for later"],
-  ["1–9", "Pick that answer in the focused question"], ["Tab", "Next question (Shift+Tab: previous)"],
-  ["Ctrl+Enter", "Send your answers and options now (they also go with your next decision)"],
+  ["G", "Go to the agent's questions"], ["1–9", "Pick that answer in the focused question"], ["Tab", "Next question (Shift+Tab: previous)"],
+  ["Ctrl+Enter", "Send your answers and options now (otherwise they go with your next decision)"],
   ["Enter", "Confirm, in a confirm step"], ["Esc", "Close a confirm, a box or a picture"], ["?", "These shortcuts"]];
 
 function render() {
@@ -669,7 +722,8 @@ function render() {
         h("button", { type: "button", id: "open", class: "link open-gh", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
       h("p", { class: "meta muted" },
         `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} · head `,
-        h("code", { title: p.head_sha }, short(p.head_sha)))),
+        h("code", { title: p.head_sha }, short(p.head_sha))),
+      questionsChip(p)),
     statusBanner(p),
     verdictBlock(p),
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
@@ -720,9 +774,9 @@ function render() {
         h("button", { type: "button", id: "skip", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
         h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
         helpButton(() => setKeys(!showKeys), showKeys)),
-      actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentCustom.has(a.id), actionsOpen,
+      actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentNow.has(a.id), actionsOpen,
         () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); },
-        (a) => a.mode === "toggle" ? toggles.has(a.id) : undefined),
+        (a) => a.mode === "toggle" ? ds.isOn(a) : undefined),
       h("p", { id: "merge-hint", class: "hint small", "aria-live": "polite" }),
       closed ? h("p", { class: "hint small" }, `${closed} Request changes and Ask are off.`) : null),
     lightbox(p),
@@ -781,7 +835,7 @@ addEventListener("keydown", (e) => {
       if (step) {
         e.preventDefault();
         const opts = optionsOf(q);
-        const at = opts.findIndex((o) => o.value === answerOf(q, choices));
+        const at = opts.findIndex((o) => o.value === answerOf(q, ds.choices));
         pick(q, opts[((at < 0 ? (step > 0 ? -1 : 0) : at) + step + opts.length) % opts.length].value);
         return;
       }
@@ -795,7 +849,8 @@ addEventListener("keydown", (e) => {
     } else if (e.key === "Escape" && mode) { e.preventDefault(); closeMode(); }
     return;
   }
-  if (e.key === "Enter" && e.ctrlKey && !e.altKey && !e.metaKey && !mode) { e.preventDefault(); sendAnswers(); return; }
+  // Ctrl+Enter sends the answers; during a Merge confirm it explains why not (they go with it).
+  if (e.key === "Enter" && e.ctrlKey && !e.altKey && !e.metaKey && (!mode || mode === "confirm")) { e.preventDefault(); sendAnswers(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   if (key === "Escape" && showKeys) { e.preventDefault(); setKeys(false); return; }
@@ -820,6 +875,7 @@ addEventListener("keydown", (e) => {
   else if (key === "r" && !formsClosed(pr) && sent !== "request_changes") { e.preventDefault(); setMode("request"); }
   else if (key === "a" && !formsClosed(pr)) { e.preventDefault(); setMode("ask"); }
   else if (key === "o") { e.preventDefault(); openLink(pr.url).catch((err) => { setNotice(err.message, "danger"); render(); }); }
+  else if (key === "g" && pr.questions.length) { e.preventDefault(); toQuestions(); }
   // With a confirm open, Skip, Hold and the user's actions wait until it is answered.
   else if (mode === "confirm" || mode === "outward") return;
   else if (key === "s") { e.preventDefault(); sendSimple("skip"); }
@@ -847,8 +903,10 @@ startApp({
   name: "Muster PR decision",
   input: (data) => {
     const r = validatePr(data);
+    inputGen++;
     if (!r.ok) {
       // Nothing may stay confirmed across invalid input; the user starts again from Merge.
+      ds.touch();
       gate.input(null);
       outGate.inputTarget(null);
       outward = null;
@@ -866,12 +924,7 @@ startApp({
     const changedSha = !!pr && pr.head_sha !== next.head_sha;
     // The draft follows the agent's questions and actions: answers to questions that are gone,
     // and options whose action is gone or changed (an outward one was confirmed as it was), drop.
-    if (id !== identity) { choices = {}; toggles.clear(); sentAnswers = null; }
-    choices = pruneChoices(next.questions, choices);
-    for (const [k, sig] of toggles) {
-      const a = next.actions.find((x) => x.id === k);
-      if (!a || toggleSig(a) !== sig) toggles.delete(k);
-    }
+    ds.input(id, next.questions, next.actions);
     if (gate.input(next, draft(next)) && mode === "confirm") {
       mode = null;
       setNotice("The PR changed while you were confirming. Check it again, then Merge.", "warning");
@@ -899,10 +952,10 @@ startApp({
       notice = null;
     } else if (changedSha) {
       setNotice(`The PR's head commit changed to ${short(next.head_sha)}. Check the changes again before merging.`, "warning");
-    } else if (sent || sentCustom.size) notice = null;
+    } else if (sent || sentNow.size) notice = null;
     // Any update is the agent's reply to what was sent.
     sent = null;
-    sentCustom.clear();
+    sentNow.clear();
     if (next.answer && !answers.some((a) => a.question === next.answer!.question && a.text === next.answer!.text)) {
       answers.push(next.answer);
       newAnswer = true;

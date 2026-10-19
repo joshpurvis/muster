@@ -224,8 +224,11 @@ jargon that the user had to ask what they meant. Decided:
 6. **Speed.** The skill uses `muster pr list` and `muster pr snapshot` (one read-only command
    each instead of many `gh` calls; the gh recipe stays for older Muster), prepares the next
    PRs while the user reads (cards marked `ready`), and for 6 or more PRs may start helper
-   sessions on a faster model that only write their judgement to files, which the main agent
-   checks before showing; helpers never act on GitHub.
+   sessions on a faster model that only write draft judgements to files. Those are one
+   untrusted source: the main agent runs `muster pr snapshot` itself for every PR before
+   using one, checks the draft against it, and marks quick wins only from its own snapshot and
+   a complete diff (no truncated files, complete file list and checks); helpers never act on
+   GitHub.
 
 ## Persistence
 

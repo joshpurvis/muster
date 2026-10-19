@@ -4,7 +4,7 @@ import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { Gate } from "../shared/confirm.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
 import { branchOk, type Method, METHODS, type MergeEvent, mergeCommand, mergeEventFor, REPO, SHA } from "../shared/merge.ts";
-import { type Draft, draftSig, draftText, EMPTY_DRAFT, type Question, validateQuestions } from "../shared/questions.ts";
+import { type Draft, draftSig, draftText, EMPTY_DRAFT, type Question, toggleSig, validateQuestions } from "../shared/questions.ts";
 import { type ImageInput, validateImage } from "../image/logic.ts";
 import { type ChartSpec, validateChart } from "../chart/logic.ts";
 
@@ -321,10 +321,13 @@ export function formsClosed(pr: Pr): string | null {
   return null;
 }
 
-/** What a confirmation is bound to: any change to these, or to the draft that rides along,
- * cancels it. */
+/** What a confirmation is bound to: any change to these, to the questions, or to the draft
+ * that rides along, cancels it. */
 export function confirmTarget(pr: Pr, draft: Draft = EMPTY_DRAFT): string {
-  return JSON.stringify([pr.repo, pr.number, pr.base, pr.head_sha, pr.checks.state, pr.merge_method_default, draftSig(draft)]);
+  // The questions as defined (ids, kinds, options, required flags, texts) and each option's
+  // action as described: a new required question, or a changed option, cancels the confirm.
+  const options = draft.options.map((id) => { const a = pr.actions.find((x) => x.id === id); return a ? toggleSig(a) : id; });
+  return JSON.stringify([pr.repo, pr.number, pr.base, pr.head_sha, pr.checks.state, pr.merge_method_default, pr.questions, draftSig(draft), options]);
 }
 
 /**

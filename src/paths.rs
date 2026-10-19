@@ -113,18 +113,20 @@ pub fn write_private(p: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = p.parent() {
         ensure_private_dir(dir)?;
     }
-    let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    // A fresh, unpredictable temporary name, created exclusively and never through a symlink:
+    // a planted entry can't redirect or truncate another file.
+    let tmp = p.with_extension(format!("tmp{:016x}", rand::random::<u64>()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)?;
+    let written = f.write_all(data).and_then(|()| f.sync_all()).and_then(|()| std::fs::rename(&tmp, p));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, p)
+    written
 }
 
 /// Contents of `daemon.json`.

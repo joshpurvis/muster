@@ -1,6 +1,6 @@
 ---
 name: muster-panels
-description: Show things to the user in a Muster panel beside the terminal (an image, a chart, a table, Markdown, or a small interactive app of your own) and get their clicks back. Use when the user says "show me", "chart this", "plot", "put it in a table", "show the screenshot", "put it in a panel", or when a picture, chart or table would be easier to read than terminal text, while running inside a Muster session. For pull request reviews use muster-pr-review.
+description: "Show things to the user in a Muster panel beside the terminal (an image, a chart, a table, Markdown, or a small interactive app of your own) and get their clicks back. Use when the user asks for a visual view: to see something in a panel, a chart or plot, a table view, or an image or screenshot shown, e.g. \"chart this\", \"put it in a table\", \"show the screenshot\", \"show this in a panel\". Not for ordinary explanations. Needs a Muster session; for pull request reviews use muster-pr-review."
 ---
 
 # Muster panels

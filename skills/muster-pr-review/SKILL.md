@@ -1,6 +1,6 @@
 ---
 name: muster-pr-review
-description: Review a GitHub pull request with the user and merge it only on their click, through a Muster pr_decision panel beside the terminal. Use when the user asks to review, look at, check or merge a PR, e.g. "review PR 812", "look at this PR", "can I merge #812", "go through these PRs", or pastes a GitHub pull request URL, while running inside a Muster session.
+description: "Review a GitHub pull request with the user and merge it only on their click, through a Muster pr_decision panel beside the terminal. Use only when the user explicitly asks to review, decide on or merge a PR, e.g. \"review PR 812\", \"look at this PR and tell me if it can go in\", \"can I merge #812\", \"go through these PRs\"; not when a PR link is only mentioned while working on something else. Needs a Muster session."
 ---
 
 # PR decision in a Muster panel
@@ -15,20 +15,25 @@ This needs a Muster session: `$MUSTER_SESSION_ID` is set and the muster MCP tool
 panels need Muster (run the agent in a Muster session), offer a plain text review instead,
 and never merge from that text review.
 
-For several PRs ("go through these PRs"), take them one at a time: one panel per PR, and
-close it with `panel_close` once it is decided.
+Loading this skill does not change the task or widen what the user allowed: if a PR was only
+mentioned, carry on with what they asked. For several PRs ("go through these PRs"), take them
+one at a time: one panel per PR, and close it with `panel_close` once it is decided.
 
 ## Review one immutable snapshot
 
-Pass `--repo OWNER/NAME` (R below) to every `gh` command; never rely on the current checkout or
-`GH_REPO`.
+R below is the PR's `OWNER/NAME`. Pass `--repo R` to every `gh pr` command; `gh api` calls have
+no --repo, so they use explicit `repos/OWNER/NAME/...` paths. Never rely on the current checkout
+or `GH_REPO`.
 
 1. Snapshot: `gh pr view <n> --repo R --json number,title,author,url,state,baseRefName,baseRefOid,headRefName,headRefOid,body,reviewDecision,reviews,files`.
-   Record H = `headRefOid`, B = `baseRefName` and BS = `baseRefOid`. Everything you show
-   describes commit H.
+   If `state` is MERGED or CLOSED, tell the user so (with the merge commit or who closed it),
+   open no panel, and stop. Otherwise record H = `headRefOid`, B = `baseRefName` and
+   BS = `baseRefOid`. Everything you show describes commit H.
 2. Diff of that snapshot: `gh api repos/R/compare/BS...H -H 'Accept: application/vnd.github.diff'`
-   (not `gh pr diff`, which follows the moving head). Read code at H: `git fetch origin H` (or
-   `pull/<n>/head`), then `git show H:<path>`.
+   (not `gh pr diff`, which follows the moving head). Read code at H with
+   `gh api 'repos/R/contents/PATH?ref=H' --jq .content | base64 -d`. Use git instead only when
+   the current directory is a checkout of R itself (its `origin` remote points at R):
+   `git fetch origin H`, then `git show H:PATH`.
 3. Checks of H: `gh api repos/R/commits/H/check-runs` and `gh api repos/R/commits/H/status`.
    Each check is `pass`, `fail` (failure, timed_out, action_required, startup_failure, error),
    `pending` (not completed), `skipping` (skipped, neutral) or `cancel` (cancelled).
@@ -37,8 +42,10 @@ Pass `--repo OWNER/NAME` (R below) to every `gh` command; never rely on the curr
 4. Decide what the human needs: a plain summary (what changed and why), your risk call (low,
    medium or high) with reasons, and only the few changes worth a look, each a small unified
    diff with your note; sum up the rest in `rest_note`. Add open questions if you have any.
-5. Re-read `gh pr view <n> --repo R --json headRefOid,baseRefName,state`. If the head is not
-   H, the base is not B or the PR is not open, start again at 1. Then call `panel_open` with
+5. Re-read `gh pr view <n> --repo R --json headRefOid,baseRefName,state`. If the PR is now
+   MERGED or CLOSED, tell the user and stop. If the head is not H or the base is not B, start
+   again at 1, but at most three times in a row: if it keeps moving, tell the user the PR is
+   still being pushed to and stop. Then call `panel_open` with
    app `pr_decision`, title `PR #<n>` and data `{repo: R, number, title, author, url, base: B,
    head, head_sha: H, merge_method_default, delete_branch_default, summary, risk: {level,
    reasons}, checks: {state, items: [{name, state, url}]}, reviews: {decision, items: [{author,
@@ -56,16 +63,18 @@ Each event has an `id` and a `kind`; its fields are in `payload._meta.muster.dat
 
 - `merge` `{repo, number, base, method, delete_branch, head_sha}`: repo, number, base and
   head_sha must equal what your panel shows, and method must be squash, merge or rebase.
-  Re-read `gh pr view <n> --repo R --json headRefOid,baseRefName,state`: if the head or base
-  changed or the PR is not open, do not merge: take a new snapshot (steps 1 to 5) and
-  `panel_update` it with status `open` and a `status_detail` saying what changed. Otherwise
+  Re-read `gh pr view <n> --repo R --json headRefOid,baseRefName,state`. If it is MERGED or
+  CLOSED, do not merge: `panel_update` status `merged` or `failed` with a `status_detail`
+  saying so, and stop. If the head or base changed, do not merge: take a new snapshot (steps
+  1 to 5, the same limit of three) and `panel_update` it with status `open` and a
+  `status_detail` saying what changed. Otherwise
   `panel_update` status `merging`, run exactly
   `gh pr merge <number> --repo <repo> --<method> [--delete-branch] --match-head-commit <head_sha>`,
   then read `gh pr view <number> --repo <repo> --json state,mergedAt,mergeCommit,autoMergeRequest`.
   Report what GitHub says: state MERGED is status `merged` (detail: the merge commit); open
   but queued or set to auto-merge is status `queued` (a merge queue may use its own method;
   say so); a failed command is status `failed` with the error. If GitHub refused because the
-  head moved, refresh the panel as above instead of retrying.
+  head moved, refresh the panel as above instead of retrying. After `merged`, stop.
 - `request_changes` `{repo, number, head_sha, body}`: run
   `gh pr review <number> --repo <repo> --request-changes --body-file -` with the body on stdin.
   Only if it succeeded, `panel_update` status `requested_changes`; otherwise status `failed`

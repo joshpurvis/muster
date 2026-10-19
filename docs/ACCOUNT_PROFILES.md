@@ -28,7 +28,10 @@ directory, not a verified account identity.
   state and ID in its own database. Directory contents are never opened. Duplicate paths
   (including symlink aliases) are refused. Renaming changes only the label; changing the path
   requires registering a new profile. Disable retains historical references and never stops
-  a running process. There is no profile-directory deletion operation.
+  a running process. There is no profile-directory deletion operation. The one exception
+  to "never opened": `muster skills install` writes Muster's own skills into every profile's
+  `skills/` folder (and only there), so profile sessions find them; see
+  [CLI.md](CLI.md#agent-skills).
 - Select a profile with `muster new --profile NAME`, the New Tab dialog, or
   `muster agent new NAME --profile PROFILE`. Named-agent profile bindings are fixed at
   creation, including for replacement sessions and `--fresh`. Create another named agent

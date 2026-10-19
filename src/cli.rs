@@ -1573,7 +1573,7 @@ pub fn profile_add(d: &Discovery, name: &str, directory: &std::path::Path) -> an
         directory.to_string_lossy().into_owned()
     } else { std::env::current_dir()?.join(directory).to_string_lossy().into_owned() })?;
     let p = client::rpc(d, "account_profile.create", json!({"name": name, "config_dir": directory}))?;
-    println!("Registered {} ({}). Sign in and verify the account inside Claude Code; Muster has not checked or changed authentication.", p["name"].as_str().unwrap_or(name), p["id"]);
+    println!("Registered {} ({}). Sign in and verify the account inside Claude Code; Muster has not checked or changed authentication.\nRun `muster skills install` to give this profile's sessions Muster's agent skills.", p["name"].as_str().unwrap_or(name), p["id"]);
     Ok(())
 }
 

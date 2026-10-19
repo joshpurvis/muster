@@ -1,5 +1,7 @@
 //! Agent skills Muster ships (skills/<name>/SKILL.md) and `muster skills install|status`, which
-//! copies them into Claude Code's and Codex's user skill folders. A marker next to each
+//! copies them into Claude Code's and Codex's user skill folders: the default Claude folder and
+//! every Claude account profile's folder (sessions under a profile read skills from there). A
+//! marker next to each
 //! installed file records the hash of what Muster wrote, so a file the user edited is never
 //! overwritten without --force. Nothing else in those folders is touched.
 
@@ -37,7 +39,7 @@ pub fn body(text: &str) -> &str {
 pub enum SkillsCmd {
     /// Install or update Muster's agent skills for Claude Code and Codex (both unless one is named).
     Install {
-        /// Claude Code: $CLAUDE_CONFIG_DIR/skills, else ~/.claude/skills.
+        /// Claude Code: $CLAUDE_CONFIG_DIR/skills (else ~/.claude/skills) and each Claude profile's skills folder.
         #[arg(long)] claude: bool,
         /// Codex: $CODEX_HOME/skills, else ~/.codex/skills.
         #[arg(long)] codex: bool,
@@ -56,21 +58,81 @@ pub enum SkillsCmd {
 #[derive(Debug, Clone)]
 pub struct Target {
     pub tool: &'static str,
+    /// What output calls this target: the tool, plus the Claude profiles that use the folder.
+    pub label: String,
     /// The tool's user skills folder.
     pub root: PathBuf,
+    /// Whether Muster may create the folder holding `root` (the default ~/.claude or ~/.codex).
+    /// A profile's folder is the user's own setup and must already exist.
+    pub create_parent: bool,
 }
 
-/// Targets from the environment: `env` reads a variable (HOME, CLAUDE_CONFIG_DIR, CODEX_HOME).
-pub fn targets(claude: bool, codex: bool, env: impl Fn(&str) -> Option<String>) -> anyhow::Result<Vec<Target>> {
+/// A Claude account profile as Muster stores it (`muster profile ls`).
+#[derive(Debug, Clone)]
+pub struct ProfileDir { pub name: String, pub config_dir: PathBuf, pub enabled: bool }
+
+/// Reads the configured Claude profiles straight from Muster's database, read-only, without
+/// the daemon. No database (Muster never ran) or no profiles table yet means no profiles.
+pub fn read_profiles(db: &Path) -> anyhow::Result<Vec<ProfileDir>> {
+    use rusqlite::OpenFlags;
+    if !db.try_exists().unwrap_or(true) { return Ok(Vec::new()) }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let conn = if wal.try_exists().unwrap_or(true) {
+        // The daemon has it open (or left a log to replay): read through the log as it does.
+        rusqlite::Connection::open_with_flags(db, flags)
+    } else {
+        // No log: everything is in the main file. Read it as is, so a plain read-only open
+        // does not leave -wal/-shm files (with default permissions) beside Muster's database.
+        let encoded = db.display().to_string().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
+        rusqlite::Connection::open_with_flags(format!("file:{encoded}?immutable=1"), flags | OpenFlags::SQLITE_OPEN_URI)
+    }.with_context(|| format!("opening {}", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let has_table: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='account_profiles'", [], |r| r.get(0))?;
+    if has_table == 0 { return Ok(Vec::new()) }
+    let mut st = conn.prepare("SELECT name, config_dir, enabled FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
+    let rows = st.query_map([], |r| Ok(ProfileDir {
+        name: r.get(0)?, config_dir: PathBuf::from(r.get::<_, String>(1)?), enabled: r.get(2)?,
+    }))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The targets, and notes on profiles that were left out (their folder is unavailable).
+pub struct Targets { pub list: Vec<Target>, pub notes: Vec<String> }
+
+/// Targets from the environment and the Claude profiles: `env` reads a variable (HOME,
+/// CLAUDE_CONFIG_DIR, CODEX_HOME). Claude gets the default folder plus every profile's folder,
+/// one target per real folder (a profile that points at the default folder shares its target).
+pub fn targets(claude: bool, codex: bool, env: impl Fn(&str) -> Option<String>, profiles: &[ProfileDir]) -> anyhow::Result<Targets> {
     let (claude, codex) = if claude || codex { (claude, codex) } else { (true, true) };
     let home = || env("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).context("HOME is not set");
     let dir = |var: &str, default: &str| -> anyhow::Result<PathBuf> {
         Ok(match env(var).filter(|v| !v.is_empty()) { Some(v) => PathBuf::from(v), None => home()?.join(default) })
     };
     let mut out = Vec::new();
-    if claude { out.push(Target { tool: "claude", root: dir("CLAUDE_CONFIG_DIR", ".claude")?.join("skills") }); }
-    if codex { out.push(Target { tool: "codex", root: dir("CODEX_HOME", ".codex")?.join("skills") }); }
-    Ok(out)
+    let mut notes = Vec::new();
+    if claude {
+        // (canonical folder, folder, names using it ("default" for the default folder), is default)
+        let default = dir("CLAUDE_CONFIG_DIR", ".claude")?;
+        let mut folders = vec![(std::fs::canonicalize(&default).unwrap_or_else(|_| default.clone()), default, vec!["default".to_string()], true)];
+        for p in profiles {
+            let name = if p.enabled { p.name.clone() } else { format!("{}: disabled", p.name) };
+            match std::fs::canonicalize(&p.config_dir) {
+                Ok(real) if real.is_dir() => match folders.iter_mut().find(|f| f.0 == real) {
+                    Some(f) => f.2.push(name),
+                    None => folders.push((real, p.config_dir.clone(), vec![name], false)),
+                },
+                _ => notes.push(format!("claude ({name}) skipped: its folder {} is unavailable", p.config_dir.display())),
+            }
+        }
+        for (_, folder, names, is_default) in folders {
+            let label = if names == ["default"] { "claude".to_string() } else { format!("claude ({})", names.join(", ")) };
+            out.push(Target { tool: "claude", label, root: folder.join("skills"), create_parent: is_default });
+        }
+    }
+    if codex { out.push(Target { tool: "codex", label: "codex".into(), root: dir("CODEX_HOME", ".codex")?.join("skills"), create_parent: true }); }
+    Ok(Targets { list: out, notes })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,8 +305,13 @@ fn tilde(path: &Path, home: Option<&str>) -> String {
 /// The lines to print, and the reason the command fails (exit 1) if it does.
 pub struct Report { pub lines: Vec<String>, pub failed: Option<String> }
 
-fn line(tool: &str, what: &str, path: &Path, home: Option<&str>) -> String {
-    format!("{tool:<10} {what:<26} {}", tilde(path, home))
+/// The label column's width: the longest label, at least `min`.
+fn width(targets: &[Target], min: usize) -> usize {
+    targets.iter().map(|t| t.label.chars().count()).max().unwrap_or(0).max(min)
+}
+
+fn line(label: &str, w: usize, what: &str, path: &Path, home: Option<&str>) -> String {
+    format!("{label:<w$} {what:<26} {}", tilde(path, home))
 }
 
 /// Installs every skill into every target. Nothing is written while any entry is blocked, or
@@ -256,6 +323,7 @@ pub fn install(targets: &[Target], dry_run: bool, force: bool, home: Option<&str
 
 fn install_with(targets: &[Target], dry_run: bool, force: bool, home: Option<&str>, before_write: &dyn Fn(&Plan)) -> Report {
     let plans = plan(targets);
+    let w = width(targets, 10);
     let mut lines: Vec<String> = plans.iter().map(|p| {
         let what = match (p.state(), force) {
             (State::Missing, _) => "new".to_string(),
@@ -265,7 +333,7 @@ fn install_with(targets: &[Target], dry_run: bool, force: bool, home: Option<&st
             (State::Modified, false) => "skipped: locally modified".into(),
             (State::Blocked(why), _) => format!("refused: {why}"),
         };
-        line(p.target.tool, &what, &file(&p.target, p.skill), home)
+        line(&p.target.label, w, &what, &file(&p.target, p.skill), home)
     }).collect();
     let blocked: Vec<String> = plans.iter().filter_map(|p| match p.state() { State::Blocked(why) => Some(why.clone()), _ => None }).collect();
     if !blocked.is_empty() {
@@ -285,7 +353,7 @@ fn install_with(targets: &[Target], dry_run: bool, force: bool, home: Option<&st
         before_write(p);
         match apply(p) {
             Ok(()) => results.push(planned.clone()),
-            Err(why) => { failures += 1; results.push(line(p.target.tool, &format!("failed: {why}"), &file(&p.target, p.skill), home)); }
+            Err(why) => { failures += 1; results.push(line(&p.target.label, w, &format!("failed: {why}"), &file(&p.target, p.skill), home)); }
         }
     }
     Report { lines: results, failed: (failures > 0).then(|| format!("{failures} skill file(s) failed; the others above were installed. Fix the cause and run again.")) }
@@ -294,8 +362,13 @@ fn install_with(targets: &[Target], dry_run: bool, force: bool, home: Option<&st
 fn apply(p: &Plan) -> Result<(), String> {
     let dir = p.target.root.join(p.skill.name);
     if let Some(tool_dir) = p.target.root.parent() {
-        // The tool's own folder (~/.claude, $CODEX_HOME) is the user's to arrange, links included.
-        std::fs::create_dir_all(tool_dir).map_err(|e| format!("creating {}: {e}", tool_dir.display()))?;
+        // The tool's own folder (~/.claude, $CODEX_HOME, a profile's folder) is the user's to
+        // arrange, links included. Only the default folders are created; a profile's must exist.
+        if p.target.create_parent {
+            std::fs::create_dir_all(tool_dir).map_err(|e| format!("creating {}: {e}", tool_dir.display()))?;
+        } else if !std::fs::metadata(tool_dir).is_ok_and(|m| m.is_dir()) {
+            return Err(format!("profile folder {} is unavailable", tool_dir.display()));
+        }
     }
     make_dir(&p.target.root)?;
     make_dir(&dir)?;
@@ -317,7 +390,8 @@ fn apply(p: &Plan) -> Result<(), String> {
 }
 
 pub fn status(targets: &[Target], home: Option<&str>) -> Vec<String> {
-    plan(targets).iter().map(|p| format!("{:<18} {:<8} {:<17} {}", p.skill.name, p.target.tool, p.state().word(),
+    let w = width(targets, 8);
+    plan(targets).iter().map(|p| format!("{:<18} {:<w$} {:<17} {}", p.skill.name, p.target.label, p.state().word(),
         tilde(&file(&p.target, p.skill), home))).collect()
 }
 
@@ -327,15 +401,24 @@ pub const TRADE_OFF: &str = "A skill runs in your current agent, so the PR's tex
 pub fn run(cmd: SkillsCmd) -> anyhow::Result<()> {
     let env = |k: &str| std::env::var(k).ok();
     let home = env("HOME");
+    let (claude, codex) = match &cmd { SkillsCmd::Install { claude, codex, .. } | SkillsCmd::Status { claude, codex } => (*claude, *codex) };
+    let profiles = if claude || !codex {
+        let db = crate::paths::db_path();
+        read_profiles(&db).unwrap_or_else(|e| {
+            eprintln!("warning: could not read Muster's Claude profiles from {}: {e:#}; only the default Claude folder is covered", db.display());
+            Vec::new()
+        })
+    } else { Vec::new() };
+    let ts = targets(claude, codex, env, &profiles)?;
     match cmd {
-        SkillsCmd::Install { claude, codex, dry_run, force } => {
-            let report = install(&targets(claude, codex, env)?, dry_run, force, home.as_deref());
-            for line in &report.lines { println!("{line}"); }
+        SkillsCmd::Install { dry_run, force, .. } => {
+            let report = install(&ts.list, dry_run, force, home.as_deref());
+            for line in report.lines.iter().chain(&ts.notes) { println!("{line}"); }
             if let Some(why) = report.failed { bail!("{why}") }
             if !dry_run { println!("Start a new agent session to pick up the skills.\n{TRADE_OFF}"); }
         }
-        SkillsCmd::Status { claude, codex } => {
-            for line in status(&targets(claude, codex, env)?, home.as_deref()) { println!("{line}"); }
+        SkillsCmd::Status { .. } => {
+            for line in status(&ts.list, home.as_deref()).iter().chain(&ts.notes) { println!("{line}"); }
         }
     }
     Ok(())
@@ -355,7 +438,7 @@ mod tests {
     }
 
     fn targets_in(home: &Path) -> Vec<Target> {
-        targets(false, false, |k| (k == "HOME").then(|| home.display().to_string())).unwrap()
+        targets(false, false, |k| (k == "HOME").then(|| home.display().to_string()), &[]).unwrap().list
     }
 
     /// The YAML frontmatter as `key: value` pairs, parsed strictly enough for what skills use:
@@ -413,15 +496,15 @@ mod tests {
     #[test]
     fn targets_follow_the_documented_folders() {
         let home = PathBuf::from("/h");
-        let t = targets(false, false, |k| (k == "HOME").then(|| "/h".to_string())).unwrap();
+        let t = targets(false, false, |k| (k == "HOME").then(|| "/h".to_string()), &[]).unwrap().list;
         assert_eq!(t.iter().map(|t| (t.tool, t.root.clone())).collect::<Vec<_>>(),
             vec![("claude", home.join(".claude/skills")), ("codex", home.join(".codex/skills"))]);
-        let t = targets(false, true, |k| match k { "HOME" => Some("/h".into()), "CODEX_HOME" => Some("/c".into()), _ => None }).unwrap();
+        let t = targets(false, true, |k| match k { "HOME" => Some("/h".into()), "CODEX_HOME" => Some("/c".into()), _ => None }, &[]).unwrap().list;
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].root, PathBuf::from("/c/skills"));
-        let t = targets(true, false, |k| (k == "CLAUDE_CONFIG_DIR").then(|| "/cc".to_string())).unwrap();
+        let t = targets(true, false, |k| (k == "CLAUDE_CONFIG_DIR").then(|| "/cc".to_string()), &[]).unwrap().list;
         assert_eq!(t[0].root, PathBuf::from("/cc/skills"));
-        assert!(targets(true, false, |_| None).is_err(), "no HOME, no guess");
+        assert!(targets(true, false, |_| None, &[]).is_err(), "no HOME, no guess");
     }
 
     fn names_in(dir: &Path) -> Vec<String> {
@@ -592,6 +675,70 @@ mod tests {
         assert_eq!(names_in(&dir), vec![MARKER.to_string(), "SKILL.md".to_string()]);
         assert!(install(&ts, false, false, None).failed.is_none());
         assert_eq!(state(codex, panels), State::Current);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn every_claude_profile_folder_is_a_target_once() {
+        let home = temp_home("profiles");
+        // Muster's own store, as `muster profile add` leaves it (the daemon's database).
+        let db = home.join("data/muster.db");
+        let store = crate::store::Store::open(&db).unwrap();
+        // Personal is a symlink to the real folder (the user's arrangement); Work is plain.
+        std::fs::create_dir_all(home.join("real-personal")).unwrap();
+        std::os::unix::fs::symlink(home.join("real-personal"), home.join(".claude-personal")).unwrap();
+        std::fs::create_dir_all(home.join(".claude-work")).unwrap();
+        store.insert_account_profile("Personal", home.join(".claude-personal").to_str().unwrap()).unwrap();
+        store.insert_account_profile("Work", home.join(".claude-work").to_str().unwrap()).unwrap();
+        drop(store);
+        let profiles = read_profiles(&db).unwrap();
+        assert_eq!(profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Personal", "Work"]);
+        assert!(read_profiles(&home.join("no-such.db")).unwrap().is_empty(), "Muster never ran: no profiles");
+
+        let env = |k: &str| (k == "HOME").then(|| home.display().to_string());
+        let ts = targets(false, false, env, &profiles).unwrap();
+        assert!(ts.notes.is_empty(), "{:?}", ts.notes);
+        let labels: Vec<_> = ts.list.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["claude", "claude (Personal)", "claude (Work)", "codex"]);
+        assert!(install(&ts.list, false, false, None).failed.is_none());
+        for dir in [".claude", "real-personal", ".claude-work", ".codex"] {
+            for s in SKILLS {
+                assert_eq!(std::fs::read_to_string(home.join(dir).join("skills").join(s.name).join("SKILL.md")).unwrap(), s.text, "{dir}");
+            }
+        }
+        let st = status(&ts.list, Some(home.to_str().unwrap()));
+        assert_eq!(st.len(), 8, "{st:?}");
+        assert!(st.iter().all(|l| l.contains("current")), "{st:?}");
+        for want in ["claude (Personal) current           ~/.claude-personal/skills/muster-pr-review/SKILL.md",
+            "claude (Work)     current           ~/.claude-work/skills/muster-panels/SKILL.md"] {
+            assert!(st.iter().any(|l| l.contains(want)), "{want} in {st:?}");
+        }
+        // --codex alone leaves the Claude folders out, profiles included.
+        assert_eq!(targets(false, true, env, &profiles).unwrap().list.len(), 1);
+
+        // A profile pointing at the default folder (here through CLAUDE_CONFIG_DIR) shares its
+        // target; a missing or disabled profile folder is noted, never created.
+        let mut more = profiles.clone();
+        more.push(ProfileDir { name: "Alias".into(), config_dir: home.join(".claude"), enabled: true });
+        more.push(ProfileDir { name: "Gone".into(), config_dir: home.join(".claude-gone"), enabled: true });
+        more[1].enabled = false;
+        let env2 = |k: &str| match k { "HOME" => Some(home.display().to_string()), "CLAUDE_CONFIG_DIR" => Some(home.join("./.claude").display().to_string()), _ => None };
+        let ts = targets(true, false, env2, &more).unwrap();
+        let labels: Vec<_> = ts.list.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["claude (default, Alias)", "claude (Personal)", "claude (Work: disabled)"]);
+        assert_eq!(ts.notes.len(), 1);
+        assert!(ts.notes[0].contains("claude (Gone) skipped") && ts.notes[0].contains("unavailable"), "{:?}", ts.notes);
+        assert!(install(&ts.list, false, false, None).lines.iter().all(|l| l.contains("unchanged")));
+        assert!(!home.join(".claude-gone").exists());
+
+        // A profile folder that disappears after planning is not recreated.
+        std::fs::remove_dir_all(home.join(".claude-work")).unwrap();
+        let ts = targets(true, false, env2, &profiles).unwrap();
+        assert!(ts.notes.iter().any(|n| n.contains("claude (Work) skipped")));
+        let work = Target { tool: "claude", label: "claude (Work)".into(), root: home.join(".claude-work/skills"), create_parent: false };
+        let r = install(&[work], false, false, None);
+        assert!(r.lines.iter().all(|l| l.contains("is unavailable")), "{:?}", r.lines);
+        assert!(!home.join(".claude-work").exists());
         std::fs::remove_dir_all(&home).unwrap();
     }
 }

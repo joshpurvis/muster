@@ -112,7 +112,7 @@ An agent loads one when the request matches its description ("review PR 812", "c
 Both only work inside a Muster session and say so otherwise.
 
 ```sh
-muster skills install            # Claude Code and Codex
+muster skills install            # Claude Code (default folder and every profile) and Codex
 muster skills install --claude   # or --codex; --dry-run shows the changes, writes nothing
 muster skills status
 ```
@@ -121,8 +121,15 @@ A skill runs in your current agent, so the PR's text enters its context; for PRs
 you don't trust, start a separate agent from the PR reviewer template (New agent) to keep it
 isolated. Loading a skill never widens what you allowed the agent to do.
 
-Targets: Claude Code `$CLAUDE_CONFIG_DIR/skills`, else `~/.claude/skills`; Codex
-`$CODEX_HOME/skills`, else `~/.codex/skills` (where Codex's own skill-creator puts user skills).
+Targets: Claude Code `$CLAUDE_CONFIG_DIR/skills`, else `~/.claude/skills`, plus
+`<folder>/skills` for every Claude profile (`muster profile ls`, disabled ones included), since
+a session started under a profile reads skills from that profile's folder. The profiles are
+read from Muster's database, read-only, so the daemon need not run. Each real folder is one
+target: a profile that points at the default folder shares its line, labelled
+`claude (default, Name)`; profile lines read `claude (Name)`. A profile folder that is missing
+is reported as skipped and never created. Codex: `$CODEX_HOME/skills`, else `~/.codex/skills`
+(where Codex's own skill-creator puts user skills); profiles do not change Codex's folder.
+After adding a profile, run `muster skills install` again to cover it.
 Each skill is `<target>/<name>/SKILL.md` (mode 0600, folders 0700), with a `.muster-installed`
 marker beside it holding the SHA-256 of what Muster wrote. `install` lists each file as new,
 updated, unchanged or locally modified. It writes nothing at all if a file was edited since

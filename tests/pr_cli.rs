@@ -31,6 +31,7 @@ for a in "$@"; do
   esac
 done
 if [ "$key" = other ]; then case "$*" in *"/compare/"*) key=compare;; esac; fi
+if [ "$key" = checks ]; then case "$*" in *"after="*) key=checks2;; esac; fi
 if [ -f "$d/$key.once" ]; then cat "$d/$key.once"; rm -f "$d/$key.once"; echo "gh: slow down (HTTP 403)" >&2; exit 1; fi
 if [ -f "$d/$key.exit" ]; then
   [ -f "$d/$key.out" ] && cat "$d/$key.out"
@@ -40,11 +41,14 @@ fi
 cat "$d/$key.json"
 "#;
 
-/// Prints `img-<last path segment>` for the URL (the last argument), else fails like curl -f.
+/// Reads the URL from the config on stdin (`-K -`) and prints `img-<last path segment>`, else
+/// fails like curl -f. Records its argv in `curl-calls` and its stdin in `curl-stdin`.
 const CURL_STUB: &str = r#"#!/bin/bash
 d="$(cd "$(dirname "$0")" && pwd)"
 printf '%s\x1f' "$@" >> "$d/curl-calls"; printf '\x1e\n' >> "$d/curl-calls"
-url="${@: -1}"; seg="${url%%\?*}"; seg="${seg##*/}"
+cfg="$(cat)"; printf '%s\x1e\n' "$cfg" >> "$d/curl-stdin"
+url="$(printf '%s\n' "$cfg" | sed -n 's/^url = "\(.*\)"$/\1/p')"
+seg="${url%%\?*}"; seg="${seg##*/}"
 [ -f "$d/img-$seg" ] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
 cat "$d/img-$seg"
 "#;
@@ -124,9 +128,14 @@ impl Fx {
                 "baseRefName": "master", "baseRefOid": BASE, "headRefName": head_branch, "headRefOid": HEAD,
                 "mergedAt": null, "closedAt": null, "mergeCommit": null,
                 "latestReviews": {"nodes": [{"author": {"login": "lee"}, "state": "APPROVED"}, {"author": null, "state": "COMMENTED"}]}}}}}));
+        self.open_pr_rest();
+    }
+
+    /// Everything but the snapshot read: head unchanged, two checks, a two-file diff.
+    fn open_pr_rest(&self) {
         self.head(HEAD, "OPEN");
         self.json("checks", json!({"data": {"repository": {"object": {"statusCheckRollup": {"contexts": {
-            "pageInfo": {"hasNextPage": false, "endCursor": "x"},
+            "totalCount": 2, "pageInfo": {"hasNextPage": false, "endCursor": "x"},
             "nodes": [
                 {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://ci.example/1",
                  "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}},
@@ -175,6 +184,8 @@ fn snapshot_happy_path_shape_and_pictures() {
         ("delete_branch_default", json!(true)), ("body", json!(body)), ("files_complete", json!(true))] {
         assert_eq!(v[k], want, "{k}");
     }
+    assert_eq!(v["checks_complete"], true);
+    assert_eq!(v["checks_total"], Value::Null);
     assert_eq!(v["checks"], json!({"state": "pending", "items": [
         {"name": "CI / test", "state": "pass", "url": "https://ci.example/1"},
         {"name": "deploy/preview", "state": "pending", "url": "https://preview.example"}]}));
@@ -183,7 +194,7 @@ fn snapshot_happy_path_shape_and_pictures() {
         {"file": "src/a.rs", "status": "modified", "additions": 2, "deletions": 1, "binary": false, "truncated": false,
          "diff": "diff --git a/src/a.rs b/src/a.rs\nindex 1..2 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1,2 @@\n-old\n+new\n+more\n"},
         {"file": "logo.png", "status": "added", "additions": 0, "deletions": 0, "binary": true, "truncated": false,
-         "diff": "diff --git a/logo.png b/logo.png\nnew file mode 100644\nindex 0..1\nBinary files /dev/null and b/logo.png differ\n"}]));
+         "note": "binary file: no text diff", "diff": "diff --git a/logo.png b/logo.png\nnew file mode 100644\nindex 0..1\nBinary files /dev/null and b/logo.png differ\n"}]));
     assert!(v["fetched_at"].as_str().is_some_and(|t| t.len() == 20 && t.ends_with('Z')));
 
     // One picture downloaded into a fresh private directory here; the rest skipped with reasons.
@@ -208,9 +219,14 @@ fn snapshot_happy_path_shape_and_pictures() {
     let curl = fx.calls("curl");
     assert_eq!(fx.count("curl"), 3, "{curl}");
     assert!(!curl.contains("evil.example") && !curl.contains("http://"), "{curl}");
-    for flag in ["--proto\x1f=https\x1f", "--proto-redir\x1f=https\x1f", "--max-filesize\x1f1500000\x1f", "--max-time\x1f20\x1f", "--\x1fhttps://"] {
+    for flag in ["-q\x1f", "--proto\x1f=https\x1f", "--proto-redir\x1f=https\x1f", "--max-filesize\x1f1500000\x1f", "--max-time\x1f20\x1f", "-K\x1f-\x1f"] {
         assert!(curl.split('\x1e').filter(|c| !c.trim().is_empty()).all(|c| c.contains(flag)), "{flag:?} in {curl}");
     }
+    assert!(curl.split('\x1e').all(|c| c.trim_start().is_empty() || c.trim_start().starts_with("-q\x1f")), "-q comes first: {curl}");
+    // The URLs went on stdin, never in argv.
+    assert!(!curl.contains("https://"), "{curl}");
+    let stdin = std::fs::read_to_string(fx.bin.join("curl-stdin")).unwrap();
+    assert!(stdin.contains("url = \"https://github.com/user-attachments/assets/aaaa-1111\""), "{stdin}");
     // gh: the PR, the diff and checks for exactly the head SHA, then the PR again. Read-only.
     let gh = fx.calls("gh");
     assert_eq!(fx.count("gh"), 4, "{gh}");
@@ -219,6 +235,34 @@ fn snapshot_happy_path_shape_and_pictures() {
     for write in ["merge", "review", "comment", "-X", "--method", "POST", "PATCH", "edit"] {
         assert!(!gh.split(['\x1f', '\x1e', '\n']).any(|a| a == write), "{write} in {gh}");
     }
+}
+
+#[test]
+fn signed_attachment_links_stay_out_of_every_argv_and_output() {
+    let fx = Fx::new("signed");
+    fx.open_pr("T", "![shot](https://github.com/user-attachments/assets/aaaa1111-2222)", "dana/x");
+    let mut snap: Value = serde_json::from_slice(&std::fs::read(fx.bin.join("snapshot.json")).unwrap()).unwrap();
+    snap["data"]["repository"]["pullRequest"]["bodyHTML"] =
+        json!("<p><img alt=\"shot\" src=\"https://private-user-images.githubusercontent.com/9/77-aaaa1111-2222.png?jwt=SECRETJWT.part2-x\"></p>");
+    fx.json("snapshot", snap);
+    fx.set("img-77-aaaa1111-2222.png", PNG);
+    let r = snapshot(&fx, &["--verbose"]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(r.json()["media"][0]["alt"], "shot");
+    assert_eq!(fx.count("curl"), 1);
+    let stdin = std::fs::read_to_string(fx.bin.join("curl-stdin")).unwrap();
+    assert!(stdin.contains("url = \"https://private-user-images.githubusercontent.com/9/77-aaaa1111-2222.png?jwt=SECRETJWT.part2-x\""), "{stdin}");
+    for (what, text) in [("curl argv", fx.calls("curl")), ("gh argv", fx.calls("gh")), ("stdout", r.stdout.clone()), ("stderr", r.stderr.clone())] {
+        assert!(!text.contains("SECRETJWT"), "the signed link leaked into {what}: {text}");
+    }
+    // A failed download's reason never carries it either.
+    let fx2 = Fx::new("signed-fail");
+    fx2.set("snapshot.json", std::fs::read(fx.bin.join("snapshot.json")).unwrap());
+    fx2.open_pr_rest();
+    let r = snapshot(&fx2, &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.json()["media_skipped"][0]["reason"].as_str().unwrap().contains("refused"));
+    assert!(!r.stdout.contains("SECRETJWT") && !r.stderr.contains("SECRETJWT"), "{}", r.stdout);
 }
 
 #[test]
@@ -281,11 +325,20 @@ fn closed_pr_exits_4_with_its_state_and_fetches_nothing_else() {
     // Closed while reading: the full snapshot, with the new state, still exit 4.
     let fx = Fx::new("closed-late");
     fx.open_pr("T", "", "dana/x");
-    fx.head(HEAD, "CLOSED");
+    fx.json("head", json!({"data": {"repository": {"pullRequest": {"state": "MERGED", "headRefOid": HEAD, "baseRefName": "master",
+        "baseRefOid": BASE, "mergedAt": "2026-10-19T08:00:00Z", "closedAt": "2026-10-19T08:00:00Z",
+        "mergeCommit": {"oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}}}}));
     let r = snapshot(&fx, &[]);
     assert_eq!(r.code, 4, "{}", r.stderr);
-    assert_eq!(r.json()["state"], "CLOSED");
-    assert!(r.json()["files"].is_array());
+    let v = r.json();
+    assert_eq!((v["state"].as_str(), v["merged_at"].as_str(), v["closed_at"].as_str(), v["merge_commit"].as_str()),
+        (Some("MERGED"), Some("2026-10-19T08:00:00Z"), Some("2026-10-19T08:00:00Z"), Some("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")));
+    assert!(v["files"].is_array());
+    let fx = Fx::new("closed-late2");
+    fx.open_pr("T", "", "dana/x");
+    fx.head(HEAD, "CLOSED");
+    let v = snapshot(&fx, &[]).json();
+    assert_eq!((v["state"].as_str(), v["merge_commit"].clone(), v.get("merged_at").is_some()), (Some("CLOSED"), Value::Null, true));
 }
 
 #[test]
@@ -298,6 +351,7 @@ fn gh_failures_exit_5_with_json() {
     assert_eq!(r.code, 5, "{}", r.stderr);
     assert_eq!(r.json()["error"], "gh_failed");
     assert!(r.json()["detail"].as_str().unwrap().contains("HTTP 500"));
+    assert!(!fx.calls("gh").contains("per_page=1"), "only a too-large diff falls back to the files API");
 
     let fx = Fx::new("ghauth");
     fx.fail("snapshot", 4, "To get started with GitHub CLI, please run:  gh auth login");
@@ -362,6 +416,23 @@ fn media_dir_is_created_where_asked() {
 }
 
 #[test]
+fn media_dir_never_goes_through_a_symlink() {
+    let fx = Fx::new("medialink");
+    fx.open_pr("T", "![a](https://github.com/user-attachments/assets/aaaa-1111)", "dana/x");
+    fx.set("img-aaaa-1111", PNG);
+    let outside = fx.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fx.cwd.join("shots")).unwrap();
+    for dir in ["shots/new", "shots"] {
+        let r = snapshot(&fx, &["--media-dir", dir]);
+        assert_eq!(r.code, 2, "{dir}: {}", r.stderr);
+        assert!(r.stderr.contains("symlink") || r.stderr.contains("already exists"), "{dir}: {}", r.stderr);
+    }
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing was created outside");
+    assert_eq!(fx.count("gh"), 0);
+}
+
+#[test]
 fn diffs_are_capped_and_marked_truncated() {
     let fx = Fx::new("truncate");
     fx.open_pr("T", "No pictures.", "dana/x");
@@ -389,14 +460,21 @@ fn a_refused_diff_falls_back_to_the_files_api() {
     fx.json("compare", json!({"files": [
         {"filename": "a.rs", "status": "renamed", "previous_filename": "old.rs", "additions": 1, "deletions": 0, "changes": 1, "patch": "@@ -1 +1,2 @@\n x\n+y"},
         {"filename": "huge.lock", "status": "modified", "additions": 9000, "deletions": 10, "changes": 9010},
-        {"filename": "pic.png", "status": "added", "additions": 0, "deletions": 0, "changes": 0}]}));
+        {"filename": "pic.png", "status": "added", "additions": 0, "deletions": 0, "changes": 0},
+        {"filename": "new.txt", "status": "renamed", "previous_filename": "old.txt", "additions": 0, "deletions": 0, "changes": 0},
+        {"filename": "run.sh", "status": "changed", "additions": 0, "deletions": 0, "changes": 0}]}));
     let r = snapshot(&fx, &[]);
     assert_eq!(r.code, 0, "{}", r.stderr);
     let v = r.json();
     assert_eq!(v["files"][0], json!({"file": "a.rs", "status": "renamed", "previous_file": "old.rs", "additions": 1, "deletions": 0,
         "binary": false, "truncated": false, "diff": "--- a/old.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n x\n+y\n"}));
-    assert_eq!((v["files"][1]["truncated"].as_bool(), v["files"][1]["binary"].as_bool()), (Some(true), Some(false)));
-    assert_eq!(v["files"][2]["binary"], true);
+    let f = |i: usize| (v["files"][i]["binary"].as_bool(), v["files"][i]["truncated"].as_bool(), v["files"][i]["diff"].as_str(), v["files"][i]["note"].as_str());
+    assert_eq!(f(1), (Some(false), Some(true), Some(""), Some("GitHub left out this file's diff (too large)")));
+    // Without a patch and without changed lines nothing proves a file binary.
+    assert_eq!(f(2), (Some(false), Some(false), Some(""), Some("new empty file (or a binary file: GitHub's file list doesn't say)")));
+    assert_eq!(f(3), (Some(false), Some(false), Some(""), Some("renamed from old.txt, content unchanged")));
+    assert_eq!(v["files"][3]["previous_file"], "old.txt");
+    assert_eq!(f(4), (Some(false), Some(false), Some(""), Some("file mode changed only")));
     assert!(fx.calls("gh").contains(&format!("repos/acme/api/compare/{BASE}...{HEAD}?per_page=1\x1f")));
 }
 
@@ -420,6 +498,69 @@ fn rate_limits_wait_or_stop_with_the_reset_time() {
     assert_eq!(r.json()["error"], "rate_limited");
     assert_eq!(r.json()["reset_at"], "2026-10-19T06:12:15Z");
     assert_eq!(fx.count("gh"), 1);
+}
+
+#[test]
+fn a_rate_limited_diff_never_falls_back() {
+    // Secondary limit asking for longer than 120 s: stop, exit 5, no files API call.
+    let fx = Fx::new("diff429");
+    fx.open_pr("T", "", "dana/x");
+    fx.fail("diff", 1, "gh: Too Many Requests (HTTP 429)");
+    fx.set("diff.out", "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 999\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit.\"}");
+    let r = snapshot(&fx, &[]);
+    assert_eq!(r.code, 5, "{}", r.stderr);
+    assert_eq!(r.json()["error"], "rate_limited");
+    assert!(r.json()["reset_at"].is_string());
+    assert!(!fx.calls("gh").contains("per_page=1"), "{}", fx.calls("gh"));
+    // Primary limit used up on the diff: the same.
+    let fx = Fx::new("diffprimary");
+    fx.open_pr("T", "", "dana/x");
+    fx.fail("diff", 1, "gh: API rate limit exceeded for user ID 1. (HTTP 403)");
+    fx.set("diff.out", "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1792390335\r\n\r\n{\"message\":\"API rate limit exceeded\"}");
+    let r = snapshot(&fx, &[]);
+    assert_eq!((r.code, r.json()["error"].as_str(), r.json()["reset_at"].as_str()), (5, Some("rate_limited"), Some("2026-10-19T06:12:15Z")));
+    assert!(!fx.calls("gh").contains("per_page=1"));
+}
+
+fn check_page(states: &[&str], total: usize, next: bool) -> Value {
+    let nodes: Vec<Value> = states.iter().enumerate().map(|(i, st)| json!({"__typename": "CheckRun", "name": format!("job{i}"),
+        "status": "COMPLETED", "conclusion": st, "detailsUrl": "https://ci.example/1"})).collect();
+    json!({"data": {"repository": {"object": {"statusCheckRollup": {"contexts": {
+        "totalCount": total, "pageInfo": {"hasNextPage": next, "endCursor": "c"}, "nodes": nodes}}}}}})
+}
+
+#[test]
+fn checks_are_paged_and_never_passing_when_incomplete() {
+    // 211 checks over two pages, the only failure on the last: failing, and it is kept.
+    let fx = Fx::new("checks211");
+    fx.open_pr("T", "", "dana/x");
+    fx.json("checks", check_page(&["SUCCESS"; 100], 211, true));
+    let mut last = vec!["SUCCESS"; 110];
+    last.push("FAILURE");
+    fx.json("checks2", check_page(&last, 211, false));
+    let r = snapshot(&fx, &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let v = r.json();
+    assert_eq!((v["checks"]["state"].as_str(), v["checks_complete"].as_bool(), v["checks_total"].as_u64()), (Some("failing"), Some(true), Some(211)));
+    let items = v["checks"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 200);
+    assert!(items.iter().any(|i| i["state"] == "fail"));
+    // More pages than it reads: all green so far is still only pending, and it says so.
+    let fx = Fx::new("checksmany");
+    fx.open_pr("T", "", "dana/x");
+    fx.json("checks", check_page(&["SUCCESS"; 100], 5000, true));
+    fx.json("checks2", check_page(&["SUCCESS"; 100], 5000, true));
+    let r = snapshot(&fx, &[]);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let v = r.json();
+    assert_eq!((v["checks"]["state"].as_str(), v["checks_complete"].as_bool(), v["checks_total"].as_u64()), (Some("pending"), Some(false), Some(5000)));
+    assert_eq!(fx.calls("gh").matches("query PrChecks").count(), 20, "bounded");
+    // A failure already seen stays failing.
+    let fx = Fx::new("checksfail");
+    fx.open_pr("T", "", "dana/x");
+    fx.json("checks", check_page(&["FAILURE"], 5000, true));
+    fx.json("checks2", check_page(&["SUCCESS"; 100], 5000, true));
+    assert_eq!(snapshot(&fx, &[]).json()["checks"]["state"], "failing");
 }
 
 #[test]

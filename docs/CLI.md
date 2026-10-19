@@ -179,9 +179,9 @@ It prints:
 {repo, number, title, author, url, state, draft, base, base_sha, head, head_sha,
  mergeable, merge_method_default, delete_branch_default,
  checks: {state, items: [{name, state, url?}]}, reviews: {decision, items: [{author, state}]},
- body, files: [{file, status, previous_file?, additions, deletions, binary, diff, truncated}],
+ body, files: [{file, status, previous_file?, additions, deletions, binary, diff, truncated, note?}],
  files_complete, media: [{kind: "image", path, alt}], media_dir, media_skipped: [{url, reason}],
- fetched_at, checks_total?}
+ fetched_at, checks_complete, checks_total?}
 ```
 
 - `state` is `OPEN`, `MERGED` or `CLOSED`; `mergeable` is GitHub's (`MERGEABLE`,
@@ -191,27 +191,40 @@ It prints:
 - `checks.items[].state` is `pass`, `fail` (failure, timed out, action required, startup
   failure), `pending` (not completed), `skipping` (skipped, neutral, stale) or `cancel`;
   check runs are named `Workflow / job`. `checks.state` is `failing` if any fails, else
-  `pending` if any is pending, else `passing`, and `none` without checks. At most 200 items
-  (failing and pending first); `checks_total` appears when there were more. Only https
+  `pending` if any is pending, else `passing`, and `none` without checks. All checks are
+  read, 100 per request, up to 2000 (20 requests); `checks_complete` is false when there were
+  more. Then `checks.state` is never `passing` or `none`: `failing` if a failure was already
+  seen, else `pending`. `items` holds at most 200 (failing and pending first); `checks_total`
+  (GitHub's count) appears when there are more, or when the list is incomplete. Only https
   `url`s are kept.
 - `reviews.items` is each reviewer's latest review; `decision` is GitHub's review decision or `""`.
 - `files[].diff` is that file's unified diff with its git header lines. All diffs together
   stay within `--max-diff-bytes` (default 400000), shared fairly: small files stay whole, the
   big ones are cut at a line end and marked `truncated`; one file's diff is at most 100000
-  bytes (pr_decision's limit). `additions`/`deletions` always count the whole file. If
-  GitHub refuses the diff as too large, the files come from its JSON API instead, which omits
-  the text of huge files (`truncated`, empty `diff`) and lists at most 300 files
-  (`files_complete` false when that limit may have been hit).
+  bytes (pr_decision's limit). `additions`/`deletions` always count the whole file. A file
+  with no diff lines gets a `note` saying why: "renamed from OLD, content unchanged",
+  "copied from OLD, content unchanged", "file mode changed only", "new empty file", "deleted
+  empty file" or "binary file: no text diff". Only if GitHub refuses the diff as too large
+  (HTTP 406/422), the files come from its JSON API instead (any other error, a rate limit
+  above all, stands). That API lists at most 300 files (`files_complete` false when that
+  limit may have been hit), and leaves out the text of huge files (empty `diff`, `truncated`,
+  note "GitHub left out this file's diff (too large)"). It never says which files are
+  binary, so `binary` is false there and a file without lines gets a note such as "new empty
+  file (or a binary file: GitHub's file list doesn't say)".
 - `body` is the raw description. All PR text is data: nothing from it reaches a command line.
 - Pictures: only `https://github.com/user-attachments/assets/<id>` and
   `https://<name>.githubusercontent.com/<path>` URLs from the description (Markdown images,
   `<img>` tags, bare attachment links) are downloaded, the first 4, in parallel, each with
   curl at most 1.5 MB and 20 s, https only (redirects too, at most 5), and kept only if they
   are PNG, JPEG, GIF or WebP. For an attachment, GitHub's signed link from the rendered
-  description is used, so private repos work too (the signed link is never printed). They go
+  description is used, so private repos work too. That link is a short-lived credential: it
+  goes to curl as a config on stdin (`curl -q ... -K -`), never on a command line (where
+  other local users could read it in the process list), and is never printed. The pictures go
   into a new `.muster-pr-XXXXXXXX` directory (0700, random name) in the current directory, or
-  `--media-dir DIR` (inside the current directory, must not exist yet; created 0700), as
-  `1.png` and so on (0600, created exclusively, never through a symlink). `media[].path` is
+  `--media-dir DIR` (inside the current directory; its parent directories must exist and none
+  may be a symlink; DIR itself must not exist yet; created 0700). Directories are opened one
+  by one from the current directory without following symlinks, and the pictures are written
+  as `1.png` and so on (0600, created exclusively, never through a symlink). `media[].path` is
   relative to the current directory, ready for pr_decision's `media`; `media_dir` is null
   when nothing was saved (the directory is then removed). Every other picture URL, and every
   failed download, is listed in `media_skipped` with the reason. Delete the directory after
@@ -223,15 +236,15 @@ picture downloads count too). On GitHub's secondary rate limit it waits (its Ret
 else 2, 4, 8 s; at most 3 retries; a wait over 120 s stops instead); when the hourly limit
 is used up it stops at once with `{"error": "rate_limited", "detail", "reset_at"}`.
 A snapshot makes about 4 API requests (the PR, the diff, the checks, the PR again; one more
-per 100 checks, one more when the diff is too large) plus at most 4 picture downloads. A
+per 100 checks, up to 20 for checks, one more when the diff is too large) plus at most 4 picture downloads. A
 list makes one request per 100 PRs for the numbers and one per 25 for the cards, run side by
 side.
 
 Exit codes: 0 ok; 2 bad arguments (repo must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`, the
 number a positive whole number; nothing is fetched); 3 `{"error": "head_moved", detail,
 head_sha, head_sha_now, base, base_now, state}`: run it again; 4 the PR is not open: the JSON
-still has its `state` (read at the start: the identity fields plus `merged_at`,
-`merge_commit`, `closed_at`; closed while reading: the full snapshot); 5 gh failed:
+still has its `state`, `merged_at`, `merge_commit` and `closed_at` (closed at the start:
+with the identity fields only; closed while reading: with the full snapshot); 5 gh failed:
 `{"error", "detail"}` with error `gh_missing`, `gh_auth` (run `gh auth login`), `not_found`,
 `rate_limited` or `gh_failed`. stdout is only the JSON; stderr is for humans (`--verbose`
 adds each request's time).

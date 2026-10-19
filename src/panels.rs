@@ -132,7 +132,7 @@ fn input_html(cwd: &Path, inline: Option<String>, path: Option<String>) -> anyho
     Ok(html)
 }
 
-fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
     ensure!(data.is_object(), "panel data must be an object");
     let data = serde_json::to_vec(data)?;
     ensure!(data.len() <= MAX_FILE, "data exceeds 1 MiB");
@@ -179,13 +179,14 @@ fn remove_dir(path: &Path) {
 
 pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId> {
     let (_, ch) = caller(hub, session)?;
-    ensure!(matches!(args.app.as_str(), "markdown" | "custom"), "unknown app (use markdown or custom)");
+    let builtin = crate::panel_apps::html(&args.app);
+    ensure!(args.app == "custom" || builtin.is_some(), "unknown app (use {} or custom)", crate::panel_apps::BUILTINS);
     let supplied = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
-    let html = if args.app == "custom" { supplied.context("custom apps need html or html_path")? }
-        else { ensure!(supplied.is_none(), "markdown does not accept custom HTML"); MARKDOWN.to_string() };
-    let csp = args.csp.unwrap_or_default();
+    let html = match builtin { None => supplied.context("custom apps need html or html_path")?,
+        Some(html) => { ensure!(supplied.is_none(), "{} does not accept custom HTML", args.app); html.to_string() } };
+    let mut csp = args.csp.unwrap_or_default();
+    let data = crate::panel_apps::data(&args.app, Path::new(&ch.cwd), args.data.unwrap_or_else(|| json!({})), &mut csp, true)?;
     validate_csp(&csp)?;
-    let data = data_bytes(&args.data.unwrap_or_else(|| json!({})))?;
     let title = title(&args.title)?;
     // Write the files under a temporary name first; the row commit names them.
     let staging = hub.store().panels_root().join(staging_name(".staging-"));
@@ -241,7 +242,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     let html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
     ensure!(html.is_none() || seen.app == "custom", "only custom apps accept HTML updates");
     let title = args.title.as_deref().map(title).transpose()?;
-    let data = args.data.as_ref().map(data_bytes).transpose()?;
+    let data = args.data.map(|d| crate::panel_apps::data(&seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
     // Unchanged HTML keeps its revision (the app keeps running), if nobody changed it meanwhile.
     let same_html = html.as_ref().is_some_and(|html| std::fs::read_to_string(app_file(hub, &seen)).is_ok_and(|old| old == *html));
     let folder = dir(hub, seen.id);

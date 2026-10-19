@@ -1,0 +1,94 @@
+/* Shared look of Muster's built-in panel apps. Variable names follow the MCP Apps spec, so a
+   host's `styles.variables` override them; the values match Muster's own light and dark themes. */
+:root {
+  color-scheme: light;
+  --color-background-primary: #ffffff;
+  --color-background-secondary: #f4f3f6;
+  --color-background-tertiary: #ececf1;
+  --color-text-primary: #1d1d22;
+  --color-text-secondary: #4d4d58;
+  --color-text-tertiary: #62626c;
+  --color-border-primary: #cfced8;
+  --color-border-secondary: #e2e1e7;
+  --color-ring-primary: #6d5ce8;
+  --color-text-info: #5a48d8;
+  --color-background-info: rgba(109, 92, 232, 0.1);
+  --color-text-success: #1a7f37;
+  --color-background-success: rgba(26, 127, 55, 0.1);
+  --color-text-danger: #cf222e;
+  --color-background-danger: rgba(207, 34, 46, 0.09);
+  --color-text-warning: #9a5b00;
+  --color-background-warning: rgba(214, 138, 0, 0.12);
+  --accent: #6d5ce8;
+  /* Filled buttons keep white text at 4.5:1 or more in both themes. */
+  --accent-fill: #6d5ce8;
+  --on-accent: #ffffff;
+  --danger-fill: #c4291c;
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --border-radius-sm: 4px;
+  --border-radius-md: 6px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { color-scheme: dark; }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-background-primary: #19191d;
+  --color-background-secondary: #212127;
+  --color-background-tertiary: #29292f;
+  --color-text-primary: #e4e4e8;
+  --color-text-secondary: #aaaab6;
+  --color-text-tertiary: #8f8f9b;
+  --color-border-primary: #3a3a44;
+  --color-border-secondary: #2b2b33;
+  --color-ring-primary: #a194ff;
+  --color-text-info: #a194ff;
+  --color-background-info: rgba(139, 124, 246, 0.14);
+  --color-text-success: #3fb950;
+  --color-background-success: rgba(63, 185, 80, 0.13);
+  --color-text-danger: #ff7b72;
+  --color-background-danger: rgba(248, 81, 73, 0.13);
+  --color-text-warning: #f0a020;
+  --color-background-warning: rgba(240, 160, 32, 0.13);
+  --accent: #8b7cf6;
+  --accent-fill: #6652e0;
+  --danger-fill: #c4291c;
+}
+* { box-sizing: border-box; }
+html { background: var(--color-background-primary); color: var(--color-text-primary); }
+body { margin: 0; font: 14px/1.5 var(--font-sans); overflow-wrap: anywhere; }
+main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+h1, h2, h3 { line-height: 1.25; margin: 0; }
+h1 { font-size: 18px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--color-text-secondary); margin: 0 0 8px; font-weight: 600; }
+p { margin: 0 0 8px; }
+a { color: var(--color-text-info); }
+code, kbd, pre, .mono { font-family: var(--font-mono); font-size: 12.5px; }
+kbd { border: 1px solid var(--color-border-primary); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--color-text-secondary); }
+button, select, input, textarea { font: inherit; color: inherit; }
+button {
+  cursor: pointer; border: 1px solid var(--color-border-primary); background: var(--color-background-secondary);
+  border-radius: var(--border-radius-md); padding: 5px 12px; min-height: 32px;
+}
+button:hover:not(:disabled) { background: var(--color-background-tertiary); }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent-fill); }
+button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
+button.link { border: 0; background: none; padding: 0; min-height: 0; color: var(--color-text-info); text-decoration: underline; }
+select, input[type="search"], input[type="text"], textarea {
+  background: var(--color-background-primary); border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md); padding: 5px 8px; min-height: 32px;
+}
+textarea { display: block; width: 100%; resize: vertical; }
+:focus-visible { outline: 2px solid var(--color-ring-primary); outline-offset: 2px; }
+.muted { color: var(--color-text-secondary); }
+.error {
+  border: 1px solid var(--color-text-danger); background: var(--color-background-danger); color: var(--color-text-primary);
+  border-radius: var(--border-radius-md); padding: 12px 14px; margin: 16px;
+}
+.error strong { color: var(--color-text-danger); }
+.error ul { margin: 6px 0 0; padding-left: 20px; font-family: var(--font-mono); font-size: 12.5px; }
+.warnings { color: var(--color-text-warning); font-size: 12px; margin: 0 0 8px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

@@ -86,6 +86,7 @@ task-scoped backend and limits as the MCP tools and print JSON.
 
 ```sh
 muster panel open --title Review --app markdown --data '{"markdown":"# Review"}'
+muster panel open --title Screenshot --app image --data '{"path":"shots/login.png","alt":"Login page"}'
 muster panel open --title Preview --app custom --html-path ./review.html --data '{}'
 muster panel update 1 --data '{"markdown":"# Updated"}' --title 'Updated review'
 muster panel list

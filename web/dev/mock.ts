@@ -13,7 +13,38 @@ const TOKEN = "dev";
 const DIST = new URL("../dist/", import.meta.url);
 const HOME = Deno.env.get("HOME") ?? "/tmp";
 const panelProxy = await Deno.readTextFile(new URL("../panels/proxy.html", import.meta.url));
-const markdownApp = await Deno.readTextFile(new URL("../panels/markdown.html", import.meta.url));
+const builtinApps: Record<string, string> = {};
+for (const app of ["markdown", "image", "chart", "table", "pr_decision"]) {
+  builtinApps[app] = await Deno.readTextFile(new URL(`../panels/${app}.html`, import.meta.url));
+}
+/** Like src/panel_apps.rs: an image `path` becomes a data URI; a `url` origin joins resourceDomains. */
+async function mockPanelData(app: string, cwd: string, data: any, csp: any, opening: boolean) {
+  if (app !== "image") return data;
+  const out = { ...data };
+  if (typeof data.path === "string" && data.url === undefined) {
+    const root = await Deno.realPath(cwd);
+    const file = await Deno.realPath(`${root}/${data.path}`);
+    if (!file.startsWith(root + "/")) throw new Error("image path must stay inside the task worktree");
+    const info = await Deno.stat(file);
+    if (!info.isFile || info.size > 8 * 1024 * 1024) throw new Error("image path must name a regular file of at most 8 MiB");
+    const bytes = await Deno.readFile(file);
+    const mime = bytes[0] === 0x89 && bytes[1] === 0x50 ? "image/png" : bytes[0] === 0xff && bytes[1] === 0xd8 ? "image/jpeg"
+      : /\.svg$/i.test(file) ? "image/svg+xml" : null;
+    if (!mime) throw new Error("unsupported image type");
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    Object.assign(out, { src: `data:${mime};base64,${btoa(bin)}`, mime, bytes: bytes.length });
+  } else if (typeof data.url === "string" && data.path === undefined) {
+    const u = new URL(data.url);
+    if (u.protocol !== "https:" || u.username || u.password) throw new Error("image url must be https");
+    csp.resourceDomains ??= [];
+    if (!csp.resourceDomains.includes(u.origin)) {
+      if (!opening) throw new Error("the image URL's origin is not in this panel's resourceDomains");
+      csp.resourceDomains.push(u.origin);
+    }
+  } else throw new Error("image data needs path or url");
+  return out;
+}
 const panels = new Map<number, PanelResource>();
 const panelEvents: any[] = [];
 let panelSeq = 0;
@@ -504,6 +535,20 @@ const AGENT_TEMPLATES = [
     autostart: false,
   },
   {
+    id: "pr_reviewer",
+    label: "PR reviewer",
+    about: "Reads a GitHub PR, shows what you need to decide in a panel, merges only on your click.",
+    name: "pr-reviewer",
+    kind: "claude",
+    model: null,
+    effort: null,
+    persona:
+      "You help the human decide on GitHub pull requests fast, with a Muster pr_decision panel. Gather with gh, open the panel, wait_for_panel_event, and merge only on a merge event with --match-head-commit <head_sha>.",
+    permissions: DEFAULT_PERMS,
+    accepts: ["human"],
+    autostart: false,
+  },
+  {
     id: "worker",
     label: "Background worker",
     about: "Codex for routine jobs, also on schedules and webhooks; starts with the daemon.",
@@ -800,11 +845,13 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const s = sessions.get(p.from_session);
       if (!s) throw new Error("calling session not found");
       const args = p.arguments;
-      if (!["markdown", "custom"].includes(args.app)) throw new Error("unknown app");
+      if (args.app !== "custom" && !builtinApps[args.app]) throw new Error("unknown app");
+      const csp = structuredClone(args.csp ?? {});
+      const data = await mockPanelData(args.app, channels.find((c) => c.id === s.channel_id)?.cwd ?? HOME, args.data ?? {}, csp, true);
       const id = ++panelSeq;
       const panel: Panel = { id, title: args.title, app: args.app, channel_id: s.channel_id, session_id: s.id,
-        window_id: s.window_id, csp: args.csp ?? {}, revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
-      panels.set(id, { panel, html: args.app === "markdown" ? markdownApp : args.html, data: args.data ?? {} });
+        window_id: s.window_id, csp, revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
+      panels.set(id, { panel, html: args.app === "custom" ? args.html : builtinApps[args.app], data });
       broadcast("panel_upserted", panel);
       return { panel_id: id };
     }
@@ -821,7 +868,10 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (resource.panel.channel_id !== sessions.get(p.from_session)?.channel_id) throw new Error("panel belongs to another task");
       resource.panel.revision++;
       if (args.html !== undefined && args.html !== resource.html) { resource.html = args.html; resource.panel.html_revision = resource.panel.revision; }
-      if (args.data !== undefined) resource.data = args.data;
+      if (args.data !== undefined) {
+        const cwd = channels.find((c) => c.id === resource.panel.channel_id)?.cwd ?? HOME;
+        resource.data = await mockPanelData(resource.panel.app, cwd, args.data, structuredClone(resource.panel.csp), false);
+      }
       if (args.title !== undefined) resource.panel.title = args.title;
       broadcast("panel_upserted", resource.panel);
       return {};

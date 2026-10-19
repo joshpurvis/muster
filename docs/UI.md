@@ -98,7 +98,8 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 
 ### Agent panel tabs
 
-Agents open Markdown or custom MCP Apps beside their terminal. A new panel joins the group
+Agents open built-in apps (Markdown, Image, Chart, Table, PR decision) or custom MCP Apps
+beside their terminal; the strip above the frame names which ("Panel · Chart"). A new panel joins the group
 to the opener's right, or creates that split. Its tab has a panel icon, title and close button;
 dragging, splitting, moving between windows, keyboard tab selection and group zoom work as
 for terminals. The menu includes Reload panel and Close panel. Closing sends `closed` to the
@@ -111,6 +112,15 @@ Moving a panel to another window, reloading the window or a backend restart load
 from its last input: state the app kept only in the page (an unsent comment) is lost there.
 Theme changes reach the app through the bridge. The built-in Markdown app renders text safely
 and includes a comment field for sending a user event.
+The other built-ins follow the theme and work by keyboard: Image toggles fit/actual size
+(Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
+Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
+has Merge (M), Request changes (R), Ask (A) and Open on GitHub (O). Merge first shows the
+exact `gh pr merge` command and needs a fresh Enter or "Confirm merge" (a held key never
+confirms; a change to the PR cancels the step); with failing checks it is disabled unless
+Shift is held (Shift+M), and a hint beside it says so. Esc closes the confirm or a comment
+box and returns to its button; Ctrl+Enter sends a comment or question. The latest action's
+result shows above the action bar.
 
 An app sends a message or opens a link only right after a real click or key inside it: the
 sandbox proxy checks its own user activation (selecting the tab or focusing the panel does not
@@ -282,7 +292,7 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
 
 **New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
 
-- New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, Background worker, from
+- New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the template's one-line description; picking one fills every field
   (a name you typed is kept). Name and kind (Claude · Codex).
 - Model and effort (optional, effort suggests the CLI's levels), persona (monospace textarea,

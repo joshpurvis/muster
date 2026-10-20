@@ -24,6 +24,7 @@ import type {
 import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
+import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes } from "./notes.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { type Dismissed, releaseOfScript, type UpdateStatus } from "./updates.ts";
@@ -34,8 +35,11 @@ import {
   type LayoutState,
   type PaneNode,
   parseLayout,
+  noteId,
+  noteTab,
   panelTab,
   panelId,
+  placeBeside,
   placePanel,
   reconcile,
 } from "./layout/tree.ts";
@@ -105,8 +109,13 @@ export const windowSessions = computed((): SessionInfo[] => {
 export const windowPanels = computed(() => [...panels.value.values()].filter((p) =>
   !p.closed && channelById.value.has(p.channel_id) && (!windowsSupported.value || p.window_id === windowId.value)
 ));
+/** Notes whose tab is in this window. A note whose window is gone is closed. */
+export const windowNotes = computed(() => [...notes.value.values()].filter((n) =>
+  n.window_id !== null && (windowsSupported.value ? n.window_id === windowId.value : true)
+));
 export const hereIds = computed(() => new Set([
   ...windowSessions.value.map((s) => s.id), ...windowPanels.value.map((p) => panelTab(p.id)),
+  ...windowNotes.value.map((n) => noteTab(n.id)),
 ]));
 
 // ---------------- updates, shared window prefs, shutdown ----------------
@@ -291,6 +300,8 @@ export type Overlay =
   | { kind: "shortcuts" }
   | { kind: "permissions"; channelId: number }
   | { kind: "rename_window" }
+  /** "Notes…": every note, open or closed (docs/UI.md "Notes"). */
+  | { kind: "notes" }
   /** "Shell for new terminals…": the shell new shell tabs run. */
   | { kind: "shell" }
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
@@ -441,11 +452,20 @@ export function releaseNewSessions() {
 const liveIds = computed(() => [...hereIds.value].filter((id) => !held.value.has(id)));
 
 function reconcileTabs(s: LayoutState, ids: number[]): LayoutState {
-  const terminalIds = ids.filter((id) => panelId(id) === null);
+  // Panels, and notes an agent showed beside itself, go beside their opener; the rest join the
+  // focused group.
+  const beside = (id: number) => {
+    const n = noteId(id);
+    return n !== null && notes.peek().get(n)?.beside != null;
+  };
+  const terminalIds = ids.filter((id) => panelId(id) === null && !beside(id));
   const existing = allSessions(s.root).filter((id) => ids.includes(id));
   let next = reconcile(s, [...new Set([...terminalIds, ...existing])]);
   for (const p of windowPanels.peek()) {
     if (ids.includes(panelTab(p.id))) next = placePanel(next, p.id, p.session_id);
+  }
+  for (const n of windowNotes.peek()) {
+    if (n.beside != null && ids.includes(noteTab(n.id))) next = placeBeside(next, noteTab(n.id), n.beside);
   }
   return next;
 }
@@ -619,6 +639,7 @@ export function applyHello(h: HelloResult) {
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
     panels.value = new Map((h.panels ?? []).filter((p) => !p.closed).map((p) => [p.id, p]));
     panelOrigin.value = h.panel_origin ?? "";
+    applyNotesHello(h.notes);
     helloEpoch.value++;
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
@@ -655,6 +676,12 @@ export function applyEvent(ev: ServerEvent) {
       panels.value = next;
       break;
     }
+    case "note_upserted":
+      withHolds(() => applyNoteUpsert(ev.data));
+      break;
+    case "note_removed":
+      applyNoteRemoved(ev.data.id);
+      break;
     case "account_profiles_changed":
       accountProfiles.value = ev.data;
       break;

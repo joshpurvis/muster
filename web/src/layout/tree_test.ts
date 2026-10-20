@@ -20,6 +20,10 @@ import {
   paneRects,
   panelTab,
   panelId,
+  isSessionTab,
+  noteId,
+  noteTab,
+  placeBeside,
   placePanel,
   parseLayout,
   reconcile,
@@ -61,6 +65,22 @@ Deno.test("panel tabs preserve old numeric layouts and avoid the empty sentinel"
   const next = placePanel(loaded, 1, 1);
   assertEquals(sig(next.root), "row([1,2] [-2])");
   assertEquals(sig(parseLayout(JSON.parse(JSON.stringify(next)))!.root), sig(next.root));
+});
+
+Deno.test("note tabs have their own ids, apart from panels and sessions", () => {
+  assertEquals(noteId(noteTab(1)), 1);
+  assertEquals(noteId(noteTab(123456)), 123456);
+  assertEquals(panelId(noteTab(1)), null);
+  assertEquals(noteId(panelTab(1)), null);
+  assertEquals(noteId(-1), null);
+  assertEquals(noteId(5), null);
+  assert(!isSessionTab(noteTab(1)) && !isSessionTab(panelTab(1)) && isSessionTab(3));
+  let s = placeBeside(splitPane(emptyLayout([1]), "right", 2), noteTab(7), 1);
+  assertEquals(sig(s.root), `row([1] [2,${noteTab(7)}])`);
+  s = parseLayout(JSON.parse(JSON.stringify(s)))!;
+  assertEquals(sig(s.root), `row([1] [2,${noteTab(7)}])`);
+  s = reconcile(s, [1, 2]);
+  assertEquals(sig(s.root), "row([1] [2])");
 });
 
 Deno.test("new panels join the opener's right group and move like terminal tabs", () => {

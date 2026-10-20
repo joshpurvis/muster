@@ -6,7 +6,7 @@
 //
 // Not part of the production bundle.
 
-import type { Panel, PanelResource } from "../src/types.ts";
+import type { Note, NoteAuthor, Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
 import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
@@ -784,6 +784,109 @@ function pushAgentMessage(m: any) {
   );
 }
 
+// ---------- notes (like src/notes.rs) ----------
+
+const notes = new Map<number, Note>();
+let noteSeq = 0;
+const NOTE_MAX = 1024 * 1024;
+const isCtl = (c: string) => { const k = c.codePointAt(0)!; return k < 32 || (k >= 127 && k < 160); };
+const cleanNote = (s: string) => [...s.replace(/\r\n?/g, "\n")].filter((c) => c === "\n" || c === "\t" || !isCtl(c)).join("");
+
+function noteAuthor(from: number | undefined): NoteAuthor {
+  const s = from !== undefined ? sessions.get(from) : undefined;
+  if (from !== undefined && !s) throw new Error("calling session no longer exists");
+  if (!s || s.kind === "shell") return { kind: "human", name: null, session_id: s?.id ?? null };
+  const c = channels.find((x) => x.id === s.channel_id);
+  const kind = s.kind === "claude" ? "Claude" : "Codex";
+  return { kind: "agent", name: c ? `${kind} (${c.name})` : kind, session_id: s.id };
+}
+
+function getNote(id: number): Note {
+  const n = notes.get(id);
+  if (!n) throw new Error(`no note with id ${id} (see note_list)`);
+  if (n.window_id !== null && !winById(n.window_id)) n.window_id = n.beside = null;
+  return n;
+}
+
+function saveNote(n: Note): Note {
+  broadcast("note_upserted", n);
+  return n;
+}
+
+function noteMethod(method: string, p: any): unknown {
+  switch (method) {
+    case "note.list":
+      return [...notes.keys()].map(getNote).map((n) => ({
+        id: n.id, title: n.title, rev: n.rev, bytes: new TextEncoder().encode(n.body).length, lines: n.body.split("\n").length,
+        created_at: n.created_at, updated_at: n.updated_at, updated_by: n.updated_by, open: n.window_id !== null, window_id: n.window_id,
+      }));
+    case "note.get":
+      return getNote(p.id);
+    case "note.create": {
+      const body = cleanNote(p.body ?? "");
+      if (body.length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB");
+      if (p.window_id != null && !winById(p.window_id)) throw new Error(`no window with id ${p.window_id}`);
+      const id = ++noteSeq;
+      const n: Note = { id, title: String(p.title ?? "").trim() || `Note ${id}`, body, rev: 1, created_at: now(), updated_at: now(),
+        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null };
+      notes.set(id, n);
+      return saveNote(n);
+    }
+    case "note.write": {
+      const n = getNote(p.id);
+      if (n.rev !== p.base_rev) {
+        throw new Error(`note ${n.id} changed since revision ${p.base_rev}: it is at revision ${n.rev}. Read it again (note_read) and write from that revision`);
+      }
+      const body = cleanNote(String(p.body));
+      if (new TextEncoder().encode(body).length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB (1048576 bytes)");
+      if (body === n.body && p.title === undefined) return n;
+      if (p.title !== undefined) n.title = String(p.title).trim();
+      if (body !== n.body) Object.assign(n, { body, rev: n.rev + 1, updated_at: now(), updated_by: noteAuthor(p.from_session) });
+      return saveNote(n);
+    }
+    case "note.append": {
+      const n = getNote(p.id);
+      const text = cleanNote(String(p.text));
+      if (!text) throw new Error("nothing to append");
+      const sep = n.body === "" || n.body.endsWith("\n") ? "" : "\n";
+      if (new TextEncoder().encode(n.body + sep + text).length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB");
+      Object.assign(n, { body: n.body + sep + text, rev: n.rev + 1, updated_at: now(), updated_by: noteAuthor(p.from_session) });
+      return saveNote(n);
+    }
+    case "note.rename": {
+      const n = getNote(p.id);
+      const t = String(p.name ?? "").trim();
+      if (!t || t.length > 200 || [...t].some(isCtl)) throw new Error("a note title must be 1–200 bytes of text on one line");
+      n.title = t;
+      return saveNote(n);
+    }
+    case "note.open": {
+      const n = getNote(p.id);
+      const w = p.window_id ?? (p.from_session !== undefined ? sessions.get(p.from_session)?.window_id : undefined);
+      if (!winById(w)) throw new Error(`no window with id ${w}`);
+      n.window_id = w;
+      n.beside = p.window_id == null && p.from_session !== undefined ? p.from_session : (p.beside ?? null);
+      return saveNote(n);
+    }
+    case "note.close": {
+      const n = getNote(p.id);
+      const prev = winById(n.window_id);
+      n.window_id = n.beside = null;
+      saveNote(n);
+      removeWindowIfEmpty(prev);
+      return n;
+    }
+    case "note.delete": {
+      if (noteAuthor(p.from_session).kind !== "human") throw new Error("only the human deletes notes");
+      getNote(p.id);
+      notes.delete(p.id);
+      broadcast("note_removed", { id: p.id });
+      return {};
+    }
+  }
+  throw new Error(`unknown method: ${method}`);
+}
+
 async function agentMethod(method: string, p: any): Promise<unknown> {
   switch (method) {
     case "agent.list":
@@ -973,6 +1076,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     return updates;
   }
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
+  if (method.startsWith("note.")) return noteMethod(method, p);
   switch (method) {
     case "panel.open": {
       const s = sessions.get(p.from_session);
@@ -1082,6 +1186,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         sessions: [...sessions.values()],
         panels: [...panels.values()].map((r) => r.panel).filter((p) => !p.closed),
         panel_origin: panelOrigin,
+        notes: [...notes.keys()].map(getNote),
         windows,
         home: HOME,
         default_shell: "/bin/bash",

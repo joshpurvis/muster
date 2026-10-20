@@ -221,6 +221,8 @@ export type ModelCatalog = Record<"claude" | "codex", KindModels>;
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
+  | { event: "note_upserted"; data: Note }
+  | { event: "note_removed"; data: { id: number } }
   | { event: "account_profiles_changed"; data: AccountProfile[] }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
@@ -252,6 +254,8 @@ export interface WindowPrefs {
 export interface HelloResult {
   panels?: Panel[];
   panel_origin?: string;
+  /** Missing from backends without notes. */
+  notes?: Note[];
   account_profiles?: AccountProfile[];
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
@@ -295,6 +299,29 @@ export interface Panel {
   created_at: number;
   updated_at: number;
   closed: boolean;
+}
+
+/** Who last changed a note's text. */
+export interface NoteAuthor {
+  kind: "human" | "agent";
+  name?: string | null;
+  session_id?: SessionId | null;
+}
+
+/** A plain-text note shared by the human and agents (docs/PROTOCOL.md "Notes"). */
+export interface Note {
+  id: number;
+  title: string;
+  body: string;
+  /** Counts changes to `body`. */
+  rev: number;
+  created_at: number;
+  updated_at: number;
+  updated_by: NoteAuthor;
+  /** The window showing its tab; null while closed. */
+  window_id: WindowId | null;
+  /** Shown beside this session when it first appears (`note_open`). */
+  beside: SessionId | null;
 }
 
 export interface PanelResource {

@@ -21,6 +21,8 @@ import {
   windowsSupported,
 } from "./state.ts";
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
+import { noteId } from "./layout/tree.ts";
+import { notesSupported } from "./notes.ts";
 import { canCloseWindow, isNative } from "./native.ts";
 import { latencyMonitorOn, setLatencyMonitor } from "./latency_monitor.ts";
 import { isMac } from "./util.ts";
@@ -126,6 +128,8 @@ export function keyLabel(s: string): string[] {
 
 const hasTab = () => focusedTabId.value !== null;
 const hasTerminal = () => focusedSession.value !== null;
+/** The focused tab's note id, when it is a note. */
+const focusedNote = () => (focusedTabId.value === null ? null : noteId(focusedTabId.value));
 
 function onOff(on: boolean, onText: string, offText: string) {
   toast("info", on ? onText : offText);
@@ -259,10 +263,38 @@ export const commands: Command[] = [
     id: "rename-tab",
     title: "Rename",
     group: "Tab",
-    enabled: hasTerminal,
+    enabled: () => hasTerminal() || focusedNote() !== null,
     run: () => {
       const s = focusedSession.value;
+      const note = focusedNote();
       if (s) A.startRename(s.id, "terminal");
+      else if (note !== null) A.startNoteRename(note);
+    },
+  },
+
+  // Notes (docs/UI.md "Notes")
+  {
+    id: "new-note",
+    title: "New note",
+    group: "Notes",
+    enabled: () => notesSupported.value && windowId.value !== null,
+    run: () => A.newNote(),
+  },
+  {
+    id: "notes",
+    title: "Notes… (reopen, find, delete)",
+    group: "Notes",
+    enabled: () => notesSupported.value,
+    run: () => A.openNotesList(),
+  },
+  {
+    id: "delete-note",
+    title: "Delete this note…",
+    group: "Notes",
+    enabled: () => focusedNote() !== null,
+    run: () => {
+      const note = focusedNote();
+      if (note !== null) A.deleteNoteAsk(note);
     },
   },
   {

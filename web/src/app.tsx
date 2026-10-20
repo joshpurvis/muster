@@ -36,6 +36,7 @@ import { canCloseWindow, isNative, setNativeDecorations } from "./native.ts";
 import * as terms from "./terms.ts";
 import * as A from "./actions.ts";
 import { installKeys } from "./keys.ts";
+import { notes } from "./notes.ts";
 import { WindowControls } from "./components/WindowControls.tsx";
 import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
@@ -146,6 +147,7 @@ rpc.start();
   layout,
   sessions,
   panels,
+  notes,
   windowSessions,
   windowId,
   focusedSession,

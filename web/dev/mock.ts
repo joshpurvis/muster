@@ -8,7 +8,7 @@
 
 import type { Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
-import { memoryFileNameError } from "../src/agents.ts";
+import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
@@ -872,7 +872,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     // taken name gets -2, -3, ...), text only, at most 256 KB.
     case "agent.memory.add": {
       const a = agentNamed(p.name);
-      const name = String(p.file_name ?? "").trim();
+      const name = String(p.file_name ?? "");
       const bad = memoryFileNameError(name);
       if (bad) throw new Error(`can't add \`${name}\`: ${bad}`);
       if (typeof p.text !== "string") throw new Error("text is required");
@@ -893,7 +893,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     }
     case "agent.memory.delete": {
       const a = agentNamed(p.name);
-      const path = String(p.path ?? "").trim();
+      const path = String(p.path ?? "");
       const files = memory.get(a.name) ?? new Map<string, string>();
       if (!files.has(path)) throw new Error(`memory/${path}: No such file or directory`);
       files.delete(path);
@@ -902,7 +902,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     case "agent.memory.read":
     case "agent.memory.write": {
       const a = agentNamed(p.name);
-      const path = String(p.path ?? "").trim();
+      const path = String(p.path ?? "");
       if (!path || path.startsWith("/") || path.split("/").some((x) => !x || x === "." || x === "..")) {
         throw new Error(`memory paths can't contain \`..\`, \`.\` or empty parts (got \`${path}\`)`);
       }
@@ -914,6 +914,10 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       }
       if (typeof p.text !== "string") throw new Error("text is required");
       if (p.text.length > 256 * 1024) throw new Error("memory files are at most 256 KB");
+      // A new file's name reads as what it is; an existing one keeps its name (agents::memory_write).
+      if (!files.has(path) && path.split("/").some(hiddenCharsOrSpaces)) {
+        throw new Error(`\`${path}\` has control or invisible characters, or spaces around a part`);
+      }
       files.set(path, p.text);
       return { path, size: p.text.length };
     }

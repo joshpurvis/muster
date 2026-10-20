@@ -108,12 +108,16 @@ export function effortAfterModel(effort: string, before: string[], after: string
   return after.includes(effort.trim()) ? effort : "";
 }
 
-/** A memory file path the daemon accepts: relative, plain parts (no `..`, `.` or empty parts). */
+/** A memory file path the daemon accepts for a new note (typed in the name field; surrounding
+ * spaces are trimmed off what was typed): relative, plain parts (no `..`, `.` or empty parts),
+ * each one reading as what it is (`hiddenCharsOrSpaces`). */
 export function memoryPathError(path: string): string | null {
   const p = path.trim();
   if (!p) return "Name the file";
   if (p.startsWith("/") || p.endsWith("/")) return "A file name inside memory/, like notes.md";
-  if (p.split("/").some((part) => !part || part === "." || part === "..")) return "No .. or empty parts";
+  const parts = p.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) return "No .. or empty parts";
+  if (parts.some(hiddenCharsOrSpaces)) return "No invisible characters, or spaces around a folder name";
   return null;
 }
 
@@ -121,18 +125,50 @@ export function memoryPathError(path: string): string | null {
 export const MEMORY_FILE_MAX = 256 * 1024;
 /** Longest name `agent.memory.add` takes (`MEMORY_NAME_MAX`, in UTF-8 bytes). */
 const MEMORY_NAME_MAX = 200;
-/** Control characters, and characters that hide or reorder text (as the daemon refuses them). */
-const SNEAKY = /[\p{Cc}­؜᠎​-‏‪-‮⁠-⁩﻿]/u;
+/** Unicode's Default_Ignorable_Code_Point ranges, as the daemon's `default_ignorable` (kept as
+ * numbers so no invisible character is ever written into this file). */
+const IGNORABLE: [number, number][] = [
+  [0x00ad, 0x00ad],
+  [0x034f, 0x034f],
+  [0x061c, 0x061c],
+  [0x115f, 0x1160],
+  [0x17b4, 0x17b5],
+  [0x180b, 0x180f],
+  [0x200b, 0x200f],
+  [0x202a, 0x202e],
+  [0x2060, 0x206f],
+  [0x3164, 0x3164],
+  [0xfe00, 0xfe0f],
+  [0xfeff, 0xfeff],
+  [0xffa0, 0xffa0],
+  [0xfff0, 0xfff8],
+  [0x1bca0, 0x1bca3],
+  [0x1d173, 0x1d17a],
+  [0xe0000, 0xe0fff],
+];
+
+/** A name part the daemon refuses to create (`agents::memory_new_part`): a control character
+ * (Cc), a default-ignorable one, or spaces before or after it. */
+export function hiddenCharsOrSpaces(part: string): boolean {
+  if (part !== part.trim()) return true;
+  for (const ch of part) {
+    const c = ch.codePointAt(0)!;
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
+    if (IGNORABLE.some(([lo, hi]) => c >= lo && c <= hi)) return true;
+  }
+  return false;
+}
 
 /** Why the daemon would refuse a picked or dropped file's name for `agent.memory.add`, or null.
- * The same rules as `agents::memory_file_name`: one visible name, no folders, not hidden. */
+ * The same rules as `agents::memory_file_name`: one visible name exactly as it is (never
+ * trimmed), no folders, not hidden. */
 export function memoryFileNameError(name: string): string | null {
-  const n = name.trim();
-  if (!n) return "it has no name";
-  if (new TextEncoder().encode(n).length > MEMORY_NAME_MAX) return "its name is too long";
-  if (n.includes("/") || n.includes("\\")) return "its name is a path";
-  if (n.startsWith(".")) return "hidden files (names starting with a dot) aren't added";
-  if (SNEAKY.test(n)) return "its name has control or invisible characters";
+  if (!name.trim()) return "it has no name";
+  if (name !== name.trim()) return "its name starts or ends with a space";
+  if (new TextEncoder().encode(name).length > MEMORY_NAME_MAX) return "its name is too long";
+  if (name.includes("/") || name.includes("\\")) return "its name is a path";
+  if (name.startsWith(".")) return "hidden files (names starting with a dot) aren't added";
+  if (hiddenCharsOrSpaces(name)) return "its name has control or invisible characters";
   return null;
 }
 

@@ -1055,18 +1055,80 @@ try {
     await a.click(".mem-del");
     await a.wait(`!!document.querySelector('.mem-del-yes')`, 1000);
     check(await a.eval(`document.activeElement?.textContent === 'Cancel'`), "Delete starts on Cancel");
+    check(
+      await a.eval(`(() => { const q = document.querySelector('.mem-pending[role=alertdialog]');
+        return !!q && document.getElementById(q.getAttribute('aria-labelledby'))?.textContent.includes('style-guide-2.md')
+          && document.activeElement.getAttribute('aria-describedby') === q.getAttribute('aria-labelledby'); })()`),
+      "the delete question is an alertdialog naming the file, described on its buttons",
+    );
     await shot(a, "11d-agent-memory-delete");
     await a.key("Escape");
     await a.wait(`!document.querySelector('.mem-del-yes') && !!document.querySelector('.agent-dlg')`, 1000);
+    await a.wait(`document.activeElement?.classList.contains('mem-del')`, 1000);
     await a.click(".mem-del");
     await a.wait(`!!document.querySelector('.mem-del-yes')`, 1000);
     await a.click(".mem-del-yes");
     await a.wait(`document.querySelectorAll('.mem-file').length === 1`, 2000);
+    await a.wait(`document.activeElement?.classList.contains('mem-add')`, 1000);
     const left: any = await R(a, "agent.memory.list", { name: "researcher" });
     check(left.files.map((f: any) => f.path).join() === "style-guide.md", JSON.stringify(left.files));
+
+    // Two drops in a row: the second waits for the first batch instead of being lost.
+    const drop = (names: string[]) =>
+      `(() => { const dt = new DataTransfer();
+        for (const n of ${JSON.stringify(names)}) dt.items.add(new File(["text of " + n], n));
+        const t = document.querySelector('.mem-side');
+        for (const type of ['dragenter', 'dragover', 'drop']) {
+          t.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+        } })()`;
+    await a.eval(`${drop(["q1.md"])}; ${drop(["q2.md"])}`);
+    await a.wait(`document.querySelectorAll('.mem-file').length === 3`, 3000);
+    await a.wait(`document.querySelector('.mem-text')?.value === 'text of q1.md'`, 2000);
+    check(
+      (await a.eval(`document.querySelector('.mem-added').textContent`)).includes("q1.md and q2.md"),
+      "one note for both drops",
+    );
+    // Slow RPCs never overwrite what was done meanwhile (delayed in the page, mock untouched).
+    await a.eval(`(() => { const r = ${M}.rpc; r.__call = r.call;
+      r.call = (m, p) => ["agent.memory.delete", "agent.memory.read"].includes(m) && r.__slow?.includes(m)
+        ? new Promise((ok) => setTimeout(ok, 700)).then(() => r.__call(m, p)) : r.__call(m, p); })()`);
+    const fileBtn = (n: string) =>
+      `[...document.querySelectorAll('.mem-file')].find((b) => b.textContent === ${JSON.stringify(n)})`;
+    // A delete still running while another file is opened and edited: the edits stay.
+    await a.eval(`${M}.rpc.__slow = ["agent.memory.delete"]`);
+    await a.click(".mem-del");
+    await a.click(".mem-del-yes");
+    await a.eval(`${fileBtn("style-guide.md")}.click()`);
+    await a.wait(`document.querySelector('.mem-text')?.value.startsWith('# Style guide')`, 2000);
+    await a.click(".mem-text");
+    await a.type(" typed during delete");
+    await a.wait(`!${fileBtn("q1.md")}`, 3000);
+    await a.sleep(200);
+    check(
+      await a.eval(`document.querySelector('.mem-head code').textContent === 'memory/style-guide.md'
+        && document.querySelector('.mem-text').value.endsWith(' typed during delete')`),
+      "a finished delete kept the other file's edits",
+    );
+    await a.click(".mem-save");
+    await a.wait(`!document.querySelector('.mem-dirty')`, 2000);
+    // An added file opening late: edits made while it was being read win.
+    await a.eval(`${M}.rpc.__slow = ["agent.memory.read"]`);
+    await a.eval(drop(["late.md"]));
+    await a.wait(`!!${fileBtn("late.md")}`, 3000);
+    await a.click(".mem-text");
+    await a.type(" and while late.md opened");
+    await a.sleep(1000);
+    check(
+      await a.eval(`document.querySelector('.mem-head code').textContent === 'memory/style-guide.md'
+        && document.querySelector('.mem-text').value.endsWith(' and while late.md opened')`),
+      "a late read didn't replace the edits",
+    );
+    await a.eval(`(() => { const r = ${M}.rpc; r.call = r.__call; delete r.__slow; })()`);
+    await a.click(".mem-save");
+    await a.wait(`!document.querySelector('.mem-dirty')`, 2000);
     await a.key("Escape");
     await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
-    ok("Memory: the empty state explains seeding; Add files… and a drop copied text files in (binary skipped, a taken name numbered); Delete asked first");
+    ok("Memory: the empty state explains seeding; Add files… and drops copied text files in (binary skipped, a taken name numbered, a second drop queued); Delete asked first and gave focus back; slow RPCs kept later edits");
     await a.sleep(500); // the layout (with the panel flag) saves debounced
   }
 

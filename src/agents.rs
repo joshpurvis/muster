@@ -1908,7 +1908,9 @@ const MEMORY_LIST_MAX: usize = 500;
 /// A path inside memory/: relative, plain names only (no `..`, `.`, root or empty parts).
 pub fn memory_rel(path: &str) -> anyhow::Result<PathBuf> {
     use std::path::Component;
-    let p = path.trim();
+    // Exactly as given, never trimmed: `notes.md ` (an agent may make one) is another file
+    // than `notes.md`, and reading, saving or deleting one must never reach the other.
+    let p = path;
     if p.is_empty() || p.len() > 255 || p.contains('\0') {
         anyhow::bail!("bad memory path `{p}`");
     }
@@ -2172,6 +2174,17 @@ pub fn memory_write(a: &Agent, path: &str, text: &str) -> anyhow::Result<Value> 
         anyhow::bail!("memory files are at most {} KB", MEMORY_FILE_MAX / 1024);
     }
     let rel = memory_rel(path)?;
+    // Saving a file that exists keeps its name, whatever it is (an agent may have made it).
+    // A new file, and folders made for it, get names that read as what they are.
+    let exists = open_memory(a, false)
+        .ok()
+        .and_then(|m| walk_memory(m, &rel, false).ok())
+        .is_some_and(|(d, n)| at::stat(&d, &n).is_ok_and(|s| at::is_file(&s)));
+    if !exists {
+        for part in path.split('/') {
+            memory_new_part(part)?;
+        }
+    }
     let (dir, name) = walk_memory(open_memory(a, true)?, &rel, true)?;
     match at::stat(&dir, &name) {
         Ok(s) if at::is_dir(&s) => anyhow::bail!("memory/{} is a folder", rel.display()),
@@ -2211,13 +2224,14 @@ pub const MEMORY_NAME_MAX: usize = 200;
 /// A file name added to memory/ from outside (a file the human picked or dropped): one plain,
 /// visible name. No folders (`/` or `\`), nothing starting with `.` (so no `.`, `..` or hidden
 /// files), no control characters and no invisible or direction-changing ones (a name that
-/// reads differently from what it is), at most `MEMORY_NAME_MAX` bytes. Surrounding spaces are
-/// dropped.
+/// reads differently from what it is: `memory_new_part`), at most `MEMORY_NAME_MAX` bytes.
+/// Spaces before or after it are refused, never trimmed.
 pub fn memory_file_name(name: &str) -> anyhow::Result<String> {
-    let n = name.trim();
-    if n.is_empty() {
+    let n = name;
+    if n.trim().is_empty() {
         anyhow::bail!("the file needs a name");
     }
+    memory_new_part(n)?;
     if n.len() > MEMORY_NAME_MAX {
         anyhow::bail!("file names are at most {MEMORY_NAME_MAX} bytes");
     }
@@ -2227,18 +2241,33 @@ pub fn memory_file_name(name: &str) -> anyhow::Result<String> {
     if n.starts_with('.') {
         anyhow::bail!("`{n}` starts with `.`: hidden files aren't added to memory/");
     }
-    // Control characters, and format characters that hide or reorder text: the soft hyphen,
-    // zero-width spaces and joiners, direction marks, embeddings, overrides and isolates, the BOM.
-    let sneaky = |c: char| {
-        c.is_control()
-            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
-    };
-    if n.chars().any(sneaky) {
-        anyhow::bail!("`{}` has control or invisible characters", n.escape_default());
-    }
     memory_rel(n)?;
     Ok(n.to_string())
+}
+
+/// Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties.txt): characters that
+/// render as nothing (soft hyphen, combining grapheme joiner, zero-width spaces and joiners,
+/// direction marks, embeddings, overrides and isolates, variation selectors, fillers, the BOM,
+/// tags). A name with one looks like another name that has none.
+fn default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// A part of a name muster creates in memory/ (a new file or folder, from `agent.memory.add` or
+/// `agent.memory.write`): reads as what it is. No control characters, nothing
+/// default-ignorable, no spaces before or after it.
+fn memory_new_part(part: &str) -> anyhow::Result<()> {
+    if part.chars().any(|c| c.is_control() || default_ignorable(c)) {
+        anyhow::bail!("`{}` has control or invisible characters", part.escape_default());
+    }
+    if part != part.trim() {
+        anyhow::bail!("`{part}` starts or ends with a space");
+    }
+    Ok(())
 }
 
 /// `name` with `-<i>` before its extension: `notes.md` → `notes-2.md`, `README` → `README-2`.
@@ -2798,7 +2827,12 @@ mod tests {
     #[test]
     fn added_file_names_are_plain_visible_names() {
         assert_eq!(memory_file_name("notes.md").unwrap(), "notes.md");
-        assert_eq!(memory_file_name("  Style guide (v2).txt ").unwrap(), "Style guide (v2).txt");
+        assert_eq!(memory_file_name("Style guide (v2).txt").unwrap(), "Style guide (v2).txt");
+        // Never trimmed or otherwise changed: refused instead.
+        for bad in [" notes.md", "notes.md ", "notes.md\u{a0}", "no\u{034F}tes.md", "e\u{FE0F}.md", "tag\u{E0041}.md",
+            "fill\u{3164}.md", "\u{2066}iso.md", "x\u{115F}.md"] {
+            assert!(memory_file_name(bad).is_err(), "{bad:?} should be refused");
+        }
         assert_eq!(memory_file_name("README").unwrap(), "README");
         assert!(memory_file_name(&"a".repeat(MEMORY_NAME_MAX)).is_ok());
         for bad in [
@@ -2852,6 +2886,28 @@ mod tests {
             .collect();
         assert!(names.iter().all(|n| !n.contains("muster-tmp")), "{names:?}");
         assert!(!names.iter().any(|n| n == "big.md" || n == "bin.dat"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn existing_names_are_used_exactly_and_new_ones_read_as_they_are() {
+        let home = scratch("memory-exact");
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        memory_write(&a, "notes.md", "plain").unwrap();
+        // An agent made a look-alike with a trailing space: it is its own file everywhere.
+        std::fs::write(home.join("memory/notes.md "), "spaced").unwrap();
+        assert_eq!(memory_read(&a, "notes.md ").unwrap()["text"], "spaced");
+        memory_write(&a, "notes.md ", "spaced, saved").unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("memory/notes.md")).unwrap(), "plain");
+        memory_delete(&a, "notes.md ").unwrap();
+        assert!(!home.join("memory/notes.md ").exists());
+        assert_eq!(memory_read(&a, "notes.md").unwrap()["text"], "plain");
+        // New names (files and the folders made for them) can't hide characters or spaces.
+        for bad in ["no\u{034F}tes.md", "notes.md ", " a/b.md", "a /b.md", "dir\u{200B}/x.md", "x\u{7}.md"] {
+            assert!(memory_write(&a, bad, "x").is_err(), "{bad:?} should be refused");
+        }
+        assert!(!home.join("memory/a ").exists() && !home.join("memory/dir\u{200B}").exists());
         std::fs::remove_dir_all(&home).ok();
     }
 

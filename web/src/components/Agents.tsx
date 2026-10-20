@@ -862,12 +862,28 @@ function MemoryTab(
   const picker = useRef<HTMLInputElement>(null);
   const newRef = useRef<HTMLInputElement>(null);
   const delCancel = useRef<HTMLButtonElement>(null);
+  const delBtn = useRef<HTMLButtonElement>(null);
+  const addBtn = useRef<HTMLButtonElement>(null);
+  /** Bumped by every edit and every change of the open file. A read, save or delete that was
+   * started before a bump must not overwrite what the human did since (the RPCs are async). */
+  const gen = useRef(0);
+  const bump = () => ++gen.current;
+  /** The open file right now (for async results; the closure's `sel` is the one they started with). */
+  const selNow = useRef<string | null>(null);
+  selNow.current = sel;
+  /** Files picked or dropped while a batch is still being added: added after it, never lost. */
+  const queue = useRef<File[]>([]);
   const isDirty = sel !== null && text !== (orig ?? "");
   dirty.current = isDirty || (sel !== null && orig === null && text !== "");
   const personaFile = agent.kind === "claude" ? "CLAUDE.md" : "AGENTS.md";
   useEffect(() => {
     if (delAsk) delCancel.current?.focus();
   }, [delAsk]);
+  /** Close the delete question; Cancel and Esc put the keyboard back on Delete. */
+  const cancelDel = () => {
+    setDelAsk(false);
+    setTimeout(() => delBtn.current?.focus());
+  };
 
   const refresh = () =>
     rpc.call<{ files: MemFile[] }>("agent.memory.list", { name: agent.name })
@@ -877,17 +893,20 @@ function MemoryTab(
     refresh();
   }, [agent.name]);
 
+  /** Open `path`. The text is applied only if nothing was edited or opened meanwhile. */
   const load = async (path: string) => {
     setPending(null);
     setDelAsk(false);
     setErr(null);
+    const g = bump();
     try {
       const r = await rpc.call<{ text: string }>("agent.memory.read", { name: agent.name, path });
+      if (gen.current !== g) return;
       setSel(path);
       setText(r.text);
       setOrig(r.text);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      if (gen.current === g) setErr(errText(e));
     }
   };
   const open = (path: string) => {
@@ -897,14 +916,17 @@ function MemoryTab(
   };
   const save = async () => {
     if (sel === null || busy) return;
+    const [path, saved] = [sel, text];
     setBusy(true);
     setErr(null);
     try {
-      await rpc.call("agent.memory.write", { name: agent.name, path: sel, text });
-      setOrig(text);
+      await rpc.call("agent.memory.write", { name: agent.name, path, text: saved });
+      // What's on disk is what was sent, whatever was typed since; another file opened
+      // meanwhile has its own.
+      if (selNow.current === path) setOrig(saved);
       await refresh();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(errText(e));
     } finally {
       setBusy(false);
     }
@@ -919,6 +941,7 @@ function MemoryTab(
       setErr("Save or discard the open file first.");
       return;
     }
+    bump();
     setSel(p);
     setText("");
     setOrig(null);
@@ -926,15 +949,18 @@ function MemoryTab(
   };
 
   /** Copy picked or dropped files into memory/ (`agent.memory.add`: a taken name gets `-2`,
-   * nothing is replaced). Binary, huge and hidden files are skipped and listed with the reason. */
+   * nothing is replaced). Binary, huge and hidden files are skipped and listed with the reason.
+   * Files that arrive while a batch runs join it (the result note lists them all). */
   const addFiles = async (list: File[]) => {
-    if (!list.length || adding) return;
+    if (!list.length) return;
+    queue.current.push(...list);
+    if (queue.current.length > list.length) return; // a batch is running and will take them
     setAdding(true);
     setErr(null);
     setAdded(null);
     const res: AddResult = { added: [], skipped: [] };
-    for (const f of list) {
-      const name = f.name.trim() || "(no name)";
+    for (let f = queue.current[0]; f; queue.current.shift(), f = queue.current[0]) {
+      const name = f.name || "(no name)";
       const r = await readMemoryFile(f);
       if ("skip" in r) {
         res.skipped.push({ name, why: r.skip });
@@ -954,18 +980,22 @@ function MemoryTab(
     await refresh();
     setAdded(res);
     setAdding(false);
-    // Show what was added, unless that would take the place of unsaved edits.
+    // Show what was added, unless that would take the place of unsaved edits (`load` itself
+    // gives way to anything edited or opened while it reads).
     if (res.added.length && !dirty.current) load(res.added[0].path);
   };
   const pick = () => picker.current?.click();
   const del = async () => {
     if (sel === null) return;
+    const path = sel;
+    const onDisk = orig !== null;
     setDelAsk(false);
-    if (orig !== null) {
+    const g = gen.current;
+    if (onDisk) {
       setBusy(true);
       setErr(null);
       try {
-        await rpc.call("agent.memory.delete", { name: agent.name, path: sel });
+        await rpc.call("agent.memory.delete", { name: agent.name, path });
       } catch (e) {
         setErr(errText(e));
         setBusy(false);
@@ -973,10 +1003,18 @@ function MemoryTab(
       }
       setBusy(false);
     }
-    setSel(null);
-    setText("");
-    setOrig(null);
-    setPending(null);
+    if (gen.current === g) {
+      // Nothing edited or opened while it was deleted: close the file.
+      bump();
+      setSel(null);
+      setText("");
+      setOrig(null);
+      setPending(null);
+      setTimeout(() => addBtn.current?.focus());
+    } else if (selNow.current === path) {
+      // Edited meanwhile: keep the edits, as a file that isn't saved any more.
+      setOrig(null);
+    }
     await refresh();
   };
   const hasFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes("Files");
@@ -1034,9 +1072,13 @@ function MemoryTab(
           addFiles(picked);
         }}
       />
-      {drag && <div class="mem-drop" aria-hidden="true">Drop to add to memory/</div>}
+      {drag && (
+        <div class="mem-drop" aria-hidden="true">
+          {adding ? "Drop to add these after the files being added" : "Drop to add to memory/"}
+        </div>
+      )}
       <div class="mem-side">
-        <button type="button" class="btn btn-sm mem-add" disabled={adding} onClick={pick}>
+        <button ref={addBtn} type="button" class="btn btn-sm mem-add" onClick={pick}>
           {adding ? <Spinner size={11} /> : <IconPlus size={12} />} Add files…
         </button>
         <div class="mem-files" role="listbox" aria-label="memory/ files">
@@ -1125,7 +1167,7 @@ function MemoryTab(
             </p>
             <p>Seed it with what it should know, like project facts, a style guide or past decisions.</p>
             <div class="mem-intro-actions">
-              <button type="button" class="btn btn-primary" disabled={adding} onClick={pick}>
+              <button type="button" class="btn btn-primary" onClick={pick}>
                 {adding ? <Spinner size={12} /> : null} Add files…
               </button>
               <button type="button" class="btn" onClick={() => newRef.current?.focus()}>New note</button>
@@ -1146,9 +1188,11 @@ function MemoryTab(
               <code>memory/{sel}</code>
               {isDirty && <span class="mem-dirty">unsaved</span>}
               <button
+                ref={delBtn}
                 type="button"
                 class="btn btn-sm btn-ghost mem-del"
-                disabled={busy || delAsk}
+                disabled={busy}
+                aria-expanded={delAsk}
                 onClick={() => (orig === null && text === "" ? del() : setDelAsk(true))}
               >
                 Delete
@@ -1165,24 +1209,40 @@ function MemoryTab(
             {delAsk && (
               <div
                 class="mem-pending"
+                role="alertdialog"
+                aria-modal="false"
+                aria-labelledby="mem-del-q"
                 onKeyDown={(e) => {
                   // Esc answers this question (no), not the dialog.
                   if (e.key === "Escape") {
                     e.preventDefault();
                     e.stopPropagation();
-                    setDelAsk(false);
+                    cancelDel();
                   }
                 }}
               >
-                {orig === null
-                  ? `Discard ${sel}? It isn't saved yet.`
-                  : `Delete memory/${sel}${
-                    isDirty ? " and your unsaved changes" : ""
-                  }? This can't be undone.`}
-                <button ref={delCancel} type="button" class="btn btn-sm" onClick={() => setDelAsk(false)}>
+                <span id="mem-del-q">
+                  {orig === null
+                    ? `Discard ${sel}? It isn't saved yet.`
+                    : `Delete memory/${sel}${
+                      isDirty ? " and your unsaved changes" : ""
+                    }? This can't be undone.`}
+                </span>
+                <button
+                  ref={delCancel}
+                  type="button"
+                  class="btn btn-sm"
+                  aria-describedby="mem-del-q"
+                  onClick={cancelDel}
+                >
                   Cancel
                 </button>
-                <button type="button" class="btn btn-sm btn-danger mem-del-yes" onClick={del}>
+                <button
+                  type="button"
+                  class="btn btn-sm btn-danger mem-del-yes"
+                  aria-describedby="mem-del-q"
+                  onClick={del}
+                >
                   {orig === null ? "Discard" : "Delete"}
                 </button>
               </div>
@@ -1201,7 +1261,10 @@ function MemoryTab(
               value={text}
               spellcheck={false}
               aria-label={`memory/${sel}`}
-              onInput={(e) => setText((e.target as HTMLTextAreaElement).value)}
+              onInput={(e) => {
+                bump();
+                setText((e.target as HTMLTextAreaElement).value);
+              }}
               onKeyDown={(e) => {
                 if (e.key === "s" && (e.ctrlKey || e.metaKey)) {
                   e.preventDefault();

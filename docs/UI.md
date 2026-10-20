@@ -334,13 +334,20 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
     `.`); others are skipped with the reason. Nothing is replaced: a name that is taken gets a
     number (`notes.md` → `notes-2.md`). A note above the editor lists what was added (and
     renamed) and skipped, and says that the agent reads memory/ when a new conversation starts,
-    so a running or resumed conversation needs to be asked to read memory/. The first added file
-    opens, unless the open file has unsaved edits.
-  - **Delete** asks in a bar under the file's name (Cancel focused; Esc answers no) and removes
-    the file (`agent.memory.delete`); a note never saved is just discarded. The question is in
-    the tab, not the app's confirm dialog, which would replace the Edit dialog and lose its
-    unsaved Settings. Edit saves only changed fields (`agent.update`); model,
-  effort and permissions apply from the agent's next start, which the toast says when it runs.
+    so a running or resumed conversation needs to be asked to read memory/. Files picked or
+    dropped while a batch is still being added join it (the outline says so), never dropped.
+    The first added file opens, unless the open file has unsaved edits or the human edits or
+    opens something before its text arrives.
+  - **Delete** asks in a bar under the file's name (an `alertdialog` its buttons are described
+    by; Cancel focused; Cancel or Esc answers no and puts focus back on Delete) and removes the
+    file (`agent.memory.delete`; focus then goes to Add files…); a note never saved is just
+    discarded. A delete that finishes after another file was opened or edited leaves that work
+    alone. The question is in the tab, not the app's confirm dialog, which would replace the
+    Edit dialog and lose its unsaved Settings.
+  - Files are named exactly as listed (an agent's `notes.md ` is not `notes.md`); a new note's
+    name can't have invisible characters or spaces around a folder name.
+- Edit saves only changed fields (`agent.update`); model, effort and permissions apply from the
+  agent's next start, which the toast says when it runs.
 - Ctrl+Enter creates or saves. Creating opens the panel if it was closed.
 
 ## Naming (no names up front)

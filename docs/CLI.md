@@ -107,7 +107,7 @@ the full event that a panel prompt showed only as a placeholder (panel ID, then 
 ## Notes
 
 Plain-text notes you and agents share (docs/UI.md "Notes", docs/PROTOCOL.md "Notes"). Work
-inside or outside a session; inside one, writes are attributed to that session's agent (a shell
+inside or outside a session; inside one, writes are attributed to that session's agent and share its MCP rate limit (a shell
 tab counts as you). `<note>` is an id (all digits), an exact title (case-insensitive) or a unique
 title prefix; ambiguous or unknown ones exit 2.
 

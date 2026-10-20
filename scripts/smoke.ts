@@ -527,6 +527,17 @@ exec cat > '${BASE}/fake-input'
   ok(await c.call("note.append", { id: bigNote.id, text: "y" }).then(() => false, (e) => /1 MiB/.test(String(e))), "notes are capped at 1 MiB");
   ok(await c.call("note.create", { title: "Too big", body: big + "y" }).then(() => false, () => true), "an oversized note is refused");
   await c.call("note.delete", { id: bigNote.id });
+  // A full 1 MiB note whose every character is JSON-escaped still fits a request (CLI and MCP).
+  const quoted = "\"".repeat(1024 * 1024);
+  const viaHttp = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+    method: "POST", headers: { Authorization: `Bearer ${d.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id: 1, method: "note.create", params: { title: "Quotes", body: quoted } }),
+  });
+  const quotedNote = await viaHttp.json();
+  ok(viaHttp.status === 200 && quotedNote.result?.body?.length === quoted.length, `a 1 MiB note fits POST /api/rpc (${viaHttp.status})`);
+  const viaMcp = await mcp(fakeToken, "note_write", { note_id: quotedNote.result.id, text: quoted.slice(1), rev: 1 });
+  ok(viaMcp.rev === 2, "and POST /mcp");
+  await c.call("note.delete", { id: quotedNote.result.id });
   ok(await c.call("note.delete", { id: made.note_id, from_session: fake.id }).then(() => false, (e) => /only the human/.test(String(e))),
     "an agent's session can't delete a note");
   const opened = await mcp(fakeToken, "note_open", { note_id: made.note_id });
@@ -860,7 +871,9 @@ exec cat > '${BASE}/fake-input'
   ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
   ok(h.panels.some((p: Json) => p.id === pid && p.revision === 2), "panel survives backend restart");
   const keptNote = h.notes.find((n: Json) => n.id === human.id);
-  ok(keptNote?.rev === noteRev && keptNote.body === "rewritten\nfrom the cli" && h.notes.some((n: Json) => n.id === made.note_id && n.window_id === 1),
+  ok(keptNote?.rev === noteRev && keptNote.body === undefined && keptNote.preview === "rewritten",
+    "hello.notes are summaries (no text)");
+  ok((await c.call("note.get", { id: human.id })).body === "rewritten\nfrom the cli" && h.notes.some((n: Json) => n.id === made.note_id && n.window_id === 1),
     "notes (text, revision, window) survive a backend restart");
   ok((await mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 0 })).events[0].kind === "durable", "queued shell panel event survives backend restart");
   ok(canon(h.windows.find((w: Json) => w.id === 1).layout) === canon(layout) && s.window_id === 1, "window layouts and session windows persist");

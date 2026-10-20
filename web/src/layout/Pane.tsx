@@ -6,7 +6,7 @@ import { noteId, noteTab, panelId, panelTab, type PaneNode } from "./tree.ts";
 import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
 import { NoteView } from "../components/NoteView.tsx";
 import { notes, notesSupported } from "../notes.ts";
-import type { Note } from "../types.ts";
+import type { NoteInfo } from "../types.ts";
 import {
   accountProfiles,
   altHeld,
@@ -272,9 +272,9 @@ export function Group(
       onPointerDownCapture={() => A.focusGroup(pane.id)}
     >
       {!fullscreen && <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />}
-      {fullscreen && active && (
+      {fullscreen && (active || activeNote) && (
         // Terminals keep Esc (agents and editors use it), so a terminal shown fullscreen gets
-        // this way back; a panel has the same button in the strip above it.
+        // this way back (a note's editor keeps Esc too); a panel has the same button in its strip.
         <button
           type="button"
           class="fs-exit"
@@ -302,7 +302,9 @@ export function Group(
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
         {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
-        {activeNote && <NoteView key={activeNote.id} id={activeNote.id} />}
+        {tabs.map((t) => noteId(t)).filter((n): n is number => n !== null).map((n) => (
+          <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
+        ))}
         {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (
@@ -585,7 +587,7 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
 }
 
 function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
-  note: Note; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
+  note: NoteInfo; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
 }) {
   const id = noteTab(note.id);
   const renamingThis = A.renamingNote.value === note.id;

@@ -82,8 +82,40 @@ fn view(hub: &Hub, mut n: Note) -> Note {
     n
 }
 
-pub fn list(hub: &Hub) -> anyhow::Result<Vec<Note>> {
-    Ok(hub.store().load_notes()?.into_iter().map(|n| view(hub, n)).collect())
+/// Every note without its text (bounded: see `Store::load_note_summaries`).
+pub fn list(hub: &Hub) -> anyhow::Result<Vec<NoteSummary>> {
+    let windows: std::collections::BTreeSet<WindowId> = hub.windows().iter().map(|w| w.id).collect();
+    Ok(hub.store().load_note_summaries()?.into_iter().map(|mut n| {
+        if n.window_id.is_some_and(|w| !windows.contains(&w)) {
+            n.window_id = None;
+            n.beside = None;
+            n.open = false;
+        }
+        n
+    }).collect())
+}
+
+/// Most notes Jump and the notes list get back for a text search.
+pub const SEARCH_LIMIT: usize = 20;
+
+/// Notes whose text holds `query` (at least 2 characters), newest first, each with the line
+/// that holds it (shortened around the match).
+pub fn search(hub: &Hub, query: &str) -> anyhow::Result<Vec<Value>> {
+    let q = query.trim();
+    if q.chars().count() < 2 { return Ok(vec![]) }
+    ensure!(q.len() <= 200, "search text is too long");
+    // ASCII case folding, as SQLite's lower(): byte offsets stay those of the original text.
+    let lower = q.to_ascii_lowercase();
+    Ok(hub.store().search_notes(q, SEARCH_LIMIT)?.into_iter().map(|(id, around)| {
+        let line = around.lines().find(|l| l.to_ascii_lowercase().contains(&lower)).unwrap_or(&around).trim();
+        let line: String = if line.chars().count() > 120 {
+            let at = line.to_ascii_lowercase().find(&lower).unwrap_or(0);
+            let start = line[..at].char_indices().rev().nth(40).map_or(0, |(i, _)| i);
+            let cut: String = line[start..].chars().take(118).collect();
+            format!("{}{cut}…", if start > 0 { "…" } else { "" })
+        } else { line.to_string() };
+        json!({"id": id, "line": line})
+    }).collect())
 }
 
 pub fn get(hub: &Hub, id: NoteId) -> anyhow::Result<Note> {
@@ -91,16 +123,8 @@ pub fn get(hub: &Hub, id: NoteId) -> anyhow::Result<Note> {
     Ok(view(hub, n))
 }
 
-/// What `note_list` / `note.list` show of a note: everything but the text.
-pub fn summary(n: &Note) -> Value {
-    json!({
-        "id": n.id, "title": n.title, "rev": n.rev, "bytes": n.body.len(), "lines": n.body.lines().count(),
-        "created_at": n.created_at, "updated_at": n.updated_at, "updated_by": n.updated_by,
-        "open": n.window_id.is_some(), "window_id": n.window_id,
-    })
-}
-
-fn save(hub: &Hub, n: Note) -> anyhow::Result<Note> {
+fn save(hub: &Hub, mut n: Note) -> anyhow::Result<Note> {
+    n.version += 1;
     hub.store().save_note(&n)?;
     let n = view(hub, n);
     hub.emit(ServerEvent::NoteUpserted(n.clone()));
@@ -123,7 +147,7 @@ pub fn create(hub: &Hub, title_in: Option<&str>, body: &str, by: NoteAuthor, win
     ensure!(hub.store().count_notes()? < MAX_NOTES, "Muster already has {MAX_NOTES} notes; delete some first");
     let now = now_ms();
     let mut n = Note { id: 0, title: named.clone().unwrap_or_else(|| "Note".into()), body, rev: 1, created_at: now,
-        updated_at: now, updated_by: by, window_id: window, beside: window.and(beside) };
+        updated_at: now, updated_by: by, window_id: window, beside: window.and(beside), version: 1 };
     hub.store().create_note(&mut n)?;
     if named.is_none() {
         n.title = format!("Note {}", n.id);
@@ -200,8 +224,9 @@ pub fn open(hub: &Hub, id: NoteId, window: WindowId, beside: Option<SessionId>) 
 /// Close its tab. The note stays (`delete` removes it).
 pub fn close(hub: &Hub, id: NoteId) -> anyhow::Result<Note> {
     let _g = hub.notes.lock.lock();
-    let mut n = get(hub, id)?;
-    if n.window_id.is_none() { return Ok(n) }
+    // The stored record: a window that is gone reads as none, but its id must still be cleared.
+    let mut n = hub.store().load_note(id)?.with_context(|| format!("no note with id {id} (see note_list)"))?;
+    if n.window_id.is_none() && n.beside.is_none() { return Ok(n) }
     n.window_id = None;
     n.beside = None;
     save(hub, n)
@@ -234,7 +259,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
     match name {
         "note_list" => {
             ensure!(args.as_object().is_none_or(|o| o.is_empty()), "note_list takes no arguments");
-            Ok(json!({"notes": list(hub)?.iter().map(summary).collect::<Vec<_>>()}))
+            Ok(json!({"notes": list(hub)?}))
         }
         "note_read" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { note_id: NoteId }
@@ -346,6 +371,52 @@ mod tests {
         assert_eq!((c.window_id, c.beside), (None, None));
         delete(&hub, n.id).unwrap();
         assert!(get(&hub, n.id).is_err() && delete(&hub, n.id).is_err());
+    }
+
+    #[test]
+    fn a_deleted_window_closes_its_notes_for_good() {
+        let hub = fixture();
+        let w2 = hub.create_window(None).unwrap().id;
+        let n = create(&hub, Some("Moved"), "x", NoteAuthor::human(), Some(w2), None).unwrap();
+        assert_eq!(n.window_id, Some(w2));
+        let mut rx = hub.subscribe();
+        // Nobody holds window 2 and it has no tabs: it is dropped, and the note closes with it.
+        hub.panel_left_window(w2);
+        assert!(hub.window(w2).is_none());
+        let stored = hub.store().load_note(n.id).unwrap().unwrap();
+        assert_eq!((stored.window_id, stored.beside), (None, None));
+        assert!(stored.version > n.version);
+        let mut saw = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ServerEvent::NoteUpserted(x) = ev { saw |= x.id == n.id && x.window_id.is_none(); }
+        }
+        assert!(saw, "clients hear that the note closed");
+        // A dangling id from an older build is cleared at startup, and close clears it too.
+        hub.store().save_note(&Note { window_id: Some(77), ..stored.clone() }).unwrap();
+        assert_eq!(get(&hub, n.id).unwrap().window_id, None, "reads as closed");
+        assert_eq!(close(&hub, n.id).unwrap().window_id, None);
+        assert_eq!(hub.store().load_note(n.id).unwrap().unwrap().window_id, None, "close cleared the stored id");
+        hub.store().save_note(&Note { window_id: Some(77), ..stored }).unwrap();
+        let rebuilt = Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
+            muster_bin: "/bin/true".into(), terminal_host: None }, hub.store().clone()).unwrap();
+        assert_eq!(rebuilt.store().load_note(n.id).unwrap().unwrap().window_id, None);
+    }
+
+    #[test]
+    fn summaries_have_no_text_and_search_returns_lines() {
+        let hub = fixture();
+        let a = create(&hub, Some("A"), "\n  first line  \nsecond Deploy at 15:00\n", NoteAuthor::human(), None, None).unwrap();
+        create(&hub, Some("B"), &format!("{}needle{}", "x".repeat(5000), "y".repeat(5000)), NoteAuthor::human(), None, None).unwrap();
+        let list = list(&hub).unwrap();
+        assert_eq!((list[0].bytes, list[0].lines, list[0].preview.as_str()), (39, 3, "first line"));
+        assert_eq!(list[1].lines, 1);
+        let hits = search(&hub, "deploy").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0]["id"].as_i64(), hits[0]["line"].as_str()), (Some(a.id), Some("second Deploy at 15:00")));
+        let long = search(&hub, "NEEDLE").unwrap();
+        let line = long[0]["line"].as_str().unwrap();
+        assert!(line.contains("needle") && line.chars().count() <= 121 && line.starts_with('…'), "{line}");
+        assert!(search(&hub, "x").unwrap().is_empty(), "one character searches nothing");
     }
 
     #[test]

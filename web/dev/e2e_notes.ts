@@ -85,6 +85,49 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   check(!(await body(id)).includes("clobbered"), "nothing was clobbered");
   ok(`agent appends show live (${by.trim()}); a stale full write is refused`);
 
+  // ---- switching tabs keeps the editor (and its undo); fullscreen has a way back
+  const editor = `textarea.note-text[data-note-id="${id}"]`;
+  await a.click(editor);
+  await a.type(" UNDO-ME");
+  const pane = paneOfSession(await root(), tab)!;
+  const sibling = pane.tabs.find((t) => t !== tab);
+  if (sibling !== undefined) {
+    await a.click(`[data-tab-sid="${sibling}"]`);
+    await a.wait(`document.querySelector('${editor}')?.closest('.note-view')?.hidden === true`, 2000);
+    await a.click(`[data-tab-sid="${tab}"]`);
+    await a.wait(`document.querySelector('${editor}')?.closest('.note-view')?.hidden === false`, 2000);
+  }
+  await a.click(editor);
+  await a.key("Ctrl+z");
+  await a.wait(`!document.querySelector('${editor}').value.includes('UNDO-ME')`, 2000);
+  await a.wait(`!${M}.notes.value.get(${id}).body.includes('UNDO-ME')`, 4000);
+  ok("switching away and back kept the editor mounted: Ctrl+Z still undid the typing");
+  await a.key("Alt+Shift+Z");
+  await a.wait(`${M}.fullscreen.value !== null && !!document.querySelector('.fs-exit')`, 2000);
+  await a.click(".fs-exit");
+  await a.wait(`${M}.fullscreen.value === null`, 2000);
+  ok("a note shown fullscreen has the Exit fullscreen button");
+
+  // ---- typing still on its way when the page goes away is kept, and saved by the next page
+  await a.click(editor);
+  // Saves fail (as when the daemon can't be reached), so only the kept copy can bring it back.
+  await a.eval(`(() => { const r = ${M}.rpc; const call = r.call.bind(r);
+    r.call = (m, p) => m === "note.write" ? Promise.reject(new Error("Disconnected")) : call(m, p); })()`);
+  await a.type("\n- typed just before a reload");
+  await a.wait(`document.querySelector('.note-status .note-state')?.textContent.startsWith('Not saved yet')`, 3000);
+  check(!(await body(id)).includes("typed just before a reload"), "the save really failed");
+  await a.eval(`location.reload()`);
+  await a.wait(`!!document.querySelector('.app') && ${M}.notes.value.size > 0`, 10000);
+  await a.eval(`(() => { const r = ${M}.rpc; if (r.__guarded) return; const call = r.call.bind(r);
+    r.call = (m, p) => m === "window.show" ? Promise.reject(new Error("e2e: window.show blocked")) : call(m, p);
+    r.__guarded = true; })()`);
+  await a.wait(`(${M}.notes.value.get(${id})?.body ?? '').includes('typed just before a reload')`, 6000);
+  const afterReload = await R("note.get", { id });
+  check(afterReload.body.includes("typed just before a reload") && afterReload.body.includes("deploy at 15:00"),
+    `the reloaded window saved the typing: ${afterReload.body}`);
+  await a.wait(`document.querySelector('${editor}')?.value.includes('typed just before a reload')`, 4000);
+  ok("typing not saved before a reload came back and was saved");
+
   // ---- drag the note's tab into the other group: a note beside a terminal, text kept
   const from = paneOfSession(await root(), tab)!;
   const other = allPanes(await root()).find((p) => p.id !== from.id)!;

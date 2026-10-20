@@ -52,7 +52,7 @@ import {
 } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
-import { flushAllDrafts, flushDraft, knowNote, notes } from "./notes.ts";
+import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import type {
@@ -377,7 +377,7 @@ export function openNotesList() {
 export function deleteNoteAsk(id: number, after?: () => void) {
   const n = notes.value.get(id);
   if (!n) return;
-  const lines = n.body ? n.body.split("\n").length : 0;
+  const lines = n.lines;
   overlay.value = {
     kind: "confirm",
     title: `Delete “${n.title}”?`,
@@ -1116,22 +1116,47 @@ export function openJump(initial = "") {
 // ---------- window and Muster lifecycle ----------
 
 /** Save a layout change that is still waiting, but never hold the page up for long. */
+/** Save the layout and unsaved note typing before the page goes. Note typing is kept in this
+ * browser first (notes.ts), so a save still on its way when the wait ends isn't lost: the next
+ * page of this window saves it. */
 function settleLayout(): Promise<unknown> {
-  return Promise.race([Promise.all([saveLayoutNow(), flushAllDrafts()]), new Promise((r) => setTimeout(r, 500))]);
+  persistAllDrafts();
+  return Promise.race([Promise.all([saveLayoutNow(), flushAllDrafts()]), new Promise((r) => setTimeout(r, 2000))]);
 }
 
-// A page going away (closed, reloaded by the browser) sends unsaved note typing first.
+// A page going away (closed, reloaded by the browser) keeps and sends unsaved note typing first.
 addEventListener("pagehide", () => void flushAllDrafts());
+
+/** Go ahead with `go` (`what`: "Reload", "Close") unless note typing is neither saved nor kept
+ * in this browser (storage full or blocked): then ask first. */
+function leaveUnlessUnsaved(what: string, go: () => void) {
+  const left = unsavedNotes();
+  if (!left.length || persistAllDrafts()) return go();
+  const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
+  overlay.value = {
+    kind: "confirm",
+    title: "Some note text isn't saved yet",
+    body: [
+      `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
+      `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
+    ],
+    confirmLabel: `${what} anyway`,
+    danger: true,
+    run: go,
+  };
+}
 
 /** Ctrl+Shift+R: reload this window, which also loads the active UI release. */
 export function reloadWindow() {
-  settleLayout().finally(() => location.reload());
+  settleLayout().finally(() => leaveUnlessUnsaved("Reload", () => location.reload()));
 }
 
 /** Close this window only; its tabs stay in it for the next `muster`. */
 export async function closeWindow() {
   await settleLayout();
-  if (!(await native.closeWindow())) toast("warn", "This browser won't let Muster close the window. Close it yourself.");
+  leaveUnlessUnsaved("Close", async () => {
+    if (!(await native.closeWindow())) toast("warn", "This browser won't let Muster close the window. Close it yourself.");
+  });
 }
 
 /** Show or hide the native windows' system title bar (every window, and new ones). Shown at

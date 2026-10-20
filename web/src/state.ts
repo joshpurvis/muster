@@ -24,7 +24,7 @@ import type {
 import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
-import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes } from "./notes.ts";
+import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupported, restoreDrafts } from "./notes.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { type Dismissed, releaseOfScript, type UpdateStatus } from "./updates.ts";
@@ -867,6 +867,13 @@ effect(() => {
 addEventListener("focus", () => {
   const c = focusedTask.value;
   if (c) markRead(c.id);
+});
+
+// Note typing this window's last page couldn't save comes back once the window is known.
+effect(() => {
+  if (!helloDone.value || !notesSupported.value) return;
+  if (!windowsSupported.value) restoreDrafts(null);
+  else if (windowId.value !== null) restoreDrafts(windowId.value);
 });
 
 effect(() => {

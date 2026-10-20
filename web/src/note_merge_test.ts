@@ -46,6 +46,20 @@ Deno.test("a rewrite elsewhere and typing at the end both apply", () => {
   for (const s of ["old stuff", "new things"]) if (!r.text.includes(s)) throw new Error(r.text);
 });
 
+Deno.test("a merge never splits an emoji's surrogate pair", () => {
+  const lone = (s: string) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+  for (const [base, mine, theirs] of [["😀", "😁", "😂"], ["a😀b", "a😁b", "a😂b"], ["x😀", "x😀y", "😁x😀"]]) {
+    const r = merge3(base, mine, theirs, "bot");
+    if (lone(r.text)) throw new Error(`lone surrogate in ${JSON.stringify(r.text)}`);
+    for (const s of [mine, theirs]) {
+      for (const ch of [...s].filter((c) => c.length === 2 && !base.includes(c))) {
+        if (!r.text.includes(ch)) throw new Error(`${ch} lost in ${r.text}`);
+      }
+    }
+  }
+  eq(mapOffset("😀", "😁", 2), 2);
+});
+
 Deno.test("the caret keeps its place across someone else's edit", () => {
   eq(mapOffset("hello world", "hello brave world", 0), 0);
   eq(mapOffset("hello world", "hello brave world", 11), 17);

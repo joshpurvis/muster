@@ -255,7 +255,7 @@ export interface HelloResult {
   panels?: Panel[];
   panel_origin?: string;
   /** Missing from backends without notes. */
-  notes?: Note[];
+  notes?: NoteSummary[];
   account_profiles?: AccountProfile[];
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
@@ -322,7 +322,21 @@ export interface Note {
   window_id: WindowId | null;
   /** Shown beside this session when it first appears (`note_open`). */
   beside: SessionId | null;
+  /** Raised by every change (text, title, window): the newer record wins. */
+  version: number;
 }
+
+/** A note without its text (`hello.notes`, `note.list`). */
+export interface NoteSummary extends Omit<Note, "body"> {
+  open: boolean;
+  bytes: number;
+  lines: number;
+  /** The first non-blank line, at most 120 characters. */
+  preview: string;
+}
+
+/** What the UI knows of a note: its summary, and its text once fetched or sent by an event. */
+export type NoteInfo = Omit<NoteSummary, "open"> & { body?: string };
 
 export interface PanelResource {
   panel: Panel;

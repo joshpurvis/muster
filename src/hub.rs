@@ -638,6 +638,10 @@ impl Hub {
                 },
             );
         }
+        // Notes whose window is gone are closed for good (window ids are reused).
+        if let Err(e) = store.close_orphan_notes() {
+            tracing::warn!("closing notes of deleted windows: {e}");
+        }
         // Typing stays paused for a run whose input was interrupted before a restart, until
         // the user continues. The input path finds each session's handle without `inner`.
         let interrupted: Vec<(RunId, String)> = store.load_runtime(INPUT_INTERRUPTED_KEY)?.unwrap_or_default();
@@ -2157,8 +2161,12 @@ impl Hub {
             || self.store.load_panels().map_or(true, |ps| ps.iter().any(|p| !p.closed && p.window_id == Some(id))) {
             return false;
         }
-        if let Err(e) = self.store.delete_window(id) {
-            tracing::warn!(window = id, "deleting window: {e}");
+        match self.store.delete_window(id) {
+            Err(e) => tracing::warn!(window = id, "deleting window: {e}"),
+            // Its notes closed with it; tell clients (the store is read directly: `notes::get`
+            // would take `inner`, held here).
+            Ok(notes) => events.extend(notes.into_iter()
+                .filter_map(|n| self.store.load_note(n).ok().flatten()).map(ServerEvent::NoteUpserted)),
         }
         g.windows.remove(&id);
         events.push(ServerEvent::WindowRemoved { id });

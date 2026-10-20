@@ -178,14 +178,20 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   edited it last and when: type to find one by its name or text, Enter opens it here (from
   closed, or pulled from another window), Ctrl+Enter makes a new note named after what was typed,
   Shift+Delete (or the row's bin) asks to delete it. Jump lists every note too, by its title and
-  by its text (two letters or more: the matching line is shown). An agent's `note_open` shows
+  by its text (two letters or more: the daemon searches, `note.search`, and the matching line is shown). An agent's `note_open` shows
   the note in the group to its right, or a new split there, as a panel opens.
 - **Editor**: a monospace `<textarea>` with line wrap on the terminal's background. Typing saves
   by itself half a second after it stops (Ctrl+S saves at once, and never opens the browser's
   "Save page"); leaving the editor, closing the tab, moving it to another window and reloading
   the window save first. A status line under it: Saved / Edited / Saving… / the reason a save
   failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
-  with how long ago, the caret's line and column, and the size.
+  with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
+  its editor (hidden behind the visible tab), so switching tabs keeps the undo history (Ctrl+Z);
+  moving the tab to another group or window, or someone else's change, starts it afresh.
+- **Never lost**: typing not yet saved is kept in this browser until the daemon has it. After a
+  reload, a closed window or a crash, the window's next page brings it back (a bar says so),
+  merged onto the note as it is by then, and saves it. Reload window and Close window first wait
+  for saves on their way; when typing can be neither saved nor kept, they ask first.
 - **Live**: an agent's change appears at once in the open editor, with the caret and scroll kept
   where they were. Typing that isn't saved yet is merged with it, never lost: changes in
   different places both apply; changes to the same lines keep the human's and then the agent's
@@ -198,7 +204,9 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   Fullscreen, Move to window ▸, All notes…, Close note, Delete note….
 - **Keys**: in the editor, Muster's shortcuts that work in text fields still do (Ctrl+Space,
   Ctrl+K, Ctrl+Shift+P, Ctrl+Tab, Alt+Shift+…); Alt+letters and Alt+arrows stay with the text, as
-  in any field; Esc stays too (fullscreen ends with Alt+Shift+Z).
+  in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
+  the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
+  arrow keys move the selected row, which screen readers announce.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
 
 ### Dragging tabs

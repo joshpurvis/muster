@@ -3997,6 +3997,7 @@ body.dragging .panel-view { pointer-events: none; }
   flex-direction: column;
   background: var(--term-bg);
 }
+.note-view[hidden] { display: none; }
 .note-view.note-missing {
   align-items: center;
   justify-content: center;

@@ -14,12 +14,19 @@ interface Span {
   text: string;
 }
 
+const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
+const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+
 function span(base: string, next: string): Span {
   const max = Math.min(base.length, next.length);
   let p = 0;
   while (p < max && base.charCodeAt(p) === next.charCodeAt(p)) p++;
+  // Never between the two halves of a surrogate pair (😀 and 😁 share their first half): a
+  // merge would leave a lone surrogate, which the daemon refuses as text.
+  if (p > 0 && isHigh(base.charCodeAt(p - 1))) p--;
   let s = 0;
   while (s < max - p && base.charCodeAt(base.length - 1 - s) === next.charCodeAt(next.length - 1 - s)) s++;
+  if (s > 0 && isLow(base.charCodeAt(base.length - s))) s--;
   return { start: p, end: base.length - s, text: next.slice(p, next.length - s) };
 }
 

@@ -2,7 +2,7 @@
 // with who edited it last, the save state and the caret position. The text and caret live in the
 // note's draft (notes.ts), so moving the tab between groups keeps them.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { authorName, draftOf, draftsChanged, editDraft, flushDraft, isDirty, notes } from "../notes.ts";
+import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, isDirty, notes } from "../notes.ts";
 import { mapOffset } from "../note_merge.ts";
 import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
@@ -32,13 +32,23 @@ function size(bytes: number): string {
 
 const utf8 = new TextEncoder();
 
-export function NoteView({ id }: { id: number }) {
+/** Note `id`'s editor. Every note tab of a group keeps its editor mounted (`hidden` while it isn't
+ * the visible tab), so switching tabs keeps the textarea and its undo history. */
+export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean }) {
   const n = notes.value.get(id);
   void draftsChanged.value;
   const now = useNow();
   const ref = useRef<HTMLTextAreaElement>(null);
   const [pos, setPos] = useState({ line: 1, col: 1 });
   const d = n ? draftOf(n) : undefined;
+  // Only its summary is known yet (hello carries no text): fetch the text.
+  useEffect(() => {
+    if (n && n.body === undefined && !d) ensureBody(id);
+  }, [id, n?.version, !!d]);
+  // Another tab of the group took its place: save what was typed.
+  useEffect(() => {
+    if (hidden && d && isDirty(d)) flushDraft(id);
+  }, [hidden]);
 
   const track = () => {
     const el = ref.current;
@@ -67,7 +77,8 @@ export function NoteView({ id }: { id: number }) {
     };
   }, [id, !!d]);
 
-  if (!n || !d) return <div class="note-view note-missing">This note was deleted.</div>;
+  if (!n) return <div class="note-view note-missing" hidden={hidden}>This note was deleted.</div>;
+  if (!d) return <div class="note-view note-missing" hidden={hidden}>Loading note…</div>;
 
   const bytes = utf8.encode(d.text).length;
   const over = bytes > MAX_BYTES;
@@ -77,7 +88,7 @@ export function NoteView({ id }: { id: number }) {
   const lines = d.text === "" ? 0 : d.text.split("\n").length;
 
   return (
-    <div class="note-view">
+    <div class="note-view" hidden={hidden}>
       <textarea
         ref={ref}
         class="note-text"
@@ -105,6 +116,11 @@ export function NoteView({ id }: { id: number }) {
           }
         }}
       />
+      {d.restored && (
+        <div class="note-merge" role="status">
+          Brought back typing that wasn't saved when this window last closed or reloaded; it is being saved now.
+        </div>
+      )}
       {d.conflictWith && (
         <div class="note-merge" role="status">
           Your typing and {d.conflictWith}'s change touched the same lines. Both are kept: theirs is between the ──── lines.

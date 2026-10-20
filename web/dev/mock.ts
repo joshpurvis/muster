@@ -6,7 +6,7 @@
 //
 // Not part of the production bundle.
 
-import type { Note, NoteAuthor, Panel, PanelResource } from "../src/types.ts";
+import type { Note, NoteAuthor, NoteSummary, Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
 import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
@@ -804,22 +804,40 @@ function noteAuthor(from: number | undefined): NoteAuthor {
 function getNote(id: number): Note {
   const n = notes.get(id);
   if (!n) throw new Error(`no note with id ${id} (see note_list)`);
-  if (n.window_id !== null && !winById(n.window_id)) n.window_id = n.beside = null;
+  if (n.window_id !== null && !winById(n.window_id)) {
+    n.window_id = n.beside = null;
+    n.version++;
+  }
   return n;
 }
 
 function saveNote(n: Note): Note {
+  n.version++;
   broadcast("note_upserted", n);
   return n;
+}
+
+/** Like src/store.rs `load_note_summaries`: no text. */
+function noteSummary(n: Note): NoteSummary {
+  const { body, ...rest } = n;
+  return {
+    ...rest, open: n.window_id !== null, bytes: new TextEncoder().encode(body).length,
+    lines: body === "" ? 0 : body.split("\n").length - (body.endsWith("\n") ? 1 : 0),
+    preview: (body.split("\n").map((l) => l.trim()).find((l) => l) ?? "").slice(0, 120),
+  };
 }
 
 function noteMethod(method: string, p: any): unknown {
   switch (method) {
     case "note.list":
-      return [...notes.keys()].map(getNote).map((n) => ({
-        id: n.id, title: n.title, rev: n.rev, bytes: new TextEncoder().encode(n.body).length, lines: n.body.split("\n").length,
-        created_at: n.created_at, updated_at: n.updated_at, updated_by: n.updated_by, open: n.window_id !== null, window_id: n.window_id,
-      }));
+      return [...notes.keys()].map(getNote).map(noteSummary);
+    case "note.search": {
+      const q = String(p.query ?? "").trim().toLowerCase();
+      if (q.length < 2) return [];
+      return [...notes.values()].sort((a, b) => b.updated_at - a.updated_at)
+        .filter((n) => n.body.toLowerCase().includes(q)).slice(0, 20)
+        .map((n) => ({ id: n.id, line: n.body.split("\n").find((l) => l.toLowerCase().includes(q))!.trim().slice(0, 120) }));
+    }
     case "note.get":
       return getNote(p.id);
     case "note.create": {
@@ -828,7 +846,7 @@ function noteMethod(method: string, p: any): unknown {
       if (p.window_id != null && !winById(p.window_id)) throw new Error(`no window with id ${p.window_id}`);
       const id = ++noteSeq;
       const n: Note = { id, title: String(p.title ?? "").trim() || `Note ${id}`, body, rev: 1, created_at: now(), updated_at: now(),
-        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null };
+        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null, version: 0 };
       notes.set(id, n);
       return saveNote(n);
     }
@@ -1186,7 +1204,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         sessions: [...sessions.values()],
         panels: [...panels.values()].map((r) => r.panel).filter((p) => !p.closed),
         panel_origin: panelOrigin,
-        notes: [...notes.keys()].map(getNote),
+        notes: [...notes.keys()].map(getNote).map(noteSummary),
         windows,
         home: HOME,
         default_shell: "/bin/bash",

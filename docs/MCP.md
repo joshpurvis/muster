@@ -682,7 +682,7 @@ Wire format and limits: docs/PROTOCOL.md "Notes".
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `note_list` | — | `{notes: [{id, title, rev, bytes, lines, created_at, updated_at, updated_by, open, window_id}]}`, no text. |
+| `note_list` | — | `{notes: [{id, title, rev, version, bytes, lines, preview, created_at, updated_at, updated_by, open, window_id, beside}]}`, no text (`preview` is the first non-blank line). |
 | `note_read` | `note_id` | `{note_id, title, rev, text, updated_at, updated_by, open}`. |
 | `note_write` | `text`, `title?`, `note_id?`, `rev?` | `{note_id, title, rev}`. Without `note_id`: a new note (not shown until `note_open`). With it: replaces the whole text (and the title, if given); `rev` is required and must be the current one, else the write is refused (`changed since revision …`): read again, redo the change, write with the new rev. |
 | `note_append` | `note_id`, `text` | `{note_id, rev}`. Adds the text at the end, on a new line. No rev, never conflicts: use it while the human may be typing. |
@@ -691,7 +691,7 @@ Wire format and limits: docs/PROTOCOL.md "Notes".
 Each write and append records the caller as `updated_by` (`{kind: "agent", name, session_id}`;
 the name is a named agent's, else `Claude (task name)`), which the editor shows as "edited by …".
 `note_write` and `note_append` share the post rate limit (30 per minute with posts and panel
-updates). There is no delete tool: only the human deletes notes. The human's unsaved typing is
+updates), also when an agent runs `muster note` from its session (those calls run as these tools). There is no delete tool: only the human deletes notes. The human's unsaved typing is
 never lost to an agent's write: the editor merges it onto the newer revision (docs/PROTOCOL.md
 "Notes"). The same calls from the shell: `muster note …` (docs/CLI.md).
 

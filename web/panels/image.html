@@ -524,17 +524,39 @@ textarea { display: block; width: 100%; resize: vertical; line-height: 1.5; }
 .app-foot .keys { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 @media (max-width: 520px) { .app-head .mk-title { font-size: 17px; } .app-head .mk-takeaway { font-size: 13px; } }
 
-main { padding: 0; max-width: none; display: flex; flex-direction: column; height: 100vh; }
-.bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
-.source { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
-.spacer { flex: 1; }
-.warnings { padding: 6px 12px 0; }
-.stage { flex: 1; min-height: 0; overflow: auto; display: flex; padding: 12px; }
-.stage img { margin: auto; display: block; cursor: zoom-in; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
-.stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.stage.actual img { max-width: none; max-height: none; cursor: zoom-out; flex: none; }
-.stage .error { margin: auto; }
-.caption { padding: 8px 12px 12px; margin: 0; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
+main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
+.warnings { flex: none; }
+.img-figure { flex: 1; min-height: 0; display: flex; flex-direction: column; margin: 0; }
+.stage-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+/* The soft stage: a faint wash of the accent over the sunken surface, and an inner keyline. */
+.img-stage {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
+  background: radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--mk-accent) 7%, transparent), transparent 60%), var(--mk-sunken);
+  box-shadow: inset 0 0 0 1px var(--mk-line);
+}
+.img-stage img {
+  margin: auto; display: block; border-radius: 8px; cursor: zoom-in;
+  background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 24px 60px -18px rgba(0, 0, 0, .55), 0 0 0 1px var(--mk-line-2);
+}
+[data-theme="light"] .img-stage img { box-shadow: 0 24px 60px -22px rgba(20, 20, 40, .35), 0 0 0 1px var(--mk-line-2); }
+.img-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.img-stage.actual img { max-width: none; max-height: none; flex: none; cursor: zoom-out; }
+.img-stage .error { margin: auto; }
+.img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-zoom {
+  position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
+  background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);
+}
+.img-zoom[hidden], .mk-chip[hidden] { display: none; }
+.cap { flex: none; display: flex; justify-content: space-between; align-items: center; gap: 10px 16px; margin-top: 14px; font-size: 14px; color: var(--mk-text-2); flex-wrap: wrap; }
+.cap .caption { min-width: 0; }
+.cap .meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.cap .mk-chip.source { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 22px; }
+@media (max-width: 520px) {
+  .img-stage { padding: 12px; }
+  .img-tools { top: 8px; right: 8px; }
+}
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -869,6 +891,8 @@ main { padding: 0; max-width: none; display: flex; flex-direction: column; heigh
   var fit = true;
   var current = null;
   var warnings = [];
+  var apply = () => {
+  };
   function render() {
     if (!current) return;
     const img = current;
@@ -879,26 +903,49 @@ main { padding: 0; max-width: none; display: flex; flex-direction: column; heigh
       draggable: "false"
     });
     const stage = h("div", {
-      class: "stage",
+      class: "stage img-stage",
       tabindex: "0",
-      "aria-label": "Image; Z toggles zoom"
+      "aria-label": "Image; Z toggles actual size"
     }, picture);
-    const size = h("span", {
-      class: "muted dims"
-    });
-    const label = h("span");
-    const toggle = h("button", {
+    const fitBtn = h("button", {
       type: "button",
-      title: "Toggle zoom (Z)",
-      onclick: () => setFit(!fit)
-    }, label, " ", h("kbd", null, "Z"));
+      id: "zoom-fit",
+      onclick: () => setFit(true)
+    }, "Fit");
+    const actualBtn = h("button", {
+      type: "button",
+      id: "zoom-actual",
+      title: "Actual size (Z)",
+      onclick: () => setFit(false)
+    }, "Actual size ", h("kbd", null, "Z"));
+    const zoom = h("span", {
+      class: "img-zoom",
+      "aria-hidden": "true"
+    });
+    const dims = h("span", {
+      class: "mk-chip dims",
+      hidden: true
+    });
+    const updateZoom = () => {
+      if (!picture.naturalWidth) {
+        zoom.hidden = true;
+        return;
+      }
+      zoom.hidden = false;
+      zoom.textContent = `${Math.round(picture.clientWidth / picture.naturalWidth * 100)}%`;
+    };
     apply = () => {
-      stage.className = `stage ${fit ? "fit" : "actual"}`;
-      label.textContent = fit ? "Actual size" : "Zoom to fit";
-      toggle.setAttribute("aria-pressed", String(!fit));
+      stage.className = `stage img-stage ${fit ? "fit" : "actual"}`;
+      fitBtn.setAttribute("aria-pressed", String(fit));
+      actualBtn.setAttribute("aria-pressed", String(!fit));
+      requestAnimationFrame(updateZoom);
     };
     picture.addEventListener("load", () => {
-      if (picture.naturalWidth) size.textContent = `${picture.naturalWidth} \xD7 ${picture.naturalHeight}`;
+      if (picture.naturalWidth) {
+        dims.textContent = `${picture.naturalWidth} \xD7 ${picture.naturalHeight}`;
+        dims.hidden = false;
+      }
+      updateZoom();
     });
     picture.addEventListener("error", () => {
       stage.replaceChildren(h("div", {
@@ -907,24 +954,31 @@ main { padding: 0; max-width: none; display: flex; flex-direction: column; heigh
       }, h("strong", null, "The image could not be shown. "), img.src.startsWith("data:") ? "The file is not a valid image of its type." : "Check that the URL is reachable and that its origin is declared in csp.resourceDomains."));
     });
     picture.addEventListener("click", () => setFit(!fit));
-    mount(root, h("header", {
-      class: "bar"
-    }, h("span", {
-      class: "source mono",
-      title: img.source
-    }, img.source), img.bytes !== void 0 ? h("span", {
-      class: "muted"
-    }, formatBytes(img.bytes)) : null, size, h("span", {
-      class: "spacer"
-    }), toggle), warnings.length ? h("p", {
+    new ResizeObserver(updateZoom).observe(stage);
+    mount(root, warnings.length ? h("p", {
       class: "warnings"
-    }, warnings.join("; ")) : null, stage, img.caption ? h("p", {
+    }, warnings.join("; ")) : null, h("figure", {
+      class: "img-figure"
+    }, h("div", {
+      class: "stage-wrap"
+    }, stage, h("div", {
+      class: "img-tools mk-seg",
+      role: "group",
+      "aria-label": "Zoom"
+    }, fitBtn, actualBtn), zoom), h("figcaption", {
+      class: "cap"
+    }, img.caption ? h("span", {
       class: "caption"
-    }, img.caption) : null);
+    }, img.caption) : h("span"), h("span", {
+      class: "meta"
+    }, h("span", {
+      class: "mk-chip source",
+      title: img.source
+    }, img.source), dims, img.bytes !== void 0 ? h("span", {
+      class: "mk-chip"
+    }, formatBytes(img.bytes)) : null))));
     apply();
   }
-  var apply = () => {
-  };
   function setFit(next) {
     fit = next;
     apply();

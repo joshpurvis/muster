@@ -1,11 +1,33 @@
-main { padding: 0; max-width: none; display: flex; flex-direction: column; height: 100vh; }
-.bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
-.source { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
-.spacer { flex: 1; }
-.warnings { padding: 6px 12px 0; }
-.stage { flex: 1; min-height: 0; overflow: auto; display: flex; padding: 12px; }
-.stage img { margin: auto; display: block; cursor: zoom-in; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
-.stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.stage.actual img { max-width: none; max-height: none; cursor: zoom-out; flex: none; }
-.stage .error { margin: auto; }
-.caption { padding: 8px 12px 12px; margin: 0; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
+main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
+.warnings { flex: none; }
+.img-figure { flex: 1; min-height: 0; display: flex; flex-direction: column; margin: 0; }
+.stage-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+/* The soft stage: a faint wash of the accent over the sunken surface, and an inner keyline. */
+.img-stage {
+  flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
+  background: radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--mk-accent) 7%, transparent), transparent 60%), var(--mk-sunken);
+  box-shadow: inset 0 0 0 1px var(--mk-line);
+}
+.img-stage img {
+  margin: auto; display: block; border-radius: 8px; cursor: zoom-in;
+  background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 24px 60px -18px rgba(0, 0, 0, .55), 0 0 0 1px var(--mk-line-2);
+}
+[data-theme="light"] .img-stage img { box-shadow: 0 24px 60px -22px rgba(20, 20, 40, .35), 0 0 0 1px var(--mk-line-2); }
+.img-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.img-stage.actual img { max-width: none; max-height: none; flex: none; cursor: zoom-out; }
+.img-stage .error { margin: auto; }
+.img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-zoom {
+  position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
+  background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);
+}
+.img-zoom[hidden], .mk-chip[hidden] { display: none; }
+.cap { flex: none; display: flex; justify-content: space-between; align-items: center; gap: 10px 16px; margin-top: 14px; font-size: 14px; color: var(--mk-text-2); flex-wrap: wrap; }
+.cap .caption { min-width: 0; }
+.cap .meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.cap .mk-chip.source { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 22px; }
+@media (max-width: 520px) {
+  .img-stage { padding: 12px; }
+  .img-tools { top: 8px; right: 8px; }
+}

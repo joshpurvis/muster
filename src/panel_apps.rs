@@ -645,9 +645,11 @@ pub fn check_chart(data: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Everything the table app checks (web/src/panels/apps/table/logic.ts). `scope`, `takeaway`,
+/// `source` and a column's `format` and `tones` are optional additions for the Briefing look.
 pub fn check_table(data: &Value) -> anyhow::Result<()> {
     let o = object(data, "table data")?;
-    opt_text(o, "table", "title", 200)?;
+    for (key, max) in [("title", 200), ("scope", 200), ("takeaway", 600), ("source", 300)] { opt_text(o, "table", key, max)?; }
     let columns = field(o, "table", "columns")?.as_array().context("table `columns` must be an array")?;
     ensure!((1..=50).contains(&columns.len()), "table `columns` needs 1 to 50 columns");
     let mut keys = Vec::with_capacity(columns.len());
@@ -660,6 +662,16 @@ pub fn check_table(data: &Value) -> anyhow::Result<()> {
         keys.push(key);
         opt_text(c, &at, "label", 200)?;
         one_of(c, &at, "align", &["left", "right", "center"], false)?;
+        one_of(c, &at, "format", &["bar", "badge", "mono"], false)?;
+        if let Some(tones) = c.get("tones").filter(|v| !v.is_null()) {
+            let tones = object(tones, &format!("{at} `tones`"))?;
+            ensure!(tones.len() <= 50, "{at} `tones` has {} values; at most 50", tones.len());
+            for (value, tone) in tones {
+                ensure!(value.chars().count() <= 200, "{at} `tones` keys must be cell values of at most 200 characters");
+                ensure!(tone.as_str().is_some_and(|t| ["good", "warn", "bad", "info", "accent", "plain"].contains(&t)),
+                    "{at} `tones.{value}` must be one of good, warn, bad, info, accent, plain (got {tone})");
+            }
+        }
     }
     if let Some(sort) = o.get("sort").filter(|v| !v.is_null()) {
         let sort = object(sort, "table `sort`")?;
@@ -803,12 +815,18 @@ mod tests {
         assert!(check_chart(&json!({"type":"pie","x":{"values":[1]},"series":[]})).unwrap_err().to_string().contains("one of bar"));
         assert!(check_chart(&json!({"type":"bar","x":{"values":[1]},"series":(0..13).map(|i| json!({"name":i.to_string(),"values":[1]})).collect::<Vec<_>>()})).is_err());
         check_table(&json!({"columns":[{"key":"a"}],"rows":[{"a":1}]})).unwrap();
+        check_table(&json!({"title":"Flaky tests","scope":"acme","takeaway":"One is **bad**.","source":"junit","columns":[{"key":"a","format":"bar"},
+            {"key":"s","format":"badge","tones":{"Flaky":"warn","Fixed":"good"}},{"key":"f","format":"mono"}],"rows":[{"a":1,"s":"Flaky","f":"x.ts"}]})).unwrap();
         assert!(check_table(&json!({"columns":[],"rows":[]})).is_err());
         assert!(check_table(&json!({"columns":[{"label":"x"}],"rows":[]})).unwrap_err().to_string().contains("key"));
         assert!(check_table(&json!({"columns":[{"key":"a"}],"rows":[1]})).unwrap_err().to_string().contains("object"));
         for (t, why) in [(json!({"columns":[{"key":"a"},{"key":"a"}],"rows":[]}), "duplicates"),
             (json!({"columns":[{"key":"a"}],"rows":[{"a":[1]}]}), "rows[0].a"), (json!({"columns":[{"key":"a"}],"rows":[{"a":"x".repeat(10_001)}]}), "10000"),
-            (json!({"columns":[{"key":"a"}],"rows":[],"sort":{"key":"b"}}), "not a column key"), (json!({"columns":[{"key":"a","align":"middle"}],"rows":[]}), "align")] {
+            (json!({"columns":[{"key":"a"}],"rows":[],"sort":{"key":"b"}}), "not a column key"), (json!({"columns":[{"key":"a","align":"middle"}],"rows":[]}), "align"),
+            (json!({"columns":[{"key":"a","format":"sparkline"}],"rows":[]}), "`format` must be one of bar, badge, mono"),
+            (json!({"columns":[{"key":"a","format":"badge","tones":{"Flaky":"orange"}}],"rows":[]}), "`tones.Flaky` must be one of good, warn"),
+            (json!({"columns":[{"key":"a","tones":["warn"]}],"rows":[]}), "`tones` must be an object"),
+            (json!({"columns":[{"key":"a"}],"rows":[],"takeaway":"x".repeat(601)}), "`takeaway` is longer than 600")] {
             let e = format!("{:#}", check_table(&t).unwrap_err());
             assert!(e.contains(why), "{t}: {e}");
         }

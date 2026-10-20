@@ -1,27 +1,40 @@
-main { max-width: none; display: flex; flex-direction: column; height: 100vh; padding: 12px 16px; }
-.top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
-.spacer { flex: 1; }
-#filter { width: min(260px, 100%); }
-.count { font-size: 12px; white-space: nowrap; }
-.scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); }
-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
-thead th {
-  position: sticky; top: 0; z-index: 1; background: var(--color-background-secondary);
-  border-bottom: 1px solid var(--color-border-primary); padding: 0; font-weight: 600; white-space: nowrap;
+/* The table app on the kit's table styles (.mk-table). The page is a column: the head and the
+   toolbar stay, the table scrolls under its sticky header. */
+main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
+.app-head { flex: none; }
+.tbl-bar { flex: none; display: flex; align-items: center; gap: 10px; margin: 0 0 12px; flex-wrap: wrap; }
+.tbl-bar .mk-search { flex: 0 1 280px; min-width: 160px; }
+.tbl-bar .tally { margin-left: auto; font-size: 13px; color: var(--mk-text-3); white-space: nowrap; }
+.tbl-bar .tally b { color: var(--mk-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.mk-table-wrap { flex: 1; min-height: 0; }
+.mk-table th { padding: 0; }
+.mk-table th .sort {
+  display: flex; align-items: center; gap: 4px; width: 100%; height: 38px; padding: 0 14px; border: 0; border-radius: 0;
+  background: none; box-shadow: none; font: 600 12px var(--mk-font); color: inherit; justify-content: flex-start;
 }
-th.right .sort { justify-content: flex-end; }
-th.center .sort { justify-content: center; }
-.sort {
-  display: flex; align-items: center; gap: 4px; width: 100%; border: 0; border-radius: 0; background: none;
-  padding: 6px 10px; min-height: 32px; font-weight: 600; text-align: inherit;
+.mk-table th.right .sort { justify-content: flex-end; }
+.mk-table th.center .sort { justify-content: center; }
+.mk-table th .sort:hover { background: var(--mk-sunken); }
+.mk-table th .arr { color: var(--mk-accent); min-width: 8px; }
+.mk-table td { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+.mk-table td.t1 { font-weight: 550; }
+.mk-table td.num { font-family: var(--mk-mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.mk-table td.left { text-align: left; }
+.mk-table td.right { text-align: right; }
+.mk-table td.center { text-align: center; }
+.mk-table.compact td { height: 32px; }
+.mk-table.compact th .sort { height: 32px; }
+.mk-table .mk-bar-cell span:first-child { min-width: 2ch; }
+.empty-state[hidden] { display: none; }
+.empty-state { display: grid; place-items: center; text-align: center; padding: 32px 12px; }
+.empty-state .mk-icon { width: 40px; height: 40px; border-radius: 12px; }
+.empty-state .mk-icon svg { width: 18px; height: 18px; }
+.empty-state .e-title { margin: 12px 0 2px; font-weight: 600; color: var(--mk-text); }
+.empty-state .e-why { margin: 0 0 14px; font-size: 13px; color: var(--mk-text-3); }
+.more:not(:empty) { padding-top: 8px; flex: none; }
+.app-foot { flex: none; }
+@media (max-width: 520px) {
+  .tbl-bar .mk-search { flex: 1 1 100%; }
+  .tbl-bar .tally { margin-left: 0; }
+  .app-foot .keys { display: none; }
 }
-.sort:hover { background: var(--color-background-tertiary) !important; }
-.arrow { font-size: 9px; color: var(--color-text-info); min-width: 9px; }
-td { padding: 4px 10px; border-bottom: 1px solid var(--color-border-secondary); vertical-align: top; max-width: 40ch; }
-tbody tr:hover td { background: var(--color-background-secondary); }
-td.num { font-family: var(--font-mono); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.left { text-align: left; }
-.right { text-align: right; }
-.center { text-align: center; }
-td.empty { text-align: center; color: var(--color-text-secondary); padding: 20px; }
-.more:not(:empty) { padding-top: 8px; }

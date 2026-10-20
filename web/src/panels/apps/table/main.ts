@@ -1,6 +1,11 @@
+// The table app: the finding first (title, scope, takeaway), then a filterable, sortable table
+// in the kit's style: numbers right-aligned in tabular figures, optional inline bars, badges
+// and mono columns, a sticky header, and a comfortable or compact density.
 import { startApp, typing } from "../shared/client.ts";
 import { h, mount, problems } from "../shared/dom.ts";
-import { cellText, filterRows, nextSort, type Sort, sortRows, type TableSpec, validateTable } from "./logic.ts";
+import { iconEl } from "../../kit/icons.ts";
+import { esc, fmt, rich } from "../../kit/format.ts";
+import { cellText, type Column, columnMax, filterRows, nextSort, type Sort, sortRows, type TableSpec, validateTable } from "./logic.ts";
 
 const root = document.getElementById("app")!;
 const SHOWN = 1000;
@@ -9,37 +14,72 @@ let warnings: string[] = [];
 let sort: Sort | undefined;
 let query = "";
 let limit = SHOWN;
+let compact = false;
 let body: HTMLTableSectionElement | null = null;
 let count: HTMLElement | null = null;
+let sorted: HTMLElement | null = null;
 let more: HTMLElement | null = null;
 let headers: HTMLElement | null = null;
+let empty: HTMLElement | null = null;
+let maxes = new Map<string, number>();
+
+const alignOf = (c: Column) => c.align ?? (c.numeric ? "right" : "left");
+
+function cell(c: Column, v: unknown, first: boolean): HTMLElement {
+  const align = alignOf(c);
+  const text = cellText(v as never);
+  const long = typeof v === "string" && v.length > 80 ? v : null;
+  if (c.format === "bar" && c.numeric && typeof v === "number") {
+    const max = maxes.get(c.key) || 1;
+    return h("td", { class: `num n ${align}` },
+      h("div", { class: "mk-bar-cell" }, h("span", null, text),
+        h("span", { class: "b", "aria-hidden": "true" }, h("i", { style: `width:${Math.min(100, (Math.abs(v) / max) * 100).toFixed(1)}%` }))));
+  }
+  if (c.format === "badge" && text) {
+    const tone = c.tones?.[text] ?? "plain";
+    return h("td", { class: align }, h("span", { class: `mk-badge ${tone}` }, text));
+  }
+  if (c.format === "mono") return h("td", { class: `file ${align}`, title: long }, text);
+  if (c.numeric) return h("td", { class: `num n ${align}` }, text);
+  return h("td", { class: `${align}${first ? " t1" : ""}`, title: long }, text);
+}
 
 function rowsShown() {
-  if (!spec || !body || !count || !more) return;
+  if (!spec || !body || !count || !more || !empty || !sorted) return;
   const s = spec;
   const rows = sortRows(filterRows(s.rows, s.columns, query), sort);
-  body.replaceChildren(...rows.slice(0, limit).map((r) =>
-    h("tr", null, s.columns.map((c) => {
-      const v = r[c.key];
-      const align = c.align ?? (c.numeric ? "right" : "left");
-      return h("td", { class: `${c.numeric ? "num" : ""} ${align}`, title: typeof v === "string" && v.length > 80 ? v : null }, cellText(v));
-    }))));
-  if (!rows.length) body.append(h("tr", null, h("td", { colspan: s.columns.length, class: "empty" }, query ? "No rows match the filter." : "No rows.")));
-  count.textContent = query || rows.length !== s.rows.length ? `${rows.length} of ${s.rows.length} rows` : `${s.rows.length} row${s.rows.length === 1 ? "" : "s"}`;
+  body.replaceChildren(...rows.slice(0, limit).map((r) => h("tr", null, s.columns.map((c, i) => cell(c, r[c.key], i === 0)))));
+  // No match: say why and how to get out, in place of the rows.
+  empty.hidden = rows.length > 0;
+  empty.replaceChildren(...(rows.length ? [] : query
+    ? [h("div", { class: "mk-icon" }, iconEl("filter")), h("p", { class: "e-title" }, `No rows match "${query}"`),
+      h("p", { class: "e-why" }, "Every word has to match somewhere in the row."),
+      h("button", { type: "button", class: "sm", id: "clear-filter", onclick: () => clearFilter(true) }, "Clear filter ", h("kbd", null, "Esc"))]
+    : [h("p", { class: "e-title" }, "No rows."), h("p", { class: "e-why" }, "The agent sent this table without any rows.")]));
+  count.replaceChildren(...(query || rows.length !== s.rows.length
+    ? [h("b", null, fmt(rows.length, "int")), ` of ${fmt(s.rows.length, "int")} rows`]
+    : [h("b", null, fmt(s.rows.length, "int")), ` row${s.rows.length === 1 ? "" : "s"}`]));
+  const by = sort ? s.columns.find((c) => c.key === sort!.key)?.label : undefined;
+  sorted.textContent = by ? ` · sorted by ${by}` : "";
   more.replaceChildren(rows.length > limit
-    ? h("button", { type: "button", onclick: () => { limit += SHOWN; rowsShown(); } }, `Show ${Math.min(SHOWN, rows.length - limit)} more of ${rows.length - limit} hidden rows`)
+    ? h("button", { type: "button", class: "sm", onclick: () => { limit += SHOWN; rowsShown(); } }, `Show ${Math.min(SHOWN, rows.length - limit)} more of ${rows.length - limit} hidden rows`)
     : "");
+}
+
+function clearFilter(focus: boolean) {
+  query = "";
+  const f = document.getElementById("filter") as HTMLInputElement | null;
+  if (f) { f.value = ""; if (focus) f.focus(); }
+  rowsShown();
 }
 
 function headerCells() {
   if (!spec || !headers) return;
   headers.replaceChildren(...spec.columns.map((c) => {
     const dir = sort?.key === c.key ? sort.dir : null;
-    const align = c.align ?? (c.numeric ? "right" : "left");
-    return h("th", { scope: "col", class: align, "aria-sort": dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none" },
+    return h("th", { scope: "col", class: alignOf(c), "aria-sort": dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none" },
       h("button", {
-        type: "button", class: "sort", title: `Sort by ${c.label}`,
-        "data-key": c.key,
+        type: "button", class: "sort", title: `Sort by ${c.label}`, "data-key": c.key,
         onclick: () => {
           sort = nextSort(sort, c.key, c.numeric);
           headerCells();
@@ -47,27 +87,50 @@ function headerCells() {
           // The header was rebuilt: keep the keyboard on the same column.
           [...document.querySelectorAll<HTMLElement>("button.sort")].find((b) => b.dataset.key === c.key)?.focus();
         },
-      }, h("span", null, c.label), h("span", { class: "arrow", "aria-hidden": "true" }, dir === "asc" ? "▲" : dir === "desc" ? "▼" : "")));
+      }, h("span", null, c.label), h("span", { class: "arr", "aria-hidden": "true" }, dir === "asc" ? "↑" : dir === "desc" ? "↓" : "")));
   }));
+}
+
+function setDensity(next: boolean) {
+  compact = next;
+  document.querySelector(".mk-table")?.classList.toggle("compact", compact);
+  document.querySelectorAll<HTMLElement>(".density button").forEach((b) => b.setAttribute("aria-pressed", String((b.dataset.d === "compact") === compact)));
 }
 
 function render() {
   if (!spec) return;
+  const s = spec;
   const focused = document.activeElement?.id;
+  maxes = new Map(s.columns.filter((c) => c.format === "bar").map((c) => [c.key, columnMax(s.rows, c.key)]));
   const filter = h("input", {
-    id: "filter", type: "search", placeholder: "Filter rows", "aria-label": "Filter rows (/)", value: query, autocomplete: "off",
+    id: "filter", class: "mk-input", type: "search", placeholder: "Filter rows", "aria-label": "Filter rows (/)", value: query, autocomplete: "off",
   }) as HTMLInputElement;
   filter.addEventListener("input", () => { query = filter.value; limit = SHOWN; rowsShown(); });
-  count = h("span", { class: "muted count", "aria-live": "polite" });
+  count = h("span", { class: "count" });
+  sorted = h("span", { class: "sorted" });
   headers = h("tr");
   body = h("tbody");
   more = h("div", { class: "more" });
-  mount(root, 
-    h("div", { class: "top" }, spec.title ? h("h1", null, spec.title) : null, h("span", { class: "spacer" }), filter, count),
+  empty = h("div", { class: "empty-state", role: "status" });
+  const head = h("header", { class: "app-head" });
+  if (s.title || s.scope) head.innerHTML = `<h1 class="mk-title">${esc(s.title ?? "")}${s.scope ? ` <span class="mk-scope">${esc(s.scope)}</span>` : ""}</h1>`;
+  if (s.takeaway) head.insertAdjacentHTML("beforeend", `<p class="mk-takeaway">${rich(s.takeaway)}</p>`);
+  const density = h("div", { class: "mk-seg density", role: "group", "aria-label": "Row density" },
+    h("button", { type: "button", "data-d": "comfortable", "aria-pressed": String(!compact), onclick: () => setDensity(false) }, "Comfortable"),
+    h("button", { type: "button", "data-d": "compact", "aria-pressed": String(compact), onclick: () => setDensity(true) }, "Compact"));
+  mount(root,
+    s.title || s.scope || s.takeaway ? head : null,
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
-    h("div", { class: "scroll", tabindex: "0", "aria-label": spec.title ?? "Table" },
-      h("table", null, spec.title ? h("caption", { class: "sr-only" }, spec.title) : null, h("thead", null, headers), body)),
+    h("div", { class: "tbl-bar" },
+      h("label", { class: "mk-search" }, iconEl("search"), filter, h("kbd", { "aria-hidden": "true" }, "/")),
+      density,
+      h("span", { class: "tally", "aria-live": "polite" }, count, sorted)),
+    h("div", { class: "mk-table-wrap", tabindex: "0", "aria-label": s.title ?? "Table" },
+      h("table", { class: `mk-table sortable${compact ? " compact" : ""}` }, s.title ? h("caption", { class: "sr-only" }, s.title) : null, h("thead", null, headers), body),
+      empty),
     more,
+    h("footer", { class: "app-foot" }, s.source ? h("span", { class: "mk-source" }, `Source: ${s.source}`) : null,
+      h("span", { class: "keys" }, "Click a header to sort · ", h("kbd", null, "/"), " filter")),
   );
   headerCells();
   rowsShown();
@@ -78,10 +141,9 @@ addEventListener("keydown", (e) => {
   if (e.key === "/" && !typing(e) && !e.ctrlKey && !e.metaKey && !e.altKey) {
     document.getElementById("filter")?.focus();
     e.preventDefault();
-  } else if (e.key === "Escape" && (e.target as HTMLElement)?.id === "filter" && query) {
-    query = "";
-    (e.target as HTMLInputElement).value = "";
-    rowsShown();
+  } else if (e.key === "Escape" && query && ((e.target as HTMLElement)?.id === "filter" || (e.target as HTMLElement)?.id === "clear-filter")) {
+    e.preventDefault();
+    clearFilter((e.target as HTMLElement).id === "clear-filter");
   }
 });
 

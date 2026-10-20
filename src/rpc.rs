@@ -102,6 +102,11 @@ pub fn hello(hub: &Hub) -> Value {
         "terminal_host": hub.terminal_host_info(),
         "updates": hub.updates().status(),
         "prefs": hub.ui_prefs(),
+        // The backend's own pid, so a CLI that can't see it (a sandboxed command in its own PID
+        // namespace) can still tell the discovery file names this backend.
+        "pid": std::process::id(),
+        // Whether the backend has an OpenRouter key; never the key itself.
+        "openrouter": { "key_present": hub.openrouter_key().is_some() },
     })
 }
 
@@ -310,6 +315,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
             let p: P = parse(params)?;
             let exe = crate::updates::reload(hub, &p.expect).await?;
+            Ok(json!({ "exe": exe.to_string_lossy() }))
+        }
+        "daemon.reload_handoff" => {
+            human_only(who, method, &params)?;
+            #[derive(Deserialize)]
+            struct P {
+                /// The `muster` binary running the `reload` command.
+                exe: std::path::PathBuf,
+            }
+            let p: P = parse(params)?;
+            let exe = crate::updates::reload_handoff(hub, &p.exe)?;
             Ok(json!({ "exe": exe.to_string_lossy() }))
         }
         "daemon.shutdown" => {
@@ -934,6 +950,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "agent.templates" => to_value(crate::agents::templates()),
         "agent.models" => Ok(crate::agents::model_catalog()),
+        "openrouter.models" => Ok(hub.openrouter_models().models(hub.openrouter_key().is_some()).await),
         "agent.remove" => {
             require_local(who, method)?;
             #[derive(Deserialize)]
@@ -958,6 +975,9 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
+                // The running process keeps the provider it started with: a change shows here
+                // until a restart (Start fresh, or Stop then Start) applies it.
+                "provider_pending": !bs.started && bs.session.provider != bs.agent.provider,
                 "session": bs.session,
                 "started": bs.started,
             }))
@@ -1655,6 +1675,10 @@ mod tests {
     /// with the MCP server state attached. Nothing here starts a process: every call below is
     /// refused before delivery.
     fn fixture() -> (Arc<Hub>, Arc<McpState<HubBackend>>) {
+        fixture_keyed(None)
+    }
+
+    fn fixture_keyed(openrouter_key: Option<crate::openrouter::ApiKey>) -> (Arc<Hub>, Arc<McpState<HubBackend>>) {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
         let mut ch = crate::mcp::guard::test_channel(0);
@@ -1673,6 +1697,7 @@ mod tests {
             client_token: "t".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
             terminal_host: None,
+            openrouter_key,
         };
         let hub = Hub::new(cfg, store).unwrap();
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));
@@ -1685,6 +1710,7 @@ mod tests {
             hub,
             NewAgent {
                 account_profile: None,
+                provider: None,
                 name: name.into(),
                 kind: None,
                 model: None,
@@ -1840,6 +1866,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openrouter_needs_the_key_and_no_reply_carries_it() {
+        const KEY: &str = "sk-or-rpc-fixture-secret";
+        let (hub, _st) = fixture();
+        assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["openrouter"]["key_present"], false);
+        let e = call(&hub, "agent.create", json!({"name": "or-none", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("OPENROUTER_API_KEY"), "{e}");
+        agent(&hub, "or-sub");
+        let e = call(&hub, "agent.update", json!({"name": "or-sub", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("OPENROUTER_API_KEY"), "{e}");
+        assert_eq!(call(&hub, "agent.list", json!({})).await.unwrap()[0]["provider"], "subscription");
+
+        let (hub, _st) = fixture_keyed(crate::openrouter::ApiKey::new(KEY));
+        hub.openrouter_models().seed(crate::model::now_ms(), crate::openrouter::parse_models(
+            include_bytes!("fixtures/openrouter_models.json")).unwrap());
+        let a = call(&hub, "agent.create", json!({"name": "or-claude", "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-5.5"})).await.unwrap();
+        assert_eq!((a["provider"].as_str(), a["model"].as_str()), (Some("openrouter"), Some("anthropic/claude-sonnet-5.5")));
+        let e = call(&hub, "agent.create", json!({"name": "or-codex", "kind": "codex", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("needs a model"), "{e}");
+        call(&hub, "agent.create", json!({"name": "or-codex", "kind": "codex", "provider": "openrouter",
+            "model": "openai/gpt-6.1-sol"})).await.unwrap();
+        let e = call(&hub, "agent.update", json!({"name": "or-codex", "model": ""})).await.unwrap_err();
+        assert!(e.contains("needs a model"), "{e}");
+        let r = call(&hub, "agent.update", json!({"name": "or-claude", "provider": "subscription", "model": "opus"})).await.unwrap();
+        assert_eq!(r["provider"], "subscription");
+        let models = call(&hub, "openrouter.models", json!({})).await.unwrap();
+        assert_eq!(models["key_present"], true);
+        assert!(models["models"].as_array().unwrap().iter().any(|m| m["id"] == "openai/gpt-6.1-sol"));
+        let hello = call(&hub, "hello", json!({})).await.unwrap();
+        assert_eq!(hello["openrouter"]["key_present"], true);
+        for reply in [hello, models, call(&hub, "agent.list", json!({})).await.unwrap(),
+            call(&hub, "agent.models", json!({})).await.unwrap()] {
+            assert!(!reply.to_string().contains(KEY));
+        }
+        // The persona files and the store never hold it either.
+        for name in ["or-claude", "or-codex"] {
+            let a = hub.agents().get(name).unwrap();
+            for f in ["CLAUDE.md", "AGENTS.md"] {
+                if let Ok(text) = std::fs::read_to_string(std::path::Path::new(&a.home_dir).join(f)) {
+                    assert!(!text.contains(KEY));
+                }
+            }
+        }
+        assert!(!format!("{:?}", hub.store().load_agents().unwrap()).contains(KEY));
+        // A device never learns about OpenRouter's models.
+        assert!(crate::devices::method_scope("openrouter.models").is_none());
+    }
+
+    #[tokio::test]
     async fn refused_asks_are_logged_and_listed() {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-ivy");
@@ -1933,7 +2008,7 @@ mod tests {
     async fn restart_and_shutdown_are_human_only() {
         let (hub, _st) = fixture();
         let device = Principal::Device { id: 1 };
-        for method in ["daemon.reload", "daemon.shutdown"] {
+        for method in ["daemon.reload", "daemon.shutdown", "daemon.reload_handoff"] {
             assert!(crate::devices::method_scope(method).is_none(), "{method}");
             let e = dispatch(&hub, &device, method, json!({})).await.unwrap_err();
             assert!(e.0.contains("only available on this computer"), "{}", e.0);
@@ -1947,6 +2022,15 @@ mod tests {
         assert!(e.contains("where it was launched from"), "{e}");
         let h = call(&hub, "hello", json!({})).await.unwrap();
         assert_eq!(h["updates"], json!({"ui_release": null, "backend": null, "host": null}));
+        // The key handoff: refused (so the CLI reloads the usual way) without a key, without a
+        // known launch path, and for a binary other than the one the backend started from.
+        let e = call(&hub, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
+        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("launched from"), "{e}");
+        assert_eq!(h["pid"], std::process::id());
+        let (keyed, _st) = fixture_keyed(crate::openrouter::ApiKey::new("sk-or-rpc-fixture-secret"));
+        let e = call(&keyed, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
+        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("launched from"), "{e}");
+        assert!(!e.contains("sk-or-rpc"));
     }
 
     #[tokio::test]

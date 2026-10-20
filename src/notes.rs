@@ -319,7 +319,7 @@ mod tests {
         info.kind = SessionKind::Claude;
         store.insert_session(&StoredSession { info, extra_args: vec![] }).unwrap();
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None }, store).unwrap()
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
     }
 
     #[test]
@@ -365,7 +365,7 @@ mod tests {
         let o = open(&hub, n.id, 1, Some(1)).unwrap();
         assert_eq!((o.window_id, o.beside), (Some(1), Some(1)));
         let rebuilt = Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None }, hub.store().clone()).unwrap();
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, hub.store().clone()).unwrap();
         assert_eq!(get(&rebuilt, n.id).unwrap(), o);
         let c = close(&hub, n.id).unwrap();
         assert_eq!((c.window_id, c.beside), (None, None));
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(hub.store().load_note(n.id).unwrap().unwrap().window_id, None, "close cleared the stored id");
         hub.store().save_note(&Note { window_id: Some(77), ..stored }).unwrap();
         let rebuilt = Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None }, hub.store().clone()).unwrap();
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, hub.store().clone()).unwrap();
         assert_eq!(rebuilt.store().load_note(n.id).unwrap().unwrap().window_id, None);
     }
 

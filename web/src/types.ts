@@ -125,6 +125,9 @@ export interface SessionInfo {
   /** A named agent's closed tab (`session.hide`): it runs on in no window until it is shown
    * again (`session.set_window`). Missing from older daemons. */
   hidden?: boolean;
+  /** What its current (or last) run bills to, set when it starts: a named agent's provider
+   * change shows here only once a restart applies it. Missing from older daemons. */
+  provider?: Provider;
 }
 
 export type EventKind =
@@ -153,8 +156,13 @@ export interface TimelineEvent {
 export type Origin = "human" | "schedule" | "webhook";
 
 /** A named agent (`agent.list`, `agent_upserted`; src/agents.rs `agent_json`). */
+/** Where an agent's model runs (src/openrouter.rs): the CLI's own login, or OpenRouter (pay per
+ * token). Missing from backends without OpenRouter support. */
+export type Provider = "subscription" | "openrouter";
+
 export interface Agent {
   account_profile_id?: number | null;
+  provider?: Provider;
   id: number;
   name: string;
   kind: "claude" | "codex";
@@ -218,6 +226,33 @@ export interface KindModels {
 }
 export type ModelCatalog = Record<"claude" | "codex", KindModels>;
 
+/** One model from OpenRouter's public list (`openrouter.models`). */
+export interface OpenRouterModel {
+  /** What `--model` / `-m` gets, e.g. `anthropic/claude-sonnet-5.5`. */
+  id: string;
+  name: string;
+  /** The id's prefix without `~`, for grouping. */
+  vendor: string;
+  context_length: number | null;
+  /** US dollars per million tokens. */
+  prompt_per_m: number | null;
+  completion_per_m: number | null;
+  created: number | null;
+  /** An alias (`~anthropic/claude-opus-latest`): the model it points at now. */
+  alias_of?: string | null;
+}
+
+/** `openrouter.models`: the daemon's cached copy of OpenRouter's list, filtered for coding agents. */
+export interface OpenRouterModels {
+  key_present: boolean;
+  models: OpenRouterModel[];
+  /** Unix ms of the fetch (null: never fetched). */
+  fetched_at: number | null;
+  stale: boolean;
+  /** Why the last fetch failed (null: it didn't). */
+  error: string | null;
+}
+
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
@@ -273,6 +308,8 @@ export interface HelloResult {
   updates?: UpdateStatus;
   /** Missing from backends without shared window preferences. */
   prefs?: WindowPrefs;
+  /** Whether the backend has an OpenRouter key (never the key). Missing: no OpenRouter support. */
+  openrouter?: { key_present: boolean };
 }
 
 export interface PanelCsp {

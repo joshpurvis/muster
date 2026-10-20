@@ -55,6 +55,7 @@ import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
+import { providerPendingNote } from "./agents.ts";
 import type {
   Agent,
   Channel,
@@ -1279,16 +1280,24 @@ export async function openAgent(name: string, fresh = false) {
   const a = agents.value.find((x) => x.name === name);
   if (!a) return;
   pushRecent("a:" + a.id);
-  if (!fresh && a.session_id !== null && agentLive(a)) return gotoSession(a.session_id);
+  if (!fresh && a.session_id !== null && agentLive(a)) {
+    // A provider change applies only when it restarts: say so, as `agent.start` does.
+    const pending = providerPendingNote(a, sessions.value.get(a.session_id));
+    if (pending) toast("info", pending, 6000);
+    return gotoSession(a.session_id);
+  }
   try {
     const mark = sessionMark();
-    const r = await rpc.call<{ agent: Agent; session: SessionInfo; started: boolean }>("agent.start", {
-      name: a.name,
-      fresh: fresh || undefined,
-      window_id: windowId.value ?? undefined,
-    });
+    const r = await rpc.call<{ agent: Agent; session: SessionInfo; started: boolean; provider_pending?: boolean }>(
+      "agent.start",
+      { name: a.name, fresh: fresh || undefined, window_id: windowId.value ?? undefined },
+    );
     knowAgent(r.agent);
     knowSession(r.session, mark);
+    if (r.provider_pending) {
+      const pending = providerPendingNote(r.agent, r.session);
+      if (pending) toast("info", pending, 6000);
+    }
     await gotoSession(r.session.id);
   } catch (e) {
     toast("error", `Couldn't start ${a.name}: ${errText(e)}`);

@@ -36,6 +36,9 @@ pub struct StoredTerminal {
     pub token: String,
     pub port_base: u16,
     pub spec: muster_terminal_protocol::SpawnSpec,
+    /// Where `spec` had the OpenRouter key, stored empty (src/openrouter.rs `redact_spec`).
+    #[serde(default, skip_serializing_if = "crate::openrouter::KeyRefs::is_empty")]
+    pub key_refs: crate::openrouter::KeyRefs,
     pub pending: bool,
     pub retired: bool,
 }
@@ -345,6 +348,12 @@ const MIGRATIONS: &[&str] = &[
         beside INTEGER,
         version INTEGER NOT NULL DEFAULT 1
     );
+    "#,
+    // v18: where an agent's model runs (src/openrouter.rs), and what each session's run bills
+    // to; existing ones keep the subscription. Never a key: that stays in the daemon's memory.
+    r#"
+    ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
+    ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
     "#,
 ];
 
@@ -763,7 +772,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart, account_profile_id FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id, provider FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -786,6 +795,7 @@ impl Store {
                 channel_id: r.get(12)?,
                 autostart: r.get::<_, i64>(13)? != 0,
                 account_profile_id: r.get(14)?,
+                provider: crate::openrouter::Provider::parse(&r.get::<_, String>(15)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -797,8 +807,8 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -813,7 +823,8 @@ impl Store {
                 b.created_at,
                 b.channel_id,
                 b.autostart as i64,
-                b.account_profile_id
+                b.account_profile_id,
+                b.provider.as_str()
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -838,7 +849,7 @@ impl Store {
     pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
-                    autostart = ?7 WHERE id = ?1",
+                    autostart = ?7, provider = ?8 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -846,7 +857,8 @@ impl Store {
                 b.persona,
                 perms_json(&b.permissions),
                 serde_json::to_string(&b.accepts_origins)?,
-                b.autostart as i64
+                b.autostart as i64,
+                b.provider.as_str()
             ],
         )?;
         Ok(())
@@ -1371,7 +1383,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
-                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden FROM sessions ORDER BY id",
+                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -1402,6 +1414,7 @@ impl Store {
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
                     hidden: r.get::<_, i64>(19)? != 0,
+                    provider: crate::openrouter::Provider::parse(&r.get::<_, String>(20)?),
                     account_profile_id: r.get(18)?,
                 },
                 extra_args: serde_json::from_str(&extra).unwrap_or_default(),
@@ -1416,8 +1429,8 @@ impl Store {
         let i = &s.info;
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
-                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -1437,7 +1450,8 @@ impl Store {
                 i.created_at,
                 i.window_id,
                 i.account_profile_id,
-                i.hidden
+                i.hidden,
+                i.provider.as_str()
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -1447,7 +1461,7 @@ impl Store {
     pub fn update_session(&self, i: &SessionInfo) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET name=?2, cwd=?3, state=?4, state_detail=?5, state_since=?6, title=?7, pid=?8,
-                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14, hidden=?15 WHERE id=?1",
+                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14, hidden=?15, provider=?16 WHERE id=?1",
             params![
                 i.id,
                 i.name,
@@ -1463,7 +1477,8 @@ impl Store {
                 i.queued,
                 i.channel_id,
                 i.window_id,
-                i.hidden
+                i.hidden,
+                i.provider.as_str()
             ],
         )?;
         Ok(())
@@ -1971,6 +1986,7 @@ mod tests {
         assert!(s.load_agents().unwrap().is_empty());
         let mut b = Agent {
             account_profile_id: None,
+            provider: crate::openrouter::Provider::OpenRouter,
             id: 0,
             name: "Scout".into(),
             kind: SessionKind::Codex,
@@ -1996,6 +2012,14 @@ mod tests {
         assert_eq!((back.channel_id, back.session_id, back.resume_id.as_deref()), (Some(8), Some(42), Some("abc-123")));
         assert_eq!(back.accepts_origins, vec![Origin::Human, Origin::Schedule]);
         assert_eq!(back.model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(back.provider, crate::openrouter::Provider::OpenRouter);
+        let mut sub = back.clone();
+        sub.provider = crate::openrouter::Provider::Subscription;
+        s.update_agent_config(&sub).unwrap();
+        assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
+        // Rows from before v17 (and anything unreadable) are the subscription.
+        s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
+        assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
 
         let m = AgentMessage {
             id: 0,

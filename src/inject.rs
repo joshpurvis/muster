@@ -1371,7 +1371,7 @@ mod tests {
             store.insert_session(&crate::store::StoredSession { info, extra_args: vec![] }).unwrap();
         }
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None }, store).unwrap()
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
     }
 
     #[test]

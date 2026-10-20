@@ -40,6 +40,8 @@
   --st-exited: #6a6a76;
   --attn-bg: rgba(240, 160, 32, 0.11);
   --attn-border: rgba(240, 160, 32, 0.32);
+  /* Billing text (OpenRouter, pay per use): at least 4.5:1 on its tinted chip. */
+  --bill-fg: #f0a020;
   --add: #3fb950;
   --del: #f85149;
   --add-bg: rgba(63, 185, 80, 0.12);
@@ -104,6 +106,7 @@
   --st-exited: #9a9aa6;
   --attn-bg: rgba(214, 138, 0, 0.1);
   --attn-border: rgba(214, 138, 0, 0.35);
+  --bill-fg: #8a5300;
   --add: #1a7f37;
   --del: #cf222e;
   --add-bg: rgba(26, 127, 55, 0.09);
@@ -3988,6 +3991,173 @@ body.dragging .panel-view { pointer-events: none; }
 @media (prefers-reduced-motion: reduce) { .pv-spin { animation: none; } }
 .preview-frame { background: #fff; }
 .preview-status-url { font-family: var(--font-mono); overflow-wrap: anywhere; }
+
+/* ---------------- OpenRouter (pay per use) ---------------- */
+
+/* Amber, like other "this costs you" signals: billed per token, not a subscription. */
+.or-badge,
+.tab-or {
+  flex: none;
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--bill-fg);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+  white-space: nowrap;
+}
+
+.or-badge-head {
+  margin-left: 8px;
+  vertical-align: middle;
+  align-self: center;
+}
+
+.tab-or {
+  align-self: center;
+  font-size: 9.5px;
+  line-height: 14px;
+  padding: 0 4px;
+}
+
+.or-key-hint {
+  display: block;
+  line-height: 1.45;
+}
+
+.seg-btn[data-provider]:disabled {
+  color: var(--text-faint);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.seg-btn[data-provider]:disabled:hover {
+  color: var(--text-faint);
+}
+
+.or-warn {
+  align-items: flex-start;
+  line-height: 1.45;
+  color: var(--bill-fg);
+}
+
+.or-warn .icon {
+  margin-top: 2px;
+}
+
+.field-row .or-field {
+  grid-column: 1 / -1;
+}
+
+.or-field .field-hint {
+  display: block;
+  line-height: 1.45;
+}
+
+.or-list {
+  max-height: 232px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  background: var(--bg-1);
+  padding: 3px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.or-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.or-vendor {
+  position: sticky;
+  top: -3px;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 7px 3px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--bg-1);
+}
+
+.or-pref {
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-faint);
+}
+
+.or-opt {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  text-align: left;
+  padding: 5px 7px;
+  border-radius: 5px;
+  color: var(--text);
+}
+
+.or-opt:hover {
+  background: var(--hover);
+}
+
+.or-opt:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.or-opt.on {
+  background: var(--accent-soft);
+}
+
+.or-opt-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.or-opt-name {
+  flex: none;
+  font-weight: 550;
+}
+
+.or-opt-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.or-opt-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.or-none {
+  padding: 8px 7px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 
 /* ---------- notes (docs/UI.md "Notes") ---------- */
 .note-view {

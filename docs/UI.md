@@ -54,7 +54,10 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 - Every group has a tab strip (31px), always shown, even with one tab. Tabs show the state dot,
   the kind icon, the label, an optional `⎇` (worktree) and permissions icon (amber for network
   or accept edits, red for full access or bypass; both on every tab of the task), and `×` on
-  hover.
+  hover. The tab of a named agent whose current run is on OpenRouter (`SessionInfo.provider`, set when
+  it starts) also has a small amber **OpenRouter** chip (its tooltip and accessible name:
+  "OpenRouter · pay per use"): it bills per token. It stays until a restart applies another
+  provider, and goes when the process exits. Billing text is at least 4.5:1 in both themes.
 - **Label**: the task's name (auto-derived, muted italics while it's only the folder name). When
   the task has several sessions, a secondary muted part names the session (`fix auth · shell`);
   the task part is truncated first.
@@ -336,7 +339,8 @@ of the same kind arrives; the next waiting update shows meanwhile.
   remembers last; no "None": a tab is a session), worktree toggle (default **off**; disabled for a known non-git
   folder), base branch (only when worktree is on), optional name (blank = auto), optional first
   prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
-  Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees).
+  Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees). It has no model choice, so
+  no provider choice either: running on OpenRouter is a named agent's setting (below).
 - **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
 - **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).
 - **New agent / Edit agent** and the **message** overlay: see "Agents panel".
@@ -372,7 +376,7 @@ terminal tab; there is no chat view.
 | Part | What |
 |---|---|
 | Header | "Agents", the count, `×` hides the panel. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. Hover: the persona's first line. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
 | Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays). |
@@ -388,6 +392,24 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the template's one-line description; picking one fills every field
   (a name you typed is kept). Name and kind (Claude · Codex).
+- **Provider** (shown when the backend supports it): Subscription · OpenRouter. Subscription is
+  the CLI's own login, as before. Without `OPENROUTER_API_KEY` on the backend, OpenRouter is
+  disabled and a hint under it says how to set it (`env OPENROUTER_API_KEY=… muster reload` from a
+  shell that has the key; the key is read only when the backend starts; see docs/PROTOCOL.md
+  "OpenRouter"). An agent already on OpenRouter keeps the choice and the hint says it won't start.
+  With OpenRouter chosen, an amber note says it bills per token to the OpenRouter key, not the
+  subscription, and that Claude Code is built for Anthropic's models (Codex: OpenAI's work
+  best). Switching provider keeps the model only when the other list has it.
+- Model on OpenRouter replaces the Model dropdown: a search box over OpenRouter's models
+  (`openrouter.models`: tool use only), then a list grouped by vendor with the CLI's own vendor
+  first (Anthropic for Claude, OpenAI for Codex), each row the model's name, id, price per million
+  tokens in / out and context size; Default first for Claude (Claude Code's choice through
+  OpenRouter's latest Anthropic aliases), Custom… last (any id). Every word typed must match the
+  id or the name; ↓ goes from the search box into the list, ↑/↓/Home/End move in it, Enter in the
+  box picks the first match. The list is one Tab stop (the chosen model): the dialog's focus trap
+  skips elements with `tabindex="-1"`, so Tab never walks the rows. Under it: how many models and where from, or, with no list, why it
+  couldn't load and that Custom… still works. A Codex agent on OpenRouter has no Default: Create
+  stays off until a model is chosen.
 - Model and Effort dropdowns for the agent's kind (`agent.models`): Default (the CLI's
   choice), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
   Custom…, which shows a text field for any other value. A saved value the list doesn't have
@@ -425,8 +447,9 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
     Edit dialog and lose its unsaved Settings.
   - Files are named exactly as listed (an agent's `notes.md ` is not `notes.md`); a new note's
     name can't have invisible characters or spaces around a folder name.
-- Edit saves only changed fields (`agent.update`); model, effort and permissions apply from the
-  agent's next start, which the toast says when it runs.
+- Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
+  from the agent's next start, which the toast says when it runs. Edit's title shows the
+  OpenRouter badge for an agent on it.
 - Ctrl+Enter creates or saves. Creating opens the panel if it was closed.
 
 ## Naming (no names up front)

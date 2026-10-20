@@ -705,6 +705,7 @@ mod tests {
             client_token: "tok".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
             terminal_host: None,
+            openrouter_key: None,
         };
         let hub = Hub::new(cfg, crate::store::Store::open_memory().unwrap()).unwrap();
         let app = router(hub.clone()).unwrap();

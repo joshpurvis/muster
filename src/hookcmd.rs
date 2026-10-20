@@ -17,7 +17,8 @@
 //! without requiring a live backend. The backend replays it with transactional checkpoints.
 //! Legacy runs retain blocking HTTP/1.1 forwarding. Both paths have an absolute deadline.
 //! Always exits 0 and prints nothing on stdout (Claude/Codex may treat hook stdout as context
-//! or decisions). No-ops silently when MUSTER_URL / MUSTER_TOKEN are unset.
+//! or decisions). No-ops silently when MUSTER_URL / MUSTER_TOKEN are unset (and no token file
+//! stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -32,9 +33,28 @@ const MAX_STRING: usize = 4000;
 const REPLY_KEYS: &[&str] = &["last_assistant_message", "last-assistant-message"];
 const MAX_REPLY: usize = 64 * 1024;
 
+/// Where a run whose CLI strips credentials from its hooks' environment finds its session token
+/// (`<session dir>/hook-token`, private, rewritten at each start): an OpenRouter Claude session
+/// runs with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, which removes `MUSTER_TOKEN` (src/openrouter.rs).
+pub const TOKEN_FILE: &str = "hook-token";
+
+/// `$MUSTER_TOKEN`, else the token file of `$MUSTER_SESSION_ID`'s session.
+fn session_token() -> Option<String> {
+    session_token_from(|k| std::env::var(k).ok())
+}
+
+fn session_token_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if let Some(t) = var("MUSTER_TOKEN").filter(|t| !t.is_empty()) {
+        return Some(t);
+    }
+    let id: crate::model::SessionId = var("MUSTER_SESSION_ID")?.trim().parse().ok()?;
+    let t = std::fs::read_to_string(crate::paths::session_dir(id).join(TOKEN_FILE)).ok()?;
+    Some(t.trim().to_string()).filter(|t| !t.is_empty() && t.len() <= 256)
+}
+
 /// Returns the process exit code (always 0 unless the adapter wants to block the hook).
 pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
-    let (Ok(url), Ok(token)) = (std::env::var("MUSTER_URL"), std::env::var("MUSTER_TOKEN")) else {
+    let (Ok(url), Some(token)) = (std::env::var("MUSTER_URL"), session_token()) else {
         return 0;
     };
     if !valid_name(event) || url.is_empty() || token.is_empty() {
@@ -219,6 +239,23 @@ fn post(url: &str, path: &str, token: &str, agent: &str, body: &[u8]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scrubbed_hook_finds_its_token_in_the_session_folder() {
+        let dir = crate::paths::session_dir(987_654);
+        crate::paths::ensure_private_dir(&dir).unwrap();
+        crate::paths::write_private(&dir.join(TOKEN_FILE), b"run-token-1\n").unwrap();
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let from = |p| session_token_from(env(p));
+        assert_eq!(from(&[("MUSTER_TOKEN", "from-env"), ("MUSTER_SESSION_ID", "987654")]).as_deref(), Some("from-env"));
+        assert_eq!(from(&[("MUSTER_SESSION_ID", "987654")]).as_deref(), Some("run-token-1"));
+        assert_eq!(from(&[("MUSTER_TOKEN", ""), ("MUSTER_SESSION_ID", "987654")]).as_deref(), Some("run-token-1"));
+        assert_eq!(from(&[("MUSTER_SESSION_ID", "987655")]), None);
+        assert_eq!(from(&[]), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::net::TcpListener;
 
     #[test]

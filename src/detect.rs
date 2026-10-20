@@ -312,6 +312,7 @@ mod tests {
             created_at: 0,
             window_id: None,
             hidden: false,
+            provider: Default::default(),
         }
     }
 

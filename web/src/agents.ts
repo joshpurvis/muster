@@ -2,7 +2,16 @@
 // session, the message log, and the New / Edit dialog's rules. No signals, no DOM: unit tested
 // (agents_test.ts).
 
-import type { Agent, AgentMessage, AgentState, ModelCatalog, Origin, SessionInfo } from "./types.ts";
+import type {
+  Agent,
+  AgentMessage,
+  AgentState,
+  ModelCatalog,
+  OpenRouterModel,
+  Origin,
+  Provider,
+  SessionInfo,
+} from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
 
 /** What a row shows: the dot's state, whether a process runs, and the state's label and start. */
@@ -194,4 +203,112 @@ export async function readMemoryFile(
   }
   if (text.includes("\0")) return { skip: "not a text file" };
   return { text };
+}
+
+// ---------------- OpenRouter (src/openrouter.rs) ----------------
+
+/** The badge on agents and tabs that run on OpenRouter: billed per token, not a subscription. */
+export const OPENROUTER_BADGE = "OpenRouter · pay per use";
+
+/** A tab bills OpenRouter while its run was started on it (the session's own provider, so a
+ * changed agent keeps the badge until a restart applies the change). */
+export function sessionOnOpenRouter(s: SessionInfo | undefined): boolean {
+  return s?.provider === "openrouter" && s.state !== "exited";
+}
+
+/** An agent row's badge: shown while its live run is on OpenRouter or its saved provider is;
+ * `note` says when the two differ (the change waits for a restart). */
+export function agentBilling(
+  a: Agent,
+  s: SessionInfo | undefined,
+): { badge: boolean; label: string; note: string | null } {
+  const live = !!s && a.session_id === s.id && s.state !== "exited";
+  const running = live && s!.provider === "openrouter";
+  const saved = a.provider === "openrouter";
+  const pending = live && s!.provider !== undefined && running !== saved;
+  if (!pending) return { badge: running || saved, label: OPENROUTER_BADGE, note: null };
+  return running
+    ? {
+      badge: true,
+      label: "OpenRouter · until restart",
+      note: "Still runs on OpenRouter, pay per use: its new provider applies when it restarts",
+    }
+    : { badge: true, label: "OpenRouter · from restart", note: "Switches to OpenRouter (pay per use) when it restarts" };
+}
+
+/** The message after showing a running agent whose saved provider its run doesn't have yet. */
+export function providerPendingNote(a: Agent, s: SessionInfo | undefined): string | null {
+  if (!s || s.provider === undefined || s.state === "exited") return null;
+  const saved = a.provider ?? "subscription";
+  if (s.provider === saved) return null;
+  const name = (p: string) => (p === "openrouter" ? "OpenRouter" : "its subscription");
+  return `${a.name} still runs on ${name(s.provider)}. ${name(saved)[0].toUpperCase()}${
+    name(saved).slice(1)
+  } applies when it restarts: Start fresh, or Stop and start it.`;
+}
+
+/** Each CLI's own vendor comes first: Claude Code is built for Anthropic's models, Codex for
+ * OpenAI's (others work through OpenRouter on a best-effort basis). */
+export const PREFERRED_VENDOR: Record<Agent["kind"], string> = { claude: "anthropic", codex: "openai" };
+
+export interface VendorGroup {
+  vendor: string;
+  models: OpenRouterModel[];
+}
+
+/** The models matching `query` (every word, in the id or the name, any case), grouped by
+ * vendor: `prefer` first, then A to Z; within a vendor, the daemon's order (newest first). */
+export function vendorGroups(models: OpenRouterModel[], query: string, prefer: string): VendorGroup[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const groups = new Map<string, OpenRouterModel[]>();
+  for (const m of models) {
+    const hay = `${m.id} ${m.name}`.toLowerCase();
+    if (!words.every((w) => hay.includes(w))) continue;
+    const g = groups.get(m.vendor);
+    if (g) g.push(m);
+    else groups.set(m.vendor, [m]);
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => (a === prefer ? -1 : b === prefer ? 1 : a.localeCompare(b)))
+    .map(([vendor, models]) => ({ vendor, models }));
+}
+
+/** `$0.25`, `$1.50`, `$3`, `<$0.01`. */
+function dollars(n: number): string {
+  if (n > 0 && n < 0.01) return "<$0.01";
+  const cents = Math.round(n * 100);
+  return cents % 100 === 0 ? `$${cents / 100}` : `$${(cents / 100).toFixed(2)}`;
+}
+
+/** What a model costs per million tokens, in and out: `$3 / $15`, `free`, or "" when unknown. */
+export function priceLabel(m: OpenRouterModel): string {
+  const { prompt_per_m: p, completion_per_m: c } = m;
+  if (p === null || c === null) return "";
+  if (p === 0 && c === 0) return "free";
+  return `${dollars(p)} / ${dollars(c)}`;
+}
+
+/** `1M`, `200k`, "" when unknown. */
+export function contextLabel(n: number | null): string {
+  if (!n) return "";
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(1))}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
+/** The values the Model field lists for `provider`: the CLI's curated ids, or OpenRouter's. */
+export function listedModels(
+  provider: Provider,
+  kind: Agent["kind"],
+  catalog: ModelCatalog | null,
+  openrouter: OpenRouterModel[],
+): string[] {
+  return provider === "openrouter"
+    ? openrouter.map((m) => m.id)
+    : (catalog?.[kind].models ?? []).map((m) => m.id);
+}
+
+/** Codex on OpenRouter has no usable default (its own model names lack the vendor prefix). */
+export function needsModel(provider: Provider, kind: Agent["kind"], model: string): boolean {
+  return provider === "openrouter" && kind === "codex" && !model.trim();
 }

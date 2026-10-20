@@ -24,6 +24,7 @@ import {
 } from "../state.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
+import { OPENROUTER_BADGE, sessionOnOpenRouter } from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -676,8 +677,10 @@ function GroupTab(
   }
 
   const home = meta.value.home;
+  const onOpenRouter = sessionOnOpenRouter(s);
   const tip = [
     tabText(label),
+    onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
@@ -757,6 +760,7 @@ function GroupTab(
           <IconBranch size={12} />
         </span>
       )}
+      {onOpenRouter && <span class="tab-or" aria-label={OPENROUTER_BADGE}>OpenRouter</span>}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}
       <button

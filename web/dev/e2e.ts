@@ -967,6 +967,95 @@ try {
     );
     ok("New agent: the Researcher template prefilled the dialog; schedule on a Claude agent warns; created");
 
+    // Provider: OpenRouter is off without the backend's key (the hint says how to set it); with
+    // it, the Model field is a searchable list of OpenRouter's models grouped by vendor, and the
+    // agent gets the pay-per-use badge.
+    if (!real) {
+      const newAgentDialog = async () => {
+        await a.key("Ctrl+Shift+P");
+        await a.wait(`!!document.querySelector('.switcher')`);
+        await a.type("new agent");
+        await a.sleep(150);
+        await a.key("Enter");
+        await a.wait(`!!document.querySelector('.agent-dlg [data-provider="openrouter"]')`, 3000);
+      };
+      await newAgentDialog();
+      check(
+        await a.eval(`document.querySelector('.agent-dlg [data-provider="openrouter"]').disabled`) &&
+          await a.eval(`document.querySelector('.agent-dlg [data-provider="subscription"]').getAttribute('aria-checked') === 'true'`),
+        "without the key OpenRouter is disabled and Subscription chosen",
+      );
+      check(
+        await a.eval(`document.querySelector('.or-key-hint')?.textContent.includes('env OPENROUTER_API_KEY=… muster reload')`),
+        "the hint says how to set the key and that the backend restarts",
+      );
+      await shot(a, "10c-new-agent-openrouter-off");
+      await a.key("Escape");
+      await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
+      await R(a, "mock.openrouter", { key_present: true });
+      await R(a, "mock.drop_clients", {});
+      await a.sleep(600);
+      await a.wait(`${M}.rpc.isOpen && ${M}.openRouter.value?.key_present === true`, 10_000);
+      await newAgentDialog();
+      await a.type("or-coder");
+      await a.click(`.agent-dlg [data-provider="openrouter"]`);
+      await a.wait(`document.querySelectorAll('.or-opt').length > 10`, 3000);
+      check(
+        await a.eval(`document.querySelector('.or-vendor')?.textContent.startsWith('anthropic')`),
+        "Anthropic's models come first for a Claude agent",
+      );
+      check(
+        await a.eval(`document.querySelector('.or-warn')?.textContent.includes('pay per use')`),
+        "the dialog says OpenRouter bills per token",
+      );
+      await a.click(`.or-opt[data-model="anthropic/claude-sonnet-5.5"]`);
+      await a.wait(`document.querySelector('.or-opt.on')?.dataset.model === 'anthropic/claude-sonnet-5.5'`, 1000);
+      await shot(a, "10d-new-agent-openrouter-models");
+      // Tab stops at the chosen model once, then leaves the list (its other rows are ↑/↓ only).
+      await a.eval(`document.querySelector('.or-search').focus()`);
+      await a.key("Tab");
+      check(
+        await a.eval(`document.activeElement?.dataset.model === 'anthropic/claude-sonnet-5.5'`),
+        "Tab from the search box reaches the chosen model",
+      );
+      await a.key("Tab");
+      check(
+        await a.eval(`!document.activeElement?.classList.contains('or-opt')`),
+        "the next Tab leaves the model list instead of walking every row",
+      );
+      // Focused directly: the Tabs above may have scrolled the dialog past the box.
+      await a.eval(`document.querySelector('.or-search').focus()`);
+      await a.type("qwen coder");
+      await a.sleep(150);
+      check(
+        await a.eval(`[...document.querySelectorAll('.or-opt')].map((o) => o.dataset.model).join()`) ===
+          "qwen/qwen3.5-coder,custom",
+        "search keeps only the matching model (and Custom…)",
+      );
+      await shot(a, "10e-new-agent-openrouter-search");
+      await a.key("Enter");
+      await a.wait(`document.querySelector('.or-opt.on')?.dataset.model === 'qwen/qwen3.5-coder'`, 1000);
+      await a.key("Ctrl+Enter");
+      await a.wait(`!document.querySelector('.agent-dlg') && !!document.querySelector('[data-agent="or-coder"] .or-badge')`, 3000);
+      const orAgent: any = (await R(a, "agent.list", {})).find((x: any) => x.name === "or-coder");
+      check(
+        orAgent?.provider === "openrouter" && orAgent.model === "qwen/qwen3.5-coder",
+        `created on OpenRouter with the picked model: ${JSON.stringify(orAgent)}`,
+      );
+      // Started, its tab carries the badge too.
+      await a.click(`[data-agent="or-coder"]`);
+      await a.wait(`!!document.querySelector('.tab.active .tab-or')`, 6000);
+      await shot(a, "10f-agent-openrouter-badge");
+      // Switched back to the subscription while running: it still bills OpenRouter until it
+      // restarts, and both the row and the tab keep saying so.
+      await R(a, "agent.update", { name: "or-coder", provider: "subscription" });
+      await a.wait(`document.querySelector('[data-agent="or-coder"] .or-badge')?.textContent === 'OpenRouter · until restart'`, 3000);
+      check(await a.eval(`!!document.querySelector('.tab.active .tab-or')`), "the tab keeps its badge until a restart");
+      await R(a, "agent.remove", { name: "or-coder" });
+      await a.wait(`!document.querySelector('.tab-or')`, 3000);
+      ok("Provider: OpenRouter off without the key (with a hint), a searchable model list with it, the pay-per-use badge");
+    }
+
     // Edit ▸ Memory: list, open, edit and save a file.
     await a.click(`[data-agent="orchestrator"]`, { button: "right" });
     await a.wait(`!!document.querySelector('.menu')`);

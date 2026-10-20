@@ -21,6 +21,7 @@ mod panel_kit;
 mod web_preview;
 mod skills;
 mod notify;
+mod openrouter;
 mod paths;
 mod pr;
 mod renderer;
@@ -396,6 +397,10 @@ enum AgentCmd {
         profile: Option<String>,
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
         kind: String,
+        /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
+        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
+        provider: Option<String>,
         /// Model for the agent CLI.
         #[arg(long, value_name = "M")]
         model: Option<String>,
@@ -421,6 +426,10 @@ enum AgentCmd {
     /// (model, effort and permissions apply from its next start).
     Edit {
         name: String,
+        /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
+        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
+        provider: Option<String>,
         /// Model for the agent CLI (empty: the CLI's default).
         #[arg(long, value_name = "M")]
         model: Option<String>,
@@ -623,6 +632,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 name,
                 profile,
                 kind,
+                provider,
                 model,
                 effort,
                 persona,
@@ -636,6 +646,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     name,
                     profile,
                     kind: Some(kind),
+                    provider,
                     model,
                     effort,
                     persona: read_persona(persona, persona_file)?,
@@ -647,6 +658,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             ),
             AgentCmd::Edit {
                 name,
+                provider,
                 model,
                 effort,
                 persona,
@@ -660,6 +672,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     name,
                     kind: None,
                     profile: None,
+                    provider,
                     model,
                     effort,
                     persona: read_persona(persona, persona_file)?,
@@ -696,7 +709,29 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
 /// The running daemon, if its discovery file is fresh and it answers.
 fn find_daemon() -> Option<Discovery> {
     let d = paths::read_discovery()?;
-    (paths::pid_alive(d.pid) && is_muster_process(d.pid) && client::healthy(d.port)).then_some(d)
+    (backend_alive(&d) && client::healthy(d.port)).then_some(d)
+}
+
+/// Is the backend `d` names running? By its pid where this process can see it. A command run in
+/// its own PID namespace can't (Claude Code's Bash under `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, in
+/// an OpenRouter session): there the backend must answer its token-authenticated `hello` with
+/// that pid, which a stale discovery file or a recycled pid can't fake.
+fn backend_alive(d: &Discovery) -> bool {
+    if paths::pid_alive(d.pid) {
+        return is_muster_process(d.pid);
+    }
+    backend_answers_as(d)
+}
+
+/// The backend at `d.port` knows `d.token` and reports `d.pid` as its own.
+fn backend_answers_as(d: &Discovery) -> bool {
+    client::rpc_with_timeout(d, "hello", serde_json::json!({}), Duration::from_secs(5))
+        .is_ok_and(|h| h["pid"].as_u64() == Some(d.pid as u64))
+}
+
+/// The backend runs but this process can't see (or signal) it: see [`backend_alive`].
+fn backend_hidden(d: &Discovery) -> bool {
+    !paths::pid_alive(d.pid) && backend_answers_as(d)
 }
 
 fn running() -> anyhow::Result<Discovery> {
@@ -818,7 +853,7 @@ fn stop() -> anyhow::Result<()> {
 /// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
 /// compatible host and the same backend identity immediately before signalling.
 fn reload() -> anyhow::Result<()> {
-    let discovery = paths::read_discovery().filter(|d| paths::pid_alive(d.pid) && is_muster_process(d.pid));
+    let discovery = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &discovery {
         let hello = client::rpc(d, "hello", serde_json::json!({}))
             .context("cannot verify restart safety; backend left running")?;
@@ -826,11 +861,83 @@ fn reload() -> anyhow::Result<()> {
             &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
         ).context("cannot verify a compatible terminal host; backend left running")?;
         check_reload(&hello, &host.client.hello, &paths::lock_path())?;
+        // From a PID namespace this command can't stop the backend (nor see its replacement's
+        // process), so the backend restarts itself, keeping its environment.
+        if backend_hidden(d) {
+            anyhow::ensure!(
+                std::env::var_os(openrouter::ENV_KEY).is_none(),
+                "this command runs where Muster's backend process isn't visible (a sandboxed command), so the backend \
+                 has to restart itself with its own environment; {} set here can't be applied. Run it outside the sandbox",
+                openrouter::ENV_KEY
+            );
+            reload_handoff(d)?;
+            println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
+            return Ok(());
+        }
+        // The replacement gets this command's environment. When that has no OpenRouter key and
+        // the backend has one (only in its memory), the backend restarts itself instead, so the
+        // key carries over. OPENROUTER_API_KEY set here, even empty, replaces (or clears) it.
+        if std::env::var_os(openrouter::ENV_KEY).is_none() && hello["openrouter"]["key_present"] == true {
+            match reload_handoff(d) {
+                Ok(()) => {
+                    println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
+                    return Ok(());
+                }
+                Err(error) if error.to_string().contains(crate::updates::HANDOFF_REFUSED) => {
+                    eprintln!("note: the backend can't restart itself here ({error:#}); reloading from this shell instead");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        warn_openrouter_key_lost(&hello);
         stop_backend(Some(d))?;
     }
     start_daemon_detached()?;
     println!("muster backend restarted; terminals preserved");
     Ok(())
+}
+
+/// Ask the backend to run `reload` itself (`daemon.reload_handoff`), then wait for its
+/// replacement. A refusal (a message with `HANDOFF_REFUSED`) is returned as an error so the
+/// caller reloads the usual way; any other failure may have started the reload already, so it
+/// waits for a replacement rather than starting a second one.
+fn reload_handoff(d: &Discovery) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating the muster binary")?;
+    let sent = client::rpc(d, "daemon.reload_handoff", serde_json::json!({ "exe": exe }));
+    if let Err(error) = &sent
+        && error.to_string().contains(crate::updates::HANDOFF_REFUSED)
+    {
+        return sent.map(|_| ());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(next) = paths::read_discovery().filter(|n| n.pid != d.pid && backend_alive(n))
+            && client::rpc(&next, "hello", serde_json::json!({})).is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(match sent {
+                Err(error) => error.context("the backend did not restart"),
+                Ok(_) => anyhow::anyhow!("the backend did not come back within 30 s; see {}", paths::log_path().display()),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The replacement backend gets this command's environment, so an OpenRouter key the running
+/// backend has and this shell doesn't is gone after the reload: say so (never refuse).
+fn warn_openrouter_key_lost(hello: &serde_json::Value) {
+    let here = std::env::var(openrouter::ENV_KEY).ok().and_then(|v| openrouter::ApiKey::new(&v)).is_some();
+    if hello["openrouter"]["key_present"] == true && !here {
+        eprintln!(
+            "note: the running backend has an OpenRouter key and this command's {key} is empty or unusable, so the \
+             restarted backend won't: OpenRouter agents won't start until it is restarted with one \
+             (`env {key}=… muster reload`).",
+            key = openrouter::ENV_KEY
+        );
+    }
 }
 
 /// Everything the replacement backend will require of the running host, checked before
@@ -851,6 +958,9 @@ fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_prot
 }
 
 fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
+    if let Some(d) = paths::read_discovery().filter(backend_hidden) {
+        anyhow::bail!("Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); stop it from outside", d.pid);
+    }
     let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
         println!("muster daemon: not running");
         return Ok(());
@@ -1013,6 +1123,8 @@ async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
 }
 
 fn run_daemon() -> anyhow::Result<()> {
+    // First, while this is the only thread: the key leaves the process environment.
+    let openrouter_key = openrouter::take_key_from_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MUSTER_LOG")
@@ -1028,13 +1140,13 @@ fn run_daemon() -> anyhow::Result<()> {
     let _lock = acquire_lock()?;
     paths::ensure_private_dir(&paths::data_dir())?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let r = rt.block_on(daemon_main());
+    let r = rt.block_on(daemon_main(openrouter_key));
     rt.shutdown_timeout(Duration::from_secs(2));
     paths::remove_discovery_if_ours();
     r
 }
 
-async fn daemon_main() -> anyhow::Result<()> {
+async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // The terminal host and its rollback fence first: an older, monolithic daemon holding
@@ -1067,6 +1179,7 @@ async fn daemon_main() -> anyhow::Result<()> {
             client_token: client_token.clone(),
             muster_bin,
             terminal_host: Some(terminal_host),
+            openrouter_key,
         },
         store,
     )?;

@@ -200,6 +200,9 @@ pub struct HubConfig {
     pub muster_bin: PathBuf,
     /// Absent only in pure application fixtures that never launch processes.
     pub terminal_host: Option<Arc<TerminalService>>,
+    /// The owner's OpenRouter key, read from the daemon's environment at start
+    /// (src/openrouter.rs). Memory only: never stored, logged or sent to a client.
+    pub openrouter_key: Option<crate::openrouter::ApiKey>,
 }
 
 /// What `attach` hands to a client connection.
@@ -449,6 +452,8 @@ pub struct Hub {
     updates: crate::updates::Updates,
     /// Serializes `set_ui_prefs`.
     prefs_lock: Mutex<()>,
+    /// OpenRouter's model list (`openrouter.models`).
+    openrouter_models: Arc<crate::openrouter::ModelCache>,
     weak: Weak<Hub>,
 }
 
@@ -491,6 +496,28 @@ impl Hub {
 
     pub fn updates(&self) -> &crate::updates::Updates {
         &self.updates
+    }
+
+    pub fn openrouter_key(&self) -> Option<&crate::openrouter::ApiKey> {
+        self.cfg.openrouter_key.as_ref()
+    }
+
+    pub fn openrouter_models(&self) -> &Arc<crate::openrouter::ModelCache> {
+        &self.openrouter_models
+    }
+
+    /// The provider session `id` runs on: its named agent's (read at each start, so an edit
+    /// applies from the next one); every other session uses its CLI's own login.
+    pub fn session_provider(&self, id: SessionId) -> crate::openrouter::Provider {
+        self.agents.by_session(id).map(|a| a.provider).unwrap_or_default()
+    }
+
+    /// Fail before a (re)start when the session's provider can't run (no key).
+    pub fn check_session_provider(&self, id: SessionId) -> anyhow::Result<()> {
+        if self.session_provider(id) == crate::openrouter::Provider::OpenRouter && self.openrouter_key().is_none() {
+            return Err(crate::openrouter::missing_key_error());
+        }
+        Ok(())
     }
 
     /// Window preferences shared by every window (`prefs.get`).
@@ -548,7 +575,22 @@ impl Hub {
             for record in terminal_records.values_mut() {
                 if record.host_instance != host.client.hello.instance { continue }
                 if !record.retired && record.pending {
-                    match host.spawn(record.spec.clone()) {
+                    // The host already has this run: it started, so adopt it below. Re-sending
+                    // could differ from what was launched (the OpenRouter key changed or is gone
+                    // since), which the host refuses, and a refused run would be retired: its
+                    // live process killed.
+                    if inventory.iter().any(|run| run.run == record.spec.run) {
+                        record.pending = false;
+                        store.save_terminal(record.spec.run.id, record)?;
+                        continue;
+                    }
+                    // Never started, and it needs a key this backend doesn't have: keep it
+                    // pending (nothing runs) until a backend with the key recovers it.
+                    if !record.key_refs.is_empty() && cfg.openrouter_key.is_none() {
+                        tracing::warn!(run = ?record.spec.run, "an OpenRouter launch waits for {}", crate::openrouter::ENV_KEY);
+                        continue;
+                    }
+                    match host.spawn(crate::openrouter::restore_spec(record.spec.clone(), &record.key_refs, cfg.openrouter_key.as_ref())) {
                         Ok(_) => record.pending = false,
                         // A definite per-run rejection (its program or cwd vanished during
                         // the outage) retires only that launch; the others still recover.
@@ -684,6 +726,7 @@ impl Hub {
             rt: tokio::runtime::Handle::try_current().ok(),
             updates: Default::default(),
             prefs_lock: Mutex::new(()),
+            openrouter_models: Arc::new(crate::openrouter::ModelCache::new(paths::data_dir().join("openrouter-models.json"))),
             weak: weak.clone(),
         });
         if let Some(host) = &hub.cfg.terminal_host {
@@ -2579,6 +2622,7 @@ impl Hub {
                 created_at: now,
                 window_id: Some(window_id),
                 hidden: false,
+                provider: Default::default(),
             };
             let stored = StoredSession {
                 info,
@@ -2736,6 +2780,10 @@ impl Hub {
             let records = self.terminal_records.lock();
             if let Some(record) = records.get(&id) {
                 anyhow::ensure!(!record.retired, "session {id}'s previous terminal is still being retired; retry after cleanup");
+                if record.pending && !record.key_refs.is_empty() && self.openrouter_key().is_none() {
+                    return Err(crate::openrouter::missing_key_error()
+                        .context(format!("session {id}'s previous launch, prepared for OpenRouter, waits for the key")));
+                }
                 anyhow::ensure!(!record.pending, "session {id}'s previous launch is unconfirmed; retry after it is reconciled");
             }
         }
@@ -2780,7 +2828,19 @@ impl Hub {
             initial_prompt: prompt.clone(),
             permissions,
         };
-        let spec = adapter_for(info.kind).command(&ctx)?;
+        let mut spec = adapter_for(info.kind).command(&ctx)?;
+        let provider = self.session_provider(id);
+        let openrouter = match provider {
+            crate::openrouter::Provider::OpenRouter => {
+                let key = self.openrouter_key().cloned().ok_or_else(crate::openrouter::missing_key_error)?;
+                if info.kind == SessionKind::Codex {
+                    // Muster's own provider settings, ahead of the stored (allowlisted) args.
+                    spec.args.splice(0..0, crate::openrouter::codex_args());
+                }
+                Some(key)
+            }
+            crate::openrouter::Provider::Subscription => None,
+        };
         let queued_prompt = prompt.filter(|_| !spec.consumed_initial_prompt).zip(source);
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         env.insert("MUSTER".into(), "1".into());
@@ -2801,15 +2861,29 @@ impl Hub {
         let host = self.cfg.terminal_host.as_ref().context("terminal host is not configured")?;
         let mut complete_env: BTreeMap<String, String> = std::env::vars().collect();
         for key in INHERITED_SESSION_MARKERS { complete_env.remove(*key); }
+        // Never the OpenRouter key (nor a variable holding it, nor the gateway paired with it),
+        // nor OpenRouter settings inherited from an OpenRouter session.
+        crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
         complete_env.extend(env);
         self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
+        let mut injected = Vec::new();
+        if let Some(key) = &openrouter {
+            injected = crate::openrouter::apply_session_env(info.kind, key, &mut complete_env)?;
+            if info.kind == SessionKind::Claude {
+                // Its hooks lose MUSTER_TOKEN to Claude Code's credential scrub: they read it here.
+                paths::write_private(&session_dir.join(crate::hookcmd::TOKEN_FILE), token.as_bytes())?;
+            }
+        }
         let launch = SpawnSpec {
             run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
             env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
         };
+        // No stored launch record holds the key, whatever the session's provider; only the
+        // variables Muster set to it are filled in again when it is re-sent (restore_spec).
+        let (stored_spec, key_refs) = crate::openrouter::redact_spec(launch.clone(), self.openrouter_key(), &injected);
         let mut record = StoredTerminal {
             host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
-            spec: launch.clone(), pending: true, retired: false,
+            spec: stored_spec, key_refs, pending: true, retired: false,
         };
         let previous = {
             let mut g = self.inner.lock();
@@ -2823,6 +2897,8 @@ impl Hub {
             info.state = AgentState::Starting;
             info.state_detail = None;
             info.state_since = now_ms();
+            // What this run bills to (the badge follows the run, not the agent's saved setting).
+            info.provider = provider;
             info.pid = None;
             info.exit_code = None;
             info.subagents = 0;
@@ -2864,6 +2940,7 @@ impl Hub {
                         info.subagents = previous.subagents;
                         info.title = previous.title.clone();
                         info.queued = previous.queued;
+                        info.provider = previous.provider;
                         if let Err(err) = self.store.update_session(info) {
                             tracing::warn!(session = id, "persisting session: {err}");
                         }
@@ -2954,6 +3031,7 @@ impl Hub {
         // Fail before interrupting a live process if its selected profile cannot start.
         let info = self.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         self.check_account_profile(info.account_profile_id)?;
+        self.check_session_provider(id)?;
         {
             let mut g = self.inner.lock();
             let e = g
@@ -3585,15 +3663,18 @@ impl Hub {
     /// restart. Spawn is retry-safe: the host returns the original process for the same run.
     pub fn reconcile_pending(&self) -> anyhow::Result<()> {
         let Some(host) = &self.cfg.terminal_host else { return Ok(()) };
+        let key = self.openrouter_key();
         let pending: Vec<_> = self.terminal_records.lock().iter()
             .filter(|(_, r)| r.pending && !r.retired && r.host_instance == host.client.hello.instance)
+            // Deferred until a backend with the OpenRouter key (see `Hub::new`).
+            .filter(|(_, r)| key.is_some() || r.key_refs.is_empty())
             .map(|(id, r)| (*id, r.clone())).collect();
         for (id, mut record) in pending {
             let run = record.spec.run;
             // A start still in progress handles its own acknowledgement.
             let idle = self.inner.lock().sessions.get(&id).is_some_and(|e| !e.busy && e.generation == run.generation);
             if !idle { continue }
-            let result = host.spawn(record.spec.clone());
+            let result = host.spawn(crate::openrouter::restore_spec(record.spec.clone(), &record.key_refs, key));
             let mut g = self.inner.lock();
             let mut records = self.terminal_records.lock();
             if !records.get(&id).is_some_and(|r| r.spec.run == run && r.pending && !r.retired) { continue }
@@ -4104,10 +4185,17 @@ mod tests {
 
     /// `move_fixture`, with session 2 (Claude, in channel 1) a named agent's.
     fn agent_fixture() -> Arc<Hub> {
-        fixture_with(None, |store| {
+        provider_fixture(None, None, Default::default())
+    }
+
+    /// `agent_fixture` with the agent on `provider`, a terminal host and an OpenRouter key.
+    fn provider_fixture(terminal_host: Option<Arc<TerminalService>>, key: Option<crate::openrouter::ApiKey>,
+        provider: crate::openrouter::Provider) -> Arc<Hub> {
+        fixture_keyed(terminal_host, key, |store| {
             store
                 .insert_agent(&crate::agents::Agent {
                     account_profile_id: None,
+                    provider,
                     id: 0,
                     name: "ada".into(),
                     kind: SessionKind::Claude,
@@ -4128,6 +4216,11 @@ mod tests {
     }
 
     fn fixture_with(terminal_host: Option<Arc<TerminalService>>, setup: impl FnOnce(&Store)) -> Arc<Hub> {
+        fixture_keyed(terminal_host, None, setup)
+    }
+
+    fn fixture_keyed(terminal_host: Option<Arc<TerminalService>>, openrouter_key: Option<crate::openrouter::ApiKey>,
+        setup: impl FnOnce(&Store)) -> Arc<Hub> {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
         let ch = |name: &str, archived| Channel {
@@ -4171,6 +4264,7 @@ mod tests {
             client_token: "t".into(),
             muster_bin: PathBuf::from("/bin/true"),
             terminal_host,
+            openrouter_key,
         };
         Hub::new(cfg, store).unwrap()
     }
@@ -4217,7 +4311,7 @@ mod tests {
     }
 
     fn remember_launch(hub: &Hub, pending: bool) {
-        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(),
+        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(), key_refs: Default::default(),
             port_base: 20000, pending, retired: false,
             spec: SpawnSpec { run: RunId { id: 1, generation: 42 }, program: "/bin/true".into(),
                 args: vec![], env: BTreeMap::new(), cwd: std::env::temp_dir(), cols: 80, rows: 24 } };
@@ -4279,7 +4373,7 @@ mod tests {
     #[test]
     fn hook_count_state_and_grace_are_checkpointed_without_duplicate_effects() {
         let hub = move_fixture();
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: "/".into(), cols: 80, rows: 24 } };
@@ -4320,7 +4414,7 @@ mod tests {
         let hub = move_fixture();
         let directory = std::env::temp_dir().join(format!("muster-input-boundary-{}", paths::random_token()));
         let mut inbox = crate::hook_inbox::Inbox::open(&directory.join("hooks.sqlite")).unwrap();
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };
@@ -4463,11 +4557,126 @@ mod tests {
     }
 
     #[test]
+    fn an_openrouter_agent_gets_the_gateway_and_no_record_holds_the_key() {
+        use crate::openrouter::{ApiKey, Provider};
+        const KEY: &str = "sk-or-fixture-secret-4242";
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-openrouter");
+        let hub = provider_fixture(Some(service.clone()), ApiKey::new(KEY), Provider::OpenRouter);
+        assert_eq!(hub.session_provider(2), Provider::OpenRouter);
+        assert_eq!(hub.session_provider(1), Provider::Subscription);
+        hub.check_session_provider(2).unwrap();
+        for id in [1, 2] {
+            let _ = hub.start_process(id, None, None); // the fixture host refuses every launch
+        }
+        let spawns = received.spawns.lock().clone();
+        assert_eq!(spawns.len(), 2, "{spawns:?}");
+        let (shell, claude) = (&spawns[0], &spawns[1]);
+        assert_eq!(claude.env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api");
+        assert_eq!(claude.env["ANTHROPIC_AUTH_TOKEN"], KEY);
+        assert_eq!(claude.env["ANTHROPIC_API_KEY"], "");
+        assert_eq!(claude.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1");
+        assert_eq!(claude.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        // Its hooks lose MUSTER_TOKEN to that scrub; they read the run's token from its folder.
+        let token_file = paths::session_dir(2).join(crate::hookcmd::TOKEN_FILE);
+        assert_eq!(std::fs::read_to_string(&token_file).unwrap(), claude.env["MUSTER_TOKEN"]);
+        assert!(!paths::session_dir(1).join(crate::hookcmd::TOKEN_FILE).exists(), "only where the scrub runs");
+        assert!(!claude.env.contains_key("OPENROUTER_API_KEY"));
+        for var in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY", "MUSTER_PROVIDER"] {
+            assert!(!shell.env.contains_key(var), "a subscription session never gets {var}");
+        }
+        assert!(!shell.env.values().any(|v| v.contains(KEY)));
+        // The launch records Muster keeps (memory and database) have a placeholder instead.
+        for record in hub.store.load_terminals().unwrap().values().chain(hub.terminal_records.lock().values()) {
+            assert!(!serde_json::to_string(record).unwrap().contains(KEY));
+        }
+        assert!(!serde_json::to_string(&hub.sessions()).unwrap().contains(KEY));
+        drop((hub, service));
+        let _ = std::fs::remove_dir_all(directory);
+
+        // Without a key, an OpenRouter agent's session doesn't start (nothing reaches the host).
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-openrouter-nokey");
+        let hub = provider_fixture(Some(service.clone()), None, Provider::OpenRouter);
+        assert!(hub.check_session_provider(2).unwrap_err().to_string().contains("OPENROUTER_API_KEY"));
+        assert!(hub.start_process(2, None, None).err().unwrap().to_string().contains("OPENROUTER_API_KEY"));
+        assert!(received.spawns.lock().is_empty());
+        drop((hub, service));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_pending_openrouter_launch_is_adopted_or_deferred_never_rebuilt() {
+        use crate::openrouter::{ApiKey, Provider};
+        const KEY: &str = "sk-or-fixture-secret-4242";
+        let key = ApiKey::new(KEY).unwrap();
+        let run = RunId { id: 2, generation: 42 };
+        // A launch prepared for OpenRouter, saved (redacted) before a crash.
+        let prepared = |key: &ApiKey| {
+            let (spec, key_refs) = crate::openrouter::redact_spec(SpawnSpec { run, program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::from([
+                    ("ANTHROPIC_AUTH_TOKEN".to_string(), key.expose().to_string()),
+                    ("MUSTER_PROVIDER".to_string(), "openrouter".to_string()),
+                ]),
+                cwd: std::env::temp_dir(), cols: 80, rows: 24 }, Some(key), &["ANTHROPIC_AUTH_TOKEN".to_string()]);
+            StoredTerminal { host_instance: "input-host".into(), token: "run-token".into(),
+                port_base: 20000, pending: true, retired: false, spec, key_refs }
+        };
+        let status = |directory: &Path| muster_terminal_protocol::TerminalStatus { run, pid: Some(1), alive: true,
+            drained: false, has_processes: true, exit_code: None, title: None, cols: 80, rows: 24, output_seq: 0,
+            last_output_at: 0, application_cursor: false, log_persisted: true, cwd: directory.to_owned() };
+        let with_agent = |store: &Store, record: &StoredTerminal| {
+            store.insert_agent(&crate::agents::Agent {
+                account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
+                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(),
+                permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false,
+            }).unwrap();
+            store.save_terminal(2, record).unwrap();
+        };
+
+        // The host already started it, and the backend now has another key (or none): it is
+        // adopted as it runs, never re-sent (the host would refuse the different launch and
+        // the recovery would retire, i.e. kill, the live process).
+        for now_key in [None, ApiKey::new("sk-or-a-different-key-77")] {
+            let directory = std::env::temp_dir();
+            let (service, dir, received) = crate::terminal::testing::serving_host_with("hub-or-adopt", vec![status(&directory)]);
+            let hub = fixture_keyed(Some(service.clone()), now_key, |store| with_agent(store, &prepared(&key)));
+            assert!(received.spawns.lock().is_empty(), "nothing re-sent");
+            let saved = hub.store.load_terminals().unwrap().remove(&2).unwrap();
+            assert!(!saved.pending && !saved.retired, "adopted: {saved:?}");
+            assert!(hub.session(2).unwrap().state != AgentState::Exited);
+            drop((hub, service));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Never started, and this backend has no key: it waits (nothing runs, nothing retired),
+        // and a new start says why.
+        let (service, dir, received) = crate::terminal::testing::serving_host("hub-or-defer");
+        let hub = fixture_keyed(Some(service.clone()), None, |store| with_agent(store, &prepared(&key)));
+        assert!(received.spawns.lock().is_empty());
+        let saved = hub.store.load_terminals().unwrap().remove(&2).unwrap();
+        assert!(saved.pending && !saved.retired);
+        hub.reconcile_pending().unwrap();
+        assert!(received.spawns.lock().is_empty(), "reconcile_pending defers it too");
+        assert!(format!("{:#}", hub.start_process(2, None, None).err().unwrap()).contains("OPENROUTER_API_KEY"));
+        drop((hub, service));
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Never started, and the key is back: re-sent with it.
+        let (service, dir, received) = crate::terminal::testing::serving_host("hub-or-resend");
+        let _hub = fixture_keyed(Some(service.clone()), Some(key.clone()), |store| with_agent(store, &prepared(&key)));
+        let spawns = received.spawns.lock().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].env["ANTHROPIC_AUTH_TOKEN"], KEY);
+        drop((_hub, service));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn keystrokes_reach_the_terminal_while_a_callback_commit_holds_the_hub_lock() {
         let (service, directory, received) = crate::terminal::testing::serving_host("hub-hot-path");
         let hub = move_fixture();
         let terminal = install_terminal(&hub, &service, 2, 42, &directory);
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: terminal.run(), program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };
@@ -4650,7 +4859,7 @@ mod tests {
         let original = move_fixture();
         let old = original.session(1).unwrap();
         let cfg = HubConfig { port: 0, client_token: "replacement".into(),
-            muster_bin: PathBuf::from("/bin/true"), terminal_host: None };
+            muster_bin: PathBuf::from("/bin/true"), terminal_host: None, openrouter_key: None };
         let replacement = Hub::new(cfg, original.store.clone()).unwrap();
         let current = replacement.session(1).unwrap();
         assert_ne!(old.state_seq, current.state_seq);
@@ -5007,6 +5216,7 @@ mod tests {
                 client_token: "t".into(),
                 muster_bin: PathBuf::from("/bin/true"),
             terminal_host: None,
+            openrouter_key: None,
             },
             store,
         )

@@ -115,7 +115,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -160,10 +160,11 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
-| `agent.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). Emits `agent_upserted`. |
-| `agent.update` | `{name, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Model, effort and permissions apply from its next start. Emits `agent_upserted`. |
+| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
+| `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
 | `agent.messages` | `{agent?, before?, limit? = 50 (max 200)}` | `{messages: AgentMessage[], more: bool}`, newest first: messages to `agent` (else every agent) with id below `before`. |
 | `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
 | `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`, used exactly as given (never trimmed: `notes.md ` is its own file): no absolute path, no `..`, `.` or empty parts. Every component is opened from the one before it (`openat` with `O_NOFOLLOW`, from the home folder's fd), so a link anywhere, also one swapped in during the call, is refused. At most 256 KB, UTF-8 only. |
@@ -172,13 +173,14 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.memory.delete` | `{name, path}` | `{path}`. Removes one regular file under `memory/` (same path rules and walk as a read); a folder or a link is refused. |
 | `agent.list` | `{}` | `Agent[]` |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
-| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, provider_pending}` (`provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
 | `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedules and webhooks will call the daemon-internal `agents::ask` with one. Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 ```ts
 type Origin = "human" | "schedule" | "webhook";
-type Agent = { id: number; name: string; kind: "claude" | "codex"; model: string | null; effort: string | null;
+type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "subscription" | "openrouter";
+             model: string | null; effort: string | null;
              persona: string; permissions: Permissions /* its tab's, when muster creates it */;
              accepts_origins: Origin[]; autostart: boolean; home_dir: string; session_id: number | null;
              channel_id: number | null /* its own tab */; state: AgentState | null /* its session's */; detail: string | null;
@@ -194,6 +196,10 @@ type Template = { id: string; label: string; about: string; name: string; kind: 
 type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null;
              efforts: string[] | null /* this model's levels where they differ; null: the CLI's */ }[];
              efforts: string[] /* passed to --effort / -c model_reasoning_effort= */ };
+type OpenRouterModel = { id: string /* --model / -m, e.g. "anthropic/claude-sonnet-5.5" */; name: string;
+             vendor: string /* the id's prefix, for grouping */; context_length: number | null;
+             prompt_per_m: number | null; completion_per_m: number | null /* USD per million tokens */;
+             created: number | null /* unix s */; alias_of: string | null /* for "~vendor/…-latest" aliases */ };
 ```
 
 Agent events (also on `GET /api/events`; never sent to paired devices):
@@ -604,6 +610,129 @@ They are set when the process starts. After `session.move` the channel values (`
 `PORT`, `MUSTER_PORT_BASE`) are stale until the session restarts; `MUSTER_SESSION_ID` stays
 right, so tools should look the channel up from the session (as `muster new` does).
 
+## OpenRouter
+
+Named agents can run on [OpenRouter](https://openrouter.ai) instead of their CLI's own login
+(`Agent.provider`, store migration v18; existing agents stay on `subscription`). OpenRouter
+bills per token to the owner's key, so the UI badges these agents and their tabs "OpenRouter ·
+pay per use". Code: `src/openrouter.rs`.
+
+**The key.** `OPENROUTER_API_KEY` in the backend's environment (at least 16 characters, no
+spaces), read once when it starts. Then, before any thread starts, it leaves the backend's own
+environment together with every other variable holding it, so git, gh, the terminal host and
+sessions inherit none of it. It is held in memory only: never in the store, a log, `muster ls`,
+an MCP or RPC reply (clients get `hello.openrouter.key_present`), the persona files, or the
+launch records. Every run's saved launch, whatever its provider, has the variables Muster set to
+the key (`ANTHROPIC_AUTH_TOKEN` or `OPENROUTER_API_KEY`) stored empty and listed beside the launch
+(`key_refs`), and the key cut out of every other value and argument (a prompt that happened to
+contain it), for good. Re-sending a launch fills in only the listed variables, and only in a
+launch made for OpenRouter (`MUSTER_PROVIDER=openrouter`), so no text a user or an agent wrote can
+ask for the key. It stays readable in the backend's own `/proc/<pid>/environ` (only by you), which keeps
+the environment the process started with.
+
+**Setting or changing it.** Restart the backend with it, from a shell that has it:
+
+```sh
+env OPENROUTER_API_KEY=sk-or-… muster reload        # terminals keep running
+# with Bitwarden (fish): the field name is the example from your own note
+env OPENROUTER_API_KEY=(bwx get bw://Projects/muster/local/OPENROUTER_API_KEY) muster reload
+env OPENROUTER_API_KEY= muster reload               # clears it
+```
+
+`muster reload` normally starts the new backend with the environment of the process that runs
+it. With `OPENROUTER_API_KEY` set there (even empty), that is what happens: the shell's
+environment, and its key or none. Without the variable, while the backend has a key (an agent
+applying a build from its session, where `OPENROUTER_API_KEY` never is), the command asks the
+backend to restart itself (`daemon.reload_handoff`): the backend runs `<its launch path> reload`
+with its own environment plus its key, as the window's "Restart backend" banner does, so the key
+carries over without passing through argv, a file or a reply. The backend does this only when
+the command is the binary it was started from (compared as canonical paths); otherwise the
+command reloads from its own environment and prints that the key is dropped. A command that can't
+see the backend's process (Claude Code's Bash in an OpenRouter session runs in its own PID
+namespace) always has the backend restart itself, since it couldn't stop it; there an
+`OPENROUTER_API_KEY` set in the command is refused. Such a command finds the backend by its
+discovery file and token: the backend's `hello` must report the pid the file names. `muster stop` then
+`env OPENROUTER_API_KEY=… muster` works too, but ends every session.
+
+**Inherited settings.** Every session's inherited environment loses `OPENROUTER_API_KEY` and
+every variable whose value contains the key. OpenRouter's own Claude Code setup has the owner
+export `ANTHROPIC_AUTH_TOKEN=<key>`, `ANTHROPIC_BASE_URL=https://openrouter.ai/api` and an empty
+`ANTHROPIC_API_KEY`; when the inherited `ANTHROPIC_AUTH_TOKEN` is the backend's key, the
+OpenRouter `ANTHROPIC_BASE_URL` and the empty `ANTHROPIC_API_KEY` go with it, so no subscription
+session or shell bills OpenRouter. A gateway or token of the owner's that isn't this key stays
+(as before). A backend started from an OpenRouter session (marked `MUSTER_PROVIDER=openrouter`)
+drops all the variables below from its environment.
+
+**Where it goes.** Only into the sessions of agents set to OpenRouter, at each start:
+
+| CLI | Environment | Arguments |
+|---|---|---|
+| Claude Code | `ANTHROPIC_BASE_URL=https://openrouter.ai/api`, `ANTHROPIC_AUTH_TOKEN=<key>`, `ANTHROPIC_API_KEY=` (empty), `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE}_MODEL=~anthropic/claude-{opus,sonnet,fable}-latest[1m]`, `ANTHROPIC_DEFAULT_HAIKU_MODEL=~anthropic/claude-haiku-latest`, `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`; every inherited `CLAUDE_CODE_USE_*` provider selector (Bedrock, Vertex, Foundry, Mantle, Claude Platform on AWS, and later ones; not `CLAUDE_CODE_USE_POWERSHELL_TOOL`), `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` are removed | `--model <OpenRouter id>` when the agent has one (else Claude Code's default, through the aliases above) |
+| Codex | `OPENROUTER_API_KEY=<key>` | `-c model_provider="muster_openrouter" -c model_providers.muster_openrouter.name="OpenRouter (Muster)" -c model_providers.muster_openrouter.base_url="https://openrouter.ai/api/v1" -c model_providers.muster_openrouter.env_key="OPENROUTER_API_KEY" -c model_providers.muster_openrouter.wire_api="responses" -c shell_environment_policy.ignore_default_excludes=false` before Muster's own `-c` overrides (never stored with the session), then `-m <OpenRouter id>` (required: Codex's own model names lack the `openai/` prefix) |
+
+Both also get `MUSTER_PROVIDER=openrouter`. Every other session (subscription agents, tabs,
+shells, helpers an OpenRouter agent spawns) starts without any of it. The provider is read from
+the agent's record at each start and saved on the session (`SessionInfo.provider`, what the
+current or last run bills to); changing it applies from the next start, and `agent.start` on a
+running agent whose run has the other provider answers `provider_pending: true`.
+
+- `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`: Claude Code then ignores provider, endpoint and
+  authentication variables (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_USE_*`) in settings files, so a profile's, project's or user's `env` block can't
+  send the key to another endpoint. It also makes Claude Code skip the telemetry opt-out it
+  otherwise applies on third-party providers (telemetry then follows `DISABLE_TELEMETRY`).
+- `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`: the Bash commands, hooks and stdio MCP servers Claude Code
+  starts get no credentials (by name or value: the key, `MUSTER_TOKEN`, `CLAUDE_CONFIG_DIR`), so
+  a routine `env` in Bash can't print the key into the scrollback Muster keeps; on Linux Bash also
+  runs in its own PID namespace (it can't read the backend's `/proc/<pid>/environ`; `ps` and
+  `kill` don't see processes outside it). Muster's hooks, which lose `MUSTER_TOKEN` this way, read
+  the run's session token from `<data>/sessions/<id>/hook-token` (private, rewritten at each
+  start). Muster's MCP server is HTTP with the token in the per-session config file, untouched.
+- What remains: the CLI process itself holds the key (it has to). In a Codex session, Codex keeps
+  `*KEY*`/`*SECRET*`/`*TOKEN*` variables out of the commands it runs (forced on above); its hooks,
+  `notify` command and stdio MCP servers may still inherit `OPENROUTER_API_KEY` (guess: Codex has
+  no scrub for those). The scrub matches credentials by name and value shape; a copy of the key
+  under an innocent name and an innocent-looking value would get through (Muster never makes one).
+
+Sources (checked 2026-10-20): OpenRouter's [Claude Code guide](https://openrouter.ai/docs/guides/guides/claude-code-integration)
+(the variables, "`ANTHROPIC_API_KEY` must be explicitly empty", the alias values), Claude Code's
+[environment variables](https://code.claude.com/docs/en/env-vars) (the provider selectors,
+`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` and what the scrub
+removes) and [authentication](https://code.claude.com/docs/en/authentication)
+(`ANTHROPIC_AUTH_TOKEN` ranks above a subscription login), OpenRouter's
+[Codex guide](https://openrouter.ai/docs/cookbook/coding-agents/codex-cli.md) and Codex's
+[config reference](https://developers.openai.com/codex/config-reference) (`responses` is the only
+wire API; `auth` can't sit next to `env_key`, hence Muster's own provider id). OpenRouter says
+Claude Code is only guaranteed with Anthropic's own models, and Codex works best with OpenAI's;
+the dialog says so. If Claude Code was signed in to a subscription in that configuration folder,
+it may warn about an auth conflict on start (OpenRouter suggests `/logout` once); the auth token
+still wins.
+
+**Profiles.** A Claude profile still selects `CLAUDE_CONFIG_DIR` (settings, history); its check
+for inherited auth or endpoint overrides runs on the inherited environment, before the OpenRouter
+variables are added, so the two combine.
+
+**Starting without the key.** An OpenRouter agent's start, restart or autostart fails with an
+error naming `OPENROUTER_API_KEY` (before a running process is touched); `agent.create` and a
+switch to `openrouter` are refused the same way.
+
+**Recovery.** A launch prepared before a backend crash is completed by the next backend. If the
+terminal host already started it, the next backend adopts that process as it runs and never
+re-sends the launch (with the key since changed or gone, the host would refuse a different
+launch, and a refused run is retired). One the host never started, prepared for OpenRouter
+(`key_refs` not empty), waits while the backend has no key (nothing runs; starting that session
+says it waits for the key) and is sent with the key by a backend that has one.
+
+**The model list** (`openrouter.models`). The backend fetches `https://openrouter.ai/api/v1/models`
+(public, no key; curl, https only, 20 s, at most 16 MB read as it arrives, the process killed past
+that) and keeps the result in memory and in `<data>/openrouter-models.json`, refreshed at most
+hourly (in the background once a list exists; after a failure, no new try for 5 minutes) and
+served from the file when offline. With no list yet, every caller waits for the one fetch in
+flight. Kept: models with `tools` in `supported_parameters` and text in and out; dropped: `:batch`
+copies and `openrouter/*` routers. Sorted by vendor, newest first. `error` says why the last fetch
+failed; with no list at all the dialog offers Custom… only (and asks again next time).
+`stale`: the copy is over an hour old.
+
 ## Remote devices
 
 A phone reaches the daemon through `tailscale serve` (docs/ANDROID.md). The daemon still binds
@@ -698,12 +827,13 @@ watcher and no polling by clients.
 
 | Method | Params | Result |
 |---|---|---|
+| `daemon.reload_handoff` | `{exe}` | `{exe}`. The backend restarts itself: it runs `<its launch path> reload` detached with its own environment plus its OpenRouter key (if any), as `daemon.reload` does. `muster reload` asks for it when run without `OPENROUTER_API_KEY` while the backend has a key (so the key carries over), and always from a command that can't see the backend's process (a sandboxed command in its own PID namespace, which couldn't signal it). Refused (an error starting `handoff refused:`; the CLI then reloads the usual way where it can) without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
 | `prefs.get` | `{}` | `{decorations, shell?, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
 | `prefs.set` | `{decorations?, shell?}` | The new preferences; fields left out stay, unknown fields are refused. `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
 
-What "human only" means for `daemon.reload`, `daemon.shutdown` (and `prefs.set`, which needs
+What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.shutdown` (and `prefs.set`, which needs
 the client token too): they are refused to paired devices (no device scope), to MCP (no tool)
 and hooks (session tokens can't reach this API), and `daemon.*` to calls carrying a
 `from_session` param (the CLI inside a session sends one). That is all. Any process running as

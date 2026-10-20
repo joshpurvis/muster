@@ -170,7 +170,7 @@ pub fn spawn(hub: &Arc<Hub>, launch: Launch) {
 }
 
 /// A detached `muster <args>` from `exe` in its own session, its output in the daemon log.
-fn run_cli(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
+fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter::ApiKey>) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -179,6 +179,11 @@ fn run_cli(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
         .context("opening the daemon log")?;
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    // The key left this backend's environment at start (src/openrouter.rs); `reload` starts the
+    // replacement with this command's environment, so it is handed on explicitly.
+    if let Some(key) = openrouter_key {
+        cmd.env(crate::openrouter::ENV_KEY, key.expose());
+    }
     // SAFETY: setsid is async-signal-safe; the command outlives this backend.
     unsafe {
         cmd.pre_exec(|| {
@@ -187,6 +192,40 @@ fn run_cli(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
         });
     }
     cmd.spawn().with_context(|| format!("starting {}", exe.display()))
+}
+
+/// What a refused `daemon.reload_handoff` error starts with: the CLI then reloads the usual way.
+pub const HANDOFF_REFUSED: &str = "handoff refused:";
+
+/// `daemon.reload_handoff {exe}`: `muster reload` from a shell without `OPENROUTER_API_KEY`
+/// while this backend has a key (the key is only in this backend's memory), or from a sandboxed
+/// command that can't see or signal this backend's process. Instead of the command starting the
+/// replacement, this backend runs `<launch path> reload` itself, as the update banner does: the
+/// replacement gets this backend's environment and its key, if any. Only when the command is the build this backend was
+/// started from (`exe`, compared as canonical paths), so the same build is restarted as a
+/// reload typed there would have.
+pub fn reload_handoff(hub: &Arc<Hub>, exe: &Path) -> anyhow::Result<PathBuf> {
+    let (launch, _) = hub.updates().launch.lock().clone()
+        .with_context(|| format!("{HANDOFF_REFUSED} this backend does not know where it was launched from"))?;
+    let same = match (std::fs::canonicalize(exe), std::fs::canonicalize(&launch)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    anyhow::ensure!(same, "{HANDOFF_REFUSED} this backend was started from {}, not {}", launch.display(), exe.display());
+    let mut child = run_cli(&launch, &["reload"], hub.openrouter_key())?;
+    let weak = Arc::downgrade(hub);
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+            && let Some(hub) = weak.upgrade()
+        {
+            hub.notice("error", format!(
+                "The backend was not restarted ({status}). Details: {}",
+                crate::paths::log_path().display()
+            ));
+        }
+    });
+    Ok(launch)
 }
 
 /// Is the build now at the launch path (`current`, its SHA-256) the one the human approved
@@ -215,7 +254,7 @@ pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
     let path = exe.clone();
     let current = tokio::task::spawn_blocking(move || crate::executables::hash_file(&path)).await??;
     check_reload(&current, &running, expect, &exe)?;
-    let mut child = run_cli(&exe, &["reload"])?;
+    let mut child = run_cli(&exe, &["reload"], hub.openrouter_key())?;
     let weak = Arc::downgrade(hub);
     // On success this backend is stopped before the command ends, so only a failure reports.
     std::thread::spawn(move || {
@@ -239,7 +278,7 @@ pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
 pub fn shutdown(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let exe = hub.muster_bin().to_path_buf();
     anyhow::ensure!(exe.exists(), "the muster command {} is missing", exe.display());
-    let mut child = run_cli(&exe, &["stop"])?;
+    let mut child = run_cli(&exe, &["stop"], None)?;
     hub.emit(ServerEvent::DaemonStopping { reason: "shutdown".into() });
     let weak = Arc::downgrade(hub);
     std::thread::spawn(move || {

@@ -371,6 +371,7 @@ pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionI
         created_at: 0,
         window_id: None,
         hidden: false,
+        provider: Default::default(),
     }
 }
 

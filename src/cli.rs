@@ -1780,6 +1780,7 @@ pub fn profile_default(d: &Discovery, path: &std::path::Path, profile: &str) -> 
 
 pub struct AgentOpts {
     pub profile: Option<String>,
+    pub provider: Option<String>,
     pub name: String,
     pub kind: Option<String>,
     pub model: Option<String>,
@@ -1801,6 +1802,9 @@ impl AgentOpts {
         };
         if let Some(k) = &self.kind {
             set("kind", json!(k));
+        }
+        if let Some(pr) = &self.provider {
+            set("provider", json!(pr));
         }
         if let Some(m) = &self.model {
             set("model", json!(m));
@@ -1832,9 +1836,10 @@ impl AgentOpts {
 
 fn print_agent(verb: &str, b: &Value, name: &str) {
     println!(
-        "{verb} {} ({}, accepts {}{}): home {}",
+        "{verb} {} ({}{}, accepts {}{}): home {}",
         b["name"].as_str().unwrap_or(name),
         b["kind"].as_str().unwrap_or("?"),
+        if b["provider"] == "openrouter" { " on OpenRouter, pay per use" } else { "" },
         b["accepts_origins"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
@@ -1892,7 +1897,10 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
             let state = s(b, "state");
             vec![
                 Cell::plain(s(b, "name")),
-                Cell::plain(s(b, "kind")),
+                Cell::plain(match b["provider"].as_str() {
+                    Some("openrouter") => format!("{}·openrouter", s(b, "kind")),
+                    _ => s(b, "kind"),
+                }),
                 Cell::plain(s(b, "model")),
                 Cell::plain(accepts),
                 Cell::plain(b["session_id"].as_u64().map_or("-".into(), |i| i.to_string())),
@@ -1933,6 +1941,12 @@ pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()>
         println!("{id}");
     } else {
         println!("{id} (already running)");
+    }
+    if r["provider_pending"] == true {
+        eprintln!(
+            "note: it still runs on {}; its new provider applies when it restarts (`muster agent start {name} --fresh`, or stop and start it)",
+            r["session"]["provider"].as_str().unwrap_or("its old provider")
+        );
     }
     Ok(())
 }

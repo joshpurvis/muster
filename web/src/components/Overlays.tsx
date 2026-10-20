@@ -64,9 +64,11 @@ function Modal(
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
+    // Tab stops only: an element taken out of the Tab order (tabindex="-1", like the options of
+    // a roving listbox) is skipped, unless focus is on it now (Tab then moves on from there).
     const focusables = () =>
       [...(ref.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])].filter((el) =>
-        el.offsetParent !== null || el === document.activeElement
+        el === document.activeElement || (el.tabIndex >= 0 && el.offsetParent !== null)
       );
     const key = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !e.defaultPrevented) {

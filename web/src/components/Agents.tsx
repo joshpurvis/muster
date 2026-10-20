@@ -11,6 +11,7 @@ import {
   agentsPanelOpen,
   agentsSupported,
   knowAgent,
+  openRouter,
   overlay,
   prefs,
   sessions,
@@ -19,30 +20,41 @@ import {
 } from "../state.ts";
 import * as A from "../actions.ts";
 import {
+  agentBilling,
   agentStatus,
   ago,
   choiceOf,
+  contextLabel,
   CUSTOM,
   effortAfterModel,
   effortsFor,
   feedFor,
   firstLine,
   keepForKind,
+  listedModels,
   memoryPathError,
   nameError,
+  needsModel,
+  OPENROUTER_BADGE,
+  PREFERRED_VENDOR,
+  priceLabel,
   readMemoryFile,
   UNATTENDED_WARNING,
   unattendedWarning,
   upsertMessage,
+  vendorGroups,
 } from "../agents.ts";
 import type {
   Agent,
   AgentMessage,
   AgentTemplate,
   ModelCatalog,
+  OpenRouterModel,
+  OpenRouterModels,
   Origin,
   Permissions,
   ProfileChoice,
+  Provider,
 } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
@@ -143,6 +155,7 @@ function agentMenu(a: Agent, x: number, y: number) {
 function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boolean }) {
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
+  const billing = agentBilling(a, s);
   const persona = firstLine(a.persona);
   const open = () => {
     agentFilter.value = a.id;
@@ -155,7 +168,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}, ${st.label}`}
+      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}`}
       onClick={open}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -188,6 +201,14 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
         </span>
+        {billing.badge && (
+          <span
+            class={cx("or-badge", billing.note && "or-badge-pending")}
+            data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
+          >
+            {billing.label}
+          </span>
+        )}
       </span>
       <button
         type="button"
@@ -395,8 +416,173 @@ const modelPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
 const effortPicks = (c: ModelCatalog | null, kind: Agent["kind"], model: string): Pick[] =>
   effortsFor(c, kind, model).map((e) => ({ value: e, label: e }));
 
+/** OpenRouter's list (`openrouter.models`), shared by every dialog for a few minutes (the daemon
+ * keeps its own copy for an hour). */
+let orCache: { at: number; list: OpenRouterModels } | null = null;
+const OR_CACHE_MS = 5 * 60_000;
+
+/** The Model field for an agent on OpenRouter: a search box over OpenRouter's models (tool use
+ * only, grouped by vendor, the CLI's own vendor first), Default (Claude only) and Custom…. The
+ * list is a listbox: ↑/↓ move, Enter or a click picks; ↓ in the search box goes to the first
+ * match and Enter there picks it. */
+function OpenRouterModelField(
+  { kind, value, custom, list, loading, onChange }: {
+    kind: Agent["kind"];
+    value: string;
+    custom: boolean;
+    list: OpenRouterModels | null;
+    loading: boolean;
+    onChange: (v: string, custom: boolean) => void;
+  },
+) {
+  const id = useId();
+  const [q, setQ] = useState("");
+  const box = useRef<HTMLDivElement>(null);
+  const typed = useRef<HTMLInputElement>(null);
+  const focusTyped = useRef(false);
+  const models = list?.models ?? [];
+  const choice = choiceOf(value, models.map((m) => m.id), custom);
+  const groups = vendorGroups(models, q, PREFERRED_VENDOR[kind]);
+  const shown = groups.reduce((n, g) => n + g.models.length, 0);
+  useEffect(() => {
+    if (focusTyped.current && typed.current) {
+      focusTyped.current = false;
+      typed.current.focus();
+      typed.current.select();
+    }
+  });
+  // The chosen model in view when the list first renders.
+  useEffect(() => {
+    box.current?.querySelector<HTMLElement>("[aria-selected=true]")?.scrollIntoView({ block: "nearest" });
+  }, [models.length]);
+  const options = () => [...(box.current?.querySelectorAll<HTMLElement>("[role=option]") ?? [])];
+  const pick = (v: string) => {
+    focusTyped.current = v === CUSTOM;
+    onChange(v === CUSTOM ? value : v, v === CUSTOM);
+  };
+  const opt = (v: string, label: ComponentChildren, sub: ComponentChildren, key = v) => {
+    const on = choice === v;
+    return (
+      <button
+        key={key}
+        type="button"
+        role="option"
+        aria-selected={on}
+        tabIndex={on || (choice === CUSTOM && v === CUSTOM) ? 0 : -1}
+        class={cx("or-opt", on && "on")}
+        data-model={v === CUSTOM ? "custom" : v}
+        onClick={() => pick(v)}
+      >
+        <span class="or-opt-main">{label}</span>
+        {sub && <span class="or-opt-sub">{sub}</span>}
+      </button>
+    );
+  };
+  const modelRow = (m: OpenRouterModel) => {
+    const price = priceLabel(m);
+    const ctx = contextLabel(m.context_length);
+    return opt(
+      m.id,
+      <>
+        <span class="or-opt-name">{m.name.replace(/^[^:]+:\s*/, "")}</span>
+        <code class="or-opt-id">{m.id}</code>
+      </>,
+      <>
+        {price && <span data-tip="US dollars per million tokens, in / out">{price}</span>}
+        {ctx && <span>{ctx} context</span>}
+        {m.alias_of && <span>now {m.alias_of}</span>}
+      </>,
+    );
+  };
+  let status: ComponentChildren;
+  if (loading && !models.length) status = <><Spinner size={11} /> Loading OpenRouter's models…</>;
+  else if (!models.length) {
+    status = (
+      <span class="field-bad">
+        Couldn't load OpenRouter's model list{list?.error ? ` (${list.error})` : ""}. Type a model id under Custom….
+      </span>
+    );
+  } else {
+    status = (
+      <>
+        {models.length} models with tool use, from openrouter.ai; prices per million tokens in / out.
+        {list?.error && list.stale && " This copy is over an hour old: refreshing failed."}
+      </>
+    );
+  }
+  return (
+    <div class="field or-field">
+      <label class="field-label" for={id}>Model on OpenRouter</label>
+      <input
+        id={id}
+        class="or-search"
+        value={q}
+        placeholder={models.length ? `Search ${models.length} models, e.g. sonnet or qwen coder` : "Search models"}
+        spellcheck={false}
+        aria-controls={`${id}-list`}
+        onInput={(e) => setQ((e.target as HTMLInputElement).value)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            options().find((o) => o.dataset.model !== "")?.focus();
+          } else if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && q.trim()) {
+            e.preventDefault();
+            const first = groups[0]?.models[0];
+            if (first) pick(first.id);
+          }
+        }}
+      />
+      <div
+        ref={box}
+        id={`${id}-list`}
+        class="or-list"
+        role="listbox"
+        aria-label="OpenRouter models"
+        onKeyDown={(e) => {
+          const all = options();
+          const i = all.indexOf(document.activeElement as HTMLElement);
+          const to = e.key === "ArrowDown" ? i + 1 : e.key === "ArrowUp" ? i - 1 : e.key === "Home"
+            ? 0
+            : e.key === "End"
+            ? all.length - 1
+            : null;
+          if (to === null) return;
+          e.preventDefault();
+          all[Math.max(0, Math.min(all.length - 1, to))]?.focus();
+        }}
+      >
+        {kind === "claude" && !q.trim() &&
+          opt("", "Default", "Claude Code's choice, through OpenRouter's latest Anthropic aliases")}
+        {groups.map((g) => (
+          <div key={g.vendor} role="group" aria-label={g.vendor} class="or-group">
+            <div class="or-vendor" aria-hidden="true">
+              {g.vendor}
+              {g.vendor === PREFERRED_VENDOR[kind] && <span class="or-pref">works best with {KIND_LABEL[kind]}</span>}
+            </div>
+            {g.models.map(modelRow)}
+          </div>
+        ))}
+        {q.trim() && !shown && models.length > 0 && <div class="or-none">No model matches “{q.trim()}”.</div>}
+        {opt(CUSTOM, "Custom…", "any OpenRouter model id")}
+      </div>
+      {choice === CUSTOM && (
+        <input
+          ref={typed}
+          value={value}
+          aria-label="Custom OpenRouter model id"
+          placeholder={kind === "codex" ? "e.g. openai/gpt-6.1-sol" : "e.g. anthropic/claude-sonnet-5.5"}
+          spellcheck={false}
+          onInput={(e) => onChange((e.target as HTMLInputElement).value, true)}
+        />
+      )}
+      <span class="field-hint">{status}</span>
+    </div>
+  );
+}
+
 interface Draft {
   account_profile: ProfileChoice;
+  provider: Provider;
   name: string;
   kind: Agent["kind"];
   model: string;
@@ -410,6 +596,7 @@ interface Draft {
 function fromTemplate(t: AgentTemplate): Draft {
   return {
     account_profile: "default",
+    provider: "subscription",
     name: t.name,
     kind: t.kind,
     model: t.model ?? "",
@@ -424,6 +611,7 @@ function fromTemplate(t: AgentTemplate): Draft {
 function fromAgent(a: Agent): Draft {
   return {
     account_profile: a.account_profile_id ?? "default",
+    provider: a.provider ?? "subscription",
     name: a.name,
     kind: a.kind,
     model: a.model ?? "",
@@ -437,6 +625,7 @@ function fromAgent(a: Agent): Draft {
 
 const BLANK: Draft = {
   account_profile: "default",
+  provider: "subscription",
   name: "",
   kind: "claude",
   model: "",
@@ -463,6 +652,8 @@ export function AgentDialog(
   const [tab, setTab] = useState<"settings" | "memory">(editing ? tabInit ?? "settings" : "settings");
   const [templates, setTemplates] = useState<AgentTemplate[]>(templateCache ?? []);
   const [catalog, setCatalog] = useState<ModelCatalog | null>(catalogCache);
+  const [orList, setOrList] = useState<OpenRouterModels | null>(orCache?.list ?? null);
+  const [orLoading, setOrLoading] = useState(false);
   const [tpl, setTpl] = useState("blank");
   const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : BLANK);
   /** Model / Effort show Custom… until another entry is picked (`choiceOf`). */
@@ -496,16 +687,38 @@ export function AgentDialog(
   useLayoutEffect(() => {
     if (!editing) nameRef.current?.focus();
   }, []);
+  // OpenRouter's models, once OpenRouter is chosen (the daemon fetches and caches them).
+  useEffect(() => {
+    if (d.provider !== "openrouter" || (orCache && Date.now() - orCache.at < OR_CACHE_MS)) return;
+    setOrLoading(true);
+    rpc.call<OpenRouterModels>("openrouter.models").then((list) => {
+      // An empty answer (the fetch failed) is asked again by the next dialog, not kept.
+      if (list.models.length) orCache = { at: Date.now(), list };
+      setOrList(list);
+    }).catch((e) => {
+      setOrList({ key_present: false, models: [], fetched_at: null, stale: false, error: String(e?.message ?? e) });
+    }).finally(() => setOrLoading(false));
+  }, [d.provider]);
 
   if (editing && !agent) return null;
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }));
+  const orModels = orList?.models ?? [];
+  /** The backend can run agents on OpenRouter (null: an older backend, no Provider choice). */
+  const or = openRouter.value;
   /** A model or effort the new kind doesn't list goes back to Default (the kind already chosen:
    * nothing changes). */
   const setKind = (k: Agent["kind"]) => {
     if (k === d.kind) return;
-    const model = keepForKind(d.model, modelPicks(catalog, k).map((p) => p.value));
+    const model = keepForKind(d.model, listedModels(d.provider, k, catalog, orModels));
     set({ kind: k, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)) });
     setCustom({ model: false, effort: false });
+  };
+  /** Switching provider keeps the model only when the other list has it (an OpenRouter id means
+   * nothing to the subscription, and the other way round). */
+  const setProvider = (p: Provider) => {
+    if (p === d.provider) return;
+    set({ provider: p, model: keepForKind(d.model, listedModels(p, d.kind, catalog, orModels)) });
+    setCustom((c) => ({ ...c, model: false }));
   };
   /** A level the new model doesn't offer goes back to Default; a custom effort stays. */
   const setModel = (model: string, on: boolean) => {
@@ -527,7 +740,8 @@ export function AgentDialog(
   const taken = agents.value.filter((a) => a.id !== agent?.id).map((a) => a.name);
   const nErr = editing ? null : nameError(d.name, taken);
   const warn = unattendedWarning(d.kind, d.accepts);
-  const canSave = !busy && !nErr && d.accepts.length > 0;
+  const orBlocked = needsModel(d.provider, d.kind, d.model);
+  const canSave = !busy && !nErr && d.accepts.length > 0 && !orBlocked;
   const toggleOrigin = (o: Origin, on: boolean) =>
     set({ accepts: ORIGINS.map((x) => x.o).filter((x) => (x === o ? on : d.accepts.includes(x))) });
 
@@ -541,6 +755,8 @@ export function AgentDialog(
           name: d.name.trim(),
           kind: d.kind,
           account_profile: d.kind === "claude" ? d.account_profile : undefined,
+          // Older backends don't know the field: sent only to one that has the choice.
+          provider: or ? d.provider : undefined,
           model: d.model.trim() || undefined,
           effort: d.effort.trim() || undefined,
           persona: d.persona,
@@ -557,6 +773,7 @@ export function AgentDialog(
       }
       const before = fromAgent(agent);
       const patch: Record<string, unknown> = {};
+      if (d.provider !== before.provider) patch.provider = d.provider;
       if (d.model.trim() !== before.model) patch.model = d.model.trim();
       if (d.effort.trim() !== before.effort) patch.effort = d.effort.trim();
       if (d.persona !== before.persona) patch.persona = d.persona;
@@ -568,10 +785,10 @@ export function AgentDialog(
       if (Object.keys(patch).length) {
         const a = await rpc.call<Agent>("agent.update", { name: agent.name, ...patch });
         knowAgent(a);
-        const later = ["model", "effort", "permissions"].some((k) => k in patch) && A.agentLive(agent);
+        const later = ["provider", "model", "effort", "permissions"].some((k) => k in patch) && A.agentLive(agent);
         toast(
           "success",
-          later ? "Saved. Model, effort and permissions apply from its next start." : "Saved.",
+          later ? "Saved. Provider, model, effort and permissions apply from its next start." : "Saved.",
         );
       }
       overlay.value = null;
@@ -618,6 +835,7 @@ export function AgentDialog(
             {agent && <span class={cx("ap-kind", "ap-kind-" + agent.kind)}>{KIND_LABEL[agent.kind]}</span>}
             {" "}
             {title}
+            {agent?.provider === "openrouter" && <span class="or-badge or-badge-head">{OPENROUTER_BADGE}</span>}
           </h2>
           <span class="muted">
             {agent
@@ -713,16 +931,75 @@ export function AgentDialog(
               <ProfileSelect value={d.account_profile} onChange={(choice) => set({ account_profile: choice ?? "default" })} disabled={editing} />
               {editing && <span class="field-hint">This agent keeps its profile and conversation together. Create a new agent to use another profile.</span>}
             </>}
+            {or && (
+              <div class="field">
+                <span class="field-label" id="agent-provider-label">Provider</span>
+                <div class="seg seg-lg" role="radiogroup" aria-labelledby="agent-provider-label">
+                  {(["subscription", "openrouter"] as const).map((p) => {
+                    const off = p === "openrouter" && !or.key_present && d.provider !== "openrouter";
+                    return (
+                      <button
+                        key={p}
+                        type="button"
+                        role="radio"
+                        aria-checked={d.provider === p}
+                        aria-describedby={off ? "agent-provider-hint" : undefined}
+                        disabled={off}
+                        data-provider={p}
+                        class={cx("seg-btn", d.provider === p && "on")}
+                        onClick={() => setProvider(p)}
+                      >
+                        {p === "subscription" ? "Subscription" : "OpenRouter"}
+                      </button>
+                    );
+                  })}
+                </div>
+                {!or.key_present && (
+                  <span class="field-hint or-key-hint" id="agent-provider-hint">
+                    {d.provider === "openrouter"
+                      ? "This agent won't start: the backend has no OpenRouter key. "
+                      : "OpenRouter is off. "}
+                    It needs <code>OPENROUTER_API_KEY</code>{" "}
+                    in the environment of Muster's backend, read only when the backend starts. From a shell
+                    that has the key, run <code>env OPENROUTER_API_KEY=… muster reload</code>{" "}
+                    (terminals keep running).
+                  </span>
+                )}
+                {d.provider === "openrouter" && (
+                  <span class="perm-warn or-warn" role="note">
+                    <IconShieldAlert size={13} />{" "}
+                    {OPENROUTER_BADGE}: billed per token to your OpenRouter key, not your {KIND_LABEL[d.kind]}{" "}
+                    subscription.{" "}
+                    {d.kind === "claude"
+                      ? "Claude Code is built for Anthropic's models; others may not work."
+                      : "OpenAI's models work best with Codex."}
+                  </span>
+                )}
+              </div>
+            )}
             <div class="field-row">
-              <PickField
-                label="Model"
-                value={d.model}
-                picks={modelPicks(catalog, d.kind)}
-                custom={custom.model}
-                customLabel="Custom model"
-                placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
-                onChange={setModel}
-              />
+              {d.provider === "openrouter"
+                ? (
+                  <OpenRouterModelField
+                    kind={d.kind}
+                    value={d.model}
+                    custom={custom.model}
+                    list={orList}
+                    loading={orLoading}
+                    onChange={setModel}
+                  />
+                )
+                : (
+                  <PickField
+                    label="Model"
+                    value={d.model}
+                    picks={modelPicks(catalog, d.kind)}
+                    custom={custom.model}
+                    customLabel="Custom model"
+                    placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
+                    onChange={setModel}
+                  />
+                )}
               <PickField
                 label="Effort"
                 value={d.effort}
@@ -736,6 +1013,11 @@ export function AgentDialog(
                 }}
               />
             </div>
+            {orBlocked && (
+              <span class="field-hint field-bad">
+                Codex on OpenRouter needs a model with its vendor, e.g. openai/gpt-6.1-sol.
+              </span>
+            )}
             <label class="field">
               <span class="field-label">Persona</span>
               <textarea

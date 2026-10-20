@@ -1402,7 +1402,7 @@ mod tests {
         info.window_id = Some(1);
         store.insert_session(&crate::store::StoredSession { info, extra_args: vec![] }).unwrap();
         let hub = crate::hub::Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None }, store).unwrap();
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap();
         // The test channel's cwd is /tmp.
         let rel = format!("muster-panel-apps-core-{}.png", std::process::id());
         std::fs::write(Path::new("/tmp").join(&rel), PNG).unwrap();

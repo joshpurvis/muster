@@ -38,6 +38,7 @@ use crate::hub::{CreateChannel, Hub, ServerEvent, SpawnSession};
 use crate::mcp::guard;
 use crate::model::*;
 use crate::paths;
+use crate::openrouter::Provider;
 use crate::store::Store;
 
 /// Where a message chain started. Claude agents accept `human` only by default (PLAN.md §10).
@@ -96,6 +97,9 @@ pub fn parse_accepts(s: &str) -> anyhow::Result<Vec<Origin>> {
 pub struct Agent {
     /// Pinned for the agent's lifetime, so its resume ID never crosses configuration dirs.
     pub account_profile_id: Option<crate::account_profiles::ProfileId>,
+    /// Where its model runs: the CLI's own login, or OpenRouter (src/openrouter.rs). Applies
+    /// from its next start, like the model.
+    pub provider: Provider,
     pub id: i64,
     pub name: String,
     pub kind: SessionKind,
@@ -553,6 +557,10 @@ pub fn route(agent: &Agent, prov: Option<Prov>, forced: Option<Origin>, recent: 
     Ok(r)
 }
 
+/// Longest model id or effort level passed on a command line (OpenRouter ids are
+/// `vendor/model:variant`).
+pub const MODEL_MAX: usize = 128;
+
 /// `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex), plus
 /// `--resume <id>` for a Claude agent with a conversation to resume. Checked against the
 /// agent-argument allowlist.
@@ -568,7 +576,7 @@ pub fn agent_args(
     // One plain token each: never something the CLI could read as another flag.
     for (what, v) in [("model", model), ("effort", effort)] {
         if let Some(v) = v
-            && (v.starts_with('-') || v.len() > 64 || v.chars().any(|c| c.is_whitespace() || c.is_control()))
+            && (v.starts_with('-') || v.len() > MODEL_MAX || v.chars().any(|c| c.is_whitespace() || c.is_control()))
         {
             anyhow::bail!("bad {what} `{v}`: one word, not starting with `-`");
         }
@@ -842,6 +850,7 @@ impl Registry {
         a.permissions = next.permissions;
         a.accepts_origins = next.accepts_origins.clone();
         a.autostart = next.autostart;
+        a.provider = next.provider;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -1105,6 +1114,24 @@ fn clean_opt(o: Option<String>) -> Option<String> {
     o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Can `kind` run on `provider` with `model`? OpenRouter needs the daemon's key (when
+/// `need_key`), and Codex there needs a model: its own default has no vendor prefix, which
+/// OpenRouter doesn't know.
+pub fn check_provider(hub: &Hub, kind: SessionKind, provider: Provider, model: Option<&str>, need_key: bool) -> anyhow::Result<()> {
+    if provider != Provider::OpenRouter {
+        return Ok(());
+    }
+    anyhow::ensure!(kind != SessionKind::Shell, "only Claude and Codex agents can run on OpenRouter");
+    anyhow::ensure!(
+        kind != SessionKind::Codex || model.is_some_and(|m| !m.trim().is_empty()),
+        "a Codex agent on OpenRouter needs a model, with its vendor (e.g. openai/gpt-6.1-sol)"
+    );
+    if need_key && hub.openrouter_key().is_none() {
+        return Err(crate::openrouter::missing_key_error());
+    }
+    Ok(())
+}
+
 /// `agent.create` / `muster agent new`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewAgent {
@@ -1113,6 +1140,9 @@ pub struct NewAgent {
     pub name: String,
     #[serde(default)]
     pub kind: Option<SessionKind>,
+    /// Default: the subscription.
+    #[serde(default)]
+    pub provider: Option<Provider>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -1139,6 +1169,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     hub.check_account_profile(account_profile_id)?;
     let (model, effort) = (clean_opt(req.model), clean_opt(req.effort));
     agent_args(kind, model.as_deref(), effort.as_deref(), None)?;
+    let provider = req.provider.unwrap_or_default();
+    check_provider(hub, kind, provider, model.as_deref(), true)?;
     let accepts = match req.accepts {
         Some(a) => clean_accepts(a)?,
         None => default_accepts(kind),
@@ -1155,6 +1187,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
         hub.store(),
         Agent {
             account_profile_id,
+            provider,
             id: 0,
             name,
             kind,
@@ -1182,6 +1215,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
 pub struct AgentUpdate {
     pub name: String,
     #[serde(default)]
+    pub provider: Option<Provider>,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
@@ -1208,6 +1243,11 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
         next.effort = clean_opt(Some(e));
     }
     agent_args(next.kind, next.model.as_deref(), next.effort.as_deref(), None)?;
+    if let Some(p) = req.provider {
+        next.provider = p;
+    }
+    // The key is needed to switch to OpenRouter, not to edit an agent already on it.
+    check_provider(hub, next.kind, next.provider, next.model.as_deref(), next.provider != cur.provider)?;
     if let Some(a) = req.accepts {
         next.accepts_origins = clean_accepts(a)?;
     }
@@ -1311,6 +1351,7 @@ async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Win
     }
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
+    check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     if fresh {
         hub.agents().update(hub.store(), agent.id, |b| b.resume_id = None)?;
         agent.resume_id = None;
@@ -1659,6 +1700,7 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "name": b.name,
         "kind": b.kind,
         "account_profile_id": b.account_profile_id,
+        "provider": b.provider,
         "model": b.model,
         "effort": b.effort,
         "persona": b.persona,
@@ -2328,6 +2370,7 @@ mod tests {
     fn agent(kind: SessionKind) -> Agent {
         Agent {
             account_profile_id: None,
+            provider: Provider::Subscription,
             id: 1,
             name: "ada".into(),
             kind,

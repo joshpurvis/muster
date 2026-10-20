@@ -541,6 +541,7 @@ interface MockAgent {
   id: number;
   name: string;
   kind: "claude" | "codex";
+  provider: "subscription" | "openrouter";
   model: string | null;
   effort: string | null;
   persona: string;
@@ -671,10 +672,13 @@ function newAgent(p: any): MockAgent {
     throw new Error(`an agent named ${name} already exists`);
   }
   const kind = p.kind === "codex" ? "codex" : "claude";
+  const provider = p.provider === "openrouter" ? "openrouter" : "subscription";
+  checkProvider(kind, provider, p.model ?? null, true);
   const a: MockAgent = {
     id: seq++,
     name,
     kind,
+    provider,
     model: p.model || null,
     effort: p.effort || null,
     persona: p.persona ?? "",
@@ -690,6 +694,44 @@ function newAgent(p: any): MockAgent {
   agentList.push(a);
   memory.set(a.name, new Map());
   return a;
+}
+
+/** OpenRouter (src/openrouter.rs): whether the mock backend "has" OPENROUTER_API_KEY
+ * (`mock.openrouter` sets it), and a short copy of the filtered model list. */
+let orKey = false;
+const OR_MODELS = [
+  ["anthropic/claude-opus-5.5", "Anthropic: Claude Opus 5.5", 1000000, 5, 25],
+  ["anthropic/claude-sonnet-5.5", "Anthropic: Claude Sonnet 5.5", 1000000, 2, 10],
+  ["anthropic/claude-haiku-5.5", "Anthropic: Claude Haiku 5.5", 200000, 0.8, 4],
+  ["~anthropic/claude-opus-latest", "Anthropic: Claude Opus Latest", 1000000, 5, 25],
+  ["deepseek/deepseek-v4-pro", "DeepSeek: DeepSeek V4 Pro", 1000000, 0.55, 2.2],
+  ["google/gemini-3.8-pro", "Google: Gemini 3.8 Pro", 2000000, 2.5, 15],
+  ["google/gemini-3.8-flash", "Google: Gemini 3.8 Flash", 1000000, 0.33, 2.75],
+  ["minimax/minimax-m3.1-flash:free", "MiniMax: MiniMax M3.1 Flash (free)", 1000000, 0, 0],
+  ["moonshotai/kimi-k3", "MoonshotAI: Kimi K3", 256000, 0.6, 2.5],
+  ["openai/gpt-6.1-sol", "OpenAI: GPT-6.1 Sol", 400000, 2, 12],
+  ["openai/gpt-6-luna", "OpenAI: GPT-6 Luna", 400000, 0.25, 2],
+  ["qwen/qwen3.5-coder", "Qwen: Qwen3.5 Coder", 1000000, 0.3, 1.2],
+  ["z-ai/glm-5.2", "Z.ai: GLM 5.2", 200000, 0.6, 2.2],
+].map(([id, name, context_length, prompt_per_m, completion_per_m], i) => ({
+  id,
+  name,
+  vendor: String(id).replace(/^~/, "").split("/")[0],
+  context_length,
+  prompt_per_m,
+  completion_per_m,
+  created: 1792000000 - i,
+  alias_of: String(id).startsWith("~") ? "anthropic/claude-opus-5.5" : null,
+}));
+
+function checkProvider(kind: string, provider: string, model: string | null, needKey: boolean) {
+  if (provider !== "openrouter") return;
+  if (kind === "codex" && !model?.trim()) {
+    throw new Error("a Codex agent on OpenRouter needs a model, with its vendor (e.g. openai/gpt-6.1-sol)");
+  }
+  if (needKey && !orKey) {
+    throw new Error("OpenRouter needs the OPENROUTER_API_KEY environment variable on Muster's backend, which doesn't have it.");
+  }
 }
 
 function agentJson(a: MockAgent) {
@@ -799,6 +841,10 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     }
     case "agent.update": {
       const a = agentNamed(p.name);
+      const provider = p.provider === undefined ? a.provider : p.provider === "openrouter" ? "openrouter" : "subscription";
+      const model = "model" in p ? String(p.model).trim() || null : a.model;
+      checkProvider(a.kind, provider, model, provider !== a.provider);
+      a.provider = provider;
       for (const k of ["model", "effort"] as const) if (k in p) a[k] = String(p[k]).trim() || null;
       if ("persona" in p) a.persona = p.persona;
       if ("autostart" in p) a.autostart = !!p.autostart;
@@ -972,6 +1018,14 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     broadcast("updates_changed", updates);
     return updates;
   }
+  if (method === "mock.openrouter") {
+    // Pretend the backend was (re)started with or without OPENROUTER_API_KEY: {key_present}.
+    orKey = !!p.key_present;
+    return { key_present: orKey };
+  }
+  if (method === "openrouter.models") {
+    return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
+  }
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   switch (method) {
     case "panel.open": {
@@ -1087,6 +1141,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         default_shell: "/bin/bash",
         updates,
         prefs: windowPrefs,
+        openrouter: { key_present: orKey },
       };
     case "prefs.get":
       return windowPrefs;

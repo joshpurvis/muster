@@ -54,6 +54,12 @@ directory, not a verified account identity.
   behavior. Profile/project/managed settings and external login changes still belong to
   Claude Code: the human verifies the active account with `/status`.
 
+A named agent can also run on OpenRouter (docs/PROTOCOL.md "OpenRouter"): that is the owner's
+own OpenRouter key from the backend's environment, not a Claude credential, and goes only into
+that agent's sessions as `ANTHROPIC_AUTH_TOKEN`. The inherited-override check above runs on the
+inherited environment before those variables are added, so a pinned profile still supplies
+`CLAUDE_CONFIG_DIR` (settings, history) while the requests go to OpenRouter.
+
 The supported isolation target is a Claude subscription login in each directory. Claude's
 documentation notes that **keyless Console sign-ins are not isolated by `CLAUDE_CONFIG_DIR`**.
 Muster does not claim to verify which authentication method or account a directory uses.

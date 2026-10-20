@@ -170,7 +170,7 @@ pub fn spawn(hub: &Arc<Hub>, launch: Launch) {
 }
 
 /// A detached `muster <args>` from `exe` in its own session, its output in the daemon log.
-fn run_cli(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
+fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter::ApiKey>) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -179,6 +179,11 @@ fn run_cli(exe: &Path, args: &[&str]) -> anyhow::Result<std::process::Child> {
         .context("opening the daemon log")?;
     let mut cmd = Command::new(exe);
     cmd.args(args).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    // The key left this backend's environment at start (src/openrouter.rs); `reload` starts the
+    // replacement with this command's environment, so it is handed on explicitly.
+    if let Some(key) = openrouter_key {
+        cmd.env(crate::openrouter::ENV_KEY, key.expose());
+    }
     // SAFETY: setsid is async-signal-safe; the command outlives this backend.
     unsafe {
         cmd.pre_exec(|| {
@@ -215,7 +220,7 @@ pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
     let path = exe.clone();
     let current = tokio::task::spawn_blocking(move || crate::executables::hash_file(&path)).await??;
     check_reload(&current, &running, expect, &exe)?;
-    let mut child = run_cli(&exe, &["reload"])?;
+    let mut child = run_cli(&exe, &["reload"], hub.openrouter_key())?;
     let weak = Arc::downgrade(hub);
     // On success this backend is stopped before the command ends, so only a failure reports.
     std::thread::spawn(move || {
@@ -239,7 +244,7 @@ pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
 pub fn shutdown(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let exe = hub.muster_bin().to_path_buf();
     anyhow::ensure!(exe.exists(), "the muster command {} is missing", exe.display());
-    let mut child = run_cli(&exe, &["stop"])?;
+    let mut child = run_cli(&exe, &["stop"], None)?;
     hub.emit(ServerEvent::DaemonStopping { reason: "shutdown".into() });
     let weak = Arc::downgrade(hub);
     std::thread::spawn(move || {

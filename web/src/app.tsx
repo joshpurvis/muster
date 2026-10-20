@@ -8,6 +8,7 @@ import { connStatus, rpc } from "./rpc.ts";
 import {
   agentMessages,
   agents,
+  openRouter,
   agentsPanelOpen,
   fullscreen,
   applyEvent,
@@ -150,6 +151,7 @@ rpc.start();
   windowId,
   focusedSession,
   agents,
+  openRouter,
   agentMessages,
   agentsPanelOpen,
   fullscreen,

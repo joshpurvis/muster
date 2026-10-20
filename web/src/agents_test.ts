@@ -2,21 +2,27 @@ import {
   agentStatus,
   ago,
   choiceOf,
+  contextLabel,
   CUSTOM,
   effortAfterModel,
   effortsFor,
   feedFor,
   firstLine,
   keepForKind,
+  listedModels,
   MEMORY_FILE_MAX,
   memoryFileNameError,
   memoryPathError,
   nameError,
+  needsModel,
+  openRouterSessions,
+  priceLabel,
   readMemoryFile,
   unattendedWarning,
   upsertMessage,
+  vendorGroups,
 } from "./agents.ts";
-import type { Agent, AgentMessage, ModelCatalog, SessionInfo } from "./types.ts";
+import type { Agent, AgentMessage, ModelCatalog, OpenRouterModel, SessionInfo } from "./types.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual);
@@ -222,4 +228,66 @@ Deno.test("efforts per model: a model's own list, else the CLI's; a model change
   assertEquals(effortAfterModel("ultra", sol, luna, true), "ultra", "typed in Custom: kept");
   assertEquals(effortAfterModel("minimal", sol, luna, false), "minimal", "an unlisted stored level: kept");
   assertEquals(effortAfterModel("ultra", [], [], false), "ultra", "no catalog: shown as custom, kept");
+});
+
+const orModel = (id: string, over: Partial<OpenRouterModel> = {}): OpenRouterModel => ({
+  id,
+  name: id,
+  vendor: id.replace(/^~/, "").split("/")[0],
+  context_length: 200000,
+  prompt_per_m: 3,
+  completion_per_m: 15,
+  created: 1,
+  ...over,
+});
+
+Deno.test("OpenRouter: models grouped by vendor, the CLI's own vendor first, searched by every word", () => {
+  const models = [
+    orModel("google/gemini-3.8-flash", { name: "Google: Gemini 3.8 Flash" }),
+    orModel("anthropic/claude-sonnet-5.5", { name: "Anthropic: Claude Sonnet 5.5" }),
+    orModel("openai/gpt-6.1-sol", { name: "OpenAI: GPT-6.1 Sol" }),
+    orModel("qwen/qwen3-coder", { name: "Qwen: Qwen3 Coder" }),
+  ];
+  assertEquals(vendorGroups(models, "", "anthropic").map((g) => g.vendor), ["anthropic", "google", "openai", "qwen"]);
+  assertEquals(vendorGroups(models, "", "openai").map((g) => g.vendor), ["openai", "anthropic", "google", "qwen"]);
+  assertEquals(vendorGroups(models, "qwen CODER", "anthropic").map((g) => g.models[0].id), ["qwen/qwen3-coder"]);
+  assertEquals(vendorGroups(models, "sonnet 5.5", "openai").map((g) => g.vendor), ["anthropic"]);
+  assertEquals(vendorGroups(models, "nothing-like-it", "openai"), []);
+});
+
+Deno.test("OpenRouter: prices, context, listed models and the Codex model rule", () => {
+  assertEquals(priceLabel(orModel("a/b")), "$3 / $15");
+  assertEquals(priceLabel(orModel("a/b", { prompt_per_m: 0.25, completion_per_m: 1.5 })), "$0.25 / $1.50");
+  assertEquals(priceLabel(orModel("a/b", { prompt_per_m: 0.004, completion_per_m: 0 })), "<$0.01 / $0");
+  assertEquals(priceLabel(orModel("a/b:free", { prompt_per_m: 0, completion_per_m: 0 })), "free");
+  assertEquals(priceLabel(orModel("a/b", { prompt_per_m: null })), "");
+  assertEquals([contextLabel(1_000_000), contextLabel(1_050_000), contextLabel(200_000), contextLabel(null)], [
+    "1M",
+    "1.1M",
+    "200k",
+    "",
+  ]);
+  const catalog: ModelCatalog = {
+    claude: { models: [{ id: "opus", note: null, efforts: null }], efforts: [] },
+    codex: { models: [{ id: "gpt-6-sol", note: null, efforts: null }], efforts: [] },
+  };
+  const or = [orModel("anthropic/claude-sonnet-5.5")];
+  assertEquals(listedModels("subscription", "claude", catalog, or), ["opus"]);
+  assertEquals(listedModels("openrouter", "codex", catalog, or), ["anthropic/claude-sonnet-5.5"]);
+  assertEquals(listedModels("subscription", "codex", null, or), []);
+  // Switching provider keeps a model only when the other list has it.
+  assertEquals(keepForKind("opus", listedModels("openrouter", "claude", catalog, or)), "");
+  assertEquals(needsModel("openrouter", "codex", " "), true);
+  assertEquals(needsModel("openrouter", "claude", ""), false, "Claude Code's aliases map to OpenRouter's");
+  assertEquals(needsModel("subscription", "codex", ""), false);
+});
+
+Deno.test("OpenRouter: the badge goes on the tabs of agents running on it", () => {
+  const list = [
+    agent({ id: 1, provider: "openrouter", session_id: 7 }),
+    agent({ id: 2, provider: "subscription", session_id: 8 }),
+    agent({ id: 3, provider: "openrouter", session_id: null }),
+    agent({ id: 4, session_id: 9 }),
+  ];
+  assertEquals([...openRouterSessions(list)], [7]);
 });

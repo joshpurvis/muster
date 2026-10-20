@@ -61,6 +61,8 @@ export const meta = signal({ version: "", home: "", default_shell: "", login_she
 export const workspaces = signal<Workspace[]>([]);
 export const accountProfiles = signal<AccountProfile[]>([]);
 export const accountProfilesSupported = signal(false);
+/** `hello.openrouter`: null when the backend has no OpenRouter support. */
+export const openRouter = signal<{ key_present: boolean } | null>(null);
 export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 export const panels = signal<Map<number, Panel>>(new Map());
@@ -611,6 +613,7 @@ export function applyHello(h: HelloResult) {
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     accountProfiles.value = h.account_profiles ?? [];
     accountProfilesSupported.value = Array.isArray(h.account_profiles);
+    openRouter.value = h.openrouter ?? null;
     channels.value = h.channels.filter((c) => !c.archived);
     windowsSupported.value = Array.isArray(h.windows);
     windows.value = [...(h.windows ?? [])].sort((a, b) => a.id - b.id);

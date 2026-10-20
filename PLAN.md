@@ -159,7 +159,8 @@ panel".
 | Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
 | Asking | MCP `ask_agent` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
 | Messages | Each delivery gets an `agent_messages` row (from, to, origin, hop, reply_to, text, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. A message the agent's policy refuses is kept too, with the reason (never delivered, not counted toward the cap). |
-| Editing | `agent.update` / `muster agent edit` / the panel's Edit dialog: persona (rewrites the persona file), model, effort, accepted origins, autostart, permissions (also set on its tab). Model, effort and permissions apply from the next start. |
+| Editing | `agent.update` / `muster agent edit` / the panel's Edit dialog: persona (rewrites the persona file), provider, model, effort, accepted origins, autostart, permissions (also set on its tab). Provider, model, effort and permissions apply from the next start. |
+| Provider | `subscription` (the CLI's own login) or `openrouter`: pay per token with the owner's `OPENROUTER_API_KEY` from the backend's environment, held in memory only and passed only into that agent's sessions (§3: it is the owner's key, not a CLI credential; still never stored, logged or sent to clients). `src/openrouter.rs`, docs/PROTOCOL.md "OpenRouter". |
 
 **Origin rule.** Every message carries the origin of the chain it belongs to: `human`,
 `schedule` or `webhook`. Every session has a provenance: the origin and hop of the message it

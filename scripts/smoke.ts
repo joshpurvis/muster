@@ -59,10 +59,10 @@ interface Daemon {
 
 let current: Daemon | null = null;
 
-async function startDaemon(): Promise<Daemon> {
+async function startDaemon(extraEnv: Record<string, string> = {}): Promise<Daemon> {
   const proc = new Deno.Command(BIN, {
     args: ["daemon", "--foreground"],
-    env: ENV,
+    env: { ...ENV, ...extraEnv },
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
@@ -193,16 +193,30 @@ async function rawHttp(req: string): Promise<string> {
 
 // ----- test -----
 
+/** A fake CLI's launch: its arguments on the first line, then the provider variables it got
+ * (only those that are set), in `<BASE>/launch-<cli>-<session id>`. */
+const LAUNCH_VARS =
+  "ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_DEFAULT_SONNET_MODEL OPENROUTER_API_KEY MUSTER_PROVIDER";
+const LAUNCH_DUMP = (cli: string) =>
+  `{ printf 'ARGS'; printf ' %s' "$@"; printf '\\n'; for v in ${LAUNCH_VARS}; do if [ -n "\${!v+set}" ]; then printf '%s=%s\\n' "$v" "\${!v}"; fi; done; } > '${BASE}/launch-${cli}-'"$MUSTER_SESSION_ID"`;
+
 async function main() {
   // Stand-in only: renders an empty Codex composer, records input, never starts an agent.
   await Deno.mkdir(`${BASE}/bin`, { recursive: true });
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
+${LAUNCH_DUMP("codex")}
 stty -echo -icanon min 1 time 0
 printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
 exec cat > '${BASE}/fake-input'
 `);
   await Deno.chmod(`${BASE}/bin/codex`, 0o700);
+  // Stand-in Claude: records how it was launched, then idles (never starts a real agent).
+  await Deno.writeTextFile(`${BASE}/bin/claude`, `#!/bin/bash
+${LAUNCH_DUMP("claude")}
+exec cat > /dev/null
+`);
+  await Deno.chmod(`${BASE}/bin/claude`, 0o700);
   await Deno.mkdir(REPO, { recursive: true });
   await git(REPO, "init", "-q", "-b", "main");
   await Deno.writeTextFile(`${REPO}/README.md`, "smoke\n");
@@ -981,9 +995,195 @@ exec cat > '${BASE}/fake-input'
   ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");
   await c.call("agent.remove", { name: "bg" });
 
+  await openRouter(c, d);
+  console.log(`\nPASS (${passed} checks)`);
+}
+
+/** The fake CLI's launch record for session `id` (waits until it is written). */
+async function launchOf(cli: string, id: number): Promise<{ args: string; env: Record<string, string> }> {
+  const path = `${BASE}/launch-${cli}-${id}`;
+  for (let n = 0; n < 100 && !(await exists(path)); n++) await sleep(100);
+  await sleep(100);
+  const [first, ...rest] = (await Deno.readTextFile(path)).split("\n");
+  const env: Record<string, string> = {};
+  for (const line of rest.filter((l) => l)) env[line.slice(0, line.indexOf("="))] = line.slice(line.indexOf("=") + 1);
+  return { args: first, env };
+}
+
+/** Every file under `dir` (recursively) that contains `needle`. */
+async function filesContaining(dir: string, needle: string): Promise<string[]> {
+  const out: string[] = [];
+  const bytes = enc.encode(needle);
+  const has = (hay: Uint8Array) => {
+    outer: for (let i = 0; i + bytes.length <= hay.length; i++) {
+      for (let j = 0; j < bytes.length; j++) if (hay[i + j] !== bytes[j]) continue outer;
+      return true;
+    }
+    return false;
+  };
+  for await (const e of Deno.readDir(dir)) {
+    const p = `${dir}/${e.name}`;
+    if (e.isDirectory) out.push(...await filesContaining(p, needle));
+    else if (e.isFile && has(await Deno.readFile(p))) out.push(p);
+  }
+  return out;
+}
+
+const cli = (args: string[], env: Record<string, string>) =>
+  new Deno.Command(BIN, { args, env, stdin: "null", stdout: "piped", stderr: "piped" }).output();
+
+/** OpenRouter (src/openrouter.rs): the key comes from the backend's environment and only an
+ * OpenRouter agent's session gets it. Ends with the backend stopped. */
+async function openRouter(c: Client, d: Daemon): Promise<void> {
+  const KEY = "sk-or-smoke-fake-key-7f3a9c";
+  ok((await c.call("hello")).openrouter?.key_present === false, "openrouter: no OPENROUTER_API_KEY, hello says so");
+  await c.call("agent.create", { name: "orx", provider: "openrouter" }).then(
+    () => ok(false, "openrouter: refused without the key"),
+    (e) => ok(String(e).includes("OPENROUTER_API_KEY"), "openrouter: an agent on it is refused without the key"),
+  );
   c.close();
   await stopDaemon(d, "SIGTERM");
-  console.log(`\nPASS (${passed} checks)`);
+  // A fresh cache: the backend answers from it and never goes to the network here.
+  const cached = [
+    {
+      id: "anthropic/claude-sonnet-5.5",
+      name: "Anthropic: Claude Sonnet 5.5",
+      vendor: "anthropic",
+      context_length: 1000000,
+      prompt_per_m: 2,
+      completion_per_m: 10,
+      created: 1790000000,
+    },
+    {
+      id: "openai/gpt-6.1-sol",
+      name: "OpenAI: GPT-6.1 Sol",
+      vendor: "openai",
+      context_length: 400000,
+      prompt_per_m: 2,
+      completion_per_m: 12,
+      created: 1791000000,
+    },
+  ];
+  await Deno.writeTextFile(`${DATA}/openrouter-models.json`, JSON.stringify({ fetched_at: Date.now(), models: cached }));
+  d = await startDaemon({ OPENROUTER_API_KEY: KEY });
+  c = new Client(d.token);
+  await c.open();
+  ok((await c.call("hello")).openrouter.key_present === true, "openrouter: the key in the backend's environment is seen");
+  const models = await c.call("openrouter.models");
+  ok(
+    models.key_present && models.models.map((m: Json) => m.id).join() === cached.map((m) => m.id).join() &&
+      !models.error,
+    `openrouter.models answers from the cache: ${JSON.stringify(models).slice(0, 200)}`,
+  );
+  await c.call("agent.create", { name: "orc", kind: "codex", provider: "openrouter" }).then(
+    () => ok(false, "openrouter: codex needs a model"),
+    (e) => ok(String(e).includes("needs a model"), "openrouter: a Codex agent on it needs a model"),
+  );
+  const orClaude = await c.call("agent.create", {
+    name: "or-claude",
+    provider: "openrouter",
+    model: "anthropic/claude-sonnet-5.5",
+  });
+  ok(orClaude.provider === "openrouter", "openrouter: agent.create stores the provider");
+  await c.call("agent.create", { name: "sub-claude", model: "opus" });
+  await c.call("agent.create", { name: "or-codex", kind: "codex", provider: "openrouter", model: "openai/gpt-6.1-sol" });
+  const sOr = (await c.call("agent.start", { name: "or-claude" })).session.id;
+  const sSub = (await c.call("agent.start", { name: "sub-claude" })).session.id;
+  const sCodex = (await c.call("agent.start", { name: "or-codex" })).session.id;
+  await c.call("channel.create", {
+    workspace_id: (await c.call("hello")).workspaces[0].id,
+    agent: "shell",
+    prompt: `env > '${BASE}/shell-env'; sleep 30`,
+  });
+  const or = await launchOf("claude", sOr);
+  ok(
+    or.env.ANTHROPIC_BASE_URL === "https://openrouter.ai/api" && or.env.ANTHROPIC_AUTH_TOKEN === KEY &&
+      or.env.ANTHROPIC_API_KEY === "" && or.env.ANTHROPIC_DEFAULT_SONNET_MODEL === "~anthropic/claude-sonnet-latest[1m]" &&
+      or.env.MUSTER_PROVIDER === "openrouter" && !("OPENROUTER_API_KEY" in or.env),
+    `openrouter: the Claude agent gets the gateway, the key as ANTHROPIC_AUTH_TOKEN, an empty API key: ${
+      JSON.stringify(Object.keys(or.env))
+    }`,
+  );
+  ok(or.args.includes("--model anthropic/claude-sonnet-5.5"), `openrouter: --model gets the OpenRouter id: ${or.args.slice(0, 300)}`);
+  const sub = await launchOf("claude", sSub);
+  ok(
+    Object.keys(sub.env).length === 0 && sub.args.includes("--model opus"),
+    `openrouter: a subscription agent gets none of it: ${JSON.stringify(sub.env)}`,
+  );
+  const cx = await launchOf("codex", sCodex);
+  ok(
+    cx.env.OPENROUTER_API_KEY === KEY && !("ANTHROPIC_BASE_URL" in cx.env) && !("ANTHROPIC_AUTH_TOKEN" in cx.env),
+    "openrouter: the Codex agent gets OPENROUTER_API_KEY only",
+  );
+  ok(
+    cx.args.includes(`-c model_provider="openrouter"`) &&
+      cx.args.includes(`-c model_providers.openrouter.base_url="https://openrouter.ai/api/v1"`) &&
+      cx.args.includes(`-c model_providers.openrouter.env_key="OPENROUTER_API_KEY"`) && cx.args.includes("-m openai/gpt-6.1-sol"),
+    `openrouter: Codex gets the provider overrides and the model: ${cx.args.slice(0, 400)}`,
+  );
+  let shellEnv = "";
+  for (let n = 0; n < 100 && !shellEnv.includes("MUSTER_SESSION_ID="); n++) {
+    try {
+      shellEnv = await Deno.readTextFile(`${BASE}/shell-env`);
+    } catch { /* not yet */ }
+    await sleep(100);
+  }
+  ok(shellEnv.includes("MUSTER_SESSION_ID="), "openrouter: the shell tab ran");
+  ok(
+    !shellEnv.includes(KEY) && !shellEnv.includes("ANTHROPIC_BASE_URL") && !shellEnv.includes("MUSTER_PROVIDER"),
+    "openrouter: a shell tab inherits neither the key nor the gateway",
+  );
+  // The key is nowhere Muster writes or answers.
+  const replies = [
+    await c.call("hello"),
+    await c.call("agent.list"),
+    await c.call("openrouter.models"),
+    await c.call("agent.models"),
+    await c.call("session.output", { id: sOr }),
+  ];
+  ok(replies.every((r) => !JSON.stringify(r).includes(KEY)), "openrouter: no RPC reply carries the key");
+  const ls = await cli(["ls", "--json"], ENV);
+  const als = await cli(["agent", "ls", "--json"], ENV);
+  ok(
+    ls.success && als.success && dec.decode(als.stdout).includes("or-claude") &&
+      ![ls, als].some((o) => dec.decode(o.stdout).includes(KEY) || dec.decode(o.stderr).includes(KEY)),
+    "openrouter: `muster ls --json` and `muster agent ls --json` don't show the key",
+  );
+  const inData = await filesContaining(DATA, KEY);
+  ok(inData.length === 0, `openrouter: no file in the data dir holds the key (store, launch records, logs): ${inData}`);
+  ok((await filesContaining(RUNTIME, KEY)).length === 0, "openrouter: nothing in the runtime dir holds it");
+  ok(!d.log.join("").includes(KEY), "openrouter: the daemon log never shows it");
+  for (const a of ["or-claude", "sub-claude", "or-codex"]) await c.call("agent.remove", { name: a });
+  c.close();
+
+  // `muster reload` gives the new backend the environment of the shell it runs in.
+  const noKey = await cli(["reload"], ENV);
+  ok(
+    noKey.success && dec.decode(noKey.stderr).includes("has no OPENROUTER_API_KEY"),
+    `openrouter: reload from a shell without the key warns: ${dec.decode(noKey.stderr).slice(0, 300)}`,
+  );
+  await d.proc.status;
+  const connect = async () => {
+    const token = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`)).token;
+    const k = new Client(token);
+    await k.open();
+    return k;
+  };
+  c = await connect();
+  ok((await c.call("hello")).openrouter.key_present === false, "openrouter: ...and the reloaded backend has no key");
+  c.close();
+  const withKey = await cli(["reload"], { ...ENV, OPENROUTER_API_KEY: KEY });
+  ok(withKey.success && !dec.decode(withKey.stderr).includes("OPENROUTER_API_KEY"), "openrouter: reload from a shell with the key");
+  c = await connect();
+  ok((await c.call("hello")).openrouter.key_present === true, "openrouter: ...gives the reloaded backend the key");
+  c.close();
+  ok(
+    (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
+    "openrouter: still in no file after the reloads (the detached backend's log included)",
+  );
+  const stop = await cli(["stop"], ENV);
+  ok(stop.success, "openrouter: the reloaded backend stops");
+  // `current` (the first backend) has exited; the cleanup below finds nothing left to stop.
 }
 
 let failed = false;

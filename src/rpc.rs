@@ -101,6 +101,8 @@ pub fn hello(hub: &Hub) -> Value {
         "terminal_host": hub.terminal_host_info(),
         "updates": hub.updates().status(),
         "prefs": hub.ui_prefs(),
+        // Whether the backend has an OpenRouter key; never the key itself.
+        "openrouter": { "key_present": hub.openrouter_key().is_some() },
     })
 }
 
@@ -856,6 +858,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "agent.templates" => to_value(crate::agents::templates()),
         "agent.models" => Ok(crate::agents::model_catalog()),
+        "openrouter.models" => Ok(hub.openrouter_models().models(hub.openrouter_key().is_some()).await),
         "agent.remove" => {
             require_local(who, method)?;
             #[derive(Deserialize)]
@@ -1561,6 +1564,10 @@ mod tests {
     /// with the MCP server state attached. Nothing here starts a process: every call below is
     /// refused before delivery.
     fn fixture() -> (Arc<Hub>, Arc<McpState<HubBackend>>) {
+        fixture_keyed(None)
+    }
+
+    fn fixture_keyed(openrouter_key: Option<crate::openrouter::ApiKey>) -> (Arc<Hub>, Arc<McpState<HubBackend>>) {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
         let mut ch = crate::mcp::guard::test_channel(0);
@@ -1579,6 +1586,7 @@ mod tests {
             client_token: "t".into(),
             muster_bin: std::path::PathBuf::from("/bin/true"),
             terminal_host: None,
+            openrouter_key,
         };
         let hub = Hub::new(cfg, store).unwrap();
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));
@@ -1591,6 +1599,7 @@ mod tests {
             hub,
             NewAgent {
                 account_profile: None,
+                provider: None,
                 name: name.into(),
                 kind: None,
                 model: None,
@@ -1718,6 +1727,55 @@ mod tests {
         assert!(m["claude"]["models"].as_array().unwrap().iter().any(|x| x["id"] == "opus"));
         call(&hub, "agent.remove", json!({"name": "rpc-eve"})).await.unwrap();
         assert_eq!(drain(&mut rx, "agent_removed")[0]["name"], "rpc-eve");
+    }
+
+    #[tokio::test]
+    async fn openrouter_needs_the_key_and_no_reply_carries_it() {
+        const KEY: &str = "sk-or-rpc-fixture-secret";
+        let (hub, _st) = fixture();
+        assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["openrouter"]["key_present"], false);
+        let e = call(&hub, "agent.create", json!({"name": "or-none", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("OPENROUTER_API_KEY"), "{e}");
+        agent(&hub, "or-sub");
+        let e = call(&hub, "agent.update", json!({"name": "or-sub", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("OPENROUTER_API_KEY"), "{e}");
+        assert_eq!(call(&hub, "agent.list", json!({})).await.unwrap()[0]["provider"], "subscription");
+
+        let (hub, _st) = fixture_keyed(crate::openrouter::ApiKey::new(KEY));
+        hub.openrouter_models().seed(crate::model::now_ms(), crate::openrouter::parse_models(
+            include_bytes!("fixtures/openrouter_models.json")).unwrap());
+        let a = call(&hub, "agent.create", json!({"name": "or-claude", "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-5.5"})).await.unwrap();
+        assert_eq!((a["provider"].as_str(), a["model"].as_str()), (Some("openrouter"), Some("anthropic/claude-sonnet-5.5")));
+        let e = call(&hub, "agent.create", json!({"name": "or-codex", "kind": "codex", "provider": "openrouter"})).await.unwrap_err();
+        assert!(e.contains("needs a model"), "{e}");
+        call(&hub, "agent.create", json!({"name": "or-codex", "kind": "codex", "provider": "openrouter",
+            "model": "openai/gpt-6.1-sol"})).await.unwrap();
+        let e = call(&hub, "agent.update", json!({"name": "or-codex", "model": ""})).await.unwrap_err();
+        assert!(e.contains("needs a model"), "{e}");
+        let r = call(&hub, "agent.update", json!({"name": "or-claude", "provider": "subscription", "model": "opus"})).await.unwrap();
+        assert_eq!(r["provider"], "subscription");
+        let models = call(&hub, "openrouter.models", json!({})).await.unwrap();
+        assert_eq!(models["key_present"], true);
+        assert!(models["models"].as_array().unwrap().iter().any(|m| m["id"] == "openai/gpt-6.1-sol"));
+        let hello = call(&hub, "hello", json!({})).await.unwrap();
+        assert_eq!(hello["openrouter"]["key_present"], true);
+        for reply in [hello, models, call(&hub, "agent.list", json!({})).await.unwrap(),
+            call(&hub, "agent.models", json!({})).await.unwrap()] {
+            assert!(!reply.to_string().contains(KEY));
+        }
+        // The persona files and the store never hold it either.
+        for name in ["or-claude", "or-codex"] {
+            let a = hub.agents().get(name).unwrap();
+            for f in ["CLAUDE.md", "AGENTS.md"] {
+                if let Ok(text) = std::fs::read_to_string(std::path::Path::new(&a.home_dir).join(f)) {
+                    assert!(!text.contains(KEY));
+                }
+            }
+        }
+        assert!(!format!("{:?}", hub.store().load_agents().unwrap()).contains(KEY));
+        // A device never learns about OpenRouter's models.
+        assert!(crate::devices::method_scope("openrouter.models").is_none());
     }
 
     #[tokio::test]

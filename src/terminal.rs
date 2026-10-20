@@ -750,6 +750,8 @@ pub(crate) mod testing {
     pub(crate) struct Received {
         pub inputs: Mutex<Vec<(RunId, Vec<u8>)>>,
         pub stall: std::sync::atomic::AtomicBool,
+        /// Launches it was asked for (each refused as unsupported).
+        pub spawns: Mutex<Vec<muster_terminal_protocol::SpawnSpec>>,
     }
 
     /// A host that serves a backend: an empty inventory, an idle event stream, and input
@@ -779,7 +781,10 @@ pub(crate) mod testing {
                                 if wire::write(&mut stream, &Frame::json(&Response::Ok).unwrap()).is_err() { return }
                             }
                         }
-                        _ => { let _ = wire::write(&mut stream, &Frame::json(&Response::Error { code: "operation".into(), message: "unsupported by the fixture".into() }).unwrap()); }
+                        command => {
+                            if let Command::Spawn(spec) = command { received.spawns.lock().push(spec) }
+                            let _ = wire::write(&mut stream, &Frame::json(&Response::Error { code: "operation".into(), message: "unsupported by the fixture".into() }).unwrap());
+                        }
                     }
                 });
             }

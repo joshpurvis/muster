@@ -331,6 +331,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v17: where an agent's model runs (src/openrouter.rs); existing agents keep the
+    // subscription. Never a key: that stays in the daemon's memory.
+    r#"
+    ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
+    "#,
 ];
 
 /// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
@@ -670,7 +675,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart, account_profile_id FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id, provider FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -693,6 +698,7 @@ impl Store {
                 channel_id: r.get(12)?,
                 autostart: r.get::<_, i64>(13)? != 0,
                 account_profile_id: r.get(14)?,
+                provider: crate::openrouter::Provider::parse(&r.get::<_, String>(15)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -704,8 +710,8 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -720,7 +726,8 @@ impl Store {
                 b.created_at,
                 b.channel_id,
                 b.autostart as i64,
-                b.account_profile_id
+                b.account_profile_id,
+                b.provider.as_str()
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -745,7 +752,7 @@ impl Store {
     pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
-                    autostart = ?7 WHERE id = ?1",
+                    autostart = ?7, provider = ?8 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -753,7 +760,8 @@ impl Store {
                 b.persona,
                 perms_json(&b.permissions),
                 serde_json::to_string(&b.accepts_origins)?,
-                b.autostart as i64
+                b.autostart as i64,
+                b.provider.as_str()
             ],
         )?;
         Ok(())
@@ -1859,6 +1867,7 @@ mod tests {
         assert!(s.load_agents().unwrap().is_empty());
         let mut b = Agent {
             account_profile_id: None,
+            provider: crate::openrouter::Provider::OpenRouter,
             id: 0,
             name: "Scout".into(),
             kind: SessionKind::Codex,
@@ -1884,6 +1893,14 @@ mod tests {
         assert_eq!((back.channel_id, back.session_id, back.resume_id.as_deref()), (Some(8), Some(42), Some("abc-123")));
         assert_eq!(back.accepts_origins, vec![Origin::Human, Origin::Schedule]);
         assert_eq!(back.model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(back.provider, crate::openrouter::Provider::OpenRouter);
+        let mut sub = back.clone();
+        sub.provider = crate::openrouter::Provider::Subscription;
+        s.update_agent_config(&sub).unwrap();
+        assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
+        // Rows from before v17 (and anything unreadable) are the subscription.
+        s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
+        assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
 
         let m = AgentMessage {
             id: 0,

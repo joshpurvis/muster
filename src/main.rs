@@ -20,6 +20,7 @@ mod panel_kit;
 mod web_preview;
 mod skills;
 mod notify;
+mod openrouter;
 mod paths;
 mod pr;
 mod renderer;
@@ -390,6 +391,10 @@ enum AgentCmd {
         profile: Option<String>,
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
         kind: String,
+        /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
+        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
+        provider: Option<String>,
         /// Model for the agent CLI.
         #[arg(long, value_name = "M")]
         model: Option<String>,
@@ -415,6 +420,10 @@ enum AgentCmd {
     /// (model, effort and permissions apply from its next start).
     Edit {
         name: String,
+        /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
+        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
+        provider: Option<String>,
         /// Model for the agent CLI (empty: the CLI's default).
         #[arg(long, value_name = "M")]
         model: Option<String>,
@@ -616,6 +625,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 name,
                 profile,
                 kind,
+                provider,
                 model,
                 effort,
                 persona,
@@ -629,6 +639,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     name,
                     profile,
                     kind: Some(kind),
+                    provider,
                     model,
                     effort,
                     persona: read_persona(persona, persona_file)?,
@@ -640,6 +651,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             ),
             AgentCmd::Edit {
                 name,
+                provider,
                 model,
                 effort,
                 persona,
@@ -653,6 +665,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     name,
                     kind: None,
                     profile: None,
+                    provider,
                     model,
                     effort,
                     persona: read_persona(persona, persona_file)?,
@@ -819,11 +832,26 @@ fn reload() -> anyhow::Result<()> {
             &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
         ).context("cannot verify a compatible terminal host; backend left running")?;
         check_reload(&hello, &host.client.hello, &paths::lock_path())?;
+        warn_openrouter_key_lost(&hello);
         stop_backend(Some(d))?;
     }
     start_daemon_detached()?;
     println!("muster backend restarted; terminals preserved");
     Ok(())
+}
+
+/// The replacement backend gets this command's environment, so an OpenRouter key the running
+/// backend has and this shell doesn't is gone after the reload: say so (never refuse).
+fn warn_openrouter_key_lost(hello: &serde_json::Value) {
+    let here = std::env::var(openrouter::ENV_KEY).ok().and_then(|v| openrouter::ApiKey::new(&v)).is_some();
+    if hello["openrouter"]["key_present"] == true && !here {
+        eprintln!(
+            "note: the running backend has an OpenRouter key and this shell has no {key}, so the restarted \
+             backend won't: OpenRouter agents won't start until it is restarted with it \
+             (`env {key}=… muster reload`). The UI's update button keeps the key.",
+            key = openrouter::ENV_KEY
+        );
+    }
 }
 
 /// Everything the replacement backend will require of the running host, checked before
@@ -1006,6 +1034,8 @@ async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
 }
 
 fn run_daemon() -> anyhow::Result<()> {
+    // First, while this is the only thread: the key leaves the process environment.
+    let openrouter_key = openrouter::take_key_from_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MUSTER_LOG")
@@ -1021,13 +1051,13 @@ fn run_daemon() -> anyhow::Result<()> {
     let _lock = acquire_lock()?;
     paths::ensure_private_dir(&paths::data_dir())?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let r = rt.block_on(daemon_main());
+    let r = rt.block_on(daemon_main(openrouter_key));
     rt.shutdown_timeout(Duration::from_secs(2));
     paths::remove_discovery_if_ours();
     r
 }
 
-async fn daemon_main() -> anyhow::Result<()> {
+async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // The terminal host and its rollback fence first: an older, monolithic daemon holding
@@ -1060,6 +1090,7 @@ async fn daemon_main() -> anyhow::Result<()> {
             client_token: client_token.clone(),
             muster_bin,
             terminal_host: Some(terminal_host),
+            openrouter_key,
         },
         store,
     )?;

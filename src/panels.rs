@@ -50,6 +50,9 @@ pub struct Open {
     pub html: Option<String>,
     pub html_path: Option<String>,
     pub csp: Option<PanelCsp>,
+    /// Custom apps only: put the Muster Kit (kit.css, kit.js and the fonts) in front of the
+    /// HTML when it is served. It does not count toward the 1 MiB.
+    pub kit: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +63,14 @@ pub struct Update {
     pub data: Option<Value>,
     pub html: Option<String>,
     pub html_path: Option<String>,
+    /// Switch the kit on or off for a custom app (the app reloads).
+    pub kit: Option<bool>,
+}
+
+/// `kit` is for custom apps: the built-ins already draw with it.
+fn check_kit(app: &str, kit: Option<bool>) -> anyhow::Result<()> {
+    ensure!(kit.is_none() || app == "custom", "kit applies to custom apps only (the built-in apps already use it)");
+    Ok(())
 }
 
 pub fn dir(hub: &Hub, id: PanelId) -> PathBuf { hub.store().panel_dir(id) }
@@ -96,9 +107,11 @@ pub fn validate_csp(csp: &PanelCsp) -> anyhow::Result<()> {
 
 /// `srcdoc` inherits this policy; the inner frame additionally receives the strict app CSP.
 /// connectDomains are retained for a future per-panel approval; they grant no access today.
+/// `font-src data:` lets the kit's bundled fonts (src/panel_kit.rs) load from data: URIs: a
+/// data: font can carry nothing out and reach nothing, so it opens no network path.
 pub fn proxy_csp(csp: &PanelCsp, ui_port: u16) -> String {
     let resources = csp.resource_domains.join(" ");
-    format!("default-src 'none'; script-src 'self' 'unsafe-inline' {resources}; style-src 'self' 'unsafe-inline' {resources}; img-src 'self' data: {resources}; font-src 'self' {resources}; media-src 'self' data: {resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:{ui_port} http://localhost:{ui_port}")
+    format!("default-src 'none'; script-src 'self' 'unsafe-inline' {resources}; style-src 'self' 'unsafe-inline' {resources}; img-src 'self' data: {resources}; font-src 'self' data: {resources}; media-src 'self' data: {resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:{ui_port} http://localhost:{ui_port}")
 }
 
 /// Read the app HTML. Called without the operation lock. `html_path` must stay inside the
@@ -190,6 +203,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
     let (_, ch) = caller(hub, session)?;
     let builtin = crate::panel_apps::html(&args.app);
     ensure!(args.app == "custom" || builtin.is_some(), "unknown app (use {} or custom)", crate::panel_apps::BUILTINS);
+    check_kit(&args.app, args.kit)?;
     let supplied = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
     let html = match builtin { None => supplied.context("custom apps need html or html_path")?,
         Some(html) => { ensure!(supplied.is_none(), "{} does not accept custom HTML", args.app); html.to_string() } };
@@ -214,7 +228,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
         ensure!(open.len() < MAX_OPEN_TOTAL, "Muster already has {MAX_OPEN_TOTAL} open panels; close some first");
         let now = now_ms();
         let mut panel = Panel { id: 0, channel_id: ch.id, session_id: s.id, window_id: s.window_id.or(ch.window_id),
-            title, app: args.app, csp, revision: 1, data_revision: 1, html_revision: 1,
+            title, app: args.app, csp, revision: 1, data_revision: 1, html_revision: 1, kit: args.kit == Some(true),
             created_at: now, updated_at: now, closed: false, context: None, dropped_events: 0 };
         let mut placed = None;
         let created = hub.store().create_panel(&mut panel, |p| {
@@ -250,10 +264,13 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     let (_, ch) = caller(hub, session)?;
     let html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
     ensure!(html.is_none() || seen.app == "custom", "only custom apps accept HTML updates");
+    check_kit(&seen.app, args.kit)?;
+    // Whether the kit really changes is decided under the lock, against the panel as it is then.
+    let kit = args.kit;
     let title = args.title.as_deref().map(title).transpose()?;
     let data = args.data.map(|d| app_data(hub, &seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
     let id = args.panel_id;
-    commit(hub, &seen, title, html, data, || {
+    commit(hub, &seen, title, html, data, kit, || {
         let p = own(hub, session, id)?;
         caller_in(hub, session, ch.id)?;
         Ok(p)
@@ -263,7 +280,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
 /// Stage files without the lock, then rename and commit under it. `recheck` runs under the
 /// lock and returns the panel as it is now, refusing if the caller may no longer change it;
 /// `write` stores the new row (given the old one), also under the lock.
-fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, data: Option<Vec<u8>>,
+fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, data: Option<Vec<u8>>, kit: Option<bool>,
     recheck: impl FnOnce() -> anyhow::Result<Panel>, write: impl FnOnce(&Panel, &mut Panel) -> anyhow::Result<()>) -> anyhow::Result<()> {
     // Unchanged HTML keeps its revision (the app keeps running), if nobody changed it meanwhile.
     let same_html = html.as_ref().is_some_and(|html| std::fs::read_to_string(app_file(hub, &seen)).is_ok_and(|old| old == *html));
@@ -285,10 +302,18 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
         if let Some(t) = title { p.title = t; }
         p.revision += 1;
         p.updated_at = now_ms();
-        let new_html = html.is_some() && !(same_html && old.html_revision == seen.html_revision);
+        let kit_changed = kit.is_some_and(|k| k != p.kit);
+        if let Some(k) = kit { p.kit = k; }
+        let new_html = html.is_some() && (kit_changed || !(same_html && old.html_revision == seen.html_revision));
         if new_html {
             p.html_revision = p.revision;
             std::fs::rename(&staged_html, app_file(hub, &p))?;
+        } else if kit_changed {
+            // Switching the kit alone changes what the sandbox gets, so the app reloads as a new
+            // HTML revision; its HTML is the one committed now (never a copy read before the
+            // lock, which a concurrent update may have replaced).
+            p.html_revision = p.revision;
+            std::fs::hard_link(app_file(hub, &old), app_file(hub, &p))?;
         }
         if data.is_some() {
             p.data_revision = p.revision;
@@ -297,7 +322,7 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
         else { std::fs::hard_link(data_file(hub, &old), data_file(hub, &p))?; }
         if let Err(e) = write(&old, &mut p) {
             let _ = std::fs::remove_file(data_file(hub, &p));
-            if new_html { let _ = std::fs::remove_file(app_file(hub, &p)); }
+            if p.html_revision != old.html_revision { let _ = std::fs::remove_file(app_file(hub, &p)); }
             return Err(e);
         }
         hub.emit(ServerEvent::PanelUpserted(p.clone()));
@@ -330,7 +355,7 @@ pub fn navigate(hub: &Hub, id: PanelId, typed: &str) -> anyhow::Result<(String, 
     if resource(hub, id)?["data"]["url"].as_str() == Some(url.as_str()) { return Ok((url, false)) }
     let data = crate::web_preview::data(json!({"url": url}), &own_ports(hub))?;
     let mut changed = false;
-    commit(hub, &seen, None, None, Some(data), || {
+    commit(hub, &seen, None, None, Some(data), None, || {
         let p = get(hub, id)?;
         ensure!(hub.channel(p.channel_id).is_some_and(|c| !c.archived), "the panel's task is gone");
         ensure!(p.app == "web_preview", "only a web preview has an address bar");
@@ -357,7 +382,10 @@ pub fn resource(hub: &Hub, id: PanelId) -> anyhow::Result<Value> {
             Ok((std::fs::read_to_string(app_file(hub, &p))?, std::fs::read(data_file(hub, &p))?))
         };
         match read() {
-            Ok((html, data)) => return Ok(json!({"panel": p, "html": html, "data": serde_json::from_slice::<Value>(&data)?})),
+            Ok((html, data)) => {
+                let html = crate::panel_kit::serve(&p.app, p.kit, html);
+                return Ok(json!({"panel": p, "html": html, "data": serde_json::from_slice::<Value>(&data)?}))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 3 => attempt += 1,
             Err(e) => return Err(e.into()),
         }
@@ -677,7 +705,7 @@ mod tests {
 
     fn markdown(hub: &Hub) -> PanelId {
         open(hub, 1, Open { title: "Review".into(), app: "markdown".into(), data: Some(json!({"markdown":"# Hello"})),
-            html: None, html_path: None, csp: None }).unwrap()
+            html: None, html_path: None, csp: None, kit: None }).unwrap()
     }
 
     #[test]
@@ -688,7 +716,7 @@ mod tests {
         for file in ["app-1.html", "data-1.json"] {
             assert_eq!(std::fs::metadata(dir(&hub, id).join(file)).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# New"})), title: Some("Changed".into()), html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# New"})), title: Some("Changed".into()), html: None, html_path: None, kit: None }).unwrap();
         let res = resource(&hub, id).unwrap();
         assert_eq!(res["panel"]["revision"], 2);
         assert_eq!(res["panel"]["html_revision"], 1);
@@ -704,12 +732,59 @@ mod tests {
     #[test]
     fn only_changed_html_advances_html_revision() {
         let hub = fixture();
-        let id = open(&hub, 1, Open { title:"Custom".into(), app:"custom".into(), data:None, html:Some("a".into()), html_path:None, csp:None }).unwrap();
+        let id = open(&hub, 1, Open { title:"Custom".into(), app:"custom".into(), data:None, html:Some("a".into()), html_path:None, csp:None, kit: None }).unwrap();
         for (html, expected) in [("a", 1), ("b", 3)] {
-            update(&hub, 1, Update { panel_id:id, title:None, data:None, html:Some(html.into()), html_path:None }).unwrap();
+            update(&hub, 1, Update { panel_id:id, title:None, data:None, html:Some(html.into()), html_path:None, kit: None }).unwrap();
             assert_eq!(get(&hub, id).unwrap().html_revision, expected);
         }
         archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn the_kit_goes_in_front_of_custom_html_only_when_asked() {
+        let hub = fixture();
+        let custom = |kit: Option<bool>| Open { title: "Deploys".into(), app: "custom".into(), data: None, html: Some("<main class=\"mk-page\">hi</main>".into()),
+            html_path: None, csp: None, kit };
+        let plain = open(&hub, 1, custom(None)).unwrap();
+        assert!(!get(&hub, plain).unwrap().kit);
+        assert_eq!(resource(&hub, plain).unwrap()["html"], "<main class=\"mk-page\">hi</main>");
+        let kit = open(&hub, 1, custom(Some(true))).unwrap();
+        let served = resource(&hub, kit).unwrap()["html"].as_str().unwrap().to_string();
+        assert!(get(&hub, kit).unwrap().kit && served.starts_with("<style>") && served.ends_with("<main class=\"mk-page\">hi</main>"));
+        assert!(served.contains("@font-face") && served.contains("<script>") && served.contains("mk-page"));
+        // Only the agent's HTML is stored, and only it counts toward the 1 MiB.
+        assert_eq!(std::fs::read_to_string(app_file(&hub, &get(&hub, kit).unwrap())).unwrap(), "<main class=\"mk-page\">hi</main>");
+        let big = "x".repeat(MAX_FILE - 10);
+        let id = open(&hub, 1, Open { html: Some(big), ..custom(Some(true)) }).unwrap();
+        assert!(resource(&hub, id).unwrap()["html"].as_str().unwrap().len() > MAX_FILE, "the kit is added after the size check");
+        // Switching the kit reloads the app (a new HTML revision) with the same HTML.
+        let before = get(&hub, plain).unwrap().html_revision;
+        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
+        let p = get(&hub, plain).unwrap();
+        assert!(p.kit && p.html_revision > before);
+        assert!(resource(&hub, plain).unwrap()["html"].as_str().unwrap().starts_with("<style>"));
+        // The same value again changes nothing.
+        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
+        assert_eq!(get(&hub, plain).unwrap().html_revision, p.html_revision);
+        // A kit switch read before a concurrent HTML update commits keeps that newer HTML.
+        let stale = get(&hub, plain).unwrap();
+        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: Some("<p>newer</p>".into()), html_path: None, kit: None }).unwrap();
+        commit(&hub, &stale, None, None, None, Some(false), || get(&hub, plain), |_, p| hub.store().save_panel(p)).unwrap();
+        let p = get(&hub, plain).unwrap();
+        assert!(!p.kit && p.html_revision == p.revision);
+        assert_eq!(resource(&hub, plain).unwrap()["html"], "<p>newer</p>");
+        // Built-ins already use the kit: asking for it is refused, naming the field.
+        let e = open(&hub, 1, Open { title: "C".into(), app: "chart".into(), data: Some(json!({"type":"bar","x":{"values":[]},"series":[]})),
+            html: None, html_path: None, csp: None, kit: Some(true) }).unwrap_err().to_string();
+        assert!(e.contains("kit applies to custom apps only"), "{e}");
+        // A built-in's served HTML has its fonts in place of the marker.
+        let chart = open(&hub, 1, Open { title: "C".into(), app: "chart".into(), data: Some(json!({"type":"bar","x":{"values":[]},"series":[]})),
+            html: None, html_path: None, csp: None, kit: None }).unwrap();
+        let html = resource(&hub, chart).unwrap()["html"].as_str().unwrap().to_string();
+        assert!(html.contains("@font-face{font-family:\"MK Inter\"") && !html.contains(crate::panel_kit::FONT_MARKER));
+        // The proxy CSP lets those data: fonts load and still blocks the network.
+        let policy = proxy_csp(&PanelCsp::default(), 7433);
+        assert!(policy.contains("font-src 'self' data:") && policy.contains("connect-src 'none'") && PROXY.contains("font-src 'self' data:") && PROXY.contains("frame-src 'none'"));
     }
 
     #[test]
@@ -736,7 +811,7 @@ mod tests {
         let id = markdown(&hub);
         assert!(close(&hub, Some(2), id, false).unwrap_err().to_string().contains("another task"));
         assert!(wait(&hub, 2, Some(id), 0).await.unwrap_err().to_string().contains("another task"));
-        assert!(update(&hub, 2, Update { panel_id:id, title:None, data:Some(json!({})), html:None, html_path:None }).is_err());
+        assert!(update(&hub, 2, Update { panel_id:id, title:None, data:Some(json!({})), html:None, html_path:None, kit:None }).is_err());
         context(&hub, id, json!({"structuredContent":{"selected":2}})).unwrap();
         event(&hub, id, "approve".into(), json!({"hunk":2})).unwrap();
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
@@ -842,7 +917,7 @@ mod tests {
     async fn web_previews_take_only_local_dev_servers() {
         let hub = fixture();
         hub.panels.port.store(40001, Ordering::Relaxed);
-        let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None };
+        let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None, kit: None };
         let id = open(&hub, 1, preview("http://LOCALHOST:5173")).unwrap();
         assert_eq!(resource(&hub, id).unwrap()["data"], json!({"url": "http://localhost:5173/"}));
         for bad in ["https://github.com/", "http://127.0.0.1:40001/proxy", "http://localhost:5173@evil.example/", "http://[::1]:5173/"] {
@@ -851,18 +926,18 @@ mod tests {
         let mut with_html = preview("http://localhost:5173");
         with_html.html = Some("<p>x</p>".into());
         assert!(open(&hub, 1, with_html).is_err(), "a web preview takes no HTML");
-        update(&hub, 1, Update { panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None, kit: None }).unwrap();
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (2, 1), "a title-only update keeps the data revision (no page reload)");
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None, kit: None }).unwrap();
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (3, 3), "a data update advances it");
         assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://127.0.0.1:8000/docs");
-        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None }).is_err());
-        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None }).is_err());
+        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None, kit: None }).is_err());
+        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None, kit: None }).is_err());
         // Nothing listens on the stored port (bound and released): the agent gets a note.
         let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": format!("http://127.0.0.1:{free}/")})), html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": format!("http://127.0.0.1:{free}/")})), html: None, html_path: None, kit: None }).unwrap();
         let out = with_preview_note(&hub, id, json!({"panel_id": id})).await;
         assert!(out["note"].as_str().unwrap().contains("Nothing answers"), "{out}");
         assert!(with_preview_note(&hub, markdown(&hub), json!({})).await.get("note").is_none());
@@ -874,7 +949,7 @@ mod tests {
         let hub = fixture();
         hub.panels.port.store(40001, Ordering::Relaxed);
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None }).unwrap();
         assert_eq!(navigate(&hub, id, " 3000 ").unwrap(), ("http://localhost:3000/".to_string(), true));
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (2, 2), "stored like a data update");
@@ -897,7 +972,7 @@ mod tests {
         let md = markdown(&hub);
         assert!(navigate(&hub, md, "3000").unwrap_err().to_string().contains("only a web preview"));
         // `previous` is what was stored at commit time, agent updates included.
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:4000/"})), html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:4000/"})), html: None, html_path: None, kit: None }).unwrap();
         navigate(&hub, id, "4001").unwrap();
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
         assert_eq!(out["events"][0]["payload"], json!({"url": "http://localhost:4001/", "previous": "http://127.0.0.1:4000/"}));
@@ -908,7 +983,7 @@ mod tests {
     async fn every_navigation_reaches_the_agent_past_the_app_event_limit() {
         let hub = fixture();
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None }).unwrap();
         // The apps' limit is 30 events a minute; the user's own navigations are not app input.
         for n in 0..45 { assert!(navigate(&hub, id, &format!("{}", 3000 + n)).unwrap().1); }
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
@@ -923,7 +998,7 @@ mod tests {
     async fn concurrent_navigations_queue_in_commit_order() {
         let hub = fixture();
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None }).unwrap();
         let threads: Vec<_> = (0..4).map(|t| {
             let hub = hub.clone();
             std::thread::spawn(move || for n in 0..10 { let _ = navigate(&hub, id, &format!("{}", 3000 + t * 100 + n)); })
@@ -957,10 +1032,10 @@ mod tests {
     fn open_panels_per_task_are_bounded() {
         let hub = fixture();
         for _ in 0..MAX_OPEN_PER_TASK { markdown(&hub); }
-        let err = open(&hub, 1, Open { title: "One more".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None }).unwrap_err();
+        let err = open(&hub, 1, Open { title: "One more".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None }).unwrap_err();
         assert!(err.to_string().contains("open panels"), "{err}");
         // Another task has its own allowance; closing one frees a slot.
-        open(&hub, 2, Open { title: "Other".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None }).unwrap();
+        open(&hub, 2, Open { title: "Other".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None }).unwrap();
         close(&hub, Some(1), 1, false).unwrap();
         markdown(&hub);
         archive(&hub, 1).unwrap();
@@ -1016,7 +1091,7 @@ mod tests {
     fn startup_sweeps_stale_files_and_spent_closed_panels() {
         let hub = fixture();
         let id = markdown(&hub);
-        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# 2"})), title: None, html: None, html_path: None }).unwrap();
+        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# 2"})), title: None, html: None, html_path: None, kit: None }).unwrap();
         let folder = dir(&hub, id);
         for junk in ["data-1.tmp4242", "stage-0123456789abcdef", "app-9.html"] { std::fs::write(folder.join(junk), "x").unwrap(); }
         let root = hub.store().panels_root();

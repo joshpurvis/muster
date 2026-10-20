@@ -160,3 +160,59 @@ export const prMediaSample = {
   ],
   actions: actionsSample,
 };
+
+// ----- the Briefing look: the gallery's own examples (docs/AGENT_PANELS.md "The kit") -----
+
+/** A chart with every optional field the Briefing look added. */
+export const chartBriefSample = {
+  type: "bar", title: "CI minutes per day", scope: "acme-store · week of Oct 13", format: "int", pin: 4,
+  takeaway: "PR builds used **1.75×** the minutes of master builds. Friday was the peak at **124 minutes**; the weekend was quiet.",
+  source: "gh run list · 412 runs",
+  x: { label: "Day", values: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] },
+  series: [{ name: "master", values: [42, 55, 38, 61, 70, 12, 9] }, { name: "PRs", values: [80, 96, 73, 110, 124, 20, null] }],
+  y: { label: "Minutes" },
+  stats: [
+    { label: "master", color: "var(--mk-c1)", value: "287", unit: "min", delta: "−12%", tone: "good", note: "vs last week" },
+    { label: "PRs", color: "var(--mk-c2)", value: "503", unit: "min", delta: "+8%", tone: "bad", note: "vs last week" },
+    { label: "Busiest day", color: "var(--mk-text-3)", value: "Fri", note: "194 min in all" },
+  ],
+};
+
+/** Many series, one highlighted, an annotation, percents. */
+export const chartMultiSample = (() => {
+  const hours = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, "0") + ":00");
+  const wob = (base: number, amp: number, seed: number) => hours.map((_, i) => +(base + amp * Math.sin(i * 0.7 + seed) * 0.5 + amp * 0.35 * Math.cos(i * 1.9 + seed)).toFixed(2));
+  const checkout = hours.map((_, i) => +(i < 14 ? 0.38 + 0.06 * Math.sin(i) : 0.38 + (i - 13) * 0.17 + 0.05 * Math.sin(i * 2)).toFixed(2));
+  checkout[23] = 2.1;
+  return {
+    type: "line", title: "Error rate by service", scope: "production, today", format: "pct", highlight: "checkout", pin: 17,
+    takeaway: "**checkout** climbed from 0.4% to **2.1%** after 14:00, when the coupon flag went on. The other four services stayed under 0.7%.",
+    source: "Loki · rate(errors[1h]) · 5 services", x: { label: "Hour", values: hours },
+    series: [{ name: "checkout", values: checkout }, { name: "search", values: wob(0.52, 0.12, 1) }, { name: "accounts", values: wob(0.31, 0.1, 2) },
+      { name: "billing", values: wob(0.22, 0.08, 3) }, { name: "images", values: wob(0.12, 0.05, 4) }],
+    annotations: [{ x: "14:00", label: "flag: new-coupon-flow on" }],
+  };
+})();
+
+/** A table with inline bars, badges and a mono column. */
+export const tableBriefSample = {
+  title: "Flaky tests", scope: "acme-store · last 200 CI runs", source: "junit reports from gh run list",
+  takeaway: "**search ranks by score** failed 1 run in 9. Everything else is rare; two are already fixed.",
+  columns: [{ key: "test", label: "Test" }, { key: "file", label: "File", format: "mono" }, { key: "failed", label: "Failed", format: "bar" },
+    { key: "seconds", label: "Seconds" },
+    { key: "status", label: "Status", format: "badge", tones: { Flaky: "warn", Quarantined: "bad", Slow: "info", "Fixed in #839": "good", "Fixed in #841": "good" } }],
+  sort: { key: "failed", dir: "desc" },
+  rows: [
+    { test: "search ranks by score", file: "src/search/search_test.ts", failed: 23, seconds: 1.8, status: "Flaky" },
+    { test: "checkout sends receipt", file: "src/cart/receipt_test.ts", failed: 9, seconds: 6.2, status: "Flaky" },
+    { test: "session survives restart", file: "src/auth/session_test.ts", failed: 6, seconds: 12.4, status: "Quarantined" },
+    { test: "export large csv", file: "src/admin/export_test.ts", failed: 4, seconds: 27.05, status: "Slow" },
+    { test: "webhook retries back off", file: "src/hooks/sender_test.ts", failed: 3, seconds: 3.4, status: "Flaky" },
+    { test: "image resize keeps ratio", file: "src/media/resize_test.ts", failed: 2, seconds: 0.9, status: "Fixed in #839" },
+    { test: "coupon and tax together", file: "src/cart/total_test.ts", failed: 1, seconds: 0.2, status: "Fixed in #841" },
+  ],
+};
+
+export const markdownSample = {
+  markdown: "# billing-api v2.4.0\nFaster invoices, a fix for coupon tax, and one migration to run before you deploy.\n\n> Run `0042_coupons.sql` before deploying. It adds a column and takes under a second on a table of 2 million orders.\n\n## What's new\n- **Invoices render 3× faster.** PDF fonts are cached between requests, so p95 drops from 262 ms to 158 ms.\n- **Coupons and tax.** Tax is now charged after a coupon comes off.\n\n## Upgrading\n```shell\n# run once, before the deploy\ndeno task migrate --to 0042\n```\n\n| Endpoint | p95 before | p95 after |\n|---|---|---|\n| `POST /invoices` | 262 ms | 158 ms |\n\n## Before posting\n- [x] Changelog entries checked against 31 commits\n- [ ] Confirm the migration timing on the staging copy\n",
+};

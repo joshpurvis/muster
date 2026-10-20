@@ -20,6 +20,8 @@ export interface Notice {
   kind: NoticeKind;
   title: string;
   detail: string;
+  /** The raw evidence, shown in mono for the curious (a header, a redirect). */
+  evidence?: string;
   /** Covers the frame (it shows only a browser error page), or a bar above it. */
   blocking: boolean;
 }
@@ -49,15 +51,16 @@ export function previewFrameSrc(origin: string, url: string): string {
   return `${origin}/preview?url=${encodeURIComponent(url)}`;
 }
 
-/** The notice for a check, if it found a problem. `retrying`: still checking while it is down. */
-export function previewNotice(check: PreviewCheck | null, retrying: boolean): Notice | null {
+/** The notice for a check, if it found a problem. `retrying`: still checking while it is down.
+ * `host` names the dev server in the title ("localhost:5173"). */
+export function previewNotice(check: PreviewCheck | null, retrying: boolean, host = "this address"): Notice | null {
   if (!check) return null;
   if (!check.reachable) {
     return {
       kind: "down",
-      title: "Nothing is answering at this address yet.",
+      title: `Nothing is running at ${host} yet`,
       detail: retrying
-        ? "Start the dev server, or check its port. The preview reloads by itself once the server answers."
+        ? "The preview reloads by itself as soon as the dev server starts."
         : "Start the dev server, or check its port, then press Reload.",
       blocking: true,
     };
@@ -65,16 +68,18 @@ export function previewNotice(check: PreviewCheck | null, retrying: boolean): No
   if (check.refused) {
     return {
       kind: "refused",
-      title: "This page refuses to be shown inside another page.",
-      detail: `It sends ${check.refused}. Open it in your browser instead, or allow framing in the dev server's settings.`,
+      title: "This page won't show in a panel",
+      detail: "The server tells browsers not to put it in a frame. It works in your normal browser.",
+      evidence: check.refused,
       blocking: true,
     };
   }
   if (check.leaves_to) {
     return {
       kind: "leaves",
-      title: "This page sends you on to another address.",
-      detail: `It redirects to ${check.leaves_to}, which a preview cannot show. Open it in your browser instead.`,
+      title: "This page sends you to another site",
+      detail: `It redirects away from ${host}, and a preview stays on the dev server. Open it in your browser instead.`,
+      evidence: `→ ${check.leaves_to}`,
       blocking: true,
     };
   }
@@ -144,8 +149,8 @@ export function startChecks(o: CheckLoop): () => void {
 
 export const SLOW_NOTICE: Notice = {
   kind: "slow",
-  title: "Still loading after 10 seconds.",
-  detail: "The dev server may be busy, or the page may be waiting on something.",
+  title: "Still loading after 10 s.",
+  detail: "The dev server may still be compiling, or the page may be waiting on something.",
   blocking: false,
 };
 
@@ -204,4 +209,19 @@ export function addressStep(s: AddressState, a: AddressAction): AddressState {
 /** What the field shows: the user's text, or the panel's current address. */
 export function addressText(s: AddressState, url: string | null): string {
   return s.dirty ? s.draft : url ?? "";
+}
+
+/** The address bar's status dot: the page shows (ok), the server answered but the page can't be
+ * shown here (warn), or waiting (wait: nothing yet, still loading, or nothing answering). */
+export function previewStatus(url: string | null, loaded: boolean, notice: Notice | null): "ok" | "warn" | "wait" {
+  if (!url) return "wait";
+  if (notice?.kind === "refused" || notice?.kind === "leaves") return "warn";
+  if (notice?.kind === "down" || notice?.kind === "silent") return "wait";
+  return loaded ? "ok" : "wait";
+}
+
+/** "1:20": what is left of the checks, for "stops in 1:20". */
+export function clock(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }

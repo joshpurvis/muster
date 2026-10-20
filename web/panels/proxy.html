@@ -94,8 +94,9 @@
         const resources = origins(msg.params.csp?.resourceDomains);
         keys = chords(msg.params.keys);
         // Fetch approval and nested dev previews are deferred. External child documents
-        // would have their own CSP and could otherwise bypass the no-fetch policy.
-        const csp = `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
+        // would have their own CSP and could otherwise bypass the no-fetch policy. font-src
+        // data: is for the kit's bundled fonts (data: fonts reach no network).
+        const csp = `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' data: ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
         frame = document.createElement("iframe");
         frame.title = "Panel app";
         frame.sandbox = "allow-scripts";

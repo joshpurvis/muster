@@ -273,12 +273,14 @@ export interface Panel {
   session_id: SessionId;
   window_id: WindowId | null;
   title: string;
-  app: "markdown" | "image" | "chart" | "table" | "pr_decision" | "pr_overview" | "web_preview" | "custom";
+  app: "markdown" | "image" | "chart" | "table" | "pr_decision" | "pr_overview" | "board" | "web_preview" | "custom";
   csp: PanelCsp;
   revision: number;
   /** The revision whose `panel_update` last carried data (absent from older backends). */
   data_revision?: number;
   html_revision: number;
+  /** A custom panel opened with `kit: true`: Muster puts the kit in front of its HTML. */
+  kit?: boolean;
   created_at: number;
   updated_at: number;
   closed: boolean;

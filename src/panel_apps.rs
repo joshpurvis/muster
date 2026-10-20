@@ -16,9 +16,10 @@ pub const CHART: &str = include_str!("../web/panels/chart.html");
 pub const TABLE: &str = include_str!("../web/panels/table.html");
 pub const PR_DECISION: &str = include_str!("../web/panels/pr_decision.html");
 pub const PR_OVERVIEW: &str = include_str!("../web/panels/pr_overview.html");
+pub const BOARD: &str = include_str!("../web/panels/board.html");
 
 /// For error messages and tool descriptions.
-pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview, web_preview";
+pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview, board, web_preview";
 /// Largest image file an `image` panel reads.
 pub const MAX_IMAGE: usize = 8 * 1024 * 1024;
 /// Its stored input: the base64 data URI plus the agent's own short fields.
@@ -57,6 +58,7 @@ pub fn html(app: &str) -> Option<&'static str> {
         "table" => TABLE,
         "pr_decision" => PR_DECISION,
         "pr_overview" => PR_OVERVIEW,
+        "board" => BOARD,
         // Drawn by the UI, not the sandbox proxy (src/web_preview.rs).
         "web_preview" => crate::web_preview::PLACEHOLDER,
         _ => return None,
@@ -79,6 +81,7 @@ pub fn data(app: &str, cwd: &Path, data: Value, csp: &mut PanelCsp, opening: boo
         "pr_overview" => check_overview(&data)?,
         "chart" => check_chart(&data)?,
         "table" => check_table(&data)?,
+        "board" => check_board(&data)?,
         _ => {}
     }
     if app != "image" { return crate::panels::data_bytes(&data); }
@@ -470,6 +473,7 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
     let repo = text(o, app, "repo")?;
     ensure!(repo_ok(repo), "pr_overview `repo` must be owner/name (got {repo:?})");
     opt_text(o, app, "title", 200)?;
+    opt_text(o, app, "takeaway", 600)?;
     let prs = field(o, app, "prs")?.as_array().context("pr_overview `prs` must be an array")?;
     ensure!(prs.len() <= 200, "pr_overview `prs` has {} PRs; at most 200", prs.len());
     let mut numbers = Vec::with_capacity(prs.len());
@@ -536,29 +540,78 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The kit's number formats (web/src/panels/kit/format.ts `FORMATS`).
+const FORMATS: &[&str] = &["int", "pct", "usd", "ms", "s", "plain"];
+
+/// A colour an agent may give: a kit token (`var(--mk-…)`) or a hex colour, nothing that could
+/// carry other CSS (web/src/panels/kit/format.ts `COLOR`).
+pub fn color_ok(c: &str) -> bool {
+    let hex = |h: &str| (h.len() == 3 || h.len() == 6) && h.bytes().all(|b| b.is_ascii_hexdigit());
+    if let Some(h) = c.strip_prefix('#') { return hex(h) }
+    c.strip_prefix("var(--mk-").and_then(|r| r.strip_suffix(')'))
+        .is_some_and(|t| (1..=30).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+}
+
+fn opt_color(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(c) = o.get("color").filter(|v| !v.is_null()) {
+        ensure!(c.as_str().is_some_and(color_ok), "{at} `color` must be a kit colour token such as var(--mk-c2) or a hex colour such as #6a56e6");
+    }
+    Ok(())
+}
+
+fn opt_number(o: &serde_json::Map<String, Value>, at: &str, key: &str) -> anyhow::Result<Option<f64>> {
+    match o.get(key).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => Ok(Some(v.as_f64().with_context(|| format!("{at} `{key}` must be a number"))?)),
+    }
+}
+
+/// A headline number: chart `stats` and Board `stats` items.
+fn check_stat(s: &Value, at: &str) -> anyhow::Result<()> {
+    let s = object(s, at)?;
+    req_text(s, at, "label", 100)?;
+    let v = s.get("value").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `value`"))?;
+    ensure!(v.is_number() || v.as_str().is_some_and(|t| t.chars().count() <= 40), "{at} `value` must be a number or a string of at most 40 characters");
+    for (key, max) in [("unit", 20), ("delta", 20), ("note", 100)] { opt_text(s, at, key, max)?; }
+    one_of(s, at, "tone", &["good", "bad", "flat"], false)?;
+    opt_color(s, at)?;
+    if let Some(t) = s.get("trend").filter(|v| !v.is_null()) {
+        let t = t.as_array().with_context(|| format!("{at} `trend` must be an array of numbers"))?;
+        ensure!(t.len() <= 200 && t.iter().all(Value::is_number), "{at} `trend` must be at most 200 numbers");
+    }
+    Ok(())
+}
+
+/// Everything the chart app checks (web/src/panels/apps/chart/logic.ts). The fields added for the
+/// Briefing look (takeaway … stats) are all optional; a chart with no values is allowed, so the
+/// panel can say there is nothing to show (`empty`).
 pub fn check_chart(data: &Value) -> anyhow::Result<()> {
     let app = "chart";
     let o = object(data, "chart data")?;
     one_of(o, app, "type", &["bar", "line", "scatter", "area"], true)?;
+    let kind = o.get("type").and_then(Value::as_str).unwrap_or_default();
     opt_text(o, app, "title", 200)?;
     let x = object(field(o, app, "x")?, "chart `x`")?;
     opt_text(x, "chart x", "label", 200)?;
     let x = x.get("values").and_then(Value::as_array).context("chart data needs `x.values` (an array)")?;
-    ensure!((1..=2000).contains(&x.len()), "chart `x.values` needs 1 to 2000 values");
+    ensure!(x.len() <= 2000, "chart `x.values` has {} values; at most 2000", x.len());
     ensure!(x.iter().all(|v| v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 200)),
         "chart `x.values` must be numbers or strings of at most 200 characters");
-    if o.get("type").and_then(Value::as_str) == Some("scatter") {
+    if kind == "scatter" {
         ensure!(x.iter().all(Value::is_number), "chart `x.values` must all be numbers for a scatter chart");
     }
     let series = field(o, app, "series")?.as_array().context("chart `series` must be an array")?;
-    ensure!((1..=12).contains(&series.len()), "chart `series` needs 1 to 12 series");
+    ensure!(series.len() <= 12, "chart `series` has {} series; at most 12", series.len());
+    let mut names = Vec::with_capacity(series.len());
     for (i, s) in series.iter().enumerate() {
         let s = object(s, "each chart series")?;
-        ensure!(s.get("name").and_then(Value::as_str).is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 100),
-            "chart series {i} needs a string `name` of 1 to 100 characters");
+        let name = s.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty() && n.chars().count() <= 100)
+            .with_context(|| format!("chart series {i} needs a string `name` of 1 to 100 characters"))?;
+        names.push(name);
         let values = s.get("values").and_then(Value::as_array).with_context(|| format!("chart series {i} needs `values` (an array)"))?;
         ensure!(values.len() == x.len(), "chart series {i} has {} values but x.values has {}", values.len(), x.len());
         ensure!(values.iter().all(|v| v.is_null() || v.is_number()), "chart series {i} values must be numbers or null");
+        opt_color(s, &format!("chart series[{i}]"))?;
     }
     if let Some(y) = o.get("y").filter(|v| !v.is_null()) {
         let y = object(y, "chart `y`")?;
@@ -568,12 +621,203 @@ pub fn check_chart(data: &Value) -> anyhow::Result<()> {
             ensure!(lo < hi, "chart `y.min` must be less than `y.max`");
         }
     }
+    for (key, max) in [("takeaway", 600), ("scope", 200), ("source", 300), ("empty", 200)] { opt_text(o, app, key, max)?; }
+    one_of(o, app, "format", FORMATS, false)?;
+    one_of(o, app, "xFormat", FORMATS, false)?;
+    one_of(o, app, "labels", &["auto", "values", "end", "none"], false)?;
+    if let Some(h) = o.get("highlight").filter(|v| !v.is_null()) {
+        let h = h.as_str().context("chart `highlight` must be a string")?;
+        ensure!(names.contains(&h), "chart `highlight` must be the name of a series (got {h:?})");
+    }
+    for key in ["stacked", "trend"] { opt_bool(o, app, key)?; }
+    if o.get("stacked").and_then(Value::as_bool) == Some(true) { ensure!(matches!(kind, "bar" | "area"), "chart `stacked` applies to bar and area charts only"); }
+    if o.get("trend").and_then(Value::as_bool) == Some(true) { ensure!(kind == "scatter", "chart `trend` applies to scatter charts only"); }
+    for (i, a) in opt_objects(o, app, "annotations", 20, false)?.into_iter().enumerate() {
+        let at = format!("chart annotations[{i}]");
+        req_text(a, &at, "label", 60)?;
+        let ax = a.get("x").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `x`"))?;
+        // Numbers match by value, as in the app (1 and 1.0 are the same x); strings exactly.
+        let same = |v: &Value| match (v.as_f64(), ax.as_f64()) { (Some(a), Some(b)) => a == b, _ => v == ax };
+        ensure!(x.iter().any(same), "{at} `x` must be one of x.values (got {ax})");
+    }
+    if let Some(stats) = o.get("stats").filter(|v| !v.is_null()) {
+        let stats = stats.as_array().context("chart `stats` must be an array")?;
+        ensure!(stats.len() <= 4, "chart `stats` has {} items; at most 4", stats.len());
+        for (i, s) in stats.iter().enumerate() { check_stat(s, &format!("chart stats[{i}]"))?; }
+    }
+    if let Some(pin) = opt_number(o, app, "pin")? {
+        ensure!(pin.fract() == 0.0 && pin >= 0.0 && (pin as usize) < x.len(), "chart `pin` must be the index of an x value");
+    }
     Ok(())
 }
 
+/// Block kinds a Board takes (web/src/panels/apps/board/logic.ts `KINDS`).
+pub const BOARD_KINDS: &[&str] = &["stats", "chart", "list", "meters", "callout", "actions"];
+const BOARD_TONES: &[&str] = &["good", "warn", "bad", "info", "accent"];
+
+/// An optional icon name: letters only (the panel draws "?" for a name it does not know).
+fn opt_icon(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(v) = o.get("icon").filter(|v| !v.is_null()) {
+        ensure!(v.as_str().is_some_and(|s| (1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphabetic())),
+            "{at} `icon` must be an icon name such as check, alert or chart");
+    }
+    Ok(())
+}
+
+fn opt_range(o: &serde_json::Map<String, Value>, at: &str, key: &str, lo: f64, hi: f64) -> anyhow::Result<()> {
+    if let Some(n) = opt_number(o, at, key)? { ensure!((lo..=hi).contains(&n), "{at} `{key}` must be from {lo} to {hi}"); }
+    Ok(())
+}
+
+/// Unknown fields: refused, naming the field and what the object takes.
+fn known(o: &serde_json::Map<String, Value>, at: &str, keys: &[&str]) -> anyhow::Result<()> {
+    for k in o.keys() { ensure!(keys.contains(&k.as_str()), "{at} has an unknown field `{k}` (it takes {})", keys.join(", ")); }
+    Ok(())
+}
+
+/// A short shown value: a number, or a string of at most 40 characters.
+fn opt_short_value(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(v) = o.get("value").filter(|v| !v.is_null()) {
+        ensure!(v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 40), "{at} `value` must be a number or a string of at most 40 characters");
+    }
+    Ok(())
+}
+
+/// Everything the board app checks (web/src/panels/apps/board/logic.ts), with the same limits.
+/// A Board is plain JSON: no HTML and no script, so every string is shown as text and every
+/// colour is a kit token or a hex colour.
+pub fn check_board(data: &Value) -> anyhow::Result<()> {
+    let app = "board";
+    let o = object(data, "board data")?;
+    known(o, "board data", &["title", "scope", "takeaway", "source", "min", "blocks"])?;
+    req_text(o, app, "title", 200)?;
+    for (key, max) in [("scope", 200), ("takeaway", 600), ("source", 300)] { opt_text(o, app, key, max)?; }
+    opt_range(o, app, "min", 160.0, 1200.0)?;
+    let blocks = opt_objects(o, app, "blocks", 40, true)?;
+    ensure!(!blocks.is_empty(), "board `blocks` needs at least 1 block");
+    let (mut ids, mut keys): (Vec<&str>, Vec<String>) = (Vec::new(), Vec::new());
+    for (i, b) in blocks.into_iter().enumerate() {
+        let at = format!("board blocks[{i}]");
+        let kind = b.get("kind").and_then(Value::as_str).with_context(|| format!("{at} needs `kind` (one of {})", BOARD_KINDS.join(", ")))?;
+        ensure!(BOARD_KINDS.contains(&kind), "{at} `kind` must be one of {} (got {kind:?})", BOARD_KINDS.join(", "));
+        ensure!(b.get("span").is_none_or(|v| v.is_null() || v.as_str() == Some("full")), "{at} `span` must be \"full\" (or left out for one column)");
+        opt_text(b, &at, "title", 200)?;
+        opt_text(b, &at, "aside", 100)?;
+        let base = ["kind", "span", "title", "aside"];
+        let with = |extra: &[&'static str]| base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>();
+        let items = |max: usize| -> anyhow::Result<Vec<&serde_json::Map<String, Value>>> {
+            let list = opt_objects(b, &at, "items", max, true)?;
+            ensure!(!list.is_empty(), "{at} `items` needs at least 1 item");
+            Ok(list)
+        };
+        match kind {
+            "stats" => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, s) in items(8)?.into_iter().enumerate() {
+                    let sat = format!("{at}.items[{j}]");
+                    known(s, &sat, &["label", "value", "unit", "delta", "tone", "note", "trend", "color"])?;
+                    check_stat(&Value::Object(s.clone()), &sat)?;
+                }
+            }
+            "chart" => {
+                known(b, &at, &with(&["spec", "height"]))?;
+                opt_range(b, &at, "height", 80.0, 800.0)?;
+                let spec = b.get("spec").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `spec` (the chart app's spec)"))?;
+                check_chart(spec).with_context(|| format!("{at}.spec"))?;
+            }
+            "list" => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, it) in items(100)?.into_iter().enumerate() {
+                    let iat = format!("{at}.items[{j}]");
+                    known(it, &iat, &["title", "sub", "icon", "tone", "badge", "bar", "value", "color"])?;
+                    req_text(it, &iat, "title", 200)?;
+                    opt_text(it, &iat, "sub", 300)?;
+                    opt_text(it, &iat, "badge", 40)?;
+                    opt_icon(it, &iat)?;
+                    one_of(it, &iat, "tone", BOARD_TONES, false)?;
+                    opt_range(it, &iat, "bar", 0.0, 1.0)?;
+                    opt_short_value(it, &iat)?;
+                    opt_color(it, &iat)?;
+                }
+            }
+            "meters" => {
+                known(b, &at, &with(&["note", "items"]))?;
+                opt_text(b, &at, "note", 300)?;
+                for (j, it) in items(20)?.into_iter().enumerate() {
+                    let iat = format!("{at}.items[{j}]");
+                    known(it, &iat, &["label", "value", "max", "text", "of", "mark", "markLabel", "tone", "color"])?;
+                    req_text(it, &iat, "label", 100)?;
+                    opt_number(it, &iat, "value")?.with_context(|| format!("{iat} needs a number `value`"))?;
+                    let max = opt_number(it, &iat, "max")?.with_context(|| format!("{iat} needs a number `max`"))?;
+                    ensure!(max > 0.0, "{iat} `max` must be more than 0");
+                    for (key, n) in [("text", 40), ("of", 60), ("markLabel", 100)] { opt_text(it, &iat, key, n)?; }
+                    opt_number(it, &iat, "mark")?;
+                    one_of(it, &iat, "tone", BOARD_TONES, false)?;
+                    opt_color(it, &iat)?;
+                }
+            }
+            "callout" => {
+                known(b, &at, &with(&["tone", "icon", "text"]))?;
+                req_text(b, &at, "text", 1000)?;
+                one_of(b, &at, "tone", &["good", "warn", "bad", "info"], false)?;
+                opt_icon(b, &at)?;
+            }
+            _ => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, a) in items(8)?.into_iter().enumerate() {
+                    let aat = format!("{at}.items[{j}]");
+                    known(a, &aat, &["id", "label", "primary", "danger", "confirm", "icon", "key", "data"])?;
+                    let id = a.get("id").and_then(Value::as_str).with_context(|| format!("{aat} needs a string `id` (the event kind it sends)"))?;
+                    ensure!(event_kind_ok(id) && !["closed", "overflow", "navigated"].contains(&id),
+                        "{aat}.id must start with a letter and use letters, digits, _, - or / (at most 80), and not be closed, overflow or navigated (got {id:?})");
+                    ensure!(!ids.contains(&id), "{aat}.id {id:?} is used twice");
+                    ids.push(id);
+                    let label = req_text(a, &aat, "label", 60)?;
+                    for key in ["primary", "danger"] { opt_bool(a, &aat, key)?; }
+                    opt_text(a, &aat, "confirm", 200)?;
+                    opt_icon(a, &aat)?;
+                    if let Some(k) = a.get("key").filter(|v| !v.is_null()) {
+                        let k = k.as_str().filter(|k| k.len() == 1 && k.bytes().all(|c| c.is_ascii_alphanumeric()))
+                            .with_context(|| format!("{aat}.key must be one letter or digit"))?.to_ascii_lowercase();
+                        ensure!(!keys.contains(&k), "{aat}.key {k:?} is used twice");
+                        keys.push(k);
+                    }
+                    if let Some(d) = a.get("data").filter(|v| !v.is_null()) {
+                        let d = object(d, &format!("{aat}.data"))?;
+                        ensure!(d.len() <= 10, "{aat}.data has more than 10 fields");
+                        for (k, v) in d {
+                            ensure!((1..=31).contains(&k.len()) && k.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+                                && k.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                                && !["send", "text", "confirm", "state", "sent", "busy", "key"].contains(&k.as_str()),
+                                "{aat}.data.{k}: names must be lowercase letters, digits or _ (at most 31), and not one of the kit's own");
+                            ensure!(v.is_boolean() || v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 500),
+                                "{aat}.data.{k} must be a string (at most 500 characters), number or true/false");
+                        }
+                    }
+                    // The event a press sends (web/src/panels/kit/board.ts) must fit the event limit.
+                    let data = a.get("data").filter(|v| !v.is_null()).cloned().unwrap_or_else(|| serde_json::json!({}));
+                    let event = serde_json::json!({"role": "user", "content": {"type": "text", "text": format!("Pressed \"{label}\"")},
+                        "_meta": {"muster": {"kind": id, "data": data}}});
+                    let size = serde_json::to_vec(&event)?.len();
+                    ensure!(size <= crate::panels::MAX_EVENT, "{aat} would send an event of {size} bytes; at most 16 KiB (shorten its data)");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An event kind as the panel bridge accepts it (web/src/panels/bridge.ts).
+fn event_kind_ok(k: &str) -> bool {
+    (1..=80).contains(&k.len()) && k.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'/')
+}
+
+/// Everything the table app checks (web/src/panels/apps/table/logic.ts). `scope`, `takeaway`,
+/// `source` and a column's `format` and `tones` are optional additions for the Briefing look.
 pub fn check_table(data: &Value) -> anyhow::Result<()> {
     let o = object(data, "table data")?;
-    opt_text(o, "table", "title", 200)?;
+    for (key, max) in [("title", 200), ("scope", 200), ("takeaway", 600), ("source", 300)] { opt_text(o, "table", key, max)?; }
     let columns = field(o, "table", "columns")?.as_array().context("table `columns` must be an array")?;
     ensure!((1..=50).contains(&columns.len()), "table `columns` needs 1 to 50 columns");
     let mut keys = Vec::with_capacity(columns.len());
@@ -586,6 +830,16 @@ pub fn check_table(data: &Value) -> anyhow::Result<()> {
         keys.push(key);
         opt_text(c, &at, "label", 200)?;
         one_of(c, &at, "align", &["left", "right", "center"], false)?;
+        one_of(c, &at, "format", &["bar", "badge", "mono"], false)?;
+        if let Some(tones) = c.get("tones").filter(|v| !v.is_null()) {
+            let tones = object(tones, &format!("{at} `tones`"))?;
+            ensure!(tones.len() <= 50, "{at} `tones` has {} values; at most 50", tones.len());
+            for (value, tone) in tones {
+                ensure!(value.chars().count() <= 200, "{at} `tones` keys must be cell values of at most 200 characters");
+                ensure!(tone.as_str().is_some_and(|t| ["good", "warn", "bad", "info", "accent", "plain"].contains(&t)),
+                    "{at} `tones.{value}` must be one of good, warn, bad, info, accent, plain (got {tone})");
+            }
+        }
     }
     if let Some(sort) = o.get("sort").filter(|v| !v.is_null()) {
         let sort = object(sort, "table `sort`")?;
@@ -729,12 +983,18 @@ mod tests {
         assert!(check_chart(&json!({"type":"pie","x":{"values":[1]},"series":[]})).unwrap_err().to_string().contains("one of bar"));
         assert!(check_chart(&json!({"type":"bar","x":{"values":[1]},"series":(0..13).map(|i| json!({"name":i.to_string(),"values":[1]})).collect::<Vec<_>>()})).is_err());
         check_table(&json!({"columns":[{"key":"a"}],"rows":[{"a":1}]})).unwrap();
+        check_table(&json!({"title":"Flaky tests","scope":"acme","takeaway":"One is **bad**.","source":"junit","columns":[{"key":"a","format":"bar"},
+            {"key":"s","format":"badge","tones":{"Flaky":"warn","Fixed":"good"}},{"key":"f","format":"mono"}],"rows":[{"a":1,"s":"Flaky","f":"x.ts"}]})).unwrap();
         assert!(check_table(&json!({"columns":[],"rows":[]})).is_err());
         assert!(check_table(&json!({"columns":[{"label":"x"}],"rows":[]})).unwrap_err().to_string().contains("key"));
         assert!(check_table(&json!({"columns":[{"key":"a"}],"rows":[1]})).unwrap_err().to_string().contains("object"));
         for (t, why) in [(json!({"columns":[{"key":"a"},{"key":"a"}],"rows":[]}), "duplicates"),
             (json!({"columns":[{"key":"a"}],"rows":[{"a":[1]}]}), "rows[0].a"), (json!({"columns":[{"key":"a"}],"rows":[{"a":"x".repeat(10_001)}]}), "10000"),
-            (json!({"columns":[{"key":"a"}],"rows":[],"sort":{"key":"b"}}), "not a column key"), (json!({"columns":[{"key":"a","align":"middle"}],"rows":[]}), "align")] {
+            (json!({"columns":[{"key":"a"}],"rows":[],"sort":{"key":"b"}}), "not a column key"), (json!({"columns":[{"key":"a","align":"middle"}],"rows":[]}), "align"),
+            (json!({"columns":[{"key":"a","format":"sparkline"}],"rows":[]}), "`format` must be one of bar, badge, mono"),
+            (json!({"columns":[{"key":"a","format":"badge","tones":{"Flaky":"orange"}}],"rows":[]}), "`tones.Flaky` must be one of good, warn"),
+            (json!({"columns":[{"key":"a","tones":["warn"]}],"rows":[]}), "`tones` must be an object"),
+            (json!({"columns":[{"key":"a"}],"rows":[],"takeaway":"x".repeat(601)}), "`takeaway` is longer than 600")] {
             let e = format!("{:#}", check_table(&t).unwrap_err());
             assert!(e.contains(why), "{t}: {e}");
         }
@@ -748,10 +1008,109 @@ mod tests {
         assert!(date_ok("2026-10-18T09:30:00Z") && date_ok("2026-10-18T09:30:00.123+02:00") && !date_ok("2026-10-18T09:30Z") && !date_ok("2026-10-18 09:30:00Z"));
     }
 
+    fn board_sample() -> Value {
+        json!({"title":"$4,480 spent so far this month","scope":"acme cloud · October","takeaway":"On track to finish about 6% under budget.",
+            "min":300,"source":"billing export, 1–20 Oct","blocks":[
+            {"kind":"stats","span":"full","items":[{"label":"Month to date","value":"$4,480","delta":"+4.1%","tone":"bad","note":"vs September"},
+                {"label":"Per day","value":224,"trend":[205,212,219]}]},
+            {"kind":"chart","span":"full","title":"Spend per week","aside":"by service","height":220,"spec":{"type":"bar","stacked":true,"format":"usd",
+                "x":{"values":["Oct 6","Oct 13"]},"series":[{"name":"Postgres","values":[651,669]},{"name":"Compute","values":[543,539]}]}},
+            {"kind":"list","title":"By service","items":[{"title":"Postgres","sub":"db-primary","bar":0.43,"value":"$1,906","icon":"db","tone":"warn","badge":"Growing","color":"var(--mk-c2)"}]},
+            {"kind":"meters","title":"Budgets","note":"The tick is where spend should be today.","items":[{"label":"Whole account","value":4480,"max":7400,"text":"$4,480","of":"of $7,400","mark":4774,"markLabel":"pace","tone":"warn"}]},
+            {"kind":"callout","tone":"warn","title":"Postgres is ahead of pace.","text":"It ends the month about $50 over budget."},
+            {"kind":"actions","items":[{"id":"explain","label":"Why did Postgres grow?","primary":true,"icon":"sparkle","key":"w"},
+                {"id":"rollback/prod","label":"Roll back","danger":true,"confirm":"Roll back production?","data":{"env":"production","to":"v2.3.2","dry_run":false}}]}]})
+    }
+
+    #[test]
+    fn boards_are_checked_naming_the_field() {
+        check_board(&board_sample()).unwrap();
+        check_board(&json!({"title":"t","blocks":[{"kind":"callout","text":"Nothing yet."}]})).unwrap();
+        let with = |f: &dyn Fn(&mut Value)| { let mut d = board_sample(); f(&mut d); d };
+        for (data, why) in [
+            (json!({"blocks":[{"kind":"callout","text":"x"}]}), "board data needs `title`"),
+            (json!({"title":"t","blocks":[]}), "board `blocks` needs at least 1 block"),
+            (json!({"title":"t"}), "board data needs `blocks`"),
+            (with(&|d| d["blocks"][0]["kind"] = json!("table")), "blocks[0] `kind` must be one of stats, chart, list, meters, callout, actions"),
+            (with(&|d| d["blocks"][0]["span"] = json!(2)), "blocks[0] `span` must be \"full\""),
+            (with(&|d| d["titel"] = json!("typo")), "unknown field `titel`"),
+            (with(&|d| d["min"] = json!(50)), "`min` must be from 160 to 1200"),
+            (with(&|d| d["blocks"][0]["items"][0]["tone"] = json!("great")), "items[0] `tone` must be one of good, bad, flat"),
+            (with(&|d| d["blocks"][0]["items"] = json!([])), "blocks[0] `items` needs at least 1 item"),
+            (with(&|d| d["blocks"][1]["spec"]["type"] = json!("pie")), "blocks[1].spec"),
+            (with(&|d| d["blocks"][1]["height"] = json!(5000)), "`height` must be from 80 to 800"),
+            (with(&|d| d["blocks"][2]["items"][0]["bar"] = json!(1.5)), "`bar` must be from 0 to 1"),
+            (with(&|d| d["blocks"][2]["items"][0]["color"] = json!("red; background: url(x)")), "`color` must be a kit colour token"),
+            (with(&|d| d["blocks"][2]["items"][0]["icon"] = json!("<svg>")), "`icon` must be an icon name"),
+            (with(&|d| d["blocks"][3]["items"][0]["max"] = json!(0)), "`max` must be more than 0"),
+            (with(&|d| d["blocks"][3]["items"][0]["value"] = json!("4480")), "`value` must be a number"),
+            (with(&|d| d["blocks"][4]["text"] = Value::Null), "blocks[4] data needs `text`"),
+            (with(&|d| d["blocks"][5]["items"][1]["id"] = json!("closed")), "items[1].id must start with a letter"),
+            (with(&|d| d["blocks"][5]["items"][1]["id"] = json!("explain")), "items[1].id \"explain\" is used twice"),
+            (with(&|d| d["blocks"][5]["items"][1]["key"] = json!("W")), "items[1].key \"w\" is used twice"),
+            (with(&|d| d["blocks"][5]["items"][1]["data"] = json!({"send":"x"})), "data.send: names must be lowercase"),
+            (with(&|d| d["blocks"][5]["items"][1]["data"] = json!({"env":{"a":1}})), "data.env must be a string"),
+        ] {
+            let e = format!("{:#}", check_board(&data).unwrap_err());
+            assert!(e.contains(why), "{data}: {e}");
+        }
+    }
+
+    /// The same inputs pass or fail in the app (web/src/panels/apps/board/logic_test.ts reads
+    /// this file too).
+    #[test]
+    fn boards_pass_or_fail_here_as_in_the_app() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("../web/src/panels/apps/board/parity.json")).unwrap();
+        for c in cases {
+            let r = check_board(&c["data"]);
+            assert_eq!(r.is_ok(), c["ok"].as_bool().unwrap(), "{}: {:?}", c["name"], r.err());
+        }
+        let e = format!("{:#}", check_board(&json!({"title":"t","blocks":[{"kind":"actions","items":[{"id":"go","label":"Go",
+            "data": (0..10).map(|i| (format!("k{i}"), json!("😀".repeat(500)))).collect::<serde_json::Map<_, _>>()}]}]})).unwrap_err());
+        assert!(e.contains("items[0] would send an event of") && e.contains("at most 16 KiB"), "{e}");
+    }
+
+    #[test]
+    fn chart_briefing_fields_are_optional_and_checked() {
+        // Every field the Briefing look added is optional: the old shape still passes, and so does no data at all.
+        check_chart(&chart_sample()).unwrap();
+        check_chart(&json!({"type":"bar","x":{"values":[]},"series":[],"empty":"No deploys in this range"})).unwrap();
+        let full = json!({"type":"bar","x":{"values":["Mon","Tue"]},"series":[{"name":"master","values":[42,null],"color":"var(--mk-c1)"},{"name":"PRs","values":[80,96],"color":"#41c7c1"}],
+            "takeaway":"PR builds used **1.75×** the minutes.","scope":"acme-store · week of Oct 13","source":"gh run list","format":"int","xFormat":"plain",
+            "highlight":"PRs","annotations":[{"x":"Tue","label":"v2.4"}],"stacked":true,"labels":"values","empty":"none yet","pin":1,
+            "stats":[{"label":"master","value":287,"unit":"min","delta":"−12%","tone":"good","note":"vs last week","trend":[1,2,3],"color":"var(--mk-c1)"}]});
+        check_chart(&full).unwrap();
+        let with = |f: &dyn Fn(&mut Value)| { let mut d = full.clone(); f(&mut d); d };
+        for (c, why) in [
+            (with(&|d| d["format"] = json!("eur")), "`format` must be one of int, pct, usd, ms, s, plain"),
+            (with(&|d| d["xFormat"] = json!(1)), "`xFormat` must be one of"),
+            (with(&|d| d["highlight"] = json!("nope")), "`highlight` must be the name of a series"),
+            (with(&|d| d["annotations"] = json!([{"x":"Sun","label":"x"}])), "annotations[0] `x` must be one of x.values"),
+            (with(&|d| d["annotations"] = json!([{"x":"Mon"}])), "annotations[0] data needs `label`"),
+            (with(&|d| d["stacked"] = json!("yes")), "`stacked` must be true or false"),
+            (with(&|d| d["type"] = json!("line")), "`stacked` applies to bar and area"),
+            (with(&|d| d["trend"] = json!(true)), "`trend` applies to scatter"),
+            (with(&|d| d["labels"] = json!("some")), "`labels` must be one of auto, values, end, none"),
+            (with(&|d| d["series"][0]["color"] = json!("red;background:url(x)")), "series[0] `color` must be a kit colour token"),
+            (with(&|d| d["stats"][0]["tone"] = json!("great")), "stats[0] `tone` must be one of good, bad, flat"),
+            (with(&|d| d["stats"][0]["value"] = Value::Null), "stats[0] needs `value`"),
+            (with(&|d| d["stats"] = json!([{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1}])), "at most 4"),
+            (with(&|d| d["pin"] = json!(5)), "`pin` must be the index of an x value"),
+            (with(&|d| d["takeaway"] = json!("x".repeat(601))), "`takeaway` is longer than 600"),
+        ] {
+            let e = format!("{:#}", check_chart(&c).unwrap_err());
+            assert!(e.contains(why), "{c}: {e}");
+        }
+        for ok in ["#fff", "#6a56e6", "var(--mk-c2)", "var(--mk-add)"] { assert!(color_ok(ok), "{ok}"); }
+        for bad in ["red", "#ggg", "var(--x)", "var(--mk-c2);color:red", "url(x)", "#12345", "var(--mk-)"] { assert!(!color_ok(bad), "{bad}"); }
+    }
+
     #[test]
     fn overview_and_actions_are_checked_naming_the_field() {
         check_overview(&overview_sample()).unwrap();
         check_overview(&json!({"repo":"a/b","prs":[]})).unwrap();
+        check_overview(&json!({"repo":"a/b","prs":[],"takeaway":"Six open. **One** is a quick win."})).unwrap();
+        assert!(check_overview(&json!({"repo":"a/b","prs":[],"takeaway":"x".repeat(601)})).unwrap_err().to_string().contains("`takeaway` is longer than 600"));
         let with = |f: &dyn Fn(&mut Value)| { let mut d = overview_sample(); f(&mut d); d };
         for (data, why) in [
             (with(&|d| d["repo"] = json!("acme")), "`repo` must be owner/name"),
@@ -1048,21 +1407,21 @@ mod tests {
         let rel = format!("muster-panel-apps-core-{}.png", std::process::id());
         std::fs::write(Path::new("/tmp").join(&rel), PNG).unwrap();
         let open = |app: &str, data: Value| crate::panels::open(&hub, 1, Open { title: "Shot".into(), app: app.into(),
-            data: Some(data), html: None, html_path: None, csp: None });
+            data: Some(data), html: None, html_path: None, csp: None, kit: None });
         let id = open("image", json!({"path": rel})).unwrap();
         let res = crate::panels::resource(&hub, id).unwrap();
         assert!(res["data"]["src"].as_str().unwrap().starts_with("data:image/png;base64,"));
-        assert_eq!(res["html"], IMAGE);
+        assert_eq!(res["html"], crate::panel_kit::serve("image", false, IMAGE.to_string()));
         let web = open("image", json!({"url": "https://img.example/a.png"})).unwrap();
         assert_eq!(crate::panels::get(&hub, web).unwrap().csp.resource_domains, vec!["https://img.example"]);
-        let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None });
+        let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None });
         update(web, json!({"url": "https://img.example/b.png", "caption": "B"})).unwrap();
         assert!(update(web, json!({"url": "https://evil.example/b.png"})).is_err());
         assert!(update(id, json!({"path": "../etc/passwd"})).is_err());
         for (app, data) in [("chart", chart_sample()), ("table", json!({"columns":[{"key":"a"}],"rows":[]})), ("pr_decision", pr_sample()),
             ("pr_overview", overview_sample())] {
             let id = open(app, data.clone()).unwrap();
-            assert_eq!(crate::panels::resource(&hub, id).unwrap()["html"], html(app).unwrap());
+            assert_eq!(crate::panels::resource(&hub, id).unwrap()["html"], crate::panel_kit::serve(app, false, html(app).unwrap().to_string()));
             // A malformed input fails the agent's own call, open or update.
             let e = open(app, json!({})).unwrap_err().to_string();
             assert!(e.contains(&format!("{app} data needs")), "{e}");
@@ -1070,7 +1429,7 @@ mod tests {
         }
         assert!(open("diff", json!({})).unwrap_err().to_string().contains("pr_decision"));
         assert!(crate::panels::open(&hub, 1, Open { title: "x".into(), app: "chart".into(), data: None,
-            html: Some("<p>".into()), html_path: None, csp: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
+            html: Some("<p>".into()), html_path: None, csp: None, kit: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
         crate::panels::archive(&hub, 1).unwrap();
         std::fs::remove_file(Path::new("/tmp").join(&rel)).unwrap();
     }

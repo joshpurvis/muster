@@ -4,7 +4,7 @@ import { fits, httpsUrl, Problems, type Result } from "../shared/validate.ts";
 import { Gate } from "../shared/confirm.ts";
 import { type CustomAction, validateActions } from "../shared/actions.ts";
 import { branchOk, type Method, METHODS, type MergeEvent, mergeCommand, mergeEventFor, REPO, SHA } from "../shared/merge.ts";
-import { type Draft, draftSig, draftText, EMPTY_DRAFT, type Question, toggleSig, validateQuestions } from "../shared/questions.ts";
+import { type Choices, type Draft, draftSig, draftText, EMPTY_DRAFT, missingRequired, type Question, toggleSig, validateQuestions } from "../shared/questions.ts";
 import { type ImageInput, validateImage } from "../image/logic.ts";
 import { type ChartSpec, validateChart } from "../chart/logic.ts";
 
@@ -293,11 +293,7 @@ export function answersEvent(pr: Pr, draft: Draft) {
 /** Muster refuses events over 16 KiB of JSON; keep a margin for the envelope. */
 export const MAX_EVENT_BYTES = 15 * 1024;
 
-/** UTF-8 size of the `ui/message` params an event becomes (what the backend measures). */
-export function eventBytes(event: { kind: string; text: string; data: object }): number {
-  const params = { role: "user", content: { type: "text", text: event.text }, _meta: { muster: { kind: event.kind, data: event.data } } };
-  return new TextEncoder().encode(JSON.stringify(params)).length;
-}
+export { eventBytes } from "../shared/validate.ts";
 
 /** Failing checks block Merge unless the user holds Shift. */
 export function checksBlock(pr: Pr): boolean {
@@ -340,4 +336,44 @@ export class ConfirmGate extends Gate {
   canConfirm(pr: Pr | null, draft: Draft = EMPTY_DRAFT): boolean { return this.canConfirmTarget(pr ? confirmTarget(pr, draft) : null); }
 
   input(pr: Pr | null, draft: Draft = EMPTY_DRAFT): boolean { return this.inputTarget(pr ? confirmTarget(pr, draft) : null); }
+}
+
+/** "a", "a and b", "a, b and c". */
+export function joinAnd(items: string[]): string {
+  return items.length < 2 ? items[0] ?? "" : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+export interface Readiness {
+  /** Nothing Muster can see stands in the way of a merge. */
+  ready: boolean;
+  /** The verdict card's colour: Muster's own check, never the agent's opinion. */
+  tone: "good" | "warn" | "bad";
+  /** Full reasons for the card ("answer question 2", "an approving review is still required on GitHub"). */
+  reasons: string[];
+  /** Short ones for the line under Merge ("question 2", "an approving review"). */
+  short: string[];
+}
+
+/**
+ * Muster's own merge-readiness check, from what the panel knows: required questions still
+ * unanswered, failing or running checks, and the review decision GitHub reports. It colours the
+ * verdict card and says why Merge waits, so a green card never sits beside a merge GitHub would
+ * refuse. Merge itself still opens its confirm (GitHub has the final say, e.g. an admin merge).
+ */
+export function readiness(pr: Pr, choices: Choices): Readiness {
+  if (pr.status === "merged" || pr.status === "queued") return { ready: true, tone: "good", reasons: [], short: [] };
+  const reasons: string[] = [], short: string[] = [];
+  let bad = false;
+  const missing = missingRequired(pr.questions, choices).map((q) => pr.questions.indexOf(q) + 1);
+  if (missing.length) {
+    const n = joinAnd(missing.map(String));
+    reasons.push(`answer question${missing.length === 1 ? "" : "s"} ${n}`);
+    short.push(`question${missing.length === 1 ? "" : "s"} ${n}`);
+  }
+  if (checksBlock(pr)) { bad = true; reasons.push("checks are failing"); short.push("passing checks"); }
+  else if (pr.checks.state === "pending") { reasons.push("checks are still running"); short.push("the running checks"); }
+  const decision = pr.reviews?.decision?.toUpperCase();
+  if (decision === "CHANGES_REQUESTED") { bad = true; reasons.push("a reviewer asked for changes on GitHub"); short.push("the requested changes"); }
+  else if (decision === "REVIEW_REQUIRED") { reasons.push("an approving review is still required on GitHub"); short.push("an approving review"); }
+  return { ready: reasons.length === 0, tone: reasons.length === 0 ? "good" : bad ? "bad" : "warn", reasons, short };
 }

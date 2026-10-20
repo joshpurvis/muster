@@ -18,6 +18,13 @@ beside the agent's terminal (["Showing web pages"](#showing-web-pages); schema a
 [MCP.md](MCP.md#built-in-apps)). The native embedded browser stays deferred.
 Built on `feature/preview-address`: the user can type a local address into the preview's bar;
 it is checked like the agent's, stored, and reported to the agent as a `navigated` event.
+Built on `feature/panel-design-b`, 2026-10-20: the "Briefing" look (direction B, picked by the
+owner) for every built-in panel and the host's panel chrome, drawn by one shared kit
+(`web/src/panels/kit/`) with Inter and JetBrains Mono bundled; optional takeaway, scope, source
+and headline-number fields on chart and table, more chart options (formats, highlight,
+annotations, stacking with negatives, trend, empty), a colour from Muster's own merge check on
+the PR decision verdict; and the agent toolkit: the `board` app (a dashboard from JSON, no HTML)
+and the kit for custom apps (`kit: true`; [MCP.md](MCP.md#the-kit-kit-true)).
 The `diff` app, fetch approval and placement options remain later phases. Nested frames are
 blocked for agent-written apps even for declared loopback dev servers: a child document's
 independent CSP would otherwise bypass the no-fetch policy. `web_preview` does not reopen that:
@@ -106,6 +113,11 @@ issue, a web page). Both must stay contained.
   and images from declared domains (CDNs) load without asking. Fetching data (`connect-src`)
   from a declared domain needs the user to allow it once per panel; until then those requests
   are blocked and the panel shows what it asked for. Undeclared domains are always blocked.
+- **The kit.** With `kit: true`, Muster puts kit.css and kit.js (and the fonts, as `data:`
+  URIs) in front of a custom app's HTML when it serves it. It runs inside the same sandbox with
+  the same CSP; the only CSP change for the kit is `font-src data:`, which reaches no host. The
+  kit has no `fetch`, XHR or frames, and its buttons send events through the same gated
+  `ui/message` as any app. The stored HTML stays the agent's own, so the 1 MiB limit is unchanged.
 - **The native window.** WebKitGTK reports the top-level page's address for IPC messages from any
   frame (see the note in src/gui.rs), so today a framed page could close the window or toggle its
   title bar. Before panels ship, IPC must carry a capability that only the main page has.
@@ -298,6 +310,14 @@ action; the phone comes last.
 - On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
   afterwards, so swapping a parent directory for a symlink in between could copy a file from
   outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.
+
+- The Briefing look and the kit were checked in headless Chromium (the panel e2e, both themes,
+  about 360 px and 1440 px wide). They use only features WebKitGTK 2.54 supports (ES2020, CSS
+  custom properties, `color-mix()`, container queries, `ResizeObserver`, inline SVG; the
+  `-webkit-` prefix for `backdrop-filter`). A WebKitGTK MiniBrowser run under Broadway
+  confirmed the kit's script runs, container queries and `color-mix()` are supported and both
+  `data:` fonts load; layout could not be judged there (Broadway reported a broken viewport), and
+  the native window itself was not run on this branch.
 
 ## Tools
 

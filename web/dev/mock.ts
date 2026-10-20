@@ -8,6 +8,7 @@
 
 import type { Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
+import { servePanelHtml } from "./build_panels.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -15,7 +16,7 @@ const DIST = new URL("../dist/", import.meta.url);
 const HOME = Deno.env.get("HOME") ?? "/tmp";
 const panelProxy = await Deno.readTextFile(new URL("../panels/proxy.html", import.meta.url));
 const builtinApps: Record<string, string> = {};
-for (const app of ["markdown", "image", "chart", "table", "pr_decision", "pr_overview"]) {
+for (const app of ["markdown", "image", "chart", "table", "pr_decision", "pr_overview", "board"]) {
   builtinApps[app] = await Deno.readTextFile(new URL(`../panels/${app}.html`, import.meta.url));
 }
 // Drawn by the UI around the panel server's /preview page (src/web_preview.rs).
@@ -117,7 +118,7 @@ const panelServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, (req) => {
   return new Response(panelProxy.replace("__MUSTER_UI_ORIGINS__", JSON.stringify([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`])), {
     headers: {
       "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-      "Content-Security-Policy": `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:${PORT} http://localhost:${PORT}`,
+      "Content-Security-Policy": `default-src 'none'; script-src 'self' 'unsafe-inline' ${resources}; style-src 'self' 'unsafe-inline' ${resources}; img-src 'self' data: ${resources}; font-src 'self' data: ${resources}; media-src 'self' data: ${resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:${PORT} http://localhost:${PORT}`,
     },
   });
 });
@@ -906,11 +907,13 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!s) throw new Error("calling session not found");
       const args = p.arguments;
       if (args.app !== "custom" && !builtinApps[args.app]) throw new Error("unknown app");
+      // Like src/panels.rs check_kit: the built-ins already draw with the kit.
+      if (args.kit !== undefined && args.app !== "custom") throw new Error("kit applies to custom apps only (the built-in apps already use it)");
       const csp = structuredClone(args.csp ?? {});
       const data = await mockPanelData(args.app, channels.find((c) => c.id === s.channel_id)?.cwd ?? HOME, args.data ?? {}, csp, true);
       const id = ++panelSeq;
       const panel: Panel = { id, title: args.title, app: args.app, channel_id: s.channel_id, session_id: s.id,
-        window_id: s.window_id, csp, revision: 1, data_revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
+        window_id: s.window_id, csp, revision: 1, data_revision: 1, html_revision: 1, kit: args.kit === true, created_at: now(), updated_at: now(), closed: false };
       panels.set(id, { panel, html: args.app === "custom" ? args.html : builtinApps[args.app], data });
       broadcast("panel_upserted", panel);
       return { panel_id: id };
@@ -919,15 +922,19 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (panelResourceDelay) await new Promise((r) => setTimeout(r, panelResourceDelay));
       const resource = panels.get(p.id);
       if (!resource || resource.panel.closed) throw new Error("panel not found");
-      return resource;
+      // Like src/panel_kit.rs: fonts for a built-in, the kit in front of a kit panel's HTML.
+      return { ...resource, html: await servePanelHtml(resource.panel.app, !!resource.panel.kit, resource.html) };
     }
     case "panel.update": {
       const args = p.arguments;
       const resource = panels.get(args.panel_id);
       if (!resource || resource.panel.closed) throw new Error("panel not found");
       if (resource.panel.channel_id !== sessions.get(p.from_session)?.channel_id) throw new Error("panel belongs to another task");
+      if (args.kit !== undefined && resource.panel.app !== "custom") throw new Error("kit applies to custom apps only (the built-in apps already use it)");
       resource.panel.revision++;
       if (args.html !== undefined && args.html !== resource.html) { resource.html = args.html; resource.panel.html_revision = resource.panel.revision; }
+      // Switching the kit reloads the app with the same HTML.
+      if (args.kit !== undefined && args.kit !== !!resource.panel.kit) { resource.panel.kit = args.kit; resource.panel.html_revision = resource.panel.revision; }
       if (args.data !== undefined) {
         const cwd = channels.find((c) => c.id === resource.panel.channel_id)?.cwd ?? HOME;
         resource.data = await mockPanelData(resource.panel.app, cwd, args.data, structuredClone(resource.panel.csp), false);

@@ -7,11 +7,12 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import { helloEpoch } from "../state.ts";
 import { focusGroup } from "../actions.ts";
-import { IconGlobe, IconRestart } from "../icons.tsx";
+import { KitIcon } from "./KitIcon.tsx";
 import type { Panel, PanelResource } from "../types.ts";
 import { panelOriginUrl, panelReloads, usePanelPlacement } from "./placement.ts";
 import {
-  type AddressAction, ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, untouchedSinceSubmit, type Notice, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, SLOW_MS, SLOW_NOTICE, startChecks,
+  type AddressAction, ADDRESS_IDLE, addressStep, addressText, clock, isPreviewUrl, untouchedSinceSubmit, type Notice, type PreviewCheck, previewFrameSrc, previewNotice,
+  previewRevision, previewStatus, RETRY_FOR_MS, RETRY_MS, SLOW_MS, SLOW_NOTICE, startChecks,
 } from "./preview.ts";
 
 /** Sandboxed, but a real page: its own origin, scripts, forms and popups (which open in the
@@ -48,6 +49,8 @@ export function WebPreview({ panel }: { panel: Panel }) {
     setAddress(addressRef.current);
   };
   const requests = useRef(0);
+  const checksSince = useRef(Date.now());
+  const [, tick] = useState(0);
   // The click that focuses the field must not undo its select-all on mouseup.
   const justFocused = useRef(false);
 
@@ -68,6 +71,7 @@ export function WebPreview({ panel }: { panel: Panel }) {
   useEffect(() => {
     if (!url || !origin) return;
     const key = frameKey;
+    checksSince.current = Date.now();
     const slowTimer = setTimeout(() => setSlowKey(key), SLOW_MS);
     const stop = startChecks({
       check: () => rpc.call<PreviewCheck>("panel.preview_check", { id: panel.id }),
@@ -111,9 +115,21 @@ export function WebPreview({ panel }: { panel: Panel }) {
   };
   const openInBrowser = () => { if (url) globalThis.open(url, "_blank", "noopener,noreferrer"); };
   const loaded = loadedKey === frameKey;
-  const notice: Notice | null = (dismissedKey === frameKey ? null : previewNotice(current.check, current.retrying))
+  const host = url ? new URL(url).host : "this address";
+  const notice: Notice | null = (dismissedKey === frameKey ? null : previewNotice(current.check, current.retrying, host))
     ?? (slowKey === frameKey && !loaded ? SLOW_NOTICE : null);
   const problem = !origin ? "The backend did not provide a separate panel origin." : error;
+  const status = previewStatus(url, loaded, notice);
+  const counting = notice?.kind === "down" && current.retrying;
+  // The countdown under "Nothing is running yet" ticks once a second while it checks.
+  useEffect(() => {
+    if (!counting) return;
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [counting]);
+  const left = RETRY_FOR_MS - (Date.now() - checksSince.current);
+  const STATUS_TEXT = { ok: "The page is showing", warn: "The server answered, but the page can't be shown here", wait: "Waiting for the page" };
+  const ORB: Record<string, [string, string]> = { down: ["clock", "warn"], refused: ["lock", "bad"], leaves: ["arrowRight", "info"] };
 
   return (
     <div
@@ -127,54 +143,60 @@ export function WebPreview({ panel }: { panel: Panel }) {
       onFocusCapture={() => { if (paneId.current) focusGroup(paneId.current); }}
     >
       <div class="preview-bar">
-        <span class="preview-kind">Web preview</span>
-        <input
-          class="preview-url"
-          type="text"
-          inputMode="url"
-          aria-label="Address of the page to preview"
-          title={url ? `${url}\nType a local address (like localhost:3000) and press Enter` : undefined}
-          spellcheck={false}
-          autocomplete="off"
-          autocapitalize="off"
-          aria-invalid={address.error ? true : undefined}
-          aria-describedby={address.error ? `preview-address-error-${panel.id}` : undefined}
-          value={addressText(address, url)}
-          readOnly={address.pending > 0}
-          onFocus={(e) => e.currentTarget.select()}
-          onMouseDown={(e) => { justFocused.current = document.activeElement !== e.currentTarget; }}
-          onMouseUp={(e) => {
-            if (justFocused.current) e.preventDefault();
-            justFocused.current = false;
-          }}
-          onInput={(e) => edit({ type: "input", text: e.currentTarget.value })}
-          onBlur={() => edit({ type: "blur", url: url ?? "" })}
-          onKeyDown={(e) => {
-            if (e.isComposing) return;
-            if (e.key === "Enter") {
-              e.preventDefault();
-              navigate(e.currentTarget);
-            } else if (e.key === "Escape") {
-              // Restores the address and ends the edit; the field keeps focus.
-              e.preventDefault();
-              e.stopPropagation();
-              edit({ type: "cancel" });
-            }
-          }}
-        />
-        <button type="button" class="btn btn-sm" onClick={reload} disabled={!url} title="Load the page again">
-          <IconRestart size={13} /> Reload
+        <div class="pv-addr">
+          <span class={`pv-st ${status}`} role="img" aria-label={STATUS_TEXT[status]} title={STATUS_TEXT[status]} />
+          <input
+            class="preview-url"
+            type="text"
+            inputMode="url"
+            aria-label="Address of the page to preview"
+            title={url ? `${url}\nType a local address (like localhost:3000) and press Enter` : undefined}
+            spellcheck={false}
+            autocomplete="off"
+            autocapitalize="off"
+            aria-invalid={address.error ? true : undefined}
+            aria-describedby={address.error ? `preview-address-error-${panel.id}` : undefined}
+            value={addressText(address, url)}
+            readOnly={address.pending > 0}
+            onFocus={(e) => e.currentTarget.select()}
+            onMouseDown={(e) => { justFocused.current = document.activeElement !== e.currentTarget; }}
+            onMouseUp={(e) => {
+              if (justFocused.current) e.preventDefault();
+              justFocused.current = false;
+            }}
+            onInput={(e) => edit({ type: "input", text: e.currentTarget.value })}
+            onBlur={() => edit({ type: "blur", url: url ?? "" })}
+            onKeyDown={(e) => {
+              if (e.isComposing) return;
+              if (e.key === "Enter") {
+                e.preventDefault();
+                navigate(e.currentTarget);
+              } else if (e.key === "Escape") {
+                // Restores the address and ends the edit; the field keeps focus.
+                e.preventDefault();
+                e.stopPropagation();
+                edit({ type: "cancel" });
+              }
+            }}
+          />
+          <span class="pv-tag" title="Muster previews only local dev servers (localhost)"><KitIcon name="lock" size={11} />local only</span>
+        </div>
+        <button type="button" class="btn btn-sm pv-btn icon" onClick={reload} disabled={!url} title="Load the page again" aria-label="Reload">
+          <KitIcon name="refresh" size={14} />
         </button>
-        <button type="button" class="btn btn-sm" onClick={openInBrowser} disabled={!url} title="Open this address in your web browser">
-          <IconGlobe size={13} /> Open in browser
+        <button type="button" class="btn btn-sm pv-btn" onClick={openInBrowser} disabled={!url} title="Open this address in your web browser">
+          <KitIcon name="external" size={14} /> Open in browser
         </button>
       </div>
       {address.error && (
         <div class="preview-address-error" id={`preview-address-error-${panel.id}`} role="alert">{address.error}</div>
       )}
+      {!loaded && url && !notice?.blocking && !problem && <div class="pv-progress" aria-hidden="true" />}
       {notice && !notice.blocking && !problem && (
         <div class="preview-hint" role="status" data-preview-notice={notice.kind}>
+          <span class="pv-spin" aria-hidden="true" />
           <span><strong>{notice.title}</strong> {notice.detail}</span>
+          <button type="button" class="btn btn-sm" onClick={openInBrowser}>Open in browser</button>
         </div>
       )}
       <div class="panel-body">
@@ -203,14 +225,32 @@ export function WebPreview({ panel }: { panel: Panel }) {
             </div>
           )
           : notice?.blocking && (
-            <div class="panel-status" role="alert" data-preview-notice={notice.kind}>
-              <p><strong>{notice.title}</strong></p>
-              <p class="panel-status-detail">{notice.detail}</p>
-              <p class="panel-status-detail preview-status-url">{url}</p>
-              <div class="preview-actions">
-                <button type="button" class="btn" onClick={reload}>Reload</button>
-                <button type="button" class="btn" onClick={openInBrowser}>Open in browser</button>
-                {notice.kind !== "down" && <button type="button" class="btn" onClick={() => setDismissedKey(frameKey)}>Hide this notice</button>}
+            <div class="panel-status pv-notice" role="alert" data-preview-notice={notice.kind}>
+              <div class="ps-card">
+                <span class={`ps-orb ${ORB[notice.kind]?.[1] ?? "warn"}`}><KitIcon name={ORB[notice.kind]?.[0] ?? "alert"} size={20} /></span>
+                <h3>{notice.title}</h3>
+                <p class="panel-status-detail">{notice.detail}</p>
+                {notice.evidence && <pre class="pv-why">{notice.evidence}</pre>}
+                {counting && (
+                  <div class="pv-tick">
+                    <span>Checking every {RETRY_MS / 1000} s</span>
+                    <span class="pbar" aria-hidden="true"><i style={`width:${Math.max(0, Math.min(100, (1 - left / RETRY_FOR_MS) * 100)).toFixed(1)}%`} /></span>
+                    <span>stops in {clock(left)}; Reload starts again</span>
+                  </div>
+                )}
+                <p class="preview-status-url">{url}</p>
+                <div class="preview-actions">
+                  {notice.kind === "down"
+                    ? <>
+                      <button type="button" class="btn" onClick={reload}><KitIcon name="refresh" /> Reload</button>
+                      <button type="button" class="btn" onClick={openInBrowser}><KitIcon name="external" /> Open in browser</button>
+                    </>
+                    : <>
+                      <button type="button" class="btn btn-primary" onClick={openInBrowser}><KitIcon name="external" /> Open in browser</button>
+                      <button type="button" class="btn" onClick={reload}><KitIcon name="refresh" /> Reload</button>
+                      <button type="button" class="btn btn-ghost" onClick={() => setDismissedKey(frameKey)}>Show it here anyway</button>
+                    </>}
+                </div>
               </div>
             </div>
           )}

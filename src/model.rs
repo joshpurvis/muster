@@ -37,6 +37,10 @@ pub struct Panel {
     #[serde(default)]
     pub data_revision: i64,
     pub html_revision: i64,
+    /// A custom panel opened with `kit: true`: Muster serves its HTML with the kit in front
+    /// (src/panel_kit.rs). False in records from before it existed.
+    #[serde(default)]
+    pub kit: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub closed: bool,

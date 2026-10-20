@@ -29,6 +29,11 @@ export function sendEvent(kind: string, text: string, data: object): Promise<voi
   }).then(() => {});
 }
 
+/** Send the user's own words to the agent as a plain message (the event kind is `ui/message`). */
+export function sendText(text: string): Promise<void> {
+  return request("ui/message", { role: "user", content: { type: "text", text } }).then(() => {});
+}
+
 /** Open an http(s) link in the system browser. */
 export function openLink(url: string): Promise<void> {
   return request("ui/open-link", { url }).then(() => {});
@@ -58,6 +63,10 @@ export interface AppOptions {
 }
 
 export function startApp(options: AppOptions) {
+  // Until the host says which theme, follow the system's.
+  if (!document.documentElement.dataset.theme) {
+    document.documentElement.dataset.theme = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
   addEventListener("message", (event) => {
     if (event.source !== parent || event.data?.jsonrpc !== "2.0") return;
     const msg = event.data;

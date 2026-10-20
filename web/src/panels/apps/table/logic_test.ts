@@ -1,4 +1,4 @@
-import { compareCells, filterRows, isNumericColumn, nextSort, sortRows, validateTable } from "./logic.ts";
+import { columnMax, compareCells, filterRows, isNumericColumn, nextSort, sortRows, validateTable } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
 const rows = [
@@ -48,4 +48,23 @@ Deno.test("filter: every word, any shown column, case-insensitive", () => {
   eq(filterRows(rows, columns, "b1 3").map((r) => r.name), ["b10"]);
   eq(filterRows(rows, columns, "true").length, 0);
   eq(filterRows(rows, columns, "  ").length, 4);
+});
+
+Deno.test("table input: the Briefing fields are optional and checked", () => {
+  const r = validateTable({
+    title: "Flaky tests", scope: "acme · last 200 runs", takeaway: "One is **bad**.", source: "junit",
+    columns: [{ key: "t" }, { key: "n", format: "bar" }, { key: "s", format: "badge", tones: { Flaky: "warn", Fixed: "good" } }, { key: "f", format: "mono" }],
+    rows: [{ t: "a", n: 23, s: "Flaky", f: "a.ts" }, { t: "b", n: -4, s: "Fixed", f: "b.ts" }],
+  });
+  check(r.ok, JSON.stringify(r));
+  eq([r.value.scope, r.value.columns[1].format, r.value.columns[2].tones], ["acme · last 200 runs", "bar", { Flaky: "warn", Fixed: "good" }]);
+  eq(columnMax(r.value.rows, "n"), 23);
+  eq(columnMax([{ n: null }, { n: "x" }], "n"), 0);
+  const e = errorsOf(validateTable({ columns: [{ key: "a", format: "spark" }, { key: "b", tones: { x: "orange" } }, { key: "c", tones: [1] }], rows: [], takeaway: 5 }));
+  for (const want of ["columns[0].format: must be one of bar, badge, mono", "columns[1].tones.x: must be one of good, warn, bad, info, accent, plain", "columns[2].tones: must be an object", "takeaway: must be a string"]) {
+    check(e.some((x) => x.startsWith(want)), `${want}\n${e.join("\n")}`);
+  }
+  // A bar column that holds text is drawn as text, with a warning rather than a refusal.
+  const text = validateTable({ columns: [{ key: "a", format: "bar" }], rows: [{ a: "x" }] });
+  check(text.ok && text.warnings.some((w) => w.includes('format "bar" needs numbers')), JSON.stringify(text));
 });

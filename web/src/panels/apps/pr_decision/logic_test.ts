@@ -1,6 +1,6 @@
 import {
   answersEvent, askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, mergeBlocked, mergeCommand, mergeEvent, type Pr,
-  requestChangesEvent, skipEvent, validatePr,
+  joinAnd, readiness, requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 import { missingRequired } from "../shared/questions.ts";
@@ -283,4 +283,20 @@ Deno.test("confirm gate: a new required question, or any change to the questions
   const c = new ConfirmGate();
   c.open(a1, { answers: {}, options: ["qa"] });
   check(c.input(a2, { answers: {}, options: ["qa"] }));
+});
+
+Deno.test("merge readiness: Muster's own check colours the verdict and says why Merge waits", () => {
+  const base = valid({ ...samplePr, checks: { state: "passing", items: [] } });
+  eq(readiness(base, {}), { ready: true, tone: "good", reasons: [], short: [] });
+  const q = valid({ ...samplePr, checks: { state: "passing", items: [] }, reviews: { decision: "REVIEW_REQUIRED", items: [] }, questions: [
+    { id: "a", text: "A?", kind: "yes_no" }, { id: "b", text: "B?", kind: "yes_no", required: true }] });
+  const r = readiness(q, {});
+  eq([r.ready, r.tone, r.reasons, r.short], [false, "warn",
+    ["answer question 2", "an approving review is still required on GitHub"], ["question 2", "an approving review"]]);
+  eq(readiness(q, { b: "yes" }).reasons, ["an approving review is still required on GitHub"]);
+  const failing = valid({ ...samplePr, checks: { state: "failing", items: [] }, reviews: { decision: "CHANGES_REQUESTED", items: [] } });
+  eq([readiness(failing, {}).tone, readiness(failing, {}).short], ["bad", ["passing checks", "the requested changes"]]);
+  eq(readiness(valid({ ...samplePr, checks: { state: "pending", items: [] } }), {}).reasons, ["checks are still running"]);
+  eq(readiness(valid({ ...samplePr, status: "merged", checks: { state: "failing", items: [] } }), {}).ready, true);
+  eq([joinAnd([]), joinAnd(["a"]), joinAnd(["a", "b"]), joinAnd(["a", "b", "c"])], ["", "a", "a and b", "a, b and c"]);
 });

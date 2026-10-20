@@ -14,7 +14,7 @@ export const STATUSES = ["new", "ready", "reviewing", "merging", "merged", "queu
 export type Status = typeof STATUSES[number];
 export const SORTS = ["risk", "quick", "oldest"] as const;
 export type Sort = typeof SORTS[number];
-export const SORT_LABELS: Record<Sort, string> = { risk: "Riskiest first", quick: "Quick wins first", oldest: "Oldest first" };
+export const SORT_LABELS: Record<Sort, string> = { risk: "Riskiest first", quick: "Quick wins first", oldest: "Oldest" };
 export const MAX_PRS = 200;
 
 export interface Item {
@@ -50,6 +50,8 @@ export interface Item {
 export interface Overview {
   repo: string;
   title?: string;
+  /** The agent's one-sentence finding, under the title. */
+  takeaway?: string;
   prs: Item[];
   current?: number;
   sort: Sort;
@@ -71,10 +73,11 @@ export function validateOverview(data: unknown): Result<Overview> {
   const p = new Problems();
   const o = p.object(data, "data");
   if (!o) return p.result(null as never);
-  p.known(o, "", ["repo", "title", "prs", "current", "sort", "actions"]);
+  p.known(o, "", ["repo", "title", "takeaway", "prs", "current", "sort", "actions"]);
   const repo = p.string(o, "repo", "", { required: true, max: 201 });
   if (repo !== undefined && !REPO.test(repo)) p.add("repo", "must look like owner/name");
   const title = p.string(o, "title", "", { max: 200 });
+  const takeaway = p.string(o, "takeaway", "", { max: 600 });
   const prs: Item[] = [];
   const seen = new Set<number>();
   p.array(o, "prs", "", { required: true, max: MAX_PRS })?.forEach((it, i) => {
@@ -142,7 +145,7 @@ export function validateOverview(data: unknown): Result<Overview> {
   if (current !== undefined && !seen.has(current)) p.add("current", `#${current} is not in prs`);
   const sort = p.oneOf(o, "sort", "", SORTS) ?? "risk";
   const actions = validateActions(p, o);
-  return p.result({ repo: repo!, title, prs, current, sort, actions });
+  return p.result({ repo: repo!, title, takeaway, prs, current, sort, actions });
 }
 
 // ----- order, groups and filter -----
@@ -233,6 +236,21 @@ export function age(created: number | undefined, now: number): string {
   const d = Math.floor(h / 24);
   if (d < 60) return `${d}d`;
   return `${Math.floor(d / 30)}mo`;
+}
+
+/** The one line of counts under the title: what is open, and what needs the user. "Open" is
+ * open on GitHub: every PR not merged yet, including held, queued, merging and
+ * changes-requested ones (they still have checks and reviews worth counting). */
+export function summary(prs: Item[]) {
+  const open = prs.filter((p) => p.status !== "merged");
+  return {
+    open: open.length,
+    quick: quickWins(prs).length,
+    failing: open.filter((p) => p.checks === "failing").length,
+    review: open.filter((p) => p.review === "REVIEW_REQUIRED").length,
+    held: prs.filter((p) => p.status === "held").length,
+    merged: prs.filter((p) => p.status === "merged").length,
+  };
 }
 
 /** Counts for the header: open, held and decided. */

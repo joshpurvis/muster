@@ -11,11 +11,13 @@ import {
 } from "../shared/questions.ts";
 import { DraftState } from "../shared/draft.ts";
 import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
-import { renderChart } from "../chart/view.ts";
+import { chart } from "../../kit/chart.ts";
+import { iconEl } from "../../kit/icons.ts";
+import { avatarColor } from "../../kit/parts.ts";
 import { formatBytes } from "../image/logic.ts";
 import {
   answersEvent, askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, type Method, mergeBlocked, mergeCommand,
-  mergeEvent, METHODS, type Pr, requestChangesEvent, skipEvent, validatePr,
+  joinAnd, mergeEvent, METHODS, type Pr, readiness, requestChangesEvent, skipEvent, validatePr,
 } from "./logic.ts";
 
 type Mode = null | "confirm" | "request" | "ask" | "outward";
@@ -45,7 +47,6 @@ let actualSize = false;
 let actionsOpen = false;
 let showKeys = false;
 const chartTables = new Map<number, boolean>();
-let chartWidth = 0;
 let override = false;
 const drafts = { request: "", ask: "" };
 let shift = false;
@@ -90,7 +91,7 @@ function draftChanged(full = true) {
     full = true;
   }
   if (full) render();
-  else refreshDraftRow();
+  else { refreshDraftRow(); refreshReadiness(); }
 }
 
 /** A send carried the draft: its options went with it (they are one-shot) and switch off; the
@@ -412,14 +413,16 @@ function focusMode() {
   else if (mode === "confirm") document.getElementById("confirm-merge")?.focus();
 }
 
-function badge(text: string, tone: string) { return h("span", { class: `badge ${tone}` }, text); }
+const KIT_TONE: Record<string, string> = { info: "accent", success: "good", warning: "warn", danger: "bad", muted: "plain" };
+function badge(text: string, tone: string) { return h("span", { class: `mk-badge badge ${KIT_TONE[tone] ?? tone}` }, text); }
 
 const checkIcon: Record<string, [string, string]> = {
-  pass: ["✓", "success"], fail: ["✕", "danger"], pending: ["●", "warning"], skipping: ["–", "muted"], cancel: ["–", "muted"],
+  pass: ["check", "success"], fail: ["x", "danger"], pending: ["clock", "warning"], skipping: ["minus", "muted"], cancel: ["minus", "muted"],
 };
-const checksLabel = { passing: ["Checks passing", "success"], failing: ["Checks failing", "danger"], pending: ["Checks pending", "warning"], none: ["No checks", "muted"] };
-const reviewTone = (s: string) => /APPROVED/i.test(s) ? "success" : /CHANGES_REQUESTED/i.test(s) ? "danger" : "muted";
-const words = (s: string) => s.toLowerCase().replace(/_/g, " ");
+const checksLabel = { passing: ["Passing", "success"], failing: ["Failing", "danger"], pending: ["Pending", "warning"], none: ["No checks", "muted"] };
+const reviewTone = (s: string) => /APPROVED/i.test(s) ? "success" : /CHANGES_REQUESTED/i.test(s) ? "danger" : /REVIEW_REQUIRED/i.test(s) ? "warning" : "muted";
+const words = (s: string) => { const w = s.toLowerCase().replace(/_/g, " "); return w[0].toUpperCase() + w.slice(1); };
+const decisionText = (s: string) => /REVIEW_REQUIRED/i.test(s) ? "Approval needed" : words(s);
 const statusText = {
   merging: ["Merging…", "info"], queued: ["Queued to merge", "info"], merged: ["Merged", "success"], failed: ["Failed", "danger"],
   requested_changes: ["Changes requested", "warning"],
@@ -432,14 +435,21 @@ function diffView(diff: string) {
     h("table", { class: "diff" }, h("tbody", null, shown.map((l) => {
       if (l.kind === "hunk") return h("tr", { class: "hunk" }, h("td", { colspan: 3 }, l.text));
       if (l.kind === "note" || l.kind === "meta") return h("tr", { class: l.kind }, h("td", { colspan: 3 }, l.text));
-      const sign = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
+      const sign = l.kind === "add" ? "+" : l.kind === "del" ? "−" : " ";
       return h("tr", { class: l.kind },
-        h("td", { class: "ln", "aria-hidden": "true" }, l.old ?? ""),
-        h("td", { class: "ln", "aria-hidden": "true" }, l.new ?? ""),
-        h("td", { class: "code" }, h("span", { class: "sign" }, sign), l.text));
+        h("td", { class: "ln", "aria-hidden": "true" }, l.kind === "del" ? l.old ?? "" : l.new ?? l.old ?? ""),
+        h("td", { class: "sign", "aria-hidden": "true" }, sign),
+        h("td", { class: "code" }, h("span", { class: "sr-only" }, l.kind === "add" ? "added: " : l.kind === "del" ? "removed: " : ""), l.text));
     }))),
     lines.length > shown.length ? h("p", { class: "muted more" }, `${lines.length - shown.length} more lines not shown`) : null,
     lines.length ? null : h("p", { class: "muted more" }, "No diff lines."));
+}
+
+/** Five blocks in proportion to the lines added and removed, like GitHub's. */
+function sizeBlocks(added: number, removed: number) {
+  const tot = added + removed;
+  const a = tot ? Math.round((added / tot) * 5) : 0, d = tot ? Math.min(5 - a, Math.round((removed / tot) * 5)) : 0;
+  return Array.from({ length: 5 }, (_, i) => h("i", { class: i < a ? "a" : i < a + d ? "d" : "" }));
 }
 
 function statusBanner(p: Pr) {
@@ -448,6 +458,46 @@ function statusBanner(p: Pr) {
   const [label, tone] = statusText[p.status];
   return h("div", { class: `status ${tone}` },
     h("strong", null, label), p.status_detail ? h("span", { class: "detail" }, p.status_detail) : null);
+}
+
+/** The agent's call first, with how to undo it; its colour comes from Muster's own check of
+ * whether the PR can merge (readiness), so a green card never sits beside a merge GitHub would refuse. */
+function verdictBlock(p: Pr) {
+  const r = readiness(p, ds.choices);
+  const gate = p.status === "open" && !r.ready;
+  if (!p.verdict && !p.undo && !gate) return null;
+  const vc = { good: "var(--mk-good)", warn: "var(--mk-warn)", bad: "var(--mk-bad)" }[r.tone];
+  return h("section", { class: `verdict tone-${r.tone}`, style: `--vc:${vc}`, "aria-label": "The agent's verdict" },
+    h("span", { class: "vi", "aria-hidden": "true" }, iconEl("shield")),
+    p.verdict ? h("p", { class: "verdict-text v" }, p.verdict) : null,
+    p.undo ? h("p", { class: "undo u" }, iconEl("undo"), h("span", null, p.undo)) : null,
+    gate ? h("div", { class: "gate", id: "readiness" }, iconEl("clock"),
+      h("span", null, `Not ready yet: ${joinAnd(r.reasons)}.`, h("small", null, "Checked by Muster against the PR, not the agent's opinion."))) : null);
+}
+
+function factsBlock(p: Pr) {
+  const level = p.risk.level;
+  const on = { low: 1, medium: 2, high: 3 }[level];
+  const tone = { low: "success", medium: "warning", high: "danger" }[level];
+  const decision = p.reviews?.decision;
+  return h("section", { class: "facts grid", "aria-label": "Risk, checks and reviews" },
+    h("div", { class: `mk-card fact risk-${level}` },
+      h("div", { class: "fh" }, h("h2", null, "Risk"), badge(`${level[0].toUpperCase()}${level.slice(1)}`, tone)),
+      h("div", { class: "riskbar", "aria-hidden": "true" }, [1, 2, 3].map((i) => h("i", { class: i <= on ? "on" : "" }))),
+      p.risk.reasons.length ? h("ul", { class: "reasons" }, p.risk.reasons.map((r) => h("li", { class: "reason" }, r))) : null),
+    h("div", { class: "mk-card fact" },
+      h("div", { class: "fh" }, h("h2", null, "Checks"), badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1])),
+      p.checks.items.length ? h("ul", { class: "checks" }, p.checks.items.map((c) => {
+        const [icon, t] = checkIcon[c.state];
+        return h("li", { class: `c-${t}` }, iconEl(icon), c.url ? link(c.url, c.name) : h("span", { class: "name" }, c.name), h("span", { class: "state st" }, c.state));
+      })) : h("p", { class: "muted none" }, "No check runs reported.")),
+    h("div", { class: "mk-card fact" },
+      h("div", { class: "fh" }, h("h2", null, "Reviews"), decision ? badge(decisionText(decision), reviewTone(decision)) : badge("No decision", "muted")),
+      p.reviews?.items.length ? h("ul", { class: "checks" }, p.reviews.items.map((r) =>
+        h("li", null, h("span", { class: "mk-avatar", style: `--a:${avatarColor(r.author)}`, "aria-hidden": "true" }, r.author[0]), h("span", { class: "name" }, r.author),
+          h("span", { class: `state st ${reviewTone(r.state)}` }, words(r.state).toLowerCase())))) : null,
+      decision && /REVIEW_REQUIRED/i.test(decision) ? h("p", { class: "needs" }, iconEl("users"), "Needs an approving review") : null,
+      !decision && !p.reviews?.items.length ? h("p", { class: "muted none" }, "No reviews yet.") : null));
 }
 
 function actionPanel(p: Pr) {
@@ -512,8 +562,10 @@ function draftSummary(p: Pr, d: Draft) {
 function questionsSection(p: Pr) {
   if (!p.questions.length) return null;
   const closed = formsClosed(p);
-  return h("section", { class: "questions-form", "aria-labelledby": "questions-title" },
-    h("h2", { id: "questions-title" }, p.questions.length === 1 ? "The agent asks" : `The agent asks (${p.questions.length})`),
+  const answered = p.questions.filter((q) => answerOf(q, ds.choices) !== undefined).length;
+  return h("section", { class: "questions-form pd-sec", "aria-labelledby": "questions-title" },
+    h("h2", { id: "questions-title" }, "The agent asks", h("span", { class: "count" }, `${answered} of ${p.questions.length} answered`),
+      h("span", { class: "r" }, questionsChip(p))),
     h("p", { class: "muted small qhint" }, closed
       ? `${closed} Answers can no longer be sent.`
       : "Your answers go with your next decision, or send them now. Number keys pick; Tab moves to the next question."),
@@ -526,7 +578,7 @@ function questionView(q: Question, i: number, closed: boolean) {
   const head = h("div", { class: "q-head" },
     h("span", { class: "q-num", "aria-hidden": "true" }, String(i + 1)),
     h("span", { class: "q-text", id: label }, q.text),
-    q.required ? h("span", { class: "badge warning q-req", id: `q-${q.id}-req` }, "Needed to merge") : null);
+    q.required ? h("span", { class: "q-req req", id: `q-${q.id}-req` }, "Needed to merge") : null);
   const described = [q.why ? `q-${q.id}-why` : "", q.required ? `q-${q.id}-req` : ""].filter(Boolean).join(" ") || null;
   const why = q.why ? h("p", { class: "q-why muted", id: `q-${q.id}-why` }, q.why) : null;
   let body: HTMLElement;
@@ -544,13 +596,13 @@ function questionView(q: Question, i: number, closed: boolean) {
     body = h("div", { class: "q-options", role: "radiogroup", "aria-labelledby": label, "aria-describedby": described,
       "aria-required": q.required ? "true" : null },
       opts.map((o, j) => h("button", {
-        type: "button", role: "radio", id: `q-${q.id}-o${j}`, class: `q-opt${j === at ? " on" : ""}`, "aria-checked": String(j === at),
+        type: "button", role: "radio", id: `q-${q.id}-o${j}`, class: `q-opt opt${j === at ? " on" : ""}`, "aria-checked": String(j === at),
         tabindex: j === (at < 0 ? 0 : at) ? 0 : -1, disabled: closed, "aria-keyshortcuts": j < 9 ? String(j + 1) : null,
         onclick: () => pick(q, o.value),
-      }, j < 9 ? h("kbd", null, String(j + 1)) : null, " ", o.label,
-      o.value === q.recommended ? h("span", { class: "rec" }, " Recommended") : null)));
+      }, j < 9 ? h("kbd", null, String(j + 1)) : null, o.label,
+      o.value === q.recommended ? h("span", { class: "rec" }, iconEl("sparkle"), "Recommended") : null)));
   }
-  return h("div", { class: `question${answer !== undefined ? " answered" : ""}`, id: `q-${q.id}`, "data-q": q.id }, head, why, body);
+  return h("div", { class: `question mk-card q${answer !== undefined ? " answered done" : ""}`, id: `q-${q.id}`, "data-q": q.id }, head, why, body);
 }
 
 /** In the header: the agent's questions are one click (or G) away, however far down they are. */
@@ -558,8 +610,8 @@ function questionsChip(p: Pr) {
   if (!p.questions.length) return null;
   const open = p.questions.filter((q) => answerOf(q, ds.choices) === undefined).length;
   const n = p.questions.length;
-  return h("button", { type: "button", id: "to-questions", class: `q-chip${open ? " open" : ""}`, "aria-keyshortcuts": "G", onclick: () => toQuestions() },
-    open ? `Answer ${open} question${open === 1 ? "" : "s"}` : `Review ${n} answer${n === 1 ? "" : "s"}`, " ↓ ", h("kbd", null, "G"));
+  return h("button", { type: "button", id: "to-questions", class: `sm q-chip${open ? " open" : ""}`, "aria-keyshortcuts": "G", onclick: () => toQuestions() },
+    open ? `Answer ${open} question${open === 1 ? "" : "s"}` : `Review ${n} answer${n === 1 ? "" : "s"}`, iconEl("arrowDown"), h("kbd", null, "G"));
 }
 
 /** Go to the first question still without an answer, else the first one. */
@@ -585,7 +637,7 @@ function draftRow(p: Pr) {
       p.questions.length ? h("button", { type: "button", class: "link", id: "draft-count", title: "Go to the questions (G)", onclick: () => toQuestions() },
         `${n} of ${p.questions.length} answered`) : null,
       opts.length ? `${p.questions.length ? " · " : ""}${opts.join(" · ")}` : p.questions.length ? "" : "nothing yet"),
-    h("button", { type: "button", id: "send-answers", "aria-keyshortcuts": "Control+Enter",
+    h("button", { type: "button", id: "send-answers", class: "ghost sm", "aria-keyshortcuts": "Control+Enter",
       disabled: !!closed || deciding() || draftEmpty(d) || done || mode === "confirm",
       title: mode === "confirm" ? "They go with the merge you are confirming" : "Send your answers, and the options switched on for the agent to do, now; the PR stays undecided",
       onclick: () => sendAnswers() }, label, " ", h("kbd", null, "Ctrl+Enter")));
@@ -598,34 +650,67 @@ function refreshDraftRow() {
   if (now && next) now.replaceWith(next);
 }
 
-/** The agent's verdict first, then how to undo it. */
-function verdictBlock(p: Pr) {
-  if (!p.verdict && !p.undo) return null;
-  return h("section", { class: `verdict risk-${p.risk.level}`, "aria-label": "The agent's verdict" },
-    p.verdict ? h("p", { class: "verdict-text" }, p.verdict) : null,
-    p.undo ? h("p", { class: "undo" }, h("span", { class: "undo-icon", "aria-hidden": "true" }, "↩ "), p.undo) : null);
+/** Typing an answer changes readiness: refresh everything that shows it (the verdict's colour
+ * and reasons, the answered counts, the question cards, why Merge waits) without rebuilding
+ * the question the user is typing in. */
+function refreshReadiness() {
+  if (!pr) return;
+  const p = pr;
+  const verdict = root.querySelector(":scope > section.verdict");
+  const nextVerdict = verdictBlock(p);
+  if (verdict && nextVerdict) verdict.replaceWith(nextVerdict);
+  else if (verdict) verdict.remove();
+  else if (nextVerdict) root.querySelector(":scope > p.warnings, :scope > section.facts")?.before(nextVerdict);
+  const answered = p.questions.filter((q) => answerOf(q, ds.choices) !== undefined).length;
+  const count = document.querySelector("#questions-title .count");
+  if (count) count.textContent = `${answered} of ${p.questions.length} answered`;
+  const chip = document.getElementById("to-questions"), nextChip = questionsChip(p);
+  if (chip && nextChip) chip.replaceWith(nextChip);
+  for (const q of p.questions) {
+    const done = answerOf(q, ds.choices) !== undefined;
+    document.getElementById(`q-${q.id}`)?.classList.toggle("answered", done);
+    document.getElementById(`q-${q.id}`)?.classList.toggle("done", done);
+  }
+  const ready = readiness(p, ds.choices);
+  const waits = p.status === "open" && !ready.ready;
+  mergeButton?.classList.toggle("waits", waits);
+  mergeButton?.setAttribute("aria-describedby", waits ? "merge-hint merge-why" : "merge-hint");
+  const why = document.getElementById("merge-why");
+  const nextWhy = waits && mode !== "confirm" ? mergeWhy(ready) : null;
+  if (why && nextWhy) why.replaceWith(nextWhy);
+  else if (why) why.remove();
+  else if (nextWhy) root.querySelector(".actbar > .row.bar")?.after(nextWhy);
+  updateMergeButton();
 }
+
+const mergeWhy = (ready: { short: string[] }) => h("p", { id: "merge-why", class: "why small" }, iconEl("clock"), `Merge waits for ${joinAnd(ready.short)}`);
 
 function mediaSection(p: Pr) {
   if (!p.media.length) return null;
   const images = p.media.filter((m) => m.kind === "image").length;
-  return h("section", { class: "media", "aria-label": "Pictures and charts" },
-    h("h2", null, "Pictures and charts"),
+  return h("section", { class: "media pd-sec", "aria-labelledby": "media-title" },
+    h("h2", { id: "media-title" }, "Pictures and charts"),
     h("div", { class: `media-grid${images === 1 ? " single" : ""}` }, p.media.map((m, i) => {
       if (m.kind === "image") {
         const img = m.image;
-        return h("figure", { class: "shot" },
+        return h("figure", { class: "shot mk-card" },
           h("button", { type: "button", class: "thumb", id: `media-${i}`, "aria-label": `Enlarge: ${img.alt}`, onclick: () => enlarge(i) },
             h("img", { src: img.src, alt: img.alt, decoding: "async", draggable: "false" })),
           img.caption ? h("figcaption", null, img.caption) : null);
       }
-      return h("figure", { class: "media-chart" },
+      const shown = chartTables.get(i) ?? false;
+      return h("figure", { class: "media-chart mk-card" },
+        m.spec.title ? h("h3", { class: "chart-title" }, m.spec.title) : null,
         h("div", { class: "chart-view", "data-chart": i }),
-        m.caption ? h("figcaption", null, m.caption) : null);
+        h("figcaption", null, m.caption ? h("span", null, m.caption) : h("span"),
+          h("button", { type: "button", class: "ghost sm", id: `chart-${i}-toggle`, "aria-expanded": String(shown),
+            onclick: () => { chartTables.set(i, !shown); render(); document.getElementById(`chart-${i}-toggle`)?.focus(); } },
+          iconEl("table"), shown ? "Hide data table" : "Data table")));
     })));
 }
 
-/** Charts need the laid-out width, so they are drawn after the rest is mounted (and on resize). */
+/** Charts need the laid-out width, so they are drawn after the rest is mounted; each then
+ * redraws itself when its width changes. */
 function drawCharts() {
   if (!pr) return;
   const p = pr;
@@ -633,11 +718,7 @@ function drawCharts() {
     const i = Number(el.dataset.chart);
     const m = p.media[i];
     if (m?.kind !== "chart") continue;
-    chartWidth = el.clientWidth;
-    renderChart(el, m.spec, {
-      id: `chart-${i}`, width: el.clientWidth, minWidth: 220, maxHeight: 300, heading: "h3", showTable: chartTables.get(i) ?? false,
-      onToggle: () => { chartTables.set(i, !(chartTables.get(i) ?? false)); drawCharts(); },
-    });
+    chart(el, m.spec, { height: 220, showTable: chartTables.get(i) ?? false, legendValues: false });
   }
 }
 
@@ -701,66 +782,58 @@ function render() {
   const p = pr;
   const scroll = scrollY;
   const focusId = (document.activeElement as HTMLElement | null)?.id;
-  const select = h("select", { id: "method", "aria-label": "Merge method", disabled: p.status === "merged" || p.status === "queued" }) as HTMLSelectElement;
+  const select = h("select", { id: "method", class: "method", "aria-label": "Merge method", disabled: p.status === "merged" || p.status === "queued" }) as HTMLSelectElement;
   for (const m of METHODS) select.append(h("option", { value: m, selected: m === method }, m === "merge" ? "Merge commit" : m === "squash" ? "Squash" : "Rebase"));
   select.addEventListener("change", () => { method = select.value as Method; if (mode === "confirm") render(); });
   const box = h("input", { type: "checkbox", id: "delete-branch", checked: deleteBranch, disabled: p.status === "merged" || p.status === "queued" }) as HTMLInputElement;
   box.addEventListener("change", () => { deleteBranch = box.checked; if (mode === "confirm") render(); });
+  const ready = readiness(p, ds.choices);
+  const waits = p.status === "open" && !ready.ready;
   mergeButton = h("button", {
-    type: "button", id: "merge", class: "primary", "aria-describedby": "merge-hint", "aria-keyshortcuts": "M",
+    type: "button", id: "merge", class: `primary${waits ? " waits" : ""}`, "aria-describedby": waits ? "merge-hint merge-why" : "merge-hint", "aria-keyshortcuts": "M",
     onclick: (e: Event) => openConfirm((e as MouseEvent).shiftKey || shift),
-  }, h("span", { class: "label" }, "Merge"), " ", h("kbd", null, "M")) as HTMLButtonElement;
+  }, iconEl("merge"), h("span", { class: "label" }, "Merge"), h("kbd", null, "M")) as HTMLButtonElement;
   const closed = formsClosed(p);
   const stats = p.changes.map((c) => diffStats(parseDiff(c.diff)));
   const effective = notice ?? (p.status !== "open" ? { text: `${statusText[p.status][0]}${p.status_detail ? `: ${p.status_detail}` : ""}`, tone: statusText[p.status][1] as Tone }
     : p.status_detail ? { text: p.status_detail, tone: "info" as Tone } : null);
+  const files = p.changes.length;
 
   mount(root,
     h("header", { class: "head" },
-      h("div", { class: "title-row" },
-        h("h1", { tabindex: "-1" }, p.title, " ", h("span", { class: "num" }, `#${p.number}`)),
-        h("button", { type: "button", id: "open", class: "link open-gh", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) }, "Open on GitHub ", h("kbd", null, "O"))),
-      h("p", { class: "meta muted" },
-        `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} · head `,
-        h("code", { title: p.head_sha }, short(p.head_sha))),
-      questionsChip(p)),
+      h("div", { class: "pd-meta" },
+        h("span", { class: "mk-chip" }, p.repo),
+        h("span", null, files ? `${files} change${files === 1 ? "" : "s"} worth a look` : "no changes picked to show"),
+        h("button", { type: "button", id: "open", class: "ghost sm open-gh", "aria-keyshortcuts": "O", onclick: () => openLink(p.url).catch((e) => { setNotice(e.message, "danger"); render(); }) },
+          "Open on GitHub", iconEl("external"), h("kbd", null, "O"))),
+      h("h1", { class: "mk-title", tabindex: "-1" }, p.title, " ", h("span", { class: "num" }, `#${p.number}`)),
+      h("p", { class: "meta pd-by" },
+        h("span", { class: "mk-avatar", style: `--a:${avatarColor(p.author)}`, "aria-hidden": "true" }, p.author[0]),
+        h("b", null, p.author), " wants to merge ",
+        h("code", { class: "mk-chip" }, iconEl("branch"), p.head), h("span", { class: "sr-only" }, " into "), iconEl("arrowRight"),
+        h("code", { class: "mk-chip" }, p.base), h("span", { class: "muted" }, ` in ${p.repo} · head`),
+        h("code", { class: "mk-chip", title: p.head_sha }, short(p.head_sha)))),
     statusBanner(p),
     verdictBlock(p),
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
-    h("section", null, h("h2", null, "What changed"), h("p", { class: "prose" }, p.summary)),
     // The decision signals come before the pictures: they must never be scrolled away by them.
-    h("section", { class: "grid" },
-      h("div", null,
-        h("h2", null, "Risk"),
-        badge(`${p.risk.level[0].toUpperCase()}${p.risk.level.slice(1)} risk`, { low: "success", medium: "warning", high: "danger" }[p.risk.level]),
-        p.risk.reasons.length ? h("ul", { class: "reasons" }, p.risk.reasons.map((r) => h("li", null, r))) : null),
-      h("div", null,
-        h("h2", null, "Checks"),
-        badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1]),
-        p.checks.items.length ? h("ul", { class: "checks" }, p.checks.items.map((c) => {
-          const [icon, tone] = checkIcon[c.state];
-          return h("li", null, h("span", { class: `icon ${tone}`, "aria-hidden": "true" }, icon),
-            c.url ? link(c.url, c.name) : h("span", null, c.name), h("span", { class: "muted state" }, c.state));
-        })) : null),
-      h("div", null,
-        h("h2", null, "Reviews"),
-        p.reviews?.decision ? badge(words(p.reviews.decision), reviewTone(p.reviews.decision)) : h("span", { class: "muted" }, "No review decision"),
-        p.reviews?.items.length ? h("ul", { class: "checks" }, p.reviews.items.map((r) =>
-          h("li", null, h("span", null, r.author), h("span", { class: `state ${reviewTone(r.state)}` }, words(r.state))))) : null)),
+    factsBlock(p),
+    h("section", { class: "pd-sec" }, h("h2", null, "What changed"), h("p", { class: "prose" }, p.summary)),
     questionsSection(p),
     mediaSection(p),
-    h("section", null,
-      h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"),
-      p.changes.length ? null : h("p", { class: "muted" }, "The agent picked no changes to show."),
-      p.changes.map((c, i) => h("article", { class: "change" },
-        h("header", null, h("code", { class: "file" }, c.file),
-          h("span", { class: "stat" }, h("span", { class: "plus" }, `+${stats[i].added}`), " ", h("span", { class: "minus" }, `−${stats[i].removed}`))),
-        h("p", { class: "note" }, c.note),
+    h("section", { class: "pd-sec" },
+      h("h2", null, files ? "Changes worth a look" : "Changes", files ? h("span", { class: "count" }, String(files)) : null),
+      files ? null : h("p", { class: "muted" }, "The agent picked no changes to show."),
+      p.changes.map((c, i) => h("article", { class: "change mk-card file" },
+        h("header", { class: "fh2" }, h("code", { class: "file fn" }, c.file),
+          h("span", { class: "stat ds" }, h("span", { class: "plus a" }, `+${stats[i].added}`), h("span", { class: "minus d" }, `−${stats[i].removed}`),
+            h("span", { class: "blocks", "aria-hidden": "true" }, sizeBlocks(stats[i].added, stats[i].removed)))),
+        h("p", { class: "note" }, iconEl("sparkle"), h("span", null, c.note)),
         diffView(c.diff))),
       p.rest_note ? h("p", { class: "rest muted" }, p.rest_note) : null),
-    answers.length ? h("section", { id: "answers" }, h("h2", null, "The agent's answers"),
-      answers.map((a) => h("div", { class: "answer" }, h("p", { class: "q muted" }, a.question), h("p", { class: "prose" }, a.text)))) : null,
-    h("div", { class: `actions${mode || showKeys ? " has-drawer" : ""}` },
+    answers.length ? h("section", { id: "answers", class: "pd-sec" }, h("h2", null, "The agent's answers"),
+      answers.map((a) => h("div", { class: "answer mk-card" }, h("p", { class: "q muted" }, a.question), h("p", { class: "prose" }, a.text)))) : null,
+    h("div", { class: `actions actbar${mode || showKeys ? " has-drawer" : ""}` },
       showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false), true) : null,
       actionPanel(p),
       draftRow(p),
@@ -768,12 +841,14 @@ function render() {
       h("div", { class: "row bar" },
         h("div", { class: "merge-group" }, mergeButton, select,
           h("label", { class: "check" }, box, " Delete branch")),
-        h("span", { class: "spacer" }),
+        h("span", { class: "grp-sep", "aria-hidden": "true" }),
         h("button", { type: "button", id: "request", "aria-keyshortcuts": "R", disabled: !!closed || sent === "request_changes", title: closed ?? null, onclick: () => setMode("request") }, "Request changes ", h("kbd", null, "R")),
         h("button", { type: "button", id: "ask", "aria-keyshortcuts": "A", disabled: !!closed, title: closed ?? null, onclick: () => setMode("ask") }, "Ask ", h("kbd", null, "A")),
-        h("button", { type: "button", id: "skip", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
-        h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
+        h("span", { class: "spacer" }),
+        h("button", { type: "button", id: "skip", class: "ghost", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
+        h("button", { type: "button", id: "hold", class: "ghost", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
         helpButton(() => setKeys(!showKeys), showKeys)),
+      waits && mode !== "confirm" ? mergeWhy(ready) : null,
       actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentNow.has(a.id), actionsOpen,
         () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); },
         (a) => a.mode === "toggle" ? ds.isOn(a) : undefined),
@@ -890,10 +965,6 @@ addEventListener("keyup", (e) => {
   gate.keyUp(e.code);
   outGate.keyUp(e.code);
 });
-new ResizeObserver(() => {
-  const el = document.querySelector<HTMLElement>("[data-chart]");
-  if (el && Math.abs(el.clientWidth - chartWidth) > 4) drawCharts();
-}).observe(root);
 const pointer = (e: PointerEvent) => { if (e.shiftKey !== shift) { shift = e.shiftKey; updateMergeButton(); } };
 addEventListener("pointermove", pointer);
 addEventListener("pointerdown", pointer, true);

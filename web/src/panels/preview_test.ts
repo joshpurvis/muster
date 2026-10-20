@@ -1,5 +1,5 @@
 import {
-  ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, untouchedSinceSubmit, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, RETRY_FOR_MS, RETRY_MS, startChecks,
+  ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, untouchedSinceSubmit, type PreviewCheck, previewFrameSrc, clock, previewNotice, previewRevision, previewStatus, RETRY_FOR_MS, RETRY_MS, startChecks,
 } from "./preview.ts";
 
 function check(value: unknown, message = "assertion failed") {
@@ -32,9 +32,9 @@ Deno.test("notices follow the check", () => {
   check(down.kind === "down" && down.blocking && down.detail.includes("reloads by itself"), down.detail);
   check(previewNotice({ reachable: false }, false)!.detail.includes("press Reload"));
   const refused = previewNotice({ reachable: true, answered: true, status: 200, refused: "X-Frame-Options: DENY" }, false)!;
-  check(refused.kind === "refused" && refused.detail.includes("X-Frame-Options: DENY") && refused.detail.includes("browser"));
+  check(refused.kind === "refused" && refused.evidence === "X-Frame-Options: DENY" && refused.detail.includes("browser"));
   const leaves = previewNotice({ reachable: true, answered: true, status: 302, leaves_to: "https://login.example/" }, false)!;
-  check(leaves.kind === "leaves" && leaves.detail.includes("https://login.example/"));
+  check(leaves.kind === "leaves" && leaves.evidence!.includes("https://login.example/"));
   const silent = previewNotice({ reachable: true, answered: false }, false)!;
   check(silent.kind === "silent" && !silent.blocking);
   // A refusal outranks a redirect; being down outranks both.
@@ -166,4 +166,14 @@ Deno.test("an untouched field follows the address when it changes elsewhere", ()
   check(addressText(s, "http://localhost:3000/") === "http://localhost:3000/");
   check(addressText(s, "http://localhost:4000/") === "http://localhost:4000/");
   check(addressStep(s, { type: "blur", url: "http://localhost:4000/" }) === s);
+});
+
+Deno.test("the address bar's dot and the countdown", () => {
+  check(previewStatus(null, false, null) === "wait");
+  check(previewStatus("http://localhost:5173/", true, null) === "ok");
+  check(previewStatus("http://localhost:5173/", false, null) === "wait");
+  check(previewStatus("http://localhost:5173/", true, previewNotice({ reachable: true, refused: "X-Frame-Options: DENY" }, false)) === "warn");
+  check(previewStatus("http://localhost:5173/", false, previewNotice({ reachable: false }, true)) === "wait");
+  check(previewNotice({ reachable: false }, true, "localhost:5173")!.title === "Nothing is running at localhost:5173 yet");
+  check(clock(80_000) === "1:20" && clock(0) === "0:00" && clock(1) === "0:01");
 });

@@ -5,10 +5,11 @@
 // Part of dev/e2e.ts; also runs alone (same flags as e2e.ts):
 //
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src,dev,panels \
-//     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo>
+//     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo> [cdp-port]
 import { type Browser, launch } from "./cdp.ts";
 import {
-  actionsSample, chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA, tableSample,
+  actionsSample, chartBriefSample, chartMultiSample, chartSample, HEAD_SHA, lineSample, markdownSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA,
+  tableBriefSample, tableSample,
 } from "./panel_samples.ts";
 
 const M = "globalThis.__muster";
@@ -74,6 +75,8 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     })`);
     /** Zoomed, dark then light, and the page must not scroll sideways. */
     const shots2 = async (name: string) => {
+      // The pointer rests on the status bar, so no tab tooltip covers the panel's strip.
+      await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 4, y: 896 });
       await zoom("fullscreen");
       for (const theme of ["dark", "light"]) {
         await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
@@ -93,7 +96,16 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
 
   const open = async (app: string, title: string, data: unknown) => {
     const pid = (await call("panel.open", { title, app, data })).panel_id as number;
-    return { pid, ...(await attach(pid)) };
+    const p = await attach(pid);
+    // The new tab's group may still be settling: click only once the app's width holds still.
+    let last = -1;
+    for (let i = 0; i < 40; i++) {
+      const w = await p.inApp("innerWidth");
+      if (w === last && w > 0) break;
+      last = w;
+      await a.sleep(120);
+    }
+    return { pid, ...p };
   };
   const close = (pid: number) => call("panel.close", { panel_id: pid });
   /** "?" (Shift+/), which the key helper cannot type. */
@@ -119,9 +131,10 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
   {
     const p = await open("image", "Icon", { path: "web/m/icon-512.png", alt: "Muster icon", caption: "The app icon, 512 px" });
     await p.waitIn(`document.querySelector('.stage img')?.naturalWidth === 512`);
+    check((await p.inApp(`[...document.querySelectorAll('.cap .mk-chip')].map((c) => c.textContent).join('|')`)).includes("512 × 512"), "the file facts show as chips");
     check(await p.inApp(`document.querySelector('.stage img').src.startsWith('data:image/png;base64,')`), "image arrives as a data URI");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('fit')`), "starts zoomed to fit");
-    await p.click(".bar button");
+    await p.click("#zoom-actual");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('actual')`), "button switches to actual size");
     await a.key("z");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('fit')`), "Z switches back to fit");
@@ -143,22 +156,30 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     const p = await open("chart", "CI minutes", chartSample);
     await p.waitIn(`document.querySelector('svg[role=img]')`);
     check((await p.inApp(`document.querySelector('svg title').textContent`)) === "CI minutes per day", "svg title");
-    check((await p.inApp(`document.querySelector('svg desc').textContent`)).includes("Bar chart of 2 series"), "svg desc");
-    check((await p.inApp(`document.querySelectorAll('rect.bar').length`)) === 13, "13 bars (one null skipped)");
-    check((await p.inApp(`document.querySelectorAll('.sr-only table.data tbody tr').length`)) === 7, "hidden data table");
-    const [x, y] = await p.where(`rect.bar[data-i="3"]`);
+    check((await p.inApp(`document.querySelector('svg desc').textContent`)).includes("Bar chart of master, PRs"), "svg desc");
+    check((await p.inApp(`document.querySelectorAll('path.bar').length`)) === 13, "13 bars (one null skipped)");
+    check((await p.inApp(`document.querySelectorAll('.mk-sr table tbody tr').length`)) === 7, "hidden data table");
+    const [x, y] = await p.where(`path.bar[data-i="3"]`);
     await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await p.waitIn(`!document.querySelector('.tip').hidden`);
-    const tip: string = await p.inApp(`document.querySelector('.tip').textContent`);
+    await p.waitIn(`document.querySelector('.mk-tip')`);
+    const tip: string = await p.inApp(`document.querySelector('.mk-tip').textContent`);
     check(tip.includes("Thu") && tip.includes("61") && tip.includes("110"), `hover tooltip: ${tip}`);
+    check((await p.inApp(`document.querySelector('svg text.xlab')?.textContent`)) === "Day", "the x axis label is drawn");
     await a.clickAt(x, y);
+    // Arrow keys redraw inside the same SVG and live region (focus and announcements stay).
+    await p.inApp(`document.querySelector('figure svg').setAttribute('data-probe', '1'); document.querySelector('.mk-live').setAttribute('data-probe', '1')`);
     await a.key("Right");
-    check((await p.inApp(`document.querySelector('[aria-live]').textContent`)).startsWith("Fri: master 70"), "arrow keys move the tooltip");
+    await p.waitIn(`document.querySelector('.mk-live').textContent.startsWith("Fri: master 70")`);
+    check(await p.inApp(`document.activeElement === document.querySelector('figure svg[data-probe]') && !!document.querySelector('.mk-live[data-probe]')`), "the focused SVG and the live region stay mounted");
+    check((await p.inApp(`document.querySelector('.mk-live').textContent`)).includes("vs Thu"), "the live region reads the change from the day before");
+    await p.click("#toggle-table");
+    await p.waitIn(`document.querySelector('.mk-data table') && document.querySelector('#toggle-table').getAttribute('aria-expanded') === 'true'`);
+    await p.click("#toggle-table");
     await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 5, y: 5 });
     await p.shots2("chart-bar");
     await close(p.pid);
     const l = await open("chart", "Latency", lineSample);
-    await l.waitIn(`document.querySelectorAll('.marks path').length === 3`);
+    await l.waitIn(`document.querySelectorAll('path.line').length === 3`);
     await l.shots2("chart-line");
     await close(l.pid);
     ok("chart: bars and a gapped line render as SVG with title, desc, data table, hover and keyboard values");
@@ -497,6 +518,135 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     ok("pr_decision: a late refusal never brings back an option after an update or a newer edit");
   }
 
+  // ---- the Briefing look: each restyled built-in, a board and a kit panel, dark and light, wide
+  // and about 360 px wide (no sideways scroll at either width)
+  {
+    /** Zoomed to about `width` px of app, both themes, then back to the full window. */
+    const narrowShots = async (p: Awaited<ReturnType<typeof open>>, name: string, width = 360) => {
+      await p.zoom("fullscreen");
+      await a.sleep(300);
+      const share = (await p.inApp("innerWidth")) / 1440;
+      await a.size(Math.ceil(width / share), 900);
+      await a.sleep(500);
+      const w: number = await p.inApp("innerWidth");
+      check(w < width + 40, `${name}: narrow width reached (${w})`);
+      await p.inApp("scrollTo(0, 0)");
+      await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 4, y: 896 });
+      check(await p.inApp(`document.documentElement.scrollWidth <= innerWidth + 1`), `${name} narrow: no sideways scroll ${await p.inApp(`JSON.stringify([document.documentElement.scrollWidth, innerWidth, [...document.querySelectorAll('*')].filter((e) => e.getBoundingClientRect().right > innerWidth + 1).slice(0, 5).map((e) => e.tagName + '.' + e.getAttribute('class') + ':' + Math.round(e.getBoundingClientRect().right))])`)}`);
+      for (const theme of ["dark", "light"]) {
+        await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
+        await p.waitIn(`document.documentElement.dataset.theme === '${theme}'`);
+        await a.sleep(300);
+        await a.shot(`${shots}/panel-${name}-narrow-${theme}.png`, (await a.rect(`[data-panel-view="${p.pid}"]`))!);
+      }
+      await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+      await p.zoom("inline");
+      await a.size(1440, 900);
+      await a.sleep(400);
+    };
+    const fonts = (p: Awaited<ReturnType<typeof open>>) => p.inApp(`document.fonts.ready.then(() => [...document.fonts].filter((f) => f.status === 'loaded').map((f) => f.family).join(','))`);
+
+    for (const [app, name, data, ready] of [
+      ["chart", "chart-brief", chartBriefSample, "path.bar"],
+      ["chart", "chart-multi", chartMultiSample, "path.line"],
+      ["table", "table-brief", tableBriefSample, ".mk-badge.warn"],
+      ["markdown", "markdown", markdownSample, ".md blockquote"],
+    ] as const) {
+      const p = await open(app, name, data);
+      await p.waitIn(`document.querySelector(${JSON.stringify(ready)})`);
+      check(String(await fonts(p)).includes("MK Inter"), `${name}: the bundled Inter font loaded (no network)`);
+      await p.shots2(name);
+      await narrowShots(p, name);
+      await close(p.pid);
+    }
+    ok("the restyled chart, table and Markdown panels draw the Briefing look with the bundled fonts, wide and narrow, in both themes");
+
+    // Board: JSON only. Stats, a stacked chart, a list, meters, a callout and actions.
+    const cost = JSON.parse(await Deno.readTextFile(new URL("./panel_examples/cost-breakdown.json", import.meta.url)));
+    cost.blocks.find((b: any) => b.kind === "actions").items.push({ id: "pause_replica", label: "Pause the second replica", danger: true,
+      confirm: "Pause db-replica-2 until Monday?", data: { replica: "db-replica-2", until: "monday", dry_run: false, days: 2 } });
+    cost.takeaway = cost.takeaway.replace("under the", "**under** the");
+    const b = await open("board", "Cloud spend", cost);
+    await b.waitIn(`document.querySelectorAll('.mk-stats .mk-stat').length === 4 && document.querySelectorAll('.mk-chart path.bar').length === 25`);
+    check((await b.inApp(`document.querySelector('.mk-title').textContent`)).startsWith("$4,480 spent so far this month"), "board title");
+    check((await b.inApp(`document.querySelectorAll('.mk-meter .mark').length`)) === 3, "meters with their pace ticks");
+    check((await b.inApp(`document.querySelector('.mk-takeaway b')?.textContent`)) === "under", "the takeaway's **bold** renders");
+    await b.shots2("board");
+    // A plain action sends at once; the button says so and stays off until the agent updates.
+    await b.click(`[data-send="export_csv"]`);
+    await b.waitIn(`document.querySelector('[data-send="export_csv"]').dataset.state === 'sent'`);
+    let got = await events(b.pid);
+    check(got.length === 1 && got[0].kind === "export_csv", `board action event: ${JSON.stringify(got)}`);
+    check(await b.inApp(`document.querySelector('[data-send="export_csv"]').disabled`), "a sent button waits for the agent");
+    // A confirm action asks first: the first click arms it, the second sends, with its data.
+    await b.click(`[data-send="pause_replica"]`);
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`);
+    check((await b.inApp(`document.querySelector('[data-send="pause_replica"]').textContent`)).includes("Pause db-replica-2 until Monday?"), "the button asks its question");
+    check((await events(b.pid)).length === 0, "arming sends nothing");
+    await b.click(`[data-send="pause_replica"]`);
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'sent'`);
+    got = await events(b.pid);
+    check(got.length === 1 && got[0].kind === "pause_replica" && got[0].payload.content.text === 'Pressed "Pause the second replica"' &&
+      JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ replica: "db-replica-2", until: "monday", dry_run: false, days: 2 }), `confirmed action (typed data): ${JSON.stringify(got)}`);
+    // The agent's update brings the buttons back.
+    await call("panel.update", { panel_id: b.pid, data: cost });
+    await b.waitIn(`!document.querySelector('[data-send][data-state]')`);
+    // A held Enter arms a confirm action, and its auto-repeat never confirms; a fresh press does.
+    const enter = (type: string, autoRepeat = false) => a.send("Input.dispatchKeyEvent", {
+      type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, autoRepeat, ...(type === "keyDown" ? { text: "\r", unmodifiedText: "\r" } : {}),
+    });
+    await b.inApp(`document.querySelector('[data-send="pause_replica"]').focus()`);
+    await enter("keyDown");
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`);
+    for (let i = 0; i < 4; i++) { await enter("keyDown", true); await a.sleep(40); }
+    check((await events(b.pid)).length === 0 && await b.inApp(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`), "a held Enter never confirms a board action");
+    await enter("keyUp");
+    await enter("keyDown");
+    await enter("keyUp");
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'sent'`);
+    check((await events(b.pid)).length === 1, "Enter again after letting go sends once");
+    await call("panel.update", { panel_id: b.pid, data: cost });
+    await b.waitIn(`!document.querySelector('[data-send][data-state]')`);
+    await narrowShots(b, "board");
+    // Muster refuses a malformed board, naming the field.
+    let refused = "";
+    await call("panel.update", { panel_id: b.pid, data: { ...cost, blocks: [{ kind: "table" }] } }).catch((e: Error) => { refused = String(e.message ?? e); });
+    check(refused === "" || refused.includes("kind"), `a malformed board is refused: ${refused}`);
+    await close(b.pid);
+    ok("board: JSON draws stats, a stacked chart, a list, meters, a callout and actions; an action sends one event, a confirm action asks first and sends its data; narrow and both themes");
+
+    // Kit: the agent's own HTML with kit: true gets the styles, components, fonts and handshake.
+    const html = await Deno.readTextFile(new URL("./panel_examples/deploy-board.html", import.meta.url));
+    const kid = (await call("panel.open", { title: "Deploys", app: "custom", html, kit: true })).panel_id as number;
+    const k = { pid: kid, ...(await attach(kid)) };
+    await k.waitIn(`document.querySelectorAll('.mk-steps').length === 3 && document.querySelector('mk-stat .value')`);
+    check(String(await fonts(k)).includes("MK Inter"), "kit panel: the bundled fonts loaded");
+    // (This test reads the page from an isolated world, so it checks what the kit did, not window.mk.)
+    check(await k.inApp(`document.documentElement.classList.contains('mk') && !!document.querySelector('mk-stat.mk-stat .value') && !!document.querySelector('mk-icon svg')`), "kit panel: the kit upgraded its tags");
+    await k.shots2("kit-deploy");
+    await k.click(`[data-send="rollback"]`);
+    await k.waitIn(`document.querySelector('[data-send="rollback"]').dataset.state === 'armed'`);
+    await a.key("Enter");
+    await k.waitIn(`document.querySelector('[data-send="rollback"]').dataset.state === 'sent'`);
+    got = await events(kid);
+    check(got.length === 1 && got[0].kind === "rollback" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ env: "production", to: "v2.3.2" }), `kit confirm event: ${JSON.stringify(got)}`);
+    await narrowShots(k, "kit-deploy");
+    await close(kid);
+    // Without kit: true a custom panel is exactly the agent's HTML, as before.
+    const plain = (await call("panel.open", { title: "Plain", app: "custom", html: `<p id="x">plain</p><script>parent.postMessage({jsonrpc:"2.0",id:1,method:"ui/initialize",params:{protocolVersion:"2026-01-26",appInfo:{name:"p",version:"1"},appCapabilities:{}}},"*");addEventListener("message",(e)=>{if(e.data?.id===1)parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}},"*")})</script>` })).panel_id as number;
+    const pl = await attach(plain);
+    await pl.waitIn(`document.querySelector('#x')`);
+    check(await pl.inApp(`!document.documentElement.classList.contains('mk') && document.querySelectorAll('style').length === 0`), "no kit unless asked");
+    await close(plain);
+    const test = await Deno.readTextFile(new URL("./panel_examples/test-run.html", import.meta.url));
+    const tid = (await call("panel.open", { title: "Test run #1482", app: "custom", html: test, kit: true })).panel_id as number;
+    const t = await attach(tid);
+    await t.waitIn(`document.querySelector('mk-ring svg') && document.querySelector('mk-chart svg[role=img]')`);
+    await t.shots2("kit-tests");
+    await close(tid);
+    ok("kit: a custom panel opened with kit: true draws with the kit (fonts, components, handshake); a confirm button asks, Enter sends its data; without kit the HTML is untouched");
+  }
+
   // ---- open PRs: overview → open → decision with media → hold → custom outward action → back
   {
     const ov = await open("pr_overview", "Open PRs", overviewSample);
@@ -504,11 +654,11 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     const order = () => ov.inApp(`[...document.querySelectorAll('.card')].map((c) => Number(c.id.slice(3)))`);
     const selectedNow = () => ov.inApp(`Number(document.querySelector('.card.selected')?.id.slice(3))`);
     check(JSON.stringify(await order()) === "[801,812,820,815]", `riskiest first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'quick'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-quick");
     check(JSON.stringify(await order()) === "[815,812,820,801]", `quick wins first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'oldest'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-oldest");
     check(JSON.stringify(await order()) === "[801,812,815,820]", `oldest first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'risk'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-risk");
     await ov.click("h1");
     await question();
     await ov.waitIn(`document.querySelector('.shortcuts')?.textContent.includes('Hold: put aside for later') && document.activeElement?.id === 'shortcuts-close'`);
@@ -534,7 +684,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("Down");
     await a.key("Up");
     check((await selectedNow()) === 812, "J and the arrows move too");
-    check((await ov.inApp(`document.querySelector('#pr-801 .chips').textContent`)).includes("Checks failing"), "checks badge");
+    check((await ov.inApp(`document.querySelector('#pr-801 .meta').textContent`)).includes("Checks failing"), "checks: an icon and a word");
     check((await ov.inApp(`document.querySelector('#pr-801 .meta').textContent`)).includes("Draft"), "draft flag");
     check((await events(ov.pid)).length === 0, "moving sends nothing");
     await ov.shots2("pr-overview");
@@ -589,7 +739,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await events(d.pid);
     ok("pr_decision: an enlarged picture is modal (confirm closed, background inert, Tab trapped, keys blocked), zooms to actual size with Z, and closes when the agent replaces it");
     await d.waitIn(`document.querySelector('.media-chart svg[role=img]')`);
-    check((await d.inApp(`document.querySelectorAll('.media-chart rect.bar').length`)) === 6, "media chart drawn with the chart app's code");
+    check((await d.inApp(`document.querySelectorAll('.media-chart path.bar').length`)) === 6, "media chart drawn with the chart app's code");
     check((await d.inApp(`document.querySelector('.media-chart svg title').textContent`)) === "Bar chart", "chart title");
     // Clear of the sticky action bar at the bottom.
     await d.inApp(`document.querySelector('#media-0').scrollIntoView({ block: 'center' })`);
@@ -613,7 +763,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await close(d.pid);
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held", "Put aside from the decision panel."), current: undefined } });
     await ov.waitIn(`document.querySelector('.group.g-held') && [...document.querySelectorAll('.card')].pop()?.id === 'pr-812'`);
-    check((await ov.inApp(`document.querySelector('.repo').textContent`)).includes("1 held"), "header counts the held PR");
+    check((await ov.inApp(`document.querySelector('#counts').textContent`)).includes("1 held"), "header counts the held PR");
     check((await ov.inApp(`getComputedStyle(document.querySelector('#pr-812')).opacity`)) === "1", "a held card keeps full-contrast text");
     ok("pr_decision: H sends one hold event; the overview groups the held PR at the end");
 
@@ -649,11 +799,15 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     // Quick wins: a reviewed card merges from here, behind the same confirm and exact command.
     await a.sleep(5600);
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), current: undefined } });
-    await ov.waitIn(`document.querySelector('#pr-815 .badge.quick') && document.querySelector('#quick-only')?.textContent === 'Quick wins (1)'`);
+    await ov.waitIn(`document.querySelector('#pr-815 .quick') && document.querySelector('#quick-only')?.textContent === 'Only quick wins (1)'`);
     await ov.click("#quick-only");
     await ov.waitIn(`document.querySelectorAll('.card').length === 1 && document.querySelector('#pr-815')`);
     await ov.click("#pr-815 .title");
-    check(await ov.inApp(`!!document.querySelector('#merge')`), "a selected quick win shows Merge");
+    check(await ov.inApp(`!!document.querySelector('#pr-815 #merge-815')`), "a quick win carries its own Merge");
+    // The card is a listbox option, which may hold no controls: its Merge is for the pointer
+    // only; the keyboard and screen readers get M and the action bar's Merge.
+    check(await ov.inApp(`(() => { const b = document.querySelector('#merge-815'); const m = document.querySelector('.actions #merge-selected');
+      return b.getAttribute('aria-hidden') === 'true' && b.tabIndex === -1 && !!m && m.textContent.includes('Merge #815') && !document.querySelector('[role=listbox] button:not([aria-hidden=true])'); })()`), "Merge outside the option for assistive tech");
     await a.key("m");
     await ov.waitIn(`document.querySelector('.drawer pre.command') && document.activeElement?.id === 'confirm-merge'`);
     const qcmd: string = await ov.inApp(`document.querySelector('.drawer pre.command').textContent`);
@@ -668,6 +822,18 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await call("panel.update", { panel_id: ov.pid, data: quick({ verdict: "Safe to merge: one word in the docs; checks pass again." }) });
     await ov.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
     check((await events(ov.pid)).length === 0, "a cancelled confirm sent nothing");
+    check(await ov.inApp(`document.activeElement?.id === 'pr-815'`), `a confirm cancelled by an update hands focus back to the card: ${await ov.inApp("document.activeElement?.id")}`);
+    // Escape hands focus back to the Merge that opened the confirm, so a following Enter presses
+    // it again (never "open the PR" from a focus that fell to the page).
+    await ov.click("#merge-selected");
+    await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    await a.key("Escape");
+    await ov.waitIn(`!document.querySelector('.drawer') && document.activeElement?.id === 'merge-selected'`);
+    await a.key("Enter");
+    await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    check((await events(ov.pid)).length === 0, "Enter after Escape reopened the Merge confirm and sent nothing");
+    await a.key("Escape");
+    await ov.waitIn(`!document.querySelector('.drawer') && document.activeElement?.id === 'merge-selected'`);
     await ov.click("#pr-815 .title");
     await a.key("m");
     await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
@@ -676,7 +842,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check(got.length === 1 && got[0].kind === "merge" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "merge", repo: "acme/api",
       number: 815, base: "master", method: "squash", delete_branch: true, head_sha: QUICK_SHA, answers: {}, options: [] }), `quick merge event: ${JSON.stringify(got)}`);
     check(String(got[0].payload.content.text).endsWith(qcmd), "the event text ends with the command");
-    check(await ov.inApp(`document.querySelector('#merge').disabled`), "Merge waits for the agent");
+    check(await ov.inApp(`document.querySelector('#merge-815').disabled`), "Merge waits for the agent");
     await call("panel.update", { panel_id: ov.pid, data: quick({ status: "merged", status_detail: "Merged as 4c2e1aa." }) });
     await ov.waitIn(`!document.querySelector('#pr-815') || document.querySelector('#pr-815 .badge.status')?.textContent === 'Merged'`);
     await ov.click("#quick-only");
@@ -886,12 +1052,14 @@ async function webPreview({ a, R, call, shots, ok, check }: {
 }
 
 if (import.meta.main) {
-  const [url, shots, repo] = Deno.args;
+  const [url, shots, repo, cdp] = Deno.args;
   if (!url || !shots || !repo) {
     console.error("usage: panel_apps_e2e.ts <url#token=..> <shots-dir> <repo-path>");
     Deno.exit(2);
   }
-  const a = await launch(9351, "/tmp/muster-cdp-panel-apps");
+  // A CDP port of the caller's choosing (default 9351), so parallel runs never share a browser.
+  const port = Number(cdp ?? 9351);
+  const a = await launch(port, `/tmp/muster-cdp-panel-apps-${port}`);
   let step = 0;
   try {
     await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });

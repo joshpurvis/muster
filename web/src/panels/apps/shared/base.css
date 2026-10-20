@@ -1,94 +1,88 @@
-/* Shared look of Muster's built-in panel apps. Variable names follow the MCP Apps spec, so a
-   host's `styles.variables` override them; the values match Muster's own light and dark themes. */
-:root {
-  color-scheme: light;
-  --color-background-primary: #ffffff;
-  --color-background-secondary: #f4f3f6;
-  --color-background-tertiary: #ececf1;
-  --color-text-primary: #1d1d22;
-  --color-text-secondary: #4d4d58;
-  --color-text-tertiary: #62626c;
-  --color-border-primary: #cfced8;
-  --color-border-secondary: #e2e1e7;
-  --color-ring-primary: #6d5ce8;
-  --color-text-info: #5a48d8;
-  --color-background-info: rgba(109, 92, 232, 0.1);
-  --color-text-success: #1a7f37;
-  --color-background-success: rgba(26, 127, 55, 0.1);
-  --color-text-danger: #cf222e;
-  --color-background-danger: rgba(207, 34, 46, 0.09);
-  --color-text-warning: #9a5b00;
-  --color-background-warning: rgba(214, 138, 0, 0.12);
-  --accent: #6d5ce8;
+/* Shared base of Muster's built-in panel apps, drawn on the kit's tokens (kit/kit.css comes first
+   in every built-in). The MCP Apps variable names stay as aliases of the kit tokens, so a host's
+   `styles.variables` still apply, and older rules written against them keep working. */
+:root, [data-theme] {
+  --color-background-primary: var(--mk-canvas);
+  --color-background-secondary: var(--mk-surface);
+  --color-background-tertiary: var(--mk-sunken);
+  --color-text-primary: var(--mk-text);
+  --color-text-secondary: var(--mk-text-2);
+  --color-text-tertiary: var(--mk-text-3);
+  --color-border-primary: var(--mk-line-2);
+  --color-border-secondary: var(--mk-line);
+  --color-ring-primary: var(--mk-accent);
+  --color-text-info: var(--mk-accent);
+  --color-background-info: var(--mk-accent-soft);
+  --color-text-success: var(--mk-good);
+  --color-background-success: var(--mk-good-soft);
+  --color-text-danger: var(--mk-bad);
+  --color-background-danger: var(--mk-bad-soft);
+  --color-text-warning: var(--mk-warn);
+  --color-background-warning: var(--mk-warn-soft);
+  --accent: var(--mk-accent);
   /* Filled buttons keep white text at 4.5:1 or more in both themes. */
-  --accent-fill: #6d5ce8;
-  --on-accent: #ffffff;
+  --accent-fill: var(--mk-accent-fill);
+  --on-accent: var(--mk-on-accent);
   --danger-fill: #c4291c;
-  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
-  --border-radius-sm: 4px;
-  --border-radius-md: 6px;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) { color-scheme: dark; }
-}
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --color-background-primary: #19191d;
-  --color-background-secondary: #212127;
-  --color-background-tertiary: #29292f;
-  --color-text-primary: #e4e4e8;
-  --color-text-secondary: #aaaab6;
-  --color-text-tertiary: #8f8f9b;
-  --color-border-primary: #3a3a44;
-  --color-border-secondary: #2b2b33;
-  --color-ring-primary: #a194ff;
-  --color-text-info: #a194ff;
-  --color-background-info: rgba(139, 124, 246, 0.14);
-  --color-text-success: #3fb950;
-  --color-background-success: rgba(63, 185, 80, 0.13);
-  --color-text-danger: #ff7b72;
-  --color-background-danger: rgba(248, 81, 73, 0.13);
-  --color-text-warning: #f0a020;
-  --color-background-warning: rgba(240, 160, 32, 0.13);
-  --accent: #8b7cf6;
-  --accent-fill: #6652e0;
-  --danger-fill: #c4291c;
+  --font-sans: var(--mk-font);
+  --font-mono: var(--mk-mono);
+  --border-radius-sm: var(--mk-r-sm);
+  --border-radius-md: 8px;
 }
 * { box-sizing: border-box; }
-html { background: var(--color-background-primary); color: var(--color-text-primary); }
-body { margin: 0; font: 14px/1.5 var(--font-sans); overflow-wrap: anywhere; }
-main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+html { background: var(--mk-canvas); color: var(--mk-text); }
+body { margin: 0; font: 14px/1.55 var(--mk-font); overflow-wrap: anywhere; }
+main { padding: 22px 26px 24px; max-width: 1180px; margin: 0 auto; }
+@media (max-width: 520px) { main { padding: 16px 16px 18px; } }
 h1, h2, h3 { line-height: 1.25; margin: 0; }
-h1 { font-size: 18px; }
-h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--color-text-secondary); margin: 0 0 8px; font-weight: 600; }
+h1 { font-size: 20px; font-weight: 640; letter-spacing: -0.018em; }
+h2 { font-size: 14px; font-weight: 620; color: var(--mk-text); margin: 0 0 10px; letter-spacing: -0.003em; }
 p { margin: 0 0 8px; }
-a { color: var(--color-text-info); }
-code, kbd, pre, .mono { font-family: var(--font-mono); font-size: 12.5px; }
-kbd { border: 1px solid var(--color-border-primary); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--color-text-secondary); }
-button, select, input, textarea { font: inherit; color: inherit; }
-button {
-  cursor: pointer; border: 1px solid var(--color-border-primary); background: var(--color-background-secondary);
-  border-radius: var(--border-radius-md); padding: 5px 12px; min-height: 32px;
+a { color: var(--mk-accent); }
+code, kbd, pre, .mono { font-family: var(--mk-mono); }
+code, pre, .mono { font-size: 12px; }
+:where(button, select, input, textarea) { font: inherit; color: inherit; }
+:where(button) {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 6px 13px;
+  font: 550 13px/1.25 var(--mk-font); color: var(--mk-text); cursor: pointer; text-align: center;
+  background: var(--mk-raised); border: 1px solid var(--mk-line-2); border-radius: 8px;
+  box-shadow: inset 0 1px 0 var(--mk-hi), 0 1px 2px rgba(0, 0, 0, .14);
+  transition: background .15s, border-color .15s, color .15s;
 }
-button:hover:not(:disabled) { background: var(--color-background-tertiary); }
-button:disabled { cursor: not-allowed; opacity: 0.55; }
-button.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent-fill); }
-button.danger { background: var(--danger-fill); border-color: var(--danger-fill); color: #fff; }
-button.link { border: 0; background: none; padding: 0; min-height: 0; color: var(--color-text-info); text-decoration: underline; }
+:where(button):hover:not(:disabled) { border-color: var(--mk-line-3); background: var(--mk-sunken); }
+:where(button):disabled { cursor: not-allowed; opacity: .55; }
+:where(button) svg { width: 15px; height: 15px; flex: none; }
+button.primary { color: var(--mk-on-accent); background: var(--mk-accent-fill); border-color: transparent; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .16), 0 2px 6px -2px rgba(0, 0, 0, .45); }
+button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--mk-accent-fill) 88%, #fff); border-color: transparent; }
+button.primary kbd, button.danger kbd { background: rgba(0, 0, 0, .22); color: rgba(255, 255, 255, .92); box-shadow: none; }
+button.danger { color: #fff; background: var(--danger-fill); border-color: transparent; }
+button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger-fill) 88%, #fff); }
+button.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--mk-text-2); }
+button.ghost:hover:not(:disabled) { background: var(--mk-sunken); color: var(--mk-text); }
+button.sm { min-height: 26px; padding: 3px 9px; font-size: 12px; border-radius: 7px; }
+button.link { display: inline; border: 0; background: none; box-shadow: none; padding: 0; min-height: 0; font: inherit; color: var(--mk-accent); text-decoration: underline; text-underline-offset: 3px; }
+button.link:hover:not(:disabled) { background: none; }
+:where(button) kbd { margin-left: 2px; }
 select, input[type="search"], input[type="text"], textarea {
-  background: var(--color-background-primary); border: 1px solid var(--color-border-primary);
-  border-radius: var(--border-radius-md); padding: 5px 8px; min-height: 32px;
+  min-height: 32px; padding: 5px 10px; border-radius: 8px; min-width: 0;
+  font: 13px var(--mk-font); color: var(--mk-text); background: var(--mk-sunken);
+  border: 1px solid var(--mk-line-2); box-shadow: inset 0 1px 2px rgba(0, 0, 0, .12);
 }
-textarea { display: block; width: 100%; resize: vertical; }
-:focus-visible { outline: 2px solid var(--color-ring-primary); outline-offset: 2px; }
-.muted { color: var(--color-text-secondary); }
+input::placeholder, textarea::placeholder { color: var(--mk-text-3); }
+textarea { display: block; width: 100%; resize: vertical; line-height: 1.5; }
+:focus-visible { outline: 2px solid var(--mk-accent); outline-offset: 2px; }
+.muted { color: var(--mk-text-3); }
 .error {
-  border: 1px solid var(--color-text-danger); background: var(--color-background-danger); color: var(--color-text-primary);
-  border-radius: var(--border-radius-md); padding: 12px 14px; margin: 16px;
+  display: block; border: 1px solid color-mix(in srgb, var(--mk-bad) 30%, transparent); background: var(--mk-bad-soft); color: var(--mk-text-2);
+  border-radius: var(--mk-r); padding: 14px 16px; margin: 16px; font-size: 13px;
 }
-.error strong { color: var(--color-text-danger); }
-.error ul { margin: 6px 0 0; padding-left: 20px; font-family: var(--font-mono); font-size: 12.5px; }
-.warnings { color: var(--color-text-warning); font-size: 12px; margin: 0 0 8px; }
+.error strong { color: var(--mk-text); font-weight: 600; font-size: 14px; }
+.error ul { margin: 8px 0 0; padding-left: 18px; font-family: var(--mk-mono); font-size: 12px; color: var(--mk-text); }
+.warnings { color: var(--mk-warn); font-size: 12px; margin: 0 0 10px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+/* The panel's opening lines: the title with what it covers after it, then the finding. */
+.app-head { margin-bottom: 16px; }
+.app-head .mk-takeaway { margin-top: 6px; }
+.app-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--mk-line); font-size: 12px; color: var(--mk-text-3); }
+.app-foot .keys { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+@media (max-width: 520px) { .app-head .mk-title { font-size: 17px; } .app-head .mk-takeaway { font-size: 13px; } }

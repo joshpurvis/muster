@@ -1,0 +1,4 @@
+/* The board is the kit's .mk-page; the app adds nothing but the frame around it. */
+main { padding: 0; max-width: none; }
+main > .error { margin: 16px; }
+@media (max-width: 520px) { .mk-board.mk-page { padding: 16px 16px 20px; } }

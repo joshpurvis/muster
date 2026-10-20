@@ -230,6 +230,7 @@ neither panel records nor panel events. The proxy listener has no daemon routes 
 |---|---|---|
 | `panel.open/update/close/list/wait/fetch_event` | `{from_session, arguments}` | Corresponding MCP tool result (`fetch_event` is `panel_event`); same task scope and guards |
 | `panel.resource` | `{id}` | `{panel, html, data}` |
+| `panel.navigate` | `{id, url}` | `{url, changed}`; the user's address for a `web_preview` panel: completed (`3000`, `localhost:3000`) and checked like `panel_update`, stored as a data update, and queued to the agent as a `navigated` event `{url, previous}`; the same address returns `changed: false` and stores nothing. Refusals are worded for the user |
 | `panel.preview_check` | `{id}` | A `web_preview` panel's dev server, checked by the backend at its stored URL only: `{reachable, answered?, status?, refused?, leaves_to?}` (below) |
 | `panel.event` | `{panel_id, kind, payload}` | `{}`; 16 KiB payload limit, 30 events/minute/panel |
 | `panel.context` | `{panel_id, context}` | `{}`; latest context, 16 KiB limit |

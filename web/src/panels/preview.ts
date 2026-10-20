@@ -148,3 +148,47 @@ export const SLOW_NOTICE: Notice = {
   detail: "The dev server may be busy, or the page may be waiting on something.",
   blocking: false,
 };
+
+// ----- the address bar: the user types a local address; `panel.navigate` completes and checks
+// it in the backend (src/web_preview.rs `parse_typed`), the UI never decides -----
+
+export interface AddressState {
+  /** The user is editing: the field shows `draft`, not the panel's address. */
+  editing: boolean;
+  draft: string;
+  /** The backend's reason the last address was refused, shown under the bar. */
+  error: string;
+  /** A navigation is in flight. */
+  busy: boolean;
+}
+
+export type AddressAction =
+  | { type: "focus"; url: string }
+  | { type: "input"; text: string }
+  | { type: "submit" }
+  | { type: "refused"; reason: string }
+  | { type: "done" }
+  | { type: "cancel" }
+  | { type: "blur"; url: string };
+
+export const ADDRESS_IDLE: AddressState = { editing: false, draft: "", error: "", busy: false };
+
+export function addressStep(s: AddressState, a: AddressAction): AddressState {
+  switch (a.type) {
+    // Focus starts an edit from the current address; an edit in progress keeps its text.
+    case "focus": return s.editing ? s : { editing: true, draft: a.url, error: "", busy: false };
+    case "input": return { ...s, editing: true, draft: a.text, error: "" };
+    case "submit": return s.busy ? s : { ...s, editing: true, busy: true, error: "" };
+    // A refused address stays, so the user can fix it.
+    case "refused": return { ...s, editing: true, busy: false, error: a.reason };
+    case "done":
+    case "cancel": return ADDRESS_IDLE;
+    // Leaving the field drops an untouched edit; typed text and a refusal stay until Escape.
+    case "blur": return s.busy || s.error || s.draft.trim() !== a.url ? s : ADDRESS_IDLE;
+  }
+}
+
+/** What the field shows. */
+export function addressText(s: AddressState, url: string | null): string {
+  return s.editing ? s.draft : url ?? "";
+}

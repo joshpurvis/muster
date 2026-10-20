@@ -126,6 +126,38 @@ pub fn parse(url: &str, reserved: &[u16]) -> anyhow::Result<Target> {
     Ok(Target { https, host, port, rest })
 }
 
+/// What a person types into the address bar, completed to a URL for [`parse`]: surrounding
+/// space is dropped, a bare port means `http://localhost:PORT/`, and an address without a
+/// scheme gets `http://`. Everything else is left for `parse` to judge.
+pub fn complete_typed(typed: &str) -> String {
+    let t = typed.trim();
+    if !t.is_empty() && t.len() <= 5 && t.bytes().all(|b| b.is_ascii_digit()) { return format!("http://localhost:{t}/") }
+    if t.contains("://") || t.is_empty() { t.to_string() } else { format!("http://{t}") }
+}
+
+/// [`parse`] for an address the user typed.
+pub fn parse_typed(typed: &str, reserved: &[u16]) -> anyhow::Result<Target> { parse(&complete_typed(typed), reserved) }
+
+/// A refusal reworded for the person at the address bar (the messages are written for agents).
+pub fn for_user(msg: &str) -> String {
+    let msg = msg.replace(ELSEWHERE, "The preview shows only local dev servers (localhost or 127.0.0.1 with a port); open other pages in your browser")
+        .replace("web_preview needs a url, e.g.", "Type a local address, e.g.")
+        .replace("web_preview cannot show", "The preview cannot show")
+        .replace("web_preview url", "The address");
+    // Capitalise a sentence ("port 7433 is…"), never a host name it starts with ("example.com is…").
+    let first = msg.split(' ').next().unwrap_or("");
+    let mut out = String::with_capacity(msg.len() + 1);
+    let mut chars = msg.chars();
+    match chars.next() {
+        Some(c) if !first.contains(['.', ':', '[']) => out.extend(c.to_uppercase()),
+        Some(c) => out.push(c),
+        None => {}
+    }
+    out.extend(chars);
+    if !out.ends_with('.') { out.push('.'); }
+    out
+}
+
 /// A `web_preview` panel's stored input: `{url}`, rebuilt from its checked parts.
 pub fn data(data: Value, reserved: &[u16]) -> anyhow::Result<Vec<u8>> {
     let Value::Object(o) = data else { bail!("web_preview data must be an object, e.g. {{\"url\": \"http://localhost:5173\"}}") };
@@ -362,6 +394,29 @@ mod tests {
         let err = parse("http://0.0.0.0:8000/", RESERVED).unwrap_err().to_string();
         assert!(err.contains("http://localhost:PORT"), "{err}");
         assert!(parse(&format!("http://localhost:1/{}", "a".repeat(MAX_URL)), RESERVED).is_err());
+    }
+
+    #[test]
+    fn typed_addresses_are_completed_then_checked_by_the_same_rule() {
+        for (typed, want) in [
+            ("3000", "http://localhost:3000/"), (" 5173 ", "http://localhost:5173/"), ("localhost:3000", "http://localhost:3000/"),
+            ("127.0.0.1:3000/path?q=1", "http://127.0.0.1:3000/path?q=1"), ("http://localhost:3000", "http://localhost:3000/"),
+            ("https://localhost:8443", "https://localhost:8443/"), ("LOCALHOST:8080/#x", "http://localhost:8080/#x"),
+        ] {
+            assert_eq!(parse_typed(typed, RESERVED).unwrap().url(), want, "{typed}");
+        }
+        for bad in [
+            "", "   ", "example.com", "https://example.com", "user@localhost:3000", "localhost:3000@evil.example",
+            "localhost.evil.example:3000", "[::1]:3000", "http://[::1]:3000", "7433", "localhost:40001", "127.1:3000",
+            "2130706433:3000", "0.0.0.0:3000", "local host:3000", "localhost:3000/a b", "localhost:\t3000", "999999",
+            "javascript:alert(1)", "//localhost:3000", "ftp://localhost:21", "localhost:3000\\@evil.example",
+        ] {
+            let err = parse_typed(bad, RESERVED).map(|t| t.url()).unwrap_err().to_string();
+            let user = for_user(&err);
+            assert!(!user.contains("web_preview") && !user.contains("user's") && user.ends_with('.'), "{bad:?}: {user}");
+        }
+        assert!(for_user(&parse_typed("https://github.com", RESERVED).unwrap_err().to_string()).contains("open other pages in your browser"));
+        assert!(for_user(&parse_typed("[::1]:3000", RESERVED).unwrap_err().to_string()).contains("http://localhost:PORT"));
     }
 
     #[test]

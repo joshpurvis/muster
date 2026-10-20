@@ -60,6 +60,9 @@ updates as the server reloads, and the user has Reload and Open in browser.
   final local URL). No `note` means the server answered.
 - To show another page or port, `panel_update {panel_id, data: {url}}`; any update reloads the
   page. A link or redirect to another origin stays blocked inside the panel.
+- The user can type another local address into the panel's bar. You then get a panel event
+  `navigated` with `{url, previous}`: the user is now looking at `url`, so talk about that
+  page (and use it in later updates) instead of moving them back.
 
 ## Your own app
 

@@ -438,6 +438,13 @@ exec cat > '${BASE}/fake-input'
     ok(r.status === 400, `/preview refuses ${bad}`);
     ok(await mcp(shellToken, "panel_open", { title: "Bad", app: "web_preview", data: { url: bad } }).then(() => false, (e) => /system browser|Muster's own/.test(String(e))), `web_preview panel_open refuses ${bad}`);
   }
+  // The user's address bar: completed, checked like the agent's URL, and reported to the agent.
+  const typed = await c.call("panel.navigate", { id: preview.panel_id, url: `127.0.0.1:${devServer.addr.port}/x` });
+  ok(typed.url === `${devUrl}x` && typed.changed === true, `panel.navigate completes a typed address: ${JSON.stringify(typed)}`);
+  ok(await c.call("panel.navigate", { id: preview.panel_id, url: `localhost:${PORT}` }).then(() => false, (e: unknown) => /Muster's own/.test(String(e))), "panel.navigate refuses Muster's own port");
+  const navEvents = (await mcp(shellToken, "wait_for_panel_event", { panel_id: preview.panel_id, timeout_seconds: 0 })).events;
+  ok(navEvents.length === 1 && navEvents[0].kind === "navigated" && navEvents[0].payload.url === `${devUrl}x` && navEvents[0].payload.previous === devUrl,
+    `the agent gets one navigated event: ${JSON.stringify(navEvents)}`);
   await devServer.shutdown();
   const down = await mcp(shellToken, "panel_update", { panel_id: preview.panel_id, data: { url: devUrl } });
   ok(String(down.note).includes("Nothing answers"), `a stopped dev server gives the agent a note: ${JSON.stringify(down)}`);

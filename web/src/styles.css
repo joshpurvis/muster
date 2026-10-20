@@ -3746,15 +3746,36 @@ body.dragging .panel-view { pointer-events: none; }
   font-size: 12px;
 }
 .preview-kind { flex: none; color: var(--text-muted); font-size: 11px; }
+/* The address: an input that reads as a label until hovered or focused. */
 .preview-url {
   flex: 1 1 14ch;
   min-width: 0;
+  width: auto;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  background: transparent;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font: inherit;
   font-family: var(--font-mono);
   color: var(--text);
-  user-select: text;
+}
+.preview-url:hover { border-color: var(--border); }
+.preview-url:focus { border-color: var(--border-strong); background: var(--bg-2); outline: none; }
+.preview-url:focus-visible { box-shadow: 0 0 0 1px var(--border-strong); }
+.preview-url[aria-invalid] { border-color: var(--st-error); }
+.preview-url[readonly] { color: var(--text-muted); }
+.preview-address-error {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--st-error);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 .preview-bar .btn { flex: none; max-width: 100%; }
 @container (max-width: 440px) {

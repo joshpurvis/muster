@@ -1,5 +1,5 @@
 import {
-  isPreviewUrl, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, RETRY_FOR_MS, RETRY_MS, startChecks,
+  ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, RETRY_FOR_MS, RETRY_MS, startChecks,
 } from "./preview.ts";
 
 function check(value: unknown, message = "assertion failed") {
@@ -116,4 +116,26 @@ Deno.test("a working server is checked once; stop cancels a pending retry", asyn
   check(down.pending === 1);
   down.stop();
   check(down.pending === 0, "stopped");
+});
+
+Deno.test("the address bar edits, submits, keeps a refused address and cancels", () => {
+  const url = "http://localhost:5173/";
+  let s = ADDRESS_IDLE;
+  check(addressText(s, url) === url && addressText(s, null) === "");
+  s = addressStep(s, { type: "focus", url });
+  check(s.editing && addressText(s, url) === url, "focus starts from the current address");
+  check(addressStep(s, { type: "blur", url }) === ADDRESS_IDLE, "leaving an untouched edit ends it");
+  s = addressStep(s, { type: "input", text: "3000" });
+  check(addressStep(s, { type: "blur", url }) === s, "typed text survives leaving the field");
+  check(addressStep(s, { type: "focus", url: "http://localhost:9999/" }).draft === "3000", "refocus keeps the edit");
+  s = addressStep(s, { type: "submit" });
+  check(s.busy && addressStep(s, { type: "submit" }) === s, "one navigation at a time");
+  check(addressStep(s, { type: "blur", url }) === s, "blur during a navigation keeps the edit");
+  const refused = addressStep(s, { type: "refused", reason: "example.com is not this computer." });
+  check(!refused.busy && refused.error.includes("not this computer") && addressText(refused, url) === "3000", "a refusal keeps the text");
+  check(addressStep(refused, { type: "blur", url }) === refused, "a refusal stays visible after leaving the field");
+  const typing = addressStep(refused, { type: "input", text: "3001" });
+  check(typing.error === "" && typing.draft === "3001", "typing clears the reason");
+  check(addressStep(typing, { type: "cancel" }) === ADDRESS_IDLE, "Escape restores the address");
+  check(addressStep(addressStep(typing, { type: "submit" }), { type: "done" }) === ADDRESS_IDLE, "success ends the edit");
 });

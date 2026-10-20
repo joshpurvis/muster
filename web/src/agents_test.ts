@@ -15,7 +15,9 @@ import {
   memoryPathError,
   nameError,
   needsModel,
-  openRouterSessions,
+  agentBilling,
+  providerPendingNote,
+  sessionOnOpenRouter,
   priceLabel,
   readMemoryFile,
   unattendedWarning,
@@ -23,6 +25,10 @@ import {
   vendorGroups,
 } from "./agents.ts";
 import type { Agent, AgentMessage, ModelCatalog, OpenRouterModel, SessionInfo } from "./types.ts";
+
+function check(cond: boolean, msg: string) {
+  if (!cond) throw new Error(msg);
+}
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual);
@@ -282,12 +288,33 @@ Deno.test("OpenRouter: prices, context, listed models and the Codex model rule",
   assertEquals(needsModel("subscription", "codex", ""), false);
 });
 
-Deno.test("OpenRouter: the badge goes on the tabs of agents running on it", () => {
-  const list = [
-    agent({ id: 1, provider: "openrouter", session_id: 7 }),
-    agent({ id: 2, provider: "subscription", session_id: 8 }),
-    agent({ id: 3, provider: "openrouter", session_id: null }),
-    agent({ id: 4, session_id: 9 }),
-  ];
-  assertEquals([...openRouterSessions(list)], [7]);
+Deno.test("OpenRouter: the badge follows the run, not only the saved setting", () => {
+  const run = (provider: "openrouter" | "subscription" | undefined, state: SessionInfo["state"] = "idle") => ({
+    ...session(state),
+    provider,
+  });
+  // Tabs: the session's own run.
+  assertEquals(sessionOnOpenRouter(run("openrouter")), true);
+  assertEquals(sessionOnOpenRouter(run("openrouter", "exited")), false, "nothing bills once it exited");
+  assertEquals(sessionOnOpenRouter(run("subscription")), false);
+  assertEquals(sessionOnOpenRouter(undefined), false);
+  // Rows: switched to Subscription while running on OpenRouter: still badged, until restart.
+  const onOr = agent({ provider: "subscription", session_id: 7 });
+  const b = agentBilling(onOr, run("openrouter"));
+  assertEquals([b.badge, b.label], [true, "OpenRouter · until restart"]);
+  check(!!b.note?.includes("applies when it restarts"), "the row says the change waits");
+  check(!!providerPendingNote(onOr, run("openrouter"))?.includes("still runs on OpenRouter"), "clicking it says so too");
+  // Switched to OpenRouter while running on the subscription.
+  const toOr = agentBilling(agent({ provider: "openrouter", session_id: 7 }), run("subscription"));
+  assertEquals([toOr.badge, toOr.label], [true, "OpenRouter · from restart"]);
+  // Settled, stopped, or an older backend without the session field.
+  assertEquals(agentBilling(agent({ provider: "openrouter", session_id: 7 }), run("openrouter")).note, null);
+  assertEquals(agentBilling(agent({ provider: "openrouter" }), undefined), {
+    badge: true,
+    label: "OpenRouter · pay per use",
+    note: null,
+  });
+  assertEquals(agentBilling(agent({ provider: "subscription", session_id: 7 }), run(undefined)).badge, false);
+  assertEquals(providerPendingNote(agent({ provider: "openrouter", session_id: 7 }), run("openrouter")), null);
+  assertEquals(providerPendingNote(onOr, run("openrouter", "exited")), null);
 });

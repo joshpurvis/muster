@@ -757,17 +757,23 @@ pub(crate) mod testing {
     /// A host that serves a backend: an empty inventory, an idle event stream, and input
     /// streams whose input it records (holding each answer while `stall` is set).
     pub(crate) fn serving_host(name: &str) -> (Arc<TerminalService>, PathBuf, Arc<Received>) {
+        serving_host_with(name, vec![])
+    }
+
+    /// `serving_host` whose inventory lists `runs` (runs it already started).
+    pub(crate) fn serving_host_with(name: &str, runs: Vec<TerminalStatus>) -> (Arc<TerminalService>, PathBuf, Arc<Received>) {
         let received = Arc::new(Received::default());
         let shared = received.clone();
         let (service, directory, _server) = fake_host(name, move |listener| {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 let received = shared.clone();
+                let runs = runs.clone();
                 std::thread::spawn(move || {
                     let Ok(frame) = wire::read(&mut stream) else { return };
                     let Ok(request) = frame.decode::<Request>() else { return };
                     match request.command {
-                        Command::Inventory => { let _ = wire::write(&mut stream, &Frame::json(&Response::Inventory(vec![])).unwrap()); }
+                        Command::Inventory => { let _ = wire::write(&mut stream, &Frame::json(&Response::Inventory(runs.clone())).unwrap()); }
                         Command::Events => {
                             let _ = wire::write(&mut stream, &Frame::json(&Response::Attached).unwrap());
                             while wire::write(&mut stream, &Frame::Ping).is_ok() { std::thread::sleep(Duration::from_secs(1)) }

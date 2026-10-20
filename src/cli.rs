@@ -1942,6 +1942,12 @@ pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()>
     } else {
         println!("{id} (already running)");
     }
+    if r["provider_pending"] == true {
+        eprintln!(
+            "note: it still runs on {}; its new provider applies when it restarts (`muster agent start {name} --fresh`, or stop and start it)",
+            r["session"]["provider"].as_str().unwrap_or("its old provider")
+        );
+    }
     Ok(())
 }
 

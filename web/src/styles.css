@@ -40,6 +40,8 @@
   --st-exited: #6a6a76;
   --attn-bg: rgba(240, 160, 32, 0.11);
   --attn-border: rgba(240, 160, 32, 0.32);
+  /* Billing text (OpenRouter, pay per use): at least 4.5:1 on its tinted chip. */
+  --bill-fg: #f0a020;
   --add: #3fb950;
   --del: #f85149;
   --add-bg: rgba(63, 185, 80, 0.12);
@@ -104,6 +106,7 @@
   --st-exited: #9a9aa6;
   --attn-bg: rgba(214, 138, 0, 0.1);
   --attn-border: rgba(214, 138, 0, 0.35);
+  --bill-fg: #8a5300;
   --add: #1a7f37;
   --del: #cf222e;
   --add-bg: rgba(26, 127, 55, 0.09);
@@ -4001,7 +4004,7 @@ body.dragging .panel-view { pointer-events: none; }
   line-height: 15px;
   padding: 0 5px;
   border-radius: 4px;
-  color: var(--st-attn);
+  color: var(--bill-fg);
   background: var(--attn-bg);
   border: 1px solid var(--attn-border);
   white-space: nowrap;
@@ -4038,7 +4041,7 @@ body.dragging .panel-view { pointer-events: none; }
 .or-warn {
   align-items: flex-start;
   line-height: 1.45;
-  color: var(--st-attn);
+  color: var(--bill-fg);
 }
 
 .or-warn .icon {

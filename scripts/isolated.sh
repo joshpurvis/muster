@@ -17,6 +17,7 @@ export MUSTER_DATA_DIR="$test_root/data"
 export MUSTER_PORT=0
 export CARGO_TARGET_DIR="$PWD/target"
 mkdir -m 700 "$MUSTER_RUNTIME_DIR" "$MUSTER_DATA_DIR"
+unset OPENROUTER_API_KEY MUSTER_PROVIDER
 unset MUSTER_URL MUSTER_TOKEN MUSTER_BIN MUSTER_SESSION_ID MUSTER_CHANNEL_ID MUSTER_RUN MUSTER_HOOK_DB MUSTER_WEB_DIR
 # Keep failed test artifacts for diagnosis. This wrapper deliberately never kills
 # a PID read from a discovery file: integration fixtures own their child handles.

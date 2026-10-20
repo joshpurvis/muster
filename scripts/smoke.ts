@@ -62,7 +62,8 @@ let current: Daemon | null = null;
 async function startDaemon(extraEnv: Record<string, string> = {}): Promise<Daemon> {
   const proc = new Deno.Command(BIN, {
     args: ["daemon", "--foreground"],
-    env: { ...ENV, ...extraEnv },
+    // Never the owner's real key: unkeyed unless a check gives it a fake one.
+    env: { ...ENV, OPENROUTER_API_KEY: "", ...extraEnv },
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
@@ -196,7 +197,7 @@ async function rawHttp(req: string): Promise<string> {
 /** A fake CLI's launch: its arguments on the first line, then the provider variables it got
  * (only those that are set), in `<BASE>/launch-<cli>-<session id>`. */
 const LAUNCH_VARS =
-  "ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_DEFAULT_SONNET_MODEL OPENROUTER_API_KEY MUSTER_PROVIDER";
+  "ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_DEFAULT_SONNET_MODEL OPENROUTER_API_KEY MUSTER_PROVIDER CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 const LAUNCH_DUMP = (cli: string) =>
   `{ printf 'ARGS'; printf ' %s' "$@"; printf '\\n'; for v in ${LAUNCH_VARS}; do if [ -n "\${!v+set}" ]; then printf '%s=%s\\n' "$v" "\${!v}"; fi; done; } > '${BASE}/launch-${cli}-'"$MUSTER_SESSION_ID"`;
 
@@ -1123,7 +1124,14 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     },
   ];
   await Deno.writeTextFile(`${DATA}/openrouter-models.json`, JSON.stringify({ fetched_at: Date.now(), models: cached }));
-  d = await startDaemon({ OPENROUTER_API_KEY: KEY });
+  // Also OpenRouter's own shell setup for Claude Code, with the same key: no other session may
+  // inherit it (they would all bill OpenRouter, and launch records would hold the key).
+  d = await startDaemon({
+    OPENROUTER_API_KEY: KEY,
+    ANTHROPIC_AUTH_TOKEN: KEY,
+    ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+    ANTHROPIC_API_KEY: "",
+  });
   c = new Client(d.token);
   await c.open();
   ok((await c.call("hello")).openrouter.key_present === true, "openrouter: the key in the backend's environment is seen");
@@ -1162,11 +1170,19 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
       JSON.stringify(Object.keys(or.env))
     }`,
   );
+  ok(
+    or.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST === "1" && or.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB === "1",
+    "openrouter: settings files can't re-route it, and its commands, hooks and MCP servers don't get the key",
+  );
+  ok(
+    (await Deno.readTextFile(`${DATA}/sessions/${sOr}/hook-token`)).length > 10,
+    "openrouter: its hooks find the session token in its private folder (the scrub removes MUSTER_TOKEN)",
+  );
   ok(or.args.includes("--model anthropic/claude-sonnet-5.5"), `openrouter: --model gets the OpenRouter id: ${or.args.slice(0, 300)}`);
   const sub = await launchOf("claude", sSub);
   ok(
     Object.keys(sub.env).length === 0 && sub.args.includes("--model opus"),
-    `openrouter: a subscription agent gets none of it: ${JSON.stringify(sub.env)}`,
+    `openrouter: a subscription agent gets none of it, not even the inherited OpenRouter setup: ${JSON.stringify(sub.env)}`,
   );
   const cx = await launchOf("codex", sCodex);
   ok(
@@ -1174,9 +1190,9 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     "openrouter: the Codex agent gets OPENROUTER_API_KEY only",
   );
   ok(
-    cx.args.includes(`-c model_provider="openrouter"`) &&
-      cx.args.includes(`-c model_providers.openrouter.base_url="https://openrouter.ai/api/v1"`) &&
-      cx.args.includes(`-c model_providers.openrouter.env_key="OPENROUTER_API_KEY"`) && cx.args.includes("-m openai/gpt-6.1-sol"),
+    cx.args.includes(`-c model_provider="muster_openrouter"`) &&
+      cx.args.includes(`-c model_providers.muster_openrouter.base_url="https://openrouter.ai/api/v1"`) &&
+      cx.args.includes(`-c model_providers.muster_openrouter.env_key="OPENROUTER_API_KEY"`) && cx.args.includes("-m openai/gpt-6.1-sol"),
     `openrouter: Codex gets the provider overrides and the model: ${cx.args.slice(0, 400)}`,
   );
   let shellEnv = "";
@@ -1214,19 +1230,34 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
   for (const a of ["or-claude", "sub-claude", "or-codex"]) await c.call("agent.remove", { name: a });
   c.close();
 
-  // `muster reload` gives the new backend the environment of the shell it runs in.
-  const noKey = await cli(["reload"], ENV);
-  ok(
-    noKey.success && dec.decode(noKey.stderr).includes("has no OPENROUTER_API_KEY"),
-    `openrouter: reload from a shell without the key warns: ${dec.decode(noKey.stderr).slice(0, 300)}`,
-  );
-  await d.proc.status;
+  // `muster reload` from a shell without OPENROUTER_API_KEY (an agent applying a build from its
+  // session): the backend restarts itself, so its key carries over.
   const connect = async () => {
     const token = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`)).token;
     const k = new Client(token);
     await k.open();
     return k;
   };
+  const pidNow = async () => JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`)).pid;
+  const before = await pidNow();
+  const handoff = await cli(["reload"], ENV);
+  ok(
+    handoff.success && dec.decode(handoff.stdout).includes("restarted by the backend itself"),
+    `openrouter: reload without the variable hands the key on: ${dec.decode(handoff.stdout).slice(0, 200)} ${
+      dec.decode(handoff.stderr).slice(0, 200)
+    }`,
+  );
+  await d.proc.status;
+  ok((await pidNow()) !== before, "openrouter: ...a new backend runs");
+  c = await connect();
+  ok((await c.call("hello")).openrouter.key_present === true, "openrouter: ...and it still has the key");
+  c.close();
+  // Set empty: the command clears it (and says so).
+  const cleared = await cli(["reload"], { ...ENV, OPENROUTER_API_KEY: "" });
+  ok(
+    cleared.success && dec.decode(cleared.stderr).includes("restarted backend won't"),
+    `openrouter: reload with the variable set empty warns: ${dec.decode(cleared.stderr).slice(0, 300)}`,
+  );
   c = await connect();
   ok((await c.call("hello")).openrouter.key_present === false, "openrouter: ...and the reloaded backend has no key");
   c.close();
@@ -1235,6 +1266,9 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
   c = await connect();
   ok((await c.call("hello")).openrouter.key_present === true, "openrouter: ...gives the reloaded backend the key");
   c.close();
+  for (const o of [handoff, cleared, withKey]) {
+    ok(!dec.decode(o.stdout).includes(KEY) && !dec.decode(o.stderr).includes(KEY), "openrouter: reload never prints the key");
+  }
   ok(
     (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
     "openrouter: still in no file after the reloads (the detached backend's log included)",

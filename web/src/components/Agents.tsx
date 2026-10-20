@@ -20,6 +20,7 @@ import {
 } from "../state.ts";
 import * as A from "../actions.ts";
 import {
+  agentBilling,
   agentStatus,
   ago,
   choiceOf,
@@ -154,6 +155,7 @@ function agentMenu(a: Agent, x: number, y: number) {
 function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boolean }) {
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
+  const billing = agentBilling(a, s);
   const persona = firstLine(a.persona);
   const open = () => {
     agentFilter.value = a.id;
@@ -166,7 +168,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${a.provider === "openrouter" ? `, ${OPENROUTER_BADGE}` : ""}, ${st.label}`}
+      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}`}
       onClick={open}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -199,9 +201,12 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
         </span>
-        {a.provider === "openrouter" && (
-          <span class="or-badge" data-tip="Billed per token to your OpenRouter key, not a subscription">
-            {OPENROUTER_BADGE}
+        {billing.badge && (
+          <span
+            class={cx("or-badge", billing.note && "or-badge-pending")}
+            data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
+          >
+            {billing.label}
           </span>
         )}
       </span>
@@ -687,7 +692,8 @@ export function AgentDialog(
     if (d.provider !== "openrouter" || (orCache && Date.now() - orCache.at < OR_CACHE_MS)) return;
     setOrLoading(true);
     rpc.call<OpenRouterModels>("openrouter.models").then((list) => {
-      orCache = { at: Date.now(), list };
+      // An empty answer (the fetch failed) is asked again by the next dialog, not kept.
+      if (list.models.length) orCache = { at: Date.now(), list };
       setOrList(list);
     }).catch((e) => {
       setOrList({ key_present: false, models: [], fetched_at: null, stale: false, error: String(e?.message ?? e) });

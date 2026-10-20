@@ -1011,7 +1011,20 @@ try {
       await a.click(`.or-opt[data-model="anthropic/claude-sonnet-5.5"]`);
       await a.wait(`document.querySelector('.or-opt.on')?.dataset.model === 'anthropic/claude-sonnet-5.5'`, 1000);
       await shot(a, "10d-new-agent-openrouter-models");
-      await a.click(".or-search");
+      // Tab stops at the chosen model once, then leaves the list (its other rows are ↑/↓ only).
+      await a.eval(`document.querySelector('.or-search').focus()`);
+      await a.key("Tab");
+      check(
+        await a.eval(`document.activeElement?.dataset.model === 'anthropic/claude-sonnet-5.5'`),
+        "Tab from the search box reaches the chosen model",
+      );
+      await a.key("Tab");
+      check(
+        await a.eval(`!document.activeElement?.classList.contains('or-opt')`),
+        "the next Tab leaves the model list instead of walking every row",
+      );
+      // Focused directly: the Tabs above may have scrolled the dialog past the box.
+      await a.eval(`document.querySelector('.or-search').focus()`);
       await a.type("qwen coder");
       await a.sleep(150);
       check(
@@ -1033,6 +1046,11 @@ try {
       await a.click(`[data-agent="or-coder"]`);
       await a.wait(`!!document.querySelector('.tab.active .tab-or')`, 6000);
       await shot(a, "10f-agent-openrouter-badge");
+      // Switched back to the subscription while running: it still bills OpenRouter until it
+      // restarts, and both the row and the tab keep saying so.
+      await R(a, "agent.update", { name: "or-coder", provider: "subscription" });
+      await a.wait(`document.querySelector('[data-agent="or-coder"] .or-badge')?.textContent === 'OpenRouter · until restart'`, 3000);
+      check(await a.eval(`!!document.querySelector('.tab.active .tab-or')`), "the tab keeps its badge until a restart");
       await R(a, "agent.remove", { name: "or-coder" });
       await a.wait(`!document.querySelector('.tab-or')`, 3000);
       ok("Provider: OpenRouter off without the key (with a hint), a searchable model list with it, the pay-per-use badge");

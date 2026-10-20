@@ -136,6 +136,8 @@ interface Session {
   id: number;
   channel_id: number;
   kind: Kind;
+  /** What the run bills to (a named agent's provider when it started). */
+  provider?: "subscription" | "openrouter";
   name: string;
   cwd: string;
   state: string;
@@ -992,9 +994,12 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       const a = agentNamed(p.name);
       const cur = a.session_id !== null ? sessions.get(a.session_id) : undefined;
       if (cur && cur.state !== "exited" && !p.fresh) {
-        return { agent: agentJson(a), session: cur, started: false };
+        const pending = (cur.provider ?? "subscription") !== a.provider;
+        return { agent: agentJson(a), session: cur, started: false, provider_pending: pending };
       }
       if (cur) {
+        // The run bills to what the agent says now (src/hub.rs start_process).
+        cur.provider = a.provider;
         const s = await handle("session.restart", { id: cur.id });
         broadcast("agent_upserted", agentJson(a));
         return { agent: agentJson(a), session: s, started: true };
@@ -1016,6 +1021,8 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         a.channel_id = c.id;
       }
       const s = spawn({ channel_id: c.id, kind: a.kind, name: a.name, window_id: p.window_id, cwd: HOME });
+      s.provider = a.provider;
+      broadcast("session_upserted", s);
       a.session_id = s.id;
       broadcast("agent_upserted", agentJson(a));
       return { agent: agentJson(a), session: s, started: true };

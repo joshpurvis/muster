@@ -54,8 +54,10 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 - Every group has a tab strip (31px), always shown, even with one tab. Tabs show the state dot,
   the kind icon, the label, an optional `⎇` (worktree) and permissions icon (amber for network
   or accept edits, red for full access or bypass; both on every tab of the task), and `×` on
-  hover. The tab of a named agent running on OpenRouter also has a small amber **OpenRouter**
-  chip (its tooltip and accessible name: "OpenRouter · pay per use"): it bills per token.
+  hover. The tab of a named agent whose current run is on OpenRouter (`SessionInfo.provider`, set when
+  it starts) also has a small amber **OpenRouter** chip (its tooltip and accessible name:
+  "OpenRouter · pay per use"): it bills per token. It stays until a restart applies another
+  provider, and goes when the process exits. Billing text is at least 4.5:1 in both themes.
 - **Label**: the task's name (auto-derived, muted italics while it's only the folder name). When
   the task has several sessions, a secondary muted part names the session (`fix auth · shell`);
   the task part is truncated first.
@@ -374,7 +376,7 @@ terminal tab; there is no chat view.
 | Part | What |
 |---|---|
 | Header | "Agents", the count, `×` hides the panel. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). Hover: the persona's first line. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
 | Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays). |
@@ -404,7 +406,8 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
   tokens in / out and context size; Default first for Claude (Claude Code's choice through
   OpenRouter's latest Anthropic aliases), Custom… last (any id). Every word typed must match the
   id or the name; ↓ goes from the search box into the list, ↑/↓/Home/End move in it, Enter in the
-  box picks the first match. Under it: how many models and where from, or, with no list, why it
+  box picks the first match. The list is one Tab stop (the chosen model): the dialog's focus trap
+  skips elements with `tabindex="-1"`, so Tab never walks the rows. Under it: how many models and where from, or, with no list, why it
   couldn't load and that Custom… still works. A Codex agent on OpenRouter has no Default: Create
   stays off until a model is chosen.
 - Model and Effort dropdowns for the agent's kind (`agent.models`): Default (the CLI's

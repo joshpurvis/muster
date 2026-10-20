@@ -194,6 +194,40 @@ fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter:
     cmd.spawn().with_context(|| format!("starting {}", exe.display()))
 }
 
+/// What a refused `daemon.reload_handoff` error starts with: the CLI then reloads the usual way.
+pub const HANDOFF_REFUSED: &str = "handoff refused:";
+
+/// `daemon.reload_handoff {exe}`: `muster reload` from a shell without `OPENROUTER_API_KEY`
+/// while this backend has a key. The key is only in this backend's memory, so instead of the
+/// command starting the replacement (with its own environment, so without the key) this backend
+/// runs `<launch path> reload` itself, as the update banner does: the replacement gets this
+/// backend's environment and its key. Only when the command is the build this backend was
+/// started from (`exe`, compared as canonical paths), so the same build is restarted as a
+/// reload typed there would have.
+pub fn reload_handoff(hub: &Arc<Hub>, exe: &Path) -> anyhow::Result<PathBuf> {
+    let (launch, _) = hub.updates().launch.lock().clone()
+        .with_context(|| format!("{HANDOFF_REFUSED} this backend does not know where it was launched from"))?;
+    let same = match (std::fs::canonicalize(exe), std::fs::canonicalize(&launch)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    anyhow::ensure!(same, "{HANDOFF_REFUSED} this backend was started from {}, not {}", launch.display(), exe.display());
+    let mut child = run_cli(&launch, &["reload"], hub.openrouter_key())?;
+    let weak = Arc::downgrade(hub);
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+            && let Some(hub) = weak.upgrade()
+        {
+            hub.notice("error", format!(
+                "The backend was not restarted ({status}). Details: {}",
+                crate::paths::log_path().display()
+            ));
+        }
+    });
+    Ok(launch)
+}
+
 /// Is the build now at the launch path (`current`, its SHA-256) the one the human approved
 /// (`expect`, the `updates.backend` id the banner showed), and not the one already running?
 fn check_reload(current: &str, running: &str, expect: &str, exe: &Path) -> anyhow::Result<()> {

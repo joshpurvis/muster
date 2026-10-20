@@ -57,16 +57,26 @@ const CLAUDE_ALIASES: &[(&str, &str)] = &[
     ("ANTHROPIC_DEFAULT_FABLE_MODEL", "~anthropic/claude-fable-latest[1m]"),
 ];
 
-/// Variables that would pick another endpoint or credential ahead of OpenRouter's in a Claude
-/// session (cloud providers rank above `ANTHROPIC_AUTH_TOKEN`). Removed from an OpenRouter
-/// session's inherited environment.
-const CLAUDE_OVERRIDES: &[&str] = &[
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "ANTHROPIC_MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL",
-];
+/// Inherited variables removed from an OpenRouter Claude session: ones that pick the model
+/// outside the agent's record. Every inherited `CLAUDE_CODE_USE_*` provider selector goes too
+/// ([`is_provider_selector`]): Bedrock, Vertex, Foundry, Mantle, Claude Platform on AWS and any
+/// later one rank above `ANTHROPIC_AUTH_TOKEN`.
+const CLAUDE_OVERRIDES: &[&str] = &["ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL"];
+
+/// `CLAUDE_CODE_USE_<provider>` picks a provider; `CLAUDE_CODE_USE_POWERSHELL_TOOL` is the only
+/// one of that family that doesn't (<https://code.claude.com/docs/en/env-vars>).
+fn is_provider_selector(var: &str) -> bool {
+    var.starts_with("CLAUDE_CODE_USE_") && var != "CLAUDE_CODE_USE_POWERSHELL_TOOL"
+}
+
+/// Claude Code ignores provider, endpoint and authentication variables (`ANTHROPIC_BASE_URL`,
+/// `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_*`) set in settings files, so a
+/// profile's or project's `env` block can't send the key to another endpoint.
+const PROVIDER_MANAGED: &str = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST";
+/// Claude Code strips credentials (by name or value: the key, `MUSTER_TOKEN`) from the
+/// environment of the Bash commands, hooks and stdio MCP servers it starts, and runs Bash in its
+/// own PID namespace (so it can't read the key from another process's `/proc/<pid>/environ`).
+const SUBPROCESS_SCRUB: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
 /// Everything [`apply_session_env`] may set: removed again from an environment that carries
 /// [`MARKER`] (inherited from an OpenRouter session, never the owner's own setting).
@@ -78,6 +88,8 @@ const SET_BY_US: &[&str] = &[
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    PROVIDER_MANAGED,
+    SUBPROCESS_SCRUB,
     ENV_KEY,
     MARKER,
 ];
@@ -110,6 +122,10 @@ impl Provider {
     }
 }
 
+/// Shortest key accepted. Real keys are `sk-or-v1-` and 64 hex digits; the floor keeps the
+/// redaction of stored launches ([`redact_spec`], a substring replacement) meaningful.
+const KEY_MIN: usize = 16;
+
 /// The owner's OpenRouter key. Its value is never printed (`Debug` and errors show a
 /// placeholder) and never serialized.
 #[derive(Clone, PartialEq, Eq)]
@@ -122,26 +138,66 @@ impl std::fmt::Debug for ApiKey {
 }
 
 impl ApiKey {
-    /// Blank (after trimming) is no key.
+    /// Blank, short (under 16 characters) or with control characters: no key.
     pub fn new(value: &str) -> Option<ApiKey> {
         let v = value.trim();
-        (!v.is_empty() && !v.chars().any(char::is_control)).then(|| ApiKey(v.to_string()))
+        (v.len() >= KEY_MIN && !v.chars().any(|c| c.is_control() || c.is_whitespace())).then(|| ApiKey(v.to_string()))
     }
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
 
-/// At daemon start, before any thread exists: take the key out of the daemon's environment
-/// (so git, gh, the terminal host and every session inherit nothing), and drop OpenRouter
-/// settings inherited from an OpenRouter session (see [`MARKER`]).
-pub fn take_key_from_env() -> Option<ApiKey> {
-    let key = std::env::var(ENV_KEY).ok().and_then(|v| ApiKey::new(&v));
-    let mut remove = vec![ENV_KEY];
-    if std::env::var_os(MARKER).is_some() {
-        remove.extend_from_slice(SET_BY_US);
+/// The variables to take out of an inherited environment (the daemon's own, or what a session
+/// would inherit from it) before anything of Muster's goes on:
+/// - `OPENROUTER_API_KEY`, always;
+/// - everything [`apply_session_env`] sets, when [`MARKER`] says the environment came from an
+///   OpenRouter session (a backend started from inside one);
+/// - with the daemon's key known: every variable whose value is that key, and the gateway it was
+///   paired with. OpenRouter's own setup has the owner export `ANTHROPIC_AUTH_TOKEN=<key>`,
+///   `ANTHROPIC_BASE_URL=https://openrouter.ai/api` and an empty `ANTHROPIC_API_KEY`; inherited,
+///   that would put every Claude session on the owner's bill. So when the inherited
+///   `ANTHROPIC_AUTH_TOKEN` is the key, an OpenRouter `ANTHROPIC_BASE_URL` and an empty
+///   `ANTHROPIC_API_KEY` go with it. Another token or gateway of the owner's (not this key) stays.
+pub fn inherited_removals<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)> + Clone, key: Option<&ApiKey>) -> Vec<String> {
+    let mut out = vec![ENV_KEY.to_string()];
+    if env.clone().into_iter().any(|(k, _)| k == MARKER) {
+        out.extend(SET_BY_US.iter().map(|s| s.to_string()));
     }
-    for var in remove {
+    if let Some(key) = key {
+        let paired = env.clone().into_iter().any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v.trim() == key.expose());
+        for (k, v) in env {
+            let gateway = k == "ANTHROPIC_BASE_URL" && is_openrouter_url(v);
+            let empty_key = k == "ANTHROPIC_API_KEY" && v.is_empty();
+            if v.contains(key.expose()) || (paired && (gateway || empty_key)) {
+                out.push(k.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `https://openrouter.ai/…` (any path), the host compared exactly.
+fn is_openrouter_url(url: &str) -> bool {
+    let rest = url.trim().strip_prefix("https://").or_else(|| url.trim().strip_prefix("http://")).unwrap_or("");
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("").rsplit('@').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
+    host == "openrouter.ai" || host.ends_with(".openrouter.ai")
+}
+
+/// At daemon start, before any thread exists: take the key out of the daemon's environment, with
+/// every other variable holding it ([`inherited_removals`]), so git, gh, the terminal host and
+/// every session inherit none of it.
+pub fn take_key_from_env() -> Option<ApiKey> {
+    let raw = std::env::var(ENV_KEY).ok();
+    let key = raw.as_deref().and_then(ApiKey::new);
+    if raw.as_deref().is_some_and(|r| !r.trim().is_empty()) && key.is_none() {
+        eprintln!("muster: ignoring {ENV_KEY}: not an OpenRouter key (too short, or has spaces or control characters)");
+    }
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    for var in inherited_removals(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())), key.as_ref()) {
         // SAFETY: called from `run_daemon` before the runtime (or any other thread) starts, so
         // nothing reads the environment concurrently.
         unsafe { std::env::remove_var(var) };
@@ -149,15 +205,11 @@ pub fn take_key_from_env() -> Option<ApiKey> {
     key
 }
 
-/// Every session's inherited environment, before its own variables go on: never the key, and
-/// none of the OpenRouter settings when they came from an OpenRouter session.
-pub fn scrub_inherited(env: &mut BTreeMap<String, String>) {
-    if env.contains_key(MARKER) {
-        for var in SET_BY_US {
-            env.remove(*var);
-        }
+/// Every session's inherited environment, before its own variables go on ([`inherited_removals`]).
+pub fn scrub_inherited(env: &mut BTreeMap<String, String>, key: Option<&ApiKey>) {
+    for var in inherited_removals(env.iter().map(|(k, v)| (k.as_str(), v.as_str())), key) {
+        env.remove(&var);
     }
-    env.remove(ENV_KEY);
 }
 
 pub fn missing_key_error() -> anyhow::Error {
@@ -173,9 +225,7 @@ pub fn missing_key_error() -> anyhow::Error {
 pub fn apply_session_env(kind: SessionKind, key: &ApiKey, env: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
     match kind {
         SessionKind::Claude => {
-            for var in CLAUDE_OVERRIDES {
-                env.remove(*var);
-            }
+            env.retain(|k, _| !is_provider_selector(k) && !CLAUDE_OVERRIDES.contains(&k.as_str()));
             env.insert("ANTHROPIC_BASE_URL".into(), CLAUDE_BASE_URL.into());
             env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.expose().into());
             // OpenRouter's guide: "must be explicitly empty", so an inherited key isn't used.
@@ -183,6 +233,8 @@ pub fn apply_session_env(kind: SessionKind, key: &ApiKey, env: &mut BTreeMap<Str
             for (var, model) in CLAUDE_ALIASES {
                 env.insert((*var).into(), (*model).into());
             }
+            env.insert(PROVIDER_MANAGED.into(), "1".into());
+            env.insert(SUBPROCESS_SCRUB.into(), "1".into());
         }
         SessionKind::Codex => {
             env.insert(ENV_KEY.into(), key.expose().into());
@@ -193,16 +245,25 @@ pub fn apply_session_env(kind: SessionKind, key: &ApiKey, env: &mut BTreeMap<Str
     Ok(())
 }
 
+/// Codex's provider id for OpenRouter: Muster's own, so a `[model_providers.openrouter]` table
+/// from OpenRouter's guide (with its `auth` command, which Codex refuses next to `env_key`) can't
+/// merge into it. Defined completely here.
+pub const CODEX_PROVIDER: &str = "muster_openrouter";
+
 /// Codex's provider settings, as `-c` overrides placed before the agent's own arguments (the
 /// agent's `-m` names the model). Muster's own: they never go through the argument allowlist
-/// and are not stored with the session.
+/// and are not stored with the session. The last one keeps Codex's default exclusion of
+/// `*KEY*`/`*SECRET*`/`*TOKEN*` variables from the commands it runs, whatever the owner's config
+/// says.
 pub fn codex_args() -> Vec<String> {
+    let p = CODEX_PROVIDER;
     [
-        "model_provider=\"openrouter\"".to_string(),
-        "model_providers.openrouter.name=\"OpenRouter\"".to_string(),
-        format!("model_providers.openrouter.base_url=\"{CODEX_BASE_URL}\""),
-        format!("model_providers.openrouter.env_key=\"{ENV_KEY}\""),
-        "model_providers.openrouter.wire_api=\"responses\"".to_string(),
+        format!("model_provider=\"{p}\""),
+        format!("model_providers.{p}.name=\"OpenRouter (Muster)\""),
+        format!("model_providers.{p}.base_url=\"{CODEX_BASE_URL}\""),
+        format!("model_providers.{p}.env_key=\"{ENV_KEY}\""),
+        format!("model_providers.{p}.wire_api=\"responses\""),
+        "shell_environment_policy.ignore_default_excludes=false".to_string(),
     ]
     .into_iter()
     .flat_map(|kv| ["-c".to_string(), kv])
@@ -212,26 +273,31 @@ pub fn codex_args() -> Vec<String> {
 /// What a launch record keeps in place of the key.
 const PLACEHOLDER: &str = "<muster: OpenRouter key, kept in memory only>";
 
-/// The launch as Muster stores it: every environment value equal to the key replaced.
+/// The launch as Muster stores it: the daemon's key replaced wherever it appears (in any
+/// environment value or argument, of any session, whatever its provider).
 pub fn redact_spec(mut spec: muster_terminal_protocol::SpawnSpec, key: Option<&ApiKey>) -> muster_terminal_protocol::SpawnSpec {
     if let Some(key) = key {
-        for v in spec.env.values_mut() {
-            if v == key.expose() {
-                *v = PLACEHOLDER.into();
+        for v in spec.env.values_mut().chain(spec.args.iter_mut()) {
+            if v.contains(key.expose()) {
+                *v = v.replace(key.expose(), PLACEHOLDER);
             }
         }
     }
     spec
 }
 
-/// A stored launch, ready to send to the host again: the placeholder becomes the key. Without a
-/// key (the backend was restarted without it) the placeholder stays and OpenRouter refuses it.
+/// Does a stored launch need the key to be re-sent as it was?
+pub fn needs_key(spec: &muster_terminal_protocol::SpawnSpec) -> bool {
+    spec.env.values().chain(spec.args.iter()).any(|v| v.contains(PLACEHOLDER))
+}
+
+/// A stored launch, ready to send to the host again: the placeholder becomes the key. Callers
+/// check [`needs_key`] first: without a key, such a launch is never re-sent (`hub` defers it).
 pub fn restore_spec(mut spec: muster_terminal_protocol::SpawnSpec, key: Option<&ApiKey>) -> muster_terminal_protocol::SpawnSpec {
-    for v in spec.env.values_mut() {
-        if v == PLACEHOLDER {
-            match key {
-                Some(key) => *v = key.expose().into(),
-                None => tracing::warn!("a stored OpenRouter launch is re-sent without a key: the backend has no {ENV_KEY}"),
+    if let Some(key) = key {
+        for v in spec.env.values_mut().chain(spec.args.iter_mut()) {
+            if v.contains(PLACEHOLDER) {
+                *v = v.replace(PLACEHOLDER, key.expose());
             }
         }
     }
@@ -355,11 +421,29 @@ pub struct ModelCache {
     state: parking_lot::Mutex<State>,
     /// One fetch at a time.
     fetching: tokio::sync::Mutex<()>,
+    /// Tests: answer fetches with this body after this delay instead of going to the network.
+    #[cfg(test)]
+    fake: Option<(Vec<u8>, Duration)>,
 }
 
 impl ModelCache {
     pub fn new(path: PathBuf) -> ModelCache {
-        ModelCache { path, state: Default::default(), fetching: tokio::sync::Mutex::new(()) }
+        ModelCache {
+            path,
+            state: Default::default(),
+            fetching: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fake: None,
+        }
+    }
+
+    async fn fetch(&self) -> anyhow::Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some((body, delay)) = &self.fake {
+            tokio::time::sleep(*delay).await;
+            return Ok(body.clone());
+        }
+        fetch().await
     }
 
     fn load_file(&self, st: &mut State) {
@@ -387,13 +471,13 @@ impl ModelCache {
             let stale = st.cached.as_ref().is_none_or(|c| now - c.fetched_at >= REFRESH_MS);
             (st.cached.is_some(), stale && now - st.last_attempt >= RETRY_MS)
         };
-        if due {
-            if have {
-                let me = self.clone();
-                tokio::spawn(async move { me.refresh().await });
-            } else {
-                self.refresh().await;
-            }
+        if !have {
+            // No list yet: wait for a fetch, this call's or one already running (`refresh`
+            // serializes them and skips a second try within the retry interval).
+            self.refresh().await;
+        } else if due {
+            let me = self.clone();
+            tokio::spawn(async move { me.refresh().await });
         }
         self.reply(key_present)
     }
@@ -419,7 +503,7 @@ impl ModelCache {
             }
             st.last_attempt = now_ms();
         }
-        let result = fetch().await.and_then(|body| parse_models(&body));
+        let result = self.fetch().await.and_then(|body| parse_models(&body));
         let mut st = self.state.lock();
         match result {
             Ok(models) if !models.is_empty() => {
@@ -453,26 +537,75 @@ impl ModelCache {
 
 /// GET the public models endpoint with curl (no key, https only, `-q`: no ~/.curlrc).
 async fn fetch() -> anyhow::Result<Vec<u8>> {
-    let out = tokio::time::timeout(
-        Duration::from_secs(FETCH_SECS + 5),
-        tokio::process::Command::new("curl")
-            .args(["-q", "-sS", "-f", "-L", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "3"])
-            .args(["--max-time", &FETCH_SECS.to_string(), "--max-filesize", &MAX_BYTES.to_string(), MODELS_URL])
-            .env_remove(ENV_KEY)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("OpenRouter didn't answer within {FETCH_SECS} s"))?
-    .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { anyhow::anyhow!("curl is not installed") } else { anyhow::anyhow!("running curl: {e}") })?;
-    if !out.status.success() {
-        let why = String::from_utf8_lossy(&out.stderr);
+    let mut args: Vec<String> = ["-q", "-sS", "-f", "-L", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "3"]
+        .iter().map(|a| a.to_string()).collect();
+    args.extend(["--max-time".into(), FETCH_SECS.to_string(), "--max-filesize".into(), MAX_BYTES.to_string(), MODELS_URL.into()]);
+    run_capped("curl", &args, MAX_BYTES, Duration::from_secs(FETCH_SECS + 5)).await
+}
+
+/// Run `program` and return its stdout, read as it arrives and never more than `max` bytes: past
+/// that the process is killed (curl before 8.4 doesn't hold `--max-filesize` for a chunked
+/// response). Also killed past `deadline`. The OpenRouter key is never in its environment.
+async fn run_capped(program: &str, args: &[String], max: usize, deadline: Duration) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .env_remove(ENV_KEY)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { anyhow::anyhow!("{program} is not installed") } else { anyhow::anyhow!("running {program}: {e}") })?;
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    // Stderr: the first 4 KiB kept, the rest drained, so the process never blocks on it.
+    let errors = tokio::spawn(async move {
+        let (mut kept, mut buf) = (Vec::new(), [0u8; 4096]);
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 { break }
+            let room = 4096usize.saturating_sub(kept.len());
+            kept.extend_from_slice(&buf[..n.min(room)]);
+        }
+        kept
+    });
+    let work = async {
+        let mut body = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = stdout.read(&mut buf).await?;
+            if n == 0 { break }
+            if body.len() + n > max {
+                return Ok::<_, std::io::Error>(None);
+            }
+            body.extend_from_slice(&buf[..n]);
+        }
+        Ok(Some(body))
+    };
+    let body = match tokio::time::timeout(deadline, work).await {
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!("OpenRouter didn't answer within {} s", deadline.as_secs());
+        }
+        Ok(Err(e)) => {
+            let _ = child.kill().await;
+            anyhow::bail!("reading {program}'s output: {e}");
+        }
+        Ok(Ok(None)) => {
+            let _ = child.kill().await;
+            anyhow::bail!("OpenRouter's model list is larger than {} MB", max / (1024 * 1024));
+        }
+        Ok(Ok(Some(body))) => body,
+    };
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await
+        .map_err(|_| anyhow::anyhow!("{program} didn't exit"))??;
+    let stderr = errors.await.unwrap_or_default();
+    if !status.success() {
+        let why = String::from_utf8_lossy(&stderr);
         let why = why.trim().trim_start_matches("curl: ");
         anyhow::bail!("couldn't reach OpenRouter ({})", clip(if why.is_empty() { "no details" } else { why }, 200));
     }
-    anyhow::ensure!(out.stdout.len() <= MAX_BYTES, "OpenRouter's model list is larger than expected");
-    Ok(out.stdout)
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -533,7 +666,9 @@ mod tests {
         assert!(!format!("{key:?}").contains("secret"));
         assert!(!missing_key_error().to_string().contains("secret"));
         assert!(ApiKey::new("  ").is_none());
-        assert!(ApiKey::new("a\nb").is_none());
+        assert!(ApiKey::new("sk-or-fixture\nsecret").is_none());
+        assert!(ApiKey::new("sk-or-fixture secret").is_none());
+        assert!(ApiKey::new("short").is_none(), "too short to redact safely");
     }
 
     #[test]
@@ -541,15 +676,24 @@ mod tests {
         let key = ApiKey::new("sk-or-fixture-secret").unwrap();
         let mut env = BTreeMap::from([
             ("ANTHROPIC_API_KEY".to_string(), "inherited".to_string()),
-            ("CLAUDE_CODE_USE_BEDROCK".to_string(), "1".to_string()),
+            ("ANTHROPIC_MODEL".to_string(), "opus".to_string()),
             ("EDITOR".to_string(), "vi".to_string()),
+            ("CLAUDE_CODE_USE_POWERSHELL_TOOL".to_string(), "0".to_string()),
         ]);
+        for selector in ["BEDROCK", "VERTEX", "FOUNDRY", "MANTLE", "ANTHROPIC_AWS", "SOMETHING_NEW"] {
+            env.insert(format!("CLAUDE_CODE_USE_{selector}"), "1".into());
+        }
         apply_session_env(SessionKind::Claude, &key, &mut env).unwrap();
         assert_eq!(env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api");
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "sk-or-fixture-secret");
         assert_eq!(env["ANTHROPIC_API_KEY"], "");
         assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "~anthropic/claude-sonnet-latest[1m]");
-        assert!(!env.contains_key("CLAUDE_CODE_USE_BEDROCK") && !env.contains_key(ENV_KEY));
+        // Settings files can't re-route it, and its subprocesses don't get the key.
+        assert_eq!(env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1");
+        assert_eq!(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        assert!(!env.keys().any(|k| is_provider_selector(k)), "{env:?}");
+        assert_eq!(env["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "0", "not a provider selector");
+        assert!(!env.contains_key("ANTHROPIC_MODEL") && !env.contains_key(ENV_KEY));
         assert_eq!(env["EDITOR"], "vi");
         assert_eq!(env[MARKER], "openrouter");
 
@@ -559,30 +703,57 @@ mod tests {
         assert!(!env.contains_key("ANTHROPIC_BASE_URL") && !env.contains_key("ANTHROPIC_AUTH_TOKEN"));
         assert!(apply_session_env(SessionKind::Shell, &key, &mut env).is_err());
 
+        // Muster's own provider id, defined completely: an `openrouter` table from OpenRouter's
+        // guide (with `auth`) never merges into it.
         let args = codex_args();
         assert!(args.chunks(2).all(|p| p[0] == "-c"));
-        assert!(args.contains(&"model_provider=\"openrouter\"".to_string()));
-        assert!(args.contains(&"model_providers.openrouter.base_url=\"https://openrouter.ai/api/v1\"".to_string()));
-        assert!(args.contains(&"model_providers.openrouter.env_key=\"OPENROUTER_API_KEY\"".to_string()));
+        let values: Vec<&str> = args.chunks(2).map(|p| p[1].as_str()).collect();
+        assert!(values.contains(&"model_provider=\"muster_openrouter\""));
+        assert!(values.contains(&"model_providers.muster_openrouter.base_url=\"https://openrouter.ai/api/v1\""));
+        assert!(values.contains(&"model_providers.muster_openrouter.env_key=\"OPENROUTER_API_KEY\""));
+        assert!(values.contains(&"model_providers.muster_openrouter.wire_api=\"responses\""));
+        assert!(values.contains(&"shell_environment_policy.ignore_default_excludes=false"));
+        assert!(!values.iter().any(|v| v.contains("model_providers.openrouter")));
         assert!(!args.iter().any(|a| a.contains("sk-or")));
     }
 
     #[test]
     fn inherited_openrouter_settings_never_reach_another_session() {
-        // The owner's own gateway settings (no marker) are left alone; the key never passes.
+        let key = ApiKey::new("sk-or-fixture-secret").unwrap();
+        // The owner's own gateway settings (not this key) are left alone; the key never passes.
         let mut env = BTreeMap::from([
             ("ANTHROPIC_BASE_URL".to_string(), "https://gateway.example".to_string()),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "another-gateway-token".to_string()),
             (ENV_KEY.to_string(), "sk-or-fixture-secret".to_string()),
         ]);
-        scrub_inherited(&mut env);
+        scrub_inherited(&mut env, Some(&key));
         assert_eq!(env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("https://gateway.example"));
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("another-gateway-token"));
         assert!(!env.contains_key(ENV_KEY));
-        // A backend started from inside an OpenRouter session: all of it goes.
-        let key = ApiKey::new("sk-or-fixture-secret").unwrap();
+        // OpenRouter's own shell setup, with this key: the token and the gateway it goes with.
+        let mut env = BTreeMap::from([
+            ("ANTHROPIC_BASE_URL".to_string(), "https://openrouter.ai/api".to_string()),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-or-fixture-secret".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), String::new()),
+            ("SOME_OTHER".to_string(), "Bearer sk-or-fixture-secret".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+        ]);
+        scrub_inherited(&mut env, Some(&key));
+        assert_eq!(env, BTreeMap::from([("PATH".to_string(), "/bin".to_string())]));
+        // The same gateway with another token is the owner's own choice.
+        let mut env = BTreeMap::from([
+            ("ANTHROPIC_BASE_URL".to_string(), "https://openrouter.ai/api".to_string()),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-or-someone-elses-key".to_string()),
+        ]);
+        scrub_inherited(&mut env, Some(&key));
+        assert_eq!(env.len(), 2);
+        // A backend started from inside an OpenRouter session: all of it goes, key or not.
         let mut env = BTreeMap::from([("PATH".to_string(), "/bin".to_string())]);
         apply_session_env(SessionKind::Claude, &key, &mut env).unwrap();
-        scrub_inherited(&mut env);
+        scrub_inherited(&mut env, None);
         assert_eq!(env, BTreeMap::from([("PATH".to_string(), "/bin".to_string())]));
+        assert!(is_openrouter_url("https://openrouter.ai/api") && is_openrouter_url("https://OPENROUTER.ai:443/x"));
+        assert!(!is_openrouter_url("https://openrouter.ai.evil.example/api") && !is_openrouter_url("https://evil.example/openrouter.ai"));
     }
 
     #[test]
@@ -591,9 +762,10 @@ mod tests {
         let spec = muster_terminal_protocol::SpawnSpec {
             run: muster_terminal_protocol::RunId { id: 1, generation: 1 },
             program: "claude".into(),
-            args: vec![],
+            args: vec!["--x".into(), "a=sk-or-fixture-secret".into()],
             env: BTreeMap::from([
                 ("ANTHROPIC_AUTH_TOKEN".to_string(), "sk-or-fixture-secret".to_string()),
+                ("WRAPPED".to_string(), "Bearer sk-or-fixture-secret!".to_string()),
                 ("PATH".to_string(), "/bin".to_string()),
             ]),
             cwd: "/".into(),
@@ -603,9 +775,40 @@ mod tests {
         let stored = redact_spec(spec.clone(), Some(&key));
         assert!(!serde_json::to_string(&stored).unwrap().contains("sk-or-fixture-secret"));
         assert_eq!(stored.env["PATH"], "/bin");
+        assert!(needs_key(&stored) && !needs_key(&spec));
         assert_eq!(restore_spec(stored.clone(), Some(&key)), spec);
-        assert_eq!(restore_spec(stored.clone(), None).env["ANTHROPIC_AUTH_TOKEN"], PLACEHOLDER);
+        assert_eq!(restore_spec(stored.clone(), None), stored);
         assert_eq!(redact_spec(spec.clone(), None), spec);
+    }
+
+    #[tokio::test]
+    async fn output_past_the_cap_kills_the_process() {
+        // An endless stream (as curl before 8.4 gives a chunked body past --max-filesize).
+        let started = std::time::Instant::now();
+        let e = run_capped("yes", &[], 1024 * 1024, Duration::from_secs(10)).await.unwrap_err();
+        assert!(e.to_string().contains("larger than"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let ok = run_capped("printf", &["%s".into(), "hello".into()], 1024, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(ok, b"hello");
+        let e = run_capped("sh", &["-c".into(), "echo nope >&2; exit 7".into()], 1024, Duration::from_secs(5)).await.unwrap_err();
+        assert!(e.to_string().contains("nope"), "{e}");
+        let e = run_capped("sleep", &["30".into()], 1024, Duration::from_millis(300)).await.unwrap_err();
+        assert!(e.to_string().contains("didn't answer"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_second_cold_request_waits_for_the_first_fetch() {
+        let dir = std::env::temp_dir().join(format!("muster-or-cold-{}", crate::paths::random_token()));
+        let mut cache = ModelCache::new(dir.join("openrouter-models.json"));
+        cache.fake = Some((FIXTURE.as_bytes().to_vec(), Duration::from_millis(300)));
+        let cache = std::sync::Arc::new(cache);
+        let (a, b) = tokio::join!(cache.models(true), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cache.models(true).await
+        });
+        assert!(!a["models"].as_array().unwrap().is_empty());
+        assert_eq!(a["models"], b["models"], "the second caller got the list, not an empty reply");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

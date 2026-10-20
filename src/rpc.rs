@@ -314,6 +314,20 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let exe = crate::updates::reload(hub, &p.expect).await?;
             Ok(json!({ "exe": exe.to_string_lossy() }))
         }
+        "daemon.reload_handoff" => {
+            human_only(who, method, &params)?;
+            #[derive(Deserialize)]
+            struct P {
+                /// The `muster` binary running the `reload` command.
+                exe: std::path::PathBuf,
+            }
+            let p: P = parse(params)?;
+            if hub.openrouter_key().is_none() {
+                return Err(RpcError(format!("{} this backend has no OpenRouter key to hand on", crate::updates::HANDOFF_REFUSED)));
+            }
+            let exe = crate::updates::reload_handoff(hub, &p.exe)?;
+            Ok(json!({ "exe": exe.to_string_lossy() }))
+        }
         "daemon.shutdown" => {
             human_only(who, method, &params)?;
             crate::updates::shutdown(hub)?;
@@ -961,6 +975,9 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
+                // The running process keeps the provider it started with: a change shows here
+                // until a restart (Start fresh, or Stop then Start) applies it.
+                "provider_pending": !bs.started && bs.session.provider != bs.agent.provider,
                 "session": bs.session,
                 "started": bs.started,
             }))
@@ -1991,7 +2008,7 @@ mod tests {
     async fn restart_and_shutdown_are_human_only() {
         let (hub, _st) = fixture();
         let device = Principal::Device { id: 1 };
-        for method in ["daemon.reload", "daemon.shutdown"] {
+        for method in ["daemon.reload", "daemon.shutdown", "daemon.reload_handoff"] {
             assert!(crate::devices::method_scope(method).is_none(), "{method}");
             let e = dispatch(&hub, &device, method, json!({})).await.unwrap_err();
             assert!(e.0.contains("only available on this computer"), "{}", e.0);
@@ -2005,6 +2022,14 @@ mod tests {
         assert!(e.contains("where it was launched from"), "{e}");
         let h = call(&hub, "hello", json!({})).await.unwrap();
         assert_eq!(h["updates"], json!({"ui_release": null, "backend": null, "host": null}));
+        // The key handoff: refused (so the CLI reloads the usual way) without a key, without a
+        // known launch path, and for a binary other than the one the backend started from.
+        let e = call(&hub, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
+        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("no OpenRouter key"), "{e}");
+        let (keyed, _st) = fixture_keyed(crate::openrouter::ApiKey::new("sk-or-rpc-fixture-secret"));
+        let e = call(&keyed, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
+        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("launched from"), "{e}");
+        assert!(!e.contains("sk-or-rpc"));
     }
 
     #[tokio::test]

@@ -575,6 +575,21 @@ impl Hub {
             for record in terminal_records.values_mut() {
                 if record.host_instance != host.client.hello.instance { continue }
                 if !record.retired && record.pending {
+                    // The host already has this run: it started, so adopt it below. Re-sending
+                    // could differ from what was launched (the OpenRouter key changed or is gone
+                    // since), which the host refuses, and a refused run would be retired: its
+                    // live process killed.
+                    if inventory.iter().any(|run| run.run == record.spec.run) {
+                        record.pending = false;
+                        store.save_terminal(record.spec.run.id, record)?;
+                        continue;
+                    }
+                    // Never started, and it needs a key this backend doesn't have: keep it
+                    // pending (nothing runs) until a backend with the key recovers it.
+                    if crate::openrouter::needs_key(&record.spec) && cfg.openrouter_key.is_none() {
+                        tracing::warn!(run = ?record.spec.run, "an OpenRouter launch waits for {}", crate::openrouter::ENV_KEY);
+                        continue;
+                    }
                     match host.spawn(crate::openrouter::restore_spec(record.spec.clone(), cfg.openrouter_key.as_ref())) {
                         Ok(_) => record.pending = false,
                         // A definite per-run rejection (its program or cwd vanished during
@@ -2607,6 +2622,7 @@ impl Hub {
                 created_at: now,
                 window_id: Some(window_id),
                 hidden: false,
+                provider: Default::default(),
             };
             let stored = StoredSession {
                 info,
@@ -2764,6 +2780,10 @@ impl Hub {
             let records = self.terminal_records.lock();
             if let Some(record) = records.get(&id) {
                 anyhow::ensure!(!record.retired, "session {id}'s previous terminal is still being retired; retry after cleanup");
+                if record.pending && crate::openrouter::needs_key(&record.spec) && self.openrouter_key().is_none() {
+                    return Err(crate::openrouter::missing_key_error()
+                        .context(format!("session {id}'s previous launch, prepared for OpenRouter, waits for the key")));
+                }
                 anyhow::ensure!(!record.pending, "session {id}'s previous launch is unconfirmed; retry after it is reconciled");
             }
         }
@@ -2841,21 +2861,27 @@ impl Hub {
         let host = self.cfg.terminal_host.as_ref().context("terminal host is not configured")?;
         let mut complete_env: BTreeMap<String, String> = std::env::vars().collect();
         for key in INHERITED_SESSION_MARKERS { complete_env.remove(*key); }
-        // Never the OpenRouter key, nor OpenRouter settings inherited from an OpenRouter session.
-        crate::openrouter::scrub_inherited(&mut complete_env);
+        // Never the OpenRouter key (nor a variable holding it, nor the gateway paired with it),
+        // nor OpenRouter settings inherited from an OpenRouter session.
+        crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
         complete_env.extend(env);
         self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
         if let Some(key) = &openrouter {
             crate::openrouter::apply_session_env(info.kind, key, &mut complete_env)?;
+            if info.kind == SessionKind::Claude {
+                // Its hooks lose MUSTER_TOKEN to Claude Code's credential scrub: they read it here.
+                paths::write_private(&session_dir.join(crate::hookcmd::TOKEN_FILE), token.as_bytes())?;
+            }
         }
         let launch = SpawnSpec {
             run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
             env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
         };
-        // The stored launch record never holds the key (put back when re-sent: restore_spec).
+        // No stored launch record holds the key, whatever the session's provider (put back when
+        // re-sent: restore_spec).
         let mut record = StoredTerminal {
             host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
-            spec: crate::openrouter::redact_spec(launch.clone(), openrouter.as_ref()), pending: true, retired: false,
+            spec: crate::openrouter::redact_spec(launch.clone(), self.openrouter_key()), pending: true, retired: false,
         };
         let previous = {
             let mut g = self.inner.lock();
@@ -2869,6 +2895,8 @@ impl Hub {
             info.state = AgentState::Starting;
             info.state_detail = None;
             info.state_since = now_ms();
+            // What this run bills to (the badge follows the run, not the agent's saved setting).
+            info.provider = provider;
             info.pid = None;
             info.exit_code = None;
             info.subagents = 0;
@@ -2910,6 +2938,7 @@ impl Hub {
                         info.subagents = previous.subagents;
                         info.title = previous.title.clone();
                         info.queued = previous.queued;
+                        info.provider = previous.provider;
                         if let Err(err) = self.store.update_session(info) {
                             tracing::warn!(session = id, "persisting session: {err}");
                         }
@@ -3632,15 +3661,18 @@ impl Hub {
     /// restart. Spawn is retry-safe: the host returns the original process for the same run.
     pub fn reconcile_pending(&self) -> anyhow::Result<()> {
         let Some(host) = &self.cfg.terminal_host else { return Ok(()) };
+        let key = self.openrouter_key();
         let pending: Vec<_> = self.terminal_records.lock().iter()
             .filter(|(_, r)| r.pending && !r.retired && r.host_instance == host.client.hello.instance)
+            // Deferred until a backend with the OpenRouter key (see `Hub::new`).
+            .filter(|(_, r)| key.is_some() || !crate::openrouter::needs_key(&r.spec))
             .map(|(id, r)| (*id, r.clone())).collect();
         for (id, mut record) in pending {
             let run = record.spec.run;
             // A start still in progress handles its own acknowledgement.
             let idle = self.inner.lock().sessions.get(&id).is_some_and(|e| !e.busy && e.generation == run.generation);
             if !idle { continue }
-            let result = host.spawn(crate::openrouter::restore_spec(record.spec.clone(), self.openrouter_key()));
+            let result = host.spawn(crate::openrouter::restore_spec(record.spec.clone(), key));
             let mut g = self.inner.lock();
             let mut records = self.terminal_records.lock();
             if !records.get(&id).is_some_and(|r| r.spec.run == run && r.pending && !r.retired) { continue }
@@ -4540,6 +4572,12 @@ mod tests {
         assert_eq!(claude.env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api");
         assert_eq!(claude.env["ANTHROPIC_AUTH_TOKEN"], KEY);
         assert_eq!(claude.env["ANTHROPIC_API_KEY"], "");
+        assert_eq!(claude.env["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"], "1");
+        assert_eq!(claude.env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        // Its hooks lose MUSTER_TOKEN to that scrub; they read the run's token from its folder.
+        let token_file = paths::session_dir(2).join(crate::hookcmd::TOKEN_FILE);
+        assert_eq!(std::fs::read_to_string(&token_file).unwrap(), claude.env["MUSTER_TOKEN"]);
+        assert!(!paths::session_dir(1).join(crate::hookcmd::TOKEN_FILE).exists(), "only where the scrub runs");
         assert!(!claude.env.contains_key("OPENROUTER_API_KEY"));
         for var in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY", "MUSTER_PROVIDER"] {
             assert!(!shell.env.contains_key(var), "a subscription session never gets {var}");
@@ -4561,6 +4599,69 @@ mod tests {
         assert!(received.spawns.lock().is_empty());
         drop((hub, service));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_pending_openrouter_launch_is_adopted_or_deferred_never_rebuilt() {
+        use crate::openrouter::{ApiKey, Provider};
+        const KEY: &str = "sk-or-fixture-secret-4242";
+        let key = ApiKey::new(KEY).unwrap();
+        let run = RunId { id: 2, generation: 42 };
+        // A launch prepared for OpenRouter, saved (redacted) before a crash.
+        let prepared = |key: &ApiKey| StoredTerminal { host_instance: "input-host".into(), token: "run-token".into(),
+            port_base: 20000, pending: true, retired: false,
+            spec: crate::openrouter::redact_spec(SpawnSpec { run, program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".to_string(), key.expose().to_string())]),
+                cwd: std::env::temp_dir(), cols: 80, rows: 24 }, Some(key)) };
+        let status = |directory: &Path| muster_terminal_protocol::TerminalStatus { run, pid: Some(1), alive: true,
+            drained: false, has_processes: true, exit_code: None, title: None, cols: 80, rows: 24, output_seq: 0,
+            last_output_at: 0, application_cursor: false, log_persisted: true, cwd: directory.to_owned() };
+        let with_agent = |store: &Store, record: &StoredTerminal| {
+            store.insert_agent(&crate::agents::Agent {
+                account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
+                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(),
+                permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false,
+            }).unwrap();
+            store.save_terminal(2, record).unwrap();
+        };
+
+        // The host already started it, and the backend now has another key (or none): it is
+        // adopted as it runs, never re-sent (the host would refuse the different launch and
+        // the recovery would retire, i.e. kill, the live process).
+        for now_key in [None, ApiKey::new("sk-or-a-different-key-77")] {
+            let directory = std::env::temp_dir();
+            let (service, dir, received) = crate::terminal::testing::serving_host_with("hub-or-adopt", vec![status(&directory)]);
+            let hub = fixture_keyed(Some(service.clone()), now_key, |store| with_agent(store, &prepared(&key)));
+            assert!(received.spawns.lock().is_empty(), "nothing re-sent");
+            let saved = hub.store.load_terminals().unwrap().remove(&2).unwrap();
+            assert!(!saved.pending && !saved.retired, "adopted: {saved:?}");
+            assert!(hub.session(2).unwrap().state != AgentState::Exited);
+            drop((hub, service));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        // Never started, and this backend has no key: it waits (nothing runs, nothing retired),
+        // and a new start says why.
+        let (service, dir, received) = crate::terminal::testing::serving_host("hub-or-defer");
+        let hub = fixture_keyed(Some(service.clone()), None, |store| with_agent(store, &prepared(&key)));
+        assert!(received.spawns.lock().is_empty());
+        let saved = hub.store.load_terminals().unwrap().remove(&2).unwrap();
+        assert!(saved.pending && !saved.retired);
+        hub.reconcile_pending().unwrap();
+        assert!(received.spawns.lock().is_empty(), "reconcile_pending defers it too");
+        assert!(format!("{:#}", hub.start_process(2, None, None).err().unwrap()).contains("OPENROUTER_API_KEY"));
+        drop((hub, service));
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Never started, and the key is back: re-sent with it.
+        let (service, dir, received) = crate::terminal::testing::serving_host("hub-or-resend");
+        let _hub = fixture_keyed(Some(service.clone()), Some(key.clone()), |store| with_agent(store, &prepared(&key)));
+        let spawns = received.spawns.lock().clone();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].env["ANTHROPIC_AUTH_TOKEN"], KEY);
+        drop((_hub, service));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

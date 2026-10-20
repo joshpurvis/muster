@@ -398,6 +398,10 @@ pub struct SessionInfo {
     /// shows it again (the agents panel does).
     #[serde(default)]
     pub hidden: bool,
+    /// What its current (or last) run bills to: set at each start from its named agent's
+    /// provider (src/openrouter.rs), so a provider change shows only once a restart applies it.
+    #[serde(default)]
+    pub provider: crate::openrouter::Provider,
     /// Changes whenever the state or its detail changes, and when a prompt is answered: an
     /// approval carrying the `state_seq` the caller saw never answers a different prompt.
     /// Runtime only (unique within one daemon run).

@@ -9,7 +9,6 @@ import { notes, notesSupported } from "../notes.ts";
 import type { NoteInfo } from "../types.ts";
 import {
   accountProfiles,
-  agents,
   altHeld,
   channelById,
   confirmClose,
@@ -25,7 +24,7 @@ import {
 } from "../state.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
-import { OPENROUTER_BADGE, openRouterSessions } from "../agents.ts";
+import { OPENROUTER_BADGE, sessionOnOpenRouter } from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -678,7 +677,7 @@ function GroupTab(
   }
 
   const home = meta.value.home;
-  const onOpenRouter = openRouterSessions(agents.value).has(s.id);
+  const onOpenRouter = sessionOnOpenRouter(s);
   const tip = [
     tabText(label),
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,

@@ -125,6 +125,9 @@ export interface SessionInfo {
   /** A named agent's closed tab (`session.hide`): it runs on in no window until it is shown
    * again (`session.set_window`). Missing from older daemons. */
   hidden?: boolean;
+  /** What its current (or last) run bills to, set when it starts: a named agent's provider
+   * change shows here only once a restart applies it. Missing from older daemons. */
+  provider?: Provider;
 }
 
 export type EventKind =

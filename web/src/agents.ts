@@ -10,7 +10,6 @@ import type {
   OpenRouterModel,
   Origin,
   Provider,
-  SessionId,
   SessionInfo,
 } from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
@@ -211,11 +210,41 @@ export async function readMemoryFile(
 /** The badge on agents and tabs that run on OpenRouter: billed per token, not a subscription. */
 export const OPENROUTER_BADGE = "OpenRouter · pay per use";
 
-/** Sessions of agents that run on OpenRouter (their tabs get the badge). */
-export function openRouterSessions(list: Agent[]): Set<SessionId> {
-  return new Set(
-    list.filter((a) => a.provider === "openrouter" && a.session_id !== null).map((a) => a.session_id!),
-  );
+/** A tab bills OpenRouter while its run was started on it (the session's own provider, so a
+ * changed agent keeps the badge until a restart applies the change). */
+export function sessionOnOpenRouter(s: SessionInfo | undefined): boolean {
+  return s?.provider === "openrouter" && s.state !== "exited";
+}
+
+/** An agent row's badge: shown while its live run is on OpenRouter or its saved provider is;
+ * `note` says when the two differ (the change waits for a restart). */
+export function agentBilling(
+  a: Agent,
+  s: SessionInfo | undefined,
+): { badge: boolean; label: string; note: string | null } {
+  const live = !!s && a.session_id === s.id && s.state !== "exited";
+  const running = live && s!.provider === "openrouter";
+  const saved = a.provider === "openrouter";
+  const pending = live && s!.provider !== undefined && running !== saved;
+  if (!pending) return { badge: running || saved, label: OPENROUTER_BADGE, note: null };
+  return running
+    ? {
+      badge: true,
+      label: "OpenRouter · until restart",
+      note: "Still runs on OpenRouter, pay per use: its new provider applies when it restarts",
+    }
+    : { badge: true, label: "OpenRouter · from restart", note: "Switches to OpenRouter (pay per use) when it restarts" };
+}
+
+/** The message after showing a running agent whose saved provider its run doesn't have yet. */
+export function providerPendingNote(a: Agent, s: SessionInfo | undefined): string | null {
+  if (!s || s.provider === undefined || s.state === "exited") return null;
+  const saved = a.provider ?? "subscription";
+  if (s.provider === saved) return null;
+  const name = (p: string) => (p === "openrouter" ? "OpenRouter" : "its subscription");
+  return `${a.name} still runs on ${name(s.provider)}. ${name(saved)[0].toUpperCase()}${
+    name(saved).slice(1)
+  } applies when it restarts: Start fresh, or Stop and start it.`;
 }
 
 /** Each CLI's own vendor comes first: Claude Code is built for Anthropic's models, Codex for

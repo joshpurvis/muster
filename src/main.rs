@@ -839,6 +839,21 @@ fn reload() -> anyhow::Result<()> {
             &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
         ).context("cannot verify a compatible terminal host; backend left running")?;
         check_reload(&hello, &host.client.hello, &paths::lock_path())?;
+        // The replacement gets this command's environment. When that has no OpenRouter key and
+        // the backend has one (only in its memory), the backend restarts itself instead, so the
+        // key carries over. OPENROUTER_API_KEY set here, even empty, replaces (or clears) it.
+        if std::env::var_os(openrouter::ENV_KEY).is_none() && hello["openrouter"]["key_present"] == true {
+            match reload_handoff(d) {
+                Ok(()) => {
+                    println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
+                    return Ok(());
+                }
+                Err(error) if error.to_string().contains(crate::updates::HANDOFF_REFUSED) => {
+                    eprintln!("note: the backend can't restart itself here ({error:#}); reloading from this shell instead");
+                }
+                Err(error) => return Err(error),
+            }
+        }
         warn_openrouter_key_lost(&hello);
         stop_backend(Some(d))?;
     }
@@ -847,15 +862,44 @@ fn reload() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ask the backend to run `reload` itself (`daemon.reload_handoff`), then wait for its
+/// replacement. A refusal (a message with `HANDOFF_REFUSED`) is returned as an error so the
+/// caller reloads the usual way; any other failure may have started the reload already, so it
+/// waits for a replacement rather than starting a second one.
+fn reload_handoff(d: &Discovery) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locating the muster binary")?;
+    let sent = client::rpc(d, "daemon.reload_handoff", serde_json::json!({ "exe": exe }));
+    if let Err(error) = &sent
+        && error.to_string().contains(crate::updates::HANDOFF_REFUSED)
+    {
+        return sent.map(|_| ());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(next) = paths::read_discovery().filter(|n| n.pid != d.pid && paths::pid_alive(n.pid))
+            && client::rpc(&next, "hello", serde_json::json!({})).is_ok()
+        {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(match sent {
+                Err(error) => error.context("the backend did not restart"),
+                Ok(_) => anyhow::anyhow!("the backend did not come back within 30 s; see {}", paths::log_path().display()),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The replacement backend gets this command's environment, so an OpenRouter key the running
 /// backend has and this shell doesn't is gone after the reload: say so (never refuse).
 fn warn_openrouter_key_lost(hello: &serde_json::Value) {
     let here = std::env::var(openrouter::ENV_KEY).ok().and_then(|v| openrouter::ApiKey::new(&v)).is_some();
     if hello["openrouter"]["key_present"] == true && !here {
         eprintln!(
-            "note: the running backend has an OpenRouter key and this shell has no {key}, so the restarted \
-             backend won't: OpenRouter agents won't start until it is restarted with it \
-             (`env {key}=… muster reload`). The UI's update button keeps the key.",
+            "note: the running backend has an OpenRouter key and this command's {key} is empty or unusable, so the \
+             restarted backend won't: OpenRouter agents won't start until it is restarted with one \
+             (`env {key}=… muster reload`).",
             key = openrouter::ENV_KEY
         );
     }

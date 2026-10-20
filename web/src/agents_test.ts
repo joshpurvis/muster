@@ -8,8 +8,11 @@ import {
   feedFor,
   firstLine,
   keepForKind,
+  MEMORY_FILE_MAX,
+  memoryFileNameError,
   memoryPathError,
   nameError,
+  readMemoryFile,
   unattendedWarning,
   upsertMessage,
 } from "./agents.ts";
@@ -128,6 +131,51 @@ Deno.test("dialog rules: names, memory paths, the unattended warning", () => {
   assertEquals(unattendedWarning("claude", ["human"]), false);
   assertEquals(unattendedWarning("claude", ["human", "schedule"]), true);
   assertEquals(unattendedWarning("codex", ["webhook"]), false);
+});
+
+Deno.test("adding files to memory/: names, size, text only", async () => {
+  assertEquals(memoryFileNameError("Style guide (v2).md"), null);
+  const u = (...cs: number[]) => String.fromCodePoint(...cs);
+  const bads = [
+    "",
+    ".env",
+    "..",
+    "a/b.md",
+    "a\\b",
+    `x${u(0x202e)}txt.exe`,
+    `zero${u(0x200b)}width`,
+    "nl\n.md",
+  ];
+  for (
+    const bad of [
+      ...bads,
+      " notes.md",
+      "notes.md ",
+      `no${u(0x34f)}tes.md`,
+      `e${u(0xfe0f)}.md`,
+      `t${u(0xe0041)}.md`,
+    ]
+  ) {
+    assertEquals(memoryFileNameError(bad) !== null, true, bad);
+  }
+  assertEquals(memoryFileNameError("a".repeat(201)) !== null, true);
+  // The new-note field: the same characters refused in every part.
+  assertEquals(memoryPathError(" people/ada.md "), null, "what was typed is trimmed");
+  for (const bad of [`no${u(0x34f)}tes.md`, "people /ada.md", `dir${u(0x2066)}/x.md`, "tab\t.md"]) {
+    assertEquals(memoryPathError(bad) !== null, true, bad);
+  }
+  const file = (name: string, body: BlobPart) => new File([body], name);
+  assertEquals(await readMemoryFile(file("notes.md", "# Notes\nhi")), { text: "# Notes\nhi" });
+  assertEquals(await readMemoryFile(file("bom.md", `${u(0xfeff)}hi`)), { text: "hi" });
+  assertEquals(await readMemoryFile(file("p.png", new Uint8Array([0x89, 0x50, 0xff, 0xfe]))), {
+    skip: "not a text file",
+  });
+  assertEquals(await readMemoryFile(file("nul.txt", "a\0b")), { skip: "not a text file" });
+  assertEquals(await readMemoryFile(file("big.log", "x".repeat(MEMORY_FILE_MAX + 1))), {
+    skip: "larger than 256 KB",
+  });
+  assertEquals("text" in await readMemoryFile(file("max.log", "x".repeat(MEMORY_FILE_MAX))), true);
+  assertEquals("skip" in await readMemoryFile(file(".hidden", "x")), true);
 });
 
 Deno.test("model and effort selects: Default, listed, custom; a kind switch drops what it doesn't list", () => {

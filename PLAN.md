@@ -198,7 +198,8 @@ of an agent's session rebuild its arguments from the record. Safe to run again.
 and pull the tab here, a context menu (Edit, Start fresh, Stop, Autostart, Remove), and a live
 message log (refusals in red; an entry opens the full message and reply). Jump lists every
 agent. A New / Edit dialog with templates (Blank, Orchestrator, Researcher, Reviewer, Background
-worker; defined in Rust, `agent.templates`) and a memory/ editor. Talking to an agent stays in
+worker; defined in Rust, `agent.templates`) and a memory/ editor (seeded by picking or
+dropping text files, `agent.memory.add`; files can be deleted). Talking to an agent stays in
 its terminal tab. Templates: the Researcher's "read-only plus web" is Claude **plan** mode, the
 only read-only Claude profile (it can't write memory/, so its persona asks it to list findings
 for memory/ until the human widens its mode).

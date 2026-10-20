@@ -36,6 +36,9 @@ pub struct StoredTerminal {
     pub token: String,
     pub port_base: u16,
     pub spec: muster_terminal_protocol::SpawnSpec,
+    /// Where `spec` had the OpenRouter key, stored empty (src/openrouter.rs `redact_spec`).
+    #[serde(default, skip_serializing_if = "crate::openrouter::KeyRefs::is_empty")]
+    pub key_refs: crate::openrouter::KeyRefs,
     pub pending: bool,
     pub retired: bool,
 }

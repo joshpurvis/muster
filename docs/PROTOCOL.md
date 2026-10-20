@@ -115,11 +115,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-<<<<<<< HEAD
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `openrouter`: see "OpenRouter", never the key itself) |
-=======
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
->>>>>>> master
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -626,9 +622,12 @@ spaces), read once when it starts. Then, before any thread starts, it leaves the
 environment together with every other variable holding it, so git, gh, the terminal host and
 sessions inherit none of it. It is held in memory only: never in the store, a log, `muster ls`,
 an MCP or RPC reply (clients get `hello.openrouter.key_present`), the persona files, or the
-launch records (every run's saved launch, whatever its provider, has the key replaced by a
-placeholder wherever it appears; it is put back only when that launch is re-sent to the terminal
-host). It stays readable in the backend's own `/proc/<pid>/environ` (only by you), which keeps
+launch records. Every run's saved launch, whatever its provider, has the variables Muster set to
+the key (`ANTHROPIC_AUTH_TOKEN` or `OPENROUTER_API_KEY`) stored empty and listed beside the launch
+(`key_refs`), and the key cut out of every other value and argument (a prompt that happened to
+contain it), for good. Re-sending a launch fills in only the listed variables, and only in a
+launch made for OpenRouter (`MUSTER_PROVIDER=openrouter`), so no text a user or an agent wrote can
+ask for the key. It stays readable in the backend's own `/proc/<pid>/environ` (only by you), which keeps
 the environment the process started with.
 
 **Setting or changing it.** Restart the backend with it, from a shell that has it:
@@ -648,7 +647,11 @@ backend to restart itself (`daemon.reload_handoff`): the backend runs `<its laun
 with its own environment plus its key, as the window's "Restart backend" banner does, so the key
 carries over without passing through argv, a file or a reply. The backend does this only when
 the command is the binary it was started from (compared as canonical paths); otherwise the
-command reloads from its own environment and prints that the key is dropped. `muster stop` then
+command reloads from its own environment and prints that the key is dropped. A command that can't
+see the backend's process (Claude Code's Bash in an OpenRouter session runs in its own PID
+namespace) always has the backend restart itself, since it couldn't stop it; there an
+`OPENROUTER_API_KEY` set in the command is refused. Such a command finds the backend by its
+discovery file and token: the backend's `hello` must report the pid the file names. `muster stop` then
 `env OPENROUTER_API_KEY=… muster` works too, but ends every session.
 
 **Inherited settings.** Every session's inherited environment loses `OPENROUTER_API_KEY` and
@@ -716,9 +719,9 @@ switch to `openrouter` are refused the same way.
 **Recovery.** A launch prepared before a backend crash is completed by the next backend. If the
 terminal host already started it, the next backend adopts that process as it runs and never
 re-sends the launch (with the key since changed or gone, the host would refuse a different
-launch, and a refused run is retired). One the host never started, prepared for OpenRouter, waits
-while the backend has no key (nothing runs; starting that session says it waits for the key) and
-is sent with the key by a backend that has one.
+launch, and a refused run is retired). One the host never started, prepared for OpenRouter
+(`key_refs` not empty), waits while the backend has no key (nothing runs; starting that session
+says it waits for the key) and is sent with the key by a backend that has one.
 
 **The model list** (`openrouter.models`). The backend fetches `https://openrouter.ai/api/v1/models`
 (public, no key; curl, https only, 20 s, at most 16 MB read as it arrives, the process killed past
@@ -824,7 +827,7 @@ watcher and no polling by clients.
 
 | Method | Params | Result |
 |---|---|---|
-| `daemon.reload_handoff` | `{exe}` | `{exe}`. `muster reload` from a shell without `OPENROUTER_API_KEY` while this backend has a key (see "OpenRouter"): the backend runs `<its launch path> reload` detached with its own environment plus its key, as `daemon.reload` does, so the key carries over. Refused (an error starting `handoff refused:`, after which the CLI reloads the usual way) without a key, without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
+| `daemon.reload_handoff` | `{exe}` | `{exe}`. The backend restarts itself: it runs `<its launch path> reload` detached with its own environment plus its OpenRouter key (if any), as `daemon.reload` does. `muster reload` asks for it when run without `OPENROUTER_API_KEY` while the backend has a key (so the key carries over), and always from a command that can't see the backend's process (a sandboxed command in its own PID namespace, which couldn't signal it). Refused (an error starting `handoff refused:`; the CLI then reloads the usual way where it can) without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
 | `prefs.get` | `{}` | `{decorations, shell?, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |

@@ -586,11 +586,11 @@ impl Hub {
                     }
                     // Never started, and it needs a key this backend doesn't have: keep it
                     // pending (nothing runs) until a backend with the key recovers it.
-                    if crate::openrouter::needs_key(&record.spec) && cfg.openrouter_key.is_none() {
+                    if !record.key_refs.is_empty() && cfg.openrouter_key.is_none() {
                         tracing::warn!(run = ?record.spec.run, "an OpenRouter launch waits for {}", crate::openrouter::ENV_KEY);
                         continue;
                     }
-                    match host.spawn(crate::openrouter::restore_spec(record.spec.clone(), cfg.openrouter_key.as_ref())) {
+                    match host.spawn(crate::openrouter::restore_spec(record.spec.clone(), &record.key_refs, cfg.openrouter_key.as_ref())) {
                         Ok(_) => record.pending = false,
                         // A definite per-run rejection (its program or cwd vanished during
                         // the outage) retires only that launch; the others still recover.
@@ -2780,7 +2780,7 @@ impl Hub {
             let records = self.terminal_records.lock();
             if let Some(record) = records.get(&id) {
                 anyhow::ensure!(!record.retired, "session {id}'s previous terminal is still being retired; retry after cleanup");
-                if record.pending && crate::openrouter::needs_key(&record.spec) && self.openrouter_key().is_none() {
+                if record.pending && !record.key_refs.is_empty() && self.openrouter_key().is_none() {
                     return Err(crate::openrouter::missing_key_error()
                         .context(format!("session {id}'s previous launch, prepared for OpenRouter, waits for the key")));
                 }
@@ -2866,8 +2866,9 @@ impl Hub {
         crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
         complete_env.extend(env);
         self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
+        let mut injected = Vec::new();
         if let Some(key) = &openrouter {
-            crate::openrouter::apply_session_env(info.kind, key, &mut complete_env)?;
+            injected = crate::openrouter::apply_session_env(info.kind, key, &mut complete_env)?;
             if info.kind == SessionKind::Claude {
                 // Its hooks lose MUSTER_TOKEN to Claude Code's credential scrub: they read it here.
                 paths::write_private(&session_dir.join(crate::hookcmd::TOKEN_FILE), token.as_bytes())?;
@@ -2877,11 +2878,12 @@ impl Hub {
             run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
             env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
         };
-        // No stored launch record holds the key, whatever the session's provider (put back when
-        // re-sent: restore_spec).
+        // No stored launch record holds the key, whatever the session's provider; only the
+        // variables Muster set to it are filled in again when it is re-sent (restore_spec).
+        let (stored_spec, key_refs) = crate::openrouter::redact_spec(launch.clone(), self.openrouter_key(), &injected);
         let mut record = StoredTerminal {
             host_instance: host.client.hello.instance.clone(), token: token.clone(), port_base,
-            spec: crate::openrouter::redact_spec(launch.clone(), self.openrouter_key()), pending: true, retired: false,
+            spec: stored_spec, key_refs, pending: true, retired: false,
         };
         let previous = {
             let mut g = self.inner.lock();
@@ -3665,14 +3667,14 @@ impl Hub {
         let pending: Vec<_> = self.terminal_records.lock().iter()
             .filter(|(_, r)| r.pending && !r.retired && r.host_instance == host.client.hello.instance)
             // Deferred until a backend with the OpenRouter key (see `Hub::new`).
-            .filter(|(_, r)| key.is_some() || !crate::openrouter::needs_key(&r.spec))
+            .filter(|(_, r)| key.is_some() || r.key_refs.is_empty())
             .map(|(id, r)| (*id, r.clone())).collect();
         for (id, mut record) in pending {
             let run = record.spec.run;
             // A start still in progress handles its own acknowledgement.
             let idle = self.inner.lock().sessions.get(&id).is_some_and(|e| !e.busy && e.generation == run.generation);
             if !idle { continue }
-            let result = host.spawn(crate::openrouter::restore_spec(record.spec.clone(), key));
+            let result = host.spawn(crate::openrouter::restore_spec(record.spec.clone(), &record.key_refs, key));
             let mut g = self.inner.lock();
             let mut records = self.terminal_records.lock();
             if !records.get(&id).is_some_and(|r| r.spec.run == run && r.pending && !r.retired) { continue }
@@ -4309,7 +4311,7 @@ mod tests {
     }
 
     fn remember_launch(hub: &Hub, pending: bool) {
-        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(),
+        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(), key_refs: Default::default(),
             port_base: 20000, pending, retired: false,
             spec: SpawnSpec { run: RunId { id: 1, generation: 42 }, program: "/bin/true".into(),
                 args: vec![], env: BTreeMap::new(), cwd: std::env::temp_dir(), cols: 80, rows: 24 } };
@@ -4371,7 +4373,7 @@ mod tests {
     #[test]
     fn hook_count_state_and_grace_are_checkpointed_without_duplicate_effects() {
         let hub = move_fixture();
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: "/".into(), cols: 80, rows: 24 } };
@@ -4412,7 +4414,7 @@ mod tests {
         let hub = move_fixture();
         let directory = std::env::temp_dir().join(format!("muster-input-boundary-{}", paths::random_token()));
         let mut inbox = crate::hook_inbox::Inbox::open(&directory.join("hooks.sqlite")).unwrap();
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: RunId { id: 2, generation: 42 }, program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };
@@ -4608,11 +4610,16 @@ mod tests {
         let key = ApiKey::new(KEY).unwrap();
         let run = RunId { id: 2, generation: 42 };
         // A launch prepared for OpenRouter, saved (redacted) before a crash.
-        let prepared = |key: &ApiKey| StoredTerminal { host_instance: "input-host".into(), token: "run-token".into(),
-            port_base: 20000, pending: true, retired: false,
-            spec: crate::openrouter::redact_spec(SpawnSpec { run, program: "/bin/true".into(), args: vec![],
-                env: BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".to_string(), key.expose().to_string())]),
-                cwd: std::env::temp_dir(), cols: 80, rows: 24 }, Some(key)) };
+        let prepared = |key: &ApiKey| {
+            let (spec, key_refs) = crate::openrouter::redact_spec(SpawnSpec { run, program: "/bin/true".into(), args: vec![],
+                env: BTreeMap::from([
+                    ("ANTHROPIC_AUTH_TOKEN".to_string(), key.expose().to_string()),
+                    ("MUSTER_PROVIDER".to_string(), "openrouter".to_string()),
+                ]),
+                cwd: std::env::temp_dir(), cols: 80, rows: 24 }, Some(key), &["ANTHROPIC_AUTH_TOKEN".to_string()]);
+            StoredTerminal { host_instance: "input-host".into(), token: "run-token".into(),
+                port_base: 20000, pending: true, retired: false, spec, key_refs }
+        };
         let status = |directory: &Path| muster_terminal_protocol::TerminalStatus { run, pid: Some(1), alive: true,
             drained: false, has_processes: true, exit_code: None, title: None, cols: 80, rows: 24, output_seq: 0,
             last_output_at: 0, application_cursor: false, log_persisted: true, cwd: directory.to_owned() };
@@ -4669,7 +4676,7 @@ mod tests {
         let (service, directory, received) = crate::terminal::testing::serving_host("hub-hot-path");
         let hub = move_fixture();
         let terminal = install_terminal(&hub, &service, 2, 42, &directory);
-        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(),
+        let record = StoredTerminal { host_instance: "fixture".into(), token: "callback-token".into(), key_refs: Default::default(),
             port_base: 20000, pending: false, retired: false,
             spec: SpawnSpec { run: terminal.run(), program: "/bin/true".into(), args: vec![],
                 env: BTreeMap::new(), cwd: directory.clone(), cols: 80, rows: 24 } };

@@ -1,7 +1,7 @@
 // End-to-end smoke test for the muster daemon. Run through scripts/smoke.sh, which builds the
 // binary, makes a temp dir and passes scoped Deno permissions:
 //   deno run --allow-net=127.0.0.1 --allow-read=<tmp>,<bin> --allow-write=<tmp> \
-//            --allow-run=<bin>,git,python3 scripts/smoke.ts <tmp> <bin>
+//            --allow-run=<bin>,git,python3,unshare scripts/smoke.ts <tmp> <bin>
 // The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
 // Never uses port 7433 or the default data dirs.
 
@@ -1252,6 +1252,38 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
   c = await connect();
   ok((await c.call("hello")).openrouter.key_present === true, "openrouter: ...and it still has the key");
   c.close();
+  // From a command in its own PID namespace (Claude Code's Bash under its credential scrub, in an
+  // OpenRouter session) the backend's pid isn't visible: `muster ls` still finds the backend
+  // and `muster reload` has the backend restart itself (it can't signal it from there).
+  const sandboxed = (args: string[]) =>
+    new Deno.Command("unshare", {
+      args: ["--user", "--map-current-user", "--pid", "--fork", "--mount-proc", BIN, ...args],
+      env: ENV,
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+    }).output().catch(() => null);
+  const probe = await sandboxed(["status"]);
+  if (probe === null || (!probe.success && dec.decode(probe.stderr).includes("unshare"))) {
+    console.log("  skip  openrouter: no unprivileged PID namespaces here (unshare)");
+  } else {
+    const ls = await sandboxed(["ls", "--json"]);
+    ok(ls?.success && Array.isArray(JSON.parse(dec.decode(ls.stdout))), `openrouter: \`muster ls\` from a PID namespace finds the backend: ${
+      ls && dec.decode(ls.stderr).slice(0, 200)
+    }`);
+    const pidBefore = await pidNow();
+    const hidden = await sandboxed(["reload"]);
+    ok(
+      hidden?.success && dec.decode(hidden.stdout).includes("restarted by the backend itself"),
+      `openrouter: \`muster reload\` from a PID namespace has the backend restart itself: ${
+        hidden && dec.decode(hidden.stdout).slice(0, 200)
+      } ${hidden && dec.decode(hidden.stderr).slice(0, 300)}`,
+    );
+    ok((await pidNow()) !== pidBefore, "openrouter: ...a new backend runs");
+    c = await connect();
+    ok((await c.call("hello")).openrouter.key_present === true, "openrouter: ...still with the key");
+    c.close();
+  }
   // Set empty: the command clears it (and says so).
   const cleared = await cli(["reload"], { ...ENV, OPENROUTER_API_KEY: "" });
   ok(

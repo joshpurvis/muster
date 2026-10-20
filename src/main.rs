@@ -709,7 +709,29 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
 /// The running daemon, if its discovery file is fresh and it answers.
 fn find_daemon() -> Option<Discovery> {
     let d = paths::read_discovery()?;
-    (paths::pid_alive(d.pid) && is_muster_process(d.pid) && client::healthy(d.port)).then_some(d)
+    (backend_alive(&d) && client::healthy(d.port)).then_some(d)
+}
+
+/// Is the backend `d` names running? By its pid where this process can see it. A command run in
+/// its own PID namespace can't (Claude Code's Bash under `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`, in
+/// an OpenRouter session): there the backend must answer its token-authenticated `hello` with
+/// that pid, which a stale discovery file or a recycled pid can't fake.
+fn backend_alive(d: &Discovery) -> bool {
+    if paths::pid_alive(d.pid) {
+        return is_muster_process(d.pid);
+    }
+    backend_answers_as(d)
+}
+
+/// The backend at `d.port` knows `d.token` and reports `d.pid` as its own.
+fn backend_answers_as(d: &Discovery) -> bool {
+    client::rpc_with_timeout(d, "hello", serde_json::json!({}), Duration::from_secs(5))
+        .is_ok_and(|h| h["pid"].as_u64() == Some(d.pid as u64))
+}
+
+/// The backend runs but this process can't see (or signal) it: see [`backend_alive`].
+fn backend_hidden(d: &Discovery) -> bool {
+    !paths::pid_alive(d.pid) && backend_answers_as(d)
 }
 
 fn running() -> anyhow::Result<Discovery> {
@@ -831,7 +853,7 @@ fn stop() -> anyhow::Result<()> {
 /// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
 /// compatible host and the same backend identity immediately before signalling.
 fn reload() -> anyhow::Result<()> {
-    let discovery = paths::read_discovery().filter(|d| paths::pid_alive(d.pid) && is_muster_process(d.pid));
+    let discovery = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &discovery {
         let hello = client::rpc(d, "hello", serde_json::json!({}))
             .context("cannot verify restart safety; backend left running")?;
@@ -839,6 +861,19 @@ fn reload() -> anyhow::Result<()> {
             &paths::runtime_dir().join("terminal.sock"), &paths::data_dir().join("terminal"),
         ).context("cannot verify a compatible terminal host; backend left running")?;
         check_reload(&hello, &host.client.hello, &paths::lock_path())?;
+        // From a PID namespace this command can't stop the backend (nor see its replacement's
+        // process), so the backend restarts itself, keeping its environment.
+        if backend_hidden(d) {
+            anyhow::ensure!(
+                std::env::var_os(openrouter::ENV_KEY).is_none(),
+                "this command runs where Muster's backend process isn't visible (a sandboxed command), so the backend \
+                 has to restart itself with its own environment; {} set here can't be applied. Run it outside the sandbox",
+                openrouter::ENV_KEY
+            );
+            reload_handoff(d)?;
+            println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
+            return Ok(());
+        }
         // The replacement gets this command's environment. When that has no OpenRouter key and
         // the backend has one (only in its memory), the backend restarts itself instead, so the
         // key carries over. OPENROUTER_API_KEY set here, even empty, replaces (or clears) it.
@@ -876,7 +911,7 @@ fn reload_handoff(d: &Discovery) -> anyhow::Result<()> {
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(next) = paths::read_discovery().filter(|n| n.pid != d.pid && paths::pid_alive(n.pid))
+        if let Some(next) = paths::read_discovery().filter(|n| n.pid != d.pid && backend_alive(n))
             && client::rpc(&next, "hello", serde_json::json!({})).is_ok()
         {
             return Ok(());
@@ -923,6 +958,9 @@ fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_prot
 }
 
 fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
+    if let Some(d) = paths::read_discovery().filter(backend_hidden) {
+        anyhow::bail!("Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); stop it from outside", d.pid);
+    }
     let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
         println!("muster daemon: not running");
         return Ok(());

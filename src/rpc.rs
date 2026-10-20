@@ -102,6 +102,9 @@ pub fn hello(hub: &Hub) -> Value {
         "terminal_host": hub.terminal_host_info(),
         "updates": hub.updates().status(),
         "prefs": hub.ui_prefs(),
+        // The backend's own pid, so a CLI that can't see it (a sandboxed command in its own PID
+        // namespace) can still tell the discovery file names this backend.
+        "pid": std::process::id(),
         // Whether the backend has an OpenRouter key; never the key itself.
         "openrouter": { "key_present": hub.openrouter_key().is_some() },
     })
@@ -322,9 +325,6 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 exe: std::path::PathBuf,
             }
             let p: P = parse(params)?;
-            if hub.openrouter_key().is_none() {
-                return Err(RpcError(format!("{} this backend has no OpenRouter key to hand on", crate::updates::HANDOFF_REFUSED)));
-            }
             let exe = crate::updates::reload_handoff(hub, &p.exe)?;
             Ok(json!({ "exe": exe.to_string_lossy() }))
         }
@@ -2025,7 +2025,8 @@ mod tests {
         // The key handoff: refused (so the CLI reloads the usual way) without a key, without a
         // known launch path, and for a binary other than the one the backend started from.
         let e = call(&hub, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
-        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("no OpenRouter key"), "{e}");
+        assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("launched from"), "{e}");
+        assert_eq!(h["pid"], std::process::id());
         let (keyed, _st) = fixture_keyed(crate::openrouter::ApiKey::new("sk-or-rpc-fixture-secret"));
         let e = call(&keyed, "daemon.reload_handoff", json!({"exe": "/bin/true"})).await.unwrap_err();
         assert!(e.contains(crate::updates::HANDOFF_REFUSED) && e.contains("launched from"), "{e}");

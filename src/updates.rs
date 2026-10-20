@@ -198,10 +198,10 @@ fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter:
 pub const HANDOFF_REFUSED: &str = "handoff refused:";
 
 /// `daemon.reload_handoff {exe}`: `muster reload` from a shell without `OPENROUTER_API_KEY`
-/// while this backend has a key. The key is only in this backend's memory, so instead of the
-/// command starting the replacement (with its own environment, so without the key) this backend
-/// runs `<launch path> reload` itself, as the update banner does: the replacement gets this
-/// backend's environment and its key. Only when the command is the build this backend was
+/// while this backend has a key (the key is only in this backend's memory), or from a sandboxed
+/// command that can't see or signal this backend's process. Instead of the command starting the
+/// replacement, this backend runs `<launch path> reload` itself, as the update banner does: the
+/// replacement gets this backend's environment and its key, if any. Only when the command is the build this backend was
 /// started from (`exe`, compared as canonical paths), so the same build is restarted as a
 /// reload typed there would have.
 pub fn reload_handoff(hub: &Arc<Hub>, exe: &Path) -> anyhow::Result<PathBuf> {

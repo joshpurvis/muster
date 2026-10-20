@@ -1,4 +1,4 @@
-import { change, highlightOf, isEmpty, type KitChartSpec, lineBounds, nearestPoint, stackBars, tipLeft, yDomain, yTicks } from "./chart.ts";
+import { change, endLabel, highlightOf, isEmpty, type KitChartSpec, lineBounds, nearestPoint, stackBars, tipLeft, yDomain, yTicks } from "./chart.ts";
 import { check, eq } from "../apps/shared/test_util.ts";
 
 const spec = (o: Partial<KitChartSpec>): KitChartSpec => ({ type: "bar", x: { values: ["a", "b", "c"] }, series: [], ...o });
@@ -76,4 +76,11 @@ Deno.test("tooltip placement: right of the point, else left of it, always inside
   eq(tipLeft(500, 472, 180, 600), 292);
   eq(tipLeft(120, 92, 180, 240), 0);
   eq(tipLeft(20, -8, 400, 300), 0);
+});
+
+Deno.test("end labels fit their room: whole, shortened, or the legend instead", () => {
+  eq(endLabel("p95", "182 ms", 150), "p95");
+  const cut = endLabel("checkout-service-production-eu-west", "2.1%", 150)!;
+  check(cut.endsWith("…") && (cut.length + 1 + 4) * 6.4 <= 150, cut);
+  eq(endLabel("checkout-service", "1,234,567.89 ms", 60), null);
 });

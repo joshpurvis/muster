@@ -110,6 +110,29 @@
         return compact(v, extra);
     }
   }
+  function fmtFull(v, f) {
+    if (v === null || v === void 0 || typeof v === "number" && !Number.isFinite(v)) return "\u2013";
+    if (typeof v !== "number") return String(v);
+    const a = Math.abs(v), sign = v < 0 ? "\u2212" : "";
+    switch (f) {
+      case "plain":
+        return minus(String(Number(v.toFixed(6))));
+      case "int":
+        return sign + grouped(Math.abs(Math.round(v)), 0);
+      case "usd": {
+        const cents = Math.round(a * 100) % 100 !== 0;
+        return sign + "$" + grouped(a, cents ? 2 : 0, cents ? 2 : 0);
+      }
+      case "pct":
+        return sign + grouped(a, 6) + "%";
+      case "ms":
+        return sign + grouped(a, 3) + " ms";
+      case "s":
+        return sign + grouped(a, 3) + " s";
+      default:
+        return sign + grouped(a, a !== 0 && a < 1 ? 8 : 6);
+    }
+  }
   function decimals(step) {
     if (!(step > 0) || !Number.isFinite(step)) return 0;
     for (let d = 0; d <= 20; d++) {
@@ -157,13 +180,14 @@
     if (f === "s" && raw >= 1) step = CLOCK.find((s) => s >= raw) ?? 86400 * Math.ceil(raw / 86400);
     else {
       const p = 10 ** Math.floor(Math.log10(raw));
+      const whole = f === "int";
       step = [
         1,
         2,
         2.5,
         5,
         10
-      ].map((m) => m * p).find((s) => s >= raw * (1 - 1e-9)) ?? 10 * p;
+      ].map((m) => m * p).filter((s) => !whole || s >= 1 && Number.isInteger(s)).find((s) => s >= raw * (1 - 1e-9)) ?? (whole ? Math.max(1, 10 * p) : 10 * p);
     }
     const d = Math.min(20, decimals(step));
     const min = Number((Math.floor(lo / step + 1e-9) * step).toFixed(d));
@@ -203,7 +227,7 @@
       });
       if (distinct && exact) return labels;
     }
-    return ticks.map((t) => fmt(t, f, 3));
+    return ticks.map((t) => fmt(t, f === "int" && !Number.isInteger(t) ? void 0 : f, 3));
   }
   function parseLabel(label) {
     const m = /^(−|-)?\$?([\d,]*\.?\d+(?:e-?\d+)?)([kMBT])?%?$/.exec(label.trim());
@@ -509,6 +533,18 @@
       bot: stack ? stack[si].map((b) => b?.[0] ?? 0) : null
     }));
   }
+  var END_MAX = 150;
+  var END_CHAR = 6.4;
+  function endLabel(name, value, width) {
+    const room = Math.floor((width - 4) / END_CHAR) - value.length - 1;
+    if ([
+      ...name
+    ].length <= room) return name;
+    if (room < 4) return null;
+    return [
+      ...name
+    ].slice(0, room - 1).join("").trimEnd() + "\u2026";
+  }
   function change(v, p, pct) {
     if (v === null || p === null || p === void 0 || !Number.isFinite(v) || !Number.isFinite(p)) return null;
     if (pct) return `${v - p >= 0 ? "+" : "\u2212"}${Math.abs(v - p).toFixed(2)} pt`;
@@ -549,12 +585,17 @@
     const { lo, hi } = yDomain(spec, vis.length ? vis : series, n);
     const yt = yTicks(spec, lo, hi, height < 150 ? 2 : height < 260 ? 3 : 4);
     const ylabels = tickLabels(yt.ticks, spec.format);
-    const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
+    let endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
     const last = (s) => {
       for (let i = n - 1; i >= 0; i--) if (s.values[i] !== null) return i;
       return -1;
     };
-    const endW = endLabels ? Math.min(150, Math.max(...vis.map((s) => (s.name.length + F(s.values[last(s)] ?? null).length + 1) * 6.4)) + 16) : 0;
+    const endValue = (s) => F(s.values[last(s)] ?? null);
+    let endW = endLabels ? Math.min(END_MAX, Math.max(...vis.map((s) => (s.name.length + endValue(s).length + 1) * END_CHAR)) + 16) : 0;
+    if (endLabels && vis.some((s) => !endLabel(s.name, endValue(s), endW))) {
+      endLabels = false;
+      endW = 0;
+    }
     const m = {
       top: spec.y?.label || spec.annotations?.length ? 28 : 14,
       right: 12 + endW,
@@ -571,7 +612,7 @@
     if (numericX && type !== "bar") {
       const nx = xs;
       const xl = Math.min(...nx), xh = Math.max(...nx);
-      const t = niceTicks(xl, xh, Math.max(2, Math.floor(pw / 100)));
+      const t = niceTicks(xl, xh, Math.max(2, Math.floor(pw / 100)), spec.xFormat);
       const [d0, d1] = type === "scatter" ? [
         t.min,
         t.max
@@ -773,7 +814,10 @@
         if (over > 0) labs.forEach((l) => {
           l.y -= over;
         });
-        labs.forEach((l) => P.push(`<text class="end" x="${m.left + pw + 10}" y="${(l.y + 4).toFixed(1)}" style="fill:${isCtx(l.s) ? "var(--mk-text-2)" : scol(l.s)}">${esc(l.s.name)} <tspan class="n">${esc(F(l.v))}</tspan></text>`));
+        labs.forEach((l) => {
+          const name = endLabel(l.s.name, F(l.v), endW);
+          P.push(`<text class="end" x="${m.left + pw + 10}" y="${(l.y + 4).toFixed(1)}" style="fill:${isCtx(l.s) ? "var(--mk-text-2)" : scol(l.s)}">${name === l.s.name ? "" : `<title>${esc(l.s.name)}</title>`}${esc(name)} <tspan class="n">${esc(F(l.v))}</tspan></text>`);
+        });
       }
     }
     P.push(`<line class="base" x1="${m.left}" x2="${m.left + pw}" y1="${zero.toFixed(1)}" y2="${zero.toFixed(1)}"/>`);
@@ -818,7 +862,7 @@
       tip = `<div class="x">${esc(XF(xs[focus]))}${deltas ? `<span>vs ${esc(XF(xs[prev]))}</span>` : ""}</div>` + rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i><span class="n">${esc(r.s.name)}</span><b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("");
       live = `${XF(xs[focus])}: ` + rows.map((r) => `${r.s.name} ${F(r.v)}${r.d ? ` (${r.d} vs ${XF(xs[prev])})` : ""}`).join(", ");
     }
-    const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(typeof x === "number" ? fmtFull(x, spec.xFormat || (intX ? "plain" : void 0)) : x)}</th>${series.map((s) => `<td>${esc(fmtFull(s.values[i] ?? null, spec.format))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
     let dom = st.dom;
     if (!dom || !el.contains(dom.svg)) {
       el.innerHTML = `<figure><svg role="img" tabindex="0"></svg></figure><div class="mk-sr mk-live" aria-live="polite"></div><div id="${id}-data"></div>`;

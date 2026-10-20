@@ -32,6 +32,8 @@ let sendSeq = 0;
 let outward: { action: CustomAction; pr: Item } | null = null;
 /** The quick-win card whose Merge is being confirmed (the same armed gate as outward actions). */
 let merging: Item | null = null;
+/** Where the keyboard goes back to when a Merge confirm closes: what opened it. */
+let mergeReturn: string | null = null;
 /** Show only the quick wins. */
 let quickOnly = false;
 /** "Your actions" unfolded in a small panel; the shortcut list shown. */
@@ -107,6 +109,9 @@ function openMerge(pr: Item | null) {
   const blocked = quickMergeBlocked(pr, sent.has(`merge:${pr.number}`));
   if (blocked) { notice = { text: blocked, tone: "warning" }; render(); return; }
   outward = null;
+  // Back to what opened it: the action bar's Merge, or the card (its own Merge is pointer-only).
+  const from = document.activeElement as HTMLElement | null;
+  mergeReturn = from?.id && from !== document.body && !(from.id.startsWith("merge-") && from.id !== "merge-selected") ? from.id : `pr-${pr.number}`;
   merging = pr;
   gate.openTarget(quickTarget(view.repo, pr));
   notice = null;
@@ -169,12 +174,27 @@ function confirmOutward() {
 
 /** Close the open confirm (an outward action's or a Merge) and hand the keyboard back. */
 function cancelConfirm() {
-  const back = outward ? `act-${outward.action.id}` : merging ? "merge" : null;
+  const back = confirmTrigger();
   outward = null;
   merging = null;
   gate.close();
   render();
-  if (back) document.getElementById(back)?.focus();
+  focusBack(back);
+}
+
+/** The control that opened the confirm now open, as [id, card id to fall back on]. */
+function confirmTrigger(): [string, string] | null {
+  if (outward) return [`act-${outward.action.id}`, `pr-${outward.pr.number}`];
+  if (merging) return [mergeReturn ?? `pr-${merging.number}`, `pr-${merging.number}`];
+  return null;
+}
+
+/** Focus never falls to the page when a confirm closes (Enter there would open a PR). */
+function focusBack(back: [string, string] | null) {
+  if (!back) return;
+  const el = document.getElementById(back[0]) as HTMLButtonElement | null;
+  if (el && !el.disabled) el.focus();
+  else (document.getElementById(back[1]) ?? document.getElementById("filter"))?.focus();
 }
 
 function select(n: number, focus = true) {
@@ -415,6 +435,8 @@ startApp({
     const before = selected;
     selected = followCurrent(selected, view?.current, next.current, focusedCard() !== null);
     const moved = selected !== before;
+    // A confirm this update cancels hands the keyboard back to what opened it.
+    const trigger = document.activeElement?.closest(".drawer") ? confirmTrigger() : null;
     if (outward) {
       const a = next.actions.find((x) => x.id === outward!.action.id);
       const pr = next.prs.find((x) => x.number === outward!.pr.number);
@@ -434,6 +456,7 @@ startApp({
     view = next;
     warnings = r.warnings;
     render();
+    if (trigger && !outward && !merging) focusBack(trigger);
     // Show where the selection went (focus stays where the user left it).
     if (moved && selected !== null) reveal(document.getElementById(`pr-${selected}`), document.querySelector(".actions"));
   },

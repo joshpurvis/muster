@@ -1726,10 +1726,10 @@ button.quick-toggle { flex: none; }
     return `${Math.floor(d / 30)}mo`;
   }
   function summary(prs) {
-    const open2 = prs.filter((p) => groupOf(p) !== "done");
+    const open2 = prs.filter((p) => p.status !== "merged");
     return {
       open: open2.length,
-      quick: open2.filter((p) => p.quick_win).length,
+      quick: quickWins(prs).length,
       failing: open2.filter((p) => p.checks === "failing").length,
       review: open2.filter((p) => p.review === "REVIEW_REQUIRED").length,
       held: prs.filter((p) => p.status === "held").length,
@@ -1819,6 +1819,7 @@ button.quick-toggle { flex: none; }
   var sendSeq = 0;
   var outward = null;
   var merging = null;
+  var mergeReturn = null;
   var quickOnly = false;
   var actionsOpen = false;
   var showKeys = false;
@@ -2013,6 +2014,8 @@ button.quick-toggle { flex: none; }
       return;
     }
     outward = null;
+    const from = document.activeElement;
+    mergeReturn = from?.id && from !== document.body && !(from.id.startsWith("merge-") && from.id !== "merge-selected") ? from.id : `pr-${pr.number}`;
     merging = pr;
     gate.openTarget(quickTarget(view.repo, pr));
     notice = null;
@@ -2102,12 +2105,29 @@ button.quick-toggle { flex: none; }
     document.getElementById(`act-${action.id}`)?.focus();
   }
   function cancelConfirm() {
-    const back = outward ? `act-${outward.action.id}` : merging ? "merge" : null;
+    const back = confirmTrigger();
     outward = null;
     merging = null;
     gate.close();
     render();
-    if (back) document.getElementById(back)?.focus();
+    focusBack(back);
+  }
+  function confirmTrigger() {
+    if (outward) return [
+      `act-${outward.action.id}`,
+      `pr-${outward.pr.number}`
+    ];
+    if (merging) return [
+      mergeReturn ?? `pr-${merging.number}`,
+      `pr-${merging.number}`
+    ];
+    return null;
+  }
+  function focusBack(back) {
+    if (!back) return;
+    const el = document.getElementById(back[0]);
+    if (el && !el.disabled) el.focus();
+    else (document.getElementById(back[1]) ?? document.getElementById("filter"))?.focus();
   }
   function select(n, focus = true) {
     const old = selected;
@@ -2568,6 +2588,7 @@ button.quick-toggle { flex: none; }
       const before = selected;
       selected = followCurrent(selected, view?.current, next2.current, focusedCard() !== null);
       const moved = selected !== before;
+      const trigger = document.activeElement?.closest(".drawer") ? confirmTrigger() : null;
       if (outward) {
         const a = next2.actions.find((x) => x.id === outward.action.id);
         const pr = next2.prs.find((x) => x.number === outward.pr.number);
@@ -2596,6 +2617,7 @@ button.quick-toggle { flex: none; }
       view = next2;
       warnings = r.warnings;
       render();
+      if (trigger && !outward && !merging) focusBack(trigger);
       if (moved && selected !== null) reveal(document.getElementById(`pr-${selected}`), document.querySelector(".actions"));
     }
   });

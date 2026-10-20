@@ -1,6 +1,6 @@
 import {
   quickMergeBlocked, quickMergeEvent, quickTarget, quickWins,
-  age, arrange, followCurrent, canHold, holdEvent, type Item, matches, nextEvent, nextPr, openEvent, type Overview, queue, sortPrs, tally, validateOverview,
+  age, arrange, followCurrent, canHold, holdEvent, type Item, matches, nextEvent, nextPr, openEvent, type Overview, queue, sortPrs, summary, tally, validateOverview,
 } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
@@ -169,4 +169,13 @@ Deno.test("quick wins: the merge event has pr_decision's shape and the card's ex
     check(quickTarget("acme/api", { ...w, ...change } as never) !== t, JSON.stringify(change));
   }
   check(quickTarget("acme/web", w) !== t, "another repo");
+});
+
+Deno.test("summary: open counts every PR not merged yet, with its checks and reviews", () => {
+  const o = valid(sampleOverview);
+  const st = (n: number, status: string) => ({ ...o.prs.find((p) => p.number === n)!, status } as Item);
+  const c = summary([st(812, "changes_requested"), st(801, "queued"), st(820, "merging"), st(815, "merged")]);
+  eq([c.open, c.failing, c.review, c.merged], [3, 1, 1, 1]);
+  const all = summary(o.prs);
+  eq([all.open, all.quick], [4, quickWins(o.prs).length]);
 });

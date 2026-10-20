@@ -105,6 +105,23 @@ export function fmt(v: unknown, f?: string, extra = 0): string {
   }
 }
 
+/** A number in format `f` written out in full (no k/M/B, durations in their own unit), for a
+ * data table where neighbouring values must stay apart: 12,345 · $1,234,567.89 · 0.3412% · 61,250 ms. */
+export function fmtFull(v: unknown, f?: string): string {
+  if (v === null || v === undefined || (typeof v === "number" && !Number.isFinite(v))) return "–";
+  if (typeof v !== "number") return String(v);
+  const a = Math.abs(v), sign = v < 0 ? "−" : "";
+  switch (f) {
+    case "plain": return minus(String(Number(v.toFixed(6))));
+    case "int": return sign + grouped(Math.abs(Math.round(v)), 0);
+    case "usd": { const cents = Math.round(a * 100) % 100 !== 0; return sign + "$" + grouped(a, cents ? 2 : 0, cents ? 2 : 0); }
+    case "pct": return sign + grouped(a, 6) + "%";
+    case "ms": return sign + grouped(a, 3) + " ms";
+    case "s": return sign + grouped(a, 3) + " s";
+    default: return sign + grouped(a, a !== 0 && a < 1 ? 8 : 6);
+  }
+}
+
 /** Decimal places that show `step` exactly (0.25 → 2, 2.5 → 1, 500 → 0). */
 export function decimals(step: number): number {
   if (!(step > 0) || !Number.isFinite(step)) return 0;
@@ -134,7 +151,10 @@ export function niceTicks(lo: number, hi: number, n = 4, f?: string): Ticks {
   if (f === "s" && raw >= 1) step = CLOCK.find((s) => s >= raw) ?? 86400 * Math.ceil(raw / 86400);
   else {
     const p = 10 ** Math.floor(Math.log10(raw));
-    step = [1, 2, 2.5, 5, 10].map((m) => m * p).find((s) => s >= raw * (1 - 1e-9)) ?? 10 * p;
+    // Whole numbers ("int") get whole steps: never 0.25 or 2.5, which would print as repeats.
+    const whole = f === "int";
+    step = [1, 2, 2.5, 5, 10].map((m) => m * p).filter((s) => !whole || (s >= 1 && Number.isInteger(s)))
+      .find((s) => s >= raw * (1 - 1e-9)) ?? (whole ? Math.max(1, 10 * p) : 10 * p);
   }
   const d = Math.min(20, decimals(step));
   const min = Number((Math.floor(lo / step + 1e-9) * step).toFixed(d));
@@ -165,7 +185,8 @@ export function tickLabels(ticks: number[], f?: string): string[] {
     });
     if (distinct && exact) return labels;
   }
-  return ticks.map((t) => fmt(t, f, 3));
+  // Still repeats (fixed fractional bounds on an "int" axis): show the decimals they need.
+  return ticks.map((t) => fmt(t, f === "int" && !Number.isInteger(t) ? undefined : f, 3));
 }
 
 /** The number a compact label stands for ("1.25M" → 1250000, "−$4.5k" → -4500), or null. */

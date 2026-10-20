@@ -238,12 +238,14 @@ export function age(created: number | undefined, now: number): string {
   return `${Math.floor(d / 30)}mo`;
 }
 
-/** The one line of counts under the title: what is open, and what needs the user. */
+/** The one line of counts under the title: what is open, and what needs the user. "Open" is
+ * open on GitHub: every PR not merged yet, including held, queued, merging and
+ * changes-requested ones (they still have checks and reviews worth counting). */
 export function summary(prs: Item[]) {
-  const open = prs.filter((p) => groupOf(p) !== "done");
+  const open = prs.filter((p) => p.status !== "merged");
   return {
     open: open.length,
-    quick: open.filter((p) => p.quick_win).length,
+    quick: quickWins(prs).length,
     failing: open.filter((p) => p.checks === "failing").length,
     review: open.filter((p) => p.review === "REVIEW_REQUIRED").length,
     held: prs.filter((p) => p.status === "held").length,

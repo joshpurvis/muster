@@ -1,4 +1,4 @@
-import { compact, decimals, esc, fmt, niceTicks, parseLabel, rich, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
+import { compact, decimals, esc, fmt, fmtFull, niceTicks, parseLabel, rich, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
 import { ringLengths } from "./parts.ts";
 import { check, eq } from "../apps/shared/test_util.ts";
 
@@ -78,4 +78,23 @@ Deno.test("trend line, ring segments and colours", () => {
 Deno.test("text is escaped; takeaways allow **bold** and `code` only", () => {
   eq(esc(`<b a="1">'&`), "&lt;b a=&quot;1&quot;&gt;&#39;&amp;");
   eq(rich("PR builds used **1.75×** the minutes; see `9be04f1` <script>"), "PR builds used <b>1.75×</b> the minutes; see <code>9be04f1</code> &lt;script&gt;");
+});
+
+Deno.test("int axes get whole-number ticks, never repeated labels", () => {
+  for (const [lo, hi] of [[0, 1], [0, 3], [0, 10], [0, 7], [2, 3]]) {
+    const t = niceTicks(lo, hi, 4, "int");
+    check(t.ticks.every(Number.isInteger), `${lo}–${hi}: ${t.ticks}`);
+    const labels = tickLabels(t.ticks, "int");
+    check(new Set(labels).size === labels.length, `${lo}–${hi}: ${labels}`);
+  }
+  // Fixed fractional bounds still print distinct labels.
+  const l = tickLabels([0, 0.25, 0.5, 0.75, 1], "int");
+  check(new Set(l).size === 5, l.join());
+});
+
+Deno.test("fmtFull: data table values in full, so neighbours stay apart", () => {
+  eq([12345, 12346, 12347].map((v) => fmtFull(v)), ["12,345", "12,346", "12,347"]);
+  eq([fmtFull(1234567.891, "usd"), fmtFull(-12, "usd"), fmtFull(12345.6, "int"), fmtFull(0.3412, "pct"), fmtFull(61250, "ms"), fmtFull(null)],
+    ["$1,234,567.89", "−$12", "12,346", "0.3412%", "61,250 ms", "–"]);
+  eq([fmtFull(1234.5, "plain"), fmtFull(-0.000123)], ["1234.5", "−0.000123"]);
 });

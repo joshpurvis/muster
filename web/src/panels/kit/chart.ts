@@ -2,7 +2,7 @@
 // <mk-chart> in kit panels all draw with this. It redraws at its element's width (text is never
 // scaled), and hover, arrow keys, legend toggles and a live region work everywhere. Every value is
 // also in a data table (visually hidden unless shown), so the chart is never the only way in.
-import { clamp, esc, fmt, lin, niceTicks, num, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
+import { clamp, esc, fmt, fmtFull, lin, niceTicks, num, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
 import { icon } from "./icons.ts";
 import { nid, seriesColor } from "./parts.ts";
 
@@ -156,6 +156,18 @@ export function lineBounds(series: KitSeries[], n: number, stacked: boolean): { 
   }));
 }
 
+/** End labels: at most this many px beside the plot, at about this many px per character. */
+const END_MAX = 150, END_CHAR = 6.4;
+
+/** The name an end label prints beside `value` in `width` px: whole, shortened with "…", or
+ * null when not even 3 letters would fit (the chart shows a legend instead). */
+export function endLabel(name: string, value: string, width: number): string | null {
+  const room = Math.floor((width - 4) / END_CHAR) - value.length - 1;
+  if ([...name].length <= room) return name;
+  if (room < 4) return null;
+  return [...name].slice(0, room - 1).join("").trimEnd() + "…";
+}
+
 /** "+15%", "−0.04 pt" (for pct values), or null without a previous value. */
 export function change(v: number | null, p: number | null | undefined, pct: boolean): string | null {
   if (v === null || p === null || p === undefined || !Number.isFinite(v) || !Number.isFinite(p)) return null;
@@ -199,9 +211,12 @@ function render(el: Host) {
 
   // Decided on all the series, not the visible ones, so hiding one never swaps the legend (the
   // only way to show it again) for end labels.
-  const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
+  let endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
   const last = (s: KitSeries) => { for (let i = n - 1; i >= 0; i--) if (s.values[i] !== null) return i; return -1; };
-  const endW = endLabels ? Math.min(150, Math.max(...vis.map((s) => (s.name.length + F(s.values[last(s)] ?? null).length + 1) * 6.4)) + 16) : 0;
+  const endValue = (s: KitSeries) => F(s.values[last(s)] ?? null);
+  let endW = endLabels ? Math.min(END_MAX, Math.max(...vis.map((s) => (s.name.length + endValue(s).length + 1) * END_CHAR)) + 16) : 0;
+  // A name that cannot keep a few letters beside its value gets the legend instead.
+  if (endLabels && vis.some((s) => !endLabel(s.name, endValue(s), endW))) { endLabels = false; endW = 0; }
   const m = { top: spec.y?.label || spec.annotations?.length ? 28 : 14, right: 12 + endW, bottom: spec.x.label ? 44 : 26, left: Math.max(...ylabels.map((l) => l.length)) * 7 + 12 };
   const pw = Math.max(40, width - m.left - m.right), ph = Math.max(40, height - m.top - m.bottom);
   const Y0 = lin(yt.min, yt.max, m.top + ph, m.top);
@@ -213,7 +228,7 @@ function render(el: Host) {
   if (numericX && type !== "bar") {
     const nx = xs as number[];
     const xl = Math.min(...nx), xh = Math.max(...nx);
-    const t = niceTicks(xl, xh, Math.max(2, Math.floor(pw / 100)));
+    const t = niceTicks(xl, xh, Math.max(2, Math.floor(pw / 100)), spec.xFormat);
     const [d0, d1] = type === "scatter" ? [t.min, t.max] : [xl, xh === xl ? xl + 1 : xh];
     const XV = lin(d0, d1, m.left, m.left + pw);
     XAt = XV;
@@ -356,7 +371,11 @@ function render(el: Host) {
       for (let k = 1; k < labs.length; k++) if (labs[k].y - labs[k - 1].y < 15) labs[k].y = labs[k - 1].y + 15;
       const over = labs.length ? labs[labs.length - 1].y - (m.top + ph) : 0;
       if (over > 0) labs.forEach((l) => { l.y -= over; });
-      labs.forEach((l) => P.push(`<text class="end" x="${m.left + pw + 10}" y="${(l.y + 4).toFixed(1)}" style="fill:${isCtx(l.s) ? "var(--mk-text-2)" : scol(l.s)}">${esc(l.s.name)} <tspan class="n">${esc(F(l.v))}</tspan></text>`));
+      labs.forEach((l) => {
+        // Shortened to the room it has; the full name shows on hover and is in the data table.
+        const name = endLabel(l.s.name, F(l.v), endW)!;
+        P.push(`<text class="end" x="${m.left + pw + 10}" y="${(l.y + 4).toFixed(1)}" style="fill:${isCtx(l.s) ? "var(--mk-text-2)" : scol(l.s)}">${name === l.s.name ? "" : `<title>${esc(l.s.name)}</title>`}${esc(name)} <tspan class="n">${esc(F(l.v))}</tspan></text>`);
+      });
     }
   }
   P.push(`<line class="base" x1="${m.left}" x2="${m.left + pw}" y1="${zero.toFixed(1)}" y2="${zero.toFixed(1)}"/>`);
@@ -396,7 +415,7 @@ function render(el: Host) {
       rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i><span class="n">${esc(r.s.name)}</span><b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("");
     live = `${XF(xs[focus])}: ` + rows.map((r) => `${r.s.name} ${F(r.v)}${r.d ? ` (${r.d} vs ${XF(xs[prev!])})` : ""}`).join(", ");
   }
-  const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(typeof x === "number" ? fmtFull(x, spec.xFormat || (intX ? "plain" : undefined)) : x)}</th>${series.map((s) => `<td>${esc(fmtFull(s.values[i] ?? null, spec.format))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 
   // The SVG (which may have focus) and the live region stay mounted; only their contents change,
   // so focus stays put and screen readers hear each new value.

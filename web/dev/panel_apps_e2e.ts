@@ -822,6 +822,18 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await call("panel.update", { panel_id: ov.pid, data: quick({ verdict: "Safe to merge: one word in the docs; checks pass again." }) });
     await ov.waitIn(`!document.querySelector('.drawer') && document.querySelector('.notice')?.textContent.includes('changed while you were confirming')`);
     check((await events(ov.pid)).length === 0, "a cancelled confirm sent nothing");
+    check(await ov.inApp(`document.activeElement?.id === 'pr-815'`), `a confirm cancelled by an update hands focus back to the card: ${await ov.inApp("document.activeElement?.id")}`);
+    // Escape hands focus back to the Merge that opened the confirm, so a following Enter presses
+    // it again (never "open the PR" from a focus that fell to the page).
+    await ov.click("#merge-selected");
+    await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    await a.key("Escape");
+    await ov.waitIn(`!document.querySelector('.drawer') && document.activeElement?.id === 'merge-selected'`);
+    await a.key("Enter");
+    await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);
+    check((await events(ov.pid)).length === 0, "Enter after Escape reopened the Merge confirm and sent nothing");
+    await a.key("Escape");
+    await ov.waitIn(`!document.querySelector('.drawer') && document.activeElement?.id === 'merge-selected'`);
     await ov.click("#pr-815 .title");
     await a.key("m");
     await ov.waitIn(`document.activeElement?.id === 'confirm-merge'`);

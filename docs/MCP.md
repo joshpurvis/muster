@@ -276,7 +276,8 @@ declared. The host must be a plain name or IP (no wildcards). Without `alt`, the
 "Image: <file name>" is the text alternative. The picture opens at Fit (shrunk to the panel,
 never enlarged past actual size; an SVG with only a viewBox fills it); − and + (or the keys,
 Ctrl+wheel and a pinch, around the pointer) zoom from the size on screen, 100% (1) is actual
-pixels, 0 fits again, Z or a click switches Fit / 100%, and a picture bigger than the panel
+pixels, 0 fits again, Z or a click switches Fit / 100% (twice the fitted size when
+Fit already is 100%), and a picture bigger than the panel
 scrolls and drags to pan.
 
 ```json

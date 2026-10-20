@@ -32,14 +32,22 @@ const near = (a: number, b: number) => Math.abs(a - b) < 0.0005;
 export function viewer(img: HTMLImageElement, state: ViewState, opts: { stageClass: string; label: string; ids: ViewerIds; onChange?: () => void }): Viewer {
   const stage = h("div", { class: opts.stageClass, tabindex: "0", "aria-label": opts.label }, img);
   img.draggable = false;
+  // The visible readout, and a polite live region that says the zoom once it settles (not on
+  // every wheel step).
   const readout = h("span", { class: "zoom-readout", "aria-hidden": "true" });
+  const live = h("span", { class: "mk-sr", role: "status", "aria-live": "polite" });
+  let liveTimer = 0;
+  const announce = () => {
+    clearTimeout(liveTimer);
+    liveTimer = setTimeout(() => { live.textContent = state.fit ? `Fit, ${readout.textContent}` : `Zoom ${readout.textContent}`; }, 400);
+  };
   const btn = (id: string, label: string, keys: string, content: (Node | string)[], run: () => void) =>
     h("button", { type: "button", id, title: `${label} (${keys})`, "aria-label": label, "aria-keyshortcuts": keys, onclick: run }, ...content);
   const outBtn = btn(opts.ids.zoomOut, "Zoom out", "-", [iconEl("minus")], () => zoom(stepZoom(scale(), -1, fitNow())));
   const inBtn = btn(opts.ids.zoomIn, "Zoom in", "+", [iconEl("plus")], () => zoom(stepZoom(scale(), 1, fitNow())));
   const fitBtn = btn(opts.ids.fit, "Fit", "0", ["Fit"], () => fit());
   const actualBtn = btn(opts.ids.actual, "Actual size", "1", ["100%"], () => zoom(1));
-  const controls = h("div", { class: "mk-seg zoom-tools", role: "group", "aria-label": "Zoom" }, outBtn, inBtn, fitBtn, actualBtn);
+  const controls = h("div", { class: "mk-seg zoom-tools", role: "group", "aria-label": "Zoom" }, outBtn, inBtn, fitBtn, actualBtn, live);
 
   // The picture's own size in CSS px, and whether fitting may enlarge it (a vector with no size
   // of its own, which a browser would stretch to its box anyway).
@@ -77,8 +85,9 @@ export function viewer(img: HTMLImageElement, state: ViewState, opts: { stageCla
     fitBtn.setAttribute("aria-pressed", String(state.fit));
     actualBtn.setAttribute("aria-pressed", String(near(s, 1)));
     const [lo, hi] = [clampZoom(0, fitNow()), clampZoom(Infinity, fitNow())];
-    outBtn.disabled = s <= lo * 1.001;
-    inBtn.disabled = s >= hi / 1.001;
+    // aria-disabled, not disabled: a focused button that became disabled would drop the focus.
+    outBtn.setAttribute("aria-disabled", String(s <= lo * 1.001));
+    inBtn.setAttribute("aria-disabled", String(s >= hi / 1.001));
   };
 
   /** Zoom to `next`, keeping the picture point under `anchor` (stage px; default its centre) still. */
@@ -93,11 +102,13 @@ export function viewer(img: HTMLImageElement, state: ViewState, opts: { stageCla
     stage.scrollLeft = anchoredScroll(sl, ax, ox, img.offsetLeft, s0, s1);
     stage.scrollTop = anchoredScroll(st, ay, oy, img.offsetTop, s0, s1);
     paint(); // scrolling can change what overflows (scrollbars)
+    announce();
     opts.onChange?.();
   };
   const fit = () => {
     state.fit = true;
     paint();
+    announce();
     opts.onChange?.();
   };
   /** Z and a click: Fit ↔ actual size (or twice the fitted size when that is actual size already). */
@@ -179,6 +190,6 @@ export function viewer(img: HTMLImageElement, state: ViewState, opts: { stageCla
       e.preventDefault();
       return true;
     },
-    destroy() { resize.disconnect(); },
+    destroy() { resize.disconnect(); clearTimeout(liveTimer); },
   };
 }

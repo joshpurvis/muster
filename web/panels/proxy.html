@@ -56,9 +56,11 @@
   const helper = (keys, escape) => "(" + ((keys, escape) => {
     const post = (method, params) => { try { parent.postMessage({ jsonrpc: "2.0", method, params }, "*"); } catch (_) { /* gone */ } };
     const editable = (t) => !!t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
+    /* A field inside a shadow root is retargeted to its host: look along the whole path. */
+    const inField = (e) => e.composedPath().some(editable);
     addEventListener("keydown", (e) => {
       if (!e.isTrusted || e.isComposing) return;
-      const inInput = editable(e.target);
+      const inInput = inField(e);
       const k = keys.find((k) => k.code === e.code && k.ctrl === e.ctrlKey && k.alt === e.altKey && k.shift === e.shiftKey && k.meta === e.metaKey);
       if (!k || (k.editAlt && inInput)) return;
       e.preventDefault();
@@ -66,14 +68,19 @@
       post("muster/key", { code: e.code, key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, inInput });
     }, true);
     const bare = (e) => !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
+    /* The browser's zoom keys and Ctrl+wheel would zoom all of Muster (shrinking this panel), not
+       the panel. Cancelled first (capture), so an app that stops the event cannot let it through;
+       the event still goes on to the app. */
+    addEventListener("keydown", (e) => {
+      if (e.isTrusted && (e.ctrlKey || e.metaKey) && !e.altKey && ["=", "+", "-", "_", "0"].includes(e.key)) e.preventDefault();
+    }, true);
+    addEventListener("wheel", (e) => { if (e.isTrusted && (e.ctrlKey || e.metaKey)) e.preventDefault(); }, { capture: true, passive: false });
+    /* Esc after the app had it (bubble phase), so the app's own preventDefault() keeps it. */
     addEventListener("keydown", (e) => {
       if (!e.isTrusted || e.isComposing) return;
-      /* The browser's zoom keys would zoom all of Muster (shrinking this panel), not the panel. */
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && ["=", "+", "-", "_", "0"].includes(e.key)) e.preventDefault();
-      if (!escape || e.key !== "Escape" || !bare(e) || editable(e.target) || document.querySelector("dialog[open]")) return;
+      if (!escape || e.key !== "Escape" || !bare(e) || inField(e) || document.querySelector("dialog[open]")) return;
       setTimeout(() => { if (!e.defaultPrevented) post("muster/key", { code: "Escape", key: "Escape", ctrl: false, alt: false, shift: false, meta: false, inInput: false }); }, 0);
     });
-    addEventListener("wheel", (e) => { if (e.isTrusted && (e.ctrlKey || e.metaKey)) e.preventDefault(); }, { passive: false });
     let reports = 0;
     const report = (text) => { if (reports++ < 5) post("muster/app-error", { message: String(text).slice(0, 300) }); };
     addEventListener("error", (e) => {

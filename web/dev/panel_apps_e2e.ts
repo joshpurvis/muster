@@ -190,6 +190,11 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("1");
     check(Math.abs((await shown()) - 1440) < 1, "1 is actual size");
     await a.key("0");
+    await p.waitIn(`document.querySelector('.zoom-tools [role=status]').textContent === 'Fit, ' + document.querySelector('.img-zoom').textContent`, 2000);
+    // The browser's zoom keys are cancelled before the app sees them, even by an app that stops them.
+    await p.inApp(`document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.key === '-') { globalThis.__e2eZoomPrevented = e.defaultPrevented; e.stopPropagation(); } }, { capture: true, once: true })`);
+    await a.key("Ctrl+-");
+    check(await p.inApp(`globalThis.__e2eZoomPrevented`) === true, "Ctrl+- is cancelled ahead of an app that stops it");
 
     // Fullscreen from the strip's button: the panel fills the window, no tab strips, no status line.
     const sigBefore = JSON.stringify(await a.eval(`${M}.layout.value`));
@@ -214,6 +219,19 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("Escape");
     await a.wait(`!document.querySelector('.app.fullscreen')`, 2000);
     check(JSON.stringify(await a.eval(`${M}.layout.value`)) === sigBefore, "the layout is restored again");
+    // From the panel's tab in the strip (which fullscreen hides): the keyboard goes to the app.
+    await a.eval(`document.querySelector('[data-tab-sid="${-(p.pid + 1)}"]').focus()`);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!!document.querySelector('.app.fullscreen') && document.activeElement?.dataset?.panelId === "${p.pid}"`, 3000);
+    // (Headless Chromium does not pass a frame focused from its parent on to the app's own
+    // document, so the app's keys are checked after a click inside it, as elsewhere here.)
+    await p.click(".stage");
+    await p.click(".stage"); // a click toggles Fit / 100%: twice is Fit again
+    const before2 = await shown();
+    await a.key("=");
+    check((await shown()) > before2 * 1.05, `the app's keys work in fullscreen (${before2} → ${await shown()})`);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!document.querySelector('.app.fullscreen') && document.activeElement?.dataset?.panelId === "${p.pid}"`, 3000);
     await close(p.pid);
 
     // A terminal: Esc stays with the program, Alt+Shift+Z (or the corner button) goes back.
@@ -973,6 +991,8 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await d2.waitIn(`document.querySelector('.lightbox')`);
     await a.key("z");
     await d2.waitIn(`document.querySelector('.lb-stage.sized:not(.fit)')`);
+    check(await d2.inApp(`[...document.querySelectorAll('.lb-bar > *')].every((e) => { const r = e.getBoundingClientRect(); return r.right <= innerWidth + 0.5 && r.left >= -0.5; })`),
+      `narrow picture view: every bar control (Close included) stays in view: ${await d2.inApp(`innerWidth + ' ' + JSON.stringify([...document.querySelectorAll('.lb-bar > *')].map((e) => Math.round(e.getBoundingClientRect().right)))`)}`);
     await a.shot(`${shots}/panel-pr-decision-actual-size-narrow-dark.png`, (await a.rect(`[data-panel-view="${d2.pid}"]`))!);
     await a.key("Escape");
     await a.shot(`${shots}/panel-pr-decision-media-narrow-dark.png`, (await a.rect(`[data-panel-view="${d2.pid}"]`))!);

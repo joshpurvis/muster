@@ -190,8 +190,10 @@ button.toggle .tick { font-weight: 700; }
 .shortcuts dd { margin: 0; color: var(--mk-text-2); }
 /* The enlarged picture: a modal view over the panel. */
 .lightbox { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--mk-canvas); }
-.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--mk-line); }
-.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mk-mono); }
+/* Wraps in a narrow panel (source first, then the controls), so Close never leaves the view. */
+.lb-bar { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--mk-line); }
+.lb-bar #lightbox-close { margin-left: auto; }
+.lb-src { flex: 1 1 14ch; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mk-mono); }
 .lb-stage { position: relative; flex: 1; min-height: 0; display: flex; padding: 16px; overflow: auto; background: var(--mk-sunken); }
 .lb-stage img { margin: auto; display: block; flex: none; border-radius: 6px; box-shadow: 0 0 0 1px var(--mk-line-2); background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; cursor: zoom-in; }
 /* Until the picture has loaded (and the viewer sizes it), it fits by CSS. */
@@ -203,7 +205,7 @@ button.toggle .tick { font-weight: 700; }
 .lb-readout:empty { display: none; }
 .zoom-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; }
 .zoom-tools button svg { width: 14px; height: 14px; }
-.zoom-tools button:disabled { opacity: .4; cursor: default; }
+.zoom-tools button[aria-disabled="true"] { opacity: .4; cursor: default; }
 .lb-caption { margin: 0; padding: 10px 14px 12px; color: var(--mk-text-2); border-top: 1px solid var(--mk-line); }
 @media (max-width: 520px) {
   /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts

@@ -646,18 +646,23 @@ main > .error { margin: 16px; }
     });
   }
   function typing(event) {
-    const t = event.target;
-    if (!t) return false;
-    if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
-    return t.tagName === "INPUT" && ![
-      "checkbox",
-      "radio",
-      "button",
-      "submit",
-      "reset",
-      "range",
-      "color"
-    ].includes(t.type);
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [
+      event.target
+    ];
+    return path.some((n) => {
+      const t = n;
+      if (!t || typeof t.tagName !== "string") return false;
+      if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+      return t.tagName === "INPUT" && ![
+        "checkbox",
+        "radio",
+        "button",
+        "submit",
+        "reset",
+        "range",
+        "color"
+      ].includes(t.type);
+    });
   }
 
   // src/panels/apps/shared/dom.ts

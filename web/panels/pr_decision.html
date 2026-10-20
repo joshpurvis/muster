@@ -723,8 +723,10 @@ button.toggle .tick { font-weight: 700; }
 .shortcuts dd { margin: 0; color: var(--mk-text-2); }
 /* The enlarged picture: a modal view over the panel. */
 .lightbox { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--mk-canvas); }
-.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--mk-line); }
-.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mk-mono); }
+/* Wraps in a narrow panel (source first, then the controls), so Close never leaves the view. */
+.lb-bar { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--mk-line); }
+.lb-bar #lightbox-close { margin-left: auto; }
+.lb-src { flex: 1 1 14ch; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mk-mono); }
 .lb-stage { position: relative; flex: 1; min-height: 0; display: flex; padding: 16px; overflow: auto; background: var(--mk-sunken); }
 .lb-stage img { margin: auto; display: block; flex: none; border-radius: 6px; box-shadow: 0 0 0 1px var(--mk-line-2); background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; cursor: zoom-in; }
 /* Until the picture has loaded (and the viewer sizes it), it fits by CSS. */
@@ -736,7 +738,7 @@ button.toggle .tick { font-weight: 700; }
 .lb-readout:empty { display: none; }
 .zoom-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; }
 .zoom-tools button svg { width: 14px; height: 14px; }
-.zoom-tools button:disabled { opacity: .4; cursor: default; }
+.zoom-tools button[aria-disabled="true"] { opacity: .4; cursor: default; }
 .lb-caption { margin: 0; padding: 10px 14px 12px; color: var(--mk-text-2); border-top: 1px solid var(--mk-line); }
 @media (max-width: 520px) {
   /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts
@@ -868,18 +870,23 @@ button.toggle .tick { font-weight: 700; }
     });
   }
   function typing(event) {
-    const t = event.target;
-    if (!t) return false;
-    if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
-    return t.tagName === "INPUT" && ![
-      "checkbox",
-      "radio",
-      "button",
-      "submit",
-      "reset",
-      "range",
-      "color"
-    ].includes(t.type);
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [
+      event.target
+    ];
+    return path.some((n) => {
+      const t = n;
+      if (!t || typeof t.tagName !== "string") return false;
+      if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+      return t.tagName === "INPUT" && ![
+        "checkbox",
+        "radio",
+        "button",
+        "submit",
+        "reset",
+        "range",
+        "color"
+      ].includes(t.type);
+    });
   }
 
   // src/panels/apps/shared/dom.ts
@@ -3014,6 +3021,18 @@ button.toggle .tick { font-weight: 700; }
       class: "zoom-readout",
       "aria-hidden": "true"
     });
+    const live = h("span", {
+      class: "mk-sr",
+      role: "status",
+      "aria-live": "polite"
+    });
+    let liveTimer = 0;
+    const announce = () => {
+      clearTimeout(liveTimer);
+      liveTimer = setTimeout(() => {
+        live.textContent = state.fit ? `Fit, ${readout.textContent}` : `Zoom ${readout.textContent}`;
+      }, 400);
+    };
     const btn = (id, label, keys, content, run) => h("button", {
       type: "button",
       id,
@@ -3038,7 +3057,7 @@ button.toggle .tick { font-weight: 700; }
       class: "mk-seg zoom-tools",
       role: "group",
       "aria-label": "Zoom"
-    }, outBtn, inBtn, fitBtn, actualBtn);
+    }, outBtn, inBtn, fitBtn, actualBtn, live);
     let natural = null;
     const measure = () => {
       if (!img.naturalWidth && !img.naturalHeight) return null;
@@ -3085,8 +3104,8 @@ button.toggle .tick { font-weight: 700; }
         clampZoom(0, fitNow()),
         clampZoom(Infinity, fitNow())
       ];
-      outBtn.disabled = s <= lo * 1.001;
-      inBtn.disabled = s >= hi / 1.001;
+      outBtn.setAttribute("aria-disabled", String(s <= lo * 1.001));
+      inBtn.setAttribute("aria-disabled", String(s >= hi / 1.001));
     };
     const zoom = (next, anchor) => {
       if (!natural) return;
@@ -3104,11 +3123,13 @@ button.toggle .tick { font-weight: 700; }
       stage.scrollLeft = anchoredScroll(sl, ax, ox, img.offsetLeft, s0, s1);
       stage.scrollTop = anchoredScroll(st, ay, oy, img.offsetTop, s0, s1);
       paint();
+      announce();
       opts.onChange?.();
     };
     const fit = () => {
       state.fit = true;
       paint();
+      announce();
       opts.onChange?.();
     };
     const toggle = (anchor) => {
@@ -3202,6 +3223,7 @@ button.toggle .tick { font-weight: 700; }
       },
       destroy() {
         resize.disconnect();
+        clearTimeout(liveTimer);
       }
     };
   }

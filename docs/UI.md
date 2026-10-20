@@ -116,8 +116,10 @@ The other built-ins follow the theme and work by keyboard: Image opens at Fit (s
 panel, never enlarged past actual size; an SVG with only a viewBox fills it) and zooms like an
 image viewer: − / + (buttons, `-` / `+` or `=`, Ctrl+wheel or a pinch around the pointer) step
 from the size on screen, 100% (`1`) is actual pixels, Fit (`0`) goes back, Z or a click
-switches Fit / 100%, and a picture bigger than the panel scrolls and drags to pan (the zoom
-shows bottom left; the browser's own zoom keys never zoom Muster from inside a panel); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
+switches Fit / 100% (a picture already shown at 100% when fitted goes to twice the fitted
+size instead, so the switch always zooms; again goes back to Fit), and a picture bigger than the panel scrolls and drags to pan (the zoom
+shows bottom left and is announced once it settles; the browser's own zoom keys never zoom Muster from
+inside a panel); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
 Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
 shows the agent's verdict and undo line first, has Merge (M), Request changes (R), Ask (A),
 Open on GitHub (O), Skip (S), Hold (H), Send answers (Ctrl+Enter) and the user's own actions
@@ -199,7 +201,9 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   (Alt+1..9, Ctrl+Tab) stays fullscreen. Per window and in memory only: the saved layout never
   changes, so leaving it shows the layout exactly as it was, and a reload ends it. It also ends
   when focus moves to another group (Jump, Alt+J, Alt+arrows, a new split) or the group goes,
-  and on Rename (its fields are in the strip). Works for terminals and panels alike.
+  and on Rename (its fields are in the strip). Works for terminals and panels alike. When the
+  switch removes what had the keyboard (a tab in the hidden strip, the corner button), the
+  keyboard goes to the tab shown, so a panel's own keys keep working.
   **Esc** goes back only when nothing else wants it:
   - never from a focused terminal (agents use Esc to interrupt, editors to leave a mode), nor
     from a text field; Alt+Shift+Z or the corner button go back from there;

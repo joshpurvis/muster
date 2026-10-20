@@ -395,12 +395,25 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   const terminal = panelId(tab) === null;
   toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
   if (terminal) focusActiveTerminalSoon();
+  else refocusIfLost();
 }
 
-export function exitFullscreen() {
+/** `refocus`: when the switch unmounts what had focus (a tab in the hidden strip, the corner
+ * button), the keyboard goes to the tab shown. */
+export function exitFullscreen(refocus = true) {
   if (fullscreen.value === null) return;
   fullscreen.value = null;
   dismissToastKey("fullscreen");
+  if (refocus) refocusIfLost();
+}
+
+/** Entering or leaving fullscreen mounts and unmounts tab strips: focus inside one falls to
+ * <body>, where no shortcut of a panel's app works. Give it to the visible tab instead. */
+function refocusIfLost() {
+  requestAnimationFrame(() => {
+    const a = document.activeElement;
+    if (!a || a === document.body || !a.isConnected) focusActiveTerminalSoon();
+  });
 }
 export const tabStep = (delta: number) => withLayout((l) => cycleTab(l, delta));
 export const equalizeAll = () =>
@@ -737,7 +750,7 @@ export function startRename(sid: SessionId, from: "tab" | "terminal" = "tab") {
   const s = sessions.value.get(sid);
   if (!s) return;
   // The rename fields live in the tab strip, which fullscreen hides.
-  exitFullscreen();
+  exitFullscreen(false);
   const c = channelById.value.get(s.channel_id);
   const list = sessionsByChannel.value.get(s.channel_id) ?? [];
   const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;

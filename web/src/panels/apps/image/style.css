@@ -20,10 +20,10 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 .img-stage.can-pan img { cursor: grab; }
 .img-stage.panning, .img-stage.panning img { cursor: grabbing; user-select: none; }
 .img-stage .error { margin: auto; }
-.img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-tools { position: absolute; top: 12px; right: 12px; max-width: calc(100% - 24px); flex-wrap: wrap; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
 .img-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
 .img-tools button svg { width: 14px; height: 14px; }
-.img-tools button:disabled { opacity: .4; cursor: default; }
+.img-tools button[aria-disabled="true"] { opacity: .4; cursor: default; }
 .img-zoom {
   position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
   background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);

@@ -553,10 +553,10 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 .img-stage.can-pan img { cursor: grab; }
 .img-stage.panning, .img-stage.panning img { cursor: grabbing; user-select: none; }
 .img-stage .error { margin: auto; }
-.img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-tools { position: absolute; top: 12px; right: 12px; max-width: calc(100% - 24px); flex-wrap: wrap; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
 .img-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
 .img-tools button svg { width: 14px; height: 14px; }
-.img-tools button:disabled { opacity: .4; cursor: default; }
+.img-tools button[aria-disabled="true"] { opacity: .4; cursor: default; }
 .img-zoom {
   position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
   background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);
@@ -666,18 +666,23 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
     });
   }
   function typing(event) {
-    const t = event.target;
-    if (!t) return false;
-    if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
-    return t.tagName === "INPUT" && ![
-      "checkbox",
-      "radio",
-      "button",
-      "submit",
-      "reset",
-      "range",
-      "color"
-    ].includes(t.type);
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [
+      event.target
+    ];
+    return path.some((n) => {
+      const t = n;
+      if (!t || typeof t.tagName !== "string") return false;
+      if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+      return t.tagName === "INPUT" && ![
+        "checkbox",
+        "radio",
+        "button",
+        "submit",
+        "reset",
+        "range",
+        "color"
+      ].includes(t.type);
+    });
   }
 
   // src/panels/apps/shared/dom.ts
@@ -899,6 +904,18 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       class: "zoom-readout",
       "aria-hidden": "true"
     });
+    const live = h("span", {
+      class: "mk-sr",
+      role: "status",
+      "aria-live": "polite"
+    });
+    let liveTimer = 0;
+    const announce = () => {
+      clearTimeout(liveTimer);
+      liveTimer = setTimeout(() => {
+        live.textContent = state.fit ? `Fit, ${readout.textContent}` : `Zoom ${readout.textContent}`;
+      }, 400);
+    };
     const btn = (id, label, keys, content, run) => h("button", {
       type: "button",
       id,
@@ -923,7 +940,7 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       class: "mk-seg zoom-tools",
       role: "group",
       "aria-label": "Zoom"
-    }, outBtn, inBtn, fitBtn, actualBtn);
+    }, outBtn, inBtn, fitBtn, actualBtn, live);
     let natural = null;
     const measure = () => {
       if (!img.naturalWidth && !img.naturalHeight) return null;
@@ -970,8 +987,8 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
         clampZoom(0, fitNow()),
         clampZoom(Infinity, fitNow())
       ];
-      outBtn.disabled = s <= lo * 1.001;
-      inBtn.disabled = s >= hi / 1.001;
+      outBtn.setAttribute("aria-disabled", String(s <= lo * 1.001));
+      inBtn.setAttribute("aria-disabled", String(s >= hi / 1.001));
     };
     const zoom = (next, anchor) => {
       if (!natural) return;
@@ -989,11 +1006,13 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       stage.scrollLeft = anchoredScroll(sl, ax, ox, img.offsetLeft, s0, s1);
       stage.scrollTop = anchoredScroll(st, ay, oy, img.offsetTop, s0, s1);
       paint();
+      announce();
       opts.onChange?.();
     };
     const fit = () => {
       state.fit = true;
       paint();
+      announce();
       opts.onChange?.();
     };
     const toggle = (anchor) => {
@@ -1087,6 +1106,7 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       },
       destroy() {
         resize.disconnect();
+        clearTimeout(liveTimer);
       }
     };
   }

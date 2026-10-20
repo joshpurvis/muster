@@ -801,6 +801,30 @@ try {
     check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "the same session, not restarted");
     ok("closing an agent's tab hid it (still running); clicking its row brought the same session back");
 
+    // A window that doesn't know the agents yet (its list still loading) can't stop one either:
+    // the daemon hides it on `session.remove`; the toast's Show brings it back.
+    await b2.click(`[data-tab-sid="${rev}"]`);
+    await b2.eval(`(() => { globalThis.__agents = ${M}.agents.value; ${M}.agents.value = []; })()`);
+    await b2.key("Alt+W");
+    // A busy agent asks first here (this window can't tell it is an agent): confirm.
+    await b2.sleep(300);
+    if (await b2.eval(`!!document.querySelector('.confirm-close')`)) await b2.key("Enter");
+    await b2.wait(`${M}.sessions.value.get(${rev})?.hidden === true`, 3000).catch(async (e) => {
+      console.error(await b2!.eval(`JSON.stringify({ s: ${M}.sessions.value.get(${rev}), focus: ${M}.focusedSession.value?.id,
+        active: document.activeElement?.className, toasts: [...document.querySelectorAll('.toast')].map((t) => t.textContent) })`));
+      throw e;
+    });
+    check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "removed by an unknowing window: hidden, still running");
+    await b2.eval(`${M}.agents.value = globalThis.__agents`);
+    await b2.wait(`!!document.querySelector('.toast .toast-action')`, 2000);
+    check(
+      await b2.eval(`document.querySelector('.toast-action').closest('.toast').textContent.includes('keeps running')`),
+      "the toast says it keeps running",
+    );
+    await b2.click(`.toast .toast-action`);
+    await b2.wait(`${M}.focusedSession.value?.id === ${rev} && !${M}.sessions.value.get(${rev}).hidden`, 5000);
+    ok("closing before the agent list loaded still only hid it; the toast's Show brought it back");
+
     // Stop (the row's menu) is what stops it; the tab stays, showing it stopped.
     await b2.click(`[data-agent="reviewer"]`, { button: "right" });
     await b2.wait(`!!document.querySelector('.menu')`);

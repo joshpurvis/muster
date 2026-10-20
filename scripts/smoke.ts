@@ -972,6 +972,10 @@ exec cat > '${BASE}/fake-input'
   const win = await c.call("window.create", {});
   s = await c.call("session.set_window", { id: agentSid, window_id: win.id });
   ok(!s.hidden && s.window_id === win.id && (await c.call("hello")).channels.find((x: Json) => x.id === agentCh).window_id === win.id, "session.set_window shows it again, with its task");
+  const removed = await c.call("session.remove", { id: agentSid });
+  s = await sessOf(agentSid);
+  ok(removed.hidden && removed.session.hidden && s.hidden && s.state !== "exited" && s.pid === pidBefore,
+    "session.remove of an agent's tab hides it, never stops it");
   await c.call("session.kill", { id: agentSid });
   await c.waitFor("agent stopped", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === agentSid && e.data.state === "exited"));
   ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");

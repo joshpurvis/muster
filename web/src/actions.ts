@@ -561,7 +561,8 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
  * Close a tab: removes its session (the daemon closes a task left without sessions; older
  * daemons are asked to). A busy session gets an inline "Close? ⏎ / Esc" first. A named agent's
  * tab is only hidden: the agent keeps running, and its row in the agents panel shows it again
- * (only the panel's Stop stops it).
+ * (only the panel's Stop stops it). The daemon decides that too (`session.remove` hides an
+ * agent's session), so closing before the agent list has loaded can't stop one.
  */
 export function closeTab(sid: SessionId, force = false) {
   const pid = panelId(sid);
@@ -593,11 +594,30 @@ export function closeTab(sid: SessionId, force = false) {
 function removeTab(s: SessionInfo) {
   const sid = s.id;
   const last = (sessionsByChannel.value.get(s.channel_id) ?? []).every((x) => x.id === sid);
-  rpc.call("session.remove", { id: sid })
-    .then(() => {
+  const mark = sessionMark();
+  rpc.call<{ hidden?: boolean; session?: SessionInfo }>("session.remove", { id: sid })
+    .then((r) => {
+      // The daemon hides a named agent's tab instead (this client may not know it is one yet).
+      if (r?.hidden && r.session) {
+        knowSession(r.session, mark);
+        return agentHidden(r.session);
+      }
       if (last) rpc.call("channel.close_if_empty", { id: s.channel_id }).catch(() => {});
     })
     .catch(fail("Close failed")).catch(() => {});
+}
+
+/** An agent's tab was closed (hidden): say it keeps running, with a Show that brings it back
+ * (works whatever "Terminal gets Alt keys" says; Alt+G is named only when it reaches the app). */
+function agentHidden(s: SessionInfo) {
+  focusActiveTerminalSoon();
+  if (s.state === "exited") return;
+  const name = agentBySession.value.get(s.id)?.name ?? s.name;
+  const where = prefs.value.altToTerminal ? "the agents panel" : "the agents panel (Alt+G)";
+  toast("info", `${name} keeps running in the background. Show it again from ${where}.`, 7000, undefined, {
+    label: "Show",
+    run: () => openAgent(name),
+  });
 }
 
 /** Close a named agent's tab without stopping it (`session.hide`). Daemons without it close
@@ -606,8 +626,7 @@ function hideAgentTab(s: SessionInfo, name: string, force: boolean) {
   const mark = sessionMark();
   rpc.call<SessionInfo>("session.hide", { id: s.id }).then((r) => {
     knowSession(r, mark);
-    focusActiveTerminalSoon();
-    if (r.state !== "exited") toast("info", `${name} keeps running: open it from the agents panel (Alt+G)`, 3500);
+    agentHidden({ ...r, name });
   }).catch((e) => {
     if (!unknownMethod(e)) return toast("error", `Close failed: ${errText(e)}`);
     if (!force && BUSY_STATES.has(s.state)) confirmClose.value = s.id;

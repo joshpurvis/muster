@@ -986,16 +986,21 @@ impl Hub {
     /// unknown, e.g. the folder was deleted), for the run `generation`; tells clients only when
     /// it changed. Not persisted.
     pub(crate) fn note_live_cwd(&self, id: SessionId, generation: u64, cwd: Option<String>) {
-        let info = {
-            let mut g = self.inner.lock();
-            let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return };
-            if e.info.live_cwd == cwd {
-                return;
-            }
-            e.info.live_cwd = cwd;
-            e.info.clone()
-        };
-        self.emit(ServerEvent::SessionUpserted(info));
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return };
+        if e.info.live_cwd == cwd {
+            return;
+        }
+        e.info.live_cwd = cwd;
+        self.publish_session(&e.info);
+    }
+
+    /// Broadcast a session's info. Call with `inner` held, right after the change: snapshots
+    /// are then published in the order they were made, so a slower writer can never publish
+    /// an older snapshot over a newer one (e.g. a hook's state change re-showing a tab
+    /// `hide_session` just hid). `emit` never takes a lock.
+    fn publish_session(&self, info: &SessionInfo) {
+        self.emit(ServerEvent::SessionUpserted(info.clone()));
     }
 
     /// Capture application state and its exact terminal together. A detector can
@@ -1152,10 +1157,10 @@ impl Hub {
                 .is_some_and(|p| p.run() == run && p.is_alive() && p.input_interrupted().is_some());
             if !current || entry.info.input_interrupted { return }
             entry.info.input_interrupted = true;
+            self.publish_session(&entry.info);
             entry.info.clone()
         };
         tracing::warn!(session = run.id, generation = run.generation, "terminal input interrupted");
-        self.emit(ServerEvent::SessionUpserted(info.clone()));
         self.notice("error", format!(
             "Some input to \u{201c}{}\u{201d} may not have reached its terminal, so typing there is paused. \
             Check the terminal, then choose Continue typing.", info.name));
@@ -1321,10 +1326,10 @@ impl Hub {
             if let Err(err) = self.store.update_session(&e.info) {
                 tracing::warn!(session = id, "persisting session: {err}");
             }
+            self.publish_session(&e.info);
             (from, e.info.clone())
         };
         let channel_id = info.channel_id;
-        self.emit(ServerEvent::SessionUpserted(info));
         if from != update.state {
             self.log_event(
                 Some(channel_id),
@@ -1346,7 +1351,7 @@ impl Hub {
     /// `state_seq` (and `state_since`, when given) still match; on success `state_seq` moves on,
     /// so a second answer to the same prompt is refused too. Checked and bumped under one lock.
     pub fn claim_prompt(&self, id: SessionId, seq: Option<u64>, since: Option<i64>) -> anyhow::Result<()> {
-        let info = {
+        {
             let mut g = self.inner.lock();
             let e = g
                 .sessions
@@ -1359,9 +1364,8 @@ impl Hub {
                 return Ok(());
             }
             e.info.state_seq = self.state_seq.next()?;
-            e.info.clone()
-        };
-        self.emit(ServerEvent::SessionUpserted(info));
+            self.publish_session(&e.info);
+        }
         Ok(())
     }
 
@@ -1377,7 +1381,7 @@ impl Hub {
 
     /// Update the injection-queue length shown in the UI.
     pub fn set_queued(&self, id: SessionId, queued: u32) {
-        let info = {
+        {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else {
                 return;
@@ -1389,9 +1393,8 @@ impl Hub {
                 e.last_dequeue_at = now_ms();
             }
             e.info.queued = queued;
-            e.info.clone()
-        };
-        self.emit(ServerEvent::SessionUpserted(info));
+            self.publish_session(&e.info);
+        }
     }
 
     /// Mutate a session's info under the lock, persist, broadcast.
@@ -1418,9 +1421,9 @@ impl Hub {
             if let Err(err) = self.store.update_session(&e.info) {
                 tracing::warn!(session = id, "persisting session: {err}");
             }
+            self.publish_session(&e.info);
             e.info.clone()
         };
-        self.emit(ServerEvent::SessionUpserted(info.clone()));
         Ok(info)
     }
 
@@ -2088,13 +2091,14 @@ impl Hub {
             for p in prev {
                 self.release_locked(&mut g, p, &mut events);
             }
+            // Under the lock: the adopted sessions' snapshots go out in the order they changed.
+            for ev in events.drain(..) {
+                self.emit(ev);
+            }
             window_view(&g, target).ok_or_else(|| anyhow::anyhow!("window {target} vanished"))?
         };
         crate::panels::adopt_orphans(self, w.id)?;
-        events.push(ServerEvent::WindowUpserted(w.clone()));
-        for ev in events {
-            self.emit(ev);
-        }
+        self.emit(ServerEvent::WindowUpserted(w.clone()));
         Ok(w)
     }
 
@@ -2283,11 +2287,12 @@ impl Hub {
             if let Some(w) = window_view(&g, window_id) {
                 events.push(ServerEvent::WindowUpserted(w));
             }
+            // Under the lock, as in `set_session_window`.
+            for ev in events.drain(..) {
+                self.emit(ev);
+            }
             ch
         };
-        for ev in events {
-            self.emit(ev);
-        }
         Ok(ch)
     }
 
@@ -2900,13 +2905,13 @@ impl Hub {
             if let Err(err) = self.store.update_session(&info) {
                 tracing::warn!(session = id, "persisting session: {err}");
             }
+            self.publish_session(&info);
             if let Some(old) = old {
                 g.tokens.remove(&old);
             }
             g.tokens.insert(token, id);
             (info, early, kill)
         };
-        self.emit(ServerEvent::SessionUpserted(info.clone()));
         if kill {
             pty.kill();
         }
@@ -3132,9 +3137,9 @@ impl Hub {
             if let Some(w) = entry.info.window_id {
                 self.drop_if_unused_locked(&mut g, w, &mut events);
             }
-        }
-        for ev in events {
-            self.emit(ev);
+            for ev in events.drain(..) {
+                self.emit(ev);
+            }
         }
         if !closed {
             // A removed session's title no longer names the channel: rebuild from the rest.
@@ -3451,7 +3456,7 @@ impl Hub {
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
             .find(|(_, record)| !record.retired && record.token == token)
             .map(|(id, record)| (*id, record.spec.run.generation)));
-        let (info, from, changed, fx) = {
+        let (info, from, fx) = {
             let mut g = self.inner.lock();
             let id = if cursor.is_some() {
                 recorded.filter(|(id, generation)| g.sessions.get(id).is_some_and(|entry| entry.generation == *generation))
@@ -3501,7 +3506,10 @@ impl Hub {
             let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents;
             entry.info = info.clone();
             entry.last_hook_at = last_hook_at;
-            (info, from, changed, fx)
+            if changed {
+                self.publish_session(&info);
+            }
+            (info, from, fx)
         };
         let id = info.id;
         if let Some(m) = fx.replied { crate::agents::publish_message(self, m); }
@@ -3512,9 +3520,6 @@ impl Hub {
             self.log_event(Some(info.channel_id), Some(id), EventKind::StateChange,
                 serde_json::json!({"session_id": id, "from": from, "to": info.state,
                     "detail": info.state_detail, "source": StateSource::Hook}));
-        }
-        if changed {
-            self.emit(ServerEvent::SessionUpserted(info));
         }
         Ok(())
     }
@@ -3598,9 +3603,9 @@ impl Hub {
                     }
                     if let Some(old) = old { g.tokens.remove(&old); }
                     g.tokens.insert(record.token.clone(), id);
+                    self.publish_session(&info);
                     drop(g);
                     tracing::info!(session = id, ?run, "adopted a launch whose acknowledgement was lost");
-                    self.emit(ServerEvent::SessionUpserted(info));
                     if let Some(code) = early { self.pty_exited(id, run.generation, code); }
                 }
                 Err(error) if is_definite_spawn_failure(&error) => {
@@ -3616,9 +3621,9 @@ impl Hub {
                     if let Err(err) = self.store.update_session(&info) {
                         tracing::warn!(session = id, "persisting session: {err}");
                     }
+                    self.publish_session(&info);
                     drop(g);
                     crate::inject::drop_queue(self, id);
-                    self.emit(ServerEvent::SessionUpserted(info));
                 }
                 Err(error) => tracing::debug!(session = id, ?run, "launch still unconfirmed: {error:#}"),
             }

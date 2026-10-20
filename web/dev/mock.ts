@@ -814,7 +814,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     case "agent.remove": {
       const a = agentNamed(p.name);
       if (a.session_id !== null && sessions.has(a.session_id)) {
-        await handle("session.remove", { id: a.session_id });
+        await handle("session.remove_now", { id: a.session_id });
       }
       agentList.splice(agentList.indexOf(a), 1);
       broadcast("agent_removed", { id: a.id, name: a.name });
@@ -1329,9 +1329,15 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       upsert(s);
       return s;
     }
-    case "session.remove": {
+    case "session.remove":
+    case "session.remove_now": {
       const s = sessions.get(p.id);
       if (!s) throw new Error(`no such session: ${p.id}`);
+      // As the daemon: closing a named agent's tab hides it (`agent.remove` removes it for real,
+      // through the mock-only "session.remove_now").
+      if (method === "session.remove" && agentList.some((a) => a.session_id === s.id)) {
+        return { hidden: true, session: await handle("session.hide", { id: s.id }) };
+      }
       kill(p.id);
       sessions.delete(p.id);
       broadcast("session_removed", { id: p.id });

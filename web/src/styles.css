@@ -2505,6 +2505,23 @@ textarea {
   word-break: break-word;
 }
 
+.toast-action {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toast-action:hover,
+.toast-action:focus-visible {
+  background: var(--hover-strong);
+}
+
 .toast-x {
   display: inline-flex;
   width: 20px;

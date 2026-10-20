@@ -145,7 +145,12 @@ impl Snapshot {
     }
 
     /// A session's window: its own (a tab is a session), else its tab's (older daemons).
+    /// The session's window; a daemon without per-session windows: its channel's. A hidden
+    /// agent tab is in none (its null is real, never filled in from the channel).
     fn window_of(&self, s: &Sess) -> Option<i64> {
+        if s.hidden {
+            return None;
+        }
         s.window_id.or_else(|| self.channel(s.channel_id).and_then(|c| c.window_id))
     }
 
@@ -2270,5 +2275,19 @@ mod tests {
         let sess = s.sessions.iter().find(|x| x.id == 11).unwrap();
         assert_eq!(s.window_of(sess), Some(3));
         assert_eq!(s.session_json(sess)["window_id"], 3);
+    }
+
+    #[test]
+    fn a_hidden_agent_tab_is_in_no_window() {
+        // Its task may still name a window (older views): the session's null stays, so
+        // `muster move` sends no stale `from_window_id` and `ls --json` reports null.
+        let s = Snapshot::from_hello(&json!({
+            "channels": [{"id": 1, "name": "ada", "window_id": 2}],
+            "sessions": [{"id": 9, "channel_id": 1, "kind": "claude", "name": "ada", "state": "idle",
+                "window_id": null, "hidden": true}],
+        }));
+        let sess = &s.sessions[0];
+        assert_eq!(s.window_of(sess), None);
+        assert!(s.session_json(sess)["window_id"].is_null());
     }
 }

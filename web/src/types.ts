@@ -122,6 +122,9 @@ export interface SessionInfo {
   created_at: number;
   /** The window showing this session as a tab. Missing before v2: then its channel's window. */
   window_id?: WindowId | null;
+  /** A named agent's closed tab (`session.hide`): it runs on in no window until it is shown
+   * again (`session.set_window`). Missing from older daemons. */
+  hidden?: boolean;
 }
 
 export type EventKind =
@@ -206,6 +209,14 @@ export interface AgentTemplate {
   accepts: Origin[];
   autostart: boolean;
 }
+
+/** `agent.models`: what the agent dialog offers per CLI (src/agents.rs `model_catalog`). */
+export interface KindModels {
+  /** `efforts`: this model's levels where they differ from the CLI's (null: the CLI's). */
+  models: { id: string; note: string | null; efforts: string[] | null }[];
+  efforts: string[];
+}
+export type ModelCatalog = Record<"claude" | "codex", KindModels>;
 
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }

@@ -57,7 +57,8 @@ export function sessionWindowId(s: SessionInfo, task: Channel | undefined, windo
  * Sessions shown as tabs in window `win`: its own (`window_id`), or, from daemons without
  * per-session windows, those of its tasks. Only sessions of live tasks. Ordered by their task's
  * place in the window's task list (other tasks after, oldest first), then age: the order new
- * tabs join a group in. `win === null` (no windows): every session of a live task.
+ * tabs join a group in. `win === null` (no windows): every session of a live task. A hidden
+ * agent tab (`hidden`) is in no window.
  */
 export function sessionsOfWindow(
   win: Win | null,
@@ -69,7 +70,7 @@ export function sessionsOfWindow(
   const taskKey = (c: Channel) => pos.get(c.id) ?? Number.MAX_SAFE_INTEGER;
   const out = [...sessions].filter((s) => {
     const c = live.get(s.channel_id);
-    if (!c) return false;
+    if (!c || s.hidden) return false;
     if (!win) return true;
     return s.window_id !== undefined ? s.window_id === win.id : taskInWindow(c, win);
   });

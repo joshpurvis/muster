@@ -2505,6 +2505,23 @@ textarea {
   word-break: break-word;
 }
 
+.toast-action {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toast-action:hover,
+.toast-action:focus-visible {
+  background: var(--hover-strong);
+}
+
 .toast-x {
   display: inline-flex;
   width: 20px;
@@ -3332,7 +3349,8 @@ textarea {
   gap: 6px;
 }
 
-.profile-select {
+.profile-select,
+.select-wrap {
   position: relative;
   display: block;
   min-width: 0;
@@ -3340,7 +3358,8 @@ textarea {
 
 /* WebKitGTK's native select adds theme padding inside our fixed-height fields.
    Paint the closed control ourselves; keep native options and keyboard behavior. */
-.field .profile-select select {
+.field .profile-select select,
+.field .select-wrap select {
   -webkit-appearance: none;
   appearance: none;
   height: auto;
@@ -3351,7 +3370,8 @@ textarea {
   text-overflow: ellipsis;
 }
 
-.profile-select > .icon {
+.profile-select > .icon,
+.select-wrap > .icon {
   position: absolute;
   right: 10px;
   top: 50%;

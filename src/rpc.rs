@@ -409,8 +409,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;
+            // Closing a named agent's tab never stops it, whatever the client knew about agents
+            // (its list may not have loaded yet): it is hidden instead. `agent.remove` removes it.
+            if hub.agents().by_session(p.id).is_some() {
+                return Ok(json!({ "hidden": true, "session": hub.hide_session(p.id)? }));
+            }
             hub.remove_session(p.id)?;
             Ok(json!({}))
+        }
+        "session.hide" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            to_value(hub.hide_session(p.id)?)
         }
         "session.rename" => {
             let p: Rename<SessionId> = parse(params)?;
@@ -846,6 +855,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             Ok(Value::Array(out))
         }
         "agent.templates" => to_value(crate::agents::templates()),
+        "agent.models" => Ok(crate::agents::model_catalog()),
         "agent.remove" => {
             require_local(who, method)?;
             #[derive(Deserialize)]
@@ -1701,6 +1711,11 @@ mod tests {
         assert!(call(&hub, "agent.update", json!({"name": "nobody"})).await.unwrap_err().contains("no agent named"));
         let t = call(&hub, "agent.templates", json!({})).await.unwrap();
         assert_eq!(t.as_array().unwrap().len(), 6);
+        let m = call(&hub, "agent.models", json!({})).await.unwrap();
+        for kind in ["claude", "codex"] {
+            assert!(!m[kind]["models"].as_array().unwrap().is_empty() && !m[kind]["efforts"].as_array().unwrap().is_empty());
+        }
+        assert!(m["claude"]["models"].as_array().unwrap().iter().any(|x| x["id"] == "opus"));
         call(&hub, "agent.remove", json!({"name": "rpc-eve"})).await.unwrap();
         assert_eq!(drain(&mut rx, "agent_removed")[0]["name"], "rpc-eve");
     }
@@ -1774,8 +1789,8 @@ mod tests {
         // No agent method is ever a device's, and writes need the desktop client token.
         for m in [
             "agent.create", "agent.update", "agent.list", "agent.remove", "agent.start", "agent.ask",
-            "agent.templates", "agent.messages", "agent.memory.list", "agent.memory.read", "agent.memory.write",
-            "agent.memory.add", "agent.memory.delete",
+            "agent.templates", "agent.models", "agent.messages", "agent.memory.list", "agent.memory.read",
+            "agent.memory.write", "agent.memory.add", "agent.memory.delete",
         ] {
             assert!(devices::method_scope(m).is_none(), "{m}");
         }

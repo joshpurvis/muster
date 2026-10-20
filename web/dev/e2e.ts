@@ -777,6 +777,65 @@ try {
     await a.wait(`!${M}.windowSessions.value.some((s) => s.id === ${rev})`, 5000);
     check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "pulled, not restarted");
     ok("clicking a running agent in window 2 pulled its tab into window 2's focused group");
+
+    // Closing an agent's tab only hides it: no confirm, the agent runs on, its row shows it again.
+    await b2.key("Alt+W");
+    await b2.wait(`!${M}.windowSessions.value.some((s) => s.id === ${rev})`, 3000);
+    check(
+      await b2.eval(
+        `${M}.sessions.value.get(${rev})?.hidden === true && ${M}.sessions.value.get(${rev}).state !== 'exited'`,
+      ),
+      "the agent's session runs on, hidden",
+    );
+    check(!(await here(a)).includes(rev) && !(await here(b2)).includes(rev), "a tab in no window");
+    check(await b2.eval(`!document.querySelector('.confirm-dlg') && !document.querySelector('.confirm-close')`), "no confirm");
+    check(
+      !(await b2.eval(`document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`)),
+      "its row still shows it running",
+    );
+    await b2.click(`[data-agent="reviewer"]`);
+    await b2.wait(
+      `${M}.focusedSession.value?.id === ${rev} && !${M}.sessions.value.get(${rev}).hidden`,
+      5000,
+    );
+    check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "the same session, not restarted");
+    ok("closing an agent's tab hid it (still running); clicking its row brought the same session back");
+
+    // A window that doesn't know the agents yet (its list still loading) can't stop one either:
+    // the daemon hides it on `session.remove`; the toast's Show brings it back.
+    await b2.click(`[data-tab-sid="${rev}"]`);
+    await b2.eval(`(() => { globalThis.__agents = ${M}.agents.value; ${M}.agents.value = []; })()`);
+    await b2.key("Alt+W");
+    // A busy agent asks first here (this window can't tell it is an agent): confirm.
+    await b2.sleep(300);
+    if (await b2.eval(`!!document.querySelector('.confirm-close')`)) await b2.key("Enter");
+    await b2.wait(`${M}.sessions.value.get(${rev})?.hidden === true`, 3000).catch(async (e) => {
+      console.error(await b2!.eval(`JSON.stringify({ s: ${M}.sessions.value.get(${rev}), focus: ${M}.focusedSession.value?.id,
+        active: document.activeElement?.className, toasts: [...document.querySelectorAll('.toast')].map((t) => t.textContent) })`));
+      throw e;
+    });
+    check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "removed by an unknowing window: hidden, still running");
+    await b2.eval(`${M}.agents.value = globalThis.__agents`);
+    await b2.wait(`!!document.querySelector('.toast .toast-action')`, 2000);
+    check(
+      await b2.eval(`document.querySelector('.toast-action').closest('.toast').textContent.includes('keeps running')`),
+      "the toast says it keeps running",
+    );
+    await b2.click(`.toast .toast-action`);
+    await b2.wait(`${M}.focusedSession.value?.id === ${rev} && !${M}.sessions.value.get(${rev}).hidden`, 5000);
+    ok("closing before the agent list loaded still only hid it; the toast's Show brought it back");
+
+    // Stop (the row's menu) is what stops it; the tab stays, showing it stopped.
+    await b2.click(`[data-agent="reviewer"]`, { button: "right" });
+    await b2.wait(`!!document.querySelector('.menu')`);
+    check(await menuItem(b2, "Stop"), "the row's menu has Stop");
+    await b2.wait(`${M}.sessions.value.get(${rev}).state === 'exited'`, 5000);
+    await b2.wait(
+      `document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      3000,
+    );
+    check((await here(b2)).includes(rev), "its tab stays");
+    ok("Stop in the agent's menu stopped it");
     await b2.key("Alt+G");
     await b2.wait(`!document.querySelector('.agents-panel')`, 2000);
 
@@ -806,6 +865,78 @@ try {
       await a.eval(`document.querySelector('.agent-dlg .persona-input').value.includes('plan mode')`),
       "the template prefilled the persona",
     );
+    // Model and Effort are selects: the CLI's list, Default, and Custom… for anything else.
+    const selOf = (label: string) =>
+      `document.getElementById([...document.querySelectorAll('.agent-dlg label.field-label')]` +
+      `.find((l) => l.textContent === '${label}').htmlFor)`;
+    const [ms, es] = [selOf("Model"), selOf("Effort")];
+    const choose = (sel: string, value: string) =>
+      a.eval(`(() => { const s = ${sel}; s.value = ${JSON.stringify(value)};
+        s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+    await a.wait(`${ms}.options.length > 2`, 2000);
+    const levels = await a.eval(`[...${es}.options].map((o) => o.textContent).join()`);
+    check(
+      levels === "Default (the CLI's choice),low,medium,high,xhigh,max,Custom…",
+      `Effort lists ${levels}`,
+    );
+    await choose(ms, "opus");
+    await choose(es, "xhigh");
+    await shot(a, "10a-new-agent-models");
+    await choose(ms, " custom");
+    await a.wait(`document.activeElement?.getAttribute('aria-label') === 'Custom model'`, 1000);
+    await a.type("claude-opus-5-5");
+    check(
+      await a.eval(`document.querySelector('[aria-label="Custom model"]').value === 'claude-opus-5-5'`),
+      "the custom field started from opus, selected, so typing replaced it",
+    );
+    await shot(a, "10b-new-agent-custom-model");
+    // Switching to Codex: the custom model goes back to Default; a level Codex also lists stays.
+    const kindBtn = (k: string) =>
+      `[...document.querySelectorAll('.agent-dlg .seg-btn')].find((b) => b.textContent.includes('${k}'))`;
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(`${ms}.value === '' && ${es}.value === 'xhigh'`) &&
+        await a.eval(`!document.querySelector('[aria-label="Custom model"]')`),
+      "switching to Codex reset the custom model and kept a level Codex has",
+    );
+    // Effort follows the model: gpt-6-luna has no "ultra", so picking it resets a picked ultra.
+    await choose(ms, "gpt-6.1-sol");
+    await choose(es, "ultra");
+    await choose(ms, "gpt-6-luna");
+    await a.sleep(100);
+    check(
+      await a.eval(`${es}.value === '' && ![...${es}.options].some((o) => o.value === 'ultra')`),
+      "gpt-6-luna offers no ultra; the picked ultra went back to Default",
+    );
+    // Custom stays chosen with its field cleared, and clicking the current kind changes nothing.
+    await choose(ms, " custom");
+    await a.wait(`document.activeElement?.getAttribute('aria-label') === 'Custom model'`, 1000);
+    await a.key("Backspace");
+    await a.sleep(100);
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(
+        `${ms}.value === ' custom' && document.querySelector('[aria-label="Custom model"]')?.value === ''`,
+      ),
+      "Custom stays chosen with an empty field, also after clicking the kind already chosen",
+    );
+    await a.type("gpt-6-luna-preview");
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(`document.querySelector('[aria-label="Custom model"]')?.value === 'gpt-6-luna-preview'`),
+      "clicking the current kind keeps a custom model",
+    );
+    await a.eval(`${kindBtn("Claude")}.click()`);
+    await a.sleep(100);
+    await choose(ms, "sonnet");
+    await choose(es, "");
+    // An eval'd click doesn't move focus (the custom field it removed had it): Ctrl+Enter below
+    // goes from the Model select, as after a real pick.
+    await a.eval(`${ms}.focus()`);
+    ok("Model and Effort: dropdowns per CLI, Custom… for other ids, a kind switch resets what doesn't fit");
     check(await a.eval(`!document.querySelector('.agent-warn')`), "no warning for human-only");
     await a.eval(
       `[...document.querySelectorAll('.agent-dlg .check')].find((l) => l.textContent.includes('Schedule')).querySelector('input').click()`,
@@ -829,8 +960,9 @@ try {
     );
     const made: any = (await R(a, "agent.list", {})).find((x: any) => x.name === "researcher");
     check(
-      made && made.permissions.claude_mode === "plan" && made.accepts_origins.join() === "human",
-      "created as the template says",
+      made && made.permissions.claude_mode === "plan" && made.accepts_origins.join() === "human" &&
+        made.model === "sonnet" && made.effort === null,
+      "created as the template says, with the chosen model and the default effort",
     );
     ok("New agent: the Researcher template prefilled the dialog; schedule on a Claude agent warns; created");
 

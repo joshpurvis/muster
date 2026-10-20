@@ -152,6 +152,8 @@ interface Session {
   created_at: number;
   /** The window this session is a tab in (docs/PROTOCOL.md "Groups layout (v2)"). */
   window_id: number | null;
+  /** A named agent's closed tab, still running (`session.hide`). */
+  hidden?: boolean;
 }
 
 const now = () => Date.now();
@@ -239,7 +241,18 @@ function taskFollows(c: any, prefer?: number) {
     .filter((s) => s.channel_id === c.id && winById(s.window_id))
     .sort((a, b) => a.id - b.id)
     .map((s) => s.window_id as number);
-  if (!wins.length) return;
+  if (!wins.length) {
+    // Every tab it has left is a hidden agent's: the task leaves its window too.
+    const tabs = [...sessions.values()].filter((s) => s.channel_id === c.id);
+    const from = winById(c.window_id);
+    if (from && tabs.length && tabs.every((s) => s.hidden)) {
+      from.channel_ids = from.channel_ids.filter((x) => x !== c.id);
+      c.window_id = null;
+      broadcast("channel_upserted", c);
+      if (!removeWindowIfEmpty(from)) upsertWindow(from);
+    }
+    return;
+  }
   let target: number;
   if (wins.every((w) => w === wins[0])) target = wins[0];
   else if (!wins.includes(c.window_id)) {
@@ -310,13 +323,15 @@ function claim(ws: WebSocket, id?: number): Win {
   }
   w.open = true;
   holding.set(ws, w.id);
-  // Adopt channels without a (live) window.
+  // Adopt channels without a (live) window, except a hidden agent's task.
   for (const c of channels) {
     if (c.archived) continue;
+    const tabs = [...sessions.values()].filter((s) => s.channel_id === c.id);
+    if (tabs.length && tabs.every((s) => s.hidden)) continue;
     if (c.window_id == null || !windows.some((x) => x.id === c.window_id)) placeChannel(c, w);
   }
   for (const s of sessions.values()) {
-    if (!winById(s.window_id)) {
+    if (!s.hidden && !winById(s.window_id)) {
       s.window_id = w.id;
       upsert(s);
     }
@@ -540,6 +555,25 @@ interface MockAgent {
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
+// A short copy of `agent.models` (the real lists live in src/agents.rs `model_catalog`).
+const AGENT_MODELS = {
+  claude: {
+    models: [
+      { id: "fable", note: "latest Fable", efforts: null },
+      { id: "opus", note: "latest Opus", efforts: null },
+      { id: "sonnet", note: "latest Sonnet", efforts: null },
+      { id: "haiku", note: "latest Haiku", efforts: null },
+    ],
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  codex: {
+    models: [
+      { id: "gpt-6.1-sol", note: null, efforts: null },
+      { id: "gpt-6-luna", note: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+    ],
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  },
+};
 const AGENT_TEMPLATES = [
   {
     id: "blank",
@@ -756,6 +790,8 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       return agentList.map(agentJson);
     case "agent.templates":
       return AGENT_TEMPLATES;
+    case "agent.models":
+      return AGENT_MODELS;
     case "agent.create": {
       const a = newAgent(p);
       broadcast("agent_upserted", agentJson(a));
@@ -779,7 +815,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
     case "agent.remove": {
       const a = agentNamed(p.name);
       if (a.session_id !== null && sessions.has(a.session_id)) {
-        await handle("session.remove", { id: a.session_id });
+        await handle("session.remove_now", { id: a.session_id });
       }
       agentList.splice(agentList.indexOf(a), 1);
       broadcast("agent_removed", { id: a.id, name: a.name });
@@ -1114,9 +1150,10 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
           `session ${s.id} is no longer in window ${p.from_window_id} (now in ${s.window_id ?? "none"})`,
         );
       }
-      if (s.window_id === w.id) return s;
+      if (s.window_id === w.id && !s.hidden) return s;
       const from = winById(s.window_id);
       s.window_id = w.id;
+      s.hidden = false;
       upsert(s);
       taskFollows(channels.find((c) => c.id === s.channel_id), w.id);
       removeWindowIfEmpty(from);
@@ -1324,9 +1361,15 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       upsert(s);
       return s;
     }
-    case "session.remove": {
+    case "session.remove":
+    case "session.remove_now": {
       const s = sessions.get(p.id);
       if (!s) throw new Error(`no such session: ${p.id}`);
+      // As the daemon: closing a named agent's tab hides it (`agent.remove` removes it for real,
+      // through the mock-only "session.remove_now").
+      if (method === "session.remove" && agentList.some((a) => a.session_id === s.id)) {
+        return { hidden: true, session: await handle("session.hide", { id: s.id }) };
+      }
       kill(p.id);
       sessions.delete(p.id);
       broadcast("session_removed", { id: p.id });
@@ -1336,6 +1379,22 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (!closed) taskFollows(c);
       removeWindowIfEmpty(winById(s.window_id));
       return {};
+    }
+    case "session.hide": {
+      // A named agent's tab closed: it runs on in no window (the real daemon: hub::hide_session).
+      const s = sessions.get(p.id);
+      if (!s) throw new Error(`no such session: ${p.id}`);
+      if (!agentList.some((a) => a.session_id === s.id)) {
+        throw new Error(`session ${s.id} is not a named agent's; only an agent's tab can be hidden`);
+      }
+      if (s.hidden) return s;
+      const from = winById(s.window_id);
+      s.window_id = null;
+      s.hidden = true;
+      upsert(s);
+      taskFollows(channels.find((c) => c.id === s.channel_id));
+      removeWindowIfEmpty(from);
+      return s;
     }
     case "session.move": {
       const s = sessions.get(p.id);

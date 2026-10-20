@@ -949,6 +949,18 @@ export function Toasts() {
           <div key={t.id} class={cx("toast", "toast-" + t.level)}>
             {t.level === "success" ? <IconCheck size={14} /> : <span class="toast-dot" />}
             <span class="toast-text">{t.text}</span>
+            {t.action && (
+              <button
+                type="button"
+                class="toast-action"
+                onClick={() => {
+                  dismissToast(t.id);
+                  t.action!.run();
+                }}
+              >
+                {t.action.label}
+              </button>
+            )}
             <button type="button" class="toast-x" aria-label="Dismiss" onClick={() => dismissToast(t.id)}>
               <IconX size={12} />
             </button>

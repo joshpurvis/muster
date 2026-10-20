@@ -327,6 +327,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE panel_events ADD COLUMN parked INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v16: a named agent's tab the human closed keeps running, hidden (`session.hide`).
+    r#"
+    ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
@@ -1255,7 +1259,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
-                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id FROM sessions ORDER BY id",
+                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -1285,6 +1289,7 @@ impl Store {
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
+                    hidden: r.get::<_, i64>(19)? != 0,
                     account_profile_id: r.get(18)?,
                 },
                 extra_args: serde_json::from_str(&extra).unwrap_or_default(),
@@ -1299,8 +1304,8 @@ impl Store {
         let i = &s.info;
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
-                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -1319,7 +1324,8 @@ impl Store {
                 serde_json::to_string(&s.extra_args).unwrap_or_else(|_| "[]".into()),
                 i.created_at,
                 i.window_id,
-                i.account_profile_id
+                i.account_profile_id,
+                i.hidden
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -1329,7 +1335,7 @@ impl Store {
     pub fn update_session(&self, i: &SessionInfo) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET name=?2, cwd=?3, state=?4, state_detail=?5, state_since=?6, title=?7, pid=?8,
-                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14 WHERE id=?1",
+                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14, hidden=?15 WHERE id=?1",
             params![
                 i.id,
                 i.name,
@@ -1344,7 +1350,8 @@ impl Store {
                 i.rows,
                 i.queued,
                 i.channel_id,
-                i.window_id
+                i.window_id,
+                i.hidden
             ],
         )?;
         Ok(())

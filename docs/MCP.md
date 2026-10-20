@@ -108,8 +108,8 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
-| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{note?}`; advances the revision |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)) | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
+| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?`, `kit?` (custom only; switching it reloads the app) | `{note?}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
 | `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], remaining, timed_out}`; consumes the returned events |
@@ -131,8 +131,9 @@ Reload. Input arrives as `ui/notifications/tool-input` (`params.arguments` is th
 `data`, again on every `panel_update`). A user action reaches the agent through `ui/message`,
 accepted only straight after a click or key inside the panel's content (checked by the sandbox
 proxy), at most 3 per user action (a 4th within about 5.5 s gets JSON-RPC error -32000), so
-send one message per deliberate action; `_meta.muster.kind` names it.
-A minimal app:
+send one message per deliberate action; `_meta.muster.kind` names it. With `kit: true`
+Muster does all of this for the page (below, [The kit](#the-kit-kit-true)).
+A minimal app without the kit:
 
 ```html
 <!doctype html><meta charset="utf-8"><button>Approve</button><script>
@@ -173,16 +174,89 @@ moved-to-another-task openers keep events queued. A human closing a tab queues `
 agent `panel_close` does not. Archiving the task, including when its last session closes or
 moves out, removes panels, files and events.
 
+#### The kit (`kit: true`)
+
+A custom app opened with `kit: true` gets the Muster Kit in front of its HTML: the same
+styles, components, chart renderer and fonts (Inter and JetBrains Mono, OFL) that the built-in
+apps use, plus the handshake. Muster adds it when it serves the panel, so none of it counts
+toward the 1 MiB, and it loads nothing from the network (the fonts are `data:` URIs; the panel
+CSP allows `font-src data:` and nothing else changes: no `fetch`, no nested frames).
+`panel_update {kit}` switches it on or off and reloads the app; it is refused for built-ins
+(they already use it). Without `kit`, a custom app is exactly the agent's HTML, as before.
+
+With the kit, do not call `ui/initialize` yourself: the kit does the handshake, follows the
+host theme (`<html data-theme>`), and reports size changes. Everything else is optional:
+
+```html
+<main class="mk-page">
+  <header class="mk-head">
+    <div>
+      <h1 class="mk-title">3 tests failed out of 1,216 <span class="mk-scope">billing-api · run 1482</span></h1>
+      <p class="mk-takeaway">All three started with commit <code>9be04f1</code>.</p>
+    </div>
+    <button class="mk-btn primary" data-send="rerun_failed" data-busy="Starting…"><mk-icon name="refresh"></mk-icon>Re-run failed</button>
+  </header>
+  <div class="mk-grid" style="--min:300px">
+    <section class="mk-card">
+      <h2>Duration <span class="aside">last 20 runs</span></h2>
+      <mk-stat label="This run" value="4m 12s" delta="−18 s" tone="good"></mk-stat>
+      <mk-chart height="110"><script type="application/json">
+        {"type": "line", "format": "s", "x": {"values": [1480, 1481, 1482]}, "series": [{"name": "s", "values": [266, 270, 252]}]}
+      </script></mk-chart>
+    </section>
+  </div>
+</main>
+```
+
+- Layout: `mk-page`, `mk-head`, `mk-title`, `mk-scope`, `mk-takeaway`, `mk-section` (with an
+  `h2`), `mk-grid` (`--min` sets the narrowest column), `mk-wide` (the whole row), `mk-row`,
+  `mk-stack`, `mk-card` (`tone-good|warn|bad`, `flat`), `mk-card-head`, `mk-split`, `mk-foot`,
+  `mk-source`, `mk-note`.
+- Tags: `<mk-stat label value unit delta tone note trend color>`, `<mk-chart height pin legend>`
+  with the chart app's JSON inside, `<mk-spark values>`, `<mk-ring>` with
+  `{segments, center, sub, label}` JSON, `<mk-meter label value max text of mark mark-label>`,
+  `<mk-icon name>`. A tag with bad JSON shows its error in place; the rest still draws.
+- Classes: `mk-stats`, `mk-badge` (`good warn bad info accent plain`), `mk-chip`, `mk-delta`,
+  `mk-btn` (`primary danger ghost sm`), `mk-seg`, `mk-search`/`mk-input`, `mk-list`, `mk-icon`,
+  `mk-avatar`, `mk-bar-cell`, `mk-steps` (`li[data-state=done|active|failed]`), `mk-timeline`,
+  `mk-callout`, `mk-kv`, `mk-pre`, `mk-table`, `mk-empty`, `mk-error`, `mk-skel`.
+- Buttons that talk to the agent: `data-send="kind"` plus any `data-*` sends the panel event
+  `kind` with the other data attributes as its data, with no script. `data-confirm="Question?"`
+  asks first (a second click or Enter sends; Esc, leaving the button or 5 s cancels);
+  `data-busy` and `data-sent` set what it says meanwhile; `data-text` is the sentence the agent
+  reads. A sent button stays off until the next `panel_update` (or 30 s).
+- Script: `mk.onData(fn)` (the panel's data now and on every update), `mk.send(kind, data,
+  text?)` (from a click or key handler), `mk.chart(el, spec, opts)`, `mk.board(el, data)`,
+  `mk.fmt(v, format)`, `mk.spark`, `mk.ring`, `mk.meter`, `mk.icon(name)`, `mk.icons()`,
+  `mk.upgrade(root)` for tags added later.
+- Colours: use the `--mk-*` tokens (`--mk-text`, `--mk-text-2`, `--mk-accent`, `--mk-good`,
+  `--mk-c1`…`--mk-c8`, …), never fixed colours, so light and dark both work.
+
+Source: `web/src/panels/kit/`, built into `web/panels/kit.css` and `kit.js`; examples in
+`web/dev/panel_examples/`.
+
 #### Built-in apps
 
 Built-ins take only `data` (no `html`). Each follows the host theme and works by keyboard.
 `panel_open` and `panel_update` refuse input that the app would refuse, naming the field:
 every required field, type, enum, count and length limit below, with lengths counted in
 characters (Unicode code points) the same way on both sides, so accepted input never turns
-into an error screen in the panel. Unknown fields are refused in `image` input and in
-`pr_decision` `media` items; in chart, table, pr_decision, pr_overview and `actions` they are
+into an error screen in the panel. Unknown fields are refused in `image` input, in
+`pr_decision` `media` items and in `board` input; in chart, table, pr_decision, pr_overview and `actions` they are
 accepted and listed in the panel as warnings. Source: `web/src/panels/apps/`, built into `web/panels/<app>.html` by
 `cd web && deno task panels`.
+
+Every built-in draws with the Muster Kit (the "Briefing" look: the finding first, then the
+evidence): the title with its scope after it, the agent's one-sentence takeaway, headline
+numbers, the evidence, and a source line. They share the kit's colour tokens (text at 4.5:1 or
+more on every surface in both themes, series colours at 3:1) and its two bundled fonts, which
+Muster inlines when it serves the panel, so nothing loads from the network.
+
+**`markdown`**: `{markdown}`. Set for reading (a 70-character measure): headings, paragraphs,
+lists, `- [ ]`/`- [x]` checklists, `>` quotes (a soft callout), fenced code with its language
+shown, tables (columns of numbers right-aligned), `---` rules, inline code, bold, italic and
+http(s) links (opened in the system browser). The paragraph right under the `#` title reads
+as a lead. A comment box under it sends the user's words to the agent as a `ui/message` event.
 
 **`image`**: `{path?, url?, alt?, caption?}`, exactly one of `path` or `url`. `path` is a file
 in the task worktree (the task cwd): Muster reads it when the panel opens or updates, refuses
@@ -198,33 +272,102 @@ declared. The host must be a plain name or IP (no wildcards). Without `alt`, the
 {"path": "shots/login.png", "alt": "Login page after the fix", "caption": "Chromium, 1280 px"}
 ```
 
-**`chart`**: `{type, title?, x: {label?, values}, series: [{name, values}], y?: {label?, min?, max?}}`.
-`type` is `bar`, `line`, `scatter` or `area`; `x.values` are 1–2000 numbers or strings
-(numbers only for `scatter`; all-number x gives `line`/`area` a linear axis); 1–12 series,
-each with one value per x value (a number, or `null` for a gap). Bars and areas include zero;
-`y.min`/`y.max` fix the axis (with only one fixed, the other side follows the data, even if
-the fixed bound lies beyond it). Series 1–8 get distinct colours; 9–12 reuse them with dashed
-lines, hatched bars and square markers. Drawn as SVG with an accessible title and description, a
-legend, hover and arrow-key tooltips, and a data table (hidden until "Show data table").
+**`chart`**: `{type, title?, x: {label?, values}, series: [{name, values, color?}], y?: {label?, min?, max?}}`,
+plus the optional Briefing fields below. `type` is `bar`, `line`, `scatter` or `area`;
+`x.values` are up to 2000 numbers or strings (numbers only for `scatter`; all-number x gives
+`line`/`area` a linear axis); up to 12 series, each with one value per x value (a number, or
+`null` for a gap). A chart with no values at all is valid: the panel says "No data to show"
+with `empty` as the reason. Bars and areas include zero; `y.min`/`y.max` fix the axis (with
+only one fixed, the other side follows the data, even if the fixed bound lies beyond it).
+Series take Muster's eight series colours in order; past 8 series the first is highlighted and
+the rest turn grey. Drawn by the kit as SVG (lines smoothed without overshooting, labelled at
+their ends; value labels on bars when they fit; a missing bar shows "–") with an accessible
+title and description, hover and arrow-key tooltips that name the point they compare with
+("vs Thu"), a live region reading each point, legend toggles, and a data table (visually
+hidden until "Data table"). It redraws at its new width when the panel is resized.
+
+| Optional field | |
+|---|---|
+| `takeaway` | the one-sentence finding under the title (at most 600 characters; `**bold**` and `` `code` `` render) |
+| `scope`, `source` | what the chart covers, after the title in a muted tone, and a footer line ("gh run list · 412 runs") |
+| `format`, `xFormat` | `int`, `pct` (values are already percents: 0.34 means 0.34 %; tooltip changes show in points), `usd`, `ms`, `s` (clock ticks: 30 s, 1 m, 5 m) or `plain`; for the axis, labels and tooltip. Numbers compact to k, M, B and T with a true minus sign; whole-number x (run numbers, years) prints without separators by default |
+| `highlight` | a series name: the others turn grey |
+| `annotations` | up to 20 `{x, label}`; `x` must be one of `x.values`. A dashed marker with a label, or a ringed, named point on a scatter |
+| `stacked` | `true` for `bar` and `area` only; negative values stack below zero |
+| `labels` | `auto` (default), `values`, `end` or `none` |
+| `trend` | `true` for `scatter` only: a least-squares line |
+| `empty` | what to say when there is nothing to draw (at most 200 characters) |
+| `stats` | up to 4 headline numbers above the chart, `{label, value, unit?, delta?, tone?: good\|bad\|flat, note?, trend?, color?}` (the Board's stats items); they replace the legend |
+| `pin` | the index of an x value whose tooltip shows while the pointer is away |
+| `series[].color` | a kit colour token (`var(--mk-add)`, `var(--mk-c2)`) or a hex colour |
 
 ```json
-{"type": "bar", "title": "CI minutes per day", "x": {"label": "Day", "values": ["Mon", "Tue", "Wed"]},
+{"type": "bar", "title": "CI minutes per day", "scope": "acme-store · week of Oct 13", "format": "int",
+ "takeaway": "PR builds used **1.75×** the minutes of master builds.", "source": "gh run list · 412 runs",
+ "x": {"label": "Day", "values": ["Mon", "Tue", "Wed"]},
  "series": [{"name": "master", "values": [42, 55, 38]}, {"name": "PRs", "values": [80, 96, null]}],
- "y": {"label": "Minutes"}}
+ "y": {"label": "Minutes"},
+ "stats": [{"label": "PRs", "value": "503", "unit": "min", "delta": "+8%", "tone": "bad", "note": "vs last week", "color": "var(--mk-c2)"}]}
 ```
 
-**`table`**: `{title?, columns: [{key, label?, align?}], rows: [{<key>: value}], sort?: {key, dir?}}`.
+**`table`**: `{title?, scope?, takeaway?, source?, columns: [{key, label?, align?, format?, tones?}], rows: [{<key>: value}], sort?: {key, dir?}}`.
 1–50 columns (`align`: `left`, `right` or `center`), up to 5000 rows whose values are
 strings, numbers, booleans or null. Columns holding only numbers are right-aligned in
-monospace. Header click sorts (text naturally, numbers numerically, empty cells last), the
-filter box (`/`) matches every word in any column, and the header stays visible on scroll.
-`sort.dir` is `asc` (default) or `desc`.
+tabular mono figures. A column's `format` draws its cells as `bar` (the number with an inline
+bar against the column's largest), `badge` (a tinted badge; `tones` maps a cell value to
+`good`, `warn`, `bad`, `info`, `accent` or `plain`, at most 50 values) or `mono` (paths, ids).
+Header click sorts (text naturally, numbers numerically, empty cells last), the filter box
+(`/`) matches every word in any column (a filter that matches nothing says so, with Clear
+filter), the header stays visible on scroll, and the user can switch Comfortable or Compact
+rows. `sort.dir` is `asc` (default) or `desc`.
 
 ```json
-{"title": "Slowest tests", "columns": [{"key": "test", "label": "Test"}, {"key": "seconds", "label": "Seconds"}],
- "rows": [{"test": "export_large_csv", "seconds": 27.05}, {"test": "session_survives_restart", "seconds": 12.4}],
- "sort": {"key": "seconds", "dir": "desc"}}
+{"title": "Flaky tests", "scope": "last 200 CI runs", "takeaway": "**search ranks by score** failed 1 run in 9.",
+ "columns": [{"key": "test", "label": "Test"}, {"key": "failed", "label": "Failed", "format": "bar"},
+   {"key": "status", "label": "Status", "format": "badge", "tones": {"Flaky": "warn", "Fixed": "good"}}],
+ "rows": [{"test": "search ranks by score", "failed": 23, "status": "Flaky"}, {"test": "coupon and tax", "failed": 1, "status": "Fixed"}],
+ "sort": {"key": "failed", "dir": "desc"}}
 ```
+
+**`board`**: a dashboard from plain JSON. No HTML and no script come from the agent, so it is
+the quickest and safest kind of panel for status pages and summaries. Muster refuses unknown
+fields and block kinds here, naming them.
+
+```json
+{"title": "$4,480 spent so far this month", "scope": "acme cloud · October",
+ "takeaway": "On track to finish about 6% under budget. Postgres grew the most.",
+ "blocks": [
+   {"kind": "stats", "span": "full", "items": [
+     {"label": "Month to date", "value": "$4,480", "delta": "+4.1%", "tone": "bad", "note": "vs September"},
+     {"label": "Per day", "value": "$224", "trend": [205, 212, 219, 216, 224]}]},
+   {"kind": "chart", "span": "full", "title": "Spend per week", "spec": {"type": "bar", "stacked": true, "format": "usd",
+     "x": {"values": ["Oct 6", "Oct 13", "Oct 20"]},
+     "series": [{"name": "Postgres", "values": [651, 669, 681]}, {"name": "Compute", "values": [543, 539, 549]}]}},
+   {"kind": "list", "title": "By service", "items": [{"title": "Postgres", "sub": "db-primary + 2 replicas", "bar": 0.43, "value": "$1,906"}]},
+   {"kind": "meters", "title": "Budgets", "note": "The tick is where spend should be today.",
+    "items": [{"label": "Whole account", "value": 4480, "max": 7400, "text": "$4,480", "of": "of $7,400", "mark": 4774}]},
+   {"kind": "callout", "tone": "warn", "title": "Postgres is ahead of pace.", "text": "It ends the month about $50 over budget."},
+   {"kind": "actions", "items": [{"id": "explain", "label": "Why did Postgres grow?", "primary": true, "icon": "sparkle"},
+     {"id": "pause_replica", "label": "Pause replica 2", "danger": true, "confirm": "Pause db-replica-2 until Monday?", "data": {"replica": "db-replica-2"}}]}],
+ "source": "billing export, 1–20 Oct"}
+```
+
+| Field | |
+|---|---|
+| `title`, `scope?`, `takeaway?`, `source?` | the title (required), what it covers, the one-sentence finding (`**bold**` renders), and a footer line |
+| `min?` | narrowest column in px (160–1200, default 300) before the grid drops a column |
+| `blocks` | 1–40 blocks, each `{kind, span?: "full", title?, aside?, …}`; `span: "full"` takes the whole row, otherwise one column. `kind` is one of: |
+| `stats` | `items`: 1–8 `{label, value, unit?, delta?, tone?: good\|bad\|flat, note?, trend?: number[], color?}`. `tone` says whether the change is good news; a minus sign alone says nothing about that |
+| `chart` | `spec`: exactly the chart app's input; `height?` 80–800 |
+| `list` | `items`: 1–100 `{title, sub?, icon?, tone?: good\|warn\|bad\|info\|accent, badge?, bar?: 0–1, value?, color?}` |
+| `meters` | `note?`; `items`: 1–20 `{label, value, max, text?, of?, mark?, markLabel?, tone?, color?}`. `mark` is a tick (a pace line, a limit); say what it means in `note` |
+| `callout` | `text`, `tone?: good\|warn\|bad\|info`, `icon?` |
+| `actions` | `items`: 1–8 `{id, label, primary?, danger?, confirm?, icon?, key?, data?}`. A click sends the panel event `kind: id` (letters, digits, `_`, `-`, `/`; not `closed`, `overflow` or `navigated`; unique) with `data` (at most 10 lowercase keys with string, number or boolean values) in `_meta.muster.data`. `confirm` makes it two-step: the first click turns the button into that question, the second click or Enter sends. A sent button stays off until the agent's next `panel_update`. `key` is one letter or digit that presses it |
+
+Icons (`icon`) are names from the kit's set (`check`, `alert`, `info`, `clock`, `refresh`,
+`rocket`, `undo`, `sparkle`, `db`, `server`, `dollar`, `chart`, …; an unknown name draws "?"
+and the panel lists the valid ones). Colours are kit tokens (`var(--mk-c1)` … `var(--mk-c8)`,
+`var(--mk-good)`, `var(--mk-warn)`, `var(--mk-bad)`, `var(--mk-accent)`) or hex colours.
 
 **`web_preview`** ([AGENT_PANELS.md](AGENT_PANELS.md#showing-web-pages)): `{url}`, the agent's
 running local dev server, live beside its terminal. Only loopback http(s) is accepted:
@@ -420,6 +563,7 @@ With pictures and a chart (the paths are files in the task worktree):
 |---|---|
 | `repo` | `owner/name` |
 | `title?` | heading (default "Open pull requests") |
+| `takeaway?` | the agent's one-sentence finding under the heading (at most 600 characters; `**bold**` renders) |
 | `prs` | up to 200 `{number, title, author, url?, created_at?, draft?, additions?, deletions?, files?, checks?, review?, labels?, risk?, summary?, status?, status_detail?, head_sha?, base?, quick_win?, verdict?, merge_method_default?, delete_branch_default?}`; numbers unique. `muster pr list` prints its PRs in this shape |
 | `prs[].checks?` | `passing`, `failing`, `pending` or `none` |
 | `prs[].review?` | gh's `reviewDecision`: `APPROVED`, `CHANGES_REQUESTED`, `REVIEW_REQUIRED`, `NONE` or `""` |

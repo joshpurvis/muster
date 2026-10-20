@@ -7,6 +7,9 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
+// The self-contained UMD build: deno bundle mangles the .mjs build's default import of its
+// base64 decoder ("is not a constructor"), which threw in create() and left every tab blank.
+import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { effect } from "@preact/signals";
 import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
 import type { SessionInfo } from "./types.ts";
@@ -211,6 +214,18 @@ function create(sid: number): Entry {
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
   } catch { /* optional */ }
+  // Sixel and iTerm2 inline images. Load before installQueryHandlers: xterm runs the last
+  // registered handler first, so ours keep swallowing the DA1 answer this addon would give.
+  // Each cached terminal keeps its own image store, hence the lower cap (default 128 MB).
+  // The store may keep one image over its cap, so a single image is capped too (2048x2048,
+  // 16 MB). Optional: a failure here must not stop the terminal from opening.
+  // Known gaps: the host's cursor reports (DSR 6) don't see an image move the cursor; a
+  // replay swallows XTSMGRAPHICS palette changes; a replay cut mid-image drops its rest.
+  try {
+    term.loadAddon(new ImageAddon({ storageLimit: 32, pixelLimit: 2048 * 2048 }));
+  } catch (err) {
+    console.error("image addon failed to load", err);
+  }
   term.open(el);
 
   term.attachCustomKeyEventHandler((ev) => {
@@ -405,6 +420,8 @@ function installQueryHandlers(term: Terminal, inReplay: () => boolean, setReplay
   p.registerCsiHandler({ intermediates: "$", final: "p" }, () => inReplay()); // DECRQM
   p.registerCsiHandler({ prefix: "?", intermediates: "$", final: "p" }, () => inReplay());
   p.registerDcsHandler({ intermediates: "$", final: "q" }, () => inReplay()); // DECRQSS
+  p.registerCsiHandler({ prefix: "?", final: "S" }, () => inReplay()); // XTSMGRAPHICS (image addon)
+  p.registerCsiHandler({ final: "t" }, () => inReplay()); // Pixel/cell size reports (14t, 16t, 18t)
   for (const osc of [4, 10, 11, 12]) {
     // Color queries (`?`); color changes still apply during a replay.
     p.registerOscHandler(osc, (data) => inReplay() && data.includes("?"));

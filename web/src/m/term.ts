@@ -1,5 +1,7 @@
 import { Terminal } from "@xterm/xterm";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
+// UMD build on purpose; see web/src/terms.ts.
+import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
 import type { SessionInfo } from "../types.ts";
 import { bufferText, type Cell, FONT_FAMILY, phoneGrid, scrollPosition } from "./logic.ts";
@@ -84,6 +86,12 @@ export class PhoneTerminal {
     });
     this.term.loadAddon(new Unicode11Addon());
     this.term.unicode.activeVersion = "11";
+    // Read-only view: the addon's query answers go nowhere, since nothing sends onData.
+    try {
+      this.term.loadAddon(new ImageAddon({ storageLimit: 32, pixelLimit: 2048 * 2048 }));
+    } catch (err) {
+      console.error("image addon failed to load", err);
+    }
     this.term.open(host);
     const textarea = this.term.textarea!;
     textarea.readOnly = true;

@@ -2,6 +2,7 @@
 // every surface they sit on, series colours at 3:1 on the canvas, and no series hue is the
 // good-green or bad-red. Reads the tokens straight from kit.css, so an edit that breaks them fails.
 import { check } from "../apps/shared/test_util.ts";
+import { AVATARS, avatarColor } from "./parts.ts";
 
 const css = await Deno.readTextFile(new URL("./kit.css", import.meta.url));
 
@@ -46,4 +47,9 @@ Deno.test("series colours keep 3:1 on the canvas and are never the good or bad c
       check(c !== t["mk-good"] && c !== t["mk-bad"], `${name}: --mk-c${i + 1} is not a status colour`);
     }
   }
+});
+
+Deno.test("avatar colours keep white letters at 4.5:1", () => {
+  for (const c of AVATARS) check(contrast("#ffffff", c) >= 4.5, `white on ${c} is ${contrast("#ffffff", c).toFixed(2)}:1`);
+  check(avatarColor("dana") === avatarColor("Dana") && AVATARS.includes(avatarColor("lee")), "stable per person");
 });

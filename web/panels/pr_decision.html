@@ -524,176 +524,218 @@ textarea { display: block; width: 100%; resize: vertical; line-height: 1.5; }
 .app-foot .keys { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 @media (max-width: 520px) { .app-head .mk-title { font-size: 17px; } .app-head .mk-takeaway { font-size: 13px; } }
 
-main { padding-bottom: 0; }
-.head h1 { font-size: 19px; }
-.head .num { color: var(--color-text-secondary); font-weight: 400; }
-.meta { margin: 4px 0 12px; }
-.meta code { background: var(--color-background-tertiary); border-radius: 3px; padding: 0 4px; }
-section { margin: 0 0 18px; }
+/* PR decision in the Briefing look: the agent's call first (coloured by Muster's own merge
+   check), then risk, checks and reviews as three equal cards, the questions as numbered choices,
+   pictures and charts, the diffs worth a look, and a frosted action bar grouped as decide,
+   discuss, defer. Same ids, keys and events as before. */
+main { padding: 20px 24px 0; }
+.head { margin-bottom: 4px; }
+.pd-meta { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--mk-text-3); margin-bottom: 8px; flex-wrap: wrap; }
+.pd-meta .open-gh { margin-left: auto; color: var(--mk-text-2); }
+.pd-meta .open-gh svg { width: 13px; height: 13px; }
+.head h1.mk-title { font-size: 22px; }
+.head h1:focus { outline: none; }
+.head h1 .num { color: var(--mk-text-3); font-weight: 450; }
+.pd-by { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin: 8px 0 0; font-size: 14px; color: var(--mk-text-2); }
+.pd-by b { color: var(--mk-text); font-weight: 600; }
+.pd-by > svg { width: 14px; height: 14px; color: var(--mk-text-3); }
+.pd-by code.mk-chip { font-size: 12px; }
+.pd-by code.mk-chip svg { width: 12px; height: 12px; }
 .prose { white-space: pre-wrap; margin: 0; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 16px; }
-.badge { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12.5px; font-weight: 600; border: 1px solid transparent; }
-.badge.success { color: var(--color-text-success); background: var(--color-background-success); }
-.badge.warning { color: var(--color-text-warning); background: var(--color-background-warning); }
-.badge.danger { color: var(--color-text-danger); background: var(--color-background-danger); }
-.badge.muted, .badge.info { color: var(--color-text-secondary); background: var(--color-background-tertiary); }
-.reasons { margin: 8px 0 0; padding-left: 18px; }
-.checks { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
-.checks li { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
-.checks .state { margin-left: auto; font-size: 12px; white-space: nowrap; }
-.icon { width: 1em; text-align: center; font-weight: 700; flex: none; }
-.success { color: var(--color-text-success); }
-.danger { color: var(--color-text-danger); }
-.warning { color: var(--color-text-warning); }
-.status, .notice { border-radius: var(--border-radius-md); padding: 8px 12px; margin: 0 0 14px; border: 1px solid; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
-.status { font-size: 15px; }
-.status.info, .notice.info { border-color: var(--color-text-info); background: var(--color-background-info); color: var(--color-text-primary); }
-.notice.success, .status.success { border-color: var(--color-text-success); background: var(--color-background-success); color: var(--color-text-primary); }
-.status.danger, .notice.danger { border-color: var(--color-text-danger); background: var(--color-background-danger); color: var(--color-text-primary); }
-.status.warning, .notice.warning { border-color: var(--color-text-warning); background: var(--color-background-warning); color: var(--color-text-primary); }
-.status strong { font-size: 15px; }
-.status.success strong { color: var(--color-text-success); }
-.status.danger strong { color: var(--color-text-danger); }
-.status .detail { white-space: pre-wrap; font-size: 13px; }
-.notice { font-size: 13px; }
-.actions .notice { margin: 0 0 8px; padding: 6px 10px; }
-.hint:empty { display: none; }
-.hint { margin: 6px 0 0; color: var(--color-text-warning); }
-.count { margin-left: auto; }
-.change { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); margin: 0 0 12px; overflow: hidden; }
-.change > header { display: flex; gap: 10px; align-items: baseline; padding: 6px 10px; background: var(--color-background-secondary); border-bottom: 1px solid var(--color-border-secondary); }
-.change .file { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
-.change .stat { margin-left: auto; font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
-.plus { color: var(--color-text-success); }
-.minus { color: var(--color-text-danger); }
-.change .note { margin: 0; padding: 8px 10px; white-space: pre-wrap; border-bottom: 1px solid var(--color-border-secondary); }
-.diff-wrap { overflow-x: auto; }
-.diff { border-collapse: collapse; width: 100%; font-family: var(--font-mono); font-size: 12px; line-height: 1.45; }
-.diff td { padding: 0 8px; white-space: pre; vertical-align: top; }
-.diff .ln { width: 1%; text-align: right; color: var(--color-text-tertiary); user-select: none; padding: 0 6px; }
-.diff .sign { display: inline-block; width: 1.2ch; user-select: none; }
-.diff tr.add td { background: var(--color-background-success); }
-.diff tr.add .sign { color: var(--color-text-success); }
-.diff tr.del td { background: var(--color-background-danger); }
-.diff tr.del .sign { color: var(--color-text-danger); }
-.diff tr.hunk td { color: var(--color-text-info); background: var(--color-background-info); padding: 2px 8px; }
-.diff tr.note td { color: var(--color-text-tertiary); font-style: italic; }
-.diff tr.meta td { color: var(--color-text-secondary); background: var(--color-background-secondary); padding: 3px 8px; font-family: var(--font-sans); }
-.diff-wrap .more { padding: 4px 10px; margin: 0; font-size: 12px; }
-.rest { font-size: 13px; }
-.questions { margin: 0 0 6px; padding-left: 20px; }
-.questions li { margin-bottom: 4px; white-space: pre-wrap; }
-.answer { border-left: 3px solid var(--color-text-info); padding: 2px 0 2px 10px; margin-bottom: 10px; }
-.answer .q { margin: 0 0 2px; font-size: 13px; white-space: pre-wrap; }
 .small { font-size: 12px; }
+/* Status of a PR the agent is acting on (merging, merged, failed …). */
+.status, .notice { border-radius: 10px; padding: 9px 12px; margin: 14px 0 0; border: 1px solid; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; color: var(--mk-text); font-size: 14px; }
+.status .detail { white-space: pre-wrap; font-size: 13px; color: var(--mk-text-2); }
+.status.info, .notice.info { border-color: color-mix(in srgb, var(--mk-accent) 30%, transparent); background: var(--mk-accent-soft); }
+.status.success, .notice.success { border-color: color-mix(in srgb, var(--mk-good) 30%, transparent); background: var(--mk-good-soft); }
+.status.warning, .notice.warning { border-color: color-mix(in srgb, var(--mk-warn) 30%, transparent); background: var(--mk-warn-soft); }
+.status.danger, .notice.danger { border-color: color-mix(in srgb, var(--mk-bad) 30%, transparent); background: var(--mk-bad-soft); }
+.status.success strong { color: var(--mk-good); } .status.danger strong { color: var(--mk-bad); }
+.notice { font-size: 13px; }
+.actions .notice { margin: 0 0 8px; padding: 7px 11px; }
+/* The verdict card: its colour is Muster's merge check, never the agent's opinion. */
+.verdict { position: relative; margin: 18px 0 0; padding: 16px 18px 15px 56px; border-radius: 12px; overflow: hidden;
+  background: linear-gradient(100deg, color-mix(in srgb, var(--vc) 15%, var(--mk-surface)) 0%, var(--mk-surface) 70%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--vc) 30%, transparent), var(--mk-shadow); }
+.verdict .vi { position: absolute; left: 16px; top: 15px; width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; color: var(--vc); background: color-mix(in srgb, var(--vc) 16%, transparent); }
+.verdict .vi svg { width: 16px; height: 16px; }
+.verdict .v { font-size: 17px; line-height: 1.4; font-weight: 600; color: var(--mk-text); letter-spacing: -0.012em; margin: 3px 0 0; }
+.verdict .u { display: flex; gap: 7px; align-items: center; margin: 8px 0 0; font-size: 13px; color: var(--mk-text-2); }
+.verdict .u svg { width: 14px; height: 14px; color: var(--mk-text-3); flex: none; }
+.verdict .gate { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; padding-top: 10px; border-top: 1px solid color-mix(in srgb, var(--vc) 30%, transparent); font-size: 13px; color: var(--mk-text); }
+.verdict .vi + .gate { margin-top: 3px; padding-top: 0; border-top: 0; }
+.verdict .gate svg { width: 15px; height: 15px; color: var(--vc); flex: none; margin-top: 2px; }
+.verdict .gate small { display: block; font-size: 12px; color: var(--mk-text-3); }
+/* Risk, checks and reviews: three equal cards. */
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: 10px; margin-top: 12px; }
+.fact { padding: 13px 14px 12px; }
+.fact .fh { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.fact .fh h2 { margin: 0; font: 620 13px var(--mk-font); color: var(--mk-text); }
+.fact ul { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.fact .checks li { display: flex; align-items: center; gap: 8px; padding: 3px 0; color: var(--mk-text); min-width: 0; }
+.fact .checks li > svg { width: 14px; height: 14px; flex: none; }
+.fact .checks .name { min-width: 0; overflow-wrap: anywhere; }
+.fact .checks .st { margin-left: auto; color: var(--mk-text-3); font-size: 12px; white-space: nowrap; }
+.fact .checks .st.danger { color: var(--mk-bad); } .fact .checks .st.success { color: var(--mk-good); }
+.fact .checks .c-success > svg { color: var(--mk-good); } .fact .checks .c-danger > svg { color: var(--mk-bad); }
+.fact .checks .c-warning > svg { color: var(--mk-warn); } .fact .checks .c-muted { color: var(--mk-text-2); } .fact .checks .c-muted > svg { color: var(--mk-text-3); }
+.fact .checks .mk-avatar { width: 18px; height: 18px; font-size: 11px; }
+.fact .reason { color: var(--mk-text-2); font-size: 13px; line-height: 1.45; padding: 3px 0 3px 12px; position: relative; }
+.fact .reason::before { content: ""; position: absolute; left: 0; top: .7em; width: 5px; height: 5px; border-radius: 50%; background: var(--mk-text-3); }
+.fact.risk-medium .reason::before { background: var(--mk-warn); } .fact.risk-high .reason::before { background: var(--mk-bad); } .fact.risk-low .reason::before { background: var(--mk-good); }
+.fact .needs { display: flex; align-items: center; gap: 8px; margin: 6px 0 0; font-size: 13px; color: var(--mk-text-3); }
+.fact .needs svg { width: 14px; height: 14px; }
+.fact .none { margin: 0; font-size: 13px; }
+.riskbar { display: flex; gap: 3px; margin: 0 0 10px; }
+.riskbar i { flex: 1; height: 5px; border-radius: 3px; background: var(--mk-sunken); box-shadow: inset 0 0 0 1px var(--mk-line); }
+.fact.risk-low .riskbar i.on { background: var(--mk-good); box-shadow: none; }
+.fact.risk-medium .riskbar i.on { background: var(--mk-warn); box-shadow: none; }
+.fact.risk-high .riskbar i.on { background: var(--mk-bad); box-shadow: none; }
+.fact .link { text-align: left; color: var(--mk-text); text-decoration-color: var(--mk-line-3); }
+/* Sections */
+.pd-sec { margin-top: 24px; }
+.pd-sec > h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; font: 620 14px var(--mk-font); color: var(--mk-text); flex-wrap: wrap; }
+.pd-sec > h2 .count { margin-left: 0; font-size: 13px; font-weight: 450; color: var(--mk-text-3); }
+.pd-sec > h2 .r { margin-left: auto; font-weight: 500; font-size: 12px; }
+.pd-sec > .prose { color: var(--mk-text); font-size: 15px; line-height: 1.6; max-width: 76ch; }
+/* The agent's questions: numbered cards with the recommended answer marked. */
+.questions-form .qhint { margin: -4px 0 10px; color: var(--mk-text-3); }
+.question { padding: 14px 16px; margin-bottom: 8px; }
+.question:focus-within { border-color: var(--mk-accent); }
+.q-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.q-num { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font: 650 12px var(--mk-font); background: var(--mk-sunken); color: var(--mk-text-2); box-shadow: inset 0 0 0 1px var(--mk-line-2); align-self: center; }
+.question.answered .q-num { background: var(--mk-accent-soft); color: var(--mk-accent); box-shadow: none; }
+.q-text { flex: 1 1 200px; min-width: 0; font-weight: 600; font-size: 14px; color: var(--mk-text); letter-spacing: -0.006em; white-space: pre-wrap; }
+.q-req { flex: none; font: 600 12px var(--mk-font); color: var(--mk-warn); white-space: nowrap; }
+.q-why { margin: 2px 0 0 36px; font-size: 13px; color: var(--mk-text-3); }
+.q-options, .q-text-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 10px 0 0 36px; }
+.q-opt { display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 12px 0 6px; border-radius: 8px; font: 550 13px var(--mk-font); }
+.q-opt kbd { min-width: 19px; margin: 0; }
+.q-opt.on { border-color: var(--mk-accent); background: var(--mk-accent-soft); box-shadow: inset 0 0 0 1px var(--mk-accent); }
+.q-opt .rec { font: 600 12px var(--mk-font); color: var(--mk-accent); display: inline-flex; gap: 3px; align-items: center; }
+.q-opt .rec svg { width: 11px; height: 11px; }
+.q-input { flex: 1 1 220px; min-width: 0; }
+.q-chip.open { border-color: color-mix(in srgb, var(--mk-warn) 50%, transparent); }
+.q-chip svg { width: 13px; height: 13px; }
+/* Pictures and charts */
+.media-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 10px; }
+.media-grid .media-chart, .media-grid.single .shot { grid-column: 1 / -1; }
+.media figure { margin: 0; min-width: 0; padding: 10px; }
+.media figcaption { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--mk-text-3); margin-top: 8px; flex-wrap: wrap; }
+.media-chart .chart-title { font: 620 13px var(--mk-font); color: var(--mk-text); margin: 2px 2px 10px; }
+.thumb { display: block; width: 100%; padding: 0; min-height: 0; background: var(--mk-sunken); border: 0; box-shadow: none; cursor: zoom-in; border-radius: 7px; overflow: hidden; }
+.thumb img { display: block; width: 100%; height: 170px; object-fit: contain; box-shadow: 0 0 0 1px var(--mk-line-2); border-radius: 7px; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.media-grid.single .thumb img { height: auto; max-height: 340px; }
+/* Diffs worth a look */
+.change { overflow: hidden; padding: 0; margin: 0 0 10px; }
+.change .fh2 { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--mk-line); }
+.change .fn { font: 550 13px var(--mk-mono); color: var(--mk-text); min-width: 0; overflow-wrap: anywhere; background: none; }
+.change .ds { display: inline-flex; gap: 6px; margin-left: auto; align-items: center; font: 600 12px var(--mk-mono); white-space: nowrap; }
+.change .ds .a { color: var(--mk-add); } .change .ds .d { color: var(--mk-del); }
+.change .blocks { display: inline-flex; gap: 2px; margin-left: 2px; }
+.change .blocks i { width: 7px; height: 7px; border-radius: 2px; background: var(--mk-line-2); }
+.change .blocks i.a { background: var(--mk-add); } .change .blocks i.d { background: var(--mk-del); }
+.change .note { display: flex; gap: 8px; margin: 0; padding: 9px 14px; font-size: 13px; color: var(--mk-text-2); border-bottom: 1px solid var(--mk-line); white-space: pre-wrap; }
+.change .note svg { width: 14px; height: 14px; color: var(--mk-accent); flex: none; margin-top: 3px; }
+.diff-wrap { overflow-x: auto; }
+.diff { border-collapse: collapse; width: 100%; font: 12px/1.7 var(--mk-mono); margin: 6px 0; }
+.diff td { padding: 0 12px 0 0; white-space: pre; vertical-align: top; color: var(--mk-text-2); }
+.diff .ln { width: 44px; min-width: 44px; text-align: right; color: var(--mk-text-3); user-select: none; padding: 0 10px 0 6px; }
+.diff .sign { width: 18px; user-select: none; padding: 0; }
+.diff tr.add td { background: var(--mk-add-bg); color: var(--mk-text); }
+.diff tr.add .sign { color: var(--mk-add); }
+.diff tr.del td { background: var(--mk-del-bg); color: var(--mk-text); }
+.diff tr.del .sign { color: var(--mk-del); }
+.diff tr.hunk td { color: var(--mk-info); background: var(--mk-info-soft); padding: 0 12px; }
+.diff tr.note td { color: var(--mk-text-3); font-style: italic; padding-left: 12px; }
+.diff tr.meta td { color: var(--mk-text-2); background: var(--mk-sunken); padding: 3px 12px; font-family: var(--mk-font); }
+.diff-wrap .more { padding: 4px 14px 8px; margin: 0; font-size: 12px; }
+.rest { font-size: 13px; }
+.answer { padding: 12px 14px; margin-bottom: 8px; }
+.answer .q { margin: 0 0 4px; font-size: 13px; white-space: pre-wrap; }
+/* The action bar: frosted, because it floats over the panel. Decide, discuss, defer. */
 .actions {
-  position: sticky; bottom: 0; z-index: 3; margin: 12px -16px 0; padding: 10px 16px 12px;
-  background: var(--color-background-primary); border-top: 1px solid var(--color-border-primary);
+  position: sticky; bottom: 0; z-index: 3; margin: 24px -24px 0; padding: 11px 24px 14px;
+  background: color-mix(in srgb, var(--mk-canvas) 84%, transparent); -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
+  border-top: 1px solid var(--mk-line-2); box-shadow: 0 -18px 30px -18px rgba(0, 0, 0, .45);
+  max-height: 34vh; overflow-y: auto;
 }
-.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.merge-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.check { display: inline-flex; gap: 4px; align-items: center; font-size: 13px; white-space: nowrap; cursor: pointer; }
-.spacer { flex: 1; }
-.drawer { border: 1px solid var(--color-border-primary); background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; margin-bottom: 10px; }
-.drawer-title { display: block; font-weight: 600; margin-bottom: 6px; }
-.drawer textarea { margin-bottom: 8px; }
-.command { margin: 0 0 8px; padding: 8px 10px; background: var(--color-background-primary); border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
-.warn { color: var(--color-text-warning); font-weight: 600; margin: 0 0 6px; }
-button kbd { margin-left: 2px; }
-button.primary kbd, button.danger kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
-.title-row { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
-.title-row h1 { flex: 1 1 240px; min-width: 0; }
-.title-row h1:focus { outline: none; }
-.open-gh { white-space: nowrap; font-size: 13px; }
-/* The sticky bar never takes more than about a third of a small panel; a drawer (a confirm or
-   a text box) may take more, so what it confirms is always in view. */
-.actions { max-height: 34vh; overflow-y: auto; }
+[data-theme="light"] .actions { box-shadow: 0 -18px 30px -22px rgba(20, 20, 40, .25); }
 .actions.has-drawer { max-height: 85vh; }
-.custom-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--color-border-primary); }
-.group-label, .fold { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-text-secondary); }
-.fold { min-height: 28px; padding: 2px 8px; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.row .spacer { flex: 1; }
+.merge-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.actions .bar button { padding: 0 11px; }
+.actions .bar button.ghost { padding: 0 8px; }
+/* Merge waits (Muster's check found something): it looks off and the line under it says why. */
+#merge.waits { background: var(--mk-sunken); color: var(--mk-text-3); border-color: var(--mk-line-2); box-shadow: none; }
+#merge.waits kbd { background: var(--mk-surface); color: var(--mk-text-3); box-shadow: inset 0 0 0 1px var(--mk-line); }
+#merge svg { width: 15px; height: 15px; }
+select.method {
+  min-height: 32px; padding: 0 28px 0 11px; border-radius: 8px; font: 550 13px var(--mk-font); color: var(--mk-text); cursor: pointer;
+  -webkit-appearance: none; appearance: none; background-color: var(--mk-raised); box-shadow: inset 0 1px 0 var(--mk-hi), 0 1px 2px rgba(0, 0, 0, .14);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2393939f' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 9px center; background-size: 13px;
+}
+.check { display: inline-flex; gap: 7px; align-items: center; font-size: 13px; color: var(--mk-text-2); white-space: nowrap; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--mk-accent-fill); }
+.grp-sep { width: 1px; align-self: stretch; margin: 4px 4px; background: var(--mk-line-2); }
+.why { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; color: var(--mk-warn); }
+.why svg { width: 13px; height: 13px; }
+.hint:empty { display: none; }
+.hint { margin: 6px 0 0; color: var(--mk-warn); }
+.drawer { border: 1px solid var(--mk-line-2); background: var(--mk-surface); border-radius: var(--mk-r); padding: 12px 14px; margin-bottom: 10px; box-shadow: var(--mk-shadow); }
+.drawer-title { display: block; font-weight: 600; margin-bottom: 8px; color: var(--mk-text); }
+.drawer textarea { margin-bottom: 8px; }
+.drawer .muted.small { color: var(--mk-text-3); }
+.command { margin: 0 0 8px; padding: 9px 11px; background: var(--mk-sunken); border: 1px solid var(--mk-line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mk-mono); color: var(--mk-text); }
+.warn { color: var(--mk-warn); font-weight: 600; margin: 0 0 6px; }
+.count { margin-left: auto; }
+.count.danger { color: var(--mk-bad); }
+.draft-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: space-between; margin-bottom: 10px; font-size: 13px; color: var(--mk-text-2); }
+.draft-what { min-width: 0; flex: 1 1 200px; }
+.draft-what .link { font-size: inherit; color: var(--mk-text); font-weight: 600; text-decoration: none; }
+.draft-summary { margin: 0 0 8px; font-size: 13px; }
+.draft-summary ul { margin: 2px 0 0; padding-left: 18px; }
+.draft-summary li { white-space: pre-wrap; }
+.draft-summary .out { color: var(--mk-warn); }
+.drawer-sub { margin: 0; font-weight: 600; }
+.draft-none { margin: 0 0 8px; }
+.custom-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--mk-line-2); }
+.group-label, .fold { font-size: 12px; font-weight: 600; color: var(--mk-text-2); }
+.fold { min-height: 26px; padding: 2px 8px; }
 button.help { min-width: 32px; padding: 5px 8px; font-weight: 700; }
+button.outward { border-color: color-mix(in srgb, var(--mk-warn) 45%, transparent); }
+button .out { color: var(--mk-warn); }
+button.toggle.on { border-color: var(--mk-accent); background: var(--mk-accent-soft); }
+button.toggle .tick { font-weight: 700; }
+.outward-desc { margin: 0 0 6px; }
 .shortcuts dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 8px; font-size: 13px; }
 .shortcuts dt { text-align: right; }
-.shortcuts dd { margin: 0; }
-@media (max-width: 520px) {
-  /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts
-     keeps them for assistive tech), so the sticky bar stays short. */
-  .bar .spacer { display: none; }
-  .actions { padding: 8px 12px 10px; margin: 12px -16px 0; }
-  .row, .custom-group { gap: 6px; }
-  .bar button kbd, .custom-group button kbd, .open-gh kbd { display: none; }
-  .merge-group select { max-width: 112px; }
-  .merge-group .check { font-size: 12.5px; }
-}
-button.outward { border-color: var(--color-text-warning); }
-button .out { color: var(--color-text-warning); }
-.outward-desc { margin: 0 0 6px; }
-/* Pictures and charts the agent added (media), before the diffs. */
-.media-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); gap: 12px; }
-.media-grid .media-chart, .media-grid.single .shot { grid-column: 1 / -1; }
-.media figure { margin: 0; min-width: 0; }
-.media figcaption { font-size: 12.5px; color: var(--color-text-secondary); margin-top: 4px; }
-.thumb { display: block; width: 100%; padding: 4px; min-height: 0; background: var(--color-background-secondary); cursor: zoom-in; }
-.thumb img { display: block; width: 100%; height: 150px; object-fit: contain; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
-.media-grid.single .thumb img { height: auto; max-height: 340px; }
-.media-chart { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; }
-.media-chart .chart-title { font-size: 14px; }
-.lightbox {
-  position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
-  background: var(--color-background-primary);
-}
-.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--color-border-secondary); }
-.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
-.lb-stage { flex: 1; min-height: 0; display: flex; padding: 12px; overflow: auto; }
-.lb-stage img { margin: auto; display: block; background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.shortcuts dd { margin: 0; color: var(--mk-text-2); }
+/* The enlarged picture: a modal view over the panel. */
+.lightbox { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--mk-canvas); }
+.lb-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--mk-line); }
+.lb-src { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mk-mono); }
+.lb-stage { flex: 1; min-height: 0; display: flex; padding: 16px; overflow: auto; background: var(--mk-sunken); }
+.lb-stage img { margin: auto; display: block; border-radius: 6px; box-shadow: 0 0 0 1px var(--mk-line-2); background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
 .lb-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
 .lb-stage.actual img { max-width: none; max-height: none; flex: none; cursor: grab; }
 .lb-stage.actual:active img { cursor: grabbing; }
-.lb-caption { margin: 0; padding: 8px 12px 12px; color: var(--color-text-secondary); border-top: 1px solid var(--color-border-secondary); }
-/* The agent's verdict, first and prominent, with how to undo it under it. */
-.verdict { border: 1px solid var(--color-border-secondary); border-left: 4px solid var(--color-border-primary); border-radius: var(--border-radius-md); padding: 8px 12px; margin: 0 0 14px; background: var(--color-background-secondary); }
-.verdict.risk-low { border-left-color: var(--color-text-success); }
-.verdict.risk-medium { border-left-color: var(--color-text-warning); }
-.verdict.risk-high { border-left-color: var(--color-text-danger); }
-.verdict-text { font-size: 16px; font-weight: 600; margin: 0; }
-.undo { margin: 4px 0 0; font-size: 13px; color: var(--color-text-secondary); }
-.undo-icon { font-weight: 700; }
-/* The agent's questions, answered in place. */
-.questions-form .qhint { margin: -2px 0 8px; }
-.question { border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-md); padding: 8px 10px; margin: 0 0 8px; }
-.question:focus-within { border-color: var(--color-ring-primary); box-shadow: 0 0 0 1px var(--color-ring-primary); }
-.q-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.q-num { flex: none; min-width: 1.6em; height: 1.6em; line-height: 1.6em; border-radius: 999px; text-align: center; font-size: 12px; font-weight: 700; background: var(--color-background-tertiary); color: var(--color-text-secondary); }
-.question.answered .q-num { background: var(--color-background-success); color: var(--color-text-success); }
-.q-text { flex: 1 1 200px; min-width: 0; font-weight: 600; white-space: pre-wrap; }
-.q-req { flex: none; }
-.q-why { margin: 2px 0 0 calc(1.6em + 8px); font-size: 13px; }
-.q-options, .q-text-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0 0 calc(1.6em + 8px); }
-.q-opt { min-height: 30px; padding: 3px 10px; }
-.q-opt kbd { margin: 0 2px 0 0; }
-.q-opt.on { border-color: var(--accent-fill); background: var(--color-background-info); box-shadow: inset 0 0 0 1px var(--accent-fill); font-weight: 600; }
-.q-opt .rec { font-size: 11.5px; font-weight: 600; color: var(--color-text-success); }
-.q-input { flex: 1 1 220px; min-width: 0; }
-.draft-row { justify-content: space-between; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px dashed var(--color-border-primary); }
-.draft-what { min-width: 0; flex: 1 1 200px; }
-.draft-summary { margin: 0 0 8px; font-size: 13px; }
-.draft-summary ul { margin: 2px 0 0; padding-left: 18px; }
-.draft-summary .out { color: var(--color-text-warning); }
-.drawer-sub { margin: 0; font-weight: 600; }
-.draft-none { margin: 0 0 8px; }
-button.toggle.on { border-color: var(--accent-fill); background: var(--color-background-info); font-weight: 600; }
-button.toggle .tick { font-weight: 700; }
+.lb-caption { margin: 0; padding: 10px 14px 12px; color: var(--mk-text-2); border-top: 1px solid var(--mk-line); }
 @media (max-width: 520px) {
+  /* Narrow panels: natural-width buttons and no key hints (? lists the keys; aria-keyshortcuts
+     keeps them for assistive tech), so the sticky bar stays short. */
+  main { padding: 16px 16px 0; }
+  .actions { padding: 8px 16px 10px; margin: 16px -16px 0; }
+  .bar .spacer, .grp-sep { display: none; }
+  .bar button kbd, .custom-group button kbd, .open-gh kbd, .draft-row button kbd, #merge kbd { display: none; }
   .q-why, .q-options, .q-text-row { margin-left: 0; }
-  .draft-row button kbd { display: none; }
+  .head h1.mk-title { font-size: 19px; }
+  .verdict { padding-left: 16px; padding-top: 52px; }
+  .verdict .v { font-size: 16px; }
+  select.method { max-width: 112px; }
 }
-/* The way to the questions from the top, wherever they are. */
-.q-chip { margin: 0 0 10px; min-height: 28px; padding: 2px 10px; font-size: 13px; border-radius: 999px; }
-.q-chip.open { border-color: var(--color-text-warning); background: var(--color-background-warning); font-weight: 600; }
-.q-chip kbd { margin-left: 2px; }
-.draft-summary li { white-space: pre-wrap; }
-.draft-what .link { font-size: inherit; }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -2077,11 +2119,31 @@ button.toggle .tick { font-weight: 700; }
     const d = Object.hasOwn(ICONS, name) ? ICONS[name] : ICONS.help;
     return `<svg${cls ? ` class="${cls.replace(/[^\w -]/g, "")}"` : ""} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
   }
+  function iconEl(name, cls = "") {
+    const t = document.createElement("template");
+    t.innerHTML = icon(name, cls);
+    return t.content.firstElementChild;
+  }
 
   // src/panels/kit/parts.ts
   var uid = 0;
   var nid = (p) => `mk-${p}${++uid}`;
   var seriesColor = (i) => `var(--mk-c${i % 8 + 1})`;
+  var AVATARS = [
+    "#a65a1f",
+    "#2f69b8",
+    "#22795f",
+    "#7a4bc2",
+    "#b0365e",
+    "#4f6a12",
+    "#0e6f86",
+    "#8a4a86"
+  ];
+  function avatarColor(name) {
+    let n = 0;
+    for (const ch of name.toLowerCase()) n = n * 31 + ch.codePointAt(0) >>> 0;
+    return AVATARS[n % AVATARS.length];
+  }
 
   // src/panels/kit/chart.ts
   var TYPE = {
@@ -3510,6 +3572,48 @@ ${question}`,
       return this.inputTarget(pr2 ? confirmTarget(pr2, draft2) : null);
     }
   };
+  function joinAnd(items) {
+    return items.length < 2 ? items[0] ?? "" : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+  }
+  function readiness(pr2, choices) {
+    if (pr2.status === "merged" || pr2.status === "queued") return {
+      ready: true,
+      tone: "good",
+      reasons: [],
+      short: []
+    };
+    const reasons = [], short2 = [];
+    let bad = false;
+    const missing = missingRequired(pr2.questions, choices).map((q) => pr2.questions.indexOf(q) + 1);
+    if (missing.length) {
+      const n = joinAnd(missing.map(String));
+      reasons.push(`answer question${missing.length === 1 ? "" : "s"} ${n}`);
+      short2.push(`question${missing.length === 1 ? "" : "s"} ${n}`);
+    }
+    if (checksBlock(pr2)) {
+      bad = true;
+      reasons.push("checks are failing");
+      short2.push("passing checks");
+    } else if (pr2.checks.state === "pending") {
+      reasons.push("checks are still running");
+      short2.push("the running checks");
+    }
+    const decision = pr2.reviews?.decision?.toUpperCase();
+    if (decision === "CHANGES_REQUESTED") {
+      bad = true;
+      reasons.push("a reviewer asked for changes on GitHub");
+      short2.push("the requested changes");
+    } else if (decision === "REVIEW_REQUIRED") {
+      reasons.push("an approving review is still required on GitHub");
+      short2.push("an approving review");
+    }
+    return {
+      ready: reasons.length === 0,
+      tone: reasons.length === 0 ? "good" : bad ? "bad" : "warn",
+      reasons,
+      short: short2
+    };
+  }
 
   // src/panels/apps/pr_decision/main.ts
   var root = document.getElementById("app");
@@ -3945,44 +4049,51 @@ ${question}`,
     if (mode === "request" || mode === "ask") document.getElementById(`${mode}-text`)?.focus();
     else if (mode === "confirm") document.getElementById("confirm-merge")?.focus();
   }
+  var KIT_TONE = {
+    info: "accent",
+    success: "good",
+    warning: "warn",
+    danger: "bad",
+    muted: "plain"
+  };
   function badge(text, tone) {
     return h("span", {
-      class: `badge ${tone}`
+      class: `mk-badge badge ${KIT_TONE[tone] ?? tone}`
     }, text);
   }
   var checkIcon = {
     pass: [
-      "\u2713",
+      "check",
       "success"
     ],
     fail: [
-      "\u2715",
+      "x",
       "danger"
     ],
     pending: [
-      "\u25CF",
+      "clock",
       "warning"
     ],
     skipping: [
-      "\u2013",
+      "minus",
       "muted"
     ],
     cancel: [
-      "\u2013",
+      "minus",
       "muted"
     ]
   };
   var checksLabel = {
     passing: [
-      "Checks passing",
+      "Passing",
       "success"
     ],
     failing: [
-      "Checks failing",
+      "Failing",
       "danger"
     ],
     pending: [
-      "Checks pending",
+      "Pending",
       "warning"
     ],
     none: [
@@ -3990,8 +4101,12 @@ ${question}`,
       "muted"
     ]
   };
-  var reviewTone = (s) => /APPROVED/i.test(s) ? "success" : /CHANGES_REQUESTED/i.test(s) ? "danger" : "muted";
-  var words = (s) => s.toLowerCase().replace(/_/g, " ");
+  var reviewTone = (s) => /APPROVED/i.test(s) ? "success" : /CHANGES_REQUESTED/i.test(s) ? "danger" : /REVIEW_REQUIRED/i.test(s) ? "warning" : "muted";
+  var words = (s) => {
+    const w = s.toLowerCase().replace(/_/g, " ");
+    return w[0].toUpperCase() + w.slice(1);
+  };
+  var decisionText = (s) => /REVIEW_REQUIRED/i.test(s) ? "Approval needed" : words(s);
   var statusText = {
     merging: [
       "Merging\u2026",
@@ -4032,25 +4147,34 @@ ${question}`,
       }, h("td", {
         colspan: 3
       }, l.text));
-      const sign = l.kind === "add" ? "+" : l.kind === "del" ? "-" : " ";
+      const sign = l.kind === "add" ? "+" : l.kind === "del" ? "\u2212" : " ";
       return h("tr", {
         class: l.kind
       }, h("td", {
         class: "ln",
         "aria-hidden": "true"
-      }, l.old ?? ""), h("td", {
-        class: "ln",
+      }, l.kind === "del" ? l.old ?? "" : l.new ?? l.old ?? ""), h("td", {
+        class: "sign",
         "aria-hidden": "true"
-      }, l.new ?? ""), h("td", {
+      }, sign), h("td", {
         class: "code"
       }, h("span", {
-        class: "sign"
-      }, sign), l.text));
+        class: "sr-only"
+      }, l.kind === "add" ? "added: " : l.kind === "del" ? "removed: " : ""), l.text));
     }))), lines.length > shown.length ? h("p", {
       class: "muted more"
     }, `${lines.length - shown.length} more lines not shown`) : null, lines.length ? null : h("p", {
       class: "muted more"
     }, "No diff lines."));
+  }
+  function sizeBlocks(added, removed) {
+    const tot = added + removed;
+    const a = tot ? Math.round(added / tot * 5) : 0, d = tot ? Math.min(5 - a, Math.round(removed / tot * 5)) : 0;
+    return Array.from({
+      length: 5
+    }, (_, i) => h("i", {
+      class: i < a ? "a" : i < a + d ? "d" : ""
+    }));
   }
   function statusBanner(p) {
     if (p.status === "open") return p.status_detail ? h("div", {
@@ -4064,6 +4188,101 @@ ${question}`,
     }, h("strong", null, label), p.status_detail ? h("span", {
       class: "detail"
     }, p.status_detail) : null);
+  }
+  function verdictBlock(p) {
+    const r = readiness(p, ds.choices);
+    const gate2 = p.status === "open" && !r.ready;
+    if (!p.verdict && !p.undo && !gate2) return null;
+    const vc = {
+      good: "var(--mk-good)",
+      warn: "var(--mk-warn)",
+      bad: "var(--mk-bad)"
+    }[r.tone];
+    return h("section", {
+      class: `verdict tone-${r.tone}`,
+      style: `--vc:${vc}`,
+      "aria-label": "The agent's verdict"
+    }, h("span", {
+      class: "vi",
+      "aria-hidden": "true"
+    }, iconEl("shield")), p.verdict ? h("p", {
+      class: "verdict-text v"
+    }, p.verdict) : null, p.undo ? h("p", {
+      class: "undo u"
+    }, iconEl("undo"), h("span", null, p.undo)) : null, gate2 ? h("div", {
+      class: "gate",
+      id: "readiness"
+    }, iconEl("clock"), h("span", null, `Not ready yet: ${joinAnd(r.reasons)}.`, h("small", null, "Checked by Muster against the PR, not the agent's opinion."))) : null);
+  }
+  function factsBlock(p) {
+    const level = p.risk.level;
+    const on = {
+      low: 1,
+      medium: 2,
+      high: 3
+    }[level];
+    const tone = {
+      low: "success",
+      medium: "warning",
+      high: "danger"
+    }[level];
+    const decision = p.reviews?.decision;
+    return h("section", {
+      class: "facts grid",
+      "aria-label": "Risk, checks and reviews"
+    }, h("div", {
+      class: `mk-card fact risk-${level}`
+    }, h("div", {
+      class: "fh"
+    }, h("h2", null, "Risk"), badge(`${level[0].toUpperCase()}${level.slice(1)}`, tone)), h("div", {
+      class: "riskbar",
+      "aria-hidden": "true"
+    }, [
+      1,
+      2,
+      3
+    ].map((i) => h("i", {
+      class: i <= on ? "on" : ""
+    }))), p.risk.reasons.length ? h("ul", {
+      class: "reasons"
+    }, p.risk.reasons.map((r) => h("li", {
+      class: "reason"
+    }, r))) : null), h("div", {
+      class: "mk-card fact"
+    }, h("div", {
+      class: "fh"
+    }, h("h2", null, "Checks"), badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1])), p.checks.items.length ? h("ul", {
+      class: "checks"
+    }, p.checks.items.map((c) => {
+      const [icon2, t] = checkIcon[c.state];
+      return h("li", {
+        class: `c-${t}`
+      }, iconEl(icon2), c.url ? link(c.url, c.name) : h("span", {
+        class: "name"
+      }, c.name), h("span", {
+        class: "state st"
+      }, c.state));
+    })) : h("p", {
+      class: "muted none"
+    }, "No check runs reported.")), h("div", {
+      class: "mk-card fact"
+    }, h("div", {
+      class: "fh"
+    }, h("h2", null, "Reviews"), decision ? badge(decisionText(decision), reviewTone(decision)) : badge("No decision", "muted")), p.reviews?.items.length ? h("ul", {
+      class: "checks"
+    }, p.reviews.items.map((r) => h("li", null, h("span", {
+      class: "mk-avatar",
+      style: `--a:${avatarColor(r.author)}`,
+      "aria-hidden": "true"
+    }, r.author[0]), h("span", {
+      class: "name"
+    }, r.author), h("span", {
+      class: `state st ${reviewTone(r.state)}`
+    }, words(r.state).toLowerCase())))) : null, decision && /REVIEW_REQUIRED/i.test(decision) ? h("p", {
+      class: "needs"
+    }, iconEl("users"), "Needs an approving review") : null, !decision && !p.reviews?.items.length ? h("p", {
+      class: "muted none"
+    }, "No reviews yet.") : null));
   }
   function actionPanel(p) {
     if (mode === "confirm") {
@@ -4172,12 +4391,17 @@ ${question}`,
   function questionsSection(p) {
     if (!p.questions.length) return null;
     const closed = formsClosed(p);
+    const answered = p.questions.filter((q) => answerOf(q, ds.choices) !== void 0).length;
     return h("section", {
-      class: "questions-form",
+      class: "questions-form pd-sec",
       "aria-labelledby": "questions-title"
     }, h("h2", {
       id: "questions-title"
-    }, p.questions.length === 1 ? "The agent asks" : `The agent asks (${p.questions.length})`), h("p", {
+    }, "The agent asks", h("span", {
+      class: "count"
+    }, `${answered} of ${p.questions.length} answered`), h("span", {
+      class: "r"
+    }, questionsChip(p))), h("p", {
       class: "muted small qhint"
     }, closed ? `${closed} Answers can no longer be sent.` : "Your answers go with your next decision, or send them now. Number keys pick; Tab moves to the next question."), p.questions.map((q, i) => questionView(q, i, !!closed)));
   }
@@ -4193,7 +4417,7 @@ ${question}`,
       class: "q-text",
       id: label
     }, q.text), q.required ? h("span", {
-      class: "badge warning q-req",
+      class: "q-req req",
       id: `q-${q.id}-req`
     }, "Needed to merge") : null);
     const described = [
@@ -4242,18 +4466,18 @@ ${question}`,
         type: "button",
         role: "radio",
         id: `q-${q.id}-o${j}`,
-        class: `q-opt${j === at ? " on" : ""}`,
+        class: `q-opt opt${j === at ? " on" : ""}`,
         "aria-checked": String(j === at),
         tabindex: j === (at < 0 ? 0 : at) ? 0 : -1,
         disabled: closed,
         "aria-keyshortcuts": j < 9 ? String(j + 1) : null,
         onclick: () => pick(q, o.value)
-      }, j < 9 ? h("kbd", null, String(j + 1)) : null, " ", o.label, o.value === q.recommended ? h("span", {
+      }, j < 9 ? h("kbd", null, String(j + 1)) : null, o.label, o.value === q.recommended ? h("span", {
         class: "rec"
-      }, " Recommended") : null)));
+      }, iconEl("sparkle"), "Recommended") : null)));
     }
     return h("div", {
-      class: `question${answer !== void 0 ? " answered" : ""}`,
+      class: `question mk-card q${answer !== void 0 ? " answered done" : ""}`,
       id: `q-${q.id}`,
       "data-q": q.id
     }, head, why, body);
@@ -4265,10 +4489,10 @@ ${question}`,
     return h("button", {
       type: "button",
       id: "to-questions",
-      class: `q-chip${open ? " open" : ""}`,
+      class: `sm q-chip${open ? " open" : ""}`,
       "aria-keyshortcuts": "G",
       onclick: () => toQuestions()
-    }, open ? `Answer ${open} question${open === 1 ? "" : "s"}` : `Review ${n} answer${n === 1 ? "" : "s"}`, " \u2193 ", h("kbd", null, "G"));
+    }, open ? `Answer ${open} question${open === 1 ? "" : "s"}` : `Review ${n} answer${n === 1 ? "" : "s"}`, iconEl("arrowDown"), h("kbd", null, "G"));
   }
   function toQuestions() {
     if (!pr?.questions.length || enlarged !== null) return;
@@ -4300,6 +4524,7 @@ ${question}`,
     }, `${n} of ${p.questions.length} answered`) : null, opts.length ? `${p.questions.length ? " \xB7 " : ""}${opts.join(" \xB7 ")}` : p.questions.length ? "" : "nothing yet"), h("button", {
       type: "button",
       id: "send-answers",
+      class: "ghost sm",
       "aria-keyshortcuts": "Control+Enter",
       disabled: !!closed || deciding() || draftEmpty(d) || done || mode === "confirm",
       title: mode === "confirm" ? "They go with the merge you are confirming" : "Send your answers, and the options switched on for the agent to do, now; the PR stays undecided",
@@ -4312,33 +4537,21 @@ ${question}`,
     const next = draftRow(pr);
     if (now && next) now.replaceWith(next);
   }
-  function verdictBlock(p) {
-    if (!p.verdict && !p.undo) return null;
-    return h("section", {
-      class: `verdict risk-${p.risk.level}`,
-      "aria-label": "The agent's verdict"
-    }, p.verdict ? h("p", {
-      class: "verdict-text"
-    }, p.verdict) : null, p.undo ? h("p", {
-      class: "undo"
-    }, h("span", {
-      class: "undo-icon",
-      "aria-hidden": "true"
-    }, "\u21A9 "), p.undo) : null);
-  }
   function mediaSection(p) {
     if (!p.media.length) return null;
     const images = p.media.filter((m) => m.kind === "image").length;
     return h("section", {
-      class: "media",
-      "aria-label": "Pictures and charts"
-    }, h("h2", null, "Pictures and charts"), h("div", {
+      class: "media pd-sec",
+      "aria-labelledby": "media-title"
+    }, h("h2", {
+      id: "media-title"
+    }, "Pictures and charts"), h("div", {
       class: `media-grid${images === 1 ? " single" : ""}`
     }, p.media.map((m, i) => {
       if (m.kind === "image") {
         const img = m.image;
         return h("figure", {
-          class: "shot"
+          class: "shot mk-card"
         }, h("button", {
           type: "button",
           class: "thumb",
@@ -4352,12 +4565,25 @@ ${question}`,
           draggable: "false"
         })), img.caption ? h("figcaption", null, img.caption) : null);
       }
+      const shown = chartTables.get(i) ?? false;
       return h("figure", {
-        class: "media-chart"
-      }, h("div", {
+        class: "media-chart mk-card"
+      }, m.spec.title ? h("h3", {
+        class: "chart-title"
+      }, m.spec.title) : null, h("div", {
         class: "chart-view",
         "data-chart": i
-      }), m.caption ? h("figcaption", null, m.caption) : null);
+      }), h("figcaption", null, m.caption ? h("span", null, m.caption) : h("span"), h("button", {
+        type: "button",
+        class: "ghost sm",
+        id: `chart-${i}-toggle`,
+        "aria-expanded": String(shown),
+        onclick: () => {
+          chartTables.set(i, !shown);
+          render2();
+          document.getElementById(`chart-${i}-toggle`)?.focus();
+        }
+      }, iconEl("table"), shown ? "Hide data table" : "Data table")));
     })));
   }
   function drawCharts() {
@@ -4524,6 +4750,7 @@ ${question}`,
     const focusId = document.activeElement?.id;
     const select = h("select", {
       id: "method",
+      class: "method",
       "aria-label": "Merge method",
       disabled: p.status === "merged" || p.status === "queued"
     });
@@ -4545,16 +4772,18 @@ ${question}`,
       deleteBranch = box.checked;
       if (mode === "confirm") render2();
     });
+    const ready = readiness(p, ds.choices);
+    const waits = p.status === "open" && !ready.ready;
     mergeButton = h("button", {
       type: "button",
       id: "merge",
-      class: "primary",
-      "aria-describedby": "merge-hint",
+      class: `primary${waits ? " waits" : ""}`,
+      "aria-describedby": waits ? "merge-hint merge-why" : "merge-hint",
       "aria-keyshortcuts": "M",
       onclick: (e) => openConfirm(e.shiftKey || shift)
-    }, h("span", {
+    }, iconEl("merge"), h("span", {
       class: "label"
-    }, "Merge"), " ", h("kbd", null, "M"));
+    }, "Merge"), h("kbd", null, "M"));
     const closed = formsClosed(p);
     const stats = p.changes.map((c) => diffStats(parseDiff(c.diff)));
     const effective = notice ?? (p.status !== "open" ? {
@@ -4564,94 +4793,99 @@ ${question}`,
       text: p.status_detail,
       tone: "info"
     } : null);
+    const files = p.changes.length;
     mount(
       root,
       h("header", {
         class: "head"
       }, h("div", {
-        class: "title-row"
-      }, h("h1", {
-        tabindex: "-1"
-      }, p.title, " ", h("span", {
-        class: "num"
-      }, `#${p.number}`)), h("button", {
+        class: "pd-meta"
+      }, h("span", {
+        class: "mk-chip"
+      }, p.repo), h("span", null, files ? `${files} change${files === 1 ? "" : "s"} worth a look` : "no changes picked to show"), h("button", {
         type: "button",
         id: "open",
-        class: "link open-gh",
+        class: "ghost sm open-gh",
         "aria-keyshortcuts": "O",
         onclick: () => openLink(p.url).catch((e) => {
           setNotice(e.message, "danger");
           render2();
         })
-      }, "Open on GitHub ", h("kbd", null, "O"))), h("p", {
-        class: "meta muted"
-      }, `${p.author} wants to merge `, h("code", null, p.head), " into ", h("code", null, p.base), ` in ${p.repo} \xB7 head `, h("code", {
+      }, "Open on GitHub", iconEl("external"), h("kbd", null, "O"))), h("h1", {
+        class: "mk-title",
+        tabindex: "-1"
+      }, p.title, " ", h("span", {
+        class: "num"
+      }, `#${p.number}`)), h("p", {
+        class: "meta pd-by"
+      }, h("span", {
+        class: "mk-avatar",
+        style: `--a:${avatarColor(p.author)}`,
+        "aria-hidden": "true"
+      }, p.author[0]), h("b", null, p.author), " wants to merge ", h("code", {
+        class: "mk-chip"
+      }, iconEl("branch"), p.head), h("span", {
+        class: "sr-only"
+      }, " into "), iconEl("arrowRight"), h("code", {
+        class: "mk-chip"
+      }, p.base), h("span", {
+        class: "muted"
+      }, ` in ${p.repo} \xB7 head`), h("code", {
+        class: "mk-chip",
         title: p.head_sha
-      }, short(p.head_sha))), questionsChip(p)),
+      }, short(p.head_sha)))),
       statusBanner(p),
       verdictBlock(p),
       warnings.length ? h("p", {
         class: "warnings"
       }, warnings.join("; ")) : null,
-      h("section", null, h("h2", null, "What changed"), h("p", {
+      // The decision signals come before the pictures: they must never be scrolled away by them.
+      factsBlock(p),
+      h("section", {
+        class: "pd-sec"
+      }, h("h2", null, "What changed"), h("p", {
         class: "prose"
       }, p.summary)),
-      // The decision signals come before the pictures: they must never be scrolled away by them.
-      h("section", {
-        class: "grid"
-      }, h("div", null, h("h2", null, "Risk"), badge(`${p.risk.level[0].toUpperCase()}${p.risk.level.slice(1)} risk`, {
-        low: "success",
-        medium: "warning",
-        high: "danger"
-      }[p.risk.level]), p.risk.reasons.length ? h("ul", {
-        class: "reasons"
-      }, p.risk.reasons.map((r) => h("li", null, r))) : null), h("div", null, h("h2", null, "Checks"), badge(checksLabel[p.checks.state][0], checksLabel[p.checks.state][1]), p.checks.items.length ? h("ul", {
-        class: "checks"
-      }, p.checks.items.map((c) => {
-        const [icon2, tone] = checkIcon[c.state];
-        return h("li", null, h("span", {
-          class: `icon ${tone}`,
-          "aria-hidden": "true"
-        }, icon2), c.url ? link(c.url, c.name) : h("span", null, c.name), h("span", {
-          class: "muted state"
-        }, c.state));
-      })) : null), h("div", null, h("h2", null, "Reviews"), p.reviews?.decision ? badge(words(p.reviews.decision), reviewTone(p.reviews.decision)) : h("span", {
-        class: "muted"
-      }, "No review decision"), p.reviews?.items.length ? h("ul", {
-        class: "checks"
-      }, p.reviews.items.map((r) => h("li", null, h("span", null, r.author), h("span", {
-        class: `state ${reviewTone(r.state)}`
-      }, words(r.state))))) : null)),
       questionsSection(p),
       mediaSection(p),
-      h("section", null, h("h2", null, p.changes.length ? `Changes worth a look (${p.changes.length})` : "Changes"), p.changes.length ? null : h("p", {
+      h("section", {
+        class: "pd-sec"
+      }, h("h2", null, files ? "Changes worth a look" : "Changes", files ? h("span", {
+        class: "count"
+      }, String(files)) : null), files ? null : h("p", {
         class: "muted"
       }, "The agent picked no changes to show."), p.changes.map((c, i) => h("article", {
-        class: "change"
-      }, h("header", null, h("code", {
-        class: "file"
+        class: "change mk-card file"
+      }, h("header", {
+        class: "fh2"
+      }, h("code", {
+        class: "file fn"
       }, c.file), h("span", {
-        class: "stat"
+        class: "stat ds"
       }, h("span", {
-        class: "plus"
-      }, `+${stats[i].added}`), " ", h("span", {
-        class: "minus"
-      }, `\u2212${stats[i].removed}`))), h("p", {
+        class: "plus a"
+      }, `+${stats[i].added}`), h("span", {
+        class: "minus d"
+      }, `\u2212${stats[i].removed}`), h("span", {
+        class: "blocks",
+        "aria-hidden": "true"
+      }, sizeBlocks(stats[i].added, stats[i].removed)))), h("p", {
         class: "note"
-      }, c.note), diffView(c.diff))), p.rest_note ? h("p", {
+      }, iconEl("sparkle"), h("span", null, c.note)), diffView(c.diff))), p.rest_note ? h("p", {
         class: "rest muted"
       }, p.rest_note) : null),
       answers.length ? h("section", {
-        id: "answers"
+        id: "answers",
+        class: "pd-sec"
       }, h("h2", null, "The agent's answers"), answers.map((a) => h("div", {
-        class: "answer"
+        class: "answer mk-card"
       }, h("p", {
         class: "q muted"
       }, a.question), h("p", {
         class: "prose"
       }, a.text)))) : null,
       h("div", {
-        class: `actions${mode || showKeys ? " has-drawer" : ""}`
+        class: `actions actbar${mode || showKeys ? " has-drawer" : ""}`
       }, showKeys ? shortcutsDrawer(KEYS, p.actions, () => setKeys(false), true) : null, actionPanel(p), draftRow(p), effective ? h("div", {
         class: `notice ${effective.tone}`,
         role: effective.tone === "danger" ? "alert" : "status"
@@ -4662,7 +4896,8 @@ ${question}`,
       }, mergeButton, select, h("label", {
         class: "check"
       }, box, " Delete branch")), h("span", {
-        class: "spacer"
+        class: "grp-sep",
+        "aria-hidden": "true"
       }), h("button", {
         type: "button",
         id: "request",
@@ -4677,9 +4912,12 @@ ${question}`,
         disabled: !!closed,
         title: closed ?? null,
         onclick: () => setMode("ask")
-      }, "Ask ", h("kbd", null, "A")), h("button", {
+      }, "Ask ", h("kbd", null, "A")), h("span", {
+        class: "spacer"
+      }), h("button", {
         type: "button",
         id: "skip",
+        class: "ghost",
         "aria-keyshortcuts": "S",
         disabled: !!sent,
         title: "Move on without changing this PR",
@@ -4687,11 +4925,15 @@ ${question}`,
       }, "Skip ", h("kbd", null, "S")), h("button", {
         type: "button",
         id: "hold",
+        class: "ghost",
         "aria-keyshortcuts": "H",
         disabled: !!sent || !!holdClosed(p),
         title: holdClosed(p) ?? "Put this PR aside to come back to later",
         onclick: () => sendSimple("hold")
-      }, "Hold ", h("kbd", null, "H")), helpButton(() => setKeys(!showKeys), showKeys)), actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentNow.has(a.id), actionsOpen, () => {
+      }, "Hold ", h("kbd", null, "H")), helpButton(() => setKeys(!showKeys), showKeys)), waits && mode !== "confirm" ? h("p", {
+        id: "merge-why",
+        class: "why small"
+      }, iconEl("clock"), `Merge waits for ${joinAnd(ready.short)}`) : null, actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentNow.has(a.id), actionsOpen, () => {
         actionsOpen = !actionsOpen;
         render2();
         document.getElementById("your-actions")?.focus();

@@ -524,101 +524,105 @@ textarea { display: block; width: 100%; resize: vertical; line-height: 1.5; }
 .app-foot .keys { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 @media (max-width: 520px) { .app-head .mk-title { font-size: 17px; } .app-head .mk-takeaway { font-size: 13px; } }
 
+/* PR overview in the Briefing look: the title and a line of counts, then one card per PR (number
+   and title, one risk badge, one line of facts, the agent's summary). Decided PRs step back to a
+   quieter dashed card. No coloured stripes: the risk badge carries the risk. */
 main { padding-bottom: 0; }
-.head h1 { font-size: 18px; }
-.repo { margin: 2px 0 10px; font-size: 13px; }
-.tools { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
-.tools select { flex: 0 1 auto; }
-.tools input[type="search"] { flex: 1 1 140px; min-width: 0; }
+.app-head { margin-bottom: 0; }
+.app-head h1:focus { outline: none; }
+.po-sum { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 12px 0 0; font-size: 13px; color: var(--mk-text-2); }
+.po-sum span { display: inline-flex; align-items: center; gap: 6px; }
+.po-sum span i { width: 7px; height: 7px; border-radius: 50%; background: var(--c); }
+.po-sum b { color: var(--mk-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.po-tools { display: flex; align-items: center; gap: 10px; margin: 16px 0 14px; flex-wrap: wrap; }
+.po-tools .mk-search { flex: 1 1 200px; max-width: 300px; }
+.po-tools .qw { margin-left: auto; }
+.po-tools .qw[aria-pressed="true"] { border-color: var(--mk-accent); background: var(--mk-accent-soft); color: var(--mk-text); }
 .empty { padding: 16px 0; }
-.group { margin: 14px 0 6px; }
-.group:first-child { margin-top: 0; }
 .list { outline: none; }
-.card {
-  position: relative; border: 1px solid var(--color-border-secondary); border-left: 4px solid var(--color-border-primary);
-  border-radius: var(--border-radius-md); padding: 8px 10px 8px 10px; margin: 0 0 8px; cursor: pointer;
-  background: var(--color-background-primary);
-}
-.card:hover { background: var(--color-background-secondary); }
-.card.selected { border-color: var(--color-ring-primary); box-shadow: 0 0 0 1px var(--color-ring-primary); background: var(--color-background-secondary); }
-.card:focus-visible { outline: 2px solid var(--color-ring-primary); outline-offset: 2px; }
-.card.risk-high { border-left-color: var(--color-text-danger); }
-.card.risk-medium { border-left-color: var(--color-text-warning); }
-.card.risk-low { border-left-color: var(--color-text-success); }
-.card.selected.risk-high { border-left-color: var(--color-text-danger); }
-.card.selected.risk-medium { border-left-color: var(--color-text-warning); }
-.card.selected.risk-low { border-left-color: var(--color-text-success); }
-/* Held and decided cards step back by their surface, never by fading text: badges keep full
-   contrast (4.5:1 or more) in both themes. */
-.card.g-merged, .card.g-queued, .card.g-changes_requested, .card.g-held {
-  background: var(--color-background-secondary); border-style: dashed; border-left-style: solid;
-}
-.card.g-merged .title { text-decoration: line-through; text-decoration-color: var(--color-text-tertiary); }
-.top { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
-.num { font-family: var(--font-mono); font-size: 12.5px; color: var(--color-text-secondary); flex: none; }
-.title { font-weight: 600; flex: 1 1 160px; min-width: 0; }
-.top .badge.status, .top .badge.now { flex: none; }
-.meta { font-size: 12.5px; margin: 2px 0 4px; }
-.size { font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
-.plus { color: var(--color-text-success); }
-.minus { color: var(--color-text-danger); }
-.draft { color: var(--color-text-warning); font-weight: 600; }
-.chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.chips:empty { display: none; }
-.badge { display: inline-block; border-radius: 999px; padding: 0 8px; font-size: 12px; font-weight: 600; line-height: 1.6; border: 1px solid transparent; white-space: nowrap; }
-.badge.success { color: var(--color-text-success); background: var(--color-background-success); }
-.badge.warning { color: var(--color-text-warning); background: var(--color-background-warning); }
-.badge.danger { color: var(--color-text-danger); background: var(--color-background-danger); }
-.badge.info { color: var(--color-text-info); background: var(--color-background-info); }
-.badge.muted { color: var(--color-text-secondary); background: var(--color-background-tertiary); }
-.label { font-size: 12px; line-height: 1.6; padding: 0 7px; border-radius: 999px; border: 1px solid var(--color-border-primary); color: var(--color-text-secondary); }
-.summary { margin: 6px 0 0; font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.card.selected .summary { -webkit-line-clamp: unset; display: block; }
-.detail { margin: 4px 0 0; font-size: 12px; white-space: pre-wrap; }
-.small { font-size: 12px; }
-.prose { white-space: pre-wrap; margin: 0 0 6px; }
-.notice { border-radius: var(--border-radius-md); padding: 6px 10px; margin: 0 0 8px; border: 1px solid; font-size: 13px; }
-.notice.info { border-color: var(--color-text-info); background: var(--color-background-info); }
-.notice.success { border-color: var(--color-text-success); background: var(--color-background-success); }
-.notice.danger { border-color: var(--color-text-danger); background: var(--color-background-danger); }
-.notice.warning { border-color: var(--color-text-warning); background: var(--color-background-warning); }
+.grp { display: flex; align-items: center; gap: 10px; margin: 20px 0 10px; font: 620 13px var(--mk-font); color: var(--mk-text-2); }
+.grp::after { content: ""; flex: 1; height: 1px; background: var(--mk-line); }
+.list > div:first-child .grp { margin-top: 0; }
+.prc { display: grid; grid-template-columns: 1fr auto; gap: 4px 14px; padding: 13px 16px; margin-bottom: 8px; cursor: pointer; transition: border-color .15s, background .15s; }
+.prc:hover { border-color: var(--mk-line-3); }
+.prc.selected { border-color: var(--mk-accent); background: color-mix(in srgb, var(--mk-accent) 5%, var(--mk-surface)); }
+.prc:focus-visible { outline: 2px solid var(--mk-accent); outline-offset: 2px; }
+.prc .h { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.prc .h .no { font: 550 13px var(--mk-mono); color: var(--mk-text-3); flex: none; }
+.prc .h .tt { font-weight: 600; font-size: 14px; color: var(--mk-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -0.006em; min-width: 0; }
+.prc .bd { display: flex; gap: 6px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+.prc .bd .quick svg { width: 12px; height: 12px; margin-left: -2px; }
+.prc .m { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px 10px; font-size: 12px; color: var(--mk-text-3); flex-wrap: wrap; }
+.prc .m .mk-avatar { width: 18px; height: 18px; font-size: 11px; }
+.prc .m .who { display: inline-flex; align-items: center; gap: 6px; color: var(--mk-text-2); }
+.prc .m .draft { color: var(--mk-warn); font-weight: 600; }
+.prc .m .mk-chip { height: 20px; font-size: 11px; }
+.ds2 { display: inline-flex; align-items: center; gap: 6px; font: 550 12px var(--mk-mono); }
+.ds2 .a { color: var(--mk-add); } .ds2 .d { color: var(--mk-del); }
+.ds2 .bar { display: inline-flex; height: 5px; border-radius: 3px; overflow: hidden; background: var(--mk-sunken); }
+.ds2 .bar i { display: block; height: 100%; } .ds2 .bar i.a { background: var(--mk-add); } .ds2 .bar i.d { background: var(--mk-del); }
+.ck { display: inline-flex; align-items: center; gap: 4px; font-weight: 550; }
+.ck svg { width: 13px; height: 13px; }
+.ck.good { color: var(--mk-good); } .ck.bad { color: var(--mk-bad); } .ck.warn { color: var(--mk-warn); } .ck.plain { color: var(--mk-text-3); }
+.prc .s { grid-column: 1 / -1; font-size: 13px; color: var(--mk-text-2); line-height: 1.5; margin: 4px 0 0; }
+.prc .s b { color: var(--mk-text); font-weight: 600; }
+.prc .st { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--mk-text-3); flex-wrap: wrap; }
+.prc .st .reviewed { display: inline-flex; align-items: center; gap: 6px; }
+.prc .st .reviewed svg { width: 13px; height: 13px; color: var(--mk-good); }
+.prc .st .merge-quick { margin-left: auto; }
+.prc .st .merge-quick svg { width: 14px; height: 14px; }
+.badge.now { font: 650 11px var(--mk-font); color: var(--mk-on-accent); background: var(--mk-accent-fill); padding: 2px 7px; border-radius: 5px; align-self: center; flex: none; }
+/* Held and decided cards step back by their surface, never by fading text. */
+.prc.g-merged, .prc.g-queued, .prc.g-changes_requested, .prc.g-held, .prc.g-skipped { background: transparent; box-shadow: none; border-style: dashed; }
+.prc.g-merged .tt { text-decoration: line-through; text-decoration-color: var(--mk-text-3); }
+/* The sticky bar: frosted, because it floats over the cards. */
 .actions {
-  position: sticky; bottom: 0; z-index: 3; margin: 12px -16px 0; padding: 10px 16px 10px;
-  background: var(--color-background-primary); border-top: 1px solid var(--color-border-primary);
+  position: sticky; bottom: 0; z-index: 3; margin: 12px -26px 0; padding: 10px 26px 12px;
+  background: color-mix(in srgb, var(--mk-canvas) 86%, transparent); -webkit-backdrop-filter: blur(14px) saturate(1.2); backdrop-filter: blur(14px) saturate(1.2);
+  border-top: 1px solid var(--mk-line-2); max-height: 34vh; overflow-y: auto;
 }
-.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.actions { max-height: 34vh; overflow-y: auto; }
 .actions.has-drawer { max-height: 85vh; }
-.custom-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--color-border-primary); }
-.group-label, .fold { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-text-secondary); }
-.fold { min-height: 28px; padding: 2px 8px; }
+.row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.row .spacer { flex: 1; }
+.notice { border-radius: 8px; padding: 7px 11px; margin: 0 0 8px; font-size: 13px; border: 1px solid; color: var(--mk-text); }
+.notice.info { border-color: color-mix(in srgb, var(--mk-accent) 30%, transparent); background: var(--mk-accent-soft); }
+.notice.success { border-color: color-mix(in srgb, var(--mk-good) 30%, transparent); background: var(--mk-good-soft); }
+.notice.warning { border-color: color-mix(in srgb, var(--mk-warn) 30%, transparent); background: var(--mk-warn-soft); }
+.notice.danger { border-color: color-mix(in srgb, var(--mk-bad) 30%, transparent); background: var(--mk-bad-soft); }
+.drawer { border: 1px solid var(--mk-line-2); background: var(--mk-surface); border-radius: var(--mk-r); padding: 12px 14px; margin-bottom: 10px; box-shadow: var(--mk-shadow); }
+.drawer-title { display: block; font-weight: 600; margin-bottom: 8px; color: var(--mk-text); }
+.command { margin: 0 0 8px; padding: 9px 11px; background: var(--mk-sunken); border: 1px solid var(--mk-line); border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mk-mono); color: var(--mk-text); }
+.drawer .verdict-line { margin: 0 0 6px; font-size: 13px; }
+.small { font-size: 12px; }
+.keys { margin: 8px 0 0; }
+.custom-group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--mk-line-2); }
+.group-label, .fold { font-size: 12px; font-weight: 600; color: var(--mk-text-2); }
+.fold { min-height: 26px; padding: 2px 8px; }
 button.help { min-width: 32px; padding: 5px 8px; font-weight: 700; }
+button.outward { border-color: color-mix(in srgb, var(--mk-warn) 45%, transparent); }
+button .out { color: var(--mk-warn); }
+button.toggle.on { border-color: var(--mk-accent); background: var(--mk-accent-soft); }
+.outward-desc { margin: 0 0 6px; }
+.prose { white-space: pre-wrap; margin: 0; }
 .shortcuts dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0 0 8px; font-size: 13px; }
 .shortcuts dt { text-align: right; }
-.shortcuts dd { margin: 0; }
-.keys { margin: 6px 0 0; }
-.drawer { border: 1px solid var(--color-border-primary); background: var(--color-background-secondary); border-radius: var(--border-radius-md); padding: 10px 12px; margin-bottom: 10px; }
-.drawer-title { display: block; font-weight: 600; margin-bottom: 6px; }
-button.outward { border-color: var(--color-text-warning); }
-button .out { color: var(--color-text-warning); }
-button kbd { margin-left: 2px; }
-button.primary kbd { color: inherit; border-color: currentColor; opacity: 0.8; }
+.shortcuts dd { margin: 0; color: var(--mk-text-2); }
 @media (max-width: 520px) {
-  .actions { padding: 8px 12px; }
-  .bar button kbd, .custom-group button kbd { display: none; }
-  .row, .custom-group { gap: 6px; }
-}
-/* Small panels: the key line goes (? lists the keys), so the bar stays short. */
-@media (max-height: 559px), (max-width: 520px) {
+  .actions { margin: 12px -16px 0; padding: 8px 16px 10px; }
+  .row button kbd, .custom-group button kbd { display: none; }
   .keys { display: none; }
+  .po-tools .mk-search { max-width: none; }
+  .po-tools .qw { margin-left: 0; }
+  .prc { grid-template-columns: 1fr; padding: 12px; }
+  .prc .bd { justify-content: flex-start; }
+  .prc .h .tt { white-space: normal; }
 }
-/* Quick wins: reviewed, small, green and low risk; merged from here after the same confirm. */
-.verdict-line { margin: 6px 0 0; font-size: 13px; font-weight: 600; }
-.drawer .verdict-line { margin: 0 0 6px; font-weight: 400; }
-.command { margin: 0 0 8px; padding: 8px 10px; background: var(--color-background-primary); border: 1px solid var(--color-border-secondary); border-radius: var(--border-radius-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+.prc .s { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.prc.selected .s { -webkit-line-clamp: unset; display: block; }
+.prc .st .detail { white-space: pre-wrap; color: var(--mk-text-2); }
 button.quick-toggle { flex: none; }
-button.quick-toggle.on { border-color: var(--accent-fill); background: var(--color-background-info); font-weight: 600; }
-button.merge-quick { border-color: var(--color-text-success); }
+/* Small panels: the key line goes (? lists the keys), so the bar stays short. */
+@media (max-height: 559px) { .keys { display: none; } }
 </style></head><body><main id="app"></main>
 <script>
 "use strict";
@@ -784,6 +788,96 @@ button.merge-quick { border-color: var(--color-text-success); }
     const bottom = innerHeight - (bar ? bar.getBoundingClientRect().height : 0) - 8;
     if (r.top < 8) scrollBy(0, r.top - 8);
     else if (r.bottom > bottom) scrollBy(0, Math.min(r.bottom - bottom, r.top - 8));
+  }
+
+  // src/panels/kit/icons.ts
+  var ICONS = {
+    check: "M20 6 9 17l-5-5",
+    x: "M18 6 6 18M6 6l12 12",
+    alert: "M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
+    info: "M12 16v-4m0-4h.01M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z",
+    clock: "M12 6v6l4 2M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z",
+    refresh: "M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5",
+    external: "M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
+    branch: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9",
+    merge: "M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21V9a9 9 0 0 0 9 9",
+    search: "m21 21-4.3-4.3M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0z",
+    rocket: "M4.5 16.5c-1.5 1.3-2 5-2 5s3.7-.5 5-2c.7-.8.7-2.1-.1-2.9a2.2 2.2 0 0 0-2.9-.1zM12 15l-3-3a22 22 0 0 1 2-4 12.9 12.9 0 0 1 11-6c0 2.7-.8 7.5-6 11a22 22 0 0 1-4 2zM9 12H4s.6-3 2-4c1.6-1.1 5 0 5 0M12 15v5s3-.6 4-2c1.1-1.6 0-5 0-5",
+    undo: "M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11",
+    shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4",
+    zap: "M13 2 3 14h9l-1 8 10-12h-9l1-8z",
+    play: "M6 3l14 9-14 9V3z",
+    pause: "M6 4h4v16H6zM14 4h4v16h-4z",
+    dot: "M12 12h.01",
+    chart: "M3 3v18h18M7 15l4-4 3 3 6-6",
+    table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18",
+    image: "M3 3h18v18H3zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 21",
+    doc: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h6",
+    pr: "M18 15V8a3 3 0 0 0-3-3h-3M15 2l-3 3 3 3M6 9v12M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+    globe: "M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0zM2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20",
+    lock: "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4",
+    server: "M3 4h18v7H3zM3 13h18v7H3zM7 7.5h.01M7 16.5h.01",
+    db: "M4 6c0 1.7 3.6 3 8 3s8-1.3 8-3-3.6-3-8-3-8 1.3-8 3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
+    dollar: "M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6",
+    flask: "M9 3h6M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3M7 15h10",
+    sparkle: "M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z",
+    plus: "M12 5v14M5 12h14",
+    minus: "M5 12h14",
+    arrowUp: "M12 19V5M5 12l7-7 7 7",
+    arrowDown: "M12 5v14M19 12l-7 7-7-7",
+    arrowRight: "M5 12h14M12 5l7 7-7 7",
+    chevron: "m6 9 6 6 6-6",
+    maximize: "M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7",
+    eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
+    users: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8",
+    terminal: "m4 17 6-6-6-6M12 19h8",
+    copy: "M9 9h12v12H9zM5 15H3V3h12v2",
+    filter: "M22 3H2l8 9.5V19l4 2v-8.5z",
+    sort: "M3 6h18M6 12h12M10 18h4",
+    help: "M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0zM9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"
+  };
+  var warned = /* @__PURE__ */ new Set();
+  function icon(name, cls = "") {
+    if (!Object.hasOwn(ICONS, name) && !warned.has(name)) {
+      warned.add(name);
+      console.warn(`[mk] unknown icon "${name}"; known: ${Object.keys(ICONS).join(", ")}`);
+    }
+    const d = Object.hasOwn(ICONS, name) ? ICONS[name] : ICONS.help;
+    return `<svg${cls ? ` class="${cls.replace(/[^\w -]/g, "")}"` : ""} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
+  }
+  function iconEl(name, cls = "") {
+    const t = document.createElement("template");
+    t.innerHTML = icon(name, cls);
+    return t.content.firstElementChild;
+  }
+
+  // src/panels/kit/format.ts
+  var esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[c]);
+  var rich = (s) => esc(s).replace(/\*\*([^*\n]{1,200})\*\*/g, "<b>$1</b>").replace(/`([^`\n]{1,200})`/g, "<code>$1</code>");
+
+  // src/panels/kit/parts.ts
+  var AVATARS = [
+    "#a65a1f",
+    "#2f69b8",
+    "#22795f",
+    "#7a4bc2",
+    "#b0365e",
+    "#4f6a12",
+    "#0e6f86",
+    "#8a4a86"
+  ];
+  function avatarColor(name) {
+    let n = 0;
+    for (const ch of name.toLowerCase()) n = n * 31 + ch.codePointAt(0) >>> 0;
+    return AVATARS[n % AVATARS.length];
   }
 
   // src/panels/apps/shared/confirm.ts
@@ -1323,7 +1417,7 @@ button.merge-quick { border-color: var(--color-text-success); }
   var SORT_LABELS = {
     risk: "Riskiest first",
     quick: "Quick wins first",
-    oldest: "Oldest first"
+    oldest: "Oldest"
   };
   var MAX_PRS = 200;
   var DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
@@ -1343,6 +1437,7 @@ button.merge-quick { border-color: var(--color-text-success); }
     p.known(o, "", [
       "repo",
       "title",
+      "takeaway",
       "prs",
       "current",
       "sort",
@@ -1355,6 +1450,9 @@ button.merge-quick { border-color: var(--color-text-success); }
     if (repo !== void 0 && !REPO.test(repo)) p.add("repo", "must look like owner/name");
     const title = p.string(o, "title", "", {
       max: 200
+    });
+    const takeaway = p.string(o, "takeaway", "", {
+      max: 600
     });
     const prs = [];
     const seen = /* @__PURE__ */ new Set();
@@ -1433,7 +1531,7 @@ button.merge-quick { border-color: var(--color-text-success); }
         else labels.push(l);
       });
       const risk = p.oneOf(io, "risk", at, RISKS);
-      const summary = p.string(io, "summary", at, {
+      const summary2 = p.string(io, "summary", at, {
         max: 500
       });
       const status = p.oneOf(io, "status", at, STATUSES) ?? "new";
@@ -1481,7 +1579,7 @@ button.merge-quick { border-color: var(--color-text-success); }
           review,
           labels,
           risk,
-          summary: summary?.trim() ? summary : void 0,
+          summary: summary2?.trim() ? summary2 : void 0,
           status,
           status_detail,
           head_sha,
@@ -1500,6 +1598,7 @@ button.merge-quick { border-color: var(--color-text-success); }
     return p.result({
       repo,
       title,
+      takeaway,
       prs,
       current,
       sort,
@@ -1612,14 +1711,16 @@ button.merge-quick { border-color: var(--color-text-success); }
     if (d < 60) return `${d}d`;
     return `${Math.floor(d / 30)}mo`;
   }
-  function tally(prs) {
-    const t = {
-      todo: 0,
-      done: 0,
-      held: 0
+  function summary(prs) {
+    const open2 = prs.filter((p) => groupOf(p) !== "done");
+    return {
+      open: open2.length,
+      quick: open2.filter((p) => p.quick_win).length,
+      failing: open2.filter((p) => p.checks === "failing").length,
+      review: open2.filter((p) => p.review === "REVIEW_REQUIRED").length,
+      held: prs.filter((p) => p.status === "held").length,
+      merged: prs.filter((p) => p.status === "merged").length
     };
-    for (const pr of prs) t[groupOf(pr)]++;
-    return t;
   }
   function openEvent(repo, pr) {
     return {
@@ -1774,24 +1875,6 @@ button.merge-quick { border-color: var(--color-text-success); }
       "success"
     ]
   };
-  var checksText = {
-    passing: [
-      "\u2713 Checks",
-      "success"
-    ],
-    failing: [
-      "\u2715 Checks failing",
-      "danger"
-    ],
-    pending: [
-      "\u25CF Checks pending",
-      "warning"
-    ],
-    none: [
-      "No checks",
-      "muted"
-    ]
-  };
   var reviewText = {
     APPROVED: [
       "Approved",
@@ -1852,11 +1935,6 @@ button.merge-quick { border-color: var(--color-text-success); }
       "danger"
     ]
   };
-  function badge(text, tone, extra = "") {
-    return h("span", {
-      class: `badge ${tone} ${extra}`.trim()
-    }, text);
-  }
   function send(ev, key, ok) {
     const result = sendEvent(ev.kind, ev.text, ev.data);
     const mine = ++sendSeq;
@@ -2057,25 +2135,71 @@ button.merge-quick { border-color: var(--color-text-success); }
     const i = !Number.isFinite(by) ? by > 0 ? list.length - 1 : 0 : at < 0 ? by > 0 ? 0 : list.length - 1 : Math.max(0, Math.min(list.length - 1, at + by));
     select(list[i].number);
   }
+  var KIT_TONE = {
+    info: "accent",
+    success: "good",
+    warning: "warn",
+    danger: "bad",
+    muted: "plain"
+  };
+  function badge(text, tone, extra = "") {
+    return h("span", {
+      class: `mk-badge badge ${KIT_TONE[tone] ?? tone} ${extra}`.trim()
+    }, text);
+  }
+  var checkIcon = {
+    passing: [
+      "check",
+      "good",
+      "Passing"
+    ],
+    failing: [
+      "x",
+      "bad",
+      "Failing"
+    ],
+    pending: [
+      "clock",
+      "warn",
+      "Pending"
+    ],
+    none: [
+      "minus",
+      "plain",
+      "No checks"
+    ]
+  };
+  function sizeBar(pr) {
+    const add = pr.additions ?? 0, del = pr.deletions ?? 0, tot = add + del;
+    const w = Math.min(46, 8 + Math.log10(tot + 1) * 14);
+    return h("span", {
+      class: "size ds2",
+      title: `${size(pr)} lines changed`
+    }, h("span", {
+      class: "plus a"
+    }, `+${add}`), h("span", {
+      class: "minus d"
+    }, `\u2212${del}`), tot ? h("span", {
+      class: "bar",
+      style: `width:${w.toFixed(0)}px`,
+      "aria-hidden": "true"
+    }, h("i", {
+      class: "a",
+      style: `width:${(add / tot * 100).toFixed(1)}%`
+    }), h("i", {
+      class: "d",
+      style: `width:${(del / tot * 100).toFixed(1)}%`
+    })) : null);
+  }
   function card(pr, now) {
     const st = statusText[pr.status];
     const sizeKnown = pr.additions !== void 0 || pr.deletions !== void 0;
-    const meta = [
-      pr.author,
-      age(pr.created, now),
-      sizeKnown ? h("span", {
-        class: "size",
-        title: `${size(pr)} lines changed`
-      }, h("span", {
-        class: "plus"
-      }, `+${pr.additions ?? 0}`), " ", h("span", {
-        class: "minus"
-      }, `\u2212${pr.deletions ?? 0}`)) : null,
-      pr.files !== void 0 ? `${pr.files} file${pr.files === 1 ? "" : "s"}` : null
-    ].filter(Boolean);
     const isSel = pr.number === selected;
+    const ck = pr.checks ? checkIcon[pr.checks] : null;
+    const quickReady = pr.quick_win && pr.status !== "merged" && pr.status !== "queued";
+    const mergeOff = quickReady ? quickMergeBlocked(pr, sent.has(`merge:${pr.number}`)) : null;
     return h("div", {
-      class: `card risk-${pr.risk ?? "none"}${isSel ? " selected" : ""}${pr.number === view.current ? " current" : ""} g-${pr.status}`,
+      class: `card mk-card prc risk-${pr.risk ?? "none"}${isSel ? " selected" : ""}${pr.number === view.current ? " current" : ""} g-${pr.status}`,
       id: `pr-${pr.number}`,
       role: "option",
       "aria-selected": String(isSel),
@@ -2085,41 +2209,60 @@ button.merge-quick { border-color: var(--color-text-success); }
       },
       ondblclick: () => open(pr)
     }, h("div", {
-      class: "top"
-    }, h("span", {
-      class: "num"
+      class: "h"
+    }, pr.number === view.current ? h("span", {
+      class: "badge now"
+    }, "Now") : null, h("span", {
+      class: "num no"
     }, `#${pr.number}`), h("span", {
-      class: "title"
-    }, pr.title), pr.number === view.current ? badge("Now", "info", "now") : null, st[0] ? badge(st[0], st[1], "status") : null), h("div", {
-      class: "meta muted"
-    }, meta.flatMap((m, i) => i ? [
-      " \xB7 ",
-      m
-    ] : [
-      m
-    ]), pr.draft ? [
-      " \xB7 ",
-      h("span", {
-        class: "draft"
-      }, "Draft")
-    ] : null), h("div", {
-      class: "chips"
-    }, pr.quick_win ? badge("Quick win", "success", "quick") : null, pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1]) : null, pr.checks ? badge(checksText[pr.checks][0], checksText[pr.checks][1]) : null, pr.review ? badge(reviewText[pr.review][0], reviewText[pr.review][1]) : null, pr.labels.map((l) => h("span", {
-      class: "label"
-    }, l))), pr.verdict ? h("p", {
+      class: "title tt"
+    }, pr.title)), h("div", {
+      class: "bd"
+    }, pr.quick_win ? h("span", {
+      class: "mk-badge badge accent plain quick"
+    }, iconEl("zap"), "Quick win") : null, pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1], "risk") : null), h("div", {
+      class: "meta m"
+    }, h("span", {
+      class: "who"
+    }, h("span", {
+      class: "mk-avatar",
+      style: `--a:${avatarColor(pr.author)}`,
+      "aria-hidden": "true"
+    }, pr.author[0]), pr.author), pr.created !== void 0 ? h("span", null, age(pr.created, now)) : null, sizeKnown ? sizeBar(pr) : null, pr.files !== void 0 ? h("span", null, `${pr.files} file${pr.files === 1 ? "" : "s"}`) : null, ck ? h("span", {
+      class: `ck ${ck[1]}`
+    }, iconEl(ck[0]), ck[2] === "Failing" ? "Checks failing" : ck[2]) : null, pr.review ? h("span", null, reviewText[pr.review][0]) : null, pr.draft ? h("span", {
+      class: "draft"
+    }, "Draft") : null, pr.labels.map((l) => h("span", {
+      class: "mk-chip label"
+    }, l))), pr.verdict || pr.summary ? h("p", {
+      class: "s summary"
+    }, pr.verdict ? h("b", {
       class: "verdict-line"
-    }, pr.verdict) : null, pr.summary ? h("p", {
-      class: "summary"
-    }, pr.summary) : null, pr.status_detail ? h("p", {
-      class: "detail muted"
-    }, pr.status_detail) : null);
+    }, pr.verdict, " ") : null, pr.summary ?? "") : null, quickReady || st[0] || pr.status_detail ? h("div", {
+      class: "st"
+    }, st[0] ? badge(st[0], st[1], "status") : null, pr.status_detail ? h("span", {
+      class: "detail"
+    }, pr.status_detail) : null, quickReady && pr.head_sha ? h("span", {
+      class: "reviewed"
+    }, iconEl("check"), `Reviewed at ${pr.head_sha.slice(0, 7)}, ${pr.merge_method_default}${pr.delete_branch_default ? ", delete branch" : ""}`) : null, quickReady ? h("button", {
+      type: "button",
+      id: `merge-${pr.number}`,
+      class: "sm primary merge-quick",
+      "aria-keyshortcuts": "M",
+      disabled: !!mergeOff || !!merging,
+      title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`,
+      onclick: (e) => {
+        e.stopPropagation();
+        if (selected !== pr.number) select(pr.number, false);
+        openMerge(pr);
+      }
+    }, iconEl("merge"), `Merge #${pr.number}`, h("kbd", null, "M")) : null) : null);
   }
   function actionBar() {
     const v = view;
     const pr = selectedPr();
     const nextUp = nextPr(ordered(), v.current);
     const busy = (k) => !!pr && sent.has(`${k}:${pr.number}`);
-    const mergeOff = pr ? quickMergeBlocked(pr, busy("merge")) : "Select a PR first.";
     return h("div", {
       class: `actions${outward || merging || showKeys ? " has-drawer" : ""}`
     }, showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null, outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelConfirm()) : null, merging ? mergeDrawer(v.repo, merging) : null, notice ? h("div", {
@@ -2134,31 +2277,27 @@ button.merge-quick { border-color: var(--color-text-success); }
       "aria-keyshortcuts": "Enter O",
       disabled: !pr || busy("open"),
       onclick: () => open(selectedPr())
-    }, pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")), pr?.quick_win ? h("button", {
-      type: "button",
-      id: "merge",
-      class: "merge-quick",
-      "aria-keyshortcuts": "M",
-      disabled: !!mergeOff || !!merging,
-      title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`,
-      onclick: () => openMerge(selectedPr())
-    }, `Merge #${pr.number}`, " ", h("kbd", null, "M")) : null, h("button", {
+    }, pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")), h("button", {
       type: "button",
       id: "hold",
+      class: "ghost",
       "aria-keyshortcuts": "H",
       disabled: !pr || !canHold(pr) || busy("hold"),
       onclick: () => hold(selectedPr())
     }, "Hold ", h("kbd", null, "H")), h("button", {
       type: "button",
       id: "next",
+      class: "ghost",
       "aria-keyshortcuts": "N",
       disabled: !nextUp,
       title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review",
       onclick: () => next()
-    }, "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")), helpButton(() => setKeys(!showKeys), showKeys), pr?.url ? h("button", {
+    }, "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")), helpButton(() => setKeys(!showKeys), showKeys), h("span", {
+      class: "spacer"
+    }), pr?.url ? h("button", {
       type: "button",
       id: "github",
-      class: "link",
+      class: "ghost",
       onclick: () => openLink(pr.url).catch((e) => {
         notice = {
           text: e.message,
@@ -2166,7 +2305,7 @@ button.merge-quick { border-color: var(--color-text-success); }
         };
         render();
       })
-    }, "GitHub") : null), actionsGroup(v.actions, runAction, (a) => !pr || sent.has(`custom:${a.id}:${pr.number}`), actionsOpen, () => {
+    }, iconEl("external"), "GitHub") : null), actionsGroup(v.actions, runAction, (a) => !pr || sent.has(`custom:${a.id}:${pr.number}`), actionsOpen, () => {
       actionsOpen = !actionsOpen;
       render();
       document.getElementById("your-actions")?.focus();
@@ -2188,25 +2327,28 @@ button.merge-quick { border-color: var(--color-text-success); }
     const wins = quickWins(v.prs).length;
     const shown = groups.flatMap((g) => g.items);
     if (!shown.some((p) => p.number === selected)) selected = shown[0]?.number ?? null;
-    const counts = tally(v.prs);
+    const c = summary(v.prs);
     const now = Date.now();
-    const sortSelect = h("select", {
-      id: "sort",
+    const sortSeg = h("div", {
+      class: "mk-seg sort",
+      role: "group",
       "aria-label": "Sort"
-    });
-    for (const s of SORTS) sortSelect.append(h("option", {
-      value: s,
-      selected: s === sortNow()
-    }, SORT_LABELS[s]));
-    sortSelect.addEventListener("change", () => {
-      userSort = sortSelect.value;
-      render();
-    });
+    }, SORTS.map((x) => h("button", {
+      type: "button",
+      id: `sort-${x}`,
+      "aria-pressed": String(x === sortNow()),
+      onclick: () => {
+        userSort = x;
+        render();
+        document.getElementById(`sort-${x}`)?.focus();
+      }
+    }, SORT_LABELS[x])));
     const filterBox = h("input", {
       type: "search",
       id: "filter",
-      placeholder: "Filter  /",
-      "aria-label": "Filter PRs",
+      class: "mk-input",
+      placeholder: "Filter: title, author, label",
+      "aria-label": "Filter PRs (/)",
       autocomplete: "off"
     });
     filterBox.value = filter;
@@ -2214,25 +2356,38 @@ button.merge-quick { border-color: var(--color-text-success); }
       filter = filterBox.value;
       render();
     });
-    mount(root, h("header", {
-      class: "head"
-    }, h("h1", null, v.title ?? "Open pull requests"), h("p", {
-      class: "muted repo"
-    }, v.repo, " \xB7 ", `${counts.todo} to review`, counts.done ? ` \xB7 ${counts.done} decided` : "", counts.held ? ` \xB7 ${counts.held} held` : "")), warnings.length ? h("p", {
+    const head = h("header", {
+      class: "app-head head"
+    });
+    head.innerHTML = `<h1 class="mk-title" tabindex="-1"></h1>${v.takeaway ? `<p class="mk-takeaway">${rich(v.takeaway)}</p>` : ""}`;
+    head.querySelector("h1").append(v.title ?? "Open pull requests", " ", h("span", {
+      class: "mk-scope"
+    }, v.repo));
+    const dot = (n, what, color) => n ? h("span", {
+      style: `--c:${color}`
+    }, h("i"), h("b", null, String(n)), ` ${what}`) : null;
+    mount(root, head, h("p", {
+      class: "po-sum",
+      id: "counts"
+    }, h("span", null, h("b", null, String(c.open)), " open"), dot(c.quick, `quick win${c.quick === 1 ? "" : "s"}`, "var(--mk-accent)"), dot(c.failing, "failing checks", "var(--mk-bad)"), dot(c.review, "need review", "var(--mk-warn)"), dot(c.held, "held", "var(--mk-text-3)"), dot(c.merged, "merged", "var(--mk-good)")), warnings.length ? h("p", {
       class: "warnings"
     }, warnings.join("; ")) : null, h("div", {
-      class: "tools"
-    }, sortSelect, filterBox, wins || quickOnly ? h("button", {
+      class: "tools po-tools"
+    }, sortSeg, h("label", {
+      class: "mk-search"
+    }, iconEl("search"), filterBox, h("kbd", {
+      "aria-hidden": "true"
+    }, "/")), wins || quickOnly ? h("button", {
       type: "button",
       id: "quick-only",
-      class: `quick-toggle${quickOnly ? " on" : ""}`,
+      class: `sm qw quick-toggle${quickOnly ? " on" : ""}`,
       "aria-pressed": String(quickOnly),
       title: "Show only the quick wins: reviewed, small, green and low risk; each can be merged from here",
       onclick: () => {
         quickOnly = !quickOnly;
         render();
       }
-    }, `Quick wins (${wins})`) : null), v.prs.length === 0 ? h("p", {
+    }, iconEl("filter"), `Only quick wins (${wins})`) : null), v.prs.length === 0 ? h("p", {
       class: "empty muted"
     }, "No open pull requests.") : null, v.prs.length && !shown.length ? h("p", {
       class: "empty muted"
@@ -2245,7 +2400,7 @@ button.merge-quick { border-color: var(--color-text-success); }
       role: "group",
       "aria-labelledby": `group-${g.group}`
     }, h("h2", {
-      class: `group g-${g.group}`,
+      class: `group grp g-${g.group}`,
       id: `group-${g.group}`
     }, `${GROUP_LABELS[g.group]} (${g.items.length})`), g.items.map((p) => card(p, now))))) : null, actionBar());
     scrollTo(0, scroll);

@@ -3,12 +3,15 @@
 // synchronously from the click or key handler that caused it.
 import { openLink, sendEvent, startApp, typing } from "../shared/client.ts";
 import { h, mount, problems, reveal } from "../shared/dom.ts";
+import { iconEl } from "../../kit/icons.ts";
+import { avatarColor } from "../../kit/parts.ts";
+import { rich } from "../../kit/format.ts";
 import { Gate } from "../shared/confirm.ts";
 import { actionForKey, type CustomAction, customEvent, outwardTarget } from "../shared/actions.ts";
 import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
 import {
   age, arrange, canHold, followCurrent, GROUP_LABELS, holdEvent, type Item, nextEvent, nextPr, openEvent, type Overview, queue,
-  quickMergeBlocked, quickMergeEvent, quickTarget, quickWins, type Sort, SORT_LABELS, SORTS, size, tally, validateOverview,
+  quickMergeBlocked, quickMergeEvent, quickTarget, quickWins, type Sort, SORT_LABELS, SORTS, size, summary, validateOverview,
 } from "./logic.ts";
 import { mergeCommand } from "../shared/merge.ts";
 
@@ -56,7 +59,6 @@ function setKeys(on: boolean) {
 }
 
 const riskText = { high: ["High risk", "danger"], medium: ["Medium risk", "warning"], low: ["Low risk", "success"] } as const;
-const checksText = { passing: ["✓ Checks", "success"], failing: ["✕ Checks failing", "danger"], pending: ["● Checks pending", "warning"], none: ["No checks", "muted"] } as const;
 const reviewText = { APPROVED: ["Approved", "success"], CHANGES_REQUESTED: ["Changes requested", "danger"], REVIEW_REQUIRED: ["Review required", "muted"], NONE: ["No review", "muted"] } as const;
 const statusText = {
   new: ["", "muted"], ready: ["Review ready", "info"], reviewing: ["Reviewing", "info"], merging: ["Merging…", "info"], merged: ["Merged", "success"],
@@ -64,7 +66,6 @@ const statusText = {
   skipped: ["Skipped", "muted"], changes_requested: ["Changes requested", "warning"], failed: ["Failed", "danger"],
 } as const;
 
-function badge(text: string, tone: string, extra = "") { return h("span", { class: `badge ${tone} ${extra}`.trim() }, text); }
 
 function send(ev: { kind: string; text: string; data: object }, key: string, ok: string) {
   // Synchronous post inside the user's click or key handler.
@@ -207,38 +208,58 @@ function move(by: number) {
   select(list[i].number);
 }
 
+const KIT_TONE: Record<string, string> = { info: "accent", success: "good", warning: "warn", danger: "bad", muted: "plain" };
+function badge(text: string, tone: string, extra = "") { return h("span", { class: `mk-badge badge ${KIT_TONE[tone] ?? tone} ${extra}`.trim() }, text); }
+
+const checkIcon = { passing: ["check", "good", "Passing"], failing: ["x", "bad", "Failing"], pending: ["clock", "warn", "Pending"], none: ["minus", "plain", "No checks"] } as const;
+
+/** + and − in proportion, on a bar whose length grows with the size of the change. */
+function sizeBar(pr: Item) {
+  const add = pr.additions ?? 0, del = pr.deletions ?? 0, tot = add + del;
+  const w = Math.min(46, 8 + Math.log10(tot + 1) * 14);
+  return h("span", { class: "size ds2", title: `${size(pr)} lines changed` },
+    h("span", { class: "plus a" }, `+${add}`), h("span", { class: "minus d" }, `−${del}`),
+    tot ? h("span", { class: "bar", style: `width:${w.toFixed(0)}px`, "aria-hidden": "true" },
+      h("i", { class: "a", style: `width:${((add / tot) * 100).toFixed(1)}%` }), h("i", { class: "d", style: `width:${((del / tot) * 100).toFixed(1)}%` })) : null);
+}
+
 function card(pr: Item, now: number) {
   const st = statusText[pr.status];
   const sizeKnown = pr.additions !== undefined || pr.deletions !== undefined;
-  const meta = [
-    pr.author, age(pr.created, now),
-    sizeKnown ? h("span", { class: "size", title: `${size(pr)} lines changed` }, h("span", { class: "plus" }, `+${pr.additions ?? 0}`), " ", h("span", { class: "minus" }, `−${pr.deletions ?? 0}`)) : null,
-    pr.files !== undefined ? `${pr.files} file${pr.files === 1 ? "" : "s"}` : null,
-  ].filter(Boolean);
   const isSel = pr.number === selected;
+  const ck = pr.checks ? checkIcon[pr.checks] : null;
+  const quickReady = pr.quick_win && pr.status !== "merged" && pr.status !== "queued";
+  const mergeOff = quickReady ? quickMergeBlocked(pr, sent.has(`merge:${pr.number}`)) : null;
   return h("div", {
-    class: `card risk-${pr.risk ?? "none"}${isSel ? " selected" : ""}${pr.number === view!.current ? " current" : ""} g-${pr.status}`,
+    class: `card mk-card prc risk-${pr.risk ?? "none"}${isSel ? " selected" : ""}${pr.number === view!.current ? " current" : ""} g-${pr.status}`,
     id: `pr-${pr.number}`, role: "option", "aria-selected": String(isSel), tabindex: isSel ? 0 : -1,
     onclick: () => { if (selected !== pr.number) select(pr.number); },
     ondblclick: () => open(pr),
   },
-  h("div", { class: "top" },
-    h("span", { class: "num" }, `#${pr.number}`),
-    h("span", { class: "title" }, pr.title),
-    pr.number === view!.current ? badge("Now", "info", "now") : null,
-    st[0] ? badge(st[0], st[1], "status") : null),
-  h("div", { class: "meta muted" },
-    meta.flatMap((m, i) => i ? [" · ", m] : [m]),
-    pr.draft ? [" · ", h("span", { class: "draft" }, "Draft")] : null),
-  h("div", { class: "chips" },
-    pr.quick_win ? badge("Quick win", "success", "quick") : null,
-    pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1]) : null,
-    pr.checks ? badge(checksText[pr.checks][0], checksText[pr.checks][1]) : null,
-    pr.review ? badge(reviewText[pr.review][0], reviewText[pr.review][1]) : null,
-    pr.labels.map((l) => h("span", { class: "label" }, l))),
-  pr.verdict ? h("p", { class: "verdict-line" }, pr.verdict) : null,
-  pr.summary ? h("p", { class: "summary" }, pr.summary) : null,
-  pr.status_detail ? h("p", { class: "detail muted" }, pr.status_detail) : null);
+  h("div", { class: "h" },
+    pr.number === view!.current ? h("span", { class: "badge now" }, "Now") : null,
+    h("span", { class: "num no" }, `#${pr.number}`),
+    h("span", { class: "title tt" }, pr.title)),
+  h("div", { class: "bd" },
+    pr.quick_win ? h("span", { class: "mk-badge badge accent plain quick" }, iconEl("zap"), "Quick win") : null,
+    pr.risk ? badge(riskText[pr.risk][0], riskText[pr.risk][1], "risk") : null),
+  h("div", { class: "meta m" },
+    h("span", { class: "who" }, h("span", { class: "mk-avatar", style: `--a:${avatarColor(pr.author)}`, "aria-hidden": "true" }, pr.author[0]), pr.author),
+    pr.created !== undefined ? h("span", null, age(pr.created, now)) : null,
+    sizeKnown ? sizeBar(pr) : null,
+    pr.files !== undefined ? h("span", null, `${pr.files} file${pr.files === 1 ? "" : "s"}`) : null,
+    ck ? h("span", { class: `ck ${ck[1]}` }, iconEl(ck[0]), ck[2] === "Failing" ? "Checks failing" : ck[2]) : null,
+    pr.review ? h("span", null, reviewText[pr.review][0]) : null,
+    pr.draft ? h("span", { class: "draft" }, "Draft") : null,
+    pr.labels.map((l) => h("span", { class: "mk-chip label" }, l))),
+  pr.verdict || pr.summary ? h("p", { class: "s summary" }, pr.verdict ? h("b", { class: "verdict-line" }, pr.verdict, " ") : null, pr.summary ?? "") : null,
+  quickReady || st[0] || pr.status_detail ? h("div", { class: "st" },
+    st[0] ? badge(st[0], st[1], "status") : null,
+    pr.status_detail ? h("span", { class: "detail" }, pr.status_detail) : null,
+    quickReady && pr.head_sha ? h("span", { class: "reviewed" }, iconEl("check"), `Reviewed at ${pr.head_sha.slice(0, 7)}, ${pr.merge_method_default}${pr.delete_branch_default ? ", delete branch" : ""}`) : null,
+    quickReady ? h("button", { type: "button", id: `merge-${pr.number}`, class: "sm primary merge-quick", "aria-keyshortcuts": "M", disabled: !!mergeOff || !!merging,
+      title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`, onclick: (e: Event) => { e.stopPropagation(); if (selected !== pr.number) select(pr.number, false); openMerge(pr); } },
+    iconEl("merge"), `Merge #${pr.number}`, h("kbd", null, "M")) : null) : null);
 }
 
 function actionBar() {
@@ -246,7 +267,6 @@ function actionBar() {
   const pr = selectedPr();
   const nextUp = nextPr(ordered(), v.current);
   const busy = (k: string) => !!pr && sent.has(`${k}:${pr.number}`);
-  const mergeOff = pr ? quickMergeBlocked(pr, busy("merge")) : "Select a PR first.";
   return h("div", { class: `actions${outward || merging || showKeys ? " has-drawer" : ""}` },
     showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null,
     outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelConfirm()) : null,
@@ -255,13 +275,12 @@ function actionBar() {
     h("div", { class: "row bar" },
       h("button", { type: "button", id: "open", class: "primary", "aria-keyshortcuts": "Enter O", disabled: !pr || busy("open"), onclick: () => open(selectedPr()) },
         pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")),
-      pr?.quick_win ? h("button", { type: "button", id: "merge", class: "merge-quick", "aria-keyshortcuts": "M", disabled: !!mergeOff || !!merging,
-        title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`, onclick: () => openMerge(selectedPr()) }, `Merge #${pr.number}`, " ", h("kbd", null, "M")) : null,
-      h("button", { type: "button", id: "hold", "aria-keyshortcuts": "H", disabled: !pr || !canHold(pr) || busy("hold"), onclick: () => hold(selectedPr()) }, "Hold ", h("kbd", null, "H")),
-      h("button", { type: "button", id: "next", "aria-keyshortcuts": "N", disabled: !nextUp, title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review", onclick: () => next() },
+      h("button", { type: "button", id: "hold", class: "ghost", "aria-keyshortcuts": "H", disabled: !pr || !canHold(pr) || busy("hold"), onclick: () => hold(selectedPr()) }, "Hold ", h("kbd", null, "H")),
+      h("button", { type: "button", id: "next", class: "ghost", "aria-keyshortcuts": "N", disabled: !nextUp, title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review", onclick: () => next() },
         "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")),
       helpButton(() => setKeys(!showKeys), showKeys),
-      pr?.url ? h("button", { type: "button", id: "github", class: "link", onclick: () => openLink(pr.url!).catch((e) => { notice = { text: e.message, tone: "danger" }; render(); }) }, "GitHub") : null),
+      h("span", { class: "spacer" }),
+      pr?.url ? h("button", { type: "button", id: "github", class: "ghost", onclick: () => openLink(pr.url!).catch((e) => { notice = { text: e.message, tone: "danger" }; render(); }) }, iconEl("external"), "GitHub") : null),
     actionsGroup(v.actions, runAction, (a) => !pr || sent.has(`custom:${a.id}:${pr.number}`), actionsOpen,
       () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); }),
     h("p", { class: "keys muted small" }, `J/K move · Enter open${quickWins(v.prs).length ? " · M merge a quick win" : ""} · H hold · N next · / filter · ? keys`));
@@ -278,30 +297,39 @@ function render() {
   const wins = quickWins(v.prs).length;
   const shown = groups.flatMap((g) => g.items);
   if (!shown.some((p) => p.number === selected)) selected = shown[0]?.number ?? null;
-  const counts = tally(v.prs);
+  const c = summary(v.prs);
   const now = Date.now();
-  const sortSelect = h("select", { id: "sort", "aria-label": "Sort" }) as HTMLSelectElement;
-  for (const s of SORTS) sortSelect.append(h("option", { value: s, selected: s === sortNow() }, SORT_LABELS[s]));
-  sortSelect.addEventListener("change", () => { userSort = sortSelect.value as Sort; render(); });
-  const filterBox = h("input", { type: "search", id: "filter", placeholder: "Filter  /", "aria-label": "Filter PRs", autocomplete: "off" }) as HTMLInputElement;
+  const sortSeg = h("div", { class: "mk-seg sort", role: "group", "aria-label": "Sort" }, SORTS.map((x) => h("button", {
+    type: "button", id: `sort-${x}`, "aria-pressed": String(x === sortNow()), onclick: () => { userSort = x; render(); document.getElementById(`sort-${x}`)?.focus(); },
+  }, SORT_LABELS[x])));
+  const filterBox = h("input", { type: "search", id: "filter", class: "mk-input", placeholder: "Filter: title, author, label", "aria-label": "Filter PRs (/)", autocomplete: "off" }) as HTMLInputElement;
   filterBox.value = filter;
   filterBox.addEventListener("input", () => { filter = filterBox.value; render(); });
+  const head = h("header", { class: "app-head head" });
+  head.innerHTML = `<h1 class="mk-title" tabindex="-1"></h1>${v.takeaway ? `<p class="mk-takeaway">${rich(v.takeaway)}</p>` : ""}`;
+  head.querySelector("h1")!.append(v.title ?? "Open pull requests", " ", h("span", { class: "mk-scope" }, v.repo));
+  const dot = (n: number, what: string, color: string) => n ? h("span", { style: `--c:${color}` }, h("i"), h("b", null, String(n)), ` ${what}`) : null;
 
   mount(root,
-    h("header", { class: "head" },
-      h("h1", null, v.title ?? "Open pull requests"),
-      h("p", { class: "muted repo" }, v.repo, " · ",
-        `${counts.todo} to review`, counts.done ? ` · ${counts.done} decided` : "", counts.held ? ` · ${counts.held} held` : "")),
+    head,
+    h("p", { class: "po-sum", id: "counts" },
+      h("span", null, h("b", null, String(c.open)), " open"),
+      dot(c.quick, `quick win${c.quick === 1 ? "" : "s"}`, "var(--mk-accent)"),
+      dot(c.failing, "failing checks", "var(--mk-bad)"),
+      dot(c.review, "need review", "var(--mk-warn)"),
+      dot(c.held, "held", "var(--mk-text-3)"),
+      dot(c.merged, "merged", "var(--mk-good)")),
     warnings.length ? h("p", { class: "warnings" }, warnings.join("; ")) : null,
-    h("div", { class: "tools" }, sortSelect, filterBox,
-      wins || quickOnly ? h("button", { type: "button", id: "quick-only", class: `quick-toggle${quickOnly ? " on" : ""}`, "aria-pressed": String(quickOnly),
+    h("div", { class: "tools po-tools" }, sortSeg,
+      h("label", { class: "mk-search" }, iconEl("search"), filterBox, h("kbd", { "aria-hidden": "true" }, "/")),
+      wins || quickOnly ? h("button", { type: "button", id: "quick-only", class: `sm qw quick-toggle${quickOnly ? " on" : ""}`, "aria-pressed": String(quickOnly),
         title: "Show only the quick wins: reviewed, small, green and low risk; each can be merged from here",
-        onclick: () => { quickOnly = !quickOnly; render(); } }, `Quick wins (${wins})`) : null),
+        onclick: () => { quickOnly = !quickOnly; render(); } }, iconEl("filter"), `Only quick wins (${wins})`) : null),
     v.prs.length === 0 ? h("p", { class: "empty muted" }, "No open pull requests.") : null,
     v.prs.length && !shown.length ? h("p", { class: "empty muted" }, quickOnly && !filter ? "No quick wins right now." : `No PR matches “${filter}”.`) : null,
     shown.length ? h("div", { class: "list", role: "listbox", "aria-label": "Pull requests", "aria-activedescendant": selected ? `pr-${selected}` : null },
       groups.map((g) => h("div", { role: "group", "aria-labelledby": `group-${g.group}` },
-        h("h2", { class: `group g-${g.group}`, id: `group-${g.group}` }, `${GROUP_LABELS[g.group]} (${g.items.length})`),
+        h("h2", { class: `group grp g-${g.group}`, id: `group-${g.group}` }, `${GROUP_LABELS[g.group]} (${g.items.length})`),
         g.items.map((p) => card(p, now))))) : null,
     actionBar(),
   );

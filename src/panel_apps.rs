@@ -470,6 +470,7 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
     let repo = text(o, app, "repo")?;
     ensure!(repo_ok(repo), "pr_overview `repo` must be owner/name (got {repo:?})");
     opt_text(o, app, "title", 200)?;
+    opt_text(o, app, "takeaway", 600)?;
     let prs = field(o, app, "prs")?.as_array().context("pr_overview `prs` must be an array")?;
     ensure!(prs.len() <= 200, "pr_overview `prs` has {} PRs; at most 200", prs.len());
     let mut numbers = Vec::with_capacity(prs.len());
@@ -879,6 +880,8 @@ mod tests {
     fn overview_and_actions_are_checked_naming_the_field() {
         check_overview(&overview_sample()).unwrap();
         check_overview(&json!({"repo":"a/b","prs":[]})).unwrap();
+        check_overview(&json!({"repo":"a/b","prs":[],"takeaway":"Six open. **One** is a quick win."})).unwrap();
+        assert!(check_overview(&json!({"repo":"a/b","prs":[],"takeaway":"x".repeat(601)})).unwrap_err().to_string().contains("`takeaway` is longer than 600"));
         let with = |f: &dyn Fn(&mut Value)| { let mut d = overview_sample(); f(&mut d); d };
         for (data, why) in [
             (with(&|d| d["repo"] = json!("acme")), "`repo` must be owner/name"),

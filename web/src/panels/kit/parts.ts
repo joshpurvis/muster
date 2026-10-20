@@ -7,6 +7,15 @@ export const nid = (p: string) => `mk-${p}${++uid}`;
 /** The n-th categorical series colour (8 hues, then they repeat). */
 export const seriesColor = (i: number) => `var(--mk-c${(i % 8) + 1})`;
 
+/** Avatar fills: each keeps white letters at 4.5:1 or more (kit_css_test.ts checks them). */
+export const AVATARS = ["#a65a1f", "#2f69b8", "#22795f", "#7a4bc2", "#b0365e", "#4f6a12", "#0e6f86", "#8a4a86"];
+/** The same person always gets the same colour. */
+export function avatarColor(name: string): string {
+  let n = 0;
+  for (const ch of name.toLowerCase()) n = (n * 31 + ch.codePointAt(0)!) >>> 0;
+  return AVATARS[n % AVATARS.length];
+}
+
 export interface SparkOptions { width?: number; height?: number; color?: string; area?: boolean }
 
 /** A sparkline; fewer than two numbers draw nothing. */

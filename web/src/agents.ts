@@ -71,6 +71,25 @@ export function nameError(name: string, taken: string[]): string | null {
   return null;
 }
 
+/** The Model / Effort selects' entry for a typed value (a custom model id, an unknown level). Never
+ * a real value: those are trimmed and have no spaces (src/agents.rs `agent_args`). */
+export const CUSTOM = " custom";
+
+/** Which entry a Model or Effort select shows: "" (Default) for no value, the value itself when
+ * it is listed, else CUSTOM, as when the person chose "Custom…" (`typing`). A stored value the
+ * list doesn't know is kept and shown as custom, never dropped. */
+export function choiceOf(value: string, listed: string[], typing: boolean): string {
+  const v = value.trim();
+  if (typing) return CUSTOM;
+  if (!v) return "";
+  return listed.includes(v) ? v : CUSTOM;
+}
+
+/** Switching an agent's kind keeps a model or effort only when the new kind lists it. */
+export function keepForKind(value: string, listed: string[]): string {
+  return listed.includes(value.trim()) ? value : "";
+}
+
 /** A memory file path the daemon accepts: relative, plain parts (no `..`, `.` or empty parts). */
 export function memoryPathError(path: string): string | null {
   const p = path.trim();

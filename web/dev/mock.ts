@@ -539,6 +539,22 @@ interface MockAgent {
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
+// A short copy of `agent.models` (the real lists live in src/agents.rs `model_catalog`).
+const AGENT_MODELS = {
+  claude: {
+    models: [
+      { id: "fable", note: "latest Fable" },
+      { id: "opus", note: "latest Opus" },
+      { id: "sonnet", note: "latest Sonnet" },
+      { id: "haiku", note: "latest Haiku" },
+    ],
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  codex: {
+    models: [{ id: "gpt-6.1-sol", note: null }, { id: "gpt-6-luna", note: null }],
+    efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+  },
+};
 const AGENT_TEMPLATES = [
   {
     id: "blank",
@@ -755,6 +771,8 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       return agentList.map(agentJson);
     case "agent.templates":
       return AGENT_TEMPLATES;
+    case "agent.models":
+      return AGENT_MODELS;
     case "agent.create": {
       const a = newAgent(p);
       broadcast("agent_upserted", agentJson(a));

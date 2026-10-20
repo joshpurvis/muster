@@ -1711,6 +1711,58 @@ pub fn messages(hub: &Hub, agent: Option<&str>, before: Option<i64>, limit: Opti
     Ok(json!({ "messages": ms.iter().map(message_json).collect::<Vec<_>>(), "more": more }))
 }
 
+// ----- models and efforts -----
+
+/// One model the New / Edit agent dialog offers: the value passed to the CLI, and a short note.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelChoice {
+    pub id: &'static str,
+    pub note: Option<&'static str>,
+}
+
+/// What the dialog offers for one CLI (`agent.models`). Anything else can still be typed in its
+/// Custom field: these are suggestions, never a limit (`agent_args` only checks the shape).
+#[derive(Debug, Clone, Serialize)]
+pub struct KindModels {
+    pub models: Vec<ModelChoice>,
+    pub efforts: Vec<&'static str>,
+}
+
+/// The curated model and effort lists, kept here and nowhere else (the web UI only renders
+/// them). Neither CLI has a stable, documented, offline way to list models, so they are kept by
+/// hand. To update them:
+/// - Claude Code: the aliases `claude --help` names under `--model` (plus `haiku` and
+///   `opusplan`), and the levels it lists under `--effort`.
+/// - Codex: the slugs with `"visibility": "list"` in `codex debug models` (a debug command
+///   printing the CLI's cached catalog: fine for a person to read, not for Muster to depend on),
+///   and the union of their `supported_reasoning_levels`.
+pub fn model_catalog() -> Value {
+    let m = |id, note| ModelChoice { id, note };
+    let claude = KindModels {
+        models: vec![
+            m("fable", Some("latest Fable")),
+            m("opus", Some("latest Opus")),
+            m("sonnet", Some("latest Sonnet")),
+            m("haiku", Some("latest Haiku")),
+            m("opusplan", Some("Opus to plan, Sonnet to work")),
+        ],
+        efforts: vec!["low", "medium", "high", "xhigh", "max"],
+    };
+    let codex = KindModels {
+        models: vec![
+            m("gpt-6.1-sol", None),
+            m("gpt-6-astra", None),
+            m("gpt-6-sol", None),
+            m("gpt-6-luna", None),
+            m("gpt-5.6-sol", None),
+            m("gpt-5.6-terra", None),
+            m("gpt-5.6-luna", None),
+        ],
+        efforts: vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+    };
+    json!({ "claude": claude, "codex": codex })
+}
+
 // ----- templates -----
 
 /// A starting point for the New agent dialog (`agent.templates`): every field it prefills.
@@ -2621,6 +2673,31 @@ mod tests {
         let l = memory_list(&a).unwrap();
         assert!(l["files"].as_array().unwrap().iter().all(|f| f["path"] != "link.md"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_model_catalog_is_what_the_clis_accept() {
+        let c = model_catalog();
+        for (key, kind) in [("claude", SessionKind::Claude), ("codex", SessionKind::Codex)] {
+            let models: Vec<&str> = c[key]["models"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+            let efforts: Vec<&str> = c[key]["efforts"].as_array().unwrap().iter().map(|e| e.as_str().unwrap()).collect();
+            assert!(!models.is_empty() && !efforts.is_empty(), "{key}");
+            for v in models.iter().chain(&efforts) {
+                assert!(agent_args(kind, Some(v), Some(v), None).is_ok(), "{key}: {v}");
+            }
+            let unique: HashSet<&&str> = models.iter().chain(&efforts).collect();
+            assert_eq!(unique.len(), models.len() + efforts.len(), "{key}: no duplicates");
+        }
+        // The templates only pick what the dialog lists.
+        for t in templates() {
+            let key = if t.kind == SessionKind::Claude { "claude" } else { "codex" };
+            if let Some(m) = t.model {
+                assert!(c[key]["models"].as_array().unwrap().iter().any(|x| x["id"] == m), "{}", t.id);
+            }
+            if let Some(e) = t.effort {
+                assert!(c[key]["efforts"].as_array().unwrap().iter().any(|x| x == e), "{}", t.id);
+            }
+        }
     }
 
     #[test]

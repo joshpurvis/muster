@@ -2,7 +2,7 @@
 // agent dialog with its Memory tab, and the message overlay. Talking to an agent happens in its
 // own terminal tab; the panel only starts, finds and configures agents.
 import type { ComponentChildren } from "preact";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import {
   agentFilter,
@@ -21,15 +21,26 @@ import * as A from "../actions.ts";
 import {
   agentStatus,
   ago,
+  choiceOf,
+  CUSTOM,
   feedFor,
   firstLine,
+  keepForKind,
   memoryPathError,
   nameError,
   UNATTENDED_WARNING,
   unattendedWarning,
   upsertMessage,
 } from "../agents.ts";
-import type { Agent, AgentMessage, AgentTemplate, Origin, Permissions, ProfileChoice } from "../types.ts";
+import type {
+  Agent,
+  AgentMessage,
+  AgentTemplate,
+  ModelCatalog,
+  Origin,
+  Permissions,
+  ProfileChoice,
+} from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
 import { openMenu } from "./Menu.tsx";
@@ -38,6 +49,7 @@ import { ProfileSelect } from "./AccountProfiles.tsx";
 import {
   IconAgents,
   IconChevron,
+  IconChevronDown,
   IconCodex,
   IconMore,
   IconPlus,
@@ -309,10 +321,74 @@ const ORIGINS: { o: Origin; label: string; hint: string }[] = [
   { o: "webhook", label: "Webhook", hint: "an outside trigger" },
 ];
 
-const EFFORTS: Record<Agent["kind"], string[]> = {
-  claude: ["low", "medium", "high", "max"],
-  codex: ["minimal", "low", "medium", "high", "xhigh"],
-};
+/** One entry of a Model or Effort select. */
+interface Pick {
+  value: string;
+  label: string;
+}
+
+/** Model and Effort: Default, the CLI's list (`agent.models`) and "Custom…", which shows a text
+ * field for anything else (a full model id, a level the list doesn't have yet). A stored value
+ * the list doesn't know shows as custom. Keyed by kind and template, so switching either forgets
+ * "Custom…". */
+function PickField(
+  { label, value, picks, customLabel, placeholder, onChange }: {
+    label: string;
+    value: string;
+    picks: Pick[];
+    customLabel: string;
+    placeholder: string;
+    onChange: (v: string) => void;
+  },
+) {
+  const id = useId();
+  const [typing, setTyping] = useState(false);
+  const typed = useRef<HTMLInputElement>(null);
+  const choice = choiceOf(value, picks.map((p) => p.value), typing);
+  useEffect(() => {
+    // The current value stays until you type over it.
+    if (typing) {
+      typed.current?.focus();
+      typed.current?.select();
+    }
+  }, [typing]);
+  return (
+    <div class="field">
+      <label class="field-label" for={id}>{label}</label>
+      <span class="select-wrap">
+        <select
+          id={id}
+          value={choice}
+          onChange={(e) => {
+            const v = e.currentTarget.value;
+            setTyping(v === CUSTOM);
+            if (v !== CUSTOM) onChange(v);
+          }}
+        >
+          <option value="">Default (the CLI's choice)</option>
+          {picks.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+          <option value={CUSTOM}>Custom…</option>
+        </select>
+        <IconChevronDown size={14} />
+      </span>
+      {choice === CUSTOM && (
+        <input
+          ref={typed}
+          value={value}
+          aria-label={customLabel}
+          placeholder={placeholder}
+          spellcheck={false}
+          onInput={(e) => onChange((e.target as HTMLInputElement).value)}
+        />
+      )}
+    </div>
+  );
+}
+
+const modelPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
+  (c?.[kind].models ?? []).map((m) => ({ value: m.id, label: m.note ? `${m.id} · ${m.note}` : m.id }));
+const effortPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
+  (c?.[kind].efforts ?? []).map((e) => ({ value: e, label: e }));
 
 interface Draft {
   account_profile: ProfileChoice;
@@ -367,6 +443,7 @@ const BLANK: Draft = {
 };
 
 let templateCache: AgentTemplate[] | null = null;
+let catalogCache: ModelCatalog | null = null;
 
 export function AgentDialog(
   { name, tab: tabInit, Modal, close }: {
@@ -380,6 +457,7 @@ export function AgentDialog(
   const agent = editing ? agents.value.find((a) => a.name === name) : undefined;
   const [tab, setTab] = useState<"settings" | "memory">(editing ? tabInit ?? "settings" : "settings");
   const [templates, setTemplates] = useState<AgentTemplate[]>(templateCache ?? []);
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(catalogCache);
   const [tpl, setTpl] = useState("blank");
   const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : BLANK);
   const [nameTouched, setNameTouched] = useState(false);
@@ -400,12 +478,28 @@ export function AgentDialog(
       setTemplates(t);
     }).catch(() => {});
   }, []);
+  // Daemons without `agent.models` leave only Default and Custom… in the selects.
+  useEffect(() => {
+    if (catalogCache) return;
+    rpc.call<ModelCatalog>("agent.models").then((c) => {
+      catalogCache = c;
+      setCatalog(c);
+    }).catch(() => {});
+  }, []);
   useLayoutEffect(() => {
     if (!editing) nameRef.current?.focus();
   }, []);
 
   if (editing && !agent) return null;
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }));
+  /** A model or effort the new kind doesn't list goes back to Default. */
+  const setKind = (k: Agent["kind"]) =>
+    setD((x) => ({
+      ...x,
+      kind: k,
+      model: keepForKind(x.model, modelPicks(catalog, k).map((p) => p.value)),
+      effort: keepForKind(x.effort, catalog?.[k].efforts ?? []),
+    }));
   const pick = (t: AgentTemplate) => {
     setTpl(t.id);
     const next = fromTemplate(t);
@@ -587,7 +681,7 @@ export function AgentDialog(
                         role="radio"
                         aria-checked={d.kind === k}
                         class={cx("seg-btn", d.kind === k && "on")}
-                        onClick={() => set({ kind: k })}
+                        onClick={() => setKind(k)}
                       >
                         {k === "claude" ? <IconSpark size={13} /> : <IconCodex size={13} />} {KIND_LABEL[k]}
                       </button>
@@ -601,32 +695,24 @@ export function AgentDialog(
               {editing && <span class="field-hint">This agent keeps its profile and conversation together. Create a new agent to use another profile.</span>}
             </>}
             <div class="field-row">
-              <label class="field">
-                <span class="field-label">
-                  Model <span class="muted">(optional)</span>
-                </span>
-                <input
-                  value={d.model}
-                  placeholder={d.kind === "claude" ? "the CLI's default, e.g. opus" : "the CLI's default"}
-                  spellcheck={false}
-                  onInput={(e) => set({ model: (e.target as HTMLInputElement).value })}
-                />
-              </label>
-              <label class="field">
-                <span class="field-label">
-                  Effort <span class="muted">(optional)</span>
-                </span>
-                <input
-                  value={d.effort}
-                  list={`efforts-${d.kind}`}
-                  placeholder="the CLI's default"
-                  spellcheck={false}
-                  onInput={(e) => set({ effort: (e.target as HTMLInputElement).value })}
-                />
-                <datalist id={`efforts-${d.kind}`}>
-                  {EFFORTS[d.kind].map((e) => <option key={e} value={e} />)}
-                </datalist>
-              </label>
+              <PickField
+                key={`model-${d.kind}-${tpl}`}
+                label="Model"
+                value={d.model}
+                picks={modelPicks(catalog, d.kind)}
+                customLabel="Custom model"
+                placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
+                onChange={(model) => set({ model })}
+              />
+              <PickField
+                key={`effort-${d.kind}-${tpl}`}
+                label="Effort"
+                value={d.effort}
+                picks={effortPicks(catalog, d.kind)}
+                customLabel="Custom effort"
+                placeholder="a level the CLI accepts"
+                onChange={(effort) => set({ effort })}
+              />
             </div>
             <label class="field">
               <span class="field-label">Persona</span>

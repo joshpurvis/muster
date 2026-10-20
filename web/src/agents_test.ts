@@ -1,8 +1,11 @@
 import {
   agentStatus,
   ago,
+  choiceOf,
+  CUSTOM,
   feedFor,
   firstLine,
+  keepForKind,
   memoryPathError,
   nameError,
   unattendedWarning,
@@ -123,4 +126,23 @@ Deno.test("dialog rules: names, memory paths, the unattended warning", () => {
   assertEquals(unattendedWarning("claude", ["human"]), false);
   assertEquals(unattendedWarning("claude", ["human", "schedule"]), true);
   assertEquals(unattendedWarning("codex", ["webhook"]), false);
+});
+
+Deno.test("model and effort selects: Default, listed, custom; a kind switch drops what it doesn't list", () => {
+  const listed = ["opus", "sonnet"];
+  assertEquals(choiceOf("", listed, false), "");
+  assertEquals(choiceOf("  ", listed, false), "");
+  assertEquals(choiceOf("opus", listed, false), "opus");
+  assertEquals(choiceOf(" opus ", listed, false), "opus");
+  // A stored value the list doesn't know stays, shown as custom.
+  assertEquals(choiceOf("claude-opus-5-5", listed, false), CUSTOM);
+  assertEquals(choiceOf("anything", [], false), CUSTOM);
+  // "Custom…" picked: custom even while empty or matching a listed id.
+  assertEquals(choiceOf("", listed, true), CUSTOM);
+  assertEquals(choiceOf("opus", listed, true), CUSTOM);
+  assertEquals(CUSTOM !== CUSTOM.trim(), true, "never a real (trimmed) value");
+  assertEquals(keepForKind("high", ["low", "high"]), "high");
+  assertEquals(keepForKind("max", ["low", "high"]), "");
+  assertEquals(keepForKind("opus", ["gpt-6.1-sol"]), "");
+  assertEquals(keepForKind("", ["low"]), "");
 });

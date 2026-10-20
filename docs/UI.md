@@ -308,8 +308,11 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the template's one-line description; picking one fills every field
   (a name you typed is kept). Name and kind (Claude · Codex).
-- Model and effort (optional, effort suggests the CLI's levels), persona (monospace textarea,
-  written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook checkboxes,
+- Model and Effort dropdowns for the agent's kind (`agent.models`): Default (the CLI's
+  choice), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
+  Custom…, which shows a text field for any other value. A saved value the list doesn't have
+  shows as Custom with its text. Switching kind puts a model or level the new kind doesn't list
+  back to Default. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook checkboxes,
   at least one), the Permissions section showing only the control for the agent's kind, and an
   Autostart toggle.
 - Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are

@@ -806,6 +806,49 @@ try {
       await a.eval(`document.querySelector('.agent-dlg .persona-input').value.includes('plan mode')`),
       "the template prefilled the persona",
     );
+    // Model and Effort are selects: the CLI's list, Default, and Custom… for anything else.
+    const selOf = (label: string) =>
+      `document.getElementById([...document.querySelectorAll('.agent-dlg label.field-label')]` +
+      `.find((l) => l.textContent === '${label}').htmlFor)`;
+    const [ms, es] = [selOf("Model"), selOf("Effort")];
+    const choose = (sel: string, value: string) =>
+      a.eval(`(() => { const s = ${sel}; s.value = ${JSON.stringify(value)};
+        s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+    await a.wait(`${ms}.options.length > 2`, 2000);
+    const levels = await a.eval(`[...${es}.options].map((o) => o.textContent).join()`);
+    check(
+      levels === "Default (the CLI's choice),low,medium,high,xhigh,max,Custom…",
+      `Effort lists ${levels}`,
+    );
+    await choose(ms, "opus");
+    await choose(es, "xhigh");
+    await shot(a, "10a-new-agent-models");
+    await choose(ms, " custom");
+    await a.wait(`document.activeElement?.getAttribute('aria-label') === 'Custom model'`, 1000);
+    await a.type("claude-opus-5-5");
+    check(
+      await a.eval(`document.querySelector('[aria-label="Custom model"]').value === 'claude-opus-5-5'`),
+      "the custom field started from opus, selected, so typing replaced it",
+    );
+    await shot(a, "10b-new-agent-custom-model");
+    // Switching to Codex: the custom model goes back to Default; a level Codex also lists stays.
+    const kindBtn = (k: string) =>
+      `[...document.querySelectorAll('.agent-dlg .seg-btn')].find((b) => b.textContent.includes('${k}'))`;
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(`${ms}.value === '' && ${es}.value === 'xhigh'`) &&
+        await a.eval(`!document.querySelector('[aria-label="Custom model"]')`),
+      "switching to Codex reset the custom model and kept a level Codex has",
+    );
+    await a.eval(`${kindBtn("Claude")}.click()`);
+    await a.sleep(100);
+    await choose(ms, "sonnet");
+    await choose(es, "");
+    // An eval'd click doesn't move focus (the custom field it removed had it): Ctrl+Enter below
+    // goes from the Model select, as after a real pick.
+    await a.eval(`${ms}.focus()`);
+    ok("Model and Effort: dropdowns per CLI, Custom… for other ids, a kind switch resets what doesn't fit");
     check(await a.eval(`!document.querySelector('.agent-warn')`), "no warning for human-only");
     await a.eval(
       `[...document.querySelectorAll('.agent-dlg .check')].find((l) => l.textContent.includes('Schedule')).querySelector('input').click()`,
@@ -829,8 +872,9 @@ try {
     );
     const made: any = (await R(a, "agent.list", {})).find((x: any) => x.name === "researcher");
     check(
-      made && made.permissions.claude_mode === "plan" && made.accepts_origins.join() === "human",
-      "created as the template says",
+      made && made.permissions.claude_mode === "plan" && made.accepts_origins.join() === "human" &&
+        made.model === "sonnet" && made.effort === null,
+      "created as the template says, with the chosen model and the default effort",
     );
     ok("New agent: the Researcher template prefilled the dialog; schedule on a Claude agent warns; created");
 

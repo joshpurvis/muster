@@ -4,7 +4,7 @@ Muster is a Linux desktop app for running several coding agents at once. Claude 
 plain shells run side by side in real terminals, and Muster shows you which of them is waiting
 for you.
 
-![A Muster window split into three groups: a Claude agent fixing a checkout bug, a Codex agent asking to run tests with an Approve button above its terminal, a shell showing the test run, and a table of flaky tests that an agent opened in a panel](docs/screenshots/hero.png)
+![A Muster window split into three groups: a Claude agent fixing a checkout bug, a Codex agent asking to run tests with an Approve button above its terminal, a shell showing the test run, and a panel an agent opened with a table of flaky tests, its finding in one line above the table, failure counts drawn as bars and a status badge on each test](docs/screenshots/hero.png)
 
 It is for people who hand work to agents and keep three or four of them busy: one fixing a bug,
 one writing a guide, one reviewing a pull request. With ordinary terminal tabs you keep cycling
@@ -26,25 +26,26 @@ key press away, and the terminals keep running when the window closes.
 - **Jump to anything.** Ctrl+Space searches every tab, panel, named agent and recent folder in
   every window. Agents that need you come first.
 
-  ![The Jump list open over the window: the Codex agent waiting for approval and the Claude agent asking which install method to document are listed first, followed by working and idle tabs, panels, named agents and folders](docs/screenshots/jump.png)
+  ![The Jump list open over the window: the Codex agent waiting for approval and the Claude agent asking which install method to document are listed first, followed by the working and idle tabs and the panels from every window](docs/screenshots/jump.png)
 
 - **Terminals that outlive the window.** A separate terminal host owns the processes. Close the
   window, reload the UI or restart the backend, and every agent keeps running; reopen and the
   scrollback replays.
-- **Panels beside the agent.** Agents can open Markdown, images, charts, tables and pull request
-  decisions next to their terminal, and you answer with a click. In a PR decision panel you see
+- **Panels beside the agent.** Agents can open Markdown, images, charts, tables, dashboards,
+  pull request decisions and pages of their own next to their terminal, and you answer with a
+  click ([examples below](#panels-agents-can-build)). In a PR decision panel you see
   the agent's verdict, how to undo the change, the risk, the checks and the questions it has for
   you, then merge, request changes or ask. The agent merges only after you press Merge and
   confirm.
   `muster skills install` teaches Claude Code and Codex how to use panels.
 
-  ![An agent's terminal on the left; on the right a PR decision panel for "Rate-limit failed logins per IP" with the verdict "Safe to merge", the risk, passing checks, a question for the reviewer, and Merge, Request changes, Ask, Skip and Hold buttons](docs/screenshots/pr-decision.png)
+  ![An agent's terminal on the left; on the right a PR decision panel for "Rate-limit failed logins per IP" with the verdict "Safe to merge: it slows down people guessing passwords, and the tests pass", a note that an approving review is still required, cards for the risk, the passing checks and the reviews, a plain summary of what changed, and Merge, Request changes, Ask, Skip and Hold buttons](docs/screenshots/pr-decision.png)
 
 - **Named agents that remember.** Give an agent a name, a persona and a folder of memory files,
   and it resumes its conversation each time you start it. The agents panel (Alt+G) starts them,
   edits their persona and memory, and shows the messages agents send each other.
 
-  ![The agents panel on the left listing four named agents with their states and the messages between them, a Claude agent's terminal in the middle, and a bar chart of CI minutes per day in a panel on the right](docs/screenshots/agents-chart.png)
+  ![The agents panel on the left listing four named agents with their states and the messages between them, a Claude agent's terminal in the middle, and a panel on the right with a bar chart of CI minutes per day, master builds against PR builds, under the agent's one-line finding and three headline numbers](docs/screenshots/agents-chart.png)
 
 - **Agents that drive other agents.** Every agent gets Muster's MCP tools: it can list sessions,
   start a helper, send it a prompt, wait for it to finish and read its screen. The `muster` CLI
@@ -53,6 +54,54 @@ key press away, and the terminals keep running when the window closes.
   approve or deny, send a prompt and watch a terminal.
 
   <img src="docs/screenshots/phone.png" width="300" alt="The phone view: a list of sessions with the two that need you at the top, the Codex agent with Approve and Deny buttons and the Claude agent showing its question">
+
+## Panels agents can build
+
+A panel is a small page an agent opens beside its terminal. Every built-in kind leads with what
+the agent found, in one sentence, then shows the evidence. The agent sends data, not code, and
+Muster draws it. Each picture below is one panel, drawn from what an agent sent.
+
+**A dashboard from plain JSON.** A board holds headline numbers, charts, lists, budget meters, a
+warning and buttons. A click on a button goes back to the agent as a message.
+
+![A Cloud costs board: "$4,480 spent so far this month" with the agent's finding that spend is on track to finish 6% under budget, four headline numbers, a stacked bar chart of spend per week by service, a list of services with bars, budget meters with a tick for where spend should be today, a warning that Postgres is ahead of pace, and buttons "Why did Postgres grow?" and "Export CSV"](docs/screenshots/board-costs.png)
+
+That board is about this much JSON, trimmed here to one item per block:
+
+```json
+{
+  "app": "board",
+  "title": "Cloud costs",
+  "data": {
+    "title": "$4,480 spent so far this month",
+    "takeaway": "On track to finish about 6% under the $7,400 budget.",
+    "blocks": [
+      { "kind": "stats", "items": [{ "label": "Month to date", "value": "$4,480", "delta": "+4.1%" }] },
+      { "kind": "chart", "spec": { "type": "bar", "stacked": true, "format": "usd",
+        "x": { "values": ["Sep 22", "Sep 29", "Oct 6", "Oct 13", "Oct 20"] },
+        "series": [{ "name": "Postgres", "values": [575, 586, 651, 669, 681] }] } },
+      { "kind": "meters", "items": [{ "label": "Postgres", "value": 1906, "max": 2900, "tone": "warn" }] },
+      { "kind": "actions", "items": [{ "id": "explain", "label": "Why did Postgres grow?", "primary": true }] }
+    ]
+  }
+}
+```
+
+**Charts that make the point.** The agent can pick out the series that matters, mark when
+something happened, and pin a tooltip on the value it is talking about.
+
+![A line chart of error rate by service for today: checkout, highlighted, climbs from 0.4% to 2.1% after a marker at 14:00 labelled "flag: new-coupon-flow on", while four other services stay flat in grey; a tooltip shows every service's value at 23:00](docs/screenshots/chart-errors.png)
+
+Tables get the same treatment: bars inside cells and coloured status badges, as in the flaky
+tests table at the top of this page.
+
+**A page of the agent's own, in Muster's style.** When no built-in fits, the agent writes its
+own HTML. With `kit: true` it gets Muster's styles, charts, icons and fonts, and its buttons
+reach the agent without any script.
+
+![A deploy page the agent wrote: "Rolling out v2.4.0" with a Roll back production button, three cards for production (verifying, 2 of 4 checks), staging (healthy) and a PR preview whose migration failed, each with its pipeline steps, error rate and response time, the error message with Retry and Full log buttons, and a timeline of today's events](docs/screenshots/kit-deploys.png)
+
+![A test run page: "3 tests failed out of 1,216" with Open log and Re-run failed buttons, a ring of passed, failed and skipped tests, the run time against the last 20 runs, and each failure with what was expected and what came back](docs/screenshots/kit-test-run.png)
 
 ## Quick start
 

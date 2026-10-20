@@ -331,6 +331,20 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v17: plain-text notes shared by the human and agents (src/notes.rs).
+    r#"
+    CREATE TABLE notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        rev INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by TEXT NOT NULL,
+        window_id INTEGER,
+        beside INTEGER
+    );
+    "#,
 ];
 
 /// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
@@ -564,6 +578,55 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ----- notes -----
+
+    fn note_row(r: &Row) -> rusqlite::Result<Note> {
+        let by: String = r.get(6)?;
+        Ok(Note { id: r.get(0)?, title: r.get(1)?, body: r.get(2)?, rev: r.get(3)?, created_at: r.get(4)?,
+            updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
+            window_id: r.get(7)?, beside: r.get(8)? })
+    }
+
+    pub fn load_notes(&self) -> anyhow::Result<Vec<Note>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside FROM notes ORDER BY id")?;
+        let rows = q.query_map([], Self::note_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn load_note(&self, id: NoteId) -> anyhow::Result<Option<Note>> {
+        Ok(self.conn.lock().query_row(
+            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside FROM notes WHERE id=?1",
+            [id], Self::note_row).optional()?)
+    }
+
+    pub fn count_notes(&self) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// Insert `note`; its id is assigned here.
+    pub fn create_note(&self, note: &mut Note) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("INSERT INTO notes(title,body,rev,created_at,updated_at,updated_by,window_id,beside) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![note.title, note.body, note.rev, note.created_at, note.updated_at,
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside])?;
+        note.id = conn.last_insert_rowid();
+        Ok(())
+    }
+
+    pub fn save_note(&self, note: &Note) -> anyhow::Result<()> {
+        let n = self.conn.lock().execute(
+            "UPDATE notes SET title=?2,body=?3,rev=?4,updated_at=?5,updated_by=?6,window_id=?7,beside=?8 WHERE id=?1",
+            params![note.id, note.title, note.body, note.rev, note.updated_at,
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside])?;
+        anyhow::ensure!(n == 1, "note {} not found", note.id);
+        Ok(())
+    }
+
+    pub fn delete_note(&self, id: NoteId) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute("DELETE FROM notes WHERE id=?1", [id])? == 1)
     }
 
     pub fn delete_panel(&self, id: PanelId) -> anyhow::Result<()> {

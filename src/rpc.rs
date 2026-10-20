@@ -93,6 +93,7 @@ pub fn hello(hub: &Hub) -> Value {
         "sessions": hub.sessions(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
+        "notes": crate::notes::list(hub).unwrap_or_default(),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": crate::adapters::shell::user_shell(),
@@ -150,9 +151,70 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 if let Some(fields) = result.as_object_mut() {
                     fields.remove("panels");
                     fields.remove("panel_origin");
+                    fields.remove("notes");
                 }
             }
             Ok(result)
+        }
+
+        // Notes (docs/PROTOCOL.md "Notes"). `from_session` (the CLI inside a session) only says
+        // who wrote; without it the change is the human's.
+        "note.list" => Ok(json!(crate::notes::list(hub)?.iter().map(crate::notes::summary).collect::<Vec<_>>())),
+        "note.get" => {
+            let p: IdParam<NoteId> = parse(params)?;
+            to_value(crate::notes::get(hub, p.id)?)
+        }
+        "note.create" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { #[serde(default)] title: Option<String>, #[serde(default)] body: String,
+                #[serde(default)] window_id: Option<WindowId>, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            let by = crate::notes::author(hub, p.from_session)?;
+            to_value(crate::notes::create(hub, p.title.as_deref(), &p.body, by, p.window_id, None)?)
+        }
+        "note.write" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, body: String, base_rev: i64, #[serde(default)] title: Option<String>,
+                #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            let by = crate::notes::author(hub, p.from_session)?;
+            to_value(crate::notes::write(hub, p.id, &p.body, p.base_rev, by, p.title.as_deref())?)
+        }
+        "note.append" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, text: String, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            let by = crate::notes::author(hub, p.from_session)?;
+            to_value(crate::notes::append(hub, p.id, &p.text, by)?)
+        }
+        "note.rename" => {
+            let p: Rename<NoteId> = parse(params)?;
+            to_value(crate::notes::rename(hub, p.id, &p.name)?)
+        }
+        "note.open" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, #[serde(default)] window_id: Option<WindowId>, #[serde(default)] beside: Option<SessionId>,
+                #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            // No window: beside the calling session (the CLI's `muster note open` in a session).
+            let (window, beside) = match (p.window_id, p.from_session) {
+                (Some(w), _) => (w, p.beside),
+                (None, Some(s)) => (crate::notes::window_of(hub, s)?, Some(s)),
+                (None, None) => return Err(RpcError("note.open needs window_id (or from_session)".into())),
+            };
+            to_value(crate::notes::open(hub, p.id, window, beside)?)
+        }
+        "note.close" => {
+            let p: IdParam<NoteId> = parse(params)?;
+            to_value(crate::notes::close(hub, p.id)?)
+        }
+        "note.delete" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            crate::notes::check_delete_from(hub, p.from_session)?;
+            crate::notes::delete(hub, p.id)?;
+            Ok(json!({}))
         }
 
         "panel.open" | "panel.update" | "panel.close" | "panel.list" | "panel.wait" | "panel.fetch_event" => {
@@ -1218,13 +1280,15 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
-            // Named agents aren't on the phone (no agent.* method is either; docs/ANDROID.md).
+            // Named agents, panels and notes aren't on the phone (no agent.*, panel.* or note.*
+            // method is either; docs/ANDROID.md).
             let forward = |ev: ServerEvent| {
                 if is_device
                     && matches!(
                         ev,
                         ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
                         | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
+                        | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
                     )
                 {
                     return None;

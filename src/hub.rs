@@ -37,6 +37,9 @@ use crate::worktree;
 pub enum ServerEvent {
     PanelUpserted(Panel),
     PanelRemoved { id: PanelId },
+    /// A note was created or changed (text, title, window), with its full text.
+    NoteUpserted(Note),
+    NoteRemoved { id: NoteId },
     AccountProfilesChanged(Vec<crate::account_profiles::AccountProfile>),
     WorkspaceUpserted(Workspace),
     WorkspaceRemoved {
@@ -402,6 +405,7 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 
 pub struct Hub {
     pub panels: crate::panels::Panels,
+    pub notes: crate::notes::Notes,
     cfg: HubConfig,
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
@@ -652,6 +656,7 @@ impl Hub {
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let hub = Arc::new_cyclic(|weak| Hub {
             panels: crate::panels::Panels::default(),
+            notes: crate::notes::Notes::default(),
             cfg,
             devices,
             agents,

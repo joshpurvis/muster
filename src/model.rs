@@ -8,6 +8,40 @@ pub type ChannelId = i64;
 pub type SessionId = u32;
 pub type WindowId = i64;
 pub type PanelId = i64;
+pub type NoteId = i64;
+
+/// Who last changed a note's text (docs/PROTOCOL.md "Notes").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAuthor {
+    /// "human" (the UI, or the CLI outside a session or in a shell tab) or "agent".
+    pub kind: String,
+    /// An agent's name: a named agent's own, else "Claude (task name)".
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+impl NoteAuthor {
+    pub fn human() -> Self { NoteAuthor { kind: "human".into(), name: None, session_id: None } }
+}
+
+/// A plain-text note shared by the human and agents (src/notes.rs). The daemon holds the text;
+/// `rev` counts changes to `body` (a rename or a move doesn't change it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub id: NoteId,
+    pub title: String,
+    pub body: String,
+    pub rev: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub updated_by: NoteAuthor,
+    /// The window showing the note's tab; None while it is closed (shown nowhere).
+    pub window_id: Option<WindowId>,
+    /// `note_open`: the session to show it beside when it first appears in its window.
+    pub beside: Option<SessionId>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

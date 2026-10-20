@@ -124,7 +124,11 @@ export async function panelChecks(a: Browser, { url, shots, hello, ok, check }: 
   await a.sleep(250);
   const delivery = await events(pid);
   check(delivery.length === 1 && delivery[0].kind === "ui/message" && delivery[0].payload.content.text === "Looks good from the sandbox", `real click reaches event queue exactly once: ${JSON.stringify(delivery)}`);
-  check(await inApp(`document.querySelector('output').textContent`) === "Sent", "app receives event acknowledgement");
+  // The acknowledgement is the reply to ui/message, a round trip through the daemon: wait for it.
+  // (The Markdown app says "Sent. The agent has it." since the Briefing look.)
+  let ack = "";
+  for (let i = 0; i < 40 && !ack.startsWith("Sent"); i++, await a.sleep(50)) ack = await inApp(`document.querySelector('output').textContent`);
+  check(ack.startsWith("Sent"), `app receives event acknowledgement (output: ${JSON.stringify(ack)})`);
   ok("a trusted click inside the app delivers one panel event");
 
   // ---- shortcuts work while the app has focus; editing keys stay in text fields

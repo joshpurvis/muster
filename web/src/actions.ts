@@ -15,6 +15,7 @@ import {
   focusedSession,
   focusedTask,
   focusedTabId,
+  fullscreen,
   knowPanel,
   panels,
   hereIds,
@@ -379,6 +380,28 @@ function withLayout(fn: (l: LayoutState) => LayoutState, focus = true) {
 export const focusDir = (d: Direction) => withLayout((l) => focusDirection(l, d));
 export const resizeDir = (d: Direction) => withLayout((l) => resizeFocused(l, d, 0.04), false);
 export const zoomToggle = () => withLayout((l) => toggleZoom(l));
+
+/** Show tab `tab` (default: the focused tab) alone, filling the window; again (or Esc, or the
+ * button) goes back to the layout as it was. Never saved: the layout itself is untouched. */
+export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
+  const l = layout.value;
+  if (tab === null || !l) return;
+  const pane = paneOfSession(l.root, tab);
+  if (!pane) return;
+  if (fullscreen.value === pane.id && pane.active === tab) return exitFullscreen();
+  revealSession(tab, false);
+  focusGroup(pane.id);
+  fullscreen.value = pane.id;
+  const terminal = panelId(tab) === null;
+  toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
+  if (terminal) focusActiveTerminalSoon();
+}
+
+export function exitFullscreen() {
+  if (fullscreen.value === null) return;
+  fullscreen.value = null;
+  dismissToastKey("fullscreen");
+}
 export const tabStep = (delta: number) => withLayout((l) => cycleTab(l, delta));
 export const equalizeAll = () =>
   withLayout((l) => {
@@ -713,6 +736,8 @@ export function renameSession(sid: SessionId, name: string) {
 export function startRename(sid: SessionId, from: "tab" | "terminal" = "tab") {
   const s = sessions.value.get(sid);
   if (!s) return;
+  // The rename fields live in the tab strip, which fullscreen hides.
+  exitFullscreen();
   const c = channelById.value.get(s.channel_id);
   const list = sessionsByChannel.value.get(s.channel_id) ?? [];
   const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;

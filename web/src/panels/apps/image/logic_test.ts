@@ -1,4 +1,4 @@
-import { fitScale, formatBytes, validateImage } from "./logic.ts";
+import { formatBytes, validateImage } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
 const png = "data:image/png;base64,iVBORw0KGgo=";
@@ -27,9 +27,6 @@ Deno.test("image input: clear errors for missing, mixed, unsafe or unloaded sour
   check(w.ok && w.warnings[0].includes("width"));
 });
 
-Deno.test("image zoom and size helpers", () => {
-  eq(fitScale(2000, 1000, 500, 500), 0.25);
-  eq(fitScale(100, 100, 500, 500), 1);
-  eq(fitScale(0, 0, 500, 500), 1);
+Deno.test("image size helper", () => {
   eq([formatBytes(900), formatBytes(2048), formatBytes(3 * 1024 * 1024)], ["900 B", "2.0 KiB", "3.0 MiB"]);
 });

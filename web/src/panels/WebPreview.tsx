@@ -5,9 +5,11 @@
 // check (`panel.preview_check`) and a load timeout drive the notices (preview.ts).
 import { useEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { helloEpoch } from "../state.ts";
+import { fullscreen, helloEpoch } from "../state.ts";
 import { focusGroup } from "../actions.ts";
 import { KitIcon } from "./KitIcon.tsx";
+import { FullscreenButton } from "./FullscreenButton.tsx";
+import { panelTab } from "../layout/tree.ts";
 import type { Panel, PanelResource } from "../types.ts";
 import { panelOriginUrl, panelReloads, usePanelPlacement } from "./placement.ts";
 import {
@@ -187,6 +189,7 @@ export function WebPreview({ panel }: { panel: Panel }) {
         <button type="button" class="btn btn-sm pv-btn" onClick={openInBrowser} disabled={!url} title="Open this address in your web browser">
           <KitIcon name="external" size={14} /> Open in browser
         </button>
+        <FullscreenButton tab={panelTab(panel.id)} full={fullscreen.value !== null && fullscreen.value === paneId.current} />
       </div>
       {address.error && (
         <div class="preview-address-error" id={`preview-address-error-${panel.id}`} role="alert">{address.error}</div>

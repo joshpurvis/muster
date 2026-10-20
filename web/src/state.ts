@@ -364,6 +364,25 @@ export const layout = signal<LayoutState | null>(null);
 /** The window `layout` belongs to (undefined: none built yet; null: no window support). */
 let layoutOwner: WindowId | null | undefined = undefined;
 
+/** The group shown fullscreen: its visible tab fills the whole window, with no tab strips, agents
+ * panel or status line. Per window and in memory only (a reload ends it), apart from the saved
+ * layout, which it never changes. Ends when focus leaves that group or the group goes. */
+export const fullscreen = signal<string | null>(null);
+
+/** The group the window shows alone: the fullscreen one, else the zoomed one. */
+export const shownAlone = computed((): string | null => {
+  const l = layout.value;
+  if (!l) return null;
+  const f = fullscreen.value;
+  return f && findPane(l.root, f) ? f : l.zoom;
+});
+
+effect(() => {
+  const f = fullscreen.value;
+  const l = layout.value;
+  if (f !== null && (!l || l.focus !== f || !findPane(l.root, f))) fullscreen.value = null;
+});
+
 /** This window shows the agents panel (kept in its layout, like zoom). */
 export const agentsPanelOpen = computed(() => !!layout.value?.agents);
 

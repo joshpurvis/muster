@@ -999,7 +999,7 @@
         End: n - 1,
         Escape: null
       }[e.key];
-      if (next === void 0) return;
+      if (next === void 0 || next === null && f === null) return;
       e.preventDefault();
       st.focus = next === null ? null : clamp(next, 0, n - 1);
       render(host);

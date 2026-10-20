@@ -9,6 +9,7 @@ import {
   agentMessages,
   agents,
   agentsPanelOpen,
+  fullscreen,
   applyEvent,
   applyHello,
   daemonStopped,
@@ -151,6 +152,8 @@ rpc.start();
   agents,
   agentMessages,
   agentsPanelOpen,
+  fullscreen,
+  prefs,
   termText: (sid: number) => {
     const t = terms.terminal(sid);
     if (!t) return null;
@@ -310,7 +313,7 @@ function App() {
   }
   const l = layout.value;
   return (
-    <div class="app">
+    <div class={fullscreen.value === null ? "app" : "app fullscreen"}>
       <div class="app-body">
         {agentsPanelOpen.value && <AgentsPanel />}
         <main class="content">

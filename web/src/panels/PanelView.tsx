@@ -2,7 +2,7 @@
 // (placement.ts). A web preview is drawn by WebPreview.tsx instead of the sandbox proxy.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { channels, focusedTabId, helloEpoch, layout, meta, sessions, updateLayout, windowPanels } from "../state.ts";
+import { channels, focusedTabId, fullscreen, helloEpoch, meta, sessions, shownAlone, updateLayout, windowPanels } from "../state.ts";
 import { closeTab, focusActiveTerminalSoon, focusGroup } from "../actions.ts";
 import { panelTab } from "../layout/tree.ts";
 import { ago, APP_KIND, KitIcon } from "./KitIcon.tsx";
@@ -11,6 +11,7 @@ import type { Panel, PanelResource } from "../types.ts";
 import { ACTIVATION, PanelBridge } from "./bridge.ts";
 import { panelOriginUrl, panelReloads, reloadPanel, slots, slotsChanged, usePanelPlacement } from "./placement.ts";
 import { WebPreview } from "./WebPreview.tsx";
+import { FullscreenButton } from "./FullscreenButton.tsx";
 
 export { reloadPanel };
 
@@ -95,7 +96,7 @@ function PanelView({ panel }: { panel: Panel }) {
 
   const context = () => ({
     theme: document.documentElement.dataset.theme === "light" ? "light" : "dark",
-    displayMode: paneId.current !== null && layout.peek()?.zoom === paneId.current ? "fullscreen" : "inline",
+    displayMode: paneId.current !== null && shownAlone.peek() === paneId.current ? "fullscreen" : "inline",
     availableDisplayModes: ["inline", "fullscreen"],
     platform: "desktop",
     locale: navigator.language,
@@ -192,8 +193,11 @@ function PanelView({ panel }: { panel: Panel }) {
         context,
         userActive: () => visible.current && frame.getClientRects().length > 0 && document.activeElement === frame,
         openLink: (url) => { globalThis.open(url, "_blank", "noopener,noreferrer"); },
+        // An app's own request zooms its group (the user's fullscreen, below, is theirs to
+        // leave); asking for inline also ends a fullscreen showing it.
         displayMode: (mode) => {
           const id = paneId.current;
+          if (id && mode === "inline" && fullscreen.peek() === id) fullscreen.value = null;
           if (id) updateLayout((l) => ({ ...l, focus: id, zoom: mode === "fullscreen" ? id : null }));
           return mode;
         },
@@ -229,7 +233,7 @@ function PanelView({ panel }: { panel: Panel }) {
       // Host controls (Reload panel) select the group when tabbed to, as the app frame does.
       onFocusCapture={() => { if (paneId.current) focusGroup(paneId.current); }}
     >
-      <PanelStrip panel={panel} state={error || stall ? "err" : stage !== "ready" ? "loading" : "live"} />
+      <PanelStrip panel={panel} state={error || stall ? "err" : stage !== "ready" ? "loading" : "live"} full={fullscreen.value !== null && fullscreen.value === paneId.current} />
       <div class="panel-body">
         <div class="panel-frame-host" ref={frameHost} />
         {error || stall
@@ -264,7 +268,7 @@ function PanelView({ panel }: { panel: Panel }) {
 }
 
 /** The strip above a panel: what it is, who opened it, how fresh it is, and that it is sandboxed. */
-function PanelStrip({ panel, state }: { panel: Panel; state: "live" | "loading" | "err" }) {
+function PanelStrip({ panel, state, full }: { panel: Panel; state: "live" | "loading" | "err"; full: boolean }) {
   const [, tick] = useState(0);
   useEffect(() => {
     // "updated 14 s ago" keeps itself current.
@@ -284,6 +288,7 @@ function PanelStrip({ panel, state }: { panel: Panel; state: "live" | "loading" 
       <span class="ps-r">
         <span class={`ps-live ${state}`}>{live}</span>
         <span class="ps-lock" title="Runs in a sandbox on its own origin, with no network"><KitIcon name="lock" size={12} />sandboxed</span>
+        <FullscreenButton tab={panelTab(panel.id)} full={full} />
       </span>
     </div>
   );

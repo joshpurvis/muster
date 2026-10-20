@@ -407,7 +407,7 @@ addEventListener("keydown", (e) => {
   else if (key === "m") { e.preventDefault(); openMerge(selectedPr()); }
   else if (key === "n") { e.preventDefault(); next(); }
   else if (key === "/") { e.preventDefault(); document.getElementById("filter")?.focus(); }
-  else if (key === "Escape" && notice) { notice = null; render(); }
+  else if (key === "Escape" && notice) { e.preventDefault(); notice = null; render(); }
   else {
     const a = actionForKey(view.actions, key);
     if (a) { e.preventDefault(); runAction(a); }

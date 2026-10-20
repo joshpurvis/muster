@@ -2555,6 +2555,7 @@ button.quick-toggle { flex: none; }
       e.preventDefault();
       document.getElementById("filter")?.focus();
     } else if (key === "Escape" && notice) {
+      e.preventDefault();
       notice = null;
       render();
     } else {

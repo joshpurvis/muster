@@ -112,8 +112,12 @@ Moving a panel to another window, reloading the window or a backend restart load
 from its last input: state the app kept only in the page (an unsent comment) is lost there.
 Theme changes reach the app through the bridge. The built-in Markdown app renders text safely
 and includes a comment field for sending a user event.
-The other built-ins follow the theme and work by keyboard: Image toggles fit/actual size
-(Z); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
+The other built-ins follow the theme and work by keyboard: Image opens at Fit (shrunk to the
+panel, never enlarged past actual size; an SVG with only a viewBox fills it) and zooms like an
+image viewer: − / + (buttons, `-` / `+` or `=`, Ctrl+wheel or a pinch around the pointer) step
+from the size on screen, 100% (`1`) is actual pixels, Fit (`0`) goes back, Z or a click
+switches Fit / 100%, and a picture bigger than the panel scrolls and drags to pan (the zoom
+shows bottom left; the browser's own zoom keys never zoom Muster from inside a panel); Chart shows values on hover or with the arrow keys and has a "Show data table" link;
 Table sorts by header click and filters (`/` focuses the box, Esc clears it); PR decision
 shows the agent's verdict and undo line first, has Merge (M), Request changes (R), Ask (A),
 Open on GitHub (O), Skip (S), Hold (H), Send answers (Ctrl+Enter) and the user's own actions
@@ -122,8 +126,8 @@ toggle actions switch on or off and go with the next send), answers the agent's 
 place (G or the button under the header jumps to them, number keys 1–9 pick in the focused
 question, arrows step, Tab and Shift+Tab move between questions, the recommended answer starts
 picked; a line above the actions says what goes with the next decision, and Send answers is
-off while Merge is being confirmed), and its pictures enlarge on click or Enter in a modal view (Z
-for actual size, drag to pan, arrows step, Esc closes); PR overview moves with J/K or the
+off while Merge is being confirmed), and its pictures enlarge on click or Enter in a modal view (zoom
+as in Image, drag to pan, arrows step, Esc closes); PR overview moves with J/K or the
 arrows, opens with Enter (or O, or a double-click), merges a quick win with M (after the same
 confirm as Merge), holds with H, goes through the PRs in order with N, filters with `/`, and
 can show only the quick wins. In both, `?` lists the keys. An outward custom action (marked ↗) shows what
@@ -142,7 +146,9 @@ open in the host browser.
 
 While a panel has focus, Muster's navigation shortcuts still work: Jump (Ctrl+Space, Ctrl+K),
 the palette (Ctrl+Shift+P), Alt+J, tab switching (Alt+1..9, Ctrl+Tab, Alt+[ / ]), Alt+Shift+[ / ],
-Alt+arrows between groups, Alt+Z, Alt+G, Alt+/ and F1, and Alt+W, which closes that panel.
+Alt+arrows between groups, Alt+Z, Alt+Shift+Z (fullscreen), Alt+G, Alt+/ and F1, and Alt+W,
+which closes that panel. Esc reaches the app first; one it leaves alone (see "Fullscreen")
+leaves a fullscreen panel.
 In the app's text fields, Alt+letters and Alt+arrows stay with the field, as in Muster's own.
 Commands that act on an agent (approve, interrupt, new tabs) are not taken from a panel. Closing
 a focused panel, or the agent closing it, hands the keyboard to the tab that takes its place.
@@ -183,7 +189,31 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   clicks, the wheel and motion still go to programs that track the mouse. The menu's Paste
   reads the clipboard; if the browser refuses, an error toast says to press Ctrl+Shift+V
   (which pastes without that permission). Failed copies show an error toast too. A zoomed
-  group shows a "zoomed" badge in its strip (click restores).
+  group shows a "zoomed" badge in its strip (click restores). A zoomed group takes the whole
+  window body, whatever its share of the split was.
+- **Fullscreen** (Alt+Shift+Z, the `⤢` button at the right end of a panel's strip or of the web
+  preview's bar, Fullscreen in the tab and terminal menus, and "Fullscreen tab" in the
+  palette): one tab fills the whole window, with no tab strips, agents panel or status line. A
+  panel keeps its strip, whose button turns into Exit fullscreen; a terminal gets a small
+  Exit fullscreen button in its top-right corner. It acts on the group: switching tabs in it
+  (Alt+1..9, Ctrl+Tab) stays fullscreen. Per window and in memory only: the saved layout never
+  changes, so leaving it shows the layout exactly as it was, and a reload ends it. It also ends
+  when focus moves to another group (Jump, Alt+J, Alt+arrows, a new split) or the group goes,
+  and on Rename (its fields are in the strip). Works for terminals and panels alike.
+  **Esc** goes back only when nothing else wants it:
+  - never from a focused terminal (agents use Esc to interrupt, editors to leave a mode), nor
+    from a text field; Alt+Shift+Z or the corner button go back from there;
+  - an open menu, dialog, Jump, rename or "Close?" takes that Esc and closes first;
+  - inside a panel's app, the app gets Esc first. The sandbox helper hands it over only when
+    the app did not use it: not `preventDefault()`ed, not typed in a field, and no `<dialog>`
+    open. So Esc closes a PR decision's picture or confirm, or clears a table's filter, before
+    a second Esc leaves fullscreen. An agent's own app that uses Esc should call
+    `preventDefault()`.
+  - The web preview's page is another origin and its keys never reach Muster: with focus in
+    the page, use the bar's button (Alt+Shift+Z works once focus is on the bar).
+  An app's own `ui/request-display-mode` "fullscreen" still zooms its group (it reports
+  `displayMode: "fullscreen"` in both cases); asking for "inline" also ends a fullscreen
+  showing it. The phone UI has no panels or groups and is unchanged.
 - A window with no tabs shows the empty launcher (folder input with `fs.complete`, then
   Claude / Codex / Shell, keys 1 2 3), with Jump and `⋯` in its top-right corner. An empty group
   (only possible transiently) closes.
@@ -388,6 +418,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+←↑→↓ | Focus the group in that direction |
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
+| Alt+Shift+Z | Fullscreen: the focused tab fills the window (again, or Esc outside terminals and text fields, goes back) |
 | Alt+G | Show / hide the agents panel (per window) |
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |

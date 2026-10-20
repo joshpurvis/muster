@@ -4,20 +4,26 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 .stage-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
 /* The soft stage: a faint wash of the accent over the sunken surface, and an inner keyline. */
 .img-stage {
-  flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
+  position: relative; flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
   background: radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--mk-accent) 7%, transparent), transparent 60%), var(--mk-sunken);
   box-shadow: inset 0 0 0 1px var(--mk-line);
 }
 .img-stage img {
-  margin: auto; display: block; border-radius: 8px; cursor: zoom-in;
+  margin: auto; display: block; flex: none; border-radius: 8px; cursor: zoom-in;
   background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px;
   box-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 24px 60px -18px rgba(0, 0, 0, .55), 0 0 0 1px var(--mk-line-2);
 }
 [data-theme="light"] .img-stage img { box-shadow: 0 24px 60px -22px rgba(20, 20, 40, .35), 0 0 0 1px var(--mk-line-2); }
-.img-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.img-stage.actual img { max-width: none; max-height: none; flex: none; cursor: zoom-out; }
+/* Until the picture has loaded (and the viewer sizes it), it fits by CSS. */
+.img-stage:not(.sized) img { flex: 0 1 auto; max-width: 100%; max-height: 100%; object-fit: contain; }
+.img-stage:is(.actual, .zoomed) img { cursor: zoom-out; }
+.img-stage.can-pan img { cursor: grab; }
+.img-stage.panning, .img-stage.panning img { cursor: grabbing; user-select: none; }
 .img-stage .error { margin: auto; }
 .img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+.img-tools button svg { width: 14px; height: 14px; }
+.img-tools button:disabled { opacity: .4; cursor: default; }
 .img-zoom {
   position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
   background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);
@@ -30,4 +36,5 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 @media (max-width: 520px) {
   .img-stage { padding: 12px; }
   .img-tools { top: 8px; right: 8px; }
+  .img-tools button { padding: 0 7px; }
 }

@@ -119,6 +119,8 @@ export class PanelBridge {
       if (raw.method === "ui/notifications/sandbox-proxy-ready") {
         this.notify("ui/notifications/sandbox-resource-ready", {
           html: this.resource.html, csp: this.resource.panel.csp, sandbox: "allow-scripts", keys: this.host.keys(),
+          // Hand over an Esc the app leaves alone (proxy.html): it leaves a fullscreen panel.
+          escape: true,
         });
         return;
       }

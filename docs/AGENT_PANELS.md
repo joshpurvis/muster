@@ -49,7 +49,8 @@ worth looking at). The user clicks Merge, and the agent runs `gh pr merge`.
 
 - **A tab.** A panel is a new kind of tab in the existing split/tab layout ([UI.md](UI.md)),
   next to terminal tabs. It can be split beside its agent's terminal, dragged to another group,
-  moved to another window or zoomed, with no new layout code. It belongs to a task (channel) and
+  moved to another window, zoomed or shown fullscreen (Alt+Shift+Z or the button in the strip
+  above it; Esc the app leaves alone goes back, see [UI.md](UI.md)), with no new layout code. It belongs to a task (channel) and
   remembers which session opened it. "Side panel" is just the default placement: a new panel
   opens in a split to the right of its agent's terminal.
 - **An app.** Every panel's content is a small web page in the [MCP Apps](https://modelcontextprotocol.io/extensions/apps)

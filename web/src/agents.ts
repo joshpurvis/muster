@@ -2,7 +2,7 @@
 // session, the message log, and the New / Edit dialog's rules. No signals, no DOM: unit tested
 // (agents_test.ts).
 
-import type { Agent, AgentMessage, AgentState, Origin, SessionInfo } from "./types.ts";
+import type { Agent, AgentMessage, AgentState, ModelCatalog, Origin, SessionInfo } from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
 
 /** What a row shows: the dot's state, whether a process runs, and the state's label and start. */
@@ -75,12 +75,14 @@ export function nameError(name: string, taken: string[]): string | null {
  * a real value: those are trimmed and have no spaces (src/agents.rs `agent_args`). */
 export const CUSTOM = " custom";
 
-/** Which entry a Model or Effort select shows: "" (Default) for no value, the value itself when
- * it is listed, else CUSTOM, as when the person chose "Custom…" (`typing`). A stored value the
- * list doesn't know is kept and shown as custom, never dropped. */
-export function choiceOf(value: string, listed: string[], typing: boolean): string {
+/** Which entry a Model or Effort select shows. `custom` is latched: set when the person picks
+ * "Custom…" or edits its text field, cleared only when they pick another entry, so clearing the
+ * field or typing `opus[1m]` through `opus` stays in Custom. Unlatched: "" (Default) for no
+ * value, the value itself when listed, else CUSTOM (a stored value the list doesn't know is kept
+ * and shown as custom, never dropped). */
+export function choiceOf(value: string, listed: string[], custom: boolean): string {
   const v = value.trim();
-  if (typing) return CUSTOM;
+  if (custom) return CUSTOM;
   if (!v) return "";
   return listed.includes(v) ? v : CUSTOM;
 }
@@ -88,6 +90,22 @@ export function choiceOf(value: string, listed: string[], typing: boolean): stri
 /** Switching an agent's kind keeps a model or effort only when the new kind lists it. */
 export function keepForKind(value: string, listed: string[]): string {
   return listed.includes(value.trim()) ? value : "";
+}
+
+/** The effort levels on offer for `model` of `kind`: the model's own list where it differs from
+ * the CLI's (src/agents.rs `model_catalog`), else the CLI's. Empty without a catalog. */
+export function effortsFor(c: ModelCatalog | null, kind: Agent["kind"], model: string): string[] {
+  const k = c?.[kind];
+  if (!k) return [];
+  return k.models.find((m) => m.id === model.trim())?.efforts ?? k.efforts;
+}
+
+/** The effort after the model changes: a level picked from the old model's list that the new
+ * model doesn't offer goes back to Default; a custom effort (`custom`, or one the old list
+ * didn't have) stays as typed. */
+export function effortAfterModel(effort: string, before: string[], after: string[], custom: boolean): string {
+  if (choiceOf(effort, before, custom) !== effort.trim()) return effort;
+  return after.includes(effort.trim()) ? effort : "";
 }
 
 /** A memory file path the daemon accepts: relative, plain parts (no `..`, `.` or empty parts). */

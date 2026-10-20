@@ -1718,6 +1718,8 @@ pub fn messages(hub: &Hub, agent: Option<&str>, before: Option<i64>, limit: Opti
 pub struct ModelChoice {
     pub id: &'static str,
     pub note: Option<&'static str>,
+    /// This model's effort levels where they differ from its CLI's (`None`: the CLI's).
+    pub efforts: Option<Vec<&'static str>>,
 }
 
 /// What the dialog offers for one CLI (`agent.models`). Anything else can still be typed in its
@@ -1735,9 +1737,12 @@ pub struct KindModels {
 ///   `opusplan`), and the levels it lists under `--effort`.
 /// - Codex: the slugs with `"visibility": "list"` in `codex debug models` (a debug command
 ///   printing the CLI's cached catalog: fine for a person to read, not for Muster to depend on),
-///   and the union of their `supported_reasoning_levels`.
+///   and the union of their `supported_reasoning_levels` (a model whose own list is shorter
+///   gets it as `efforts`).
 pub fn model_catalog() -> Value {
-    let m = |id, note| ModelChoice { id, note };
+    let m = |id, note| ModelChoice { id, note, efforts: None };
+    let only = |id, efforts| ModelChoice { id, note: None, efforts: Some(efforts) };
+    let no_ultra = || vec!["low", "medium", "high", "xhigh", "max"];
     let claude = KindModels {
         models: vec![
             m("fable", Some("latest Fable")),
@@ -1753,10 +1758,10 @@ pub fn model_catalog() -> Value {
             m("gpt-6.1-sol", None),
             m("gpt-6-astra", None),
             m("gpt-6-sol", None),
-            m("gpt-6-luna", None),
+            only("gpt-6-luna", no_ultra()),
             m("gpt-5.6-sol", None),
             m("gpt-5.6-terra", None),
-            m("gpt-5.6-luna", None),
+            only("gpt-5.6-luna", no_ultra()),
         ],
         efforts: vec!["low", "medium", "high", "xhigh", "max", "ultra"],
     };
@@ -2687,7 +2692,16 @@ mod tests {
             }
             let unique: HashSet<&&str> = models.iter().chain(&efforts).collect();
             assert_eq!(unique.len(), models.len() + efforts.len(), "{key}: no duplicates");
+            // A model's own levels are a strict subset of its CLI's.
+            for m in c[key]["models"].as_array().unwrap() {
+                if let Some(own) = m["efforts"].as_array() {
+                    assert!(!own.is_empty() && own.len() < efforts.len(), "{key}: {}", m["id"]);
+                    assert!(own.iter().all(|e| efforts.contains(&e.as_str().unwrap())), "{key}: {}", m["id"]);
+                }
+            }
         }
+        let luna = c["codex"]["models"].as_array().unwrap().iter().find(|m| m["id"] == "gpt-6-luna").unwrap();
+        assert!(!luna["efforts"].as_array().unwrap().iter().any(|e| e == "ultra"));
         // The templates only pick what the dialog lists.
         for t in templates() {
             let key = if t.kind == SessionKind::Claude { "claude" } else { "codex" };

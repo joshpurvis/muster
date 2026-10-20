@@ -841,6 +841,35 @@ try {
         await a.eval(`!document.querySelector('[aria-label="Custom model"]')`),
       "switching to Codex reset the custom model and kept a level Codex has",
     );
+    // Effort follows the model: gpt-6-luna has no "ultra", so picking it resets a picked ultra.
+    await choose(ms, "gpt-6.1-sol");
+    await choose(es, "ultra");
+    await choose(ms, "gpt-6-luna");
+    await a.sleep(100);
+    check(
+      await a.eval(`${es}.value === '' && ![...${es}.options].some((o) => o.value === 'ultra')`),
+      "gpt-6-luna offers no ultra; the picked ultra went back to Default",
+    );
+    // Custom stays chosen with its field cleared, and clicking the current kind changes nothing.
+    await choose(ms, " custom");
+    await a.wait(`document.activeElement?.getAttribute('aria-label') === 'Custom model'`, 1000);
+    await a.key("Backspace");
+    await a.sleep(100);
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(
+        `${ms}.value === ' custom' && document.querySelector('[aria-label="Custom model"]')?.value === ''`,
+      ),
+      "Custom stays chosen with an empty field, also after clicking the kind already chosen",
+    );
+    await a.type("gpt-6-luna-preview");
+    await a.eval(`${kindBtn("Codex")}.click()`);
+    await a.sleep(100);
+    check(
+      await a.eval(`document.querySelector('[aria-label="Custom model"]')?.value === 'gpt-6-luna-preview'`),
+      "clicking the current kind keeps a custom model",
+    );
     await a.eval(`${kindBtn("Claude")}.click()`);
     await a.sleep(100);
     await choose(ms, "sonnet");

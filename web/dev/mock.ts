@@ -543,15 +543,18 @@ const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default"
 const AGENT_MODELS = {
   claude: {
     models: [
-      { id: "fable", note: "latest Fable" },
-      { id: "opus", note: "latest Opus" },
-      { id: "sonnet", note: "latest Sonnet" },
-      { id: "haiku", note: "latest Haiku" },
+      { id: "fable", note: "latest Fable", efforts: null },
+      { id: "opus", note: "latest Opus", efforts: null },
+      { id: "sonnet", note: "latest Sonnet", efforts: null },
+      { id: "haiku", note: "latest Haiku", efforts: null },
     ],
     efforts: ["low", "medium", "high", "xhigh", "max"],
   },
   codex: {
-    models: [{ id: "gpt-6.1-sol", note: null }, { id: "gpt-6-luna", note: null }],
+    models: [
+      { id: "gpt-6.1-sol", note: null, efforts: null },
+      { id: "gpt-6-luna", note: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
+    ],
     efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
   },
 };

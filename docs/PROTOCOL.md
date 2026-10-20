@@ -188,7 +188,8 @@ type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "h
 type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
              model: string | null; effort: string | null; persona: string; permissions: Permissions;
              accepts: Origin[]; autostart: boolean };
-type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null }[];
+type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null;
+             efforts: string[] | null /* this model's levels where they differ; null: the CLI's */ }[];
              efforts: string[] /* passed to --effort / -c model_reasoning_effort= */ };
 ```
 

@@ -209,7 +209,8 @@ export interface AgentTemplate {
 
 /** `agent.models`: what the agent dialog offers per CLI (src/agents.rs `model_catalog`). */
 export interface KindModels {
-  models: { id: string; note: string | null }[];
+  /** `efforts`: this model's levels where they differ from the CLI's (null: the CLI's). */
+  models: { id: string; note: string | null; efforts: string[] | null }[];
   efforts: string[];
 }
 export type ModelCatalog = Record<"claude" | "codex", KindModels>;

@@ -23,6 +23,8 @@ import {
   ago,
   choiceOf,
   CUSTOM,
+  effortAfterModel,
+  effortsFor,
   feedFor,
   firstLine,
   keepForKind,
@@ -329,29 +331,31 @@ interface Pick {
 
 /** Model and Effort: Default, the CLI's list (`agent.models`) and "Custom…", which shows a text
  * field for anything else (a full model id, a level the list doesn't have yet). A stored value
- * the list doesn't know shows as custom. Keyed by kind and template, so switching either forgets
- * "Custom…". */
+ * the list doesn't know shows as custom. `custom` is the dialog's latch (`choiceOf`): Custom
+ * stays chosen until another entry is picked. */
 function PickField(
-  { label, value, picks, customLabel, placeholder, onChange }: {
+  { label, value, picks, custom, customLabel, placeholder, onChange }: {
     label: string;
     value: string;
     picks: Pick[];
+    custom: boolean;
     customLabel: string;
     placeholder: string;
-    onChange: (v: string) => void;
+    onChange: (v: string, custom: boolean) => void;
   },
 ) {
   const id = useId();
-  const [typing, setTyping] = useState(false);
   const typed = useRef<HTMLInputElement>(null);
-  const choice = choiceOf(value, picks.map((p) => p.value), typing);
+  /** Custom… was just picked: focus its field, the current value selected so typing replaces it. */
+  const focusTyped = useRef(false);
+  const choice = choiceOf(value, picks.map((p) => p.value), custom);
   useEffect(() => {
-    // The current value stays until you type over it.
-    if (typing) {
-      typed.current?.focus();
-      typed.current?.select();
+    if (focusTyped.current && typed.current) {
+      focusTyped.current = false;
+      typed.current.focus();
+      typed.current.select();
     }
-  }, [typing]);
+  });
   return (
     <div class="field">
       <label class="field-label" for={id}>{label}</label>
@@ -361,8 +365,8 @@ function PickField(
           value={choice}
           onChange={(e) => {
             const v = e.currentTarget.value;
-            setTyping(v === CUSTOM);
-            if (v !== CUSTOM) onChange(v);
+            focusTyped.current = v === CUSTOM;
+            onChange(v === CUSTOM ? value : v, v === CUSTOM);
           }}
         >
           <option value="">Default (the CLI's choice)</option>
@@ -378,7 +382,7 @@ function PickField(
           aria-label={customLabel}
           placeholder={placeholder}
           spellcheck={false}
-          onInput={(e) => onChange((e.target as HTMLInputElement).value)}
+          onInput={(e) => onChange((e.target as HTMLInputElement).value, true)}
         />
       )}
     </div>
@@ -387,8 +391,8 @@ function PickField(
 
 const modelPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
   (c?.[kind].models ?? []).map((m) => ({ value: m.id, label: m.note ? `${m.id} · ${m.note}` : m.id }));
-const effortPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
-  (c?.[kind].efforts ?? []).map((e) => ({ value: e, label: e }));
+const effortPicks = (c: ModelCatalog | null, kind: Agent["kind"], model: string): Pick[] =>
+  effortsFor(c, kind, model).map((e) => ({ value: e, label: e }));
 
 interface Draft {
   account_profile: ProfileChoice;
@@ -460,6 +464,8 @@ export function AgentDialog(
   const [catalog, setCatalog] = useState<ModelCatalog | null>(catalogCache);
   const [tpl, setTpl] = useState("blank");
   const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : BLANK);
+  /** Model / Effort show Custom… until another entry is picked (`choiceOf`). */
+  const [custom, setCustom] = useState({ model: false, effort: false });
   const [nameTouched, setNameTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -492,16 +498,28 @@ export function AgentDialog(
 
   if (editing && !agent) return null;
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }));
-  /** A model or effort the new kind doesn't list goes back to Default. */
-  const setKind = (k: Agent["kind"]) =>
-    setD((x) => ({
-      ...x,
-      kind: k,
-      model: keepForKind(x.model, modelPicks(catalog, k).map((p) => p.value)),
-      effort: keepForKind(x.effort, catalog?.[k].efforts ?? []),
-    }));
+  /** A model or effort the new kind doesn't list goes back to Default (the kind already chosen:
+   * nothing changes). */
+  const setKind = (k: Agent["kind"]) => {
+    if (k === d.kind) return;
+    const model = keepForKind(d.model, modelPicks(catalog, k).map((p) => p.value));
+    set({ kind: k, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)) });
+    setCustom({ model: false, effort: false });
+  };
+  /** A level the new model doesn't offer goes back to Default; a custom effort stays. */
+  const setModel = (model: string, on: boolean) => {
+    const effort = effortAfterModel(
+      d.effort,
+      effortsFor(catalog, d.kind, d.model),
+      effortsFor(catalog, d.kind, model),
+      custom.effort,
+    );
+    set({ model, effort });
+    setCustom((c) => ({ ...c, model: on }));
+  };
   const pick = (t: AgentTemplate) => {
     setTpl(t.id);
+    setCustom({ model: false, effort: false });
     const next = fromTemplate(t);
     setD((x) => ({ ...next, name: nameTouched && x.name.trim() ? x.name : next.name }));
   };
@@ -696,22 +714,25 @@ export function AgentDialog(
             </>}
             <div class="field-row">
               <PickField
-                key={`model-${d.kind}-${tpl}`}
                 label="Model"
                 value={d.model}
                 picks={modelPicks(catalog, d.kind)}
+                custom={custom.model}
                 customLabel="Custom model"
                 placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
-                onChange={(model) => set({ model })}
+                onChange={setModel}
               />
               <PickField
-                key={`effort-${d.kind}-${tpl}`}
                 label="Effort"
                 value={d.effort}
-                picks={effortPicks(catalog, d.kind)}
+                picks={effortPicks(catalog, d.kind, d.model)}
+                custom={custom.effort}
                 customLabel="Custom effort"
                 placeholder="a level the CLI accepts"
-                onChange={(effort) => set({ effort })}
+                onChange={(effort, on) => {
+                  set({ effort });
+                  setCustom((c) => ({ ...c, effort: on }));
+                }}
               />
             </div>
             <label class="field">

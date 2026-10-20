@@ -551,6 +551,172 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
     print_json(&client::rpc_with_timeout(d, method, json!({"from_session":session,"arguments":args}), Duration::from_secs(timeout))?)
 }
 
+#[derive(clap::Subcommand)]
+pub enum NoteCmd {
+    /// List notes: ID  REV  BYTES  OPEN  UPDATED  BY  TITLE.
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long)] json: bool,
+    },
+    /// Create a note; prints its id. TEXT words are joined by spaces; `-` reads stdin.
+    New {
+        #[arg(long)] title: Option<String>,
+        text: Vec<String>,
+    },
+    /// Print a note's text (`--json`: the whole note, with its rev).
+    Read {
+        /// Note id, exact title, or a unique title prefix.
+        note: String,
+        #[arg(long)] json: bool,
+    },
+    /// Replace a note's text. `--rev` is the revision you read (`read --json`): refused when the
+    /// note changed since. TEXT words are joined by spaces; none or `-` reads stdin.
+    Write {
+        note: String,
+        #[arg(long)] rev: i64,
+        text: Vec<String>,
+    },
+    /// Add text at the end of a note, on a new line (never conflicts). None or `-` reads stdin.
+    Append {
+        note: String,
+        text: Vec<String>,
+    },
+    /// Rename a note.
+    Rename { note: String, title: String },
+    /// Show a note as a tab: in window N, else beside this session (inside a Muster session).
+    Open {
+        note: String,
+        #[arg(long)] window: Option<i64>,
+    },
+    /// Close a note's tab (the note stays).
+    Close { note: String },
+    /// Delete a note for good. Refused from an agent's session: only the human deletes notes.
+    Rm { note: String },
+}
+
+#[derive(Deserialize)]
+struct NoteRow {
+    id: i64,
+    title: String,
+    rev: i64,
+    bytes: u64,
+    open: bool,
+    updated_at: i64,
+    updated_by: Value,
+}
+
+/// A note by id (all digits), exact title (case-insensitive), else unique title prefix.
+fn note_target(d: &Discovery, t: &str) -> anyhow::Result<i64> {
+    let rows: Vec<NoteRow> = serde_json::from_value(client::rpc(d, "note.list", json!({}))?)?;
+    resolve_note(&rows, t)
+}
+
+fn resolve_note(rows: &[NoteRow], t: &str) -> anyhow::Result<i64> {
+    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+        let id: i64 = t.parse().map_err(|_| exit(2, format!("no note {t}")))?;
+        return rows.iter().find(|r| r.id == id).map(|r| r.id).ok_or_else(|| exit(2, format!("no note with id {id}")));
+    }
+    let lower = t.to_lowercase();
+    let exact: Vec<&NoteRow> = rows.iter().filter(|r| r.title.to_lowercase() == lower).collect();
+    let found = if exact.is_empty() { rows.iter().filter(|r| r.title.to_lowercase().starts_with(&lower)).collect() } else { exact };
+    match found.as_slice() {
+        [one] => Ok(one.id),
+        [] => Err(exit(2, format!("no note matches {t:?} (see muster note ls)"))),
+        many => Err(exit(2, format!("{t:?} matches several notes: {}",
+            many.iter().map(|r| format!("{} {:?}", r.id, r.title)).collect::<Vec<_>>().join(", ")))),
+    }
+}
+
+/// TEXT words joined by spaces; none or `-` reads stdin as it is.
+fn note_text(words: &[String]) -> anyhow::Result<String> {
+    if words.is_empty() || (words.len() == 1 && words[0] == "-") {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprintln!("muster: reading the text from stdin (end with Ctrl-D)");
+        }
+        let mut s = String::new();
+        stdin.lock().read_to_string(&mut s).context("reading stdin")?;
+        return Ok(s);
+    }
+    Ok(words.join(" "))
+}
+
+fn note_by(v: &Value) -> String {
+    match (v["kind"].as_str(), v["name"].as_str()) {
+        (_, Some(name)) => name.to_string(),
+        (Some("human"), _) => "human".into(),
+        (kind, _) => kind.unwrap_or("?").to_string(),
+    }
+}
+
+pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
+    let from = env_session();
+    match cmd {
+        NoteCmd::Ls { json } => {
+            let v = client::rpc(d, "note.list", json!({}))?;
+            if json { return print_json(&v) }
+            let rows: Vec<NoteRow> = serde_json::from_value(v)?;
+            if rows.is_empty() {
+                println!("no notes");
+                return Ok(());
+            }
+            println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} TITLE", "ID", "REV", "BYTES", "OPEN", "UPDATED", "BY");
+            for r in rows {
+                println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} {}", r.id, r.rev, r.bytes, if r.open { "yes" } else { "-" },
+                    format_duration(now_ms() - r.updated_at), note_by(&r.updated_by), r.title);
+            }
+            Ok(())
+        }
+        NoteCmd::New { title, text } => {
+            let body = if text.is_empty() { String::new() } else { note_text(&text)? };
+            let n = client::rpc(d, "note.create", json!({"title": title, "body": body, "from_session": from}))?;
+            println!("{}", n["id"]);
+            Ok(())
+        }
+        NoteCmd::Read { note, json } => {
+            let n = client::rpc(d, "note.get", json!({"id": note_target(d, &note)?}))?;
+            if json { return print_json(&n) }
+            print!("{}", n["body"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        NoteCmd::Write { note, rev, text } => {
+            let id = note_target(d, &note)?;
+            let n = client::rpc(d, "note.write", json!({"id": id, "body": note_text(&text)?, "base_rev": rev, "from_session": from}))?;
+            println!("note {id}: rev {}", n["rev"]);
+            Ok(())
+        }
+        NoteCmd::Append { note, text } => {
+            let id = note_target(d, &note)?;
+            let t = send_text(&text, || note_text(&[]).map_err(std::io::Error::other))?;
+            let n = client::rpc(d, "note.append", json!({"id": id, "text": t, "from_session": from}))?;
+            println!("note {id}: rev {}", n["rev"]);
+            Ok(())
+        }
+        NoteCmd::Rename { note, title } => {
+            let id = note_target(d, &note)?;
+            client::rpc(d, "note.rename", json!({"id": id, "name": title}))?;
+            Ok(())
+        }
+        NoteCmd::Open { note, window } => {
+            let id = note_target(d, &note)?;
+            anyhow::ensure!(window.is_some() || from.is_some(), "give --window N, or run inside a Muster session to show it beside that session");
+            let n = client::rpc(d, "note.open", json!({"id": id, "window_id": window, "from_session": if window.is_none() { from } else { None }}))?;
+            println!("note {id}: window {}", n["window_id"]);
+            Ok(())
+        }
+        NoteCmd::Close { note } => {
+            client::rpc(d, "note.close", json!({"id": note_target(d, &note)?}))?;
+            Ok(())
+        }
+        NoteCmd::Rm { note } => {
+            let id = note_target(d, &note)?;
+            client::rpc(d, "note.delete", json!({"id": id, "from_session": from}))?;
+            println!("deleted note {id}");
+            Ok(())
+        }
+    }
+}
+
 /// `muster pair`: start a pairing, print how to reach the daemon from the phone (the
 /// `tailscale serve` lines when it isn't set up), a QR code and the short code, then wait for
 /// the phone.

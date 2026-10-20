@@ -26,8 +26,11 @@ import {
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
-import { IconBranch, IconCheck, IconCodex, IconFolder, IconPanel, IconSpark, IconTerminal, IconX } from "../icons.tsx";
-import { panelTab } from "../layout/tree.ts";
+import { IconBranch, IconCheck, IconCodex, IconFolder, IconNote, IconPanel, IconPlus, IconSpark, IconTerminal, IconTrash, IconX } from "../icons.tsx";
+import { noteTab, panelTab } from "../layout/tree.ts";
+import { authorName, notes, searchNotes } from "../notes.ts";
+import { ago } from "../agents.ts";
+import type { NoteInfo } from "../types.ts";
 import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
@@ -139,6 +142,8 @@ export function Overlays() {
       return <NewTab worktree={o.worktree} cwd={o.cwd} />;
     case "rename_window":
       return <RenameWindow />;
+    case "notes":
+      return <NotesDialog />;
     case "shell":
       return <ShellDialog />;
     case "shutdown":
@@ -209,8 +214,62 @@ function commandEntries(): Entry[] {
   return out;
 }
 
+/** Notes whose text holds `query`, by id, with the matching line. The daemon searches
+ * (`note.search`: the UI only has the notes' summaries); a newer query's answer replaces an
+ * older one, never the other way round. */
+function useNoteHits(query: string): ReadonlyMap<number, string> {
+  const [hits, setHits] = useState<ReadonlyMap<number, string>>(new Map());
+  const seq = useRef(0);
+  useEffect(() => {
+    const mine = ++seq.current;
+    if (query.trim().length < 2) {
+      setHits(new Map());
+      return;
+    }
+    const t = setTimeout(() => {
+      searchNotes(query).then((list) => {
+        if (seq.current === mine) setHits(new Map(list.map((h) => [h.id, h.line])));
+      });
+    }, 120);
+    return () => clearTimeout(t);
+  }, [query, notes.value]);
+  return hits;
+}
+
+/** Where a note is, for Jump and the notes list. */
+function noteWhere(n: NoteInfo, here: Set<number>): string {
+  if (here.has(noteTab(n.id))) return "open here";
+  const w = n.window_id !== null ? windowById.value.get(n.window_id) : undefined;
+  return w ? `in ${windowLabel(w)}` : "closed";
+}
+
+/** Every note, matched by its title and its text. */
+function noteEntries(hits: ReadonlyMap<number, string>, here: Set<number>): Entry[] {
+  const out: Entry[] = [];
+  for (const n of notes.value.values()) {
+    const line = hits.get(n.id) ?? null;
+    const where = noteWhere(n, here);
+    out.push({
+      key: "n:" + n.id,
+      label: n.title,
+      hay: `${n.title} note ${line ?? ""}`,
+      needs: false,
+      here: where === "open here",
+      boost: 1,
+      sub: line ? `“${line}”` : `note · ${where}`,
+      icon: <IconNote size={14} />,
+      right: <span class="sw-detail">{line ? where : `${authorName(n.updated_by)} · ${ago(n.updated_at, Date.now())}`}</span>,
+      run: () => {
+        overlay.value = null;
+        A.gotoNote(n.id);
+      },
+    });
+  }
+  return out;
+}
+
 /** Every tab (session) of every window, and folders for a new tab. */
-function jumpEntries(): Entry[] {
+function jumpEntries(hits: ReadonlyMap<number, string> = new Map()): Entry[] {
   const out: Entry[] = [];
   const home = meta.value.home;
   const here = hereIds.value;
@@ -268,6 +327,7 @@ function jumpEntries(): Entry[] {
       },
     });
   }
+  out.push(...noteEntries(hits, here));
   // Every named agent, stopped ones too: choosing one starts it and pulls its tab here.
   for (const a of agents.value) {
     const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
@@ -322,6 +382,7 @@ function Jump({ initial }: { initial: string }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const cmdMode = q.startsWith(">");
+  const noteHits = useNoteHits(cmdMode ? "" : q);
 
   useLayoutEffect(() => {
     const el = inputRef.current!;
@@ -344,14 +405,14 @@ function Jump({ initial }: { initial: string }) {
         .sort((a, b) => b.s - a.s);
     }
     const query = q.trim();
-    const items = jumpEntries();
+    const items = jumpEntries(noteHits);
     const ranked = rankJump(items, query, prefs.value.recent).map((r) => ({ e: r.item, hits: r.hits }));
     // Commands also match plain queries, always after everything else.
     if (!query) return ranked;
     const cmds = rankJump(commandEntries(), query, [], 10).map((r) => ({ e: r.item, hits: r.hits }));
     return [...ranked, ...cmds];
     // Live: states and tabs change while Jump is open.
-  }, [q, sessions.value, panels.value, channels.value, windows.value, layoutOrder.value, agents.value]);
+  }, [q, noteHits, sessions.value, panels.value, notes.value, channels.value, windows.value, layoutOrder.value, agents.value]);
 
   useEffect(() => setSel(0), [q]);
   useEffect(() => {
@@ -637,6 +698,140 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
 }
 
 // ---------------- rename window ----------------
+
+// ---------------- notes list ----------------
+
+/** "Notes…": every note, open or closed, newest first. Enter opens one here, Shift+Delete asks to
+ * delete it, Ctrl+Enter makes a new note (named by the filter text, if any). */
+function NotesDialog() {
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => inputRef.current?.focus(), []);
+  const here = hereIds.value;
+  const now = Date.now();
+  const hits = useNoteHits(q);
+  const rows = useMemo(() => {
+    const query = q.trim();
+    const all = [...notes.value.values()].sort((a, b) => b.updated_at - a.updated_at || b.id - a.id);
+    if (!query) return all.map((n) => ({ n, line: null as string | null }));
+    return all.map((n) => ({ n, line: hits.get(n.id) ?? null }))
+      .filter(({ n, line }) => line !== null || fuzzy(query, n.title) !== null);
+  }, [q, hits, notes.value]);
+  const optionId = (id: number) => `note-opt-${id}`;
+  useEffect(() => setSel((s) => Math.min(s, Math.max(0, rows.length - 1))), [rows.length]);
+  useEffect(() => {
+    listRef.current?.querySelector(".sw-item.sel")?.scrollIntoView({ block: "nearest" });
+  }, [sel]);
+
+  const open = (n: NoteInfo) => {
+    overlay.value = null;
+    A.gotoNote(n.id);
+  };
+  const create = () => {
+    const title = q.trim();
+    overlay.value = null;
+    A.newNote(undefined, title);
+  };
+  const remove = (n: NoteInfo) => A.deleteNoteAsk(n.id, () => (overlay.value = { kind: "notes" }));
+
+  const onKey = (e: KeyboardEvent) => {
+    const n = Math.max(1, rows.length);
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      create();
+    } else if (e.key === "ArrowDown" || (e.key === "n" && e.ctrlKey)) {
+      e.preventDefault();
+      setSel((sel + 1) % n);
+    } else if (e.key === "ArrowUp" || (e.key === "p" && e.ctrlKey)) {
+      e.preventDefault();
+      setSel((sel - 1 + n) % n);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (rows[sel]) open(rows[sel].n);
+    } else if (e.key === "Delete" && e.shiftKey && rows[sel]) {
+      e.preventDefault();
+      remove(rows[sel].n);
+    }
+  };
+
+  return (
+    <Modal class="switcher notes-list" label="Notes">
+      <div class="sw-input-row">
+        <span class="sw-mode">Notes</span>
+        <input
+          ref={inputRef}
+          class="sw-input"
+          value={q}
+          placeholder="Find a note by its name or its text…"
+          spellcheck={false}
+          aria-label="Find a note"
+          role="combobox"
+          aria-expanded="true"
+          aria-autocomplete="list"
+          aria-controls="notes-listbox"
+          aria-activedescendant={rows[sel] ? optionId(rows[sel].n.id) : undefined}
+          onInput={(e) => setQ((e.target as HTMLInputElement).value)}
+          onKeyDown={onKey}
+        />
+        <button type="button" class="btn btn-sm notes-new" onClick={create} data-tip="New note" data-keys="Ctrl+Enter">
+          <IconPlus size={13} /> New note
+        </button>
+      </div>
+      <div class="sw-list" ref={listRef} role="listbox" id="notes-listbox" aria-label="Notes">
+        {rows.length === 0 && (
+          <div class="sw-empty">
+            {notes.value.size === 0
+              ? "No notes yet. A note is plain text you and your agents share: they read it and add to it."
+              : "No matches"}
+          </div>
+        )}
+        {rows.map(({ n, line }, i) => (
+          <div
+            key={n.id}
+            id={optionId(n.id)}
+            role="option"
+            aria-selected={i === sel}
+            aria-label={`${n.title}, ${line ? `matches “${line}”` : n.preview || "empty"}, ${noteWhere(n, here)}, edited by ${authorName(n.updated_by)}, ${ago(n.updated_at, now) === "now" ? "just now" : `${ago(n.updated_at, now)} ago`}`}
+            class={cx("sw-item", "note-row", i === sel && "sel")}
+            onMouseMove={() => i !== sel && setSel(i)}
+            onClick={(e) => {
+              if (!(e.target as HTMLElement).closest("button")) open(n);
+            }}
+          >
+            <span class="sw-icon"><IconNote size={14} /></span>
+            <span class="sw-label">{n.title}</span>
+            <span class="sw-sub">
+              {line ? `“${line}”` : (n.preview.slice(0, 80) || "empty")}
+            </span>
+            <span class="sw-right">
+              <span class="sw-detail">{noteWhere(n, here)} · {authorName(n.updated_by)} · {ago(n.updated_at, now)}</span>
+              <button
+                type="button"
+                class="ap-icon-btn note-del"
+                tabIndex={-1}
+                aria-label={`Delete ${n.title} (Shift+Delete)`}
+                data-tip="Delete note…"
+                data-keys="Shift+Delete"
+                onClick={() => remove(n)}
+              >
+                <IconTrash size={13} />
+              </button>
+            </span>
+          </div>
+        ))}
+      </div>
+      <div class="sw-foot">
+        <span><kbd>⏎</kbd> open here</span>
+        <span><kbd>Ctrl</kbd><kbd>⏎</kbd> new note</span>
+        <span><kbd>Shift</kbd><kbd>Del</kbd> delete</span>
+        <span><kbd>esc</kbd> close</span>
+        <span class="sw-foot-note">Closing a note's tab keeps the note</span>
+      </div>
+    </Modal>
+  );
+}
 
 function RenameWindow() {
   const w = myWindow.value;

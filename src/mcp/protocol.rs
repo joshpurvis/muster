@@ -38,7 +38,9 @@ const INSTRUCTIONS: &str = "muster runs many coding agents and shells side by si
 (one task each, usually its own git worktree). You are one of those sessions. Use whoami to orient, \
 list_channels/list_sessions to see what's running, spawn_session to delegate, send_message + wait_for_state \
 to drive another agent, read_screen/get_recent_output to inspect it, post_to_channel to tell the human \
-something, and get_diff to review work. You cannot approve permission prompts; the human does that.";
+something, and get_diff to review work. Notes (note_list, note_read, note_write, note_append, note_open) are \
+plain-text notes the human and every agent share: append to add without conflicts; a full write needs the rev \
+from note_read. You cannot approve permission prompts; the human does that.";
 
 /// The HTTP headers we look at, already extracted (case-insensitively) by the caller.
 #[derive(Debug, Default, Clone)]

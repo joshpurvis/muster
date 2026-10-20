@@ -12,6 +12,7 @@
 import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
 import { panelChecks } from "./e2e_panels.ts";
+import { noteChecks } from "./e2e_notes.ts";
 import { panelApps } from "./panel_apps_e2e.ts";
 
 const [url, shots, repo, mode] = Deno.args;
@@ -1218,6 +1219,9 @@ try {
     await guard(a);
     ok("Ctrl+Shift+R reloaded the window");
   }
+
+  // ---- notes (dev/e2e_notes.ts)
+  if (!real) await noteChecks(a, { shots, ok, check });
 
   // ---- agent panels (dev/e2e_panels.ts)
   if (!real) await panelChecks(a, { url, shots, hello, ok, check });

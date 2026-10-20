@@ -3988,3 +3988,85 @@ body.dragging .panel-view { pointer-events: none; }
 @media (prefers-reduced-motion: reduce) { .pv-spin { animation: none; } }
 .preview-frame { background: #fff; }
 .preview-status-url { font-family: var(--font-mono); overflow-wrap: anywhere; }
+
+/* ---------- notes (docs/UI.md "Notes") ---------- */
+.note-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--term-bg);
+}
+.note-view[hidden] { display: none; }
+.note-view.note-missing {
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.note-text {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  border: 0 !important;
+  border-radius: 0 !important;
+  outline: none;
+  box-shadow: none !important;
+  background: transparent !important;
+  color: var(--term-fg);
+  caret-color: var(--term-cursor);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  tab-size: 4;
+  padding: 12px 16px 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-y: auto;
+}
+.note-text::selection { background: var(--term-selection); }
+.note-text::placeholder { color: var(--text-faint); }
+.note-merge {
+  flex: none;
+  padding: 6px 14px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+  background: var(--attn-bg);
+  border-top: 1px solid var(--attn-border);
+}
+.note-status {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 24px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-1);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+.note-state { color: var(--text-muted); }
+.note-state.busy { color: var(--accent-strong); }
+.note-state.err { color: var(--st-error); }
+.note-by { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.note-spacer { flex: 1; }
+@container (max-width: 420px) {
+  .note-size { display: none; }
+  .note-text { padding: 10px 12px 12px; }
+}
+.notes-list .sw-item { height: auto; min-height: 40px; padding-top: 4px; padding-bottom: 4px; }
+.notes-list .sw-label { flex: 0 0 auto; max-width: 40%; }
+.notes-list .sw-right { gap: 6px; }
+.notes-list .note-del { margin-left: 2px; opacity: 0; }
+.notes-list .sw-item.sel .note-del, .notes-list .note-del:focus-visible { opacity: 1; }
+.notes-new { flex: none; display: inline-flex; align-items: center; gap: 5px; }
+@media (max-width: 760px) {
+  .notes-list .sw-detail { display: none; }
+  .notes-list .note-del { opacity: 1; }
+}

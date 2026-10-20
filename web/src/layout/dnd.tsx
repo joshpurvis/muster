@@ -8,7 +8,7 @@ import { type DropZone, isNoopMove, splitFits } from "./tree.ts";
 import { layout } from "../state.ts";
 import { dropTab, moveTabToWindow, revealSession } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
-import { IconPanel, KindIcon } from "../icons.tsx";
+import { IconNote, IconPanel, KindIcon } from "../icons.tsx";
 
 export interface Target {
   paneId: string;
@@ -23,7 +23,7 @@ export interface Target {
 interface DragState {
   sid: number;
   label: string;
-  kind: SessionInfo["kind"] | "panel";
+  kind: SessionInfo["kind"] | "panel" | "note";
   x: number;
   y: number;
   target: Target | null;
@@ -221,7 +221,7 @@ function Ghost({ x, y, kind, label }: { x: number; y: number; kind: DragState["k
   top = Math.max(4, Math.min(top, innerHeight - size.h - 4));
   return (
     <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
-      {kind === "panel" ? <IconPanel size={13} /> : <KindIcon kind={kind} size={13} />}
+      {kind === "panel" ? <IconPanel size={13} /> : kind === "note" ? <IconNote size={13} /> : <KindIcon kind={kind} size={13} />}
       <span>{label}</span>
     </div>
   );

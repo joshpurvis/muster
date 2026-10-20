@@ -8,6 +8,64 @@ pub type ChannelId = i64;
 pub type SessionId = u32;
 pub type WindowId = i64;
 pub type PanelId = i64;
+pub type NoteId = i64;
+
+/// Who last changed a note's text (docs/PROTOCOL.md "Notes").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAuthor {
+    /// "human" (the UI, or the CLI outside a session or in a shell tab) or "agent".
+    pub kind: String,
+    /// An agent's name: a named agent's own, else "Claude (task name)".
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+impl NoteAuthor {
+    pub fn human() -> Self { NoteAuthor { kind: "human".into(), name: None, session_id: None } }
+}
+
+/// A plain-text note shared by the human and agents (src/notes.rs). The daemon holds the text;
+/// `rev` counts changes to `body` (a rename or a move doesn't change it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub id: NoteId,
+    pub title: String,
+    pub body: String,
+    pub rev: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub updated_by: NoteAuthor,
+    /// The window showing the note's tab; None while it is closed (shown nowhere).
+    pub window_id: Option<WindowId>,
+    /// `note_open`: the session to show it beside when it first appears in its window.
+    pub beside: Option<SessionId>,
+    /// Raised by every change (text, title, window), so clients can tell a newer record from an
+    /// older one whatever changed.
+    pub version: i64,
+}
+
+/// A note without its text (`hello.notes`, `note.list`, `note_list`): bounded however many
+/// notes there are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteSummary {
+    pub id: NoteId,
+    pub title: String,
+    pub rev: i64,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub updated_by: NoteAuthor,
+    pub window_id: Option<WindowId>,
+    pub beside: Option<SessionId>,
+    pub open: bool,
+    /// Size of the text in bytes of UTF-8, and its lines.
+    pub bytes: i64,
+    pub lines: i64,
+    /// The first non-blank line, trimmed, at most 120 characters.
+    pub preview: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

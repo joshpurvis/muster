@@ -10,7 +10,7 @@ import {
   type SplitNode,
   topRightPane,
 } from "./tree.ts";
-import { updateLayout } from "../state.ts";
+import { fullscreen, shownAlone, updateLayout } from "../state.ts";
 import { Group } from "./Pane.tsx";
 import { cx } from "../util.ts";
 
@@ -18,11 +18,13 @@ const MIN_PX = 120;
 const GUTTER = 1; // visible px; hit area is widened in CSS
 
 export function SplitView({ layout }: { layout: LayoutState }) {
-  // Hide other groups during zoom without unmounting apps or losing their local state.
-  const corner = layout.zoom ?? topRightPane(layout.root);
+  // Hide other groups during zoom (or fullscreen, which shows one group alone the same way)
+  // without unmounting apps or losing their local state.
+  const zoom = shownAlone.value;
+  const corner = zoom ?? topRightPane(layout.root);
   return (
     <div class="split-root">
-      <Node node={layout.root} path={[]} focus={layout.focus} corner={corner} zoom={layout.zoom} />
+      <Node node={layout.root} path={[]} focus={layout.focus} corner={corner} zoom={zoom} />
     </div>
   );
 }
@@ -31,11 +33,13 @@ function Node(
   { node, path, focus, corner, zoom }: { node: Layout; path: number[]; focus: string; corner: string; zoom: string | null },
 ) {
   if (node.type === "pane") {
+    const full = fullscreen.value === node.id;
     return (
       <Group
         pane={node}
         focused={node.id === focus}
-        zoomed={node.id === zoom}
+        zoomed={node.id === zoom && !full}
+        fullscreen={full}
         multi={path.length > 0}
         controls={node.id === corner}
       />
@@ -52,11 +56,14 @@ function Split(
   for (let i = 0; i < node.children.length; i++) {
     const c = node.children[i];
     const key = c.type === "pane" ? c.id : "s" + i + ":" + firstPaneId(c);
+    // A group shown alone takes the whole box: its siblings are hidden, and its own share
+    // (a fraction below 1) would otherwise leave the rest of the box empty.
+    const hidden = !!zoom && !findPane(c, zoom);
     out.push(
       <div
         key={key}
         class="split-child"
-        style={{ flex: `${node.sizes[i]} 1 0px`, display: zoom && !findPane(c, zoom) ? "none" : undefined }}
+        style={{ flex: zoom ? "1 1 0px" : `${node.sizes[i]} 1 0px`, display: hidden ? "none" : undefined }}
       >
         <Node node={c} path={[...path, i]} focus={focus} corner={corner} zoom={zoom} />
       </div>,

@@ -1264,6 +1264,10 @@ button.sl-item:hover {
   box-shadow: inset 0 0 0 1px var(--pane-focus-ring);
 }
 
+.split .pane.fullscreen::after {
+  box-shadow: none;
+}
+
 .split .pane.focused .tabstrip {
   background: var(--bg-2);
 }
@@ -3845,6 +3849,28 @@ textarea {
 .panel-strip .ps-live.err::before { background: var(--st-error); }
 .panel-strip .ps-lock { display: inline-flex; align-items: center; gap: 4px; }
 @container (max-width: 460px) { .panel-strip .ps-who, .panel-strip .ps-sep, .panel-strip .ps-lock { display: none; } }
+/* Fullscreen (Alt+Shift+Z): one group's visible tab fills the window. Its tab strip is not
+   drawn; the agents panel and the status line stay mounted but hidden. A panel keeps its strip,
+   whose last button goes back; a terminal gets a small button in its top-right corner. */
+.panel-strip .ps-full, .preview-bar .ps-full {
+  flex: none; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 22px;
+  margin-right: -6px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-faint); cursor: pointer;
+}
+.preview-bar .ps-full { width: 28px; height: 28px; margin: 0; border-radius: 8px; }
+.ps-full:hover { background: var(--hover-strong); color: var(--text); }
+.ps-full.on { color: var(--accent-strong); }
+.ps-full:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.app.fullscreen .agents-panel, .app.fullscreen .statusline { display: none; }
+.fs-exit {
+  position: absolute; top: 6px; right: 6px; z-index: 5; display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 24px; padding: 0; border: 0; border-radius: 6px; cursor: pointer;
+  /* Quiet but readable: text-faint is about 5.5:1 (dark) and 6:1 (light) on the terminal. */
+  color: var(--text-faint); background: color-mix(in srgb, var(--bg-2) 85%, transparent); box-shadow: inset 0 0 0 1px var(--border);
+  transition: color 140ms, background 140ms;
+}
+.fs-exit:hover, .fs-exit:focus-visible { color: var(--text); background: var(--bg-2); }
+.fs-exit:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (prefers-reduced-motion: reduce) { .fs-exit { transition: none; } }
 .panel-body { flex: 1; min-height: 0; position: relative; }
 .panel-frame-host { position: absolute; inset: 0; }
 .panel-frame { display: block; width: 100%; height: 100%; border: 0; }

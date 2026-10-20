@@ -537,20 +537,26 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 .stage-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
 /* The soft stage: a faint wash of the accent over the sunken surface, and an inner keyline. */
 .img-stage {
-  flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
+  position: relative; flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; padding: 28px; border-radius: 12px;
   background: radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--mk-accent) 7%, transparent), transparent 60%), var(--mk-sunken);
   box-shadow: inset 0 0 0 1px var(--mk-line);
 }
 .img-stage img {
-  margin: auto; display: block; border-radius: 8px; cursor: zoom-in;
+  margin: auto; display: block; flex: none; border-radius: 8px; cursor: zoom-in;
   background: repeating-conic-gradient(#8881 0 25%, transparent 0 50%) 0 0 / 16px 16px;
   box-shadow: 0 1px 0 rgba(255, 255, 255, .06) inset, 0 24px 60px -18px rgba(0, 0, 0, .55), 0 0 0 1px var(--mk-line-2);
 }
 [data-theme="light"] .img-stage img { box-shadow: 0 24px 60px -22px rgba(20, 20, 40, .35), 0 0 0 1px var(--mk-line-2); }
-.img-stage.fit img { max-width: 100%; max-height: 100%; object-fit: contain; }
-.img-stage.actual img { max-width: none; max-height: none; flex: none; cursor: zoom-out; }
+/* Until the picture has loaded (and the viewer sizes it), it fits by CSS. */
+.img-stage:not(.sized) img { flex: 0 1 auto; max-width: 100%; max-height: 100%; object-fit: contain; }
+.img-stage:is(.actual, .zoomed) img { cursor: zoom-out; }
+.img-stage.can-pan img { cursor: grab; }
+.img-stage.panning, .img-stage.panning img { cursor: grabbing; user-select: none; }
 .img-stage .error { margin: auto; }
-.img-tools { position: absolute; top: 12px; right: 12px; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-tools { position: absolute; top: 12px; right: 12px; max-width: calc(100% - 24px); flex-wrap: wrap; background: color-mix(in srgb, var(--mk-raised) 92%, transparent); }
+.img-tools button { min-width: 28px; display: inline-flex; align-items: center; justify-content: center; font-variant-numeric: tabular-nums; }
+.img-tools button svg { width: 14px; height: 14px; }
+.img-tools button[aria-disabled="true"] { opacity: .4; cursor: default; }
 .img-zoom {
   position: absolute; left: 12px; bottom: 12px; font: 600 11px var(--mk-mono); color: var(--mk-text-2);
   background: color-mix(in srgb, var(--mk-raised) 88%, transparent); padding: 4px 8px; border-radius: 6px; box-shadow: inset 0 0 0 1px var(--mk-line-2);
@@ -563,6 +569,7 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 @media (max-width: 520px) {
   .img-stage { padding: 12px; }
   .img-tools { top: 8px; right: 8px; }
+  .img-tools button { padding: 0 7px; }
 }
 </style></head><body><main id="app"></main>
 <script>
@@ -597,9 +604,9 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
     if (c.theme === "light" || c.theme === "dark") document.documentElement.dataset.theme = c.theme;
     const vars = c.styles?.variables;
     if (vars && typeof vars === "object") {
-      for (const [k, v] of Object.entries(vars)) {
-        if (/^--[a-z0-9-]{1,60}$/.test(k) && typeof v === "string" && v.length < 300) {
-          document.documentElement.style.setProperty(k, v);
+      for (const [k, v2] of Object.entries(vars)) {
+        if (/^--[a-z0-9-]{1,60}$/.test(k) && typeof v2 === "string" && v2.length < 300) {
+          document.documentElement.style.setProperty(k, v2);
         }
       }
     }
@@ -659,26 +666,31 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
     });
   }
   function typing(event) {
-    const t = event.target;
-    if (!t) return false;
-    if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
-    return t.tagName === "INPUT" && ![
-      "checkbox",
-      "radio",
-      "button",
-      "submit",
-      "reset",
-      "range",
-      "color"
-    ].includes(t.type);
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [
+      event.target
+    ];
+    return path.some((n) => {
+      const t = n;
+      if (!t || typeof t.tagName !== "string") return false;
+      if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+      return t.tagName === "INPUT" && ![
+        "checkbox",
+        "radio",
+        "button",
+        "submit",
+        "reset",
+        "range",
+        "color"
+      ].includes(t.type);
+    });
   }
 
   // src/panels/apps/shared/dom.ts
   function fill(el, attrs, children) {
-    for (const [k, v] of Object.entries(attrs ?? {})) {
-      if (v === null || v === void 0 || v === false) continue;
-      if (k.startsWith("on") && typeof v === "function") el.addEventListener(k.slice(2), v);
-      else el.setAttribute(k, v === true ? "" : String(v));
+    for (const [k, v2] of Object.entries(attrs ?? {})) {
+      if (v2 === null || v2 === void 0 || v2 === false) continue;
+      if (k.startsWith("on") && typeof v2 === "function") el.addEventListener(k.slice(2), v2);
+      else el.setAttribute(k, v2 === true ? "" : String(v2));
     }
     const add = (c) => {
       if (c === null || c === void 0 || c === false) return;
@@ -702,103 +714,500 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
     }, h("strong", null, title), h("ul", null, errors.slice(0, 20).map((e) => h("li", null, e))), errors.length > 20 ? h("p", null, `\u2026and ${errors.length - 20} more`) : null));
   }
 
+  // src/panels/kit/icons.ts
+  var ICONS = {
+    check: "M20 6 9 17l-5-5",
+    x: "M18 6 6 18M6 6l12 12",
+    alert: "M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
+    info: "M12 16v-4m0-4h.01M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z",
+    clock: "M12 6v6l4 2M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0z",
+    refresh: "M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5",
+    external: "M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
+    branch: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9",
+    merge: "M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21V9a9 9 0 0 0 9 9",
+    search: "m21 21-4.3-4.3M19 11a8 8 0 1 1-16 0 8 8 0 0 1 16 0z",
+    rocket: "M4.5 16.5c-1.5 1.3-2 5-2 5s3.7-.5 5-2c.7-.8.7-2.1-.1-2.9a2.2 2.2 0 0 0-2.9-.1zM12 15l-3-3a22 22 0 0 1 2-4 12.9 12.9 0 0 1 11-6c0 2.7-.8 7.5-6 11a22 22 0 0 1-4 2zM9 12H4s.6-3 2-4c1.6-1.1 5 0 5 0M12 15v5s3-.6 4-2c1.1-1.6 0-5 0-5",
+    undo: "M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11",
+    shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4",
+    zap: "M13 2 3 14h9l-1 8 10-12h-9l1-8z",
+    play: "M6 3l14 9-14 9V3z",
+    pause: "M6 4h4v16H6zM14 4h4v16h-4z",
+    dot: "M12 12h.01",
+    chart: "M3 3v18h18M7 15l4-4 3 3 6-6",
+    table: "M3 3h18v18H3zM3 9h18M3 15h18M9 3v18",
+    image: "M3 3h18v18H3zM8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3zM21 15l-5-5L5 21",
+    doc: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h6",
+    pr: "M18 15V8a3 3 0 0 0-3-3h-3M15 2l-3 3 3 3M6 9v12M6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+    globe: "M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0zM2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20",
+    lock: "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4",
+    server: "M3 4h18v7H3zM3 13h18v7H3zM7 7.5h.01M7 16.5h.01",
+    db: "M4 6c0 1.7 3.6 3 8 3s8-1.3 8-3-3.6-3-8-3-8 1.3-8 3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3",
+    dollar: "M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6",
+    flask: "M9 3h6M10 3v6L4.5 19a1.5 1.5 0 0 0 1.3 2h12.4a1.5 1.5 0 0 0 1.3-2L14 9V3M7 15h10",
+    sparkle: "M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z",
+    plus: "M12 5v14M5 12h14",
+    minus: "M5 12h14",
+    arrowUp: "M12 19V5M5 12l7-7 7 7",
+    arrowDown: "M12 5v14M19 12l-7 7-7-7",
+    arrowRight: "M5 12h14M12 5l7 7-7 7",
+    chevron: "m6 9 6 6 6-6",
+    maximize: "M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7",
+    eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
+    flag: "M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7",
+    users: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8",
+    terminal: "m4 17 6-6-6-6M12 19h8",
+    copy: "M9 9h12v12H9zM5 15H3V3h12v2",
+    filter: "M22 3H2l8 9.5V19l4 2v-8.5z",
+    sort: "M3 6h18M6 12h12M10 18h4",
+    help: "M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0zM9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"
+  };
+  var warned = /* @__PURE__ */ new Set();
+  function icon(name, cls = "") {
+    if (!Object.hasOwn(ICONS, name) && !warned.has(name)) {
+      warned.add(name);
+      console.warn(`[mk] unknown icon "${name}"; known: ${Object.keys(ICONS).join(", ")}`);
+    }
+    const d = Object.hasOwn(ICONS, name) ? ICONS[name] : ICONS.help;
+    return `<svg${cls ? ` class="${cls.replace(/[^\w -]/g, "")}"` : ""} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
+  }
+  function iconEl(name, cls = "") {
+    const t = document.createElement("template");
+    t.innerHTML = icon(name, cls);
+    return t.content.firstElementChild;
+  }
+
+  // src/panels/apps/shared/zoom.ts
+  var ZOOM_STEPS = [
+    0.05,
+    0.1,
+    0.15,
+    0.2,
+    0.25,
+    0.33,
+    0.5,
+    0.67,
+    0.75,
+    0.9,
+    1,
+    1.25,
+    1.5,
+    2,
+    3,
+    4,
+    6,
+    8,
+    12,
+    16
+  ];
+  function zoomLimits(fit) {
+    return [
+      Math.min(ZOOM_STEPS[0], fit),
+      Math.max(ZOOM_STEPS[ZOOM_STEPS.length - 1], fit)
+    ];
+  }
+  function clampZoom(scale, fit) {
+    const [lo, hi] = zoomLimits(fit);
+    return Math.min(hi, Math.max(lo, scale));
+  }
+  function stepZoom(scale, dir, fit) {
+    const steps = [
+      .../* @__PURE__ */ new Set([
+        ...ZOOM_STEPS,
+        fit
+      ])
+    ].sort((a, b) => a - b);
+    const next = dir > 0 ? steps.find((s) => s > scale * 1.001) : [
+      ...steps
+    ].reverse().find((s) => s < scale / 1.001);
+    return clampZoom(next ?? scale, fit);
+  }
+  function fitScale(w, h2, boxW, boxH, upscale = false) {
+    if (!(w > 0 && h2 > 0 && boxW > 0 && boxH > 0)) return 1;
+    const s = Math.min(boxW / w, boxH / h2);
+    return upscale ? s : Math.min(1, s);
+  }
+  function anchoredScroll(scroll, anchor, offOld, offNew, s0, s1) {
+    const at = (scroll + anchor - offOld) / s0;
+    return Math.max(0, offNew + at * s1 - anchor);
+  }
+  var UNIT = {
+    "": 1,
+    px: 1,
+    pt: 4 / 3,
+    pc: 16,
+    in: 96,
+    cm: 96 / 2.54,
+    mm: 96 / 25.4
+  };
+  function length(v2) {
+    const m = v2 ? /^\s*([0-9]*\.?[0-9]+)\s*(px|pt|pc|in|cm|mm)?\s*$/i.exec(v2) : null;
+    if (!m) return null;
+    const n = Number(m[1]) * UNIT[(m[2] ?? "").toLowerCase()];
+    return n > 0 ? n : null;
+  }
+  function svgSize(text) {
+    const tag = /<svg\b[^>]*>/i.exec(text)?.[0];
+    if (!tag) return null;
+    const attr = (name) => new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i").exec(tag)?.slice(2).find((x) => x !== void 0);
+    const w = length(attr("width")), h2 = length(attr("height"));
+    const vb = attr("viewBox")?.trim().split(/[\s,]+/).map(Number);
+    const vw = vb && vb.length === 4 && vb[2] > 0 ? vb[2] : null, vh = vb && vb.length === 4 && vb[3] > 0 ? vb[3] : null;
+    if (w && h2) return {
+      w,
+      h: h2,
+      sized: true
+    };
+    if (w && vw && vh) return {
+      w,
+      h: w * vh / vw,
+      sized: true
+    };
+    if (h2 && vw && vh) return {
+      w: h2 * vw / vh,
+      h: h2,
+      sized: true
+    };
+    if (vw && vh) return {
+      w: vw,
+      h: vh,
+      sized: false
+    };
+    return null;
+  }
+  function svgFromDataUri(src) {
+    const m = /^data:image\/svg\+xml(;[^,]*)?,(.*)$/s.exec(src);
+    if (!m) return null;
+    try {
+      return (m[1] ?? "").includes(";base64") ? new TextDecoder().decode(Uint8Array.from(atob(m[2]), (c) => c.charCodeAt(0))) : decodeURIComponent(m[2]);
+    } catch {
+      return null;
+    }
+  }
+
+  // src/panels/apps/shared/viewer.ts
+  var freshView = () => ({
+    fit: true,
+    scale: 1,
+    left: 0,
+    top: 0
+  });
+  var near = (a, b) => Math.abs(a - b) < 5e-4;
+  function viewer(img, state, opts) {
+    const stage = h("div", {
+      class: opts.stageClass,
+      tabindex: "0",
+      "aria-label": opts.label
+    }, img);
+    img.draggable = false;
+    const readout = h("span", {
+      class: "zoom-readout",
+      "aria-hidden": "true"
+    });
+    const live = h("span", {
+      class: "mk-sr",
+      role: "status",
+      "aria-live": "polite"
+    });
+    let liveTimer = 0;
+    const announce = () => {
+      clearTimeout(liveTimer);
+      liveTimer = setTimeout(() => {
+        live.textContent = state.fit ? `Fit, ${readout.textContent}` : `Zoom ${readout.textContent}`;
+      }, 400);
+    };
+    const btn = (id, label, keys, content, run) => h("button", {
+      type: "button",
+      id,
+      title: `${label} (${keys})`,
+      "aria-label": label,
+      "aria-keyshortcuts": keys,
+      onclick: run
+    }, ...content);
+    const outBtn = btn(opts.ids.zoomOut, "Zoom out", "-", [
+      iconEl("minus")
+    ], () => zoom(stepZoom(scale(), -1, fitNow())));
+    const inBtn = btn(opts.ids.zoomIn, "Zoom in", "+", [
+      iconEl("plus")
+    ], () => zoom(stepZoom(scale(), 1, fitNow())));
+    const fitBtn = btn(opts.ids.fit, "Fit", "0", [
+      "Fit"
+    ], () => fit());
+    const actualBtn = btn(opts.ids.actual, "Actual size", "1", [
+      "100%"
+    ], () => zoom(1));
+    const controls = h("div", {
+      class: "mk-seg zoom-tools",
+      role: "group",
+      "aria-label": "Zoom"
+    }, outBtn, inBtn, fitBtn, actualBtn, live);
+    let natural = null;
+    const measure = () => {
+      if (!img.naturalWidth && !img.naturalHeight) return null;
+      const text = svgFromDataUri(img.currentSrc || img.src);
+      const s = text ? svgSize(text) : null;
+      if (s) return {
+        w: s.w,
+        h: s.h,
+        upscale: !s.sized
+      };
+      const svgUrl = /\.svg(\?|#|$)/i.test(img.src) || img.src.startsWith("data:image/svg");
+      return {
+        w: img.naturalWidth || 300,
+        h: img.naturalHeight || 150,
+        upscale: svgUrl
+      };
+    };
+    const box = () => {
+      const cs = getComputedStyle(stage);
+      return [
+        stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight),
+        stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom)
+      ];
+    };
+    const fitNow = () => natural ? fitScale(natural.w, natural.h, ...box(), natural.upscale) : 1;
+    const scale = () => state.fit ? fitNow() : state.scale;
+    const overflowing = () => stage.scrollWidth > stage.clientWidth + 1 || stage.scrollHeight > stage.clientHeight + 1;
+    const paint = () => {
+      if (!natural) return;
+      const s = scale();
+      img.style.width = `${natural.w * s}px`;
+      img.style.height = `${natural.h * s}px`;
+      const over = overflowing();
+      stage.classList.add("sized");
+      stage.classList.toggle("fit", state.fit);
+      stage.classList.toggle("actual", !state.fit && near(s, 1));
+      stage.classList.toggle("zoomed", !state.fit && !near(s, 1));
+      stage.classList.toggle("can-pan", over);
+      stage.dataset.scale = s.toFixed(4);
+      readout.textContent = `${Math.round(s * 100)}%`;
+      fitBtn.setAttribute("aria-pressed", String(state.fit));
+      actualBtn.setAttribute("aria-pressed", String(near(s, 1)));
+      const [lo, hi] = [
+        clampZoom(0, fitNow()),
+        clampZoom(Infinity, fitNow())
+      ];
+      outBtn.setAttribute("aria-disabled", String(s <= lo * 1.001));
+      inBtn.setAttribute("aria-disabled", String(s >= hi / 1.001));
+    };
+    const zoom = (next, anchor) => {
+      if (!natural) return;
+      const s0 = scale(), s1 = clampZoom(next, fitNow());
+      const ax = anchor?.x ?? stage.clientWidth / 2, ay = anchor?.y ?? stage.clientHeight / 2;
+      const [sl, st, ox, oy] = [
+        stage.scrollLeft,
+        stage.scrollTop,
+        img.offsetLeft,
+        img.offsetTop
+      ];
+      state.fit = false;
+      state.scale = s1;
+      paint();
+      stage.scrollLeft = anchoredScroll(sl, ax, ox, img.offsetLeft, s0, s1);
+      stage.scrollTop = anchoredScroll(st, ay, oy, img.offsetTop, s0, s1);
+      paint();
+      announce();
+      opts.onChange?.();
+    };
+    const fit = () => {
+      state.fit = true;
+      paint();
+      announce();
+      opts.onChange?.();
+    };
+    const toggle = (anchor) => {
+      if (!state.fit) return fit();
+      const f = fitNow();
+      zoom(near(f, 1) || f > 1 ? f * 2 : 1, anchor);
+    };
+    const at = (e) => {
+      const r = stage.getBoundingClientRect();
+      return {
+        x: e.clientX - r.left - stage.clientLeft,
+        y: e.clientY - r.top - stage.clientTop
+      };
+    };
+    img.addEventListener("load", () => {
+      natural = measure();
+      paint();
+      if (!state.fit) {
+        stage.scrollLeft = state.left;
+        stage.scrollTop = state.top;
+      }
+    });
+    stage.addEventListener("scroll", () => {
+      state.left = stage.scrollLeft;
+      state.top = stage.scrollTop;
+    }, {
+      passive: true
+    });
+    stage.addEventListener("wheel", (e) => {
+      if (!(e.ctrlKey || e.metaKey) || !natural) return;
+      e.preventDefault();
+      const rate = e.deltaMode === 1 ? 0.05 : e.deltaMode === 2 ? 1 : 25e-4;
+      zoom(scale() * Math.exp(-e.deltaY * rate), at(e));
+    }, {
+      passive: false
+    });
+    let drag = null;
+    stage.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || controls.contains(e.target)) return;
+      drag = {
+        x: e.clientX,
+        y: e.clientY,
+        id: e.pointerId,
+        moved: false,
+        onImg: e.target === img
+      };
+    });
+    stage.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id || !(e.buttons & 1)) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) <= 3) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        if (overflowing()) {
+          stage.setPointerCapture(e.pointerId);
+          stage.classList.add("panning");
+        }
+      }
+      if (stage.classList.contains("panning")) stage.scrollBy(-dx, -dy);
+      drag.x = e.clientX;
+      drag.y = e.clientY;
+    });
+    const end = (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const click = !drag.moved && drag.onImg && e.type === "pointerup";
+      drag = null;
+      stage.classList.remove("panning");
+      if (click) toggle(at(e));
+    };
+    stage.addEventListener("pointerup", end);
+    stage.addEventListener("pointercancel", end);
+    const resize = new ResizeObserver(() => paint());
+    resize.observe(stage);
+    return {
+      stage,
+      controls,
+      readout,
+      overflowing,
+      key(e) {
+        if (typing(e) || e.altKey || !natural) return false;
+        const mod = e.ctrlKey || e.metaKey;
+        const k = e.key;
+        if (k === "+" || k === "=") zoom(stepZoom(scale(), 1, fitNow()));
+        else if (k === "-" || k === "_") zoom(stepZoom(scale(), -1, fitNow()));
+        else if (k === "0") fit();
+        else if (k === "1" && !mod) zoom(1);
+        else if ((k === "z" || k === "Z") && !mod) toggle();
+        else return false;
+        e.preventDefault();
+        return true;
+      },
+      destroy() {
+        resize.disconnect();
+        clearTimeout(liveTimer);
+      }
+    };
+  }
+
   // src/panels/apps/shared/validate.ts
-  function chars(v) {
-    if (v.length < 2) return v.length;
+  function chars(v2) {
+    if (v2.length < 2) return v2.length;
     let n = 0;
-    for (const _ of v) n++;
+    for (const _ of v2) n++;
     return n;
   }
-  var fits = (v, max) => v.length <= max || chars(v) <= max;
+  var fits = (v2, max) => v2.length <= max || chars(v2) <= max;
   var Problems = class {
     errors = [];
     warnings = [];
     add(path, text) {
       this.errors.push(`${path}: ${text}`);
     }
-    object(v, path) {
-      if (v && typeof v === "object" && !Array.isArray(v)) return v;
+    object(v2, path) {
+      if (v2 && typeof v2 === "object" && !Array.isArray(v2)) return v2;
       this.add(path, "must be an object");
       return void 0;
     }
     /** Optional unless `required`; returns undefined when absent or wrong. */
     string(o, key, path, opt = {}) {
-      const v = o[key];
+      const v2 = o[key];
       const at = path ? `${path}.${key}` : key;
-      if (v === void 0 || v === null) {
+      if (v2 === void 0 || v2 === null) {
         if (opt.required) this.add(at, "is required");
         return void 0;
       }
-      if (typeof v !== "string") {
+      if (typeof v2 !== "string") {
         this.add(at, "must be a string");
         return void 0;
       }
-      if ((opt.nonEmpty ?? opt.required) && !v.trim()) {
+      if ((opt.nonEmpty ?? opt.required) && !v2.trim()) {
         this.add(at, "must not be empty");
         return void 0;
       }
       const max = opt.max ?? 1e4;
-      if (!fits(v, max)) {
+      if (!fits(v2, max)) {
         this.add(at, `is longer than ${max} characters`);
         return void 0;
       }
-      return v;
+      return v2;
     }
     oneOf(o, key, path, options, required = false) {
-      const v = o[key];
+      const v2 = o[key];
       const at = path ? `${path}.${key}` : key;
-      if (v === void 0 || v === null) {
+      if (v2 === void 0 || v2 === null) {
         if (required) this.add(at, `is required (one of ${options.join(", ")})`);
         return void 0;
       }
-      if (typeof v !== "string" || !options.includes(v)) {
-        this.add(at, `must be one of ${options.join(", ")} (got ${JSON.stringify(v)?.slice(0, 40)})`);
+      if (typeof v2 !== "string" || !options.includes(v2)) {
+        this.add(at, `must be one of ${options.join(", ")} (got ${JSON.stringify(v2)?.slice(0, 40)})`);
         return void 0;
       }
-      return v;
+      return v2;
     }
     number(o, key, path, required = false) {
-      const v = o[key];
+      const v2 = o[key];
       const at = path ? `${path}.${key}` : key;
-      if (v === void 0 || v === null) {
+      if (v2 === void 0 || v2 === null) {
         if (required) this.add(at, "is required");
         return void 0;
       }
-      if (typeof v !== "number" || !Number.isFinite(v)) {
+      if (typeof v2 !== "number" || !Number.isFinite(v2)) {
         this.add(at, "must be a finite number");
         return void 0;
       }
-      return v;
+      return v2;
     }
     boolean(o, key, path) {
-      const v = o[key];
-      if (v === void 0 || v === null) return void 0;
-      if (typeof v !== "boolean") {
+      const v2 = o[key];
+      if (v2 === void 0 || v2 === null) return void 0;
+      if (typeof v2 !== "boolean") {
         this.add(path ? `${path}.${key}` : key, "must be true or false");
         return void 0;
       }
-      return v;
+      return v2;
     }
     array(o, key, path, opt) {
-      const v = o[key];
+      const v2 = o[key];
       const at = path ? `${path}.${key}` : key;
-      if (v === void 0 || v === null) {
+      if (v2 === void 0 || v2 === null) {
         if (opt.required) this.add(at, "is required");
         return void 0;
       }
-      if (!Array.isArray(v)) {
+      if (!Array.isArray(v2)) {
         this.add(at, "must be an array");
         return void 0;
       }
-      if (v.length > opt.max) {
-        this.add(at, `has ${v.length} items; at most ${opt.max}`);
+      if (v2.length > opt.max) {
+        this.add(at, `has ${v2.length} items; at most ${opt.max}`);
         return void 0;
       }
-      if (opt.min && v.length < opt.min) {
+      if (opt.min && v2.length < opt.min) {
         this.add(at, `needs at least ${opt.min} item${opt.min === 1 ? "" : "s"}`);
         return void 0;
       }
-      return v;
+      return v2;
     }
     /** Unknown keys are warnings, not errors: a typo is reported without hiding the panel. */
     known(o, path, keys) {
@@ -823,9 +1232,9 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       };
     }
   };
-  function httpsUrl(v) {
+  function httpsUrl(v2) {
     try {
-      const u = new URL(v);
+      const u = new URL(v2);
       if (u.protocol !== "https:" || u.username || u.password || !u.hostname) return void 0;
       return u.href;
     } catch {
@@ -902,84 +1311,61 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 
   // src/panels/apps/image/main.ts
   var root = document.getElementById("app");
-  var fit = true;
   var current = null;
   var warnings = [];
-  var apply = () => {
-  };
+  var view = freshView();
+  var shownSrc = "";
+  var v = null;
   function render() {
     if (!current) return;
     const img = current;
+    if (img.src !== shownSrc) view = freshView();
+    shownSrc = img.src;
+    v?.destroy();
     const picture = h("img", {
       src: img.src,
       alt: img.alt,
-      decoding: "async",
-      draggable: "false"
+      decoding: "async"
     });
-    const stage = h("div", {
-      class: "stage img-stage",
-      tabindex: "0",
-      "aria-label": "Image; Z toggles actual size"
-    }, picture);
-    const fitBtn = h("button", {
-      type: "button",
-      id: "zoom-fit",
-      onclick: () => setFit(true)
-    }, "Fit");
-    const actualBtn = h("button", {
-      type: "button",
-      id: "zoom-actual",
-      title: "Actual size (Z)",
-      onclick: () => setFit(false)
-    }, "Actual size ", h("kbd", null, "Z"));
-    const zoom = h("span", {
-      class: "img-zoom",
-      "aria-hidden": "true"
+    v = viewer(picture, view, {
+      stageClass: "stage img-stage",
+      label: "Image; + and \u2212 zoom, 0 fits, 1 is actual size, drag or arrow keys scroll",
+      ids: {
+        zoomIn: "zoom-in",
+        zoomOut: "zoom-out",
+        fit: "zoom-fit",
+        actual: "zoom-actual"
+      }
     });
+    const { stage, controls, readout } = v;
+    readout.classList.add("img-zoom");
+    readout.hidden = true;
     const dims = h("span", {
       class: "mk-chip dims",
       hidden: true
     });
-    const updateZoom = () => {
-      if (!picture.naturalWidth) {
-        zoom.hidden = true;
-        return;
-      }
-      zoom.hidden = false;
-      zoom.textContent = `${Math.round(picture.clientWidth / picture.naturalWidth * 100)}%`;
-    };
-    apply = () => {
-      stage.className = `stage img-stage ${fit ? "fit" : "actual"}`;
-      fitBtn.setAttribute("aria-pressed", String(fit));
-      actualBtn.setAttribute("aria-pressed", String(!fit));
-      requestAnimationFrame(updateZoom);
-    };
     picture.addEventListener("load", () => {
       if (picture.naturalWidth) {
         dims.textContent = `${picture.naturalWidth} \xD7 ${picture.naturalHeight}`;
         dims.hidden = false;
       }
-      updateZoom();
+      readout.hidden = false;
     });
     picture.addEventListener("error", () => {
+      readout.hidden = true;
       stage.replaceChildren(h("div", {
         class: "error",
         role: "alert"
       }, h("strong", null, "The image could not be shown. "), img.src.startsWith("data:") ? "The file is not a valid image of its type." : "Check that the URL is reachable and that its origin is declared in csp.resourceDomains."));
     });
-    picture.addEventListener("click", () => setFit(!fit));
-    new ResizeObserver(updateZoom).observe(stage);
+    controls.classList.add("img-tools");
     mount(root, warnings.length ? h("p", {
       class: "warnings"
     }, warnings.join("; ")) : null, h("figure", {
       class: "img-figure"
     }, h("div", {
       class: "stage-wrap"
-    }, stage, h("div", {
-      class: "img-tools mk-seg",
-      role: "group",
-      "aria-label": "Zoom"
-    }, fitBtn, actualBtn), zoom), h("figcaption", {
+    }, stage, controls, readout), h("figcaption", {
       class: "cap"
     }, img.caption ? h("span", {
       class: "caption"
@@ -991,18 +1377,9 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
     }, img.source), dims, img.bytes !== void 0 ? h("span", {
       class: "mk-chip"
     }, formatBytes(img.bytes)) : null))));
-    apply();
-  }
-  function setFit(next) {
-    fit = next;
-    apply();
   }
   addEventListener("keydown", (e) => {
-    if (typing(e) || e.ctrlKey || e.metaKey || e.altKey || !current) return;
-    if (e.key === "z" || e.key === "Z") {
-      setFit(!fit);
-      e.preventDefault();
-    }
+    if (current) v?.key(e);
   });
   startApp({
     name: "Muster Image",
@@ -1010,6 +1387,8 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
       const r = validateImage(data);
       if (!r.ok) {
         current = null;
+        v?.destroy();
+        v = null;
         problems(root, "This image panel's input is invalid", r.errors);
         return;
       }

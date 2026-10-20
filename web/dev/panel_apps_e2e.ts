@@ -151,6 +151,104 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     ok("image: worktree file as a data URI, zoom by button and Z, URL origin declared, load errors explained");
   }
 
+  // ---- image zoom: Fit, then + and − from the size on screen, 100% is the natural size, and a
+  // picture bigger than the panel pans; then fullscreen from the strip, and Esc goes back
+  {
+    const p = await open("image", "Screenshot", { path: "docs/screenshots/hero.png", caption: "The hero shot, 1440 × 900" });
+    await p.waitIn(`document.querySelector('.stage.sized img')?.naturalWidth === 1440`);
+    const shown = async () => (await p.inApp(`document.querySelector('.stage img').getBoundingClientRect().width`)) as number;
+    const fit = await shown();
+    check(fit < 1440 && await p.inApp(`document.querySelector('.stage').classList.contains('fit')`), `starts at Fit, below actual size (${fit} px)`);
+    await a.shot(`${shots}/zoom-fit.png`);
+    await p.click("#zoom-in");
+    const one = await shown();
+    check(one > fit * 1.05, `zoom in grows the picture from the size on screen (${fit} → ${one})`);
+    await p.click("#zoom-in");
+    const two = await shown();
+    check(two > one * 1.05, `and again (${one} → ${two})`);
+    await p.click("#zoom-out");
+    check(Math.abs((await shown()) - one) < 1, "zoom out steps back");
+    await p.click("#zoom-actual");
+    check(Math.abs((await shown()) - 1440) < 1 && (await p.inApp(`document.querySelector('.img-zoom').textContent`)) === "100%", "100% is the natural size");
+    check(await p.inApp(`(() => { const s = document.querySelector('.stage'); return s.scrollWidth > s.clientWidth && s.classList.contains('can-pan'); })()`), "a picture bigger than the panel scrolls");
+    // Drag to pan.
+    const [cx, cy] = await p.where(".stage");
+    const before = await p.inApp(`document.querySelector('.stage').scrollLeft`);
+    await a.drag([cx, cy], [cx - 200, cy], 8);
+    check((await p.inApp(`document.querySelector('.stage').scrollLeft`)) > before + 100, "dragging pans the picture");
+    // Ctrl+wheel zooms around the pointer (and never zooms the whole page).
+    await a.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: cx, y: cy, deltaX: 0, deltaY: -120, modifiers: 2 });
+    await a.sleep(150);
+    check((await shown()) > 1440 * 1.1, "Ctrl+wheel zooms in");
+    check((await a.eval(`window.visualViewport.scale`)) === 1, "the page itself is not zoomed");
+    await a.shot(`${shots}/zoom-in.png`);
+    await p.inApp(`document.querySelector('.stage').focus()`);
+    await a.key("0");
+    check(Math.abs((await shown()) - fit) < 1, "0 goes back to Fit");
+    await a.key("=");
+    check((await shown()) > fit * 1.05, "+ (=) zooms in by key");
+    await a.key("1");
+    check(Math.abs((await shown()) - 1440) < 1, "1 is actual size");
+    await a.key("0");
+    await p.waitIn(`document.querySelector('.zoom-tools [role=status]').textContent === 'Fit, ' + document.querySelector('.img-zoom').textContent`, 2000);
+    // The browser's zoom keys are cancelled before the app sees them, even by an app that stops them.
+    await p.inApp(`document.addEventListener('keydown', (e) => { if (e.ctrlKey && e.key === '-') { globalThis.__e2eZoomPrevented = e.defaultPrevented; e.stopPropagation(); } }, { capture: true, once: true })`);
+    await a.key("Ctrl+-");
+    check(await p.inApp(`globalThis.__e2eZoomPrevented`) === true, "Ctrl+- is cancelled ahead of an app that stops it");
+
+    // Fullscreen from the strip's button: the panel fills the window, no tab strips, no status line.
+    const sigBefore = JSON.stringify(await a.eval(`${M}.layout.value`));
+    const [fx, fy] = await (async () => { const r = (await a.rect(`[data-panel-view="${p.pid}"] [data-fullscreen-toggle]`))!; return [r.x + r.w / 2, r.y + r.h / 2]; })();
+    await a.clickAt(fx, fy);
+    await a.wait(`document.querySelector('.app.fullscreen') && !document.querySelector('.statusline')?.offsetParent`, 3000);
+    const view = (await a.rect(`[data-panel-view="${p.pid}"]`))!;
+    const win = await a.eval(`[innerWidth, innerHeight]`) as number[];
+    check(view.x === 0 && view.y === 0 && Math.abs(view.w - win[0]) < 1 && Math.abs(view.h - win[1]) < 1, `the panel fills the window: ${JSON.stringify(view)}`);
+    check(await a.eval(`![...document.querySelectorAll('.tabstrip')].some((t) => t.offsetParent)`), "no tab strip shows");
+    check(await p.inApp(`innerWidth`) > fit, "the app got the room");
+    await a.sleep(200);
+    await a.shot(`${shots}/fullscreen-panel.png`);
+    // Esc on the strip's button (host focus) goes back.
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.app.fullscreen')`, 2000);
+    check(JSON.stringify(await a.eval(`${M}.layout.value`)) === sigBefore, "the layout is as it was");
+    // Alt+Shift+Z from inside the app, and an Esc the app leaves alone (inside its frame) goes back.
+    await p.inApp(`document.querySelector('.stage').focus()`);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!!document.querySelector('.app.fullscreen')`, 2000);
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.app.fullscreen')`, 2000);
+    check(JSON.stringify(await a.eval(`${M}.layout.value`)) === sigBefore, "the layout is restored again");
+    // From the panel's tab in the strip (which fullscreen hides): the keyboard goes to the app.
+    await a.eval(`document.querySelector('[data-tab-sid="${-(p.pid + 1)}"]').focus()`);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!!document.querySelector('.app.fullscreen') && document.activeElement?.dataset?.panelId === "${p.pid}"`, 3000);
+    // (Headless Chromium does not pass a frame focused from its parent on to the app's own
+    // document, so the app's keys are checked after a click inside it, as elsewhere here.)
+    await p.click(".stage");
+    await p.click(".stage"); // a click toggles Fit / 100%: twice is Fit again
+    const before2 = await shown();
+    await a.key("=");
+    check((await shown()) > before2 * 1.05, `the app's keys work in fullscreen (${before2} → ${await shown()})`);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!document.querySelector('.app.fullscreen') && document.activeElement?.dataset?.panelId === "${p.pid}"`, 3000);
+    await close(p.pid);
+
+    // A terminal: Esc stays with the program, Alt+Shift+Z (or the corner button) goes back.
+    await a.click(`[data-tab-sid="${opener}"]`);
+    await a.sleep(150);
+    await a.key("Alt+Shift+Z");
+    await a.wait(`!!document.querySelector('.app.fullscreen .pane.fullscreen .fs-exit')`, 2000);
+    await a.key("Escape");
+    await a.sleep(150);
+    check(await a.eval(`!!document.querySelector('.app.fullscreen')`), "Esc in a fullscreen terminal goes to the terminal");
+    await a.shot(`${shots}/fullscreen-terminal.png`);
+    await a.click(`.fs-exit`);
+    await a.wait(`!document.querySelector('.app.fullscreen')`, 2000);
+    check(await a.eval(`${M}.prefs.value.statusLine`) === !!(await a.eval(`document.querySelector('.statusline')?.offsetParent`)), "the status line is back as it was");
+    ok("image zoom: Fit, + and − from the size on screen, 100% is natural size, drag pans, Ctrl+wheel; fullscreen panel and terminal, Esc rules, layout restored");
+  }
+
   // ---- chart: SVG with accessible title, hidden data table, hover and keyboard tooltip
   {
     const p = await open("chart", "CI minutes", chartSample);
@@ -728,7 +826,11 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check(await d.inApp(`!document.querySelector('.drawer') && !!document.querySelector('.lightbox')`) && (await events(d.pid)).length === 0, "no merge behind the picture");
     await d.inApp(`document.querySelector('#lightbox-close').focus()`);
     await a.key("z");
-    await d.waitIn(`document.querySelector('.lb-stage.actual') && document.querySelector('#lightbox-zoom').getAttribute('aria-pressed') === 'true'`);
+    await d.waitIn(`document.querySelector('.lb-stage.sized:not(.fit)')`);
+    await a.key("1");
+    await d.waitIn(`document.querySelector('.lb-stage.actual') && document.querySelector('#lightbox-zoom').getAttribute('aria-pressed') === 'true' && document.querySelector('.lb-stage img').getBoundingClientRect().width === 512`);
+    await a.key("=");
+    await d.waitIn(`Number(document.querySelector('.lb-stage').dataset.scale) > 1.2 && document.querySelector('.lb-readout').textContent === '125%'`);
     await a.key("z");
     await d.waitIn(`document.querySelector('.lb-stage.fit')`);
     // The agent replaces the pictures while one is enlarged: the view closes instead of showing another.
@@ -888,7 +990,9 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await d2.click("#media-0");
     await d2.waitIn(`document.querySelector('.lightbox')`);
     await a.key("z");
-    await d2.waitIn(`document.querySelector('.lb-stage.actual')`);
+    await d2.waitIn(`document.querySelector('.lb-stage.sized:not(.fit)')`);
+    check(await d2.inApp(`[...document.querySelectorAll('.lb-bar > *')].every((e) => { const r = e.getBoundingClientRect(); return r.right <= innerWidth + 0.5 && r.left >= -0.5; })`),
+      `narrow picture view: every bar control (Close included) stays in view: ${await d2.inApp(`innerWidth + ' ' + JSON.stringify([...document.querySelectorAll('.lb-bar > *')].map((e) => Math.round(e.getBoundingClientRect().right)))`)}`);
     await a.shot(`${shots}/panel-pr-decision-actual-size-narrow-dark.png`, (await a.rect(`[data-panel-view="${d2.pid}"]`))!);
     await a.key("Escape");
     await a.shot(`${shots}/panel-pr-decision-media-narrow-dark.png`, (await a.rect(`[data-panel-view="${d2.pid}"]`))!);

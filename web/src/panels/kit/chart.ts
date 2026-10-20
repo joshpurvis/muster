@@ -514,7 +514,8 @@ export function chart(el: HTMLElement, spec: KitChartSpec, o: ChartOptions = {})
     const st = host._mk!;
     const n = st.spec.x.values.length, f = st.focus;
     const next = ({ ArrowRight: (f ?? -1) + 1, ArrowLeft: (f ?? n) - 1, Home: 0, End: n - 1, Escape: null } as Record<string, number | null>)[e.key];
-    if (next === undefined) return;
+    // Esc with no point shown is left to the host (it leaves a fullscreen panel).
+    if (next === undefined || (next === null && f === null)) return;
     e.preventDefault();
     st.focus = next === null ? null : clamp(next, 0, n - 1);
     render(host);

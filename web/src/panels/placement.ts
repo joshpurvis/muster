@@ -4,7 +4,7 @@
 // removed or re-parented iframe reloads). Shared by app panels and web previews.
 import { useEffect, useLayoutEffect, useRef } from "preact/hooks";
 import { signal } from "@preact/signals";
-import { layout, panelOrigin } from "../state.ts";
+import { layout, panelOrigin, shownAlone } from "../state.ts";
 import { focusActiveTerminalSoon } from "../actions.ts";
 import { paneOfSession, panelTab } from "../layout/tree.ts";
 
@@ -44,9 +44,11 @@ export function usePanelPlacement(id: number, frame: { current: HTMLIFrameElemen
   const pane = l ? paneOfSession(l.root, tab) : null;
   const paneId = useRef<string | null>(null);
   paneId.current = pane?.id ?? null;
-  const active = !!l && !!pane && pane.active === tab && (!l.zoom || l.zoom === pane.id);
-  const zoomed = !!pane && l?.zoom === pane.id;
-  const split = !!l && l.root.type !== "pane" && !l.zoom;
+  // A zoomed or fullscreen group is shown alone.
+  const alone = shownAlone.value;
+  const active = !!l && !!pane && pane.active === tab && (!alone || alone === pane.id);
+  const zoomed = !!pane && alone === pane.id;
+  const split = !!l && l.root.type !== "pane" && !alone;
   const dim = split && l.focus !== pane?.id;
   const activeRef = useRef(active);
   activeRef.current = active;

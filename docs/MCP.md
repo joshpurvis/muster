@@ -154,6 +154,12 @@ document.querySelector("button").onclick = () => call("ui/message", {role: "user
 </script>
 ```
 
+Keys: the user can show any panel fullscreen (docs/UI.md, "Fullscreen"), and an Esc the app
+leaves alone takes them back. An app that uses Esc itself (to close a dialog or clear a
+selection) should call `preventDefault()` on that keydown; Esc typed in a field or with a
+`<dialog>` open is never taken. Ctrl+= / Ctrl+- / Ctrl+0 and Ctrl+wheel never zoom the page
+from inside a panel; the app still receives them (the built-in image app zooms its picture).
+
 Events contain `{id, panel_id, kind, payload, at}`; `id` stays the same if an event is
 delivered later than first planned. The latest app context rides on the last event of each
 panel in a result. The durable queue keeps 200 events per panel, adding an `overflow` event
@@ -267,7 +273,12 @@ WebP and SVG (by content; SVG also needs the `.svg` extension), and stores it as
 `<img>`, so its scripts never run. `url` must be https without credentials; `panel_open` adds
 its origin to `csp.resourceDomains`, and a later update must keep to an origin already
 declared. The host must be a plain name or IP (no wildcards). Without `alt`, the caption or
-"Image: <file name>" is the text alternative. Z or the button toggles zoom to fit / actual size.
+"Image: <file name>" is the text alternative. The picture opens at Fit (shrunk to the panel,
+never enlarged past actual size; an SVG with only a viewBox fills it); − and + (or the keys,
+Ctrl+wheel and a pinch, around the pointer) zoom from the size on screen, 100% (1) is actual
+pixels, 0 fits again, Z or a click switches Fit / 100% (twice the fitted size when
+Fit already is 100%), and a picture bigger than the panel
+scrolls and drags to pan.
 
 ```json
 {"path": "shots/login.png", "alt": "Login page after the fix", "caption": "Chromium, 1280 px"}
@@ -494,7 +505,7 @@ read; the agent's own JSON keeps the 1 MiB limit. A chart's `spec` is a `chart` 
 drawn by the same code. Pictures show as thumbnails (one alone shows larger); a click or Enter
 enlarges one in a modal view: everything behind it is inert, Tab stays inside, an open Merge
 or outward confirm is closed first, and an update that replaces the picture closes the view.
-Z or "Actual size" shows it at full size (scroll or drag to pan), arrows step through the
+It zooms like the image app (Fit, − and +, 100%, Z, Ctrl+wheel; scroll or drag to pan), arrows step through the
 pictures, Esc or Close returns to the thumbnail.
 
 Events are sent with `ui/message`; the decision is in the event's `kind`, and its fields in

@@ -123,6 +123,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
       submenu: splitMenu(s, "bottom", paneId, tabsInGroup),
     },
   );
+  items.push({ label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(s.id) });
   if (windowsSupported.value && windowId.value !== null) {
     items.push({ label: "Move to window", submenu: moveMenu(s.id) });
   }
@@ -155,6 +156,7 @@ function bodyMenu(
   multi: boolean,
   zoomed: boolean,
   tabsInGroup: number,
+  full: boolean,
 ): MenuItem[] {
   const term = terms.terminal(s.id);
   const sel = term?.getSelection() ?? "";
@@ -180,7 +182,7 @@ function bodyMenu(
       submenu: splitMenu(s, "bottom", paneId, tabsInGroup),
     },
   ];
-  if (multi || zoomed) {
+  if ((multi || zoomed) && !full) {
     items.push({
       label: zoomed ? "Restore layout" : "Zoom group",
       icon: zoomed ? <IconMinimize size={14} /> : <IconMaximize size={14} />,
@@ -191,6 +193,12 @@ function bodyMenu(
       },
     });
   }
+  items.push({
+    label: full ? "Exit fullscreen" : "Fullscreen",
+    icon: full ? <IconMinimize size={14} /> : <IconMaximize size={14} />,
+    keys: "Alt+Shift+Z",
+    run: () => A.toggleFullscreen(s.id),
+  });
   items.push(
     "sep",
     { label: "Rename", run: () => A.startRename(s.id, "terminal") },
@@ -212,10 +220,12 @@ function bodyMenu(
 }
 
 export function Group(
-  { pane, focused, zoomed, multi, controls }: {
+  { pane, focused, zoomed, fullscreen, multi, controls }: {
     pane: PaneNode;
     focused: boolean;
     zoomed: boolean;
+    /** This group's visible tab fills the window (no strip). */
+    fullscreen: boolean;
     /** The window has 2+ groups. */
     multi: boolean;
     /** This strip carries the window controls (the top-right group). */
@@ -245,16 +255,34 @@ export function Group(
     // program that tracks the mouse; terms.ts keeps its reports from the program.
     e.preventDefault();
     A.focusGroup(pane.id);
-    openMenu({ x: e.clientX, y: e.clientY, items: bodyMenu(pane.id, active, multi, zoomed, tabs.length) });
+    openMenu({ x: e.clientX, y: e.clientY, items: bodyMenu(pane.id, active, multi, zoomed, tabs.length, fullscreen) });
   };
 
   return (
     <div
-      class={cx("pane", focused && "focused", zoomed && "zoomed", dragging && "drop-target")}
+      class={cx("pane", focused && "focused", zoomed && "zoomed", fullscreen && "fullscreen", dragging && "drop-target")}
       data-pane={pane.id}
       onPointerDownCapture={() => A.focusGroup(pane.id)}
     >
-      <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />
+      {!fullscreen && <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />}
+      {fullscreen && active && (
+        // Terminals keep Esc (agents and editors use it), so a terminal shown fullscreen gets
+        // this way back; a panel has the same button in the strip above it.
+        <button
+          type="button"
+          class="fs-exit"
+          data-tip="Exit fullscreen"
+          data-keys="Alt+Shift+Z"
+          aria-label="Exit fullscreen"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            A.exitFullscreen();
+            A.focusActiveTerminalSoon();
+          }}
+        >
+          <IconMinimize size={13} />
+        </button>
+      )}
       <div
         class={cx("pane-body", active?.state === "exited" && "exited")}
         data-pane-body={pane.id}
@@ -508,6 +536,7 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
     { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
     { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
+    { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
     "sep",
     { label: "Close panel", keys: "Alt+W", run: () => A.closeTab(id) },

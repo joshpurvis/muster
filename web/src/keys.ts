@@ -9,8 +9,10 @@ import {
   focusedSession,
   focusedTabId,
   focusedTask,
+  fullscreen,
   hereIds,
   overlay,
+  renaming,
   prefs,
   setPref,
   toast,
@@ -398,6 +400,17 @@ export const commands: Command[] = [
     enabled: hasTab,
   },
   { id: "zoom", title: "Zoom group", group: "Groups", keys: ["Alt+Z"], run: () => A.zoomToggle() },
+  {
+    id: "fullscreen",
+    get title() {
+      return fullscreen.value === null ? "Fullscreen tab (fills the window)" : "Exit fullscreen";
+    },
+    group: "Groups",
+    // Alt+Shift+…, so it also reaches the app with "Terminal gets Alt keys" on.
+    keys: ["Alt+Shift+Z"],
+    run: () => A.toggleFullscreen(),
+    enabled: () => hasTab() || fullscreen.value !== null,
+  },
   { id: "equalize", title: "Equalize splits", group: "Groups", run: () => A.equalizeAll() },
   ...(["Left", "Right", "Up", "Down"] as const).map((d): Command => ({
     id: `focus-${d.toLowerCase()}`,
@@ -559,7 +572,7 @@ function pendingHere(sid: number): boolean {
 // starts, approves, interrupts or types into anything. Close closes that panel itself.
 const PANEL_COMMANDS = new Set([
   "jump", "palette", "next-needs-you", "next-tab", "prev-tab", "move-tab-left", "move-tab-right",
-  "close-tab", "agents-panel", "zoom", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
+  "close-tab", "agents-panel", "zoom", "fullscreen", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
   ...["left", "right", "up", "down"].map((d) => `focus-${d}`),
 ]);
 const panelBindings = () => bindings.filter((b) => PANEL_COMMANDS.has(b.cmd.id));
@@ -571,6 +584,13 @@ export function panelChords(): KeyChord[] {
 
 /** A shortcut pressed inside panel tab `tab`'s app (the bridge checked the panel has focus). */
 export function runPanelKey(tab: number, k: PanelKey) {
+  // An Esc the app did not use (the sandbox helper hands over only those) leaves fullscreen.
+  if (k.code === "Escape" && !k.ctrl && !k.alt && !k.shift && !k.meta) {
+    // Only this focused panel's key reaches here (PanelView), and fullscreen always shows the
+    // focused group.
+    if (!overlay.value) A.exitFullscreen();
+    return;
+  }
   const e = new KeyboardEvent("keydown", {
     code: k.code, key: k.key, ctrlKey: k.ctrl, altKey: k.alt, shiftKey: k.shift, metaKey: k.meta,
   });
@@ -585,6 +605,7 @@ export function installKeys() {
     const b = findBinding(e);
     return !!b && overlayAllows(b);
   });
+  installFullscreenEscape();
   // Clicking anywhere but the "Close?" question itself cancels it.
   addEventListener(
     "pointerdown",
@@ -648,6 +669,28 @@ export function installKeys() {
     },
     { capture: true },
   );
+}
+
+/** Esc leaves fullscreen once everything else has had it. A menu, dialog, rename or inline
+ * "Close?" open when it was pressed keeps it (they close first), and so do a focused terminal
+ * and text fields: agents, editors and fields use Esc. Inside a panel's app, the sandbox
+ * helper hands over only an Esc the app left alone (runPanelKey). */
+function installFullscreenEscape() {
+  let busy = false;
+  // Before anything closes on this Esc (registered ahead of the shortcut listener).
+  addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      busy = !!overlay.value || !!document.querySelector(".menu") || renaming.value !== null || confirmClose.value !== null;
+    }
+  }, { capture: true });
+  addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || busy || e.defaultPrevented || e.isComposing || fullscreen.value === null) return;
+    if (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
+    const ctx = ctxOf(e);
+    if (ctx.inTerminal || ctx.inInput) return;
+    e.preventDefault();
+    A.exitFullscreen();
+  });
 }
 
 /** Holding Alt alone for a moment shows the focused group's Alt+1..9 tab numbers. */

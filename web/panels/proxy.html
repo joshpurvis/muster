@@ -51,18 +51,36 @@
   // Runs first inside the app document: hands Muster's own shortcuts to the host (an app frame
   // otherwise swallows them) and reports startup errors. The app could fake these messages;
   // the host only runs a few navigation commands from them, and only while this panel has focus.
-  const helper = (keys) => "(" + ((keys) => {
+  // With `escape`, an Esc the app leaves alone (not prevented, not typed in a field, no open
+  // <dialog>) goes to the host after the app had it: it leaves a fullscreen panel.
+  const helper = (keys, escape) => "(" + ((keys, escape) => {
     const post = (method, params) => { try { parent.postMessage({ jsonrpc: "2.0", method, params }, "*"); } catch (_) { /* gone */ } };
     const editable = (t) => !!t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName));
+    /* A field inside a shadow root is retargeted to its host: look along the whole path. */
+    const inField = (e) => e.composedPath().some(editable);
     addEventListener("keydown", (e) => {
       if (!e.isTrusted || e.isComposing) return;
-      const inInput = editable(e.target);
+      const inInput = inField(e);
       const k = keys.find((k) => k.code === e.code && k.ctrl === e.ctrlKey && k.alt === e.altKey && k.shift === e.shiftKey && k.meta === e.metaKey);
       if (!k || (k.editAlt && inInput)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       post("muster/key", { code: e.code, key: e.key, ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, inInput });
     }, true);
+    const bare = (e) => !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
+    /* The browser's zoom keys and Ctrl+wheel would zoom all of Muster (shrinking this panel), not
+       the panel. Cancelled first (capture), so an app that stops the event cannot let it through;
+       the event still goes on to the app. */
+    addEventListener("keydown", (e) => {
+      if (e.isTrusted && (e.ctrlKey || e.metaKey) && !e.altKey && ["=", "+", "-", "_", "0"].includes(e.key)) e.preventDefault();
+    }, true);
+    addEventListener("wheel", (e) => { if (e.isTrusted && (e.ctrlKey || e.metaKey)) e.preventDefault(); }, { capture: true, passive: false });
+    /* Esc after the app had it (bubble phase), so the app's own preventDefault() keeps it. */
+    addEventListener("keydown", (e) => {
+      if (!e.isTrusted || e.isComposing) return;
+      if (!escape || e.key !== "Escape" || !bare(e) || inField(e) || document.querySelector("dialog[open]")) return;
+      setTimeout(() => { if (!e.defaultPrevented) post("muster/key", { code: "Escape", key: "Escape", ctrl: false, alt: false, shift: false, meta: false, inInput: false }); }, 0);
+    });
     let reports = 0;
     const report = (text) => { if (reports++ < 5) post("muster/app-error", { message: String(text).slice(0, 300) }); };
     addEventListener("error", (e) => {
@@ -71,11 +89,16 @@
     }, true);
     addEventListener("unhandledrejection", (e) => report("Unhandled rejection: " + (e.reason && e.reason.message || e.reason)));
     document.addEventListener("securitypolicyviolation", (e) => report("Blocked by the panel's content policy: " + e.effectiveDirective + " " + e.blockedURI));
-  }).toString().replace(/\n\s*/g, " ") + ")(" + JSON.stringify(keys).replace(/</g, "\\u003c") + ")";
+  }).toString().replace(/\n\s*/g, " ") + ")(" + JSON.stringify(keys).replace(/</g, "\\u003c") + ", " + (escape === true) + ")";
   let keys = [];
+  let escape = false;
   addEventListener("keydown", (e) => {
     // Focus in this proxy itself (before the app frame exists, or between frames).
     if (!e.isTrusted || !hostOrigin) return;
+    if (escape && e.key === "Escape" && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+      parent.postMessage({ jsonrpc: "2.0", method: "muster/key", params: { code: "Escape", key: "Escape", ctrl: false, alt: false, shift: false, meta: false, inInput: false } }, hostOrigin);
+      return;
+    }
     const k = keys.find((k) => k.code === e.code && k.ctrl === e.ctrlKey && k.alt === e.altKey && k.shift === e.shiftKey && k.meta === e.metaKey);
     if (!k) return;
     e.preventDefault();
@@ -93,6 +116,7 @@
         if (frame || typeof msg.params?.html !== "string") return;
         const resources = origins(msg.params.csp?.resourceDomains);
         keys = chords(msg.params.keys);
+        escape = msg.params.escape === true;
         // Fetch approval and nested dev previews are deferred. External child documents
         // would have their own CSP and could otherwise bypass the no-fetch policy. font-src
         // data: is for the kit's bundled fonts (data: fonts reach no network).
@@ -102,7 +126,7 @@
         frame.sandbox = "allow-scripts";
         frame.referrerPolicy = "no-referrer";
         // One line before the app's own markup, so its error line numbers stay its own.
-        frame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="' + csp.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"><meta name="referrer" content="no-referrer"><script>' + helper(keys) + '<\/script>' + msg.params.html;
+        frame.srcdoc = '<!doctype html><meta http-equiv="Content-Security-Policy" content="' + csp.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"><meta name="referrer" content="no-referrer"><script>' + helper(keys, escape) + '<\/script>' + msg.params.html;
         document.body.append(frame);
         if (document.hasFocus()) frame.focus();
       } else if (!msg.method?.startsWith(reserved)) {

@@ -15,6 +15,7 @@ import { chart } from "../../kit/chart.ts";
 import { iconEl } from "../../kit/icons.ts";
 import { avatarColor } from "../../kit/parts.ts";
 import { formatBytes } from "../image/logic.ts";
+import { freshView, type Viewer, viewer, type ViewState } from "../shared/viewer.ts";
 import {
   answersEvent, askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, type Method, mergeBlocked, mergeCommand,
   joinAnd, mergeEvent, METHODS, type Pr, readiness, requestChangesEvent, skipEvent, validatePr,
@@ -41,8 +42,10 @@ const outGate = new Gate();
  * an update that replaces that picture closes the view. */
 let enlarged: number | null = null;
 let enlargedSrc = "";
-/** The enlarged picture at actual size (scroll or drag to pan) instead of fitted. */
-let actualSize = false;
+/** The enlarged picture's zoom (Fit, or a scale with its scroll), kept across re-renders, and
+ * the viewer drawing it. */
+let lbView: ViewState = freshView();
+let lbViewer: Viewer | null = null;
 /** "Your actions" unfolded in a small panel; the shortcut list shown. */
 let actionsOpen = false;
 let showKeys = false;
@@ -319,7 +322,7 @@ function enlarge(i: number | null) {
     mode = null;
     setNotice("The confirm was closed while you look at the pictures. Start it again when you are ready.", "warning");
   }
-  if (i !== was) actualSize = false;
+  if (i !== was) lbView = freshView();
   enlarged = i;
   const m = i === null ? undefined : pr?.media[i];
   enlargedSrc = m?.kind === "image" ? m.image.src : "";
@@ -723,26 +726,24 @@ function drawCharts() {
 }
 
 function lightbox(p: Pr) {
-  if (enlarged === null) return null;
-  const m = p.media[enlarged];
-  if (m?.kind !== "image") return null;
+  const m = enlarged === null ? undefined : p.media[enlarged];
+  if (enlarged === null || m?.kind !== "image") {
+    lbViewer?.destroy();
+    lbViewer = null;
+    return null;
+  }
   const shots = p.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
   const at = shots.indexOf(enlarged);
   const step = (by: number) => enlarge(shots[(at + by + shots.length) % shots.length]);
-  const img = h("img", { src: m.image.src, alt: m.image.alt, draggable: "false" });
-  const stage = h("div", { class: `lb-stage ${actualSize ? "actual" : "fit"}`, tabindex: "0", "aria-label": "Picture; Z toggles actual size, drag or arrow keys scroll" }, img);
-  // At actual size, drag to pan; a click without a drag toggles the size.
-  let drag: { x: number; y: number; moved: boolean } | null = null;
-  stage.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, y: e.clientY, moved: false }; });
-  stage.addEventListener("pointermove", (e) => {
-    if (!drag || !actualSize || !(e.buttons & 1)) return;
-    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
-    stage.scrollBy(-dx, -dy);
-    drag.x = e.clientX;
-    drag.y = e.clientY;
+  const img = h("img", { src: m.image.src, alt: m.image.alt });
+  lbViewer?.destroy();
+  lbViewer = viewer(img, lbView, {
+    stageClass: "lb-stage",
+    label: "Picture; + and − zoom, 0 fits, 1 is actual size, Z toggles, drag or arrow keys scroll",
+    ids: { zoomIn: "lightbox-zoom-in", zoomOut: "lightbox-zoom-out", fit: "lightbox-fit", actual: "lightbox-zoom" },
   });
-  img.addEventListener("click", () => { if (!drag?.moved) toggleSize(); drag = null; });
+  const stage = lbViewer.stage;
+  lbViewer.readout.classList.add("muted", "small", "lb-readout");
   return h("div", { class: "lightbox", role: "dialog", "aria-modal": "true", "aria-label": m.image.alt },
     h("div", { class: "lb-bar" },
       h("span", { class: "muted small lb-src", title: m.image.source }, m.image.source, m.image.bytes !== undefined ? ` · ${formatBytes(m.image.bytes)}` : ""),
@@ -751,8 +752,8 @@ function lightbox(p: Pr) {
         h("span", { class: "muted small" }, `${at + 1} / ${shots.length}`),
         h("button", { type: "button", "aria-label": "Next picture", onclick: () => step(1) }, "→"),
       ] : null,
-      h("button", { type: "button", id: "lightbox-zoom", "aria-pressed": String(actualSize), onclick: () => toggleSize() },
-        actualSize ? "Fit" : "Actual size", " ", h("kbd", null, "Z")),
+      lbViewer.readout,
+      lbViewer.controls,
       h("button", { type: "button", id: "lightbox-close", onclick: () => enlarge(null) }, "Close ", h("kbd", null, "Esc"))),
     stage,
     m.image.caption ? h("p", { class: "lb-caption" }, m.image.caption) : null);
@@ -762,13 +763,6 @@ function setKeys(on: boolean) {
   showKeys = on;
   render();
   document.getElementById(on ? "shortcuts-close" : "keys-help")?.focus();
-}
-
-function toggleSize() {
-  actualSize = !actualSize;
-  const focus = document.activeElement?.id;
-  render();
-  if (focus) document.getElementById(focus)?.focus({ preventScroll: true });
 }
 
 const KEYS: [string, string][] = [["M", "Merge (shows the exact command first; Shift+M with failing checks)"], ["R", "Request changes"],
@@ -881,8 +875,8 @@ addEventListener("keydown", (e) => {
     if (box && trapTab(box, e)) return;
     const onStage = (e.target as HTMLElement).classList?.contains("lb-stage");
     if (e.key === "Escape") { e.preventDefault(); enlarge(null); }
-    else if ((e.key === "z" || e.key === "Z") && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); toggleSize(); }
-    else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && !(onStage && actualSize)) {
+    else if (lbViewer?.key(e)) return;
+    else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && !(onStage && lbViewer?.overflowing())) {
       const shots = pr.media.flatMap((x, i) => x.kind === "image" ? [i] : []);
       const at = shots.indexOf(enlarged);
       e.preventDefault();
@@ -1011,7 +1005,7 @@ startApp({
     }
     // The enlarged picture was replaced or removed: close the view rather than show another.
     const still = enlarged === null ? undefined : next.media[enlarged];
-    if (enlarged !== null && (still?.kind !== "image" || still.image.src !== enlargedSrc)) { enlarged = null; enlargedSrc = ""; actualSize = false; closedView = true; }
+    if (enlarged !== null && (still?.kind !== "image" || still.image.src !== enlargedSrc)) { enlarged = null; enlargedSrc = ""; lbView = freshView(); closedView = true; }
     if (id !== identity) {
       identity = id;
       method = next.merge_method_default;

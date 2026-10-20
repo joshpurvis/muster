@@ -46,9 +46,3 @@ export function formatBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
   return `${(n / 1024 / 1024).toFixed(1)} MiB`;
 }
-
-/** Scale that fits `w`×`h` inside the box without enlarging past actual size. */
-export function fitScale(w: number, h: number, boxW: number, boxH: number): number {
-  if (!(w > 0 && h > 0 && boxW > 0 && boxH > 0)) return 1;
-  return Math.min(1, boxW / w, boxH / h);
-}

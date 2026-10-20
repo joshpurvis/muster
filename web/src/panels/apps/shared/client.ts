@@ -102,8 +102,12 @@ export function startApp(options: AppOptions) {
 
 /** True when a key event is typing into a field, so single-key shortcuts must not fire. */
 export function typing(event: KeyboardEvent): boolean {
-  const t = event.target as HTMLElement | null;
-  if (!t) return false;
-  if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
-  return t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit", "reset", "range", "color"].includes((t as HTMLInputElement).type);
+  // A field inside a shadow root is retargeted to its host: look along the whole path.
+  const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+  return path.some((n) => {
+    const t = n as HTMLElement | null;
+    if (!t || typeof t.tagName !== "string") return false;
+    if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+    return t.tagName === "INPUT" && !["checkbox", "radio", "button", "submit", "reset", "range", "color"].includes((t as HTMLInputElement).type);
+  });
 }

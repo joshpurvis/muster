@@ -11,7 +11,7 @@ import {
 } from "../shared/questions.ts";
 import { DraftState } from "../shared/draft.ts";
 import { actionsGroup, helpButton, outwardDrawer, shortcutsDrawer } from "../shared/actions_view.ts";
-import { renderChart } from "../chart/view.ts";
+import { chart } from "../../kit/chart.ts";
 import { formatBytes } from "../image/logic.ts";
 import {
   answersEvent, askEvent, checksBlock, ConfirmGate, eventBytes, formsClosed, holdEvent, MAX_EVENT_BYTES, type Method, mergeBlocked, mergeCommand,
@@ -45,7 +45,6 @@ let actualSize = false;
 let actionsOpen = false;
 let showKeys = false;
 const chartTables = new Map<number, boolean>();
-let chartWidth = 0;
 let override = false;
 const drafts = { request: "", ask: "" };
 let shift = false;
@@ -625,7 +624,8 @@ function mediaSection(p: Pr) {
     })));
 }
 
-/** Charts need the laid-out width, so they are drawn after the rest is mounted (and on resize). */
+/** Charts need the laid-out width, so they are drawn after the rest is mounted; each then
+ * redraws itself when its width changes. */
 function drawCharts() {
   if (!pr) return;
   const p = pr;
@@ -633,11 +633,7 @@ function drawCharts() {
     const i = Number(el.dataset.chart);
     const m = p.media[i];
     if (m?.kind !== "chart") continue;
-    chartWidth = el.clientWidth;
-    renderChart(el, m.spec, {
-      id: `chart-${i}`, width: el.clientWidth, minWidth: 220, maxHeight: 300, heading: "h3", showTable: chartTables.get(i) ?? false,
-      onToggle: () => { chartTables.set(i, !(chartTables.get(i) ?? false)); drawCharts(); },
-    });
+    chart(el, m.spec, { height: 220, showTable: chartTables.get(i) ?? false, legendValues: false });
   }
 }
 
@@ -890,10 +886,6 @@ addEventListener("keyup", (e) => {
   gate.keyUp(e.code);
   outGate.keyUp(e.code);
 });
-new ResizeObserver(() => {
-  const el = document.querySelector<HTMLElement>("[data-chart]");
-  if (el && Math.abs(el.clientWidth - chartWidth) > 4) drawCharts();
-}).observe(root);
 const pointer = (e: PointerEvent) => { if (e.shiftKey !== shift) { shift = e.shiftKey; updateMergeButton(); } };
 addEventListener("pointermove", pointer);
 addEventListener("pointerdown", pointer, true);

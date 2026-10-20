@@ -536,29 +536,78 @@ pub fn check_overview(data: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The kit's number formats (web/src/panels/kit/format.ts `FORMATS`).
+const FORMATS: &[&str] = &["int", "pct", "usd", "ms", "s", "plain"];
+
+/// A colour an agent may give: a kit token (`var(--mk-…)`) or a hex colour, nothing that could
+/// carry other CSS (web/src/panels/kit/format.ts `COLOR`).
+pub fn color_ok(c: &str) -> bool {
+    let hex = |h: &str| (h.len() == 3 || h.len() == 6) && h.bytes().all(|b| b.is_ascii_hexdigit());
+    if let Some(h) = c.strip_prefix('#') { return hex(h) }
+    c.strip_prefix("var(--mk-").and_then(|r| r.strip_suffix(')'))
+        .is_some_and(|t| (1..=30).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+}
+
+fn opt_color(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(c) = o.get("color").filter(|v| !v.is_null()) {
+        ensure!(c.as_str().is_some_and(color_ok), "{at} `color` must be a kit colour token such as var(--mk-c2) or a hex colour such as #6a56e6");
+    }
+    Ok(())
+}
+
+fn opt_number(o: &serde_json::Map<String, Value>, at: &str, key: &str) -> anyhow::Result<Option<f64>> {
+    match o.get(key).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => Ok(Some(v.as_f64().with_context(|| format!("{at} `{key}` must be a number"))?)),
+    }
+}
+
+/// A headline number: chart `stats` and Board `stats` items.
+fn check_stat(s: &Value, at: &str) -> anyhow::Result<()> {
+    let s = object(s, at)?;
+    req_text(s, at, "label", 100)?;
+    let v = s.get("value").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `value`"))?;
+    ensure!(v.is_number() || v.as_str().is_some_and(|t| t.chars().count() <= 40), "{at} `value` must be a number or a string of at most 40 characters");
+    for (key, max) in [("unit", 20), ("delta", 20), ("note", 100)] { opt_text(s, at, key, max)?; }
+    one_of(s, at, "tone", &["good", "bad", "flat"], false)?;
+    opt_color(s, at)?;
+    if let Some(t) = s.get("trend").filter(|v| !v.is_null()) {
+        let t = t.as_array().with_context(|| format!("{at} `trend` must be an array of numbers"))?;
+        ensure!(t.len() <= 200 && t.iter().all(Value::is_number), "{at} `trend` must be at most 200 numbers");
+    }
+    Ok(())
+}
+
+/// Everything the chart app checks (web/src/panels/apps/chart/logic.ts). The fields added for the
+/// Briefing look (takeaway … stats) are all optional; a chart with no values is allowed, so the
+/// panel can say there is nothing to show (`empty`).
 pub fn check_chart(data: &Value) -> anyhow::Result<()> {
     let app = "chart";
     let o = object(data, "chart data")?;
     one_of(o, app, "type", &["bar", "line", "scatter", "area"], true)?;
+    let kind = o.get("type").and_then(Value::as_str).unwrap_or_default();
     opt_text(o, app, "title", 200)?;
     let x = object(field(o, app, "x")?, "chart `x`")?;
     opt_text(x, "chart x", "label", 200)?;
     let x = x.get("values").and_then(Value::as_array).context("chart data needs `x.values` (an array)")?;
-    ensure!((1..=2000).contains(&x.len()), "chart `x.values` needs 1 to 2000 values");
+    ensure!(x.len() <= 2000, "chart `x.values` has {} values; at most 2000", x.len());
     ensure!(x.iter().all(|v| v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 200)),
         "chart `x.values` must be numbers or strings of at most 200 characters");
-    if o.get("type").and_then(Value::as_str) == Some("scatter") {
+    if kind == "scatter" {
         ensure!(x.iter().all(Value::is_number), "chart `x.values` must all be numbers for a scatter chart");
     }
     let series = field(o, app, "series")?.as_array().context("chart `series` must be an array")?;
-    ensure!((1..=12).contains(&series.len()), "chart `series` needs 1 to 12 series");
+    ensure!(series.len() <= 12, "chart `series` has {} series; at most 12", series.len());
+    let mut names = Vec::with_capacity(series.len());
     for (i, s) in series.iter().enumerate() {
         let s = object(s, "each chart series")?;
-        ensure!(s.get("name").and_then(Value::as_str).is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 100),
-            "chart series {i} needs a string `name` of 1 to 100 characters");
+        let name = s.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty() && n.chars().count() <= 100)
+            .with_context(|| format!("chart series {i} needs a string `name` of 1 to 100 characters"))?;
+        names.push(name);
         let values = s.get("values").and_then(Value::as_array).with_context(|| format!("chart series {i} needs `values` (an array)"))?;
         ensure!(values.len() == x.len(), "chart series {i} has {} values but x.values has {}", values.len(), x.len());
         ensure!(values.iter().all(|v| v.is_null() || v.is_number()), "chart series {i} values must be numbers or null");
+        opt_color(s, &format!("chart series[{i}]"))?;
     }
     if let Some(y) = o.get("y").filter(|v| !v.is_null()) {
         let y = object(y, "chart `y`")?;
@@ -567,6 +616,31 @@ pub fn check_chart(data: &Value) -> anyhow::Result<()> {
         if let (Some(lo), Some(hi)) = (y.get("min").and_then(Value::as_f64), y.get("max").and_then(Value::as_f64)) {
             ensure!(lo < hi, "chart `y.min` must be less than `y.max`");
         }
+    }
+    for (key, max) in [("takeaway", 600), ("scope", 200), ("source", 300), ("empty", 200)] { opt_text(o, app, key, max)?; }
+    one_of(o, app, "format", FORMATS, false)?;
+    one_of(o, app, "xFormat", FORMATS, false)?;
+    one_of(o, app, "labels", &["auto", "values", "end", "none"], false)?;
+    if let Some(h) = o.get("highlight").filter(|v| !v.is_null()) {
+        let h = h.as_str().context("chart `highlight` must be a string")?;
+        ensure!(names.contains(&h), "chart `highlight` must be the name of a series (got {h:?})");
+    }
+    for key in ["stacked", "trend"] { opt_bool(o, app, key)?; }
+    if o.get("stacked").and_then(Value::as_bool) == Some(true) { ensure!(matches!(kind, "bar" | "area"), "chart `stacked` applies to bar and area charts only"); }
+    if o.get("trend").and_then(Value::as_bool) == Some(true) { ensure!(kind == "scatter", "chart `trend` applies to scatter charts only"); }
+    for (i, a) in opt_objects(o, app, "annotations", 20, false)?.into_iter().enumerate() {
+        let at = format!("chart annotations[{i}]");
+        req_text(a, &at, "label", 60)?;
+        let ax = a.get("x").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `x`"))?;
+        ensure!(x.contains(ax), "{at} `x` must be one of x.values (got {ax})");
+    }
+    if let Some(stats) = o.get("stats").filter(|v| !v.is_null()) {
+        let stats = stats.as_array().context("chart `stats` must be an array")?;
+        ensure!(stats.len() <= 4, "chart `stats` has {} items; at most 4", stats.len());
+        for (i, s) in stats.iter().enumerate() { check_stat(s, &format!("chart stats[{i}]"))?; }
+    }
+    if let Some(pin) = opt_number(o, app, "pin")? {
+        ensure!(pin.fract() == 0.0 && pin >= 0.0 && (pin as usize) < x.len(), "chart `pin` must be the index of an x value");
     }
     Ok(())
 }
@@ -746,6 +820,41 @@ mod tests {
             assert!(e.contains(why), "{c}: {e}");
         }
         assert!(date_ok("2026-10-18T09:30:00Z") && date_ok("2026-10-18T09:30:00.123+02:00") && !date_ok("2026-10-18T09:30Z") && !date_ok("2026-10-18 09:30:00Z"));
+    }
+
+    #[test]
+    fn chart_briefing_fields_are_optional_and_checked() {
+        // Every field the Briefing look added is optional: the old shape still passes, and so does no data at all.
+        check_chart(&chart_sample()).unwrap();
+        check_chart(&json!({"type":"bar","x":{"values":[]},"series":[],"empty":"No deploys in this range"})).unwrap();
+        let full = json!({"type":"bar","x":{"values":["Mon","Tue"]},"series":[{"name":"master","values":[42,null],"color":"var(--mk-c1)"},{"name":"PRs","values":[80,96],"color":"#41c7c1"}],
+            "takeaway":"PR builds used **1.75×** the minutes.","scope":"acme-store · week of Oct 13","source":"gh run list","format":"int","xFormat":"plain",
+            "highlight":"PRs","annotations":[{"x":"Tue","label":"v2.4"}],"stacked":true,"labels":"values","empty":"none yet","pin":1,
+            "stats":[{"label":"master","value":287,"unit":"min","delta":"−12%","tone":"good","note":"vs last week","trend":[1,2,3],"color":"var(--mk-c1)"}]});
+        check_chart(&full).unwrap();
+        let with = |f: &dyn Fn(&mut Value)| { let mut d = full.clone(); f(&mut d); d };
+        for (c, why) in [
+            (with(&|d| d["format"] = json!("eur")), "`format` must be one of int, pct, usd, ms, s, plain"),
+            (with(&|d| d["xFormat"] = json!(1)), "`xFormat` must be one of"),
+            (with(&|d| d["highlight"] = json!("nope")), "`highlight` must be the name of a series"),
+            (with(&|d| d["annotations"] = json!([{"x":"Sun","label":"x"}])), "annotations[0] `x` must be one of x.values"),
+            (with(&|d| d["annotations"] = json!([{"x":"Mon"}])), "annotations[0] data needs `label`"),
+            (with(&|d| d["stacked"] = json!("yes")), "`stacked` must be true or false"),
+            (with(&|d| d["type"] = json!("line")), "`stacked` applies to bar and area"),
+            (with(&|d| d["trend"] = json!(true)), "`trend` applies to scatter"),
+            (with(&|d| d["labels"] = json!("some")), "`labels` must be one of auto, values, end, none"),
+            (with(&|d| d["series"][0]["color"] = json!("red;background:url(x)")), "series[0] `color` must be a kit colour token"),
+            (with(&|d| d["stats"][0]["tone"] = json!("great")), "stats[0] `tone` must be one of good, bad, flat"),
+            (with(&|d| d["stats"][0]["value"] = Value::Null), "stats[0] needs `value`"),
+            (with(&|d| d["stats"] = json!([{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1},{"label":"a","value":1}])), "at most 4"),
+            (with(&|d| d["pin"] = json!(5)), "`pin` must be the index of an x value"),
+            (with(&|d| d["takeaway"] = json!("x".repeat(601))), "`takeaway` is longer than 600"),
+        ] {
+            let e = format!("{:#}", check_chart(&c).unwrap_err());
+            assert!(e.contains(why), "{c}: {e}");
+        }
+        for ok in ["#fff", "#6a56e6", "var(--mk-c2)", "var(--mk-add)"] { assert!(color_ok(ok), "{ok}"); }
+        for bad in ["red", "#ggg", "var(--x)", "var(--mk-c2);color:red", "url(x)", "#12345", "var(--mk-)"] { assert!(!color_ok(bad), "{bad}"); }
     }
 
     #[test]
@@ -1052,7 +1161,7 @@ mod tests {
         let id = open("image", json!({"path": rel})).unwrap();
         let res = crate::panels::resource(&hub, id).unwrap();
         assert!(res["data"]["src"].as_str().unwrap().starts_with("data:image/png;base64,"));
-        assert_eq!(res["html"], IMAGE);
+        assert_eq!(res["html"], crate::panel_kit::serve("image", false, IMAGE.to_string()));
         let web = open("image", json!({"url": "https://img.example/a.png"})).unwrap();
         assert_eq!(crate::panels::get(&hub, web).unwrap().csp.resource_domains, vec!["https://img.example"]);
         let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None });
@@ -1062,7 +1171,7 @@ mod tests {
         for (app, data) in [("chart", chart_sample()), ("table", json!({"columns":[{"key":"a"}],"rows":[]})), ("pr_decision", pr_sample()),
             ("pr_overview", overview_sample())] {
             let id = open(app, data.clone()).unwrap();
-            assert_eq!(crate::panels::resource(&hub, id).unwrap()["html"], html(app).unwrap());
+            assert_eq!(crate::panels::resource(&hub, id).unwrap()["html"], crate::panel_kit::serve(app, false, html(app).unwrap().to_string()));
             // A malformed input fails the agent's own call, open or update.
             let e = open(app, json!({})).unwrap_err().to_string();
             assert!(e.contains(&format!("{app} data needs")), "{e}");

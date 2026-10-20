@@ -16,6 +16,7 @@ mod mcp;
 mod model;
 mod panels;
 mod panel_apps;
+mod panel_kit;
 mod web_preview;
 mod skills;
 mod notify;

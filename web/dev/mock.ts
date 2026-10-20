@@ -8,6 +8,7 @@
 
 import type { Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
+import { servePanelHtml } from "./build_panels.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -919,7 +920,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (panelResourceDelay) await new Promise((r) => setTimeout(r, panelResourceDelay));
       const resource = panels.get(p.id);
       if (!resource || resource.panel.closed) throw new Error("panel not found");
-      return resource;
+      // Like src/panel_kit.rs: fonts for a built-in, the kit in front of a kit panel's HTML.
+      return { ...resource, html: await servePanelHtml(resource.panel.app, !!resource.panel.kit, resource.html) };
     }
     case "panel.update": {
       const args = p.arguments;

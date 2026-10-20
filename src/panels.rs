@@ -96,9 +96,11 @@ pub fn validate_csp(csp: &PanelCsp) -> anyhow::Result<()> {
 
 /// `srcdoc` inherits this policy; the inner frame additionally receives the strict app CSP.
 /// connectDomains are retained for a future per-panel approval; they grant no access today.
+/// `font-src data:` lets the kit's bundled fonts (src/panel_kit.rs) load from data: URIs: a
+/// data: font can carry nothing out and reach nothing, so it opens no network path.
 pub fn proxy_csp(csp: &PanelCsp, ui_port: u16) -> String {
     let resources = csp.resource_domains.join(" ");
-    format!("default-src 'none'; script-src 'self' 'unsafe-inline' {resources}; style-src 'self' 'unsafe-inline' {resources}; img-src 'self' data: {resources}; font-src 'self' {resources}; media-src 'self' data: {resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:{ui_port} http://localhost:{ui_port}")
+    format!("default-src 'none'; script-src 'self' 'unsafe-inline' {resources}; style-src 'self' 'unsafe-inline' {resources}; img-src 'self' data: {resources}; font-src 'self' data: {resources}; media-src 'self' data: {resources}; connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:{ui_port} http://localhost:{ui_port}")
 }
 
 /// Read the app HTML. Called without the operation lock. `html_path` must stay inside the
@@ -357,7 +359,10 @@ pub fn resource(hub: &Hub, id: PanelId) -> anyhow::Result<Value> {
             Ok((std::fs::read_to_string(app_file(hub, &p))?, std::fs::read(data_file(hub, &p))?))
         };
         match read() {
-            Ok((html, data)) => return Ok(json!({"panel": p, "html": html, "data": serde_json::from_slice::<Value>(&data)?})),
+            Ok((html, data)) => {
+                let html = crate::panel_kit::serve(&p.app, false, html);
+                return Ok(json!({"panel": p, "html": html, "data": serde_json::from_slice::<Value>(&data)?}))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 3 => attempt += 1,
             Err(e) => return Err(e.into()),
         }

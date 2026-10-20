@@ -40,7 +40,7 @@ function iconName(p: Problems, o: Record<string, unknown>, at: string): string |
 
 function numberIn(p: Problems, o: Record<string, unknown>, key: string, at: string, lo: number, hi: number, required = false): number | undefined {
   const v = p.number(o, key, at, required);
-  if (v !== undefined && (v < lo || v > hi)) { p.add(`${at}.${key}`, `must be from ${lo} to ${hi}`); return undefined; }
+  if (v !== undefined && (v < lo || v > hi)) { p.add(at ? `${at}.${key}` : key, `must be from ${lo} to ${hi}`); return undefined; }
   return v;
 }
 

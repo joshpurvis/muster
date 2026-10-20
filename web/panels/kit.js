@@ -1486,7 +1486,7 @@
   function numberIn(p, o, key, at, lo, hi, required = false) {
     const v = p.number(o, key, at, required);
     if (v !== void 0 && (v < lo || v > hi)) {
-      p.add(`${at}.${key}`, `must be from ${lo} to ${hi}`);
+      p.add(at ? `${at}.${key}` : key, `must be from ${lo} to ${hi}`);
       return void 0;
     }
     return v;

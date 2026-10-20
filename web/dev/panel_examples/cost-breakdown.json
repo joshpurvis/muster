@@ -1,0 +1,37 @@
+{
+  "title": "$4,480 spent so far this month",
+  "scope": "acme cloud · October",
+  "takeaway": "On track to finish about 6% under the $7,400 budget. Postgres grew the most: up $212 since September, from the second read replica.",
+  "min": 300,
+  "blocks": [
+    {"kind": "stats", "span": "full", "items": [
+      {"label": "Month to date", "value": "$4,480", "delta": "+4.1%", "tone": "bad", "note": "vs September"},
+      {"label": "Forecast", "value": "$6,940", "delta": "−6%", "tone": "good", "note": "vs budget"},
+      {"label": "Largest", "value": "Postgres", "note": "$1,906 · 43%"},
+      {"label": "Per day", "value": "$224", "trend": [205, 212, 219, 216, 221, 226, 222, 228, 224]}
+    ]},
+    {"kind": "chart", "span": "full", "title": "Spend per week", "aside": "by service", "height": 220,
+     "spec": {"type": "bar", "stacked": true, "format": "usd",
+       "x": {"values": ["Sep 22", "Sep 29", "Oct 6", "Oct 13", "Oct 20"]},
+       "series": [
+         {"name": "Postgres", "values": [575, 586, 651, 669, 681]},
+         {"name": "Compute", "values": [523, 531, 543, 539, 549]},
+         {"name": "Object storage", "values": [169, 172, 177, 180, 187]},
+         {"name": "CDN", "values": [132, 126, 139, 144, 142]},
+         {"name": "Other", "values": [59, 56, 63, 57, 60]}]}},
+    {"kind": "list", "title": "By service", "aside": "month to date", "items": [
+      {"title": "Postgres", "sub": "db-primary + 2 read replicas", "bar": 0.43, "value": "$1,906"},
+      {"title": "Compute", "sub": "billing-api, acme-store web, workers", "bar": 0.34, "value": "$1,532", "color": "var(--mk-c2)"},
+      {"title": "Object storage", "sub": "invoices, images", "bar": 0.11, "value": "$509", "color": "var(--mk-c3)"},
+      {"title": "CDN", "sub": "acme-store assets", "bar": 0.09, "value": "$385", "color": "var(--mk-c4)"}]},
+    {"kind": "meters", "title": "Budgets", "note": "The tick on each bar is where spend should be today (day 20 of 31).", "items": [
+      {"label": "Whole account", "value": 4480, "max": 7400, "text": "$4,480", "of": "of $7,400", "mark": 4774},
+      {"label": "Postgres", "value": 1906, "max": 2900, "text": "$1,906", "of": "of $2,900", "tone": "warn", "mark": 1871},
+      {"label": "Compute", "value": 1532, "max": 2600, "text": "$1,532", "of": "of $2,600", "tone": "good", "mark": 1677}]},
+    {"kind": "callout", "span": "full", "tone": "warn", "title": "Postgres is ahead of pace.", "text": "At this rate it ends the month about $50 over its $2,900 budget. The rest are on or under pace."},
+    {"kind": "actions", "span": "full", "items": [
+      {"id": "explain", "label": "Why did Postgres grow?", "primary": true, "icon": "sparkle"},
+      {"id": "export_csv", "label": "Export CSV", "icon": "copy"}]}
+  ],
+  "source": "billing export, 1–20 Oct · refreshed 09:00"
+}

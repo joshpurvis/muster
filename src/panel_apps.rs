@@ -16,9 +16,10 @@ pub const CHART: &str = include_str!("../web/panels/chart.html");
 pub const TABLE: &str = include_str!("../web/panels/table.html");
 pub const PR_DECISION: &str = include_str!("../web/panels/pr_decision.html");
 pub const PR_OVERVIEW: &str = include_str!("../web/panels/pr_overview.html");
+pub const BOARD: &str = include_str!("../web/panels/board.html");
 
 /// For error messages and tool descriptions.
-pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview, web_preview";
+pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview, board, web_preview";
 /// Largest image file an `image` panel reads.
 pub const MAX_IMAGE: usize = 8 * 1024 * 1024;
 /// Its stored input: the base64 data URI plus the agent's own short fields.
@@ -57,6 +58,7 @@ pub fn html(app: &str) -> Option<&'static str> {
         "table" => TABLE,
         "pr_decision" => PR_DECISION,
         "pr_overview" => PR_OVERVIEW,
+        "board" => BOARD,
         // Drawn by the UI, not the sandbox proxy (src/web_preview.rs).
         "web_preview" => crate::web_preview::PLACEHOLDER,
         _ => return None,
@@ -79,6 +81,7 @@ pub fn data(app: &str, cwd: &Path, data: Value, csp: &mut PanelCsp, opening: boo
         "pr_overview" => check_overview(&data)?,
         "chart" => check_chart(&data)?,
         "table" => check_table(&data)?,
+        "board" => check_board(&data)?,
         _ => {}
     }
     if app != "image" { return crate::panels::data_bytes(&data); }
@@ -646,6 +649,162 @@ pub fn check_chart(data: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Block kinds a Board takes (web/src/panels/apps/board/logic.ts `KINDS`).
+pub const BOARD_KINDS: &[&str] = &["stats", "chart", "list", "meters", "callout", "actions"];
+const BOARD_TONES: &[&str] = &["good", "warn", "bad", "info", "accent"];
+
+/// An optional icon name: letters only (the panel draws "?" for a name it does not know).
+fn opt_icon(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(v) = o.get("icon").filter(|v| !v.is_null()) {
+        ensure!(v.as_str().is_some_and(|s| (1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphabetic())),
+            "{at} `icon` must be an icon name such as check, alert or chart");
+    }
+    Ok(())
+}
+
+fn opt_range(o: &serde_json::Map<String, Value>, at: &str, key: &str, lo: f64, hi: f64) -> anyhow::Result<()> {
+    if let Some(n) = opt_number(o, at, key)? { ensure!((lo..=hi).contains(&n), "{at} `{key}` must be from {lo} to {hi}"); }
+    Ok(())
+}
+
+/// Unknown fields: refused, naming the field and what the object takes.
+fn known(o: &serde_json::Map<String, Value>, at: &str, keys: &[&str]) -> anyhow::Result<()> {
+    for k in o.keys() { ensure!(keys.contains(&k.as_str()), "{at} has an unknown field `{k}` (it takes {})", keys.join(", ")); }
+    Ok(())
+}
+
+/// A short shown value: a number, or a string of at most 40 characters.
+fn opt_short_value(o: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<()> {
+    if let Some(v) = o.get("value").filter(|v| !v.is_null()) {
+        ensure!(v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 40), "{at} `value` must be a number or a string of at most 40 characters");
+    }
+    Ok(())
+}
+
+/// Everything the board app checks (web/src/panels/apps/board/logic.ts), with the same limits.
+/// A Board is plain JSON: no HTML and no script, so every string is shown as text and every
+/// colour is a kit token or a hex colour.
+pub fn check_board(data: &Value) -> anyhow::Result<()> {
+    let app = "board";
+    let o = object(data, "board data")?;
+    known(o, "board data", &["title", "scope", "takeaway", "source", "min", "blocks"])?;
+    req_text(o, app, "title", 200)?;
+    for (key, max) in [("scope", 200), ("takeaway", 600), ("source", 300)] { opt_text(o, app, key, max)?; }
+    opt_range(o, app, "min", 160.0, 1200.0)?;
+    let blocks = opt_objects(o, app, "blocks", 40, true)?;
+    ensure!(!blocks.is_empty(), "board `blocks` needs at least 1 block");
+    let (mut ids, mut keys): (Vec<&str>, Vec<String>) = (Vec::new(), Vec::new());
+    for (i, b) in blocks.into_iter().enumerate() {
+        let at = format!("board blocks[{i}]");
+        let kind = b.get("kind").and_then(Value::as_str).with_context(|| format!("{at} needs `kind` (one of {})", BOARD_KINDS.join(", ")))?;
+        ensure!(BOARD_KINDS.contains(&kind), "{at} `kind` must be one of {} (got {kind:?})", BOARD_KINDS.join(", "));
+        ensure!(b.get("span").is_none_or(|v| v.is_null() || v.as_str() == Some("full")), "{at} `span` must be \"full\" (or left out for one column)");
+        opt_text(b, &at, "title", 200)?;
+        opt_text(b, &at, "aside", 100)?;
+        let base = ["kind", "span", "title", "aside"];
+        let with = |extra: &[&'static str]| base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>();
+        let items = |max: usize| -> anyhow::Result<Vec<&serde_json::Map<String, Value>>> {
+            let list = opt_objects(b, &at, "items", max, true)?;
+            ensure!(!list.is_empty(), "{at} `items` needs at least 1 item");
+            Ok(list)
+        };
+        match kind {
+            "stats" => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, s) in items(8)?.into_iter().enumerate() {
+                    let sat = format!("{at}.items[{j}]");
+                    known(s, &sat, &["label", "value", "unit", "delta", "tone", "note", "trend", "color"])?;
+                    check_stat(&Value::Object(s.clone()), &sat)?;
+                }
+            }
+            "chart" => {
+                known(b, &at, &with(&["spec", "height"]))?;
+                opt_range(b, &at, "height", 80.0, 800.0)?;
+                let spec = b.get("spec").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `spec` (the chart app's spec)"))?;
+                check_chart(spec).with_context(|| format!("{at}.spec"))?;
+            }
+            "list" => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, it) in items(100)?.into_iter().enumerate() {
+                    let iat = format!("{at}.items[{j}]");
+                    known(it, &iat, &["title", "sub", "icon", "tone", "badge", "bar", "value", "color"])?;
+                    req_text(it, &iat, "title", 200)?;
+                    opt_text(it, &iat, "sub", 300)?;
+                    opt_text(it, &iat, "badge", 40)?;
+                    opt_icon(it, &iat)?;
+                    one_of(it, &iat, "tone", BOARD_TONES, false)?;
+                    opt_range(it, &iat, "bar", 0.0, 1.0)?;
+                    opt_short_value(it, &iat)?;
+                    opt_color(it, &iat)?;
+                }
+            }
+            "meters" => {
+                known(b, &at, &with(&["note", "items"]))?;
+                opt_text(b, &at, "note", 300)?;
+                for (j, it) in items(20)?.into_iter().enumerate() {
+                    let iat = format!("{at}.items[{j}]");
+                    known(it, &iat, &["label", "value", "max", "text", "of", "mark", "markLabel", "tone", "color"])?;
+                    req_text(it, &iat, "label", 100)?;
+                    opt_number(it, &iat, "value")?.with_context(|| format!("{iat} needs a number `value`"))?;
+                    let max = opt_number(it, &iat, "max")?.with_context(|| format!("{iat} needs a number `max`"))?;
+                    ensure!(max > 0.0, "{iat} `max` must be more than 0");
+                    for (key, n) in [("text", 40), ("of", 60), ("markLabel", 100)] { opt_text(it, &iat, key, n)?; }
+                    opt_number(it, &iat, "mark")?;
+                    one_of(it, &iat, "tone", BOARD_TONES, false)?;
+                    opt_color(it, &iat)?;
+                }
+            }
+            "callout" => {
+                known(b, &at, &with(&["tone", "icon", "text"]))?;
+                req_text(b, &at, "text", 1000)?;
+                one_of(b, &at, "tone", &["good", "warn", "bad", "info"], false)?;
+                opt_icon(b, &at)?;
+            }
+            _ => {
+                known(b, &at, &with(&["items"]))?;
+                for (j, a) in items(8)?.into_iter().enumerate() {
+                    let aat = format!("{at}.items[{j}]");
+                    known(a, &aat, &["id", "label", "primary", "danger", "confirm", "icon", "key", "data"])?;
+                    let id = a.get("id").and_then(Value::as_str).with_context(|| format!("{aat} needs a string `id` (the event kind it sends)"))?;
+                    ensure!(event_kind_ok(id) && !["closed", "overflow", "navigated"].contains(&id),
+                        "{aat}.id must start with a letter and use letters, digits, _, - or / (at most 80), and not be closed, overflow or navigated (got {id:?})");
+                    ensure!(!ids.contains(&id), "{aat}.id {id:?} is used twice");
+                    ids.push(id);
+                    req_text(a, &aat, "label", 60)?;
+                    for key in ["primary", "danger"] { opt_bool(a, &aat, key)?; }
+                    opt_text(a, &aat, "confirm", 200)?;
+                    opt_icon(a, &aat)?;
+                    if let Some(k) = a.get("key").filter(|v| !v.is_null()) {
+                        let k = k.as_str().filter(|k| k.len() == 1 && k.bytes().all(|c| c.is_ascii_alphanumeric()))
+                            .with_context(|| format!("{aat}.key must be one letter or digit"))?.to_ascii_lowercase();
+                        ensure!(!keys.contains(&k), "{aat}.key {k:?} is used twice");
+                        keys.push(k);
+                    }
+                    if let Some(d) = a.get("data").filter(|v| !v.is_null()) {
+                        let d = object(d, &format!("{aat}.data"))?;
+                        ensure!(d.len() <= 10, "{aat}.data has more than 10 fields");
+                        for (k, v) in d {
+                            ensure!((1..=31).contains(&k.len()) && k.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+                                && k.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                                && !["send", "text", "confirm", "state", "sent", "busy", "key"].contains(&k.as_str()),
+                                "{aat}.data.{k}: names must be lowercase letters, digits or _ (at most 31), and not one of the kit's own");
+                            ensure!(v.is_boolean() || v.is_number() || v.as_str().is_some_and(|s| s.chars().count() <= 500),
+                                "{aat}.data.{k} must be a string (at most 500 characters), number or true/false");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An event kind as the panel bridge accepts it (web/src/panels/bridge.ts).
+fn event_kind_ok(k: &str) -> bool {
+    (1..=80).contains(&k.len()) && k.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'/')
+}
+
 /// Everything the table app checks (web/src/panels/apps/table/logic.ts). `scope`, `takeaway`,
 /// `source` and a column's `format` and `tones` are optional additions for the Briefing look.
 pub fn check_table(data: &Value) -> anyhow::Result<()> {
@@ -839,6 +998,54 @@ mod tests {
             assert!(e.contains(why), "{c}: {e}");
         }
         assert!(date_ok("2026-10-18T09:30:00Z") && date_ok("2026-10-18T09:30:00.123+02:00") && !date_ok("2026-10-18T09:30Z") && !date_ok("2026-10-18 09:30:00Z"));
+    }
+
+    fn board_sample() -> Value {
+        json!({"title":"$4,480 spent so far this month","scope":"acme cloud · October","takeaway":"On track to finish about 6% under budget.",
+            "min":300,"source":"billing export, 1–20 Oct","blocks":[
+            {"kind":"stats","span":"full","items":[{"label":"Month to date","value":"$4,480","delta":"+4.1%","tone":"bad","note":"vs September"},
+                {"label":"Per day","value":224,"trend":[205,212,219]}]},
+            {"kind":"chart","span":"full","title":"Spend per week","aside":"by service","height":220,"spec":{"type":"bar","stacked":true,"format":"usd",
+                "x":{"values":["Oct 6","Oct 13"]},"series":[{"name":"Postgres","values":[651,669]},{"name":"Compute","values":[543,539]}]}},
+            {"kind":"list","title":"By service","items":[{"title":"Postgres","sub":"db-primary","bar":0.43,"value":"$1,906","icon":"db","tone":"warn","badge":"Growing","color":"var(--mk-c2)"}]},
+            {"kind":"meters","title":"Budgets","note":"The tick is where spend should be today.","items":[{"label":"Whole account","value":4480,"max":7400,"text":"$4,480","of":"of $7,400","mark":4774,"markLabel":"pace","tone":"warn"}]},
+            {"kind":"callout","tone":"warn","title":"Postgres is ahead of pace.","text":"It ends the month about $50 over budget."},
+            {"kind":"actions","items":[{"id":"explain","label":"Why did Postgres grow?","primary":true,"icon":"sparkle","key":"w"},
+                {"id":"rollback/prod","label":"Roll back","danger":true,"confirm":"Roll back production?","data":{"env":"production","to":"v2.3.2","dry_run":false}}]}]})
+    }
+
+    #[test]
+    fn boards_are_checked_naming_the_field() {
+        check_board(&board_sample()).unwrap();
+        check_board(&json!({"title":"t","blocks":[{"kind":"callout","text":"Nothing yet."}]})).unwrap();
+        let with = |f: &dyn Fn(&mut Value)| { let mut d = board_sample(); f(&mut d); d };
+        for (data, why) in [
+            (json!({"blocks":[{"kind":"callout","text":"x"}]}), "board data needs `title`"),
+            (json!({"title":"t","blocks":[]}), "board `blocks` needs at least 1 block"),
+            (json!({"title":"t"}), "board data needs `blocks`"),
+            (with(&|d| d["blocks"][0]["kind"] = json!("table")), "blocks[0] `kind` must be one of stats, chart, list, meters, callout, actions"),
+            (with(&|d| d["blocks"][0]["span"] = json!(2)), "blocks[0] `span` must be \"full\""),
+            (with(&|d| d["titel"] = json!("typo")), "unknown field `titel`"),
+            (with(&|d| d["min"] = json!(50)), "`min` must be from 160 to 1200"),
+            (with(&|d| d["blocks"][0]["items"][0]["tone"] = json!("great")), "items[0] `tone` must be one of good, bad, flat"),
+            (with(&|d| d["blocks"][0]["items"] = json!([])), "blocks[0] `items` needs at least 1 item"),
+            (with(&|d| d["blocks"][1]["spec"]["type"] = json!("pie")), "blocks[1].spec"),
+            (with(&|d| d["blocks"][1]["height"] = json!(5000)), "`height` must be from 80 to 800"),
+            (with(&|d| d["blocks"][2]["items"][0]["bar"] = json!(1.5)), "`bar` must be from 0 to 1"),
+            (with(&|d| d["blocks"][2]["items"][0]["color"] = json!("red; background: url(x)")), "`color` must be a kit colour token"),
+            (with(&|d| d["blocks"][2]["items"][0]["icon"] = json!("<svg>")), "`icon` must be an icon name"),
+            (with(&|d| d["blocks"][3]["items"][0]["max"] = json!(0)), "`max` must be more than 0"),
+            (with(&|d| d["blocks"][3]["items"][0]["value"] = json!("4480")), "`value` must be a number"),
+            (with(&|d| d["blocks"][4]["text"] = Value::Null), "blocks[4] data needs `text`"),
+            (with(&|d| d["blocks"][5]["items"][1]["id"] = json!("closed")), "items[1].id must start with a letter"),
+            (with(&|d| d["blocks"][5]["items"][1]["id"] = json!("explain")), "items[1].id \"explain\" is used twice"),
+            (with(&|d| d["blocks"][5]["items"][1]["key"] = json!("W")), "items[1].key \"w\" is used twice"),
+            (with(&|d| d["blocks"][5]["items"][1]["data"] = json!({"send":"x"})), "data.send: names must be lowercase"),
+            (with(&|d| d["blocks"][5]["items"][1]["data"] = json!({"env":{"a":1}})), "data.env must be a string"),
+        ] {
+            let e = format!("{:#}", check_board(&data).unwrap_err());
+            assert!(e.contains(why), "{data}: {e}");
+        }
     }
 
     #[test]
@@ -1178,14 +1385,14 @@ mod tests {
         let rel = format!("muster-panel-apps-core-{}.png", std::process::id());
         std::fs::write(Path::new("/tmp").join(&rel), PNG).unwrap();
         let open = |app: &str, data: Value| crate::panels::open(&hub, 1, Open { title: "Shot".into(), app: app.into(),
-            data: Some(data), html: None, html_path: None, csp: None });
+            data: Some(data), html: None, html_path: None, csp: None, kit: None });
         let id = open("image", json!({"path": rel})).unwrap();
         let res = crate::panels::resource(&hub, id).unwrap();
         assert!(res["data"]["src"].as_str().unwrap().starts_with("data:image/png;base64,"));
         assert_eq!(res["html"], crate::panel_kit::serve("image", false, IMAGE.to_string()));
         let web = open("image", json!({"url": "https://img.example/a.png"})).unwrap();
         assert_eq!(crate::panels::get(&hub, web).unwrap().csp.resource_domains, vec!["https://img.example"]);
-        let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None });
+        let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None });
         update(web, json!({"url": "https://img.example/b.png", "caption": "B"})).unwrap();
         assert!(update(web, json!({"url": "https://evil.example/b.png"})).is_err());
         assert!(update(id, json!({"path": "../etc/passwd"})).is_err());
@@ -1200,7 +1407,7 @@ mod tests {
         }
         assert!(open("diff", json!({})).unwrap_err().to_string().contains("pr_decision"));
         assert!(crate::panels::open(&hub, 1, Open { title: "x".into(), app: "chart".into(), data: None,
-            html: Some("<p>".into()), html_path: None, csp: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
+            html: Some("<p>".into()), html_path: None, csp: None, kit: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
         crate::panels::archive(&hub, 1).unwrap();
         std::fs::remove_file(Path::new("/tmp").join(&rel)).unwrap();
     }

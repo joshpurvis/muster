@@ -11,11 +11,11 @@
 //   deno task panels           rebuild web/panels/<app>.html, kit.css and kit.js
 //   deno task panels --check   fail if a committed file is out of date (part of `deno task check`)
 
-export const APPS = ["markdown", "image", "chart", "table", "pr_decision", "pr_overview"] as const;
+export const APPS = ["markdown", "image", "chart", "table", "pr_decision", "pr_overview", "board"] as const;
 type App = typeof APPS[number];
 const TITLES: Record<App, string> = {
   markdown: "Markdown", image: "Muster image", chart: "Muster chart", table: "Muster table", pr_decision: "Muster PR decision",
-  pr_overview: "Muster PR overview",
+  pr_overview: "Muster PR overview", board: "Muster board",
 };
 /** Styles an app takes from another app's folder, before its own. */
 const EXTRA_CSS: Partial<Record<App, string[]>> = {};

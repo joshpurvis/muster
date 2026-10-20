@@ -487,7 +487,7 @@ fn print_json(v: &Value) -> anyhow::Result<()> {
 
 #[derive(clap::Subcommand)]
 pub enum PanelCmd {
-    /// Show an app beside this session: markdown, image, chart, table, pr_decision, pr_overview, web_preview or custom. JSON data is passed with --data.
+    /// Show an app beside this session: markdown, image, chart, table, pr_decision, pr_overview, board, web_preview or custom. JSON data is passed with --data.
     Open {
         #[arg(long)] title: String,
         #[arg(long, default_value = "markdown")] app: String,
@@ -495,6 +495,8 @@ pub enum PanelCmd {
         #[arg(long, conflicts_with = "html_path")] html: Option<String>,
         #[arg(long)] html_path: Option<String>,
         #[arg(long)] csp: Option<String>,
+        /// Custom apps: put the Muster Kit (styles, components, fonts, handshake) in front of the HTML.
+        #[arg(long)] kit: bool,
     },
     /// Update input, HTML or title of a panel in this task.
     Update {
@@ -503,6 +505,8 @@ pub enum PanelCmd {
         #[arg(long)] data: Option<String>,
         #[arg(long, conflicts_with = "html_path")] html: Option<String>,
         #[arg(long)] html_path: Option<String>,
+        /// Custom apps: switch the Muster Kit on (true) or off (false); the app reloads.
+        #[arg(long)] kit: Option<bool>,
     },
     /// Close a panel in this task.
     Close { panel_id: i64 },
@@ -523,10 +527,10 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
         s.map(|s| serde_json::from_str(&s).context("invalid JSON argument")).transpose().map(|v| v.unwrap_or(Value::Null))
     };
     let (method, mut args, timeout) = match cmd {
-        PanelCmd::Open { title, app, data, html, html_path, csp } => ("panel.open",
-            json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?}), 30),
-        PanelCmd::Update { panel_id, title, data, html, html_path } => ("panel.update",
-            json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"html":html,"html_path":html_path}), 30),
+        PanelCmd::Open { title, app, data, html, html_path, csp, kit } => ("panel.open",
+            json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?,"kit":kit.then_some(true)}), 30),
+        PanelCmd::Update { panel_id, title, data, html, html_path, kit } => ("panel.update",
+            json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"html":html,"html_path":html_path,"kit":kit}), 30),
         PanelCmd::Close { panel_id } => ("panel.close", json!({"panel_id":panel_id}), 30),
         PanelCmd::List => ("panel.list", json!({}), 30),
         PanelCmd::Wait { panel_id, timeout_seconds } => {

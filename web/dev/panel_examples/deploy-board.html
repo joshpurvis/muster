@@ -1,0 +1,79 @@
+<main class="mk-page">
+  <header class="mk-head">
+    <div>
+      <h1 class="mk-title">Rolling out v2.4.0 <span class="mk-scope">acme-store</span></h1>
+      <p class="mk-takeaway">Staging is healthy. Production is <b>verifying: 2 of 4 checks done</b>.
+        The preview for PR 418 failed its migration and is not serving.</p>
+    </div>
+    <button class="mk-btn danger" data-send="rollback" data-env="production" data-to="v2.3.2"
+      data-confirm="Roll back production to v2.3.2?" data-busy="Rolling back…">
+      <mk-icon name="undo"></mk-icon>Roll back production</button>
+  </header>
+
+  <div class="mk-grid" style="--min:250px">
+    <section class="mk-card">
+      <div class="mk-card-head">
+        <span class="mk-icon info"><mk-icon name="rocket"></mk-icon></span>
+        <span class="name">production</span>
+        <span class="mk-badge info live">Verifying</span>
+      </div>
+      <div class="mk-meta"><span class="mk-chip">v2.4.0</span><span class="mk-chip">a41c9e2</span>started 6 min ago</div>
+      <ol class="mk-steps">
+        <li data-state="done"><b>Build</b>1m 12s</li>
+        <li data-state="done"><b>Test</b>3m 40s</li>
+        <li data-state="done"><b>Migrate</b>8s</li>
+        <li data-state="active"><b>Verify</b>2 of 4 checks</li>
+        <li><b>Live</b></li>
+      </ol>
+      <div class="mk-split">
+        <mk-stat label="Error rate" value="0.21" unit="%" trend="0.3,0.28,0.25,0.31,0.24,0.22,0.21" trend-width="100" color="var(--mk-c1)"></mk-stat>
+        <mk-stat label="p95" value="182" unit="ms" trend="240,231,219,205,190,186,182" trend-width="100" color="var(--mk-c2)"></mk-stat>
+      </div>
+    </section>
+
+    <section class="mk-card">
+      <div class="mk-card-head">
+        <span class="mk-icon good"><mk-icon name="check"></mk-icon></span>
+        <span class="name">staging</span>
+        <span class="mk-badge good">Healthy</span>
+      </div>
+      <div class="mk-meta"><span class="mk-chip">v2.4.0</span><span class="mk-chip">a41c9e2</span>live for 2 h</div>
+      <ol class="mk-steps">
+        <li data-state="done"><b>Build</b></li><li data-state="done"><b>Test</b></li>
+        <li data-state="done"><b>Migrate</b></li><li data-state="done"><b>Verify</b></li>
+        <li data-state="done"><b>Live</b></li>
+      </ol>
+      <div class="mk-split">
+        <mk-stat label="Error rate" value="0.08" unit="%" trend="0.1,0.09,0.12,0.08,0.07,0.09,0.08" trend-width="100" color="var(--mk-good)"></mk-stat>
+        <mk-stat label="p95" value="164" unit="ms" trend="170,168,171,166,165,163,164" trend-width="100" color="var(--mk-c2)"></mk-stat>
+      </div>
+    </section>
+
+    <section class="mk-card">
+      <div class="mk-card-head">
+        <span class="mk-icon bad"><mk-icon name="alert"></mk-icon></span>
+        <span class="name">preview-418</span>
+        <span class="mk-badge bad">Failed</span>
+      </div>
+      <div class="mk-meta"><span class="mk-chip">pr-418</span><span class="mk-chip">7d02b5c</span>12 min ago</div>
+      <ol class="mk-steps">
+        <li data-state="done"><b>Build</b></li><li data-state="done"><b>Test</b></li>
+        <li data-state="failed"><b>Migrate</b>exit 1</li><li><b>Verify</b></li><li><b>Live</b></li>
+      </ol>
+      <pre class="mk-pre"><mark>ERROR</mark> column "coupon_code" of relation "orders" already exists (0042_coupons.sql)</pre>
+      <div class="mk-row" style="margin-top:12px">
+        <button class="mk-btn sm" data-send="retry" data-env="preview-418" data-busy="Retrying…">Retry</button>
+        <button class="mk-btn sm ghost" data-send="show_log" data-env="preview-418">Full log</button>
+      </div>
+    </section>
+  </div>
+
+  <section class="mk-section">
+    <h2>Today</h2>
+    <ul class="mk-timeline">
+      <li class="info"><b>production</b> started verifying v2.4.0<time>14:32</time></li>
+      <li class="bad"><b>preview-418</b> failed at Migrate<time>14:26</time></li>
+      <li class="good"><b>staging</b> promoted v2.4.0<time>12:41</time></li>
+    </ul>
+  </section>
+</main>

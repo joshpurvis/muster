@@ -8,7 +8,8 @@
 //     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo> [cdp-port]
 import { type Browser, launch } from "./cdp.ts";
 import {
-  actionsSample, chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA, tableSample,
+  actionsSample, chartBriefSample, chartMultiSample, chartSample, HEAD_SHA, lineSample, markdownSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA,
+  tableBriefSample, tableSample,
 } from "./panel_samples.ts";
 
 const M = "globalThis.__muster";
@@ -74,6 +75,8 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     })`);
     /** Zoomed, dark then light, and the page must not scroll sideways. */
     const shots2 = async (name: string) => {
+      // The pointer rests on the status bar, so no tab tooltip covers the panel's strip.
+      await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 4, y: 896 });
       await zoom("fullscreen");
       for (const theme of ["dark", "light"]) {
         await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
@@ -509,6 +512,116 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check((await events(p.pid)).every((ev: any) => ev.kind !== "answers"), "nothing was sent");
     await close(p.pid);
     ok("pr_decision: a late refusal never brings back an option after an update or a newer edit");
+  }
+
+  // ---- the Briefing look: each restyled built-in, a board and a kit panel, dark and light, wide
+  // and about 360 px wide (no sideways scroll at either width)
+  {
+    /** Zoomed to about `width` px of app, both themes, then back to the full window. */
+    const narrowShots = async (p: Awaited<ReturnType<typeof open>>, name: string, width = 360) => {
+      await p.zoom("fullscreen");
+      await a.sleep(300);
+      const share = (await p.inApp("innerWidth")) / 1440;
+      await a.size(Math.ceil(width / share), 900);
+      await a.sleep(500);
+      const w: number = await p.inApp("innerWidth");
+      check(w < width + 40, `${name}: narrow width reached (${w})`);
+      await p.inApp("scrollTo(0, 0)");
+      await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 4, y: 896 });
+      check(await p.inApp(`document.documentElement.scrollWidth <= innerWidth + 1`), `${name} narrow: no sideways scroll ${await p.inApp(`JSON.stringify([document.documentElement.scrollWidth, innerWidth, [...document.querySelectorAll('*')].filter((e) => e.getBoundingClientRect().right > innerWidth + 1).slice(0, 5).map((e) => e.tagName + '.' + e.getAttribute('class') + ':' + Math.round(e.getBoundingClientRect().right))])`)}`);
+      for (const theme of ["dark", "light"]) {
+        await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
+        await p.waitIn(`document.documentElement.dataset.theme === '${theme}'`);
+        await a.sleep(300);
+        await a.shot(`${shots}/panel-${name}-narrow-${theme}.png`, (await a.rect(`[data-panel-view="${p.pid}"]`))!);
+      }
+      await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+      await p.zoom("inline");
+      await a.size(1440, 900);
+      await a.sleep(400);
+    };
+    const fonts = (p: Awaited<ReturnType<typeof open>>) => p.inApp(`document.fonts.ready.then(() => [...document.fonts].filter((f) => f.status === 'loaded').map((f) => f.family).join(','))`);
+
+    for (const [app, name, data, ready] of [
+      ["chart", "chart-brief", chartBriefSample, "path.bar"],
+      ["chart", "chart-multi", chartMultiSample, "path.line"],
+      ["table", "table-brief", tableBriefSample, ".mk-badge.warn"],
+      ["markdown", "markdown", markdownSample, ".md blockquote"],
+    ] as const) {
+      const p = await open(app, name, data);
+      await p.waitIn(`document.querySelector(${JSON.stringify(ready)})`);
+      check(String(await fonts(p)).includes("MK Inter"), `${name}: the bundled Inter font loaded (no network)`);
+      await p.shots2(name);
+      await narrowShots(p, name);
+      await close(p.pid);
+    }
+    ok("the restyled chart, table and Markdown panels draw the Briefing look with the bundled fonts, wide and narrow, in both themes");
+
+    // Board: JSON only. Stats, a stacked chart, a list, meters, a callout and actions.
+    const cost = JSON.parse(await Deno.readTextFile(new URL("./panel_examples/cost-breakdown.json", import.meta.url)));
+    cost.blocks.find((b: any) => b.kind === "actions").items.push({ id: "pause_replica", label: "Pause the second replica", danger: true,
+      confirm: "Pause db-replica-2 until Monday?", data: { replica: "db-replica-2", until: "monday" } });
+    const b = await open("board", "Cloud spend", cost);
+    await b.waitIn(`document.querySelectorAll('.mk-stats .mk-stat').length === 4 && document.querySelectorAll('.mk-chart path.bar').length === 25`);
+    check((await b.inApp(`document.querySelector('.mk-title').textContent`)).startsWith("$4,480 spent so far this month"), "board title");
+    check((await b.inApp(`document.querySelectorAll('.mk-meter .mark').length`)) === 3, "meters with their pace ticks");
+    await b.shots2("board");
+    // A plain action sends at once; the button says so and stays off until the agent updates.
+    await b.click(`[data-send="export_csv"]`);
+    await b.waitIn(`document.querySelector('[data-send="export_csv"]').dataset.state === 'sent'`);
+    let got = await events(b.pid);
+    check(got.length === 1 && got[0].kind === "export_csv", `board action event: ${JSON.stringify(got)}`);
+    check(await b.inApp(`document.querySelector('[data-send="export_csv"]').disabled`), "a sent button waits for the agent");
+    // A confirm action asks first: the first click arms it, the second sends, with its data.
+    await b.click(`[data-send="pause_replica"]`);
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`);
+    check((await b.inApp(`document.querySelector('[data-send="pause_replica"]').textContent`)).includes("Pause db-replica-2 until Monday?"), "the button asks its question");
+    check((await events(b.pid)).length === 0, "arming sends nothing");
+    await b.click(`[data-send="pause_replica"]`);
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'sent'`);
+    got = await events(b.pid);
+    check(got.length === 1 && got[0].kind === "pause_replica" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ replica: "db-replica-2", until: "monday" }), `confirmed action: ${JSON.stringify(got)}`);
+    // The agent's update brings the buttons back.
+    await call("panel.update", { panel_id: b.pid, data: cost });
+    await b.waitIn(`!document.querySelector('[data-send][data-state]')`);
+    await narrowShots(b, "board");
+    // Muster refuses a malformed board, naming the field.
+    let refused = "";
+    await call("panel.update", { panel_id: b.pid, data: { ...cost, blocks: [{ kind: "table" }] } }).catch((e: Error) => { refused = String(e.message ?? e); });
+    check(refused === "" || refused.includes("kind"), `a malformed board is refused: ${refused}`);
+    await close(b.pid);
+    ok("board: JSON draws stats, a stacked chart, a list, meters, a callout and actions; an action sends one event, a confirm action asks first and sends its data; narrow and both themes");
+
+    // Kit: the agent's own HTML with kit: true gets the styles, components, fonts and handshake.
+    const html = await Deno.readTextFile(new URL("./panel_examples/deploy-board.html", import.meta.url));
+    const kid = (await call("panel.open", { title: "Deploys", app: "custom", html, kit: true })).panel_id as number;
+    const k = { pid: kid, ...(await attach(kid)) };
+    await k.waitIn(`document.querySelectorAll('.mk-steps').length === 3 && document.querySelector('mk-stat .value')`);
+    check(String(await fonts(k)).includes("MK Inter"), "kit panel: the bundled fonts loaded");
+    // (This test reads the page from an isolated world, so it checks what the kit did, not window.mk.)
+    check(await k.inApp(`document.documentElement.classList.contains('mk') && !!document.querySelector('mk-stat.mk-stat .value') && !!document.querySelector('mk-icon svg')`), "kit panel: the kit upgraded its tags");
+    await k.shots2("kit-deploy");
+    await k.click(`[data-send="rollback"]`);
+    await k.waitIn(`document.querySelector('[data-send="rollback"]').dataset.state === 'armed'`);
+    await a.key("Enter");
+    await k.waitIn(`document.querySelector('[data-send="rollback"]').dataset.state === 'sent'`);
+    got = await events(kid);
+    check(got.length === 1 && got[0].kind === "rollback" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ env: "production", to: "v2.3.2" }), `kit confirm event: ${JSON.stringify(got)}`);
+    await narrowShots(k, "kit-deploy");
+    await close(kid);
+    // Without kit: true a custom panel is exactly the agent's HTML, as before.
+    const plain = (await call("panel.open", { title: "Plain", app: "custom", html: `<p id="x">plain</p><script>parent.postMessage({jsonrpc:"2.0",id:1,method:"ui/initialize",params:{protocolVersion:"2026-01-26",appInfo:{name:"p",version:"1"},appCapabilities:{}}},"*");addEventListener("message",(e)=>{if(e.data?.id===1)parent.postMessage({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}},"*")})</script>` })).panel_id as number;
+    const pl = await attach(plain);
+    await pl.waitIn(`document.querySelector('#x')`);
+    check(await pl.inApp(`!document.documentElement.classList.contains('mk') && document.querySelectorAll('style').length === 0`), "no kit unless asked");
+    await close(plain);
+    const test = await Deno.readTextFile(new URL("./panel_examples/test-run.html", import.meta.url));
+    const tid = (await call("panel.open", { title: "Test run #1482", app: "custom", html: test, kit: true })).panel_id as number;
+    const t = await attach(tid);
+    await t.waitIn(`document.querySelector('mk-ring svg') && document.querySelector('mk-chart svg[role=img]')`);
+    await t.shots2("kit-tests");
+    await close(tid);
+    ok("kit: a custom panel opened with kit: true draws with the kit (fonts, components, handshake); a confirm button asks, Enter sends its data; without kit the HTML is untouched");
   }
 
   // ---- open PRs: overview → open → decision with media → hold → custom outward action → back

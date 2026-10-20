@@ -153,42 +153,55 @@ export const SLOW_NOTICE: Notice = {
 // it in the backend (src/web_preview.rs `parse_typed`), the UI never decides -----
 
 export interface AddressState {
-  /** The user is editing: the field shows `draft`, not the panel's address. */
-  editing: boolean;
+  /** The user's text, shown instead of the panel's address while `dirty`. */
   draft: string;
+  /** The user has typed (focus alone is not an edit: the field keeps following the address). */
+  dirty: boolean;
   /** The backend's reason the last address was refused, shown under the bar. */
   error: string;
-  /** A navigation is in flight. */
-  busy: boolean;
+  /** The navigation in flight (its request id), or 0. Escape does not end it. */
+  pending: number;
+  /** Counts typing and Escape, so a completion can tell whether the user moved on since. */
+  edits: number;
+  /** `edits` and the text when the pending navigation was sent. */
+  sentEdits: number;
+  sent: string;
 }
 
 export type AddressAction =
-  | { type: "focus"; url: string }
   | { type: "input"; text: string }
-  | { type: "submit" }
-  | { type: "refused"; reason: string }
-  | { type: "done" }
+  | { type: "submit"; id: number; text: string }
+  | { type: "done"; id: number }
+  | { type: "refused"; id: number; reason: string }
   | { type: "cancel" }
   | { type: "blur"; url: string };
 
-export const ADDRESS_IDLE: AddressState = { editing: false, draft: "", error: "", busy: false };
+export const ADDRESS_IDLE: AddressState = { draft: "", dirty: false, error: "", pending: 0, edits: 0, sentEdits: 0, sent: "" };
+
+/** Did the user leave the field alone since the pending navigation was sent? */
+export const untouchedSinceSubmit = (s: AddressState) => s.edits === s.sentEdits;
 
 export function addressStep(s: AddressState, a: AddressAction): AddressState {
   switch (a.type) {
-    // Focus starts an edit from the current address; an edit in progress keeps its text.
-    case "focus": return s.editing ? s : { editing: true, draft: a.url, error: "", busy: false };
-    case "input": return { ...s, editing: true, draft: a.text, error: "" };
-    case "submit": return s.busy ? s : { ...s, editing: true, busy: true, error: "" };
-    // A refused address stays, so the user can fix it.
-    case "refused": return { ...s, editing: true, busy: false, error: a.reason };
+    case "input": return { ...s, draft: a.text, dirty: true, error: "", edits: s.edits + 1 };
+    // One navigation at a time; `text` is what the field showed.
+    case "submit": return s.pending ? s : { ...s, pending: a.id, sent: a.text, sentEdits: s.edits, error: "" };
+    // A completion that is not the pending one, or that the user moved on from, changes only `pending`.
     case "done":
-    case "cancel": return ADDRESS_IDLE;
-    // Leaving the field drops an untouched edit; typed text and a refusal stay until Escape.
-    case "blur": return s.busy || s.error || s.draft.trim() !== a.url ? s : ADDRESS_IDLE;
+      if (a.id !== s.pending) return s;
+      return untouchedSinceSubmit(s) ? ADDRESS_IDLE : { ...s, pending: 0 };
+    // A refused address stays, so the user can fix it.
+    case "refused":
+      if (a.id !== s.pending) return s;
+      return untouchedSinceSubmit(s) ? { ...s, pending: 0, draft: s.sent, dirty: true, error: a.reason } : { ...s, pending: 0 };
+    // Escape: show the panel's address again; a navigation in flight still completes.
+    case "cancel": return { ...s, draft: "", dirty: false, error: "", edits: s.edits + 1 };
+    // Leaving the field drops an edit that matches the address; other text and a refusal stay.
+    case "blur": return !s.dirty || s.pending || s.error || s.draft.trim() !== a.url ? s : { ...s, draft: "", dirty: false };
   }
 }
 
-/** What the field shows. */
+/** What the field shows: the user's text, or the panel's current address. */
 export function addressText(s: AddressState, url: string | null): string {
-  return s.editing ? s.draft : url ?? "";
+  return s.dirty ? s.draft : url ?? "";
 }

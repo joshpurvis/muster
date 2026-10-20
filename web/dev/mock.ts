@@ -961,7 +961,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const r = panels.get(p.id);
       if (!r || r.panel.closed || r.panel.app !== "web_preview") throw new Error("only a web preview has an address bar");
       const t = String(p.url ?? "").trim();
-      const typed = /^\d{1,5}$/.test(t) ? `http://localhost:${t}/` : t.includes("://") || !t ? t : `http://${t}`;
+      const typed = /^\d{1,5}$/.test(t) ? `http://localhost:${t}/` : /^[a-z][a-z0-9+.-]*:\/\//i.test(t) || !t ? t : `http://${t}`;
       let url: string;
       try { url = mockPreviewUrl(typed).href; } catch (e) {
         throw new Error(String((e as Error).message).replace(/web_preview frames only local dev servers.*/, "The preview shows only local dev servers (localhost or 127.0.0.1 with a port); open other pages in your browser."));

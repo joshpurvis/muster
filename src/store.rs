@@ -458,6 +458,21 @@ impl Store {
     }
 
     /// Keep at most 200 events. The overflow count is delivered with the next batch.
+    /// [`Self::save_panel`] and [`Self::push_panel_event`] in one transaction: a web preview's
+    /// new address and the `navigated` event telling its agent commit together or not at all.
+    pub fn save_panel_with_event(&self, panel: &mut Panel, event: &PanelEvent) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO panel_events(panel_id,record) VALUES (?1,?2)", params![panel.id, serde_json::to_string(event)?])?;
+        let dropped = tx.execute("DELETE FROM panel_events WHERE panel_id=?1 AND id NOT IN
+            (SELECT id FROM panel_events WHERE panel_id=?1 ORDER BY id DESC LIMIT 200)", [panel.id])?;
+        panel.dropped_events += dropped as u64;
+        tx.execute("UPDATE panels SET title=?2,csp=?3,revision=?4,updated_at=?5,closed=?6,record=?7 WHERE id=?1",
+            params![panel.id, panel.title, serde_json::to_string(&panel.csp)?, panel.revision, panel.updated_at, panel.closed, serde_json::to_string(panel)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn push_panel_event(&self, panel: &mut Panel, event: &PanelEvent) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;

@@ -3764,8 +3764,8 @@ body.dragging .panel-view { pointer-events: none; }
   color: var(--text);
 }
 .preview-url:hover { border-color: var(--border); }
-.preview-url:focus { border-color: var(--border-strong); background: var(--bg-2); outline: none; }
-.preview-url:focus-visible { box-shadow: 0 0 0 1px var(--border-strong); }
+/* Keyboard and mouse focus alike: the accent border and ring (the label look gives no other cue). */
+.preview-url:focus { border-color: var(--accent); background: var(--bg-2); outline: none; box-shadow: 0 0 0 1px var(--accent); }
 .preview-url[aria-invalid] { border-color: var(--st-error); }
 .preview-url[readonly] { color: var(--text-muted); }
 .preview-address-error {

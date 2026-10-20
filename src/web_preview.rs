@@ -132,7 +132,14 @@ pub fn parse(url: &str, reserved: &[u16]) -> anyhow::Result<Target> {
 pub fn complete_typed(typed: &str) -> String {
     let t = typed.trim();
     if !t.is_empty() && t.len() <= 5 && t.bytes().all(|b| b.is_ascii_digit()) { return format!("http://localhost:{t}/") }
-    if t.contains("://") || t.is_empty() { t.to_string() } else { format!("http://{t}") }
+    if t.is_empty() || has_scheme(t) { t.to_string() } else { format!("http://{t}") }
+}
+
+/// Does `t` start with a URL scheme and `://` (not merely contain one, as in
+/// `localhost:3000/login?next=http://localhost:4000/`)?
+fn has_scheme(t: &str) -> bool {
+    t.split_once("://").is_some_and(|(scheme, _)| scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)))
 }
 
 /// [`parse`] for an address the user typed.
@@ -402,6 +409,8 @@ mod tests {
             ("3000", "http://localhost:3000/"), (" 5173 ", "http://localhost:5173/"), ("localhost:3000", "http://localhost:3000/"),
             ("127.0.0.1:3000/path?q=1", "http://127.0.0.1:3000/path?q=1"), ("http://localhost:3000", "http://localhost:3000/"),
             ("https://localhost:8443", "https://localhost:8443/"), ("LOCALHOST:8080/#x", "http://localhost:8080/#x"),
+            ("localhost:3000/login?next=http://localhost:4000/", "http://localhost:3000/login?next=http://localhost:4000/"),
+            ("127.0.0.1:3000/?u=https://x.example/", "http://127.0.0.1:3000/?u=https://x.example/"),
         ] {
             assert_eq!(parse_typed(typed, RESERVED).unwrap().url(), want, "{typed}");
         }

@@ -249,7 +249,9 @@ restores the current one). Muster completes what a person types (a bare port `30
 rule as `panel_update`; a refused address shows the reason under the bar and keeps the text.
 An accepted one is stored like an update with data (every window and a restart show it), and
 the agent gets a `navigated` event, `{url, previous}` (both as stored), through
-`wait_for_panel_event` or the idle panel prompt. Pressing Enter on the current address only
+`wait_for_panel_event` or the idle panel prompt. The address and its event commit together, in
+order, for every change: the apps' 30-events-a-minute limit does not apply to them (the
+200-event queue bound does). Pressing Enter on the current address only
 reloads and sends nothing. Agents still pass full URLs; only the bar completes short forms.
 
 Muster checks the server when the panel opens or changes, and the result's `note` tells the

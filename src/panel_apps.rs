@@ -636,7 +636,9 @@ pub fn check_chart(data: &Value) -> anyhow::Result<()> {
         let at = format!("chart annotations[{i}]");
         req_text(a, &at, "label", 60)?;
         let ax = a.get("x").filter(|v| !v.is_null()).with_context(|| format!("{at} needs `x`"))?;
-        ensure!(x.contains(ax), "{at} `x` must be one of x.values (got {ax})");
+        // Numbers match by value, as in the app (1 and 1.0 are the same x); strings exactly.
+        let same = |v: &Value| match (v.as_f64(), ax.as_f64()) { (Some(a), Some(b)) => a == b, _ => v == ax };
+        ensure!(x.iter().any(same), "{at} `x` must be one of x.values (got {ax})");
     }
     if let Some(stats) = o.get("stats").filter(|v| !v.is_null()) {
         let stats = stats.as_array().context("chart `stats` must be an array")?;
@@ -770,7 +772,7 @@ pub fn check_board(data: &Value) -> anyhow::Result<()> {
                         "{aat}.id must start with a letter and use letters, digits, _, - or / (at most 80), and not be closed, overflow or navigated (got {id:?})");
                     ensure!(!ids.contains(&id), "{aat}.id {id:?} is used twice");
                     ids.push(id);
-                    req_text(a, &aat, "label", 60)?;
+                    let label = req_text(a, &aat, "label", 60)?;
                     for key in ["primary", "danger"] { opt_bool(a, &aat, key)?; }
                     opt_text(a, &aat, "confirm", 200)?;
                     opt_icon(a, &aat)?;
@@ -792,6 +794,12 @@ pub fn check_board(data: &Value) -> anyhow::Result<()> {
                                 "{aat}.data.{k} must be a string (at most 500 characters), number or true/false");
                         }
                     }
+                    // The event a press sends (web/src/panels/kit/board.ts) must fit the event limit.
+                    let data = a.get("data").filter(|v| !v.is_null()).cloned().unwrap_or_else(|| serde_json::json!({}));
+                    let event = serde_json::json!({"role": "user", "content": {"type": "text", "text": format!("Pressed \"{label}\"")},
+                        "_meta": {"muster": {"kind": id, "data": data}}});
+                    let size = serde_json::to_vec(&event)?.len();
+                    ensure!(size <= crate::panels::MAX_EVENT, "{aat} would send an event of {size} bytes; at most 16 KiB (shorten its data)");
                 }
             }
         }
@@ -1046,6 +1054,20 @@ mod tests {
             let e = format!("{:#}", check_board(&data).unwrap_err());
             assert!(e.contains(why), "{data}: {e}");
         }
+    }
+
+    /// The same inputs pass or fail in the app (web/src/panels/apps/board/logic_test.ts reads
+    /// this file too).
+    #[test]
+    fn boards_pass_or_fail_here_as_in_the_app() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!("../web/src/panels/apps/board/parity.json")).unwrap();
+        for c in cases {
+            let r = check_board(&c["data"]);
+            assert_eq!(r.is_ok(), c["ok"].as_bool().unwrap(), "{}: {:?}", c["name"], r.err());
+        }
+        let e = format!("{:#}", check_board(&json!({"title":"t","blocks":[{"kind":"actions","items":[{"id":"go","label":"Go",
+            "data": (0..10).map(|i| (format!("k{i}"), json!("😀".repeat(500)))).collect::<serde_json::Map<_, _>>()}]}]})).unwrap_err());
+        assert!(e.contains("items[0] would send an event of") && e.contains("at most 16 KiB"), "{e}");
     }
 
     #[test]

@@ -6,7 +6,7 @@ import { chart, isEmpty } from "../../kit/chart.ts";
 import { esc, rich } from "../../kit/format.ts";
 import { icon } from "../../kit/icons.ts";
 import { stat } from "../../kit/parts.ts";
-import { type ChartSpec, validateChart } from "./logic.ts";
+import { type ChartSpec, statsKeySeries, validateChart } from "./logic.ts";
 
 const root = document.getElementById("app")!;
 let showTable = false;
@@ -23,8 +23,8 @@ function render(spec: ChartSpec, warnings: string[]) {
       (isEmpty(spec) ? "" : `<span class="keys"><button type="button" class="ghost sm" id="toggle-table" aria-expanded="${showTable}">${icon("table")}${showTable ? "Hide data table" : "Data table"}</button>` +
         `<span class="step-hint" aria-hidden="true"><kbd>←</kbd> <kbd>→</kbd> step</span></span>`) + `</footer>` : "");
   const slot = root.querySelector<HTMLElement>(".chart-slot")!;
-  // Headline numbers name the series with their colours, so they replace the legend.
-  chart(slot, spec, { showTable, legendValues: spec.series.length > 1, legend: spec.stats?.length ? false : undefined });
+  // Headline numbers that name every series in its colour replace the legend; otherwise it stays.
+  chart(slot, spec, { showTable, legendValues: spec.series.length > 1, legend: statsKeySeries(spec) ? false : undefined });
   const toggle = document.getElementById("toggle-table");
   const table = slot.querySelector<HTMLElement>("[id$='-data']");
   if (table) toggle?.setAttribute("aria-controls", table.id);

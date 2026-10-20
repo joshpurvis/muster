@@ -1,4 +1,4 @@
-import { change, highlightOf, isEmpty, type KitChartSpec, stackBars, yDomain, yTicks } from "./chart.ts";
+import { change, highlightOf, isEmpty, type KitChartSpec, lineBounds, nearestPoint, stackBars, tipLeft, yDomain, yTicks } from "./chart.ts";
 import { check, eq } from "../apps/shared/test_util.ts";
 
 const spec = (o: Partial<KitChartSpec>): KitChartSpec => ({ type: "bar", x: { values: ["a", "b", "c"] }, series: [], ...o });
@@ -52,4 +52,28 @@ Deno.test("highlight: the named series, or past 8 series the first", () => {
   eq(highlightOf(spec({ series: many.slice(0, 8) })), null);
   eq(highlightOf(spec({ series: many, highlight: "s4" })), "s4");
   eq(highlightOf(spec({ series: many.slice(0, 3), highlight: "nope" })), null);
+});
+
+Deno.test("stacked areas with negatives use the same pos/neg stacks as bars (a negative layer sits below zero)", () => {
+  const layers = lineBounds([{ name: "a", values: [5, 10, null] }, { name: "b", values: [-2, -5, 3] }, { name: "c", values: [1, -1, 2] }], 3, true);
+  eq(layers[0], { top: [5, 10, null], bot: [0, 0, 0] });
+  eq(layers[1], { top: [-2, -5, 3], bot: [0, 0, 0] });
+  eq(layers[2], { top: [6, -6, 5], bot: [5, -5, 3] });
+  // Not stacked: the values themselves, filled to zero.
+  eq(lineBounds([{ name: "b", values: [-2, null] }], 2, false), [{ top: [-2, null], bot: null }]);
+});
+
+Deno.test("scatter hover: the nearest point in both directions, within reach", () => {
+  const pts = [{ i: 0, x: 100, y: 200 }, { i: 1, x: 100, y: 20 }, { i: 2, x: 300, y: 100 }];
+  eq(nearestPoint(pts, 101, 22, 24), 1);
+  eq(nearestPoint(pts, 99, 195, 24), 0);
+  eq(nearestPoint(pts, 200, 110, 24), null);
+  eq(nearestPoint([], 0, 0, 24), null);
+});
+
+Deno.test("tooltip placement: right of the point, else left of it, always inside the chart", () => {
+  eq(tipLeft(100, 72, 180, 600), 100);
+  eq(tipLeft(500, 472, 180, 600), 292);
+  eq(tipLeft(120, 92, 180, 240), 0);
+  eq(tipLeft(20, -8, 400, 300), 0);
 });

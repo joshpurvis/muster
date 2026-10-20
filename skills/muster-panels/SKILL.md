@@ -35,8 +35,10 @@ one sentence, the headline numbers, then the evidence, then where it came from.*
 lightest kind that fits:
 
 1. **A built-in** when one fits the data: `chart`, `table`, `image`, `markdown`,
-   `web_preview` (and the PR apps). Give them a `takeaway` (one sentence, `**bold**` allowed),
-   a `scope` and a `source`.
+   `web_preview` (and the PR apps). Give a `chart` or `table` a `takeaway` (one sentence,
+   `**bold**` allowed), a `scope` and a `source`. The others refuse those fields: an `image`
+   carries its finding in `caption` (and `alt`), a `markdown` panel in its first lines, and a
+   `web_preview` in its title.
 2. **A board** (`app: "board"`) for a dashboard or status page: plain JSON, no HTML, no
    script. Headline numbers, charts, lists, budget meters, a callout and buttons that send you
    events. This is the default for anything with several parts.
@@ -95,7 +97,7 @@ blocks flow in columns at least `min` px wide (default 300) and drop to one colu
   pace line, a limit): say what it means in `note`
 - `callout`: `{tone?: good|warn|bad|info, title?, text}`
 - `actions`: `items: [{id, label, primary?, danger?, confirm?, icon?, key?, data?}]`. A click
-  sends you the panel event `kind: id` with `data`; `confirm: "Roll back production?"` makes
+  sends you the panel event `kind: id` with `data` (JSON types kept; keep it well under 16 KiB); `confirm: "Roll back production?"` makes
   it two-step. The button stays off until your next `panel_update`, so answer each event with
   an update.
 
@@ -181,7 +183,7 @@ colours: use the `--mk-*` tokens.
   `mk-list`, `mk-steps` (`li[data-state=done|active|failed]`), `mk-timeline`, `mk-callout`,
   `mk-kv`, `mk-pre`, `mk-table`, `mk-empty`.
 - Buttons: `data-send="kind"` plus any `data-*` sends you the event `kind` with those as its
-  data; `data-confirm="Roll back production to v2.3.2?"` asks first. A sent button waits for
+  data (strings); `data-confirm="Roll back production to v2.3.2?"` asks first. A sent button waits for
   your next `panel_update`.
 - Script, if you need it: `mk.onData(fn)` (your data, now and on every update),
   `mk.send(kind, data)` from a click handler, `mk.chart(el, spec)`, `mk.board(el, data)`,

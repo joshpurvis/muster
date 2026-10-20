@@ -91,7 +91,7 @@ function draftChanged(full = true) {
     full = true;
   }
   if (full) render();
-  else refreshDraftRow();
+  else { refreshDraftRow(); refreshReadiness(); }
 }
 
 /** A send carried the draft: its options went with it (they are one-shot) and switch off; the
@@ -650,6 +650,41 @@ function refreshDraftRow() {
   if (now && next) now.replaceWith(next);
 }
 
+/** Typing an answer changes readiness: refresh everything that shows it (the verdict's colour
+ * and reasons, the answered counts, the question cards, why Merge waits) without rebuilding
+ * the question the user is typing in. */
+function refreshReadiness() {
+  if (!pr) return;
+  const p = pr;
+  const verdict = root.querySelector(":scope > section.verdict");
+  const nextVerdict = verdictBlock(p);
+  if (verdict && nextVerdict) verdict.replaceWith(nextVerdict);
+  else if (verdict) verdict.remove();
+  else if (nextVerdict) root.querySelector(":scope > p.warnings, :scope > section.facts")?.before(nextVerdict);
+  const answered = p.questions.filter((q) => answerOf(q, ds.choices) !== undefined).length;
+  const count = document.querySelector("#questions-title .count");
+  if (count) count.textContent = `${answered} of ${p.questions.length} answered`;
+  const chip = document.getElementById("to-questions"), nextChip = questionsChip(p);
+  if (chip && nextChip) chip.replaceWith(nextChip);
+  for (const q of p.questions) {
+    const done = answerOf(q, ds.choices) !== undefined;
+    document.getElementById(`q-${q.id}`)?.classList.toggle("answered", done);
+    document.getElementById(`q-${q.id}`)?.classList.toggle("done", done);
+  }
+  const ready = readiness(p, ds.choices);
+  const waits = p.status === "open" && !ready.ready;
+  mergeButton?.classList.toggle("waits", waits);
+  mergeButton?.setAttribute("aria-describedby", waits ? "merge-hint merge-why" : "merge-hint");
+  const why = document.getElementById("merge-why");
+  const nextWhy = waits && mode !== "confirm" ? mergeWhy(ready) : null;
+  if (why && nextWhy) why.replaceWith(nextWhy);
+  else if (why) why.remove();
+  else if (nextWhy) root.querySelector(".actbar > .row.bar")?.after(nextWhy);
+  updateMergeButton();
+}
+
+const mergeWhy = (ready: { short: string[] }) => h("p", { id: "merge-why", class: "why small" }, iconEl("clock"), `Merge waits for ${joinAnd(ready.short)}`);
+
 function mediaSection(p: Pr) {
   if (!p.media.length) return null;
   const images = p.media.filter((m) => m.kind === "image").length;
@@ -813,7 +848,7 @@ function render() {
         h("button", { type: "button", id: "skip", class: "ghost", "aria-keyshortcuts": "S", disabled: !!sent, title: "Move on without changing this PR", onclick: () => sendSimple("skip") }, "Skip ", h("kbd", null, "S")),
         h("button", { type: "button", id: "hold", class: "ghost", "aria-keyshortcuts": "H", disabled: !!sent || !!holdClosed(p), title: holdClosed(p) ?? "Put this PR aside to come back to later", onclick: () => sendSimple("hold") }, "Hold ", h("kbd", null, "H")),
         helpButton(() => setKeys(!showKeys), showKeys)),
-      waits && mode !== "confirm" ? h("p", { id: "merge-why", class: "why small" }, iconEl("clock"), `Merge waits for ${joinAnd(ready.short)}`) : null,
+      waits && mode !== "confirm" ? mergeWhy(ready) : null,
       actionsGroup(p.actions, runAction, (a) => a.mode === "toggle" ? !!closed : sentNow.has(a.id), actionsOpen,
         () => { actionsOpen = !actionsOpen; render(); document.getElementById("your-actions")?.focus(); },
         (a) => a.mode === "toggle" ? ds.isOn(a) : undefined),

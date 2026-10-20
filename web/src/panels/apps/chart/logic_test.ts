@@ -1,4 +1,4 @@
-import { validateChart } from "./logic.ts";
+import { type ChartSpec, statsKeySeries, validateChart } from "./logic.ts";
 import { check, eq, errorsOf } from "../shared/test_util.ts";
 
 const bar = { type: "bar", title: "Builds", x: { label: "Day", values: ["Mon", "Tue", "Wed"] }, series: [{ name: "ok", values: [3, 7, null] }] };
@@ -54,4 +54,15 @@ Deno.test("chart input: the Briefing fields are optional and checked", () => {
   // A typo is a warning, not an error: the chart still shows.
   const typo = validateChart({ ...bar, takeway: "x" });
   check(typo.ok && typo.warnings[0] === "takeway: unknown field, ignored", JSON.stringify(typo));
+});
+
+Deno.test("headline numbers replace the legend only when they key every series in its colour", () => {
+  const two = { type: "bar", x: { values: ["a"] }, series: [{ name: "PRs", values: [1] }, { name: "master", values: [2] }], y: {} } as ChartSpec;
+  check(!statsKeySeries(two), "no stats: the legend");
+  check(!statsKeySeries({ ...two, stats: [{ label: "PRs", value: 1, color: "var(--mk-c1)" }] }), "one of two series named: the legend stays");
+  check(!statsKeySeries({ ...two, stats: [{ label: "Total", value: 3 }, { label: "Median", value: 1 }] }), "totals name no series");
+  check(!statsKeySeries({ ...two, stats: [{ label: "PRs", value: 1, color: "var(--mk-c1)" }, { label: "master", value: 2, color: "#ff0000" }] }), "a colour that is not the series'");
+  check(statsKeySeries({ ...two, stats: [{ label: "PRs", value: 1, color: "var(--mk-c1)" }, { label: "master", value: 2, color: "var(--mk-c2)" }] }));
+  const own = { ...two, series: [{ name: "PRs", values: [1], color: "#6A56E6" }, { name: "master", values: [2] }] };
+  check(statsKeySeries({ ...own, stats: [{ label: "PRs", value: 1, color: "#6a56e6" }, { label: "master", value: 2, color: "var(--mk-c2)" }] }));
 });

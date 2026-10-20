@@ -262,12 +262,11 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     let seen = own(hub, session, args.panel_id)?;
     ensure!(!seen.closed, "panel is closed");
     let (_, ch) = caller(hub, session)?;
-    let mut html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
+    let html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
     ensure!(html.is_none() || seen.app == "custom", "only custom apps accept HTML updates");
     check_kit(&seen.app, args.kit)?;
-    let kit = args.kit.filter(|k| *k != seen.kit);
-    // Switching the kit changes what the sandbox gets: the same HTML loads again as a new revision.
-    if kit.is_some() && html.is_none() { html = Some(std::fs::read_to_string(app_file(hub, &seen)).context("reading the panel's HTML")?); }
+    // Whether the kit really changes is decided under the lock, against the panel as it is then.
+    let kit = args.kit;
     let title = args.title.as_deref().map(title).transpose()?;
     let data = args.data.map(|d| app_data(hub, &seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
     let id = args.panel_id;
@@ -309,6 +308,12 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
         if new_html {
             p.html_revision = p.revision;
             std::fs::rename(&staged_html, app_file(hub, &p))?;
+        } else if kit_changed {
+            // Switching the kit alone changes what the sandbox gets, so the app reloads as a new
+            // HTML revision; its HTML is the one committed now (never a copy read before the
+            // lock, which a concurrent update may have replaced).
+            p.html_revision = p.revision;
+            std::fs::hard_link(app_file(hub, &old), app_file(hub, &p))?;
         }
         if data.is_some() {
             p.data_revision = p.revision;
@@ -317,7 +322,7 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
         else { std::fs::hard_link(data_file(hub, &old), data_file(hub, &p))?; }
         if let Err(e) = write(&old, &mut p) {
             let _ = std::fs::remove_file(data_file(hub, &p));
-            if new_html { let _ = std::fs::remove_file(app_file(hub, &p)); }
+            if p.html_revision != old.html_revision { let _ = std::fs::remove_file(app_file(hub, &p)); }
             return Err(e);
         }
         hub.emit(ServerEvent::PanelUpserted(p.clone()));
@@ -761,6 +766,13 @@ mod tests {
         // The same value again changes nothing.
         update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
         assert_eq!(get(&hub, plain).unwrap().html_revision, p.html_revision);
+        // A kit switch read before a concurrent HTML update commits keeps that newer HTML.
+        let stale = get(&hub, plain).unwrap();
+        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: Some("<p>newer</p>".into()), html_path: None, kit: None }).unwrap();
+        commit(&hub, &stale, None, None, None, Some(false), || get(&hub, plain), |_, p| hub.store().save_panel(p)).unwrap();
+        let p = get(&hub, plain).unwrap();
+        assert!(!p.kit && p.html_revision == p.revision);
+        assert_eq!(resource(&hub, plain).unwrap()["html"], "<p>newer</p>");
         // Built-ins already use the kit: asking for it is refused, naming the field.
         let e = open(&hub, 1, Open { title: "C".into(), app: "chart".into(), data: Some(json!({"type":"bar","x":{"values":[]},"series":[]})),
             html: None, html_path: None, csp: None, kit: Some(true) }).unwrap_err().to_string();

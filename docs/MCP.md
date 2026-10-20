@@ -221,8 +221,9 @@ host theme (`<html data-theme>`), and reports size changes. Everything else is o
   `mk-avatar`, `mk-bar-cell`, `mk-steps` (`li[data-state=done|active|failed]`), `mk-timeline`,
   `mk-callout`, `mk-kv`, `mk-pre`, `mk-table`, `mk-empty`, `mk-error`, `mk-skel`.
 - Buttons that talk to the agent: `data-send="kind"` plus any `data-*` sends the panel event
-  `kind` with the other data attributes as its data, with no script. `data-confirm="Question?"`
-  asks first (a second click or Enter sends; Esc, leaving the button or 5 s cancels);
+  `kind` with the other data attributes as its data (as strings; `mk.send` keeps JSON types),
+  with no script. `data-confirm="Question?"` asks first (a second click or Enter sends; a key
+  held down never confirms; Esc, leaving the button or 5 s cancels);
   `data-busy` and `data-sent` set what it says meanwhile; `data-text` is the sentence the agent
   reads. A sent button stays off until the next `panel_update` (or 30 s).
 - Script: `mk.onData(fn)` (the panel's data now and on every update), `mk.send(kind, data,
@@ -283,8 +284,8 @@ Series take Muster's eight series colours in order; past 8 series the first is h
 the rest turn grey. Drawn by the kit as SVG (lines smoothed without overshooting, labelled at
 their ends; value labels on bars when they fit; a missing bar shows "–") with an accessible
 title and description, hover and arrow-key tooltips that name the point they compare with
-("vs Thu"), a live region reading each point, legend toggles, and a data table (visually
-hidden until "Data table"). It redraws at its new width when the panel is resized.
+("vs Thu"), a live region reading each point, legend toggles, `x.label` and `y.label` on the
+axes, and a data table (visually hidden until "Data table"). It redraws at its new width when the panel is resized.
 
 | Optional field | |
 |---|---|
@@ -297,7 +298,7 @@ hidden until "Data table"). It redraws at its new width when the panel is resize
 | `labels` | `auto` (default), `values`, `end` or `none` |
 | `trend` | `true` for `scatter` only: a least-squares line |
 | `empty` | what to say when there is nothing to draw (at most 200 characters) |
-| `stats` | up to 4 headline numbers above the chart, `{label, value, unit?, delta?, tone?: good\|bad\|flat, note?, trend?, color?}` (the Board's stats items); they replace the legend |
+| `stats` | up to 4 headline numbers above the chart, `{label, value, unit?, delta?, tone?: good\|bad\|flat, note?, trend?, color?}` (the Board's stats items). When they key every series (a stat whose `label` is the series name and whose `color` is its colour) they replace the legend; otherwise the legend stays |
 | `pin` | the index of an x value whose tooltip shows while the pointer is away |
 | `series[].color` | a kit colour token (`var(--mk-add)`, `var(--mk-c2)`) or a hex colour |
 
@@ -362,7 +363,7 @@ fields and block kinds here, naming them.
 | `list` | `items`: 1–100 `{title, sub?, icon?, tone?: good\|warn\|bad\|info\|accent, badge?, bar?: 0–1, value?, color?}` |
 | `meters` | `note?`; `items`: 1–20 `{label, value, max, text?, of?, mark?, markLabel?, tone?, color?}`. `mark` is a tick (a pace line, a limit); say what it means in `note` |
 | `callout` | `text`, `tone?: good\|warn\|bad\|info`, `icon?` |
-| `actions` | `items`: 1–8 `{id, label, primary?, danger?, confirm?, icon?, key?, data?}`. A click sends the panel event `kind: id` (letters, digits, `_`, `-`, `/`; not `closed`, `overflow` or `navigated`; unique) with `data` (at most 10 lowercase keys with string, number or boolean values) in `_meta.muster.data`. `confirm` makes it two-step: the first click turns the button into that question, the second click or Enter sends. A sent button stays off until the agent's next `panel_update`. `key` is one letter or digit that presses it |
+| `actions` | `items`: 1–8 `{id, label, primary?, danger?, confirm?, icon?, key?, data?}`. A click sends the panel event `kind: id` (letters, digits, `_`, `-`, `/`; not `closed`, `overflow` or `navigated`; unique) with `data` (at most 10 lowercase keys with string, number or boolean values) in `_meta.muster.data`. `data` arrives with its JSON types, and the event's text is `Pressed "<label>"`; an action whose event would pass the 16 KiB event limit is refused. `confirm` makes it two-step: the first click turns the button into that question, the second click or Enter sends (a key held down never confirms). A sent button stays off until the agent's next `panel_update`. `key` is one letter or digit that presses it. `primary` with `danger` draws a filled red button |
 
 Icons (`icon`) are names from the kit's set (`check`, `alert`, `info`, `clock`, `refresh`,
 `rocket`, `undo`, `sparkle`, `db`, `server`, `dollar`, `chart`, …; an unknown name draws "?"

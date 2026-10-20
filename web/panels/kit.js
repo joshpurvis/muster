@@ -17,7 +17,12 @@
     '"': "&quot;",
     "'": "&#39;"
   })[c]);
+  var rich = (s) => esc(s).replace(/\*\*([^*\n]{1,200})\*\*/g, "<b>$1</b>").replace(/`([^`\n]{1,200})`/g, "<code>$1</code>");
   var clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  function num(v, fallback, lo = -Infinity, hi = Infinity) {
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+    return Number.isFinite(n) ? clamp(n, lo, hi) : fallback;
+  }
   var minus = (s) => s === "-0" ? "0" : s.replace(/^-(?=[\d$.])/, "\u2212");
   var lin = (d0, d1, r0, r1) => (v) => r0 + (v - d0) / (d1 - d0 || 1) * (r1 - r0);
   var UNITS = [
@@ -310,14 +315,15 @@
   var nid = (p) => `mk-${p}${++uid}`;
   var seriesColor = (i) => `var(--mk-c${i % 8 + 1})`;
   function spark(values, o = {}) {
-    const w2 = o.width || 120, h = o.height || 32, c = safeColor(o.color, "var(--mk-accent)"), pad = 3;
+    const w2 = num(o.width, 120, 8, 4e3), h = num(o.height, 32, 8, 2e3), c = safeColor(o.color, "var(--mk-accent)"), pad = 3;
     const pts = [];
-    const v = values.filter((x) => x !== null && Number.isFinite(x));
+    values = Array.isArray(values) ? values : [];
+    const v = values.filter((x) => typeof x === "number" && Number.isFinite(x));
     if (v.length < 2) return "";
     const lo = Math.min(...v), hi = Math.max(...v);
     const X = lin(0, values.length - 1, pad, w2 - pad), Y = lin(lo, hi === lo ? lo + 1 : hi, h - pad, pad);
     values.forEach((x, i) => {
-      if (x !== null && Number.isFinite(x)) pts.push([
+      if (typeof x === "number" && Number.isFinite(x)) pts.push([
         X(i),
         Y(x)
       ]);
@@ -336,7 +342,11 @@
     return lens;
   }
   function ring(segs, o = {}) {
-    const s = o.size || 132, th = o.thickness || 12, r = (s - th) / 2, C = 2 * Math.PI * r;
+    const s = num(o.size, 132, 24, 2e3), th = num(o.thickness, 12, 1, s / 2 - 2), r = (s - th) / 2, C = 2 * Math.PI * r;
+    segs = segs.map((g) => ({
+      ...g,
+      value: num(g?.value, 0)
+    }));
     const gap = segs.filter((g) => g.value > 0).length > 1 ? 3 : 0;
     const lens = ringLengths(segs.map((g) => g.value), C, 4 + gap);
     let at = 0;
@@ -347,11 +357,12 @@
       return arc;
     }).join("");
     const label = o.label || segs.map((g) => `${g.label}: ${g.value}`).join(", ");
-    return `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" role="img" aria-label="${esc(label)}"><circle cx="${s / 2}" cy="${s / 2}" r="${r}" fill="none" style="stroke:var(--mk-sunken)" stroke-width="${th}"/>${arcs}` + (o.center ? `<text x="50%" y="${s / 2 + (o.sub ? 4 : 9)}" text-anchor="middle" class="ring-center" style="fill:${safeColor(o.centerColor, "var(--mk-text)")};font-size:${clamp(o.centerSize || 28, 11, 60)}px">${esc(o.center)}</text>` : "") + (o.sub ? `<text x="50%" y="${s / 2 + 22}" text-anchor="middle" class="ring-sub">${esc(o.sub)}</text>` : "") + `</svg>`;
+    return `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" role="img" aria-label="${esc(label)}"><circle cx="${s / 2}" cy="${s / 2}" r="${r}" fill="none" style="stroke:var(--mk-sunken)" stroke-width="${th}"/>${arcs}` + (o.center ? `<text x="50%" y="${s / 2 + (o.sub ? 4 : 9)}" text-anchor="middle" class="ring-center" style="fill:${safeColor(o.centerColor, "var(--mk-text)")};font-size:${num(o.centerSize, 28, 11, 60)}px">${esc(o.center)}</text>` : "") + (o.sub ? `<text x="50%" y="${s / 2 + 22}" text-anchor="middle" class="ring-sub">${esc(o.sub)}</text>` : "") + `</svg>`;
   }
   function meter(o) {
-    const max = o.max && o.max > 0 ? o.max : 100;
-    const pct = clamp(o.value / max * 100, 0, 100);
+    const max = num(o.max, 100) > 0 ? num(o.max, 100) : 100;
+    const value = num(o.value, 0);
+    const pct = clamp(value / max * 100, 0, 100);
     const color = o.tone && [
       "good",
       "warn",
@@ -362,7 +373,7 @@
     const hasMark = typeof o.mark === "number" && Number.isFinite(o.mark);
     const mark = hasMark ? `<span class="mark" style="left:${clamp(o.mark / max * 100, 0, 100).toFixed(2)}%"></span>` : "";
     const desc = hasMark ? o.markLabel || `mark at ${fmt(o.mark, o.format)}` : "";
-    return `<div class="mk-meter" role="meter" aria-valuenow="${o.value}" aria-valuemin="0" aria-valuemax="${max}" aria-label="${esc(o.label)}"${desc ? ` aria-description="${esc(desc)}" title="${esc(desc)}"` : ""}><div class="top"><span>${esc(o.label)}</span><span><b>${esc(o.text ?? fmt(o.value, o.format))}</b>${o.of ? ` <span>${esc(o.of)}</span>` : ""}</span></div><div class="track"><span class="fill" style="width:${pct.toFixed(2)}%;--c:${color}"></span>${mark}</div></div>`;
+    return `<div class="mk-meter" role="meter" aria-valuenow="${value}" aria-valuemin="0" aria-valuemax="${max}" aria-label="${esc(o.label)}"${desc ? ` aria-description="${esc(desc)}" title="${esc(desc)}"` : ""}><div class="top"><span>${esc(o.label)}</span><span><b>${esc(o.text ?? fmt(value, o.format))}</b>${o.of ? ` <span>${esc(o.of)}</span>` : ""}</span></div><div class="track"><span class="fill" style="width:${pct.toFixed(2)}%;--c:${color}"></span>${mark}</div></div>`;
   }
   function stat(o, tag = "div") {
     const tone2 = {
@@ -376,8 +387,8 @@
     const label = `<span class="label">${color ? `<i style="background:${color}"></i>` : ""}${esc(o.label)}</span>`;
     const value = `<span class="value">${esc(o.value)}${o.unit ? `<small>${esc(o.unit)}</small>` : ""}</span>`;
     const meta = o.delta || o.note ? `<span class="meta">${o.delta ? `<span class="mk-delta ${tone2}">${esc(o.delta)}</span>` : ""}${o.note ? `<span>${esc(o.note)}</span>` : ""}</span>` : "";
-    const trend = o.trend?.length ? spark(o.trend, {
-      width: o.trendWidth || 140,
+    const trend = Array.isArray(o.trend) && o.trend.length ? spark(o.trend, {
+      width: num(o.trendWidth, 140, 40, 600),
       height: 28,
       color: color || void 0
     }) : "";
@@ -476,6 +487,28 @@
       ];
     }));
   }
+  function nearestPoint(points, px, py, max) {
+    let best = null, bd = max * max;
+    for (const p of points) {
+      const d = (p.x - px) ** 2 + (p.y - py) ** 2;
+      if (d <= bd) {
+        bd = d;
+        best = p.i;
+      }
+    }
+    return best;
+  }
+  function tipLeft(right, left, tipWidth, room) {
+    const at = right + tipWidth <= room - 4 ? right : left - tipWidth;
+    return clamp(at, 0, Math.max(0, room - tipWidth));
+  }
+  function lineBounds(series, n, stacked) {
+    const stack = stacked ? stackBars(series, n) : null;
+    return series.map((s, si) => ({
+      top: s.values.slice(0, n).map((v, i) => v === null || !Number.isFinite(v) ? null : stack ? stack[si][i][1] : v),
+      bot: stack ? stack[si].map((b) => b?.[0] ?? 0) : null
+    }));
+  }
   function change(v, p, pct) {
     if (v === null || p === null || p === void 0 || !Number.isFinite(v) || !Number.isFinite(p)) return null;
     if (pct) return `${v - p >= 0 ? "+" : "\u2212"}${Math.abs(v - p).toFixed(2)} pt`;
@@ -504,18 +537,19 @@
     const XF = (v) => typeof v === "number" ? fmt(v, spec.xFormat || (intX ? "plain" : void 0)) : v;
     const stacked = !!spec.stacked && (type === "area" || type === "bar");
     const narrow = width < 420;
-    const height = Math.round(o.height || clamp(width * 0.44, 200, 380));
+    const height = Math.round(num(o.height, 0, 60, 2e3) || clamp(width * 0.44, 200, 380));
     const title = spec.title || TYPE[type];
     const hadFocus = el.contains(document.activeElement) ? document.activeElement : null;
     if (isEmpty(spec) || !vis.length && !series.length) {
       el.innerHTML = `<div class="mk-empty" role="img" aria-label="${esc(title)}: no data" style="min-height:${Math.min(height, 200)}px">${icon("chart")}<b>No data to show</b><span>${esc(spec.empty || "The agent sent this chart without any values.")}</span></div>`;
       st.idxAt = void 0;
+      st.dom = void 0;
       return;
     }
     const { lo, hi } = yDomain(spec, vis.length ? vis : series, n);
     const yt = yTicks(spec, lo, hi, height < 150 ? 2 : height < 260 ? 3 : 4);
     const ylabels = tickLabels(yt.ticks, spec.format);
-    const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && vis.length <= 6;
+    const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
     const last = (s) => {
       for (let i = n - 1; i >= 0; i--) if (s.values[i] !== null) return i;
       return -1;
@@ -524,7 +558,7 @@
     const m = {
       top: spec.y?.label || spec.annotations?.length ? 28 : 14,
       right: 12 + endW,
-      bottom: 26,
+      bottom: spec.x.label ? 44 : 26,
       left: Math.max(...ylabels.map((l) => l.length)) * 7 + 12
     };
     const pw = Math.max(40, width - m.left - m.right), ph = Math.max(40, height - m.top - m.bottom);
@@ -571,9 +605,19 @@
         ];
       });
     }
-    st.idxAt = (px) => {
+    st.idxAt = (px, py) => {
       if (px < m.left - 8 || px > m.left + pw + 8) return null;
       if (type === "bar") return clamp(Math.floor((px - m.left) / band), 0, n - 1);
+      if (type === "scatter") {
+        const pts = vis.flatMap((s) => s.values.slice(0, n).flatMap((v, i) => v === null || !Number.isFinite(v) ? [] : [
+          {
+            i,
+            x: X(i),
+            y: Y(v)
+          }
+        ]));
+        return nearestPoint(pts, px, py, 24);
+      }
       let best = 0, bd = Infinity;
       for (let i = 0; i < n; i++) {
         const d = Math.abs(X(i) - px);
@@ -589,10 +633,11 @@
     P.push(`<g class="yaxis">${yt.ticks.map((t, k) => `<text class="tick" x="${m.left - 10}" y="${(Y0(t) + 4).toFixed(1)}" text-anchor="end">${esc(ylabels[k])}</text>`).join("")}</g>`);
     if (spec.y?.label) P.push(`<text class="ylab" x="0" y="${spec.annotations?.length ? 11 : m.top - 14}">${esc(spec.y.label)}</text>`);
     P.push(`<g class="xaxis">${xticks.map((t, k) => {
-      const anchor = type !== "bar" && k === xticks.length - 1 && t.at > m.left + pw - 24 ? "end" : type !== "bar" && k === 0 && t.at < m.left + 24 ? "start" : "middle";
-      return `<text class="tick x" x="${t.at.toFixed(1)}" y="${m.top + ph + 18}" text-anchor="${anchor}">${esc(t.label)}</text>`;
+      const anchor2 = type !== "bar" && k === xticks.length - 1 && t.at > m.left + pw - 24 ? "end" : type !== "bar" && k === 0 && t.at < m.left + 24 ? "start" : "middle";
+      return `<text class="tick x" x="${t.at.toFixed(1)}" y="${m.top + ph + 18}" text-anchor="${anchor2}">${esc(t.label)}</text>`;
     }).join("")}</g>`);
-    const focus = st.focus !== null && st.focus >= 0 && st.focus < n ? st.focus : null;
+    if (spec.x.label) P.push(`<text class="xlab" x="${(m.left + pw / 2).toFixed(1)}" y="${height - 6}" text-anchor="middle">${esc(spec.x.label)}</text>`);
+    const focus = Number.isInteger(st.focus) && st.focus >= 0 && st.focus < n ? st.focus : null;
     if (focus !== null) {
       if (type === "bar") P.push(`<rect class="band" x="${(m.left + band * focus + 2).toFixed(1)}" y="${m.top}" width="${Math.max(1, band - 4).toFixed(1)}" height="${ph}" rx="6"/>`);
       else if (type !== "scatter") P.push(`<line class="guide" x1="${X(focus).toFixed(1)}" x2="${X(focus).toFixed(1)}" y1="${m.top}" y2="${m.top + ph}"/>`);
@@ -668,19 +713,11 @@
         }
       });
     } else {
-      const base = new Array(n).fill(0);
-      const layers = vis.map((s) => {
-        const top = s.values.slice(0, n).map((v, i) => v === null || !Number.isFinite(v) ? null : stacked ? base[i] + v : v);
-        const bot = stacked ? base.slice() : null;
-        if (stacked) s.values.forEach((v, i) => {
-          if (v !== null && Number.isFinite(v)) base[i] += v;
-        });
-        return {
-          s,
-          top,
-          bot
-        };
-      });
+      const bounds = lineBounds(vis, n, stacked);
+      const layers = vis.map((s, si) => ({
+        s,
+        ...bounds[si]
+      }));
       const order = stacked ? layers : layers.slice().sort((a, b) => (isCtx(a.s) ? 0 : 1) - (isCtx(b.s) ? 0 : 1));
       order.forEach(({ s, top, bot }) => {
         const runs = [];
@@ -755,15 +792,21 @@
       P.push(`<g class="ann"><line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${m.top + 16}" y2="${m.top + ph}"/><rect x="${lx.toFixed(1)}" y="${m.top - 5}" width="${w2.toFixed(1)}" height="20" rx="10"/><text x="${(lx + w2 / 2).toFixed(1)}" y="${m.top + 9}" text-anchor="middle">${esc(a.label)}</text></g>`);
     }
     const desc = `${TYPE[type]} of ${series.map((s) => s.name).join(", ")} over ${n} value${n === 1 ? "" : "s"} of ${spec.x.label || "x"}, from ${XF(xs[0])} to ${XF(xs[n - 1])}; ${spec.y?.label || "values"} from ${F(yt.min)} to ${F(yt.max)}. Use the arrow keys to read each value.`;
-    const svg = `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" tabindex="0" aria-labelledby="${id}-t" aria-describedby="${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><defs>${defs.join("")}</defs>${P.join("")}</svg>`;
-    const showLegend = o.legend === true || o.legend !== false && series.length > 1 && !endLabels;
+    const showLegend = o.legend === true || o.legend !== false && series.length > 1 && (!endLabels || st.hidden.size > 0);
     const agg = (s) => type === "bar" ? s.values.reduce((a, b) => a + (b ?? 0), 0) : s.values[last(s)] ?? null;
     const legend = showLegend ? `<ul class="mk-legend" aria-label="Series: press to show or hide">${series.map((s) => `<li><button type="button" aria-pressed="${!st.hidden.has(s.name)}" data-series="${esc(s.name)}"><span class="sw${type === "line" ? " line" : ""}" style="--c:${scol(s)}"></span>${esc(s.name)}${o.legendValues !== false ? ` <span class="v">${esc(F(agg(s)))}</span>` : ""}</button></li>`).join("")}</ul>` : "";
-    let tip = "", live = "";
+    let tip = "", live = "", anchor = [
+      0,
+      0
+    ];
     if (focus !== null) {
-      const tx = type === "bar" ? m.left + band * (focus + 1) + 8 : X(focus) + 14;
-      const flip = tx + 196 > m.left + pw;
-      const left = flip ? type === "bar" ? m.left + band * focus - 8 : X(focus) - 14 : tx;
+      anchor = type === "bar" ? [
+        m.left + band * (focus + 1) + 8,
+        m.left + band * focus - 8
+      ] : [
+        X(focus) + 14,
+        X(focus) - 14
+      ];
       const prev = focus > 0 ? focus - 1 : null;
       const pct = spec.format === "pct";
       const deltas = o.tipDelta !== false && prev !== null && type !== "scatter";
@@ -772,15 +815,76 @@
         v: s.values[focus] ?? null,
         d: deltas ? change(s.values[focus] ?? null, s.values[prev], pct) : null
       }));
-      tip = `<div class="mk-tip" aria-hidden="true" style="left:${left.toFixed(1)}px;top:${m.top + (spec.annotations?.length ? 30 : 8)}px;${flip ? "transform:translateX(-100%)" : ""}"><div class="x">${esc(XF(xs[focus]))}${deltas ? `<span>vs ${esc(XF(xs[prev]))}</span>` : ""}</div>` + rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i>${esc(r.s.name)}<b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("") + `</div>`;
+      tip = `<div class="x">${esc(XF(xs[focus]))}${deltas ? `<span>vs ${esc(XF(xs[prev]))}</span>` : ""}</div>` + rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i><span class="n">${esc(r.s.name)}</span><b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("");
       live = `${XF(xs[focus])}: ` + rows.map((r) => `${r.s.name} ${F(r.v)}${r.d ? ` (${r.d} vs ${XF(xs[prev])})` : ""}`).join(", ");
     }
-    const table = `<div class="${o.showTable ? "mk-data" : "mk-sr"}" id="${id}-data"><table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
-    const focusSel = hadFocus ? hadFocus.dataset?.series !== void 0 ? `[data-series="${CSS.escape(hadFocus.dataset.series)}"]` : hadFocus.tagName.toLowerCase() === "svg" ? "figure svg" : null : null;
-    el.innerHTML = legend + `<figure>${svg}${tip}</figure><div class="mk-sr mk-live" aria-live="polite">${esc(live)}</div>` + table;
-    if (focusSel) el.querySelector(focusSel)?.focus({
-      preventScroll: true
-    });
+    const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    let dom = st.dom;
+    if (!dom || !el.contains(dom.svg)) {
+      el.innerHTML = `<figure><svg role="img" tabindex="0"></svg></figure><div class="mk-sr mk-live" aria-live="polite"></div><div id="${id}-data"></div>`;
+      dom = st.dom = {
+        figure: el.querySelector("figure"),
+        svg: el.querySelector("figure svg"),
+        live: el.querySelector(".mk-live"),
+        table: el.querySelector(`[id="${id}-data"]`)
+      };
+    }
+    const { figure, svg, live: liveEl, table: tableEl } = dom;
+    for (const [k, v] of [
+      [
+        "viewBox",
+        `0 0 ${width} ${height}`
+      ],
+      [
+        "width",
+        String(width)
+      ],
+      [
+        "height",
+        String(height)
+      ],
+      [
+        "aria-labelledby",
+        `${id}-t`
+      ],
+      [
+        "aria-describedby",
+        `${id}-d`
+      ]
+    ]) {
+      if (svg.getAttribute(k) !== v) svg.setAttribute(k, v);
+    }
+    svg.innerHTML = `<title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><defs>${defs.join("")}</defs>${P.join("")}`;
+    const oldLegend = el.querySelector(":scope > .mk-legend");
+    if (legend && oldLegend && st.legendHtml === legend) {
+    } else if (legend) {
+      const t = document.createElement("template");
+      t.innerHTML = legend;
+      const fresh = t.content.firstElementChild;
+      if (oldLegend) oldLegend.replaceWith(fresh);
+      else el.insertBefore(fresh, figure);
+    } else oldLegend?.remove();
+    st.legendHtml = legend;
+    figure.querySelector(":scope > .mk-tip")?.remove();
+    if (tip) {
+      const t = document.createElement("div");
+      t.className = "mk-tip";
+      t.setAttribute("aria-hidden", "true");
+      t.innerHTML = tip;
+      figure.append(t);
+      const room = figure.clientWidth || width, k = room / width;
+      t.style.left = `${tipLeft(anchor[0] * k, anchor[1] * k, t.offsetWidth, room).toFixed(1)}px`;
+      const top = (m.top + (spec.annotations?.length ? 30 : 8)) * k;
+      t.style.top = `${clamp(top, 0, Math.max(0, (figure.clientHeight || height) - t.offsetHeight)).toFixed(1)}px`;
+    }
+    if (liveEl.textContent !== live) liveEl.textContent = live;
+    tableEl.className = o.showTable ? "mk-data" : "mk-sr";
+    tableEl.innerHTML = table;
+    if (hadFocus?.dataset?.series !== void 0 && !el.contains(hadFocus)) {
+      el.querySelector(`[data-series="${CSS.escape(hadFocus.dataset.series)}"]`)?.focus({
+        preventScroll: true
+      });
+    }
   }
   function schedule(el) {
     const st = el._mk;
@@ -797,6 +901,8 @@
       o,
       raf: host._mk?.raf ?? 0,
       observer: host._mk?.observer,
+      dom: host._mk?.dom,
+      legendHtml: host._mk?.legendHtml,
       hidden: new Set(o.hidden ?? host._mk?.hidden ?? []),
       focus: pin,
       width: el.clientWidth || host._mk?.width || 640
@@ -890,9 +996,28 @@
     "key"
   ]);
   function buttonData(b) {
+    const typed = b._mkData;
+    if (typed) return {
+      ...typed
+    };
     const data2 = {};
     for (const [k, v] of Object.entries(b.dataset)) if (!RESERVED.has(k) && v !== void 0) data2[k] = v;
     return data2;
+  }
+  var held = /* @__PURE__ */ new Set();
+  var MODIFIERS = /* @__PURE__ */ new Set([
+    "Shift",
+    "Control",
+    "Alt",
+    "Meta",
+    "AltGraph",
+    "CapsLock"
+  ]);
+  function release() {
+    if (held.size) return;
+    document.querySelectorAll("[data-send][data-state='armed']").forEach((b) => {
+      b._mkReady = true;
+    });
   }
   function reset(b) {
     if (b._mkLabel !== void 0) b.innerHTML = b._mkLabel;
@@ -909,6 +1034,7 @@
   function arm(b) {
     setLabel(b, `${icon("alert")}${esc(b.dataset.confirm)}<kbd>Enter</kbd>`);
     b.dataset.state = "armed";
+    b._mkReady = held.size === 0;
     clearTimeout(b._mkT);
     b._mkT = setTimeout(() => reset(b), 5e3);
   }
@@ -917,6 +1043,7 @@
     const label = (() => {
       const t = document.createElement("template");
       t.innerHTML = b._mkLabel ?? b.innerHTML;
+      t.content.querySelectorAll("kbd").forEach((k) => k.remove());
       return t.content.textContent?.trim() ?? "";
     })();
     const text = b.dataset.text || `Pressed "${label || kind}"`;
@@ -945,6 +1072,7 @@
       arm(b);
       return;
     }
+    if (b.dataset.confirm && !b._mkReady) return;
     fire(b, send2);
   }
   function wireButtons(send2) {
@@ -953,11 +1081,25 @@
       if (b) press(b, send2);
     });
     document.addEventListener("keydown", (e) => {
-      const b = document.activeElement?.closest?.("[data-send][data-state='armed']");
+      if (!MODIFIERS.has(e.key)) held.add(e.code || e.key);
+      const on = document.activeElement?.closest?.("[data-send]");
+      if (on && e.repeat && (e.key === "Enter" || e.key === " ")) {
+        e.preventDefault();
+        return;
+      }
+      const b = on?.dataset.state === "armed" ? on : null;
       if (b && e.key === "Escape") {
         e.preventDefault();
         reset(b);
       }
+    }, true);
+    document.addEventListener("keyup", (e) => {
+      held.delete(e.code || e.key);
+      release();
+    }, true);
+    addEventListener("blur", () => {
+      held.clear();
+      release();
     });
     document.addEventListener("focusout", (e) => {
       const b = e.target.closest?.("[data-send][data-state='armed']");
@@ -976,21 +1118,21 @@
     return s ? JSON.parse(s.textContent ?? "") : JSON.parse(el.getAttribute("spec") || "{}");
   }
   var nums = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean).map(Number).filter(Number.isFinite);
-  var num = (s) => s === null || s === "" ? void 0 : Number.isFinite(Number(s)) ? Number(s) : void 0;
+  var num2 = (s) => s === null || s === "" ? void 0 : Number.isFinite(Number(s)) ? Number(s) : void 0;
   var TAGS = {
     "mk-chart": (el) => {
       const spec = json(el);
       if (!spec || typeof spec !== "object" || !spec.x || !Array.isArray(spec.series)) throw new Error("the JSON needs x.values and series (the chart app's spec)");
       chart(el, spec, {
-        pin: num(el.getAttribute("pin")),
-        height: num(el.getAttribute("height")),
+        pin: num2(el.getAttribute("pin")),
+        height: num2(el.getAttribute("height")),
         legend: el.getAttribute("legend") === "false" ? false : el.getAttribute("legend") === "true" ? true : void 0
       });
     },
     "mk-spark": (el) => {
       el.innerHTML = spark(nums(el.getAttribute("values")), {
-        width: num(el.getAttribute("width")) || 120,
-        height: num(el.getAttribute("height")) || 30,
+        width: num2(el.getAttribute("width")) || 120,
+        height: num2(el.getAttribute("height")) || 30,
         color: el.getAttribute("color") || void 0
       });
     },
@@ -1006,7 +1148,7 @@
         note: a("note"),
         trend: el.hasAttribute("trend") ? nums(a("trend") ?? "") : void 0,
         color: a("color"),
-        trendWidth: num(a("trend-width") ?? null)
+        trendWidth: num2(a("trend-width") ?? null)
       });
       el.classList.add("mk-stat");
       el.replaceChildren(...t.content.firstElementChild.childNodes);
@@ -1020,11 +1162,11 @@
       const a = (k) => el.getAttribute(k);
       el.innerHTML = meter({
         label: a("label") ?? "",
-        value: num(a("value")) ?? 0,
-        max: num(a("max")) || 100,
+        value: num2(a("value")) ?? 0,
+        max: num2(a("max")) || 100,
         text: a("text") || void 0,
         of: a("of") || void 0,
-        mark: num(a("mark")),
+        mark: num2(a("mark")),
         markLabel: a("mark-label") || void 0,
         color: a("color") || void 0,
         tone: a("tone") || void 0
@@ -1152,6 +1294,12 @@
         if (!keys.includes(k)) this.warnings.push(`${path ? path + "." : ""}${k}: unknown field, ignored`);
       }
     }
+    /** Unknown keys are errors: for inputs whose backend check refuses them too (the board). */
+    only(o, path, keys) {
+      for (const k of Object.keys(o)) {
+        if (!keys.includes(k)) this.add(`${path ? path + "." : ""}${k}`, `unknown field (it takes ${keys.join(", ")})`);
+      }
+    }
     result(value) {
       return this.errors.length ? {
         ok: false,
@@ -1163,6 +1311,23 @@
       };
     }
   };
+  var MAX_EVENT = 16 * 1024;
+  function eventBytes(event) {
+    const params = {
+      role: "user",
+      content: {
+        type: "text",
+        text: event.text
+      },
+      _meta: {
+        muster: {
+          kind: event.kind,
+          data: event.data
+        }
+      }
+    };
+    return new TextEncoder().encode(JSON.stringify(params)).length;
+  }
 
   // src/panels/apps/chart/logic.ts
   var TYPES = [
@@ -1186,10 +1351,10 @@
   var MAX_SERIES = 12;
   var MAX_ANNOTATIONS = 20;
   var MAX_STATS = 4;
-  function validateStat(p, v, at) {
+  function validateStat(p, v, at, strict = false) {
     const o = p.object(v, at);
     if (!o) return void 0;
-    p.known(o, at, [
+    (strict ? p.only : p.known).call(p, o, at, [
       "label",
       "value",
       "unit",
@@ -1471,6 +1636,7 @@
     "key"
   ];
   var MAX_BLOCKS = 40;
+  var actionText = (label) => `Pressed "${label}"`;
   function iconName(p, o, at) {
     const v = p.string(o, "icon", at, {
       max: 20
@@ -1526,11 +1692,11 @@
     }) ?? [];
     switch (kind) {
       case "stats": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "items"
         ]);
-        const list = items(8).map((s, i) => validateStat(p, s, `${at}.items[${i}]`)).filter((s) => !!s);
+        const list = items(8).map((s, i) => validateStat(p, s, `${at}.items[${i}]`, true)).filter((s) => !!s);
         return {
           ...common,
           kind,
@@ -1538,7 +1704,7 @@
         };
       }
       case "chart": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "spec",
           "height"
@@ -1562,7 +1728,7 @@
         };
       }
       case "list": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "items"
         ]);
@@ -1571,7 +1737,7 @@
           const ia = `${at}.items[${i}]`;
           const io = p.object(it, ia);
           if (!io) return;
-          p.known(io, ia, [
+          p.only(io, ia, [
             "title",
             "sub",
             "icon",
@@ -1608,7 +1774,7 @@
         };
       }
       case "meters": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "note",
           "items"
@@ -1621,7 +1787,7 @@
           const ia = `${at}.items[${i}]`;
           const io = p.object(it, ia);
           if (!io) return;
-          p.known(io, ia, [
+          p.only(io, ia, [
             "label",
             "value",
             "max",
@@ -1668,7 +1834,7 @@
         };
       }
       case "callout": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "tone",
           "icon",
@@ -1694,7 +1860,7 @@
         };
       }
       case "actions": {
-        p.known(o, at, [
+        p.only(o, at, [
           ...base,
           "items"
         ]);
@@ -1703,7 +1869,7 @@
           const ia = `${at}.items[${i}]`;
           const io = p.object(it, ia);
           if (!io) return;
-          p.known(io, ia, [
+          p.only(io, ia, [
             "id",
             "label",
             "primary",
@@ -1756,7 +1922,15 @@
             key,
             data: data2
           };
-          if (id !== void 0 && label !== void 0) list.push(item);
+          if (id !== void 0 && label !== void 0) {
+            const size = eventBytes({
+              kind: id,
+              text: actionText(label),
+              data: data2 ?? {}
+            });
+            if (size > MAX_EVENT) p.add(ia, `would send an event of ${size} bytes; at most 16 KiB (shorten its data)`);
+            list.push(item);
+          }
         });
         return {
           ...common,
@@ -1772,7 +1946,7 @@
     const p = new Problems();
     const o = p.object(data2, "data");
     if (!o) return p.result(null);
-    p.known(o, "", [
+    p.only(o, "", [
       "title",
       "scope",
       "takeaway",
@@ -1839,13 +2013,19 @@
         return `<div class="mk-callout ${tone(b.tone)}"${b.tone === "bad" || b.tone === "warn" ? ' role="note"' : ""}>${icon(name)}<div>${b.title ? `<b>${esc(b.title)}</b> ` : ""}${esc(b.text)}</div></div>`;
       }
       case "actions":
-        return (b.title ? `<div class="mk-card">${head(b)}` : "") + `<div class="mk-row">${b.items.map((a) => `<button type="button" class="mk-btn${a.primary ? " primary" : ""}${a.danger ? " danger" : ""}" data-send="${esc(a.id)}"` + (a.confirm ? ` data-confirm="${esc(a.confirm)}"` : "") + (a.key ? ` data-key="${esc(a.key.toLowerCase())}" aria-keyshortcuts="${esc(a.key.toUpperCase())}"` : "") + (a.data ? Object.entries(a.data).map(([k, v]) => ` data-${esc(k)}="${esc(v)}"`).join("") : "") + `>${a.icon ? icon(a.icon) : ""}${esc(a.label)}${a.key ? `<kbd>${esc(a.key.toUpperCase())}</kbd>` : ""}</button>`).join("")}</div>` + (b.title ? "</div>" : "");
+        return (b.title ? `<div class="mk-card">${head(b)}` : "") + `<div class="mk-row">${b.items.map((a) => `<button type="button" class="mk-btn${a.primary ? " primary" : ""}${a.danger ? " danger" : ""}" data-send="${esc(a.id)}" data-text="${esc(actionText(a.label))}"` + (a.confirm ? ` data-confirm="${esc(a.confirm)}"` : "") + (a.key ? ` data-key="${esc(a.key.toLowerCase())}" aria-keyshortcuts="${esc(a.key.toUpperCase())}"` : "") + `>${a.icon ? icon(a.icon) : ""}${esc(a.label)}${a.key ? `<kbd>${esc(a.key.toUpperCase())}</kbd>` : ""}</button>`).join("")}</div>` + (b.title ? "</div>" : "");
       default:
         return `<div class="mk-error" role="alert">${icon("alert")}<span><b>Unknown block "${esc(b.kind)}".</b> Use one of: ${KINDS.join(", ")}.</span></div>`;
     }
   }
   function board(el, d, warnings = []) {
-    el.innerHTML = `<div class="mk-page mk-board"><header class="mk-head"><div><h1 class="mk-title">${esc(d.title)}${d.scope ? ` <span class="mk-scope">${esc(d.scope)}</span>` : ""}</h1>${d.takeaway ? `<p class="mk-takeaway">${esc(d.takeaway)}</p>` : ""}</div></header>` + (warnings.length ? `<p class="mk-warnings">${esc(warnings.join("; "))}</p>` : "") + `<div class="mk-grid" style="--min:${clamp(d.min || 300, 160, 1200)}px">${d.blocks.map((b, i) => `<div class="mk-cell${b.span === "full" ? " mk-wide" : ""}${b.kind === "actions" ? " mk-actions" : ""}">${blockHtml(b, i)}</div>`).join("")}</div>` + (d.source ? `<footer class="mk-foot"><span class="mk-source">Source: ${esc(d.source)}</span></footer>` : "") + `</div>`;
+    el.innerHTML = `<div class="mk-page mk-board"><header class="mk-head"><div><h1 class="mk-title">${esc(d.title)}${d.scope ? ` <span class="mk-scope">${esc(d.scope)}</span>` : ""}</h1>${d.takeaway ? `<p class="mk-takeaway">${rich(d.takeaway)}</p>` : ""}</div></header>` + (warnings.length ? `<p class="mk-warnings">${esc(warnings.join("; "))}</p>` : "") + `<div class="mk-grid" style="--min:${clamp(d.min || 300, 160, 1200)}px">${d.blocks.map((b, i) => `<div class="mk-cell${b.span === "full" ? " mk-wide" : ""}${b.kind === "actions" ? " mk-actions" : ""}">${blockHtml(b, i)}</div>`).join("")}</div>` + (d.source ? `<footer class="mk-foot"><span class="mk-source">Source: ${esc(d.source)}</span></footer>` : "") + `</div>`;
+    el.querySelectorAll(".mk-actions [data-send]").forEach((btn) => {
+      const a = d.blocks.flatMap((b) => b.kind === "actions" ? b.items : []).find((x) => x.id === btn.dataset.send);
+      btn._mkData = {
+        ...a?.data ?? {}
+      };
+    });
     el.querySelectorAll("[data-board-chart]").forEach((c) => {
       const b = d.blocks[Number(c.dataset.boardChart)];
       if (b?.kind === "chart") chart(c, b.spec, {

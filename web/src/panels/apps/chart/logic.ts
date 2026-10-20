@@ -2,8 +2,9 @@
 // chart renderer (kit/chart.ts) here, in pr_decision `media`, in Board chart blocks and in
 // <mk-chart>. Every field added for the Briefing look is optional: older specs still work.
 import { fits, Problems, type Result } from "../shared/validate.ts";
-import { COLOR, FORMATS, type Format } from "../../kit/format.ts";
-import type { KitChartSpec } from "../../kit/chart.ts";
+import { COLOR, FORMATS, type Format, safeColor } from "../../kit/format.ts";
+import { highlightOf, type KitChartSpec } from "../../kit/chart.ts";
+import { seriesColor } from "../../kit/parts.ts";
 
 export const TYPES = ["bar", "line", "scatter", "area"] as const;
 export type ChartType = typeof TYPES[number];
@@ -32,10 +33,11 @@ export const MAX_ANNOTATIONS = 20;
 export const MAX_STATS = 4;
 
 /** A stats item (chart `stats`, Board `stats` blocks); `at` is its path in errors. */
-export function validateStat(p: Problems, v: unknown, at: string): Stat | undefined {
+/** `strict`: unknown fields are errors (a board's stats, as the backend checks them). */
+export function validateStat(p: Problems, v: unknown, at: string, strict = false): Stat | undefined {
   const o = p.object(v, at);
   if (!o) return undefined;
-  p.known(o, at, ["label", "value", "unit", "delta", "tone", "note", "trend", "color"]);
+  (strict ? p.only : p.known).call(p, o, at, ["label", "value", "unit", "delta", "tone", "note", "trend", "color"]);
   const label = p.string(o, "label", at, { required: true, max: 100 });
   let value: string | number | undefined;
   if (o.value === undefined || o.value === null) p.add(`${at}.value`, "is required");
@@ -154,5 +156,17 @@ export function validateChart(data: unknown): Result<ChartSpec> {
   return p.result({
     type: type!, title, x: { label: xLabel, values: xValues }, series, y, takeaway, scope, source, format, xFormat, highlight,
     annotations: annotations.length ? annotations : undefined, stacked, labels, trend, empty, stats: stats.length ? stats : undefined, pin,
+  });
+}
+
+/** Whether the headline numbers are a complete colour key for the series (each series has a
+ * stat with its name and the colour it is drawn in), so they can stand in for the legend. */
+export function statsKeySeries(spec: ChartSpec): boolean {
+  const stats = spec.stats ?? [];
+  if (!stats.length || !spec.series.length) return false;
+  const hl = highlightOf(spec);
+  return spec.series.every((s, i) => {
+    const drawn = hl && s.name !== hl ? "var(--mk-context)" : safeColor(s.color, seriesColor(i));
+    return stats.some((st) => st.label === s.name && !!st.color && st.color.toLowerCase() === drawn.toLowerCase());
   });
 }

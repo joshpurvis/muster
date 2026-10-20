@@ -94,6 +94,13 @@ export class Problems {
     }
   }
 
+  /** Unknown keys are errors: for inputs whose backend check refuses them too (the board). */
+  only(o: Record<string, unknown>, path: string, keys: readonly string[]) {
+    for (const k of Object.keys(o)) {
+      if (!keys.includes(k)) this.add(`${path ? path + "." : ""}${k}`, `unknown field (it takes ${keys.join(", ")})`);
+    }
+  }
+
   result<T>(value: T): Result<T> {
     return this.errors.length ? { ok: false, errors: this.errors } : { ok: true, value, warnings: this.warnings };
   }
@@ -108,4 +115,13 @@ export function httpsUrl(v: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Muster refuses panel events over 16 KiB of JSON (src/panels.rs `MAX_EVENT`). */
+export const MAX_EVENT = 16 * 1024;
+
+/** UTF-8 size of the `ui/message` params an event becomes: what the backend measures. */
+export function eventBytes(event: { kind: string; text: string; data: object }): number {
+  const params = { role: "user", content: { type: "text", text: event.text }, _meta: { muster: { kind: event.kind, data: event.data } } };
+  return new TextEncoder().encode(JSON.stringify(params)).length;
 }

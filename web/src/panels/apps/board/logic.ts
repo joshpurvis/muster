@@ -1,6 +1,7 @@
 // `board` app: a dashboard from plain JSON (no HTML, no script from the agent). Input checks
-// here mirror src/panel_apps.rs `check_board`, with the same limits. docs/MCP.md "board".
-import { fits, Problems, type Result } from "../shared/validate.ts";
+// here mirror src/panel_apps.rs `check_board`, with the same limits; unknown fields are refused
+// in both. docs/MCP.md "board".
+import { eventBytes, fits, MAX_EVENT, Problems, type Result } from "../shared/validate.ts";
 import { color_, type ChartSpec, type Stat, validateChart, validateStat } from "../chart/logic.ts";
 import { ICONS } from "../../kit/icons.ts";
 
@@ -29,6 +30,9 @@ export type Block =
 export interface Board { title: string; scope?: string; takeaway?: string; source?: string; min?: number; blocks: Block[] }
 
 export const MAX_BLOCKS = 40;
+
+/** The sentence the agent reads when an action is pressed. */
+export const actionText = (label: string) => `Pressed "${label}"`;
 
 function iconName(p: Problems, o: Record<string, unknown>, at: string): string | undefined {
   const v = p.string(o, "icon", at, { max: 20 });
@@ -63,12 +67,12 @@ function block(p: Problems, raw: unknown, at: string, ids: Set<string>, keys: Se
   const items = (max: number) => p.array(o, "items", at, { required: true, max, min: 1 }) ?? [];
   switch (kind) {
     case "stats": {
-      p.known(o, at, [...base, "items"]);
-      const list = items(8).map((s, i) => validateStat(p, s, `${at}.items[${i}]`)).filter((s): s is Stat => !!s);
+      p.only(o, at, [...base, "items"]);
+      const list = items(8).map((s, i) => validateStat(p, s, `${at}.items[${i}]`, true)).filter((s): s is Stat => !!s);
       return { ...common, kind, items: list };
     }
     case "chart": {
-      p.known(o, at, [...base, "spec", "height"]);
+      p.only(o, at, [...base, "spec", "height"]);
       const height = numberIn(p, o, "height", at, 80, 800);
       if (o.spec === undefined || o.spec === null) { p.add(`${at}.spec`, "is required (the chart app's spec)"); return undefined; }
       const r = validateChart(o.spec);
@@ -77,13 +81,13 @@ function block(p: Problems, raw: unknown, at: string, ids: Set<string>, keys: Se
       return { ...common, kind, spec: r.value, height };
     }
     case "list": {
-      p.known(o, at, [...base, "items"]);
+      p.only(o, at, [...base, "items"]);
       const list: ListItem[] = [];
       items(100).forEach((it, i) => {
         const ia = `${at}.items[${i}]`;
         const io = p.object(it, ia);
         if (!io) return;
-        p.known(io, ia, ["title", "sub", "icon", "tone", "badge", "bar", "value", "color"]);
+        p.only(io, ia, ["title", "sub", "icon", "tone", "badge", "bar", "value", "color"]);
         const title = p.string(io, "title", ia, { required: true, max: 200 });
         const item: ListItem = {
           title: title ?? "", sub: p.string(io, "sub", ia, { max: 300 }), icon: iconName(p, io, ia), tone: p.oneOf(io, "tone", ia, TONES),
@@ -94,14 +98,14 @@ function block(p: Problems, raw: unknown, at: string, ids: Set<string>, keys: Se
       return { ...common, kind, items: list };
     }
     case "meters": {
-      p.known(o, at, [...base, "note", "items"]);
+      p.only(o, at, [...base, "note", "items"]);
       const note = p.string(o, "note", at, { max: 300 });
       const list: MeterItem[] = [];
       items(20).forEach((it, i) => {
         const ia = `${at}.items[${i}]`;
         const io = p.object(it, ia);
         if (!io) return;
-        p.known(io, ia, ["label", "value", "max", "text", "of", "mark", "markLabel", "tone", "color"]);
+        p.only(io, ia, ["label", "value", "max", "text", "of", "mark", "markLabel", "tone", "color"]);
         const label = p.string(io, "label", ia, { required: true, max: 100 });
         const value = p.number(io, "value", ia, true);
         const max = p.number(io, "max", ia, true);
@@ -115,20 +119,20 @@ function block(p: Problems, raw: unknown, at: string, ids: Set<string>, keys: Se
       return { ...common, kind, note, items: list };
     }
     case "callout": {
-      p.known(o, at, [...base, "tone", "icon", "text"]);
+      p.only(o, at, [...base, "tone", "icon", "text"]);
       const text = p.string(o, "text", at, { required: true, max: 1000 });
       const tone = p.oneOf(o, "tone", at, ["good", "warn", "bad", "info"] as const);
       const ic = iconName(p, o, at);
       return text === undefined ? undefined : { ...common, kind, tone, icon: ic, text };
     }
     case "actions": {
-      p.known(o, at, [...base, "items"]);
+      p.only(o, at, [...base, "items"]);
       const list: ActionItem[] = [];
       items(8).forEach((it, i) => {
         const ia = `${at}.items[${i}]`;
         const io = p.object(it, ia);
         if (!io) return;
-        p.known(io, ia, ["id", "label", "primary", "danger", "confirm", "icon", "key", "data"]);
+        p.only(io, ia, ["id", "label", "primary", "danger", "confirm", "icon", "key", "data"]);
         const id = p.string(io, "id", ia, { required: true, max: 80 });
         if (id !== undefined && (!ACTION_ID.test(id) || RESERVED_IDS.includes(id))) p.add(`${ia}.id`, "must start with a letter and use letters, digits, _, - or / (at most 80), and not be closed, overflow or navigated");
         else if (id !== undefined && ids.has(id)) p.add(`${ia}.id`, `${JSON.stringify(id)} is used twice`);
@@ -156,7 +160,11 @@ function block(p: Problems, raw: unknown, at: string, ids: Set<string>, keys: Se
           id: id ?? "", label: label ?? "", primary: p.boolean(io, "primary", ia), danger: p.boolean(io, "danger", ia),
           confirm: p.string(io, "confirm", ia, { max: 200 }), icon: iconName(p, io, ia), key, data,
         };
-        if (id !== undefined && label !== undefined) list.push(item);
+        if (id !== undefined && label !== undefined) {
+          const size = eventBytes({ kind: id, text: actionText(label), data: data ?? {} });
+          if (size > MAX_EVENT) p.add(ia, `would send an event of ${size} bytes; at most 16 KiB (shorten its data)`);
+          list.push(item);
+        }
       });
       return { ...common, kind, items: list };
     }
@@ -168,7 +176,7 @@ export function validateBoard(data: unknown): Result<Board> {
   const p = new Problems();
   const o = p.object(data, "data");
   if (!o) return p.result(null as never);
-  p.known(o, "", ["title", "scope", "takeaway", "source", "min", "blocks"]);
+  p.only(o, "", ["title", "scope", "takeaway", "source", "min", "blocks"]);
   const title = p.string(o, "title", "", { required: true, max: 200 });
   const scope = p.string(o, "scope", "", { max: 200 });
   const takeaway = p.string(o, "takeaway", "", { max: 600 });

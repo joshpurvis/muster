@@ -14,6 +14,14 @@ export const rich = (s: unknown) =>
 
 export const clamp =(v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
+/** A finite number from `v` (a number or a numeric string) kept within [lo, hi], else
+ * `fallback`. Every number the kit writes into markup goes through it or arithmetic, so JSON
+ * from outside (a <mk-ring> spec, a mk.* call) can never carry markup into an attribute. */
+export function num(v: unknown, fallback: number, lo = -Infinity, hi = Infinity): number {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isFinite(n) ? clamp(n, lo, hi) : fallback;
+}
+
 /** A true minus sign, and never "-0". */
 export const minus = (s: string) => s === "-0" ? "0" : s.replace(/^-(?=[\d$.])/, "−");
 

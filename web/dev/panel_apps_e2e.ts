@@ -164,9 +164,13 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await p.waitIn(`document.querySelector('.mk-tip')`);
     const tip: string = await p.inApp(`document.querySelector('.mk-tip').textContent`);
     check(tip.includes("Thu") && tip.includes("61") && tip.includes("110"), `hover tooltip: ${tip}`);
+    check((await p.inApp(`document.querySelector('svg text.xlab')?.textContent`)) === "Day", "the x axis label is drawn");
     await a.clickAt(x, y);
+    // Arrow keys redraw inside the same SVG and live region (focus and announcements stay).
+    await p.inApp(`document.querySelector('figure svg').setAttribute('data-probe', '1'); document.querySelector('.mk-live').setAttribute('data-probe', '1')`);
     await a.key("Right");
     await p.waitIn(`document.querySelector('.mk-live').textContent.startsWith("Fri: master 70")`);
+    check(await p.inApp(`document.activeElement === document.querySelector('figure svg[data-probe]') && !!document.querySelector('.mk-live[data-probe]')`), "the focused SVG and the live region stay mounted");
     check((await p.inApp(`document.querySelector('.mk-live').textContent`)).includes("vs Thu"), "the live region reads the change from the day before");
     await p.click("#toggle-table");
     await p.waitIn(`document.querySelector('.mk-data table') && document.querySelector('#toggle-table').getAttribute('aria-expanded') === 'true'`);
@@ -560,11 +564,13 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     // Board: JSON only. Stats, a stacked chart, a list, meters, a callout and actions.
     const cost = JSON.parse(await Deno.readTextFile(new URL("./panel_examples/cost-breakdown.json", import.meta.url)));
     cost.blocks.find((b: any) => b.kind === "actions").items.push({ id: "pause_replica", label: "Pause the second replica", danger: true,
-      confirm: "Pause db-replica-2 until Monday?", data: { replica: "db-replica-2", until: "monday" } });
+      confirm: "Pause db-replica-2 until Monday?", data: { replica: "db-replica-2", until: "monday", dry_run: false, days: 2 } });
+    cost.takeaway = cost.takeaway.replace("under the", "**under** the");
     const b = await open("board", "Cloud spend", cost);
     await b.waitIn(`document.querySelectorAll('.mk-stats .mk-stat').length === 4 && document.querySelectorAll('.mk-chart path.bar').length === 25`);
     check((await b.inApp(`document.querySelector('.mk-title').textContent`)).startsWith("$4,480 spent so far this month"), "board title");
     check((await b.inApp(`document.querySelectorAll('.mk-meter .mark').length`)) === 3, "meters with their pace ticks");
+    check((await b.inApp(`document.querySelector('.mk-takeaway b')?.textContent`)) === "under", "the takeaway's **bold** renders");
     await b.shots2("board");
     // A plain action sends at once; the button says so and stays off until the agent updates.
     await b.click(`[data-send="export_csv"]`);
@@ -580,8 +586,25 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await b.click(`[data-send="pause_replica"]`);
     await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'sent'`);
     got = await events(b.pid);
-    check(got.length === 1 && got[0].kind === "pause_replica" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ replica: "db-replica-2", until: "monday" }), `confirmed action: ${JSON.stringify(got)}`);
+    check(got.length === 1 && got[0].kind === "pause_replica" && got[0].payload.content.text === 'Pressed "Pause the second replica"' &&
+      JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ replica: "db-replica-2", until: "monday", dry_run: false, days: 2 }), `confirmed action (typed data): ${JSON.stringify(got)}`);
     // The agent's update brings the buttons back.
+    await call("panel.update", { panel_id: b.pid, data: cost });
+    await b.waitIn(`!document.querySelector('[data-send][data-state]')`);
+    // A held Enter arms a confirm action, and its auto-repeat never confirms; a fresh press does.
+    const enter = (type: string, autoRepeat = false) => a.send("Input.dispatchKeyEvent", {
+      type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, autoRepeat, ...(type === "keyDown" ? { text: "\r", unmodifiedText: "\r" } : {}),
+    });
+    await b.inApp(`document.querySelector('[data-send="pause_replica"]').focus()`);
+    await enter("keyDown");
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`);
+    for (let i = 0; i < 4; i++) { await enter("keyDown", true); await a.sleep(40); }
+    check((await events(b.pid)).length === 0 && await b.inApp(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'armed'`), "a held Enter never confirms a board action");
+    await enter("keyUp");
+    await enter("keyDown");
+    await enter("keyUp");
+    await b.waitIn(`document.querySelector('[data-send="pause_replica"]').dataset.state === 'sent'`);
+    check((await events(b.pid)).length === 1, "Enter again after letting go sends once");
     await call("panel.update", { panel_id: b.pid, data: cost });
     await b.waitIn(`!document.querySelector('[data-send][data-state]')`);
     await narrowShots(b, "board");
@@ -781,6 +804,10 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await ov.waitIn(`document.querySelectorAll('.card').length === 1 && document.querySelector('#pr-815')`);
     await ov.click("#pr-815 .title");
     check(await ov.inApp(`!!document.querySelector('#pr-815 #merge-815')`), "a quick win carries its own Merge");
+    // The card is a listbox option, which may hold no controls: its Merge is for the pointer
+    // only; the keyboard and screen readers get M and the action bar's Merge.
+    check(await ov.inApp(`(() => { const b = document.querySelector('#merge-815'); const m = document.querySelector('.actions #merge-selected');
+      return b.getAttribute('aria-hidden') === 'true' && b.tabIndex === -1 && !!m && m.textContent.includes('Merge #815') && !document.querySelector('[role=listbox] button:not([aria-hidden=true])'); })()`), "Merge outside the option for assistive tech");
     await a.key("m");
     await ov.waitIn(`document.querySelector('.drawer pre.command') && document.activeElement?.id === 'confirm-merge'`);
     const qcmd: string = await ov.inApp(`document.querySelector('.drawer pre.command').textContent`);

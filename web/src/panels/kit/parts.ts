@@ -1,6 +1,7 @@
 // Muster Kit: sparkline, ring (donut), meter and stat tile, as HTML strings. All text goes
-// through esc(); colours through safeColor().
-import { clamp, esc, fmt, lin, safeColor, smooth } from "./format.ts";
+// through esc(), colours through safeColor() and numbers through num(): their options can come
+// from JSON an agent wrote (<mk-ring>, mk.ring), so nothing is interpolated as given.
+import { clamp, esc, fmt, lin, num, safeColor, smooth } from "./format.ts";
 
 let uid = 0;
 export const nid = (p: string) => `mk-${p}${++uid}`;
@@ -20,13 +21,14 @@ export interface SparkOptions { width?: number; height?: number; color?: string;
 
 /** A sparkline; fewer than two numbers draw nothing. */
 export function spark(values: (number | null)[], o: SparkOptions = {}): string {
-  const w = o.width || 120, h = o.height || 32, c = safeColor(o.color, "var(--mk-accent)"), pad = 3;
+  const w = num(o.width, 120, 8, 4000), h = num(o.height, 32, 8, 2000), c = safeColor(o.color, "var(--mk-accent)"), pad = 3;
   const pts: [number, number][] = [];
-  const v = values.filter((x): x is number => x !== null && Number.isFinite(x));
+  values = Array.isArray(values) ? values : [];
+  const v = values.filter((x): x is number => typeof x === "number" && Number.isFinite(x));
   if (v.length < 2) return "";
   const lo = Math.min(...v), hi = Math.max(...v);
   const X = lin(0, values.length - 1, pad, w - pad), Y = lin(lo, hi === lo ? lo + 1 : hi, h - pad, pad);
-  values.forEach((x, i) => { if (x !== null && Number.isFinite(x)) pts.push([X(i), Y(x)]); });
+  values.forEach((x, i) => { if (typeof x === "number" && Number.isFinite(x)) pts.push([X(i), Y(x)]); });
   const d = smooth(pts), g = nid("sg"), last = pts[pts.length - 1];
   return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">` +
     (o.area !== false ? `<defs><linearGradient id="${g}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" style="stop-color:${c};stop-opacity:.26"/><stop offset="1" style="stop-color:${c};stop-opacity:0"/></linearGradient></defs><path d="${d}L${last[0].toFixed(1)},${h}L${pts[0][0].toFixed(1)},${h}Z" fill="url(#${g})"/>` : "") +
@@ -49,7 +51,8 @@ export function ringLengths(values: number[], circumference: number, minLen: num
 }
 
 export function ring(segs: RingSegment[], o: RingOptions = {}): string {
-  const s = o.size || 132, th = o.thickness || 12, r = (s - th) / 2, C = 2 * Math.PI * r;
+  const s = num(o.size, 132, 24, 2000), th = num(o.thickness, 12, 1, s / 2 - 2), r = (s - th) / 2, C = 2 * Math.PI * r;
+  segs = segs.map((g) => ({ ...g, value: num(g?.value, 0) }));
   const gap = segs.filter((g) => g.value > 0).length > 1 ? 3 : 0;
   const lens = ringLengths(segs.map((g) => g.value), C, 4 + gap);
   let at = 0;
@@ -64,7 +67,7 @@ export function ring(segs: RingSegment[], o: RingOptions = {}): string {
   const label = o.label || segs.map((g) => `${g.label}: ${g.value}`).join(", ");
   return `<svg width="${s}" height="${s}" viewBox="0 0 ${s} ${s}" role="img" aria-label="${esc(label)}">` +
     `<circle cx="${s / 2}" cy="${s / 2}" r="${r}" fill="none" style="stroke:var(--mk-sunken)" stroke-width="${th}"/>${arcs}` +
-    (o.center ? `<text x="50%" y="${s / 2 + (o.sub ? 4 : 9)}" text-anchor="middle" class="ring-center" style="fill:${safeColor(o.centerColor, "var(--mk-text)")};font-size:${clamp(o.centerSize || 28, 11, 60)}px">${esc(o.center)}</text>` : "") +
+    (o.center ? `<text x="50%" y="${s / 2 + (o.sub ? 4 : 9)}" text-anchor="middle" class="ring-center" style="fill:${safeColor(o.centerColor, "var(--mk-text)")};font-size:${num(o.centerSize, 28, 11, 60)}px">${esc(o.center)}</text>` : "") +
     (o.sub ? `<text x="50%" y="${s / 2 + 22}" text-anchor="middle" class="ring-sub">${esc(o.sub)}</text>` : "") + `</svg>`;
 }
 
@@ -74,14 +77,15 @@ export interface MeterOptions {
 }
 
 export function meter(o: MeterOptions): string {
-  const max = o.max && o.max > 0 ? o.max : 100;
-  const pct = clamp((o.value / max) * 100, 0, 100);
+  const max = num(o.max, 100) > 0 ? num(o.max, 100) : 100;
+  const value = num(o.value, 0);
+  const pct = clamp((value / max) * 100, 0, 100);
   const color = o.tone && ["good", "warn", "bad", "info", "accent"].includes(o.tone) ? `var(--mk-${o.tone})` : safeColor(o.color, "var(--mk-accent)");
   const hasMark = typeof o.mark === "number" && Number.isFinite(o.mark);
   const mark = hasMark ? `<span class="mark" style="left:${clamp((o.mark! / max) * 100, 0, 100).toFixed(2)}%"></span>` : "";
   const desc = hasMark ? (o.markLabel || `mark at ${fmt(o.mark, o.format)}`) : "";
-  return `<div class="mk-meter" role="meter" aria-valuenow="${o.value}" aria-valuemin="0" aria-valuemax="${max}" aria-label="${esc(o.label)}"${desc ? ` aria-description="${esc(desc)}" title="${esc(desc)}"` : ""}>` +
-    `<div class="top"><span>${esc(o.label)}</span><span><b>${esc(o.text ?? fmt(o.value, o.format))}</b>${o.of ? ` <span>${esc(o.of)}</span>` : ""}</span></div>` +
+  return `<div class="mk-meter" role="meter" aria-valuenow="${value}" aria-valuemin="0" aria-valuemax="${max}" aria-label="${esc(o.label)}"${desc ? ` aria-description="${esc(desc)}" title="${esc(desc)}"` : ""}>` +
+    `<div class="top"><span>${esc(o.label)}</span><span><b>${esc(o.text ?? fmt(value, o.format))}</b>${o.of ? ` <span>${esc(o.of)}</span>` : ""}</span></div>` +
     `<div class="track"><span class="fill" style="width:${pct.toFixed(2)}%;--c:${color}"></span>${mark}</div></div>`;
 }
 
@@ -99,6 +103,6 @@ export function stat(o: StatOptions, tag = "div"): string {
   const meta = o.delta || o.note
     ? `<span class="meta">${o.delta ? `<span class="mk-delta ${tone}">${esc(o.delta)}</span>` : ""}${o.note ? `<span>${esc(o.note)}</span>` : ""}</span>`
     : "";
-  const trend = o.trend?.length ? spark(o.trend, { width: o.trendWidth || 140, height: 28, color: color || undefined }) : "";
+  const trend = Array.isArray(o.trend) && o.trend.length ? spark(o.trend, { width: num(o.trendWidth, 140, 40, 600), height: 28, color: color || undefined }) : "";
   return `<${tag} class="mk-stat">${label}${value}${meta}${trend}</${tag}>`;
 }

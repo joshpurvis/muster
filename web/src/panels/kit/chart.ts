@@ -2,7 +2,7 @@
 // <mk-chart> in kit panels all draw with this. It redraws at its element's width (text is never
 // scaled), and hover, arrow keys, legend toggles and a live region work everywhere. Every value is
 // also in a data table (visually hidden unless shown), so the chart is never the only way in.
-import { clamp, esc, fmt, lin, niceTicks, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
+import { clamp, esc, fmt, lin, niceTicks, num, safeColor, smooth, tickLabels, trendLine } from "./format.ts";
 import { icon } from "./icons.ts";
 import { nid, seriesColor } from "./parts.ts";
 
@@ -51,6 +51,9 @@ interface State {
   idxAt?: (px: number, py: number) => number | null;
   raf: number;
   observer?: ResizeObserver;
+  /** The parts that stay mounted across redraws: the focusable SVG and the live region. */
+  dom?: { figure: HTMLElement; svg: SVGSVGElement; live: HTMLElement; table: HTMLElement };
+  legendHtml?: string;
 }
 
 type Host = HTMLElement & { _mk?: State };
@@ -127,6 +130,32 @@ export function stackBars(series: KitSeries[], n: number): ([number, number] | n
   }));
 }
 
+/** The index of the point nearest (px, py), if one is within `max` pixels (scatter hover). */
+export function nearestPoint(points: { i: number; x: number; y: number }[], px: number, py: number, max: number): number | null {
+  let best: number | null = null, bd = max * max;
+  for (const p of points) {
+    const d = (p.x - px) ** 2 + (p.y - py) ** 2;
+    if (d <= bd) { bd = d; best = p.i; }
+  }
+  return best;
+}
+
+/** Where the tooltip goes: right of the anchor if it fits, else left of it, never outside [0, room]. */
+export function tipLeft(right: number, left: number, tipWidth: number, room: number): number {
+  const at = right + tipWidth <= room - 4 ? right : left - tipWidth;
+  return clamp(at, 0, Math.max(0, room - tipWidth));
+}
+
+/** Each line or area layer's top per point (null where missing) and, stacked, its bottom.
+ * Stacked areas stack like bars: positives up from zero, negatives down from it. */
+export function lineBounds(series: KitSeries[], n: number, stacked: boolean): { top: (number | null)[]; bot: number[] | null }[] {
+  const stack = stacked ? stackBars(series, n) : null;
+  return series.map((s, si) => ({
+    top: s.values.slice(0, n).map((v, i) => v === null || !Number.isFinite(v) ? null : stack ? stack[si][i]![1] : v),
+    bot: stack ? stack[si].map((b) => b?.[0] ?? 0) : null,
+  }));
+}
+
 /** "+15%", "−0.04 pt" (for pct values), or null without a previous value. */
 export function change(v: number | null, p: number | null | undefined, pct: boolean): string | null {
   if (v === null || p === null || p === undefined || !Number.isFinite(v) || !Number.isFinite(p)) return null;
@@ -153,13 +182,14 @@ function render(el: Host) {
   const XF = (v: string | number) => typeof v === "number" ? fmt(v, spec.xFormat || (intX ? "plain" : undefined)) : v;
   const stacked = !!spec.stacked && (type === "area" || type === "bar");
   const narrow = width < 420;
-  const height = Math.round(o.height || clamp(width * 0.44, 200, 380));
+  const height = Math.round(num(o.height, 0, 60, 2000) || clamp(width * 0.44, 200, 380));
   const title = spec.title || TYPE[type];
   const hadFocus = el.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
 
   if (isEmpty(spec) || !vis.length && !series.length) {
     el.innerHTML = `<div class="mk-empty" role="img" aria-label="${esc(title)}: no data" style="min-height:${Math.min(height, 200)}px">${icon("chart")}<b>No data to show</b><span>${esc(spec.empty || "The agent sent this chart without any values.")}</span></div>`;
     st.idxAt = undefined;
+    st.dom = undefined;
     return;
   }
 
@@ -167,10 +197,12 @@ function render(el: Host) {
   const yt = yTicks(spec, lo, hi, height < 150 ? 2 : height < 260 ? 3 : 4);
   const ylabels = tickLabels(yt.ticks, spec.format);
 
-  const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && vis.length <= 6;
+  // Decided on all the series, not the visible ones, so hiding one never swaps the legend (the
+  // only way to show it again) for end labels.
+  const endLabels = (type === "line" || type === "area") && !narrow && spec.labels !== "none" && vis.length > 0 && series.length <= 6;
   const last = (s: KitSeries) => { for (let i = n - 1; i >= 0; i--) if (s.values[i] !== null) return i; return -1; };
   const endW = endLabels ? Math.min(150, Math.max(...vis.map((s) => (s.name.length + F(s.values[last(s)] ?? null).length + 1) * 6.4)) + 16) : 0;
-  const m = { top: spec.y?.label || spec.annotations?.length ? 28 : 14, right: 12 + endW, bottom: 26, left: Math.max(...ylabels.map((l) => l.length)) * 7 + 12 };
+  const m = { top: spec.y?.label || spec.annotations?.length ? 28 : 14, right: 12 + endW, bottom: spec.x.label ? 44 : 26, left: Math.max(...ylabels.map((l) => l.length)) * 7 + 12 };
   const pw = Math.max(40, width - m.left - m.right), ph = Math.max(40, height - m.top - m.bottom);
   const Y0 = lin(yt.min, yt.max, m.top + ph, m.top);
   const Y = (v: number) => clamp(Y0(v), m.top - 2, m.top + ph + 2);
@@ -199,9 +231,14 @@ function render(el: Host) {
       return [{ at: X(i), label: s.length > 14 ? s.slice(0, 13) + "…" : s }];
     });
   }
-  st.idxAt = (px) => {
+  st.idxAt = (px, py) => {
     if (px < m.left - 8 || px > m.left + pw + 8) return null;
     if (type === "bar") return clamp(Math.floor((px - m.left) / band), 0, n - 1);
+    // A scatter's points share x values: the nearest point in both directions, if one is close.
+    if (type === "scatter") {
+      const pts = vis.flatMap((s) => s.values.slice(0, n).flatMap((v, i) => v === null || !Number.isFinite(v) ? [] : [{ i, x: X(i), y: Y(v) }]));
+      return nearestPoint(pts, px, py, 24);
+    }
     let best = 0, bd = Infinity;
     for (let i = 0; i < n; i++) { const d = Math.abs(X(i) - px); if (d < bd) { bd = d; best = i; } }
     return best;
@@ -215,8 +252,9 @@ function render(el: Host) {
     const anchor = type !== "bar" && k === xticks.length - 1 && t.at > m.left + pw - 24 ? "end" : type !== "bar" && k === 0 && t.at < m.left + 24 ? "start" : "middle";
     return `<text class="tick x" x="${t.at.toFixed(1)}" y="${m.top + ph + 18}" text-anchor="${anchor}">${esc(t.label)}</text>`;
   }).join("")}</g>`);
+  if (spec.x.label) P.push(`<text class="xlab" x="${(m.left + pw / 2).toFixed(1)}" y="${height - 6}" text-anchor="middle">${esc(spec.x.label)}</text>`);
 
-  const focus = st.focus !== null && st.focus >= 0 && st.focus < n ? st.focus : null;
+  const focus = Number.isInteger(st.focus) && st.focus! >= 0 && st.focus! < n ? st.focus : null;
   if (focus !== null) {
     if (type === "bar") P.push(`<rect class="band" x="${(m.left + band * focus + 2).toFixed(1)}" y="${m.top}" width="${Math.max(1, band - 4).toFixed(1)}" height="${ph}" rx="6"/>`);
     else if (type !== "scatter") P.push(`<line class="guide" x1="${X(focus).toFixed(1)}" x2="${X(focus).toFixed(1)}" y1="${m.top}" y2="${m.top + ph}"/>`);
@@ -277,13 +315,8 @@ function render(el: Host) {
       }
     });
   } else {
-    const base = new Array(n).fill(0);
-    const layers = vis.map((s) => {
-      const top = s.values.slice(0, n).map((v, i) => v === null || !Number.isFinite(v) ? null : stacked ? base[i] + v : v);
-      const bot = stacked ? base.slice() : null;
-      if (stacked) s.values.forEach((v, i) => { if (v !== null && Number.isFinite(v)) base[i] += v; });
-      return { s, top, bot };
-    });
+    const bounds = lineBounds(vis, n, stacked);
+    const layers = vis.map((s, si) => ({ s, ...bounds[si] }));
     // Grey context lines first, so the highlighted one draws on top.
     const order = stacked ? layers : layers.slice().sort((a, b) => (isCtx(a.s) ? 0 : 1) - (isCtx(b.s) ? 0 : 1));
     order.forEach(({ s, top, bot }) => {
@@ -344,32 +377,74 @@ function render(el: Host) {
 
   const desc = `${TYPE[type]} of ${series.map((s) => s.name).join(", ")} over ${n} value${n === 1 ? "" : "s"} of ${spec.x.label || "x"}, from ${XF(xs[0])} to ${XF(xs[n - 1])}` +
     `; ${spec.y?.label || "values"} from ${F(yt.min)} to ${F(yt.max)}. Use the arrow keys to read each value.`;
-  const svg = `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" tabindex="0" aria-labelledby="${id}-t" aria-describedby="${id}-d"><title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><defs>${defs.join("")}</defs>${P.join("")}</svg>`;
 
-  const showLegend = o.legend === true || (o.legend !== false && series.length > 1 && !endLabels);
+  // A hidden series always keeps the legend, the only way to show it again.
+  const showLegend = o.legend === true || (o.legend !== false && series.length > 1 && (!endLabels || st.hidden.size > 0));
   const agg = (s: KitSeries) => type === "bar" ? s.values.reduce<number>((a, b) => a + (b ?? 0), 0) : s.values[last(s)] ?? null;
   const legend = showLegend
     ? `<ul class="mk-legend" aria-label="Series: press to show or hide">${series.map((s) => `<li><button type="button" aria-pressed="${!st.hidden.has(s.name)}" data-series="${esc(s.name)}"><span class="sw${type === "line" ? " line" : ""}" style="--c:${scol(s)}"></span>${esc(s.name)}${o.legendValues !== false ? ` <span class="v">${esc(F(agg(s)))}</span>` : ""}</button></li>`).join("")}</ul>`
     : "";
 
-  let tip = "", live = "";
+  let tip = "", live = "", anchor: [number, number] = [0, 0];
   if (focus !== null) {
-    const tx = type === "bar" ? m.left + band * (focus + 1) + 8 : X(focus) + 14;
-    const flip = tx + 196 > m.left + pw;
-    const left = flip ? (type === "bar" ? m.left + band * focus - 8 : X(focus) - 14) : tx;
+    anchor = type === "bar" ? [m.left + band * (focus + 1) + 8, m.left + band * focus - 8] : [X(focus) + 14, X(focus) - 14];
     const prev = focus > 0 ? focus - 1 : null;
     const pct = spec.format === "pct";
     const deltas = o.tipDelta !== false && prev !== null && type !== "scatter";
     const rows = vis.map((s) => ({ s, v: s.values[focus] ?? null, d: deltas ? change(s.values[focus] ?? null, s.values[prev!], pct) : null }));
-    tip = `<div class="mk-tip" aria-hidden="true" style="left:${left.toFixed(1)}px;top:${m.top + (spec.annotations?.length ? 30 : 8)}px;${flip ? "transform:translateX(-100%)" : ""}"><div class="x">${esc(XF(xs[focus]))}${deltas ? `<span>vs ${esc(XF(xs[prev!]))}</span>` : ""}</div>` +
-      rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i>${esc(r.s.name)}<b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("") + `</div>`;
+    tip = `<div class="x">${esc(XF(xs[focus]))}${deltas ? `<span>vs ${esc(XF(xs[prev!]))}</span>` : ""}</div>` +
+      rows.map((r) => `<div class="row" style="--c:${scol(r.s)}"><i></i><span class="n">${esc(r.s.name)}</span><b>${esc(F(r.v))}</b>${deltas ? `<em>${esc(r.d ?? "")}</em>` : ""}</div>`).join("");
     live = `${XF(xs[focus])}: ` + rows.map((r) => `${r.s.name} ${F(r.v)}${r.d ? ` (${r.d} vs ${XF(xs[prev!])})` : ""}`).join(", ");
   }
-  const table = `<div class="${o.showTable ? "mk-data" : "mk-sr"}" id="${id}-data"><table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  const table = `<table><caption>${esc(title)} data</caption><thead><tr><th scope="col">${esc(spec.x.label || "x")}</th>${series.map((s) => `<th scope="col">${esc(s.name)}</th>`).join("")}</tr></thead><tbody>${xs.map((x, i) => `<tr><th scope="row">${esc(XF(x))}</th>${series.map((s) => `<td>${esc(F(s.values[i] ?? null))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
 
-  const focusSel = hadFocus ? (hadFocus.dataset?.series !== undefined ? `[data-series="${CSS.escape(hadFocus.dataset.series)}"]` : hadFocus.tagName.toLowerCase() === "svg" ? "figure svg" : null) : null;
-  el.innerHTML = legend + `<figure>${svg}${tip}</figure><div class="mk-sr mk-live" aria-live="polite">${esc(live)}</div>` + table;
-  if (focusSel) (el.querySelector(focusSel) as HTMLElement | SVGElement | null)?.focus({ preventScroll: true });
+  // The SVG (which may have focus) and the live region stay mounted; only their contents change,
+  // so focus stays put and screen readers hear each new value.
+  let dom = st.dom;
+  if (!dom || !el.contains(dom.svg)) {
+    el.innerHTML = `<figure><svg role="img" tabindex="0"></svg></figure><div class="mk-sr mk-live" aria-live="polite"></div><div id="${id}-data"></div>`;
+    dom = st.dom = {
+      figure: el.querySelector("figure")!, svg: el.querySelector("figure svg")!, live: el.querySelector(".mk-live")!, table: el.querySelector(`[id="${id}-data"]`)!,
+    };
+  }
+  const { figure, svg, live: liveEl, table: tableEl } = dom;
+  for (const [k, v] of [["viewBox", `0 0 ${width} ${height}`], ["width", String(width)], ["height", String(height)], ["aria-labelledby", `${id}-t`], ["aria-describedby", `${id}-d`]]) {
+    if (svg.getAttribute(k) !== v) svg.setAttribute(k, v);
+  }
+  svg.innerHTML = `<title id="${id}-t">${esc(title)}</title><desc id="${id}-d">${esc(desc)}</desc><defs>${defs.join("")}</defs>${P.join("")}`;
+
+  const oldLegend = el.querySelector(":scope > .mk-legend");
+  if (legend && oldLegend && st.legendHtml === legend) { /* unchanged: keep it (and its focus) */ }
+  else if (legend) {
+    const t = document.createElement("template");
+    t.innerHTML = legend;
+    const fresh = t.content.firstElementChild!;
+    if (oldLegend) oldLegend.replaceWith(fresh);
+    else el.insertBefore(fresh, figure);
+  } else oldLegend?.remove();
+  st.legendHtml = legend;
+
+  figure.querySelector(":scope > .mk-tip")?.remove();
+  if (tip) {
+    const t = document.createElement("div");
+    t.className = "mk-tip";
+    t.setAttribute("aria-hidden", "true");
+    t.innerHTML = tip;
+    figure.append(t);
+    // Measured, then kept inside the chart: right of the point, else left of it.
+    const room = figure.clientWidth || width, k = room / width;
+    t.style.left = `${tipLeft(anchor[0] * k, anchor[1] * k, t.offsetWidth, room).toFixed(1)}px`;
+    const top = (m.top + (spec.annotations?.length ? 30 : 8)) * k;
+    t.style.top = `${clamp(top, 0, Math.max(0, (figure.clientHeight || height) - t.offsetHeight)).toFixed(1)}px`;
+  }
+  if (liveEl.textContent !== live) liveEl.textContent = live;
+  tableEl.className = o.showTable ? "mk-data" : "mk-sr";
+  tableEl.innerHTML = table;
+
+  // A redrawn legend button that had focus gets it back.
+  if (hadFocus?.dataset?.series !== undefined && !el.contains(hadFocus)) {
+    el.querySelector<HTMLElement>(`[data-series="${CSS.escape(hadFocus.dataset.series)}"]`)?.focus({ preventScroll: true });
+  }
 }
 
 function schedule(el: Host) {
@@ -384,7 +459,7 @@ export function chart(el: HTMLElement, spec: KitChartSpec, o: ChartOptions = {})
   const first = !host._mk;
   const pin = o.pin ?? spec.pin ?? null;
   host._mk = {
-    id: host._mk?.id || nid("c"), spec, o, raf: host._mk?.raf ?? 0, observer: host._mk?.observer,
+    id: host._mk?.id || nid("c"), spec, o, raf: host._mk?.raf ?? 0, observer: host._mk?.observer, dom: host._mk?.dom, legendHtml: host._mk?.legendHtml,
     hidden: new Set(o.hidden ?? host._mk?.hidden ?? []), focus: pin, width: el.clientWidth || host._mk?.width || 640,
   };
   // A legend toggle never hides every series.
@@ -427,8 +502,8 @@ export function chart(el: HTMLElement, spec: KitChartSpec, o: ChartOptions = {})
   });
   el.addEventListener("focusout", (e) => {
     if (!(e.target instanceof SVGElement)) return;
-    // A redraw replaces the focused SVG and puts focus back on the new one; only a real leave
-    // (focus now outside the chart) drops the tooltip.
+    // A redrawn legend button gets focus back; only a real leave (focus now outside the chart)
+    // drops the tooltip.
     setTimeout(() => {
       const st = host._mk!;
       if (el.contains(document.activeElement)) return;

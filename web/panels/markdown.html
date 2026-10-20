@@ -45,6 +45,7 @@
   --mk-good: #4fc98c;  --mk-good-soft: rgba(79, 201, 140, .12);
   --mk-warn: #f2b450;  --mk-warn-soft: rgba(242, 180, 80, .12);
   --mk-bad: #ff7b78;   --mk-bad-soft: rgba(255, 123, 120, .12);
+  --mk-bad-fill: #c42b31;                    /* a primary danger button: white text ≥ 4.5:1 */
   --mk-info: #74b4ff;  --mk-info-soft: rgba(116, 180, 255, .12);
   --mk-add: #4fc98c; --mk-del: #ff7b78;
   --mk-add-bg: rgba(79, 201, 140, .09); --mk-del-bg: rgba(255, 123, 120, .09);
@@ -77,6 +78,7 @@
   --mk-good: #146b44;  --mk-good-soft: rgba(20, 107, 68, .08);   /* ≥ 5.6:1 on its soft fill */
   --mk-warn: #8a4f00;  --mk-warn-soft: rgba(214, 138, 0, .11);   /* ≥ 5.4:1 */
   --mk-bad: #b81f28;   --mk-bad-soft: rgba(201, 37, 45, .07);    /* ≥ 5.6:1 */
+  --mk-bad-fill: #b81f28;
   --mk-info: #1a5fb8;  --mk-info-soft: rgba(31, 111, 209, .08);  /* ≥ 5.5:1 */
   --mk-add: #1a7f37; --mk-del: #cf222e;
   --mk-add-bg: rgba(26, 127, 55, .08); --mk-del-bg: rgba(207, 34, 46, .07);
@@ -216,6 +218,9 @@
 .mk-btn.primary:hover { background: color-mix(in srgb, var(--mk-accent-fill) 88%, #fff); }
 .mk-btn.primary kbd { background: rgba(0, 0, 0, .22); color: rgba(255, 255, 255, .9); box-shadow: none; }
 .mk-btn.danger { color: var(--mk-bad); border-color: color-mix(in srgb, var(--mk-bad) 35%, transparent); }
+/* Primary and danger together: a filled red button with white text (never red on violet). */
+.mk-btn.primary.danger:not([data-state]) { color: #fff; background: var(--mk-bad-fill); border-color: transparent; }
+.mk-btn.primary.danger:not([data-state]):hover { background: color-mix(in srgb, var(--mk-bad-fill) 88%, #000); }
 .mk-btn.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--mk-text-2); }
 .mk-btn.ghost:hover { background: var(--mk-sunken); color: var(--mk-text); }
 .mk-btn.sm { min-height: 26px; padding: 3px 9px; font-size: 12px; border-radius: 7px; }
@@ -372,7 +377,7 @@
 .mk-chart .base { stroke: var(--mk-line-3); }
 .mk-chart .tick { fill: var(--mk-text-3); font: 400 11px var(--mk-mono); }
 .mk-chart .tick.x { font-family: var(--mk-font); font-size: 12px; }
-.mk-chart .ylab { fill: var(--mk-text-3); font: 550 12px var(--mk-font); }
+.mk-chart .ylab, .mk-chart .xlab { fill: var(--mk-text-3); font: 550 12px var(--mk-font); }
 .mk-chart .vlab { fill: var(--mk-text-2); font: 600 11px var(--mk-font); font-variant-numeric: tabular-nums; }
 .mk-chart .vlab.nil { fill: var(--mk-text-3); font-weight: 400; }
 .mk-chart .end { font: 600 12px var(--mk-font); font-variant-numeric: tabular-nums; }
@@ -396,15 +401,17 @@
 .mk-legend .v { color: var(--mk-text-3); font-weight: 500; font-variant-numeric: tabular-nums; }
 /* The one frosted surface in a panel: it floats over the data it describes. */
 .mk-tip {
-  position: absolute; z-index: 5; pointer-events: none; min-width: 172px; padding: 9px 11px 10px; border-radius: 10px;
+  position: absolute; z-index: 5; pointer-events: none; min-width: min(172px, 100%); max-width: 100%; box-sizing: border-box; padding: 9px 11px 10px; border-radius: 10px;
   background: color-mix(in srgb, var(--mk-raised) 90%, transparent); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); box-shadow: var(--mk-pop); font-size: 12px;
 }
 .mk-tip .x { display: flex; justify-content: space-between; gap: 12px; font-weight: 650; color: var(--mk-text); margin-bottom: 6px; font-size: 12px; }
-.mk-tip .x span { font-weight: 450; color: var(--mk-text-3); }
+.mk-tip .x span { font-weight: 450; color: var(--mk-text-3); white-space: nowrap; }
 .mk-tip .row { display: flex; align-items: center; gap: 8px; color: var(--mk-text-2); line-height: 1.75; }
 .mk-tip .row i { width: 8px; height: 8px; border-radius: 2px; background: var(--c); flex: none; }
-.mk-tip .row b { margin-left: auto; padding-left: 14px; font: 600 12px var(--mk-mono); color: var(--mk-text); }
-.mk-tip .row em { font-style: normal; font-size: 11px; color: var(--mk-text-3); font-family: var(--mk-mono); min-width: 46px; text-align: right; }
+/* Names shorten with an ellipsis; numbers never wrap. */
+.mk-tip .row .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mk-tip .row b { margin-left: auto; padding-left: 14px; font: 600 12px var(--mk-mono); color: var(--mk-text); white-space: nowrap; flex: none; }
+.mk-tip .row em { font-style: normal; font-size: 11px; color: var(--mk-text-3); font-family: var(--mk-mono); min-width: 46px; text-align: right; white-space: nowrap; flex: none; }
 .mk-heads { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 4px 0 16px; }
 .mk-heads .mk-stat .value { font-size: 22px; }
 

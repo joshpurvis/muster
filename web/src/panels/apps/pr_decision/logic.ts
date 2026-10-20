@@ -293,11 +293,7 @@ export function answersEvent(pr: Pr, draft: Draft) {
 /** Muster refuses events over 16 KiB of JSON; keep a margin for the envelope. */
 export const MAX_EVENT_BYTES = 15 * 1024;
 
-/** UTF-8 size of the `ui/message` params an event becomes (what the backend measures). */
-export function eventBytes(event: { kind: string; text: string; data: object }): number {
-  const params = { role: "user", content: { type: "text", text: event.text }, _meta: { muster: { kind: event.kind, data: event.data } } };
-  return new TextEncoder().encode(JSON.stringify(params)).length;
-}
+export { eventBytes } from "../shared/validate.ts";
 
 /** Failing checks block Merge unless the user holds Shift. */
 export function checksBlock(pr: Pr): boolean {

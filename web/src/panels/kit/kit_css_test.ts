@@ -35,6 +35,7 @@ Deno.test("kit text tokens keep 4.5:1 on every surface, in both themes", () => {
       }
     }
     check(contrast("#ffffff", t["mk-accent-fill"]) >= 4.5, `${name}: white on the accent fill`);
+    check(contrast("#ffffff", t["mk-bad-fill"]) >= 4.5, `${name}: white on the danger fill (a primary danger button) is ${contrast("#ffffff", t["mk-bad-fill"]).toFixed(2)}:1`);
   }
 });
 

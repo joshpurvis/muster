@@ -12,7 +12,7 @@ const root = document.getElementById("app")!;
 
 // Events are posted straight from the click or key handler: the host takes them only during a
 // real user action in this panel.
-const send = (kind: string, data: Record<string, string>, text: string) => sendEvent(kind, text, data);
+const send = (kind: string, data: Record<string, unknown>, text: string) => sendEvent(kind, text, data);
 wireButtons(send);
 
 addEventListener("keydown", (e) => {

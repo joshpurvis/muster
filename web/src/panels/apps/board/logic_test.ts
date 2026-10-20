@@ -33,7 +33,23 @@ Deno.test("board input: every problem is named with its path", () => {
   check(errorsOf(validateBoard({ title: "t", blocks: [] }))[0].startsWith("blocks: needs at least 1 item"));
 });
 
-Deno.test("board input: an unknown icon or field is a warning, never a blank panel", () => {
-  const r = validateBoard({ title: "t", blocks: [{ kind: "callout", text: "x", icon: "unicorn", tone: "info", colour: "x" }] });
-  check(r.ok && r.warnings.some((w) => w.includes('unknown icon "unicorn"')) && r.warnings.some((w) => w.includes("colour: unknown field")), JSON.stringify(r));
+Deno.test("board input: an unknown icon is a warning; an unknown field is refused, as the backend does", () => {
+  const r = validateBoard({ title: "t", blocks: [{ kind: "callout", text: "x", icon: "unicorn", tone: "info" }] });
+  check(r.ok && r.warnings.some((w) => w.includes('unknown icon "unicorn"')), JSON.stringify(r));
+  const e = errorsOf(validateBoard({ title: "t", blocks: [{ kind: "callout", text: "x", colour: "x" }] }));
+  check(e.some((x) => x.startsWith("blocks[0].colour: unknown field (it takes kind, span, title, aside, tone, icon, text)")), e.join("\n"));
+});
+
+Deno.test("board input: an action whose event would pass 16 KiB is refused", () => {
+  const data = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`k${i}`, "😀".repeat(500)]));
+  const e = errorsOf(validateBoard({ title: "t", blocks: [{ kind: "actions", items: [{ id: "go", label: "Go", data }] }] }));
+  check(e.some((x) => x.startsWith("blocks[0].items[0]: would send an event of") && x.includes("at most 16 KiB")), e.join("\n"));
+});
+
+Deno.test("board input: the same inputs pass or fail here as in the backend (parity.json)", async () => {
+  const cases = JSON.parse(await Deno.readTextFile(new URL("./parity.json", import.meta.url))) as { name: string; ok: boolean; data: unknown }[];
+  for (const c of cases) {
+    const r = validateBoard(c.data);
+    check(r.ok === c.ok, `${c.name}: ${JSON.stringify(r).slice(0, 400)}`);
+  }
 });

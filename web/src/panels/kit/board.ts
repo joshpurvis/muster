@@ -1,10 +1,11 @@
 // Draws Board JSON (app "board", and mk.board in kit panels) with the kit's parts. The input is
 // validated first (apps/board/logic.ts); every string goes through esc().
-import { clamp, esc, safeColor } from "./format.ts";
+import { clamp, esc, rich, safeColor } from "./format.ts";
 import { icon } from "./icons.ts";
 import { meter, stat } from "./parts.ts";
 import { chart } from "./chart.ts";
-import { type Block, type Board, KINDS } from "../apps/board/logic.ts";
+import { actionText, type Block, type Board, KINDS } from "../apps/board/logic.ts";
+import type { Btn } from "./buttons.ts";
 
 const tone = (t: string | undefined) => t && ["good", "warn", "bad", "info", "accent"].includes(t) ? t : "";
 const head = (b: { title?: string; aside?: string }) =>
@@ -30,9 +31,9 @@ function blockHtml(b: Block, i: number): string {
     }
     case "actions":
       return (b.title ? `<div class="mk-card">${head(b)}` : "") + `<div class="mk-row">${b.items.map((a) =>
-        `<button type="button" class="mk-btn${a.primary ? " primary" : ""}${a.danger ? " danger" : ""}" data-send="${esc(a.id)}"` +
+        // The action's data stays typed JSON: it is put on the button after drawing (board()).
+        `<button type="button" class="mk-btn${a.primary ? " primary" : ""}${a.danger ? " danger" : ""}" data-send="${esc(a.id)}" data-text="${esc(actionText(a.label))}"` +
         (a.confirm ? ` data-confirm="${esc(a.confirm)}"` : "") + (a.key ? ` data-key="${esc(a.key.toLowerCase())}" aria-keyshortcuts="${esc(a.key.toUpperCase())}"` : "") +
-        (a.data ? Object.entries(a.data).map(([k, v]) => ` data-${esc(k)}="${esc(v)}"`).join("") : "") +
         `>${a.icon ? icon(a.icon) : ""}${esc(a.label)}${a.key ? `<kbd>${esc(a.key.toUpperCase())}</kbd>` : ""}</button>`).join("")}</div>` + (b.title ? "</div>" : "");
     default:
       return `<div class="mk-error" role="alert">${icon("alert")}<span><b>Unknown block "${esc((b as { kind: string }).kind)}".</b> Use one of: ${KINDS.join(", ")}.</span></div>`;
@@ -42,11 +43,15 @@ function blockHtml(b: Block, i: number): string {
 /** Draw a validated Board into `el` (its charts are live kit charts). */
 export function board(el: HTMLElement, d: Board, warnings: string[] = []) {
   el.innerHTML = `<div class="mk-page mk-board"><header class="mk-head"><div><h1 class="mk-title">${esc(d.title)}${d.scope ? ` <span class="mk-scope">${esc(d.scope)}</span>` : ""}</h1>` +
-    `${d.takeaway ? `<p class="mk-takeaway">${esc(d.takeaway)}</p>` : ""}</div></header>` +
+    `${d.takeaway ? `<p class="mk-takeaway">${rich(d.takeaway)}</p>` : ""}</div></header>` +
     (warnings.length ? `<p class="mk-warnings">${esc(warnings.join("; "))}</p>` : "") +
     `<div class="mk-grid" style="--min:${clamp(d.min || 300, 160, 1200)}px">${d.blocks.map((b, i) =>
       `<div class="mk-cell${b.span === "full" ? " mk-wide" : ""}${b.kind === "actions" ? " mk-actions" : ""}">${blockHtml(b, i)}</div>`).join("")}</div>` +
     (d.source ? `<footer class="mk-foot"><span class="mk-source">Source: ${esc(d.source)}</span></footer>` : "") + `</div>`;
+  el.querySelectorAll<Btn>(".mk-actions [data-send]").forEach((btn) => {
+    const a = d.blocks.flatMap((b) => b.kind === "actions" ? b.items : []).find((x) => x.id === btn.dataset.send);
+    btn._mkData = { ...(a?.data ?? {}) };
+  });
   el.querySelectorAll<HTMLElement>("[data-board-chart]").forEach((c) => {
     const b = d.blocks[Number(c.dataset.boardChart)];
     if (b?.kind === "chart") chart(c, b.spec, { height: b.height });

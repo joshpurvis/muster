@@ -232,7 +232,7 @@ function card(pr: Item, now: number) {
   const mergeOff = quickReady ? quickMergeBlocked(pr, sent.has(`merge:${pr.number}`)) : null;
   return h("div", {
     class: `card mk-card prc risk-${pr.risk ?? "none"}${isSel ? " selected" : ""}${pr.number === view!.current ? " current" : ""} g-${pr.status}`,
-    id: `pr-${pr.number}`, role: "option", "aria-selected": String(isSel), tabindex: isSel ? 0 : -1,
+    id: `pr-${pr.number}`, role: "option", "aria-selected": String(isSel), tabindex: isSel ? 0 : -1, "aria-keyshortcuts": quickReady ? "M" : null,
     onclick: () => { if (selected !== pr.number) select(pr.number); },
     ondblclick: () => open(pr),
   },
@@ -257,7 +257,9 @@ function card(pr: Item, now: number) {
     st[0] ? badge(st[0], st[1], "status") : null,
     pr.status_detail ? h("span", { class: "detail" }, pr.status_detail) : null,
     quickReady && pr.head_sha ? h("span", { class: "reviewed" }, iconEl("check"), `Reviewed at ${pr.head_sha.slice(0, 7)}, ${pr.merge_method_default}${pr.delete_branch_default ? ", delete branch" : ""}`) : null,
-    quickReady ? h("button", { type: "button", id: `merge-${pr.number}`, class: "sm primary merge-quick", "aria-keyshortcuts": "M", disabled: !!mergeOff || !!merging,
+    // A pointer shortcut only: an option may hold no controls, so screen readers and the keyboard
+    // reach the same Merge as M on the card or the action bar's Merge (#merge-selected).
+    quickReady ? h("button", { type: "button", id: `merge-${pr.number}`, class: "sm primary merge-quick", "aria-hidden": "true", tabindex: -1, disabled: !!mergeOff || !!merging,
       title: mergeOff ?? `Merge #${pr.number}: ${pr.verdict ?? ""}`, onclick: (e: Event) => { e.stopPropagation(); if (selected !== pr.number) select(pr.number, false); openMerge(pr); } },
     iconEl("merge"), `Merge #${pr.number}`, h("kbd", null, "M")) : null) : null);
 }
@@ -267,6 +269,7 @@ function actionBar() {
   const pr = selectedPr();
   const nextUp = nextPr(ordered(), v.current);
   const busy = (k: string) => !!pr && sent.has(`${k}:${pr.number}`);
+  const quick = pr && pr.quick_win && pr.status !== "merged" && pr.status !== "queued" ? pr : null;
   return h("div", { class: `actions${outward || merging || showKeys ? " has-drawer" : ""}` },
     showKeys ? shortcutsDrawer(KEYS, v.actions, () => setKeys(false)) : null,
     outward ? outwardDrawer(outward.action, `#${outward.pr.number}`, () => confirmOutward(), () => cancelConfirm()) : null,
@@ -275,6 +278,9 @@ function actionBar() {
     h("div", { class: "row bar" },
       h("button", { type: "button", id: "open", class: "primary", "aria-keyshortcuts": "Enter O", disabled: !pr || busy("open"), onclick: () => open(selectedPr()) },
         pr ? `Open #${pr.number}` : "Open", " ", h("kbd", null, "Enter")),
+      quick ? h("button", { type: "button", id: "merge-selected", "aria-keyshortcuts": "M", disabled: !!quickMergeBlocked(quick, sent.has(`merge:${quick.number}`)) || !!merging,
+        title: quickMergeBlocked(quick, sent.has(`merge:${quick.number}`)) ?? `Merge the quick win #${quick.number} (shows the exact command first)`, onclick: () => openMerge(selectedPr()) },
+        iconEl("merge"), `Merge #${quick.number}`, " ", h("kbd", null, "M")) : null,
       h("button", { type: "button", id: "hold", class: "ghost", "aria-keyshortcuts": "H", disabled: !pr || !canHold(pr) || busy("hold"), onclick: () => hold(selectedPr()) }, "Hold ", h("kbd", null, "H")),
       h("button", { type: "button", id: "next", class: "ghost", "aria-keyshortcuts": "N", disabled: !nextUp, title: nextUp ? `Next: #${nextUp.number}` : "Nothing left to review", onclick: () => next() },
         "Next", nextUp ? ` #${nextUp.number}` : "", " ", h("kbd", null, "N")),

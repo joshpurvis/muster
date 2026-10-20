@@ -409,8 +409,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;
+            // Closing a named agent's tab never stops it, whatever the client knew about agents
+            // (its list may not have loaded yet): it is hidden instead. `agent.remove` removes it.
+            if hub.agents().by_session(p.id).is_some() {
+                return Ok(json!({ "hidden": true, "session": hub.hide_session(p.id)? }));
+            }
             hub.remove_session(p.id)?;
             Ok(json!({}))
+        }
+        "session.hide" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            to_value(hub.hide_session(p.id)?)
         }
         "session.rename" => {
             let p: Rename<SessionId> = parse(params)?;

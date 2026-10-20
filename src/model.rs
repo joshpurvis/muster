@@ -335,6 +335,11 @@ pub struct SessionInfo {
     /// Client window this session is a tab in (None: adopted by the next `window.claim`).
     #[serde(default)]
     pub window_id: Option<WindowId>,
+    /// A named agent's tab the human closed (`session.hide`): the session runs on with no
+    /// window (`window_id` None) and no `window.claim` adopts it, until `session.set_window`
+    /// shows it again (the agents panel does).
+    #[serde(default)]
+    pub hidden: bool,
     /// Changes whenever the state or its detail changes, and when a prompt is answered: an
     /// approval carrying the `state_seq` the caller saw never answers a different prompt.
     /// Runtime only (unique within one daemon run).

@@ -318,10 +318,12 @@ export interface Toast {
   text: string;
   /** A toast that is updated or dismissed as its subject changes (one per key). */
   key?: string;
+  /** A button after the text (clicking it also dismisses the toast). */
+  action?: { label: string; run: () => void };
 }
 export const toasts = signal<Toast[]>([]);
 let toastSeq = 0;
-export function toast(level: Toast["level"], text: string, ms?: number, key?: string) {
+export function toast(level: Toast["level"], text: string, ms?: number, key?: string, action?: Toast["action"]) {
   if (key && toasts.value.some((t) => t.key === key)) {
     toasts.value = toasts.value.map((t) => t.key === key ? { ...t, level, text } : t);
     return;
@@ -329,7 +331,7 @@ export function toast(level: Toast["level"], text: string, ms?: number, key?: st
   const id = ++toastSeq;
   // Collapse exact duplicates that arrive in a burst.
   if (toasts.value.some((t) => t.text === text && t.level === level)) return;
-  toasts.value = [...toasts.value, { id, level, text, key }].slice(-5);
+  toasts.value = [...toasts.value, { id, level, text, key, action }].slice(-5);
   setTimeout(() => dismissToast(id), ms ?? (level === "error" ? 8000 : 4000));
 }
 export function dismissToast(id: number) {

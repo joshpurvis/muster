@@ -936,6 +936,51 @@ exec cat > '${BASE}/fake-input'
   await c.call("agent.remove", { name: "cody" });
   ok((await c.call("agent.list")).length === 0 && await exists(`${DATA}/agents/ada/CLAUDE.md`), "agent.remove keeps the home dir");
 
+  // A named agent's closed tab is hidden, not stopped (the fake Codex stands in for the agent).
+  await c.call("agent.create", { name: "bg", kind: "codex" });
+  const started = await c.call("agent.start", { name: "bg" });
+  const agentSid: number = started.session.id;
+  const agentCh: number = started.session.channel_id;
+  const sessOf = async (id: number) => (await c.call("hello")).sessions.find((x: Json) => x.id === id);
+  await c.waitFor("fake agent idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === agentSid && e.data.state === "idle"));
+  const plainTab = await c.call("session.spawn", { channel_id: agentCh, kind: "shell" });
+  await c.call("session.hide", { id: plainTab.id }).then(
+    () => ok(false, "session.hide refuses a tab that isn't an agent's"),
+    (e) => ok(String(e).includes("not a named agent"), "session.hide refuses a tab that isn't an agent's"),
+  );
+  await c.call("session.remove", { id: plainTab.id });
+  ok(!(await sessOf(plainTab.id)), "an ordinary tab still closes for real");
+  const pidBefore = (await sessOf(agentSid)).pid;
+  const hid = await c.call("session.hide", { id: agentSid });
+  h = await c.call("hello");
+  s = h.sessions.find((x: Json) => x.id === agentSid);
+  ok(hid.hidden && s.hidden && s.window_id === null && s.state !== "exited" && s.pid === pidBefore, "a hidden agent tab keeps running");
+  ok(h.channels.some((x: Json) => x.id === agentCh && x.window_id === null) && !h.windows.some((w: Json) => w.channel_ids.includes(agentCh)), "its task is in no window");
+  await c.call("session.send", { id: agentSid, text: "hello while hidden" });
+  let got = "";
+  for (let n = 0; n < 100; n++) { got = await Deno.readTextFile(`${BASE}/fake-input`); if (got.includes("hello while hidden")) break; await sleep(100); }
+  ok(got.includes("hello while hidden"), "a hidden agent still gets messages");
+  const startAgain = await c.call("agent.start", { name: "bg" });
+  ok(startAgain.started === false && startAgain.session.id === agentSid && startAgain.session.hidden, "agent.start reports the hidden agent running, leaves it hidden");
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
+  s = await sessOf(agentSid);
+  ok(s.hidden && s.window_id === null && s.pid === pidBefore, "still hidden and running after a backend restart");
+  const win = await c.call("window.create", {});
+  s = await c.call("session.set_window", { id: agentSid, window_id: win.id });
+  ok(!s.hidden && s.window_id === win.id && (await c.call("hello")).channels.find((x: Json) => x.id === agentCh).window_id === win.id, "session.set_window shows it again, with its task");
+  const removed = await c.call("session.remove", { id: agentSid });
+  s = await sessOf(agentSid);
+  ok(removed.hidden && removed.session.hidden && s.hidden && s.state !== "exited" && s.pid === pidBefore,
+    "session.remove of an agent's tab hides it, never stops it");
+  await c.call("session.kill", { id: agentSid });
+  await c.waitFor("agent stopped", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === agentSid && e.data.state === "exited"));
+  ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");
+  await c.call("agent.remove", { name: "bg" });
+
   c.close();
   await stopDaemon(d, "SIGTERM");
   console.log(`\nPASS (${passed} checks)`);

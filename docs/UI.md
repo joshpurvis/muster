@@ -89,7 +89,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 - Context menu: Rename (same as double-click), Permissions… (task), Copy path, Copy branch, New
   terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
   Shell in this task there), Move to window ▸ (existing windows plus
-  "New window"), Restart, Interrupt, Close tab, and when it is the task's last session with a
+  "New window"), Restart, Interrupt, Close tab (a named agent's tab only hides: see "Agents panel"), and when it is the task's last session with a
   worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
   the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
   "Claude is working" / "Codex is working", "Stop its current turn?" or "Restart it? Its
@@ -294,8 +294,9 @@ terminal tab; there is no chat view.
 |---|---|
 | Header | "Agents", the count, `×` hides the panel. |
 | Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. Hover: the persona's first line. |
-| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere. Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
-| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog; its folder stays). |
+| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
+| Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
+| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays). |
 | + New agent | Under the list: the New agent dialog. |
 | Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
 
@@ -383,7 +384,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Ctrl+Alt+←↑→↓ | Move the tab to the neighbouring group in that direction (splitting at the window edge) |
 | Alt+J | Jump to the next session that needs you (all windows; pulls its tab here, or raises its window with "Jump focuses the other window"). Order: most urgent state, then longest waiting; repeated presses cycle |
 | Alt+D / Alt+Shift+D | Split the focused group right / down with a new shell in the focused tab's task (picker via menu) |
-| Alt+W | Close the focused tab (inline confirm if working); an emptied group closes |
+| Alt+W | Close the focused tab (inline confirm if working; a named agent's tab is hidden, its agent keeps running); an emptied group closes |
 | Alt+←↑→↓ | Focus the group in that direction |
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |

@@ -122,6 +122,9 @@ export interface SessionInfo {
   created_at: number;
   /** The window showing this session as a tab. Missing before v2: then its channel's window. */
   window_id?: WindowId | null;
+  /** A named agent's closed tab (`session.hide`): it runs on in no window until it is shown
+   * again (`session.set_window`). Missing from older daemons. */
+  hidden?: boolean;
 }
 
 export type EventKind =

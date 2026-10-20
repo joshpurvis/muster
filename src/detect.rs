@@ -311,6 +311,7 @@ mod tests {
             state_seq: 0,
             created_at: 0,
             window_id: None,
+            hidden: false,
         }
     }
 

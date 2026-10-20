@@ -3570,8 +3570,99 @@ textarea {
   color: var(--st-attn);
 }
 
-.mem-save {
+.mem-del {
   margin-left: auto;
+}
+
+/* Add files…: the way in, at the top of the file list. */
+.mem-add {
+  flex: none;
+}
+
+/* An empty memory/: what it is and the two ways to seed it. */
+.mem-intro {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px 28px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.mem-intro h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mem-intro p {
+  margin: 0;
+  max-width: 52ch;
+}
+
+.mem-intro-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.mem-intro-hint {
+  font-size: 11.5px;
+}
+
+/* What the last add did. */
+.mem-added {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 6px 6px 10px;
+  border-radius: var(--r);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.mem-added-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.mem-added p {
+  margin: 0;
+}
+
+.mem-skipped {
+  color: var(--st-attn);
+}
+
+.mem-added-x {
+  flex: none;
+}
+
+/* Files dragged over the tab. */
+.dlg-body.mem {
+  position: relative;
+}
+
+.mem-drop {
+  position: absolute;
+  inset: 4px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--bg-overlay) 88%, transparent);
+  color: var(--text);
+  font-size: 13px;
+  pointer-events: none;
 }
 
 .mem-pending {

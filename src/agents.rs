@@ -1908,7 +1908,9 @@ const MEMORY_LIST_MAX: usize = 500;
 /// A path inside memory/: relative, plain names only (no `..`, `.`, root or empty parts).
 pub fn memory_rel(path: &str) -> anyhow::Result<PathBuf> {
     use std::path::Component;
-    let p = path.trim();
+    // Exactly as given, never trimmed: `notes.md ` (an agent may make one) is another file
+    // than `notes.md`, and reading, saving or deleting one must never reach the other.
+    let p = path;
     if p.is_empty() || p.len() > 255 || p.contains('\0') {
         anyhow::bail!("bad memory path `{p}`");
     }
@@ -2027,6 +2029,23 @@ mod at {
         let (a, b) = (cstr(from)?, cstr(to)?);
         // SAFETY: valid fds and C strings.
         check(unsafe { libc::renameat(dir.as_raw_fd(), a.as_ptr(), dir.as_raw_fd(), b.as_ptr()) })?;
+        Ok(())
+    }
+
+    /// A second name `to` for the file `from` (both in `dir`); fails with `EEXIST` when `to`
+    /// is taken by anything, a link included (never followed).
+    pub fn link(dir: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+        let (a, b) = (cstr(from)?, cstr(to)?);
+        // SAFETY: valid fds and C strings.
+        check(unsafe { libc::linkat(dir.as_raw_fd(), a.as_ptr(), dir.as_raw_fd(), b.as_ptr(), 0) })?;
+        Ok(())
+    }
+
+    /// Remove the file (or link) `name`, saying why when it can't.
+    pub fn remove(dir: &OwnedFd, name: &str) -> io::Result<()> {
+        let c = cstr(name)?;
+        // SAFETY: valid fd and C string.
+        check(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })?;
         Ok(())
     }
 
@@ -2151,11 +2170,21 @@ pub fn memory_read(a: &Agent, path: &str) -> anyhow::Result<Value> {
 /// is replaced by the rename, never written through). Concurrent writes never share a
 /// temporary file.
 pub fn memory_write(a: &Agent, path: &str, text: &str) -> anyhow::Result<Value> {
-    use std::io::Write;
     if text.len() > MEMORY_FILE_MAX {
         anyhow::bail!("memory files are at most {} KB", MEMORY_FILE_MAX / 1024);
     }
     let rel = memory_rel(path)?;
+    // Saving a file that exists keeps its name, whatever it is (an agent may have made it).
+    // A new file, and folders made for it, get names that read as what they are.
+    let exists = open_memory(a, false)
+        .ok()
+        .and_then(|m| walk_memory(m, &rel, false).ok())
+        .is_some_and(|(d, n)| at::stat(&d, &n).is_ok_and(|s| at::is_file(&s)));
+    if !exists {
+        for part in path.split('/') {
+            memory_new_part(part)?;
+        }
+    }
     let (dir, name) = walk_memory(open_memory(a, true)?, &rel, true)?;
     match at::stat(&dir, &name) {
         Ok(s) if at::is_dir(&s) => anyhow::bail!("memory/{} is a folder", rel.display()),
@@ -2164,16 +2193,131 @@ pub fn memory_write(a: &Agent, path: &str, text: &str) -> anyhow::Result<Value> 
         }
         _ => {}
     }
-    let tmp = format!(".{name}.muster-tmp-{}", &paths::random_token()[..16]);
-    let mut f = at::file(&dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)
-        .map_err(|e| anyhow::anyhow!("writing memory/{}: {e}", rel.display()))?;
-    let written = f.write_all(text.as_bytes()).and_then(|_| f.sync_all());
-    drop(f);
-    if let Err(e) = written.and_then(|_| at::rename(&dir, &tmp, &name)) {
+    let tmp =
+        write_temp(&dir, &name, text).map_err(|e| anyhow::anyhow!("writing memory/{}: {e}", rel.display()))?;
+    if let Err(e) = at::rename(&dir, &tmp, &name) {
         at::unlink(&dir, &tmp);
         anyhow::bail!("writing memory/{}: {e}", rel.display());
     }
     Ok(json!({ "path": rel.to_string_lossy(), "size": text.len() }))
+}
+
+/// Write `text` to a new temporary file of its own (random name, `O_EXCL`, 0600, synced) in
+/// `dir`, named after `name`; returns its name. Removed again when the write fails.
+fn write_temp(dir: &std::os::fd::OwnedFd, name: &str, text: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    let tmp = format!(".{name}.muster-tmp-{}", &paths::random_token()[..16]);
+    let mut f = at::file(dir, &tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+    let written = f.write_all(text.as_bytes()).and_then(|_| f.sync_all());
+    drop(f);
+    if let Err(e) = written {
+        at::unlink(dir, &tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Longest name `agent.memory.add` takes: room is left for a `-99` suffix and the temporary
+/// file's name, all within the 255-byte limit of a file name.
+pub const MEMORY_NAME_MAX: usize = 200;
+
+/// A file name added to memory/ from outside (a file the human picked or dropped): one plain,
+/// visible name. No folders (`/` or `\`), nothing starting with `.` (so no `.`, `..` or hidden
+/// files), no control characters and no invisible or direction-changing ones (a name that
+/// reads differently from what it is: `memory_new_part`), at most `MEMORY_NAME_MAX` bytes.
+/// Spaces before or after it are refused, never trimmed.
+pub fn memory_file_name(name: &str) -> anyhow::Result<String> {
+    let n = name;
+    if n.trim().is_empty() {
+        anyhow::bail!("the file needs a name");
+    }
+    memory_new_part(n)?;
+    if n.len() > MEMORY_NAME_MAX {
+        anyhow::bail!("file names are at most {MEMORY_NAME_MAX} bytes");
+    }
+    if n.contains('/') || n.contains('\\') {
+        anyhow::bail!("`{n}` is a path; give a file name only");
+    }
+    if n.starts_with('.') {
+        anyhow::bail!("`{n}` starts with `.`: hidden files aren't added to memory/");
+    }
+    memory_rel(n)?;
+    Ok(n.to_string())
+}
+
+/// Unicode's Default_Ignorable_Code_Point set (DerivedCoreProperties.txt): characters that
+/// render as nothing (soft hyphen, combining grapheme joiner, zero-width spaces and joiners,
+/// direction marks, embeddings, overrides and isolates, variation selectors, fillers, the BOM,
+/// tags). A name with one looks like another name that has none.
+fn default_ignorable(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}'..='\u{1160}' | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+        | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// A part of a name muster creates in memory/ (a new file or folder, from `agent.memory.add` or
+/// `agent.memory.write`): reads as what it is. No control characters, nothing
+/// default-ignorable, no spaces before or after it.
+fn memory_new_part(part: &str) -> anyhow::Result<()> {
+    if part.chars().any(|c| c.is_control() || default_ignorable(c)) {
+        anyhow::bail!("`{}` has control or invisible characters", part.escape_default());
+    }
+    if part != part.trim() {
+        anyhow::bail!("`{part}` starts or ends with a space");
+    }
+    Ok(())
+}
+
+/// `name` with `-<i>` before its extension: `notes.md` → `notes-2.md`, `README` → `README-2`.
+fn suffixed(name: &str, i: u32) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => format!("{}-{i}{}", &name[..dot], &name[dot..]),
+        _ => format!("{name}-{i}"),
+    }
+}
+
+/// `agent.memory.add`: add a new file at the top of memory/ (the human seeding it from files
+/// they have). Never replaces anything: a taken name gets `-2`, `-3`, ... before its extension
+/// (up to `-99`). The text is at most `MEMORY_FILE_MAX` bytes, valid UTF-8 (it arrives as a
+/// JSON string; a lone surrogate escape fails to parse) and without NUL characters (a binary
+/// file). Written to a temporary file and linked into place with `linkat`, which fails on any
+/// existing entry (file, folder or link), so it can't overwrite or write through anything.
+pub fn memory_add(a: &Agent, file_name: &str, text: &str) -> anyhow::Result<Value> {
+    let name = memory_file_name(file_name)?;
+    if text.len() > MEMORY_FILE_MAX {
+        anyhow::bail!("{name} is larger than {} KB", MEMORY_FILE_MAX / 1024);
+    }
+    if text.contains('\0') {
+        anyhow::bail!("{name} isn't a text file");
+    }
+    let dir = open_memory(a, true)?;
+    let tmp = write_temp(&dir, &name, text).map_err(|e| anyhow::anyhow!("writing memory/{name}: {e}"))?;
+    let placed = (1..=99u32)
+        .map(|i| if i == 1 { name.clone() } else { suffixed(&name, i) })
+        .find_map(|cand| match at::link(&dir, &tmp, &cand) {
+            Ok(()) => Some(Ok(cand)),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => None,
+            Err(e) => Some(Err(anyhow::anyhow!("writing memory/{cand}: {e}"))),
+        })
+        .unwrap_or_else(|| Err(anyhow::anyhow!("memory/ already has {name} and 98 more like it")));
+    at::unlink(&dir, &tmp);
+    let path = placed?;
+    Ok(json!({ "path": path, "size": text.len(), "renamed": path != name }))
+}
+
+/// `agent.memory.delete`: remove one file under memory/, never a folder or a link (the path is
+/// walked as for a read, so nothing outside memory/ can be reached).
+pub fn memory_delete(a: &Agent, path: &str) -> anyhow::Result<Value> {
+    let rel = memory_rel(path)?;
+    let (dir, name) = walk_memory(open_memory(a, false)?, &rel, false)?;
+    let st = at::stat(&dir, &name).map_err(|e| anyhow::anyhow!("memory/{}: {e}", rel.display()))?;
+    if !at::is_file(&st) {
+        anyhow::bail!("memory/{} is not a file", rel.display());
+    }
+    at::remove(&dir, &name).map_err(|e| anyhow::anyhow!("deleting memory/{}: {e}", rel.display()))?;
+    Ok(json!({ "path": rel.to_string_lossy() }))
 }
 
 #[cfg(test)]
@@ -2677,6 +2821,122 @@ mod tests {
         assert!(memory_read(&a, "up/outside.txt").is_err());
         let l = memory_list(&a).unwrap();
         assert!(l["files"].as_array().unwrap().iter().all(|f| f["path"] != "link.md"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn added_file_names_are_plain_visible_names() {
+        assert_eq!(memory_file_name("notes.md").unwrap(), "notes.md");
+        assert_eq!(memory_file_name("Style guide (v2).txt").unwrap(), "Style guide (v2).txt");
+        // Never trimmed or otherwise changed: refused instead.
+        for bad in [" notes.md", "notes.md ", "notes.md\u{a0}", "no\u{034F}tes.md", "e\u{FE0F}.md", "tag\u{E0041}.md",
+            "fill\u{3164}.md", "\u{2066}iso.md", "x\u{115F}.md"] {
+            assert!(memory_file_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert_eq!(memory_file_name("README").unwrap(), "README");
+        assert!(memory_file_name(&"a".repeat(MEMORY_NAME_MAX)).is_ok());
+        for bad in [
+            "", "   ", ".", "..", ".env", ".bashrc", "../x.md", "a/b.md", "/etc/passwd", "..\\x", "a\\b",
+            "a\0b", "line\nbreak.md", "tab\t.md", "\u{202E}dm.exe", "zero\u{200B}width.md", "bom\u{FEFF}.md",
+        ] {
+            assert!(memory_file_name(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(memory_file_name(&"a".repeat(MEMORY_NAME_MAX + 1)).is_err());
+        assert_eq!(suffixed("notes.md", 2), "notes-2.md");
+        assert_eq!(suffixed("a.tar.gz", 3), "a.tar-3.gz");
+        assert_eq!(suffixed("README", 2), "README-2");
+    }
+
+    #[test]
+    fn memory_add_never_replaces_and_stays_inside() {
+        let home = scratch("memory-add");
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        // Creates memory/ when missing.
+        let r = memory_add(&a, "notes.md", "first").unwrap();
+        assert_eq!((r["path"].as_str(), r["renamed"].as_bool()), (Some("notes.md"), Some(false)));
+        // A taken name is suffixed; the first file is untouched.
+        let r = memory_add(&a, "notes.md", "second").unwrap();
+        assert_eq!((r["path"].as_str(), r["renamed"].as_bool()), (Some("notes-2.md"), Some(true)));
+        assert_eq!(memory_add(&a, "notes.md", "third").unwrap()["path"], "notes-3.md");
+        assert_eq!(memory_read(&a, "notes.md").unwrap()["text"], "first");
+        assert_eq!(memory_read(&a, "notes-2.md").unwrap()["text"], "second");
+        // A folder or a link by that name is never written into or through.
+        std::fs::create_dir(home.join("memory/people")).unwrap();
+        assert_eq!(memory_add(&a, "people", "x").unwrap()["path"], "people-2");
+        let outside = home.join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("memory/link.md")).unwrap();
+        assert_eq!(memory_add(&a, "link.md", "overwritten").unwrap()["path"], "link-2.md");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+        // Traversal, separators and hidden names are refused before anything is written.
+        for bad in ["../CLAUDE.md", "../../x", "sub/x.md", "..", ".hidden", "a\\..\\b"] {
+            assert!(memory_add(&a, bad, "x").is_err(), "{bad:?} should be refused");
+        }
+        assert!(!home.join("CLAUDE.md").exists() && !home.join("memory/sub").exists());
+        // Size cap and binary content.
+        let big = memory_add(&a, "big.md", &"x".repeat(MEMORY_FILE_MAX + 1)).unwrap_err().to_string();
+        assert!(big.contains("KB"), "{big}");
+        assert!(memory_add(&a, "max.md", &"x".repeat(MEMORY_FILE_MAX)).is_ok());
+        assert!(memory_add(&a, "bin.dat", "PNG\0\0").unwrap_err().to_string().contains("isn't a text file"));
+        // No temporary files left behind, and the persona folder is untouched.
+        let names: Vec<String> = std::fs::read_dir(home.join("memory"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains("muster-tmp")), "{names:?}");
+        assert!(!names.iter().any(|n| n == "big.md" || n == "bin.dat"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn existing_names_are_used_exactly_and_new_ones_read_as_they_are() {
+        let home = scratch("memory-exact");
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        memory_write(&a, "notes.md", "plain").unwrap();
+        // An agent made a look-alike with a trailing space: it is its own file everywhere.
+        std::fs::write(home.join("memory/notes.md "), "spaced").unwrap();
+        assert_eq!(memory_read(&a, "notes.md ").unwrap()["text"], "spaced");
+        memory_write(&a, "notes.md ", "spaced, saved").unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("memory/notes.md")).unwrap(), "plain");
+        memory_delete(&a, "notes.md ").unwrap();
+        assert!(!home.join("memory/notes.md ").exists());
+        assert_eq!(memory_read(&a, "notes.md").unwrap()["text"], "plain");
+        // New names (files and the folders made for them) can't hide characters or spaces.
+        for bad in ["no\u{034F}tes.md", "notes.md ", " a/b.md", "a /b.md", "dir\u{200B}/x.md", "x\u{7}.md"] {
+            assert!(memory_write(&a, bad, "x").is_err(), "{bad:?} should be refused");
+        }
+        assert!(!home.join("memory/a ").exists() && !home.join("memory/dir\u{200B}").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn memory_delete_removes_files_only() {
+        let home = scratch("memory-del");
+        let mut a = agent(SessionKind::Claude);
+        a.home_dir = home.to_string_lossy().into_owned();
+        memory_write(&a, "notes.md", "x").unwrap();
+        memory_write(&a, "people/ada.md", "y").unwrap();
+        std::fs::write(home.join("CLAUDE.md"), "persona").unwrap();
+        memory_delete(&a, "people/ada.md").unwrap();
+        assert!(!home.join("memory/people/ada.md").exists() && home.join("memory/people").is_dir());
+        assert!(memory_delete(&a, "people").unwrap_err().to_string().contains("not a file"));
+        assert!(memory_delete(&a, "missing.md").is_err());
+        for bad in ["../CLAUDE.md", "/etc/passwd", "a/../../CLAUDE.md", ""] {
+            assert!(memory_delete(&a, bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(home.join("CLAUDE.md").exists());
+        // A link is neither followed nor removed; nor is anything behind a linked folder.
+        let outside = home.join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("memory/link.md")).unwrap();
+        assert!(memory_delete(&a, "link.md").is_err());
+        std::os::unix::fs::symlink(&home, home.join("memory/up")).unwrap();
+        assert!(memory_delete(&a, "up/outside.txt").is_err());
+        assert!(outside.exists() && home.join("memory/link.md").symlink_metadata().is_ok());
+        memory_delete(&a, "notes.md").unwrap();
+        assert!(!home.join("memory/notes.md").exists());
         std::fs::remove_dir_all(&home).ok();
     }
 

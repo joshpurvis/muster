@@ -497,6 +497,48 @@ exec cat > '${BASE}/fake-input'
   const closing = (await mcp(shellToken, "panel_open", { title: "Closing", app: "markdown" })).panel_id;
   await mcp(shellToken, "panel_close", { panel_id: closing });
   ok(!(await exists(`${DATA}/panels/${closing}`)), "closing a panel deletes its app and data files");
+  // Notes: the human (UI RPC), an agent (MCP, the fake Codex session) and the CLI share them.
+  const cliEnv0 = () => ({ ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" });
+  const human = await c.call("note.create", { title: "Smoke note", body: "line one\r\n" });
+  ok(human.rev === 1 && human.body === "line one\n" && human.updated_by.kind === "human", "note.create: plain text, the human's");
+  const nw1 = await c.call("note.write", { id: human.id, body: "line one\nline two\n", base_rev: 1 });
+  ok(nw1.rev === 2, "note.write with the current revision");
+  ok(await c.call("note.write", { id: human.id, body: "stale", base_rev: 1 }).then(() => false, (e) => /changed since revision 1/.test(String(e))),
+    "a write from an old revision is refused");
+  const listed = await mcp(fakeToken, "note_list");
+  ok(listed.notes.some((n: Json) => n.id === human.id && n.rev === 2 && n.text === undefined), "MCP note_list (no text)");
+  const read = await mcp(fakeToken, "note_read", { note_id: human.id });
+  ok(read.text === "line one\nline two\n" && read.rev === 2, "MCP note_read");
+  const app = await mcp(fakeToken, "note_append", { note_id: human.id, text: "agent line" });
+  ok(app.rev === 3, "MCP note_append needs no revision");
+  ok(await mcp(fakeToken, "note_write", { note_id: human.id, text: "x" }).then(() => false, (e) => String(e).includes("rev is required")),
+    "MCP note_write needs rev to replace a note");
+  ok(await mcp(fakeToken, "note_write", { note_id: human.id, text: "x", rev: 2 }).then(() => false, (e) => String(e).includes("changed since revision 2")),
+    "MCP note_write from a stale rev is refused");
+  const rewritten = await mcp(fakeToken, "note_write", { note_id: human.id, text: "rewritten\n", rev: 3 });
+  ok(rewritten.rev === 4, "MCP note_write with the current rev");
+  const made = await mcp(fakeToken, "note_write", { title: "Agent findings", text: "- a\n" });
+  const agentNote = await c.call("note.get", { id: made.note_id });
+  ok(agentNote.updated_by.kind === "agent" && /^Codex/.test(agentNote.updated_by.name), `the agent's note names it (${agentNote.updated_by.name})`);
+  ok(c.events.some((e) => e.event === "note_upserted" && e.data.id === human.id && e.data.rev === 4 && e.data.body === "rewritten\n"),
+    "note_upserted carries each change to clients");
+  const big = "x".repeat(1024 * 1024);
+  const bigNote = await c.call("note.create", { title: "Big", body: big });
+  ok(await c.call("note.append", { id: bigNote.id, text: "y" }).then(() => false, (e) => /1 MiB/.test(String(e))), "notes are capped at 1 MiB");
+  ok(await c.call("note.create", { title: "Too big", body: big + "y" }).then(() => false, () => true), "an oversized note is refused");
+  await c.call("note.delete", { id: bigNote.id });
+  ok(await c.call("note.delete", { id: made.note_id, from_session: fake.id }).then(() => false, (e) => /only the human/.test(String(e))),
+    "an agent's session can't delete a note");
+  const opened = await mcp(fakeToken, "note_open", { note_id: made.note_id });
+  ok(opened.window_id === 1 && (await c.call("note.get", { id: made.note_id })).beside === fake.id, "MCP note_open shows it beside the agent");
+  const cliNote = await new Deno.Command(BIN, { args: ["note", "append", "Smoke note", "from", "the", "cli"], env: cliEnv0(), stdout: "piped", stderr: "piped" }).output();
+  ok(cliNote.success && dec.decode(cliNote.stdout).includes("rev 5"), `muster note append (${dec.decode(cliNote.stderr)})`);
+  const cliRead = await new Deno.Command(BIN, { args: ["note", "read", String(human.id)], env: cliEnv0(), stdout: "piped" }).output();
+  ok(dec.decode(cliRead.stdout) === "rewritten\nfrom the cli", "muster note read prints the text");
+  const cliLs = await new Deno.Command(BIN, { args: ["note", "ls"], env: cliEnv0(), stdout: "piped" }).output();
+  ok(dec.decode(cliLs.stdout).includes("Agent findings"), "muster note ls");
+  const noteRev = 5;
+
   await c.call("session.remove", { id: fake.id });
   await c.call("panel.event", { panel_id: pid, kind: "durable", payload: { persisted: true } });
 
@@ -817,6 +859,9 @@ exec cat > '${BASE}/fake-input'
   ok(s.state !== "exited" && s.pid === beforeCrash.pid, "after backend crash: original terminal process survives");
   ok(h.windows.some((w: Json) => w.id === 1 && !w.open && w.channel_ids.includes(ch.id)), "windows persist across restarts");
   ok(h.panels.some((p: Json) => p.id === pid && p.revision === 2), "panel survives backend restart");
+  const keptNote = h.notes.find((n: Json) => n.id === human.id);
+  ok(keptNote?.rev === noteRev && keptNote.body === "rewritten\nfrom the cli" && h.notes.some((n: Json) => n.id === made.note_id && n.window_id === 1),
+    "notes (text, revision, window) survive a backend restart");
   ok((await mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 0 })).events[0].kind === "durable", "queued shell panel event survives backend restart");
   ok(canon(h.windows.find((w: Json) => w.id === 1).layout) === canon(layout) && s.window_id === 1, "window layouts and session windows persist");
   await c.call("session.attach", { id: sid });

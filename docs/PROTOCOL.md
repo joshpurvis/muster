@@ -115,7 +115,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, windows[], account_profiles[], home, default_shell, login_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs}` (`updates`, `prefs`: see "Updates and window preferences") |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -292,6 +292,53 @@ Events use `ui/message` with user text; `_meta.muster.kind` optionally names a c
 The host checks transient user activation synchronously, plus a visible, focused panel frame,
 before accepting a message or opening an HTTP(S) link. Context updates alone do not inject.
 Native IPC also requires a random per-window secret injected only into the main UI frame.
+
+## Notes
+
+Plain-text notes the human and every agent share (`src/notes.rs`). The daemon holds each note's
+text; `rev` counts changes to the text (a rename or a move doesn't change it). Desktop client
+token only: devices have no `note.*` methods and get neither `hello.notes` nor note events.
+
+```ts
+type Note = { id: number; title: string; body: string; rev: number; created_at: number; updated_at: number;
+              updated_by: { kind: "human" | "agent"; name?: string; session_id?: number };
+              window_id: number | null /* its tab's window; null: closed */; beside: number | null };
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `note.list` | `{}` | Summaries, no text: `{id, title, rev, bytes, lines, created_at, updated_at, updated_by, open, window_id}[]` |
+| `note.get` | `{id}` | `Note` |
+| `note.create` | `{title?, body? = "", window_id?, from_session?}` | `Note` (rev 1). No title: `Note <id>`. With `window_id` its tab opens there. |
+| `note.write` | `{id, body, base_rev, title?, from_session?}` | `Note`. Replaces the text. Refused unless `base_rev` is the current `rev`: `note N changed since revision B: it is at revision R (last edited by …)`. The same text again changes nothing. |
+| `note.append` | `{id, text, from_session?}` | `Note`. Adds `text` at the end, after a newline unless the note is empty or already ends with one. Needs no revision. |
+| `note.rename` | `{id, name}` | `Note` |
+| `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
+| `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
+| `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
+
+`from_session` (the CLI passes `$MUSTER_SESSION_ID`) only says who wrote: an agent session makes
+`updated_by` that agent (a named agent's name, else `Claude (task name)` / `Codex (task name)`); a
+shell tab, or no `from_session`, is the human. Text is plain: CRLF and CR become LF, NUL, ESC and
+other control characters except tab and newline are dropped. Limits: 1 MiB of UTF-8 per note,
+titles 1–200 bytes on one line, 1000 notes.
+
+Every change emits `note_upserted` with the full note (text included); `note.delete` emits
+`note_removed {id}`. A window that is deleted (no tabs left when its client closed, or at
+startup) leaves its notes closed: `window_id` reads as null. Notes never keep a window alive and
+`window.claim` doesn't adopt them. Store migration v17 adds the `notes` table. In saved layouts a
+note's tab is `-(2^40 + id)`, below every panel tab.
+
+**Concurrent edits.** Writes are optimistic: every full write names the revision it was made
+from, so nothing overwrites text its writer hasn't seen. The UI keeps the text on screen and the
+revision it is based on, and saves typing 0.5 s after it stops. When a newer revision arrives (an
+agent's append or write) while typing is unsaved, or a save is refused because one arrived first,
+the UI merges its typing onto the new text (`web/src/note_merge.ts`): each side's change is one
+span (common prefix and suffix cut off); spans that don't overlap are both applied (the human's
+first at the same point), and overlapping ones keep the human's version followed by the other one
+between two marker lines (`──── <who> changed this part at the same time; their version: ────` …
+`──── end of their version ────`). Then it saves again from the new revision. No typed text is
+lost on either side.
 
 ## Windows, tabs and naming
 

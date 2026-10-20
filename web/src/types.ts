@@ -207,6 +207,14 @@ export interface AgentTemplate {
   autostart: boolean;
 }
 
+/** `agent.models`: what the agent dialog offers per CLI (src/agents.rs `model_catalog`). */
+export interface KindModels {
+  /** `efforts`: this model's levels where they differ from the CLI's (null: the CLI's). */
+  models: { id: string; note: string | null; efforts: string[] | null }[];
+  efforts: string[];
+}
+export type ModelCatalog = Record<"claude" | "codex", KindModels>;
+
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }

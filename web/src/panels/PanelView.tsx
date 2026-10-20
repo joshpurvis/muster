@@ -1,30 +1,21 @@
-// Panel apps live in one layer per window, positioned over their tab's slot in the layout.
-// Moving a tab between groups, zooming or splitting only moves the slot: the app's frame
-// stays in the document, so it keeps its state (a removed or re-parented iframe reloads).
+// Panel apps live in one layer per window, positioned over their tab's slot in the layout
+// (placement.ts). A web preview is drawn by WebPreview.tsx instead of the sandbox proxy.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { signal } from "@preact/signals";
 import { rpc } from "../rpc.ts";
-import { focusedTabId, helloEpoch, layout, meta, panelOrigin, updateLayout, windowPanels } from "../state.ts";
+import { focusedTabId, helloEpoch, layout, meta, updateLayout, windowPanels } from "../state.ts";
 import { focusActiveTerminalSoon, focusGroup } from "../actions.ts";
 import { panelChords, runPanelKey } from "../keys.ts";
-import { paneOfSession, panelTab } from "../layout/tree.ts";
 import type { Panel, PanelResource } from "../types.ts";
 import { ACTIVATION, PanelBridge } from "./bridge.ts";
+import { panelOriginUrl, panelReloads, reloadPanel, slots, slotsChanged, usePanelPlacement } from "./placement.ts";
+import { WebPreview } from "./WebPreview.tsx";
 
 const APP_NAMES: Record<string, string> = { markdown: "Markdown", image: "Image", chart: "Chart", table: "Table", pr_decision: "PR decision", pr_overview: "PR overview" };
 
-export const panelReloads = signal<ReadonlyMap<number, number>>(new Map());
-export function reloadPanel(id: number) {
-  const next = new Map(panelReloads.value);
-  next.set(id, (next.get(id) ?? 0) + 1);
-  panelReloads.value = next;
-}
+export { reloadPanel };
 
 /** An app that has not finished the MCP Apps handshake by then gets an error and Reload. */
 export const LOAD_TIMEOUT_MS = 10_000;
-
-const slots = new Map<number, HTMLElement>();
-const slotsChanged = signal(0);
 
 /** Where the active panel tab of a group shows (its app is drawn over it by PanelLayer). */
 export function PanelSlot({ id }: { id: number }) {
@@ -45,7 +36,7 @@ export function PanelSlot({ id }: { id: number }) {
 export function PanelLayer() {
   return (
     <div class="panel-layer">
-      {windowPanels.value.map((p) => <PanelView key={p.id} panel={p} />)}
+      {windowPanels.value.map((p) => p.app === "web_preview" ? <WebPreview key={p.id} panel={p} /> : <PanelView key={p.id} panel={p} />)}
     </div>
   );
 }
@@ -59,20 +50,14 @@ const STALLED: Record<Exclude<Stage, "ready">, string> = {
   init: "The app did not finish starting: it sent ui/initialize but not ui/notifications/initialized.",
 };
 
-function clip(r: DOMRect, by: DOMRect) {
-  const left = Math.max(r.left, by.left), top = Math.max(r.top, by.top);
-  return new DOMRect(left, top, Math.min(r.right, by.right) - left, Math.min(r.bottom, by.bottom) - top);
-}
-
 function PanelView({ panel }: { panel: Panel }) {
-  const ref = useRef<HTMLDivElement>(null);
   const frameHost = useRef<HTMLDivElement>(null);
   const bridge = useRef<PanelBridge | null>(null);
   const iframe = useRef<HTMLIFrameElement | null>(null);
   const htmlRevision = useRef(-1);
   const applied = useRef(-1);
   const generation = useRef(0);
-  const visible = useRef(false);
+  const { ref, visible, paneId, tab, active, zoomed, split, dim } = usePanelPlacement(panel.id, iframe);
   const stageRef = useRef<Stage>("resource");
   const timer = useRef(0);
   // A failed resource fetch, and an app that stalled during its handshake.
@@ -82,25 +67,7 @@ function PanelView({ panel }: { panel: Panel }) {
   const [appError, setAppError] = useState("");
   const appErrorRef = useRef("");
 
-  const tab = panelTab(panel.id);
-  const l = layout.value;
-  const pane = l ? paneOfSession(l.root, tab) : null;
-  const paneId = useRef<string | null>(null);
-  paneId.current = pane?.id ?? null;
-  const active = !!l && !!pane && pane.active === tab && (!l.zoom || l.zoom === pane.id);
-  const zoomed = !!pane && l?.zoom === pane.id;
-  const split = !!l && l.root.type !== "pane" && !l.zoom;
-  const dim = split && l.focus !== pane?.id;
-  const activeRef = useRef(active);
-  activeRef.current = active;
-  void slotsChanged.value;
-  const slot = slots.get(panel.id);
-
-  let origin = "";
-  try {
-    const url = new URL(panelOrigin.value);
-    if (url.protocol === "http:" && url.hostname === "127.0.0.1" && url.origin !== location.origin && url.port && url.port !== "0" && url.origin === panelOrigin.value) origin = url.origin;
-  } catch { /* Older backends have no panel origin. */ }
+  const origin = panelOriginUrl();
   const reload = panelReloads.value.get(panel.id) ?? 0;
   const epoch = helloEpoch.value;
 
@@ -113,34 +80,6 @@ function PanelView({ panel }: { panel: Panel }) {
     }
   };
 
-  /** Draw the app over its slot, or hide it. Focus inside a frame being hidden or removed
-   * would fall to <body>; hand it to the tab that took its place. */
-  const place = () => {
-    const host = ref.current;
-    const layer = host?.parentElement;
-    if (!host || !layer) return;
-    const el = slots.get(panel.id);
-    let r: DOMRect | null = el?.isConnected && activeRef.current ? el.getBoundingClientRect() : null;
-    // Split children clip panes squeezed below their floor; clip the app the same way.
-    for (let a = el?.parentElement; r && a && a !== layer.parentElement; a = a.parentElement) {
-      if (a.classList.contains("split-child") || a.classList.contains("split-root")) r = clip(r, a.getBoundingClientRect());
-    }
-    const show = !!r && r.width > 0 && r.height > 0;
-    if (show) {
-      const base = layer.getBoundingClientRect();
-      host.style.left = `${r!.left - base.left}px`;
-      host.style.top = `${r!.top - base.top}px`;
-      host.style.width = `${r!.width}px`;
-      host.style.height = `${r!.height}px`;
-      host.dataset.placed = "";
-    } else if (host.dataset.placed !== undefined) {
-      const focused = !!iframe.current && document.activeElement === iframe.current;
-      delete host.dataset.placed;
-      if (focused) focusActiveTerminalSoon();
-    }
-    visible.current = show;
-  };
-
   const context = () => ({
     theme: document.documentElement.dataset.theme === "light" ? "light" : "dark",
     displayMode: paneId.current !== null && layout.peek()?.zoom === paneId.current ? "fullscreen" : "inline",
@@ -150,19 +89,6 @@ function PanelView({ panel }: { panel: Panel }) {
     userAgent: `Muster/${meta.peek().version}`,
     containerDimensions: { width: frameHost.current?.clientWidth ?? 0, height: frameHost.current?.clientHeight ?? 0 },
   });
-
-  // Layout changes reach every group in the same render pass; measure once they are all in.
-  useLayoutEffect(() => { queueMicrotask(place); });
-  useEffect(() => {
-    const resize = new ResizeObserver(() => place());
-    if (slot) resize.observe(slot);
-    if (ref.current?.parentElement) resize.observe(ref.current.parentElement);
-    addEventListener("resize", place);
-    return () => {
-      resize.disconnect();
-      removeEventListener("resize", place);
-    };
-  }, [slot]);
 
   useEffect(() => {
     // Fail closed if an older backend has no panel origin, or it isn't a separate loopback origin.

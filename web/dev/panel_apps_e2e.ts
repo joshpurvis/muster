@@ -732,8 +732,114 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await close(ov.pid);
     ok("pr_overview: N sends next with the rest in the shown order; overview and decision with media are readable about 400 px wide");
   }
+  await webPreview({ a, R, call, shots, ok, check });
   await R("channel.archive", { id: ch.id }).catch(() => {});
   void hello;
+}
+
+/** web_preview: a local dev server framed live, Reload, Open in browser, the URL changed by
+ * panel_update, notices for a page that refuses framing and for a server that is not up (which
+ * loads by itself once it is), a frame held to its dev server's origin, and refused URLs. */
+async function webPreview({ a, R, call, shots, ok, check }: {
+  a: Browser; R: (m: string, p: unknown) => Promise<any>; call: (m: string, args: Record<string, unknown>) => Promise<any>;
+  shots: string; ok: (msg: string) => void; check: Check;
+}) {
+  const hits: string[] = [];
+  // Each page tells the UI it loaded (the UI must ignore such messages), and logs its hit.
+  const page = (name: string, extra = "") =>
+    `<!doctype html><title>${name}</title><style>body{font:16px system-ui;margin:24px}</style><h1>${name}</h1>` +
+    `<p>Served by a local dev server.</p><script>top.postMessage({e2ePreview: ${JSON.stringify(name)}, href: location.href}, "*");${extra}</script>`;
+  const serve = (name: string, handler?: (req: Request) => Response | undefined, port = 0) =>
+    Deno.serve({ port, hostname: "127.0.0.1", onListen() {} }, (req) => {
+      const path = new URL(req.url).pathname;
+      hits.push(`${name}${path}`);
+      return handler?.(req) ?? new Response(page(name), { headers: { "content-type": "text/html" } });
+    });
+  const elsewhere = serve("elsewhere");
+  const dev = serve("dev", (req) => {
+    const path = new URL(req.url).pathname;
+    if (path === "/deny") return new Response(page("deny"), { headers: { "content-type": "text/html", "x-frame-options": "DENY" } });
+    // Navigates its own frame to another origin, which the preview page's frame-src blocks.
+    if (path === "/wander") {
+      return new Response(page("wander", `setTimeout(() => { location.href = "http://127.0.0.1:${elsewhere.addr.port}/"; }, 50);`),
+        { headers: { "content-type": "text/html" } });
+    }
+  });
+  const second = serve("second");
+  const servers = [elsewhere, dev, second];
+  try {
+    await a.eval(`globalThis.__previewMsgs = []; addEventListener("message", (e) => { if (e.data?.e2ePreview) __previewMsgs.push(e.data.e2ePreview); }); globalThis.__openedLinks = [];`);
+    const loadedFrom = (name: string, ms = 8000) => a.wait(`__previewMsgs.includes(${JSON.stringify(name)})`, ms);
+    const devUrl = `http://127.0.0.1:${dev.addr.port}/`;
+    const pid = (await call("panel.open", { title: "My app", app: "web_preview", data: { url: devUrl } })).panel_id as number;
+    const view = `[data-panel-view="${pid}"]`;
+    await a.wait(`!!document.querySelector('${view} iframe') && !document.querySelector('${view} .panel-status')`, 8000);
+    await loadedFrom("dev");
+    check((await a.eval(`document.querySelector('${view} .preview-url').textContent`)) === devUrl, "the bar shows the address");
+    check((await a.eval(`document.querySelector('${view} iframe').src`)).startsWith(`${(await R("hello", {})).panel_origin}/preview?url=`),
+      "the frame is the panel server's preview page");
+    for (const theme of ["dark", "light"]) {
+      await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
+      await a.sleep(300);
+      await a.shot(`${shots}/panel-web-preview-${theme}.png`, (await a.rect(view))!);
+    }
+    await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
+
+    // Reload loads the page again; Open in browser hands the address to the system browser.
+    await a.eval(`__previewMsgs = []`);
+    await a.click(`${view} .preview-bar button[title="Load the page again"]`);
+    await loadedFrom("dev");
+    await a.click(`${view} .preview-bar button[title="Open this address in your web browser"]`);
+    check((await a.eval(`__openedLinks`)).includes(devUrl), `Open in browser opens the address: ${JSON.stringify(await a.eval(`__openedLinks`))}`);
+    ok("web_preview: a local dev server shows live, with its address, Reload and Open in browser");
+
+    // The agent changes the address; the frame follows.
+    await a.eval(`__previewMsgs = []`);
+    await call("panel.update", { panel_id: pid, data: { url: `http://127.0.0.1:${second.addr.port}/` } });
+    await loadedFrom("second");
+    await a.wait(`document.querySelector('${view} .preview-url').textContent.includes(':${second.addr.port}/')`);
+    ok("web_preview: panel_update moves the frame to the new address");
+
+    // A page that leaves for another origin stays blocked in the frame.
+    await a.eval(`__previewMsgs = []`);
+    await call("panel.update", { panel_id: pid, data: { url: `${devUrl}wander` } });
+    await loadedFrom("wander");
+    await a.sleep(1200);
+    check(!hits.includes("elsewhere/"), `a framed page cannot navigate off its dev server: ${hits.join(" ")}`);
+    ok("web_preview: the framed page cannot navigate to another origin");
+
+    // Refusing to be framed: a notice with Open in browser; the user may look anyway.
+    await call("panel.update", { panel_id: pid, data: { url: `${devUrl}deny` } });
+    await a.wait(`document.querySelector('${view} [data-preview-notice="refused"]')?.textContent.includes('X-Frame-Options: DENY')`, 8000);
+    await a.shot(`${shots}/panel-web-preview-refused-dark.png`, (await a.rect(view))!);
+    await a.click(`${view} .panel-status .preview-actions button:last-child`);
+    await a.wait(`!document.querySelector('${view} .panel-status')`);
+    ok("web_preview: a page that refuses framing says so, with Open in browser");
+
+    // Nothing listening yet: a notice, then the page once the server starts.
+    const late = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const latePort = (late.addr as Deno.NetAddr).port;
+    late.close();
+    await a.eval(`__previewMsgs = []`);
+    await call("panel.update", { panel_id: pid, data: { url: `http://127.0.0.1:${latePort}/` } });
+    await a.wait(`document.querySelector('${view} [data-preview-notice="down"]')?.textContent.includes('reloads by itself')`, 8000);
+    await a.shot(`${shots}/panel-web-preview-down-dark.png`, (await a.rect(view))!);
+    servers.push(serve("late", undefined, latePort));
+    await loadedFrom("late", 10000);
+    await a.wait(`!document.querySelector('${view} .panel-status')`);
+    ok("web_preview: a server that is not up yet gets a notice, and shows by itself once it starts");
+
+    // Anything but a local dev server is refused, pointing at the system browser.
+    for (const url of ["https://example.com/", "http://localhost.evil.example:5173/", `http://127.0.0.1:${new URL(await a.eval("location.href")).port}/`]) {
+      const err = await call("panel.update", { panel_id: pid, data: { url } }).then(() => "", (e) => String(e?.message ?? e));
+      check(err.includes("system browser") || err.includes("Muster's own"), `${url} refused: ${err}`);
+    }
+    check(((await R("hello", {})).panels as any[]).some((p) => p.id === pid), "the preview stays open after refused updates");
+    await call("panel.close", { panel_id: pid });
+    ok("web_preview: other sites and Muster's own port are refused");
+  } finally {
+    for (const s of servers) await s.shutdown().catch(() => {});
+  }
 }
 
 if (import.meta.main) {

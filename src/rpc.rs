@@ -169,6 +169,10 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let p: IdParam<PanelId> = parse(params)?;
             Ok(crate::panels::resource(hub, p.id)?)
         }
+        "panel.preview_check" => {
+            let p: IdParam<PanelId> = parse(params)?;
+            Ok(crate::web_preview::check_panel(hub, p.id).await?.1)
+        }
         "panel.event" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
             struct P { panel_id: PanelId, kind: String, payload: Value }

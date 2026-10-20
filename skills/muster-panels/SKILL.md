@@ -1,6 +1,6 @@
 ---
 name: muster-panels
-description: "Show things to the user in a Muster panel beside the terminal (an image, a chart, a table, Markdown, or a small interactive app of your own) and get their clicks back. Use when the user asks for a visual view: to see something in a panel, a chart or plot, a table view, or an image or screenshot shown, e.g. \"chart this\", \"put it in a table\", \"show the screenshot\", \"show this in a panel\". Not for ordinary explanations. Needs a Muster session; for pull request reviews use muster-pr-review."
+description: "Show things to the user in a Muster panel beside the terminal (an image, a chart, a table, Markdown, a live preview of the web app you are running locally, or a small interactive app of your own) and get their clicks back. Use when the user asks for a visual view: to see something in a panel, a chart or plot, a table view, an image or screenshot shown, or the app you are building, e.g. \"chart this\", \"put it in a table\", \"show the screenshot\", \"show this in a panel\", \"show me the app\". Not for ordinary explanations. Needs a Muster session; for pull request reviews use muster-pr-review."
 ---
 
 # Muster panels
@@ -40,7 +40,26 @@ apps", and in the `panel_open` tool description.
   y?: {label?, min?, max?}}`; one value per x value, `null` for a gap, up to 12 series.
 - `table`: `{title?, columns: [{key, label?, align?}], rows: [{key: value}], sort?: {key, dir}}`;
   the user can sort and filter.
+- `web_preview`: `{url}`, your running local dev server, live (e.g. `http://localhost:5173`).
+  See below.
 - `pr_decision` and `pr_overview`: see the muster-pr-review skill.
+
+## Previewing the web app you are building
+
+When you run a dev server (Vite, Next, `deno task dev`, `python -m http.server`) and the user
+wants to see the result, open `web_preview` with its local address and keep working: the page
+updates as the server reloads, and the user has Reload and Open in browser.
+
+- Only `http(s)://localhost`, `127.0.0.1` or `[::1]` with a port is accepted (prefer
+  `localhost`). For any other page (a deployed site, GitHub, docs), do not use a panel: open it
+  in the user's system browser (`xdg-open URL` on Linux, `open URL` on macOS) or give the link.
+- If the server prints `0.0.0.0`, use `localhost` with the same port.
+- Read `note` in the result: it says when nothing answers yet (start the server; the panel
+  loads by itself once it is up), when the page refuses to be framed (allow framing in the dev
+  server's config, or use the browser), or when it redirects to another address (pass the
+  final local URL). No `note` means the server answered.
+- To show another page or port, `panel_update {panel_id, data: {url}}`; any update reloads the
+  page. A link or redirect to another origin stays blocked inside the panel.
 
 ## Your own app
 

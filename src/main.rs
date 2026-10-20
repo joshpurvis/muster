@@ -16,6 +16,7 @@ mod mcp;
 mod model;
 mod panels;
 mod panel_apps;
+mod web_preview;
 mod skills;
 mod notify;
 mod paths;
@@ -1158,7 +1159,7 @@ async fn daemon_main() -> anyhow::Result<()> {
     let r: anyhow::Result<()> = async {
         tokio::select! {
             r = serve => r.context("server failed"),
-            r = axum::serve(panel_listener, server::panel_router(port)) => r.context("panel server failed"),
+            r = axum::serve(panel_listener, server::panel_router(port, panel_port)) => r.context("panel server failed"),
             _ = term.recv() => { tracing::info!("SIGTERM: shutting down"); Ok(()) }
             _ = int.recv() => { tracing::info!("SIGINT: shutting down"); Ok(()) }
             _ = async { loop { hup.recv().await; tracing::info!("ignoring SIGHUP"); } } => Ok(()),

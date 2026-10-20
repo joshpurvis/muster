@@ -108,8 +108,8 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id}` |
-| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{}`; advances the revision |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?` | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
+| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?` | `{note?}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
 | `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], remaining, timed_out}`; consumes the returned events |
@@ -224,6 +224,38 @@ filter box (`/`) matches every word in any column, and the header stays visible 
 {"title": "Slowest tests", "columns": [{"key": "test", "label": "Test"}, {"key": "seconds", "label": "Seconds"}],
  "rows": [{"test": "export_large_csv", "seconds": 27.05}, {"test": "session_survives_restart", "seconds": 12.4}],
  "sort": {"key": "seconds", "dir": "desc"}}
+```
+
+**`web_preview`** ([AGENT_PANELS.md](AGENT_PANELS.md#showing-web-pages)): `{url}`, the agent's
+running local dev server, live beside its terminal. Only loopback http(s) is accepted:
+`localhost`, `127.0.0.1` or `[::1]`, any port except Muster's own (its window and its panel
+server). Everything else is refused with an error that says to open the page in the user's
+system browser instead, as are credentials (`user@`), other spellings of 127.0.0.1
+(`127.1`, `2130706433`, `0177.0.0.1`), `0.0.0.0`, spaces, control and non-ASCII characters, and
+backslashes; the URL is stored rebuilt from its checked parts (`http://LOCALHOST:5173` becomes
+`http://localhost:5173/`). The panel shows the address, Reload and Open in browser (the system
+browser in the native window), and frames the page through the panel server's `/preview` page
+(docs/PROTOCOL.md), which holds the frame to the URL's origin: the page may navigate and
+redirect within it, but a link or redirect to another origin (another port, a login site) is
+blocked in the frame, and Open in browser is the way out. A popup or `target=_blank` link opens
+in the system browser (native window) or a new tab. Exception: browsers cannot name an IPv6
+address in a CSP, so a `[::1]` preview's frame is held to its scheme only (the native window
+still blocks non-loopback pages); prefer `localhost`, which reaches a server listening on ::1
+too. Every `panel_update` with data reloads the page, even at the same URL.
+
+Muster checks the server when the panel opens or changes, and the result's `note` tells the
+agent in one sentence when nothing answers, when the page refuses framing
+(`X-Frame-Options`, CSP `frame-ancestors`), when it redirects to another origin, or when it sent
+no answer in 3 s. The panel shows the same as a notice with Reload and Open in browser; while
+nothing answers it checks every 2 s for 2 minutes and loads the page once the server is up. A
+page still loading after 10 s gets a hint. These checks are best effort: they read the first
+response head only (https servers are only connected to), and a page can still fail in the
+browser in ways Muster cannot see (a self-signed certificate, a script error). Muster's
+shortcuts do not work while focus is inside the page (it belongs to the dev server); click the
+bar or another tab first. Third-party cookie rules may keep logins from sticking in the frame.
+
+```json
+{"url": "http://localhost:5173"}
 ```
 
 **`pr_decision`** ([AGENT_PANELS.md](AGENT_PANELS.md#pr-decision-end-to-end)):

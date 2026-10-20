@@ -18,7 +18,7 @@ pub const PR_DECISION: &str = include_str!("../web/panels/pr_decision.html");
 pub const PR_OVERVIEW: &str = include_str!("../web/panels/pr_overview.html");
 
 /// For error messages and tool descriptions.
-pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview";
+pub const BUILTINS: &str = "markdown, image, chart, table, pr_decision, pr_overview, web_preview";
 /// Largest image file an `image` panel reads.
 pub const MAX_IMAGE: usize = 8 * 1024 * 1024;
 /// Its stored input: the base64 data URI plus the agent's own short fields.
@@ -57,6 +57,8 @@ pub fn html(app: &str) -> Option<&'static str> {
         "table" => TABLE,
         "pr_decision" => PR_DECISION,
         "pr_overview" => PR_OVERVIEW,
+        // Drawn by the UI, not the sandbox proxy (src/web_preview.rs).
+        "web_preview" => crate::web_preview::PLACEHOLDER,
         _ => return None,
     })
 }

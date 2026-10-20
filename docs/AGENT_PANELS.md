@@ -13,9 +13,14 @@ charts in `pr_decision` (`media`), Skip and Hold, and the user's own actions in 
 answered in place, one event carrying the answers and options, a verdict and undo line,
 quick-win merging from the overview, and a skill that prepares PRs ahead
 (["Fewer round trips"](#fewer-round-trips)).
-The `diff` app, fetch approval, placement options and preview servers remain later phases. Nested frames are
-blocked even for declared loopback dev servers: a child document's independent CSP would
-otherwise bypass the no-fetch policy. `connectDomains` are stored without granting access.
+Built on `feature/web-preview`, 2026-10-20: the `web_preview` app, a local dev server live
+beside the agent's terminal (["Showing web pages"](#showing-web-pages); schema and limits in
+[MCP.md](MCP.md#built-in-apps)). The native embedded browser stays deferred.
+The `diff` app, fetch approval and placement options remain later phases. Nested frames are
+blocked for agent-written apps even for declared loopback dev servers: a child document's
+independent CSP would otherwise bypass the no-fetch policy. `web_preview` does not reopen that:
+it is a separate built-in that the UI draws itself, outside the sandbox proxy, framing only the
+dev server's URL under a CSP held to that origin. `connectDomains` are stored without granting access.
 Each panel data revision is treated as a fresh tool input/result invocation in the same frame;
 the MCP Apps spec normally sends input once per invocation. The gesture rule is checked in the
 sandbox proxy and was verified in Chromium and in WebKitGTK 2.54 (run under GTK's Broadway
@@ -86,7 +91,8 @@ issue, a web page). Both must stay contained.
 
 - **Separate origin.** The UI on `127.0.0.1:<port>` holds the client token, which can do
   anything (start agents, change permissions, shut down). Panels run on a second origin: a small
-  panel server on another port that serves only the sandbox proxy page and the apps, with the
+  panel server on another port that serves only the sandbox proxy page (and the web preview's
+  frame page) and the apps, with the
   CSP sent as an HTTP header. It holds no token and cannot reach the daemon's API. This is the
   two-iframe "sandbox proxy" model the MCP Apps spec requires of web hosts.
 - **A narrow bridge.** Through `postMessage`, an app may: receive its input and updates, report
@@ -109,7 +115,14 @@ issue, a web page). Both must stay contained.
 
 - **Local dev servers work in a frame.** An agent building a web app can show it running in a
   `web_preview` panel (`http://localhost:5173`), live, beside its terminal. Most dev servers allow
-  framing.
+  framing. (Built on `feature/web-preview`.) Only loopback http(s) URLs are accepted, never
+  Muster's own ports, checked when the panel opens or changes and again when the frame's page
+  is served. The panel server's `/preview` page frames the URL with a `frame-src` naming only
+  its origin, so a framed page cannot navigate or redirect off its dev server (to a login site,
+  another port or Muster itself); the user follows it with Open in browser. Muster's own pages
+  refuse to be framed at all. Muster checks the server itself (is it up, does it refuse
+  framing, does it redirect away) and tells both the agent (a `note` on `panel_open`) and the
+  user (a notice in the panel), since a cross-origin frame gives the UI no signal.
 - **Most logged-in sites refuse to be framed.** github.com sends `X-Frame-Options: deny`, and so
   do many others. A frame cannot show them.
 - **A real embedded browser is possible, in the native window only, and deferred.** wry can put extra native
@@ -251,7 +264,8 @@ device scopes ([ANDROID.md](ANDROID.md)) decide whether it may send events or on
    the PR reviewer template. This is the first use case, end to end. The `diff` app follows.
    (Built except `diff`; `pr_decision` and the template on `feature/panel-apps`.)
 3. Agent-written apps: arbitrary HTML/JS, declared network access, app-visible tools.
-4. `web_preview` for local dev servers; then, if wanted, the native embedded browser.
+4. `web_preview` for local dev servers (built on `feature/web-preview`); then, if wanted, the
+   native embedded browser.
 5. Panels on the phone.
 
 ## Decisions (user, 2026-10-18)
@@ -274,6 +288,12 @@ action; the phone comes last.
 - `wait_for_panel_event` and `panel_event` delete the events they return as the result is
   built. If the backend dies, or the caller's connection drops, before the caller reads it,
   those events are lost. Chosen over redelivering events the agent may already have acted on.
+- `web_preview` at `[::1]`: browsers cannot name an IPv6 address in a CSP, so that frame is
+  held to its scheme, not its origin (the native window still blocks non-loopback pages).
+  `localhost` reaches the same server and keeps the stricter rule.
+- `web_preview` checks read only the first response head (https servers are only connected
+  to), so a page can still fail in the frame for reasons the panel cannot name, and Muster's
+  keyboard shortcuts do not reach a focused dev page.
 - On macOS, `html_path` is checked by path before opening, and nothing checks the opened file
   afterwards, so swapping a parent directory for a symlink in between could copy a file from
   outside the task cwd into a panel. Linux checks the opened descriptor; Linux is the target.

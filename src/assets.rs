@@ -249,6 +249,12 @@ fn file(source: &Source, path: &str, req: &HeaderMap) -> Option<Response> {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    if path.ends_with(".html") {
+        // Muster's pages are never framed: not by a web preview that navigated to this
+        // port, nor by any other site (the phone pages replace this with their full CSP).
+        h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+    }
     Some(resp)
 }
 
@@ -261,6 +267,8 @@ fn index(source: &Source, req: &HeaderMap) -> Response {
         let mut r = axum::response::Html(NOT_BUILT).into_response();
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        r.headers_mut().insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
         r
     })
 }

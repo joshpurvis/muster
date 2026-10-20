@@ -3731,3 +3731,38 @@ textarea {
 .panel-status p { margin: 0; max-width: 70ch; overflow-wrap: anywhere; }
 .panel-status-detail { color: var(--text-muted); }
 body.dragging .panel-view { pointer-events: none; }
+/* Web preview (panels/WebPreview.tsx): the host's own bar above a local dev server's page. */
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 8px 4px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.preview-kind { flex: none; color: var(--text-muted); font-size: 11px; }
+.preview-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--text);
+  user-select: text;
+}
+.preview-bar .btn { flex: none; }
+.preview-hint {
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.preview-hint strong { color: var(--text); font-weight: 600; }
+.preview-frame { background: #fff; }
+.preview-status-url { font-family: var(--font-mono); }
+.preview-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 520px) { .preview-kind { display: none; } }

@@ -3,8 +3,11 @@ import {
   ago,
   feedFor,
   firstLine,
+  MEMORY_FILE_MAX,
+  memoryFileNameError,
   memoryPathError,
   nameError,
+  readMemoryFile,
   unattendedWarning,
   upsertMessage,
 } from "./agents.ts";
@@ -123,4 +126,24 @@ Deno.test("dialog rules: names, memory paths, the unattended warning", () => {
   assertEquals(unattendedWarning("claude", ["human"]), false);
   assertEquals(unattendedWarning("claude", ["human", "schedule"]), true);
   assertEquals(unattendedWarning("codex", ["webhook"]), false);
+});
+
+Deno.test("adding files to memory/: names, size, text only", async () => {
+  assertEquals(memoryFileNameError("Style guide (v2).md"), null);
+  for (const bad of ["", ".env", "..", "a/b.md", "a\\b", "x‮txt.exe", "zero​width", "nl\n.md"]) {
+    assertEquals(memoryFileNameError(bad) !== null, true, bad);
+  }
+  assertEquals(memoryFileNameError("a".repeat(201)) !== null, true);
+  const file = (name: string, body: BlobPart) => new File([body], name);
+  assertEquals(await readMemoryFile(file("notes.md", "# Notes\nhi")), { text: "# Notes\nhi" });
+  assertEquals(await readMemoryFile(file("bom.md", "﻿hi")), { text: "hi" });
+  assertEquals(await readMemoryFile(file("p.png", new Uint8Array([0x89, 0x50, 0xff, 0xfe]))), {
+    skip: "not a text file",
+  });
+  assertEquals(await readMemoryFile(file("nul.txt", "a\0b")), { skip: "not a text file" });
+  assertEquals(await readMemoryFile(file("big.log", "x".repeat(MEMORY_FILE_MAX + 1))), {
+    skip: "larger than 256 KB",
+  });
+  assertEquals("text" in await readMemoryFile(file("max.log", "x".repeat(MEMORY_FILE_MAX))), true);
+  assertEquals("skip" in await readMemoryFile(file(".hidden", "x")), true);
 });

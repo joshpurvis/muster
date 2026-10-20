@@ -887,25 +887,35 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let p: P = parse(params)?;
             Ok(crate::agents::messages(hub, p.agent.as_deref(), p.before, p.limit)?)
         }
-        "agent.memory.list" | "agent.memory.read" | "agent.memory.write" => {
+        "agent.memory.list" | "agent.memory.read" | "agent.memory.write" | "agent.memory.add"
+        | "agent.memory.delete" => {
             #[derive(Deserialize)]
             struct P {
                 name: String,
                 #[serde(default)]
                 path: Option<String>,
                 #[serde(default)]
+                file_name: Option<String>,
+                #[serde(default)]
                 text: Option<String>,
             }
             let p: P = parse(params)?;
             let a = hub.agents().get(&p.name).ok_or_else(|| crate::agents::no_agent(hub, &p.name))?;
             let path = || p.path.as_deref().ok_or_else(|| RpcError("path is required".into()));
+            let text = || p.text.as_deref().ok_or_else(|| RpcError("text is required".into()));
             match method {
                 "agent.memory.list" => Ok(crate::agents::memory_list(&a)?),
                 "agent.memory.read" => Ok(crate::agents::memory_read(&a, path()?)?),
                 _ => {
                     require_local(who, method)?;
-                    let text = p.text.as_deref().ok_or_else(|| RpcError("text is required".into()))?;
-                    Ok(crate::agents::memory_write(&a, path()?, text)?)
+                    match method {
+                        "agent.memory.write" => Ok(crate::agents::memory_write(&a, path()?, text()?)?),
+                        "agent.memory.add" => {
+                            let f = p.file_name.as_deref().ok_or_else(|| RpcError("file_name is required".into()))?;
+                            Ok(crate::agents::memory_add(&a, f, text()?)?)
+                        }
+                        _ => Ok(crate::agents::memory_delete(&a, path()?)?),
+                    }
                 }
             }
         }
@@ -1741,10 +1751,31 @@ mod tests {
         assert!(r["files"].as_array().unwrap().iter().any(|f| f["path"] == "people/ada.md"));
         assert!(call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "../CLAUDE.md"})).await.is_err());
         assert!(call(&hub, "agent.memory.write", json!({"name": "rpc-max", "path": "x.md"})).await.is_err());
+        // Adding: never replaces, suffixes a taken name, refuses paths; deleting removes the file.
+        let r = call(&hub, "agent.memory.add", json!({"name": "rpc-max", "file_name": "guide.md", "text": "a"}))
+            .await
+            .unwrap();
+        assert_eq!((r["path"].clone(), r["renamed"].clone()), (json!("guide.md"), json!(false)));
+        let r = call(&hub, "agent.memory.add", json!({"name": "rpc-max", "file_name": "guide.md", "text": "b"}))
+            .await
+            .unwrap();
+        assert_eq!((r["path"].clone(), r["renamed"].clone()), (json!("guide-2.md"), json!(true)));
+        for bad in ["../CLAUDE.md", "people/x.md", ".env"] {
+            let p = json!({"name": "rpc-max", "file_name": bad, "text": "x"});
+            assert!(call(&hub, "agent.memory.add", p).await.is_err(), "{bad}");
+        }
+        assert!(call(&hub, "agent.memory.add", json!({"name": "rpc-max", "text": "x"})).await.is_err());
+        call(&hub, "agent.memory.delete", json!({"name": "rpc-max", "path": "guide-2.md"})).await.unwrap();
+        assert!(call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "guide-2.md"})).await.is_err());
+        assert!(call(&hub, "agent.memory.delete", json!({"name": "rpc-max", "path": "../CLAUDE.md"})).await.is_err());
+        // Text that isn't valid UTF-8 (a lone surrogate) never reaches the handler.
+        let raw = r#"{"name": "rpc-max", "file_name": "bad.md", "text": "\ud800"}"#;
+        assert!(serde_json::from_str::<Value>(raw).is_err());
         // No agent method is ever a device's, and writes need the desktop client token.
         for m in [
             "agent.create", "agent.update", "agent.list", "agent.remove", "agent.start", "agent.ask",
             "agent.templates", "agent.messages", "agent.memory.list", "agent.memory.read", "agent.memory.write",
+            "agent.memory.add", "agent.memory.delete",
         ] {
             assert!(devices::method_scope(m).is_none(), "{m}");
         }
@@ -1755,6 +1786,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.0.contains("desktop client"), "{}", e.0);
+        for (m, p) in [
+            ("agent.memory.add", json!({"name": "rpc-max", "file_name": "y.md", "text": "x"})),
+            ("agent.memory.delete", json!({"name": "rpc-max", "path": "people/ada.md"})),
+        ] {
+            let e = dispatch(&hub, &phone, m, p).await.unwrap_err();
+            assert!(e.0.contains("desktop client"), "{m}: {}", e.0);
+        }
+        assert!(call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "people/ada.md"})).await.is_ok());
     }
     #[tokio::test]
     async fn restart_and_shutdown_are_human_only() {

@@ -315,9 +315,25 @@ Daemons without agents (`agent.list` is an unknown method) show a one-line note 
 - Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are
   unclear about unattended use; scheduled work is safer on a Codex agent."
 - Edit shows the kind badge, name and home folder, and a second tab, **Memory**: the files in
-  the agent's `memory/` on the left (plus a field to create one by name), a plain-text editor
-  on the right with Save (Ctrl+S). Switching files or closing with unsaved changes asks first
-  (closing: a second Esc discards). Edit saves only changed fields (`agent.update`); model,
+  the agent's `memory/` on the left, under an **Add files…** button and above a field to create
+  a note by name, and a plain-text editor on the right with Delete and Save (Ctrl+S). Switching
+  files or closing with unsaved changes asks first (closing: a second Esc discards).
+  - Empty `memory/`: the right side explains it (the agent's notebook; its `CLAUDE.md` /
+    `AGENTS.md` tells it to read these files when a conversation starts and to keep its notes
+    there) and offers **Add files…** and **New note** (focuses the name field).
+  - **Add files…** opens the browser's file picker (`<input type=file multiple>`; the native
+    window shows the system's); dropping files anywhere on the tab does the same (a dashed
+    outline while dragging). Each file goes through `agent.memory.add`: text files only (UTF-8,
+    no NUL characters), at most 256 KB, a plain visible name (no folders, nothing starting with
+    `.`); others are skipped with the reason. Nothing is replaced: a name that is taken gets a
+    number (`notes.md` → `notes-2.md`). A note above the editor lists what was added (and
+    renamed) and skipped, and says that the agent reads memory/ when a new conversation starts,
+    so a running or resumed conversation needs to be asked to read memory/. The first added file
+    opens, unless the open file has unsaved edits.
+  - **Delete** asks in a bar under the file's name (Cancel focused; Esc answers no) and removes
+    the file (`agent.memory.delete`); a note never saved is just discarded. The question is in
+    the tab, not the app's confirm dialog, which would replace the Edit dialog and lose its
+    unsaved Settings. Edit saves only changed fields (`agent.update`); model,
   effort and permissions apply from the agent's next start, which the toast says when it runs.
 - Ctrl+Enter creates or saves. Creating opens the panel if it was closed.
 

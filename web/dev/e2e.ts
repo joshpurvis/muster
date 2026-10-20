@@ -870,6 +870,71 @@ try {
     await a.key("Escape");
     await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
     ok("Edit ▸ Memory listed memory/, kept a draft across tabs, asked before discarding it, and saved");
+
+    // Seeding an empty memory/: the intro explains it; Add files… and a drop copy files in.
+    await a.click(`[data-agent="researcher"]`, { button: "right" });
+    await a.wait(`!!document.querySelector('.menu')`);
+    check(await menuItem(a, "Memory…"), "the new agent's menu has Memory…");
+    await a.wait(`!!document.querySelector('.mem-intro')`, 3000);
+    const intro: string = await a.eval(`document.querySelector('.mem-intro').textContent`);
+    check(intro.includes("CLAUDE.md") && intro.includes("Add files…") && intro.includes("New note"), intro);
+    await shot(a, "11a-agent-memory-empty");
+    // Add files… is a real <input type=file multiple>: hand it a text file and a binary one.
+    check(await a.eval(`document.querySelector('.mem input[type=file]')?.multiple === true`), "file picker");
+    await a.eval(`(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File(["# Style guide\\nShort sentences.\\n"], "style-guide.md", { type: "text/markdown" }));
+      dt.items.add(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0xff, 0x00])], "logo.png"));
+      const i = document.querySelector('.mem input[type=file]');
+      i.files = dt.files;
+      i.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    await a.wait(`document.querySelector('.mem-text')?.value.startsWith('# Style guide')`, 3000);
+    const note: string = await a.eval(`document.querySelector('.mem-added').textContent`);
+    check(note.includes("Added style-guide.md") && note.includes("Skipped logo.png: not a text file"), note);
+    await shot(a, "11b-agent-memory-added");
+    // Dropping a file whose name is taken adds it under a numbered name; nothing is replaced.
+    await a.eval(`(() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File(["second copy"], "style-guide.md"));
+      const t = document.querySelector('.mem-side');
+      for (const type of ['dragenter', 'dragover', 'drop']) {
+        t.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+      }
+    })()`);
+    await a.wait(`document.querySelector('.mem-text')?.value === 'second copy'`, 3000);
+    check(
+      (await a.eval(`document.querySelector('.mem-added').textContent`)).includes("already existed"),
+      "the taken name is explained",
+    );
+    const seeded: any = await R(a, "agent.memory.list", { name: "researcher" });
+    check(
+      seeded.files.map((f: any) => f.path).join() === "style-guide-2.md,style-guide.md",
+      JSON.stringify(seeded.files),
+    );
+    check(
+      (await R(a, "agent.memory.read", { name: "researcher", path: "style-guide.md" }) as any).text
+        .startsWith("# Style guide"),
+      "the first copy is untouched",
+    );
+    check(await a.eval(`!document.querySelector('.mem-drop')`), "the drop outline is gone");
+    await shot(a, "11c-agent-memory-dropped");
+    // Delete asks in place (Esc keeps the file and the dialog), then removes the file.
+    await a.click(".mem-del");
+    await a.wait(`!!document.querySelector('.mem-del-yes')`, 1000);
+    check(await a.eval(`document.activeElement?.textContent === 'Cancel'`), "Delete starts on Cancel");
+    await shot(a, "11d-agent-memory-delete");
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.mem-del-yes') && !!document.querySelector('.agent-dlg')`, 1000);
+    await a.click(".mem-del");
+    await a.wait(`!!document.querySelector('.mem-del-yes')`, 1000);
+    await a.click(".mem-del-yes");
+    await a.wait(`document.querySelectorAll('.mem-file').length === 1`, 2000);
+    const left: any = await R(a, "agent.memory.list", { name: "researcher" });
+    check(left.files.map((f: any) => f.path).join() === "style-guide.md", JSON.stringify(left.files));
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('.agent-dlg')`, 2000);
+    ok("Memory: the empty state explains seeding; Add files… and a drop copied text files in (binary skipped, a taken name numbered); Delete asked first");
     await a.sleep(500); // the layout (with the panel flag) saves debounced
   }
 

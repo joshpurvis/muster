@@ -79,3 +79,46 @@ export function memoryPathError(path: string): string | null {
   if (p.split("/").some((part) => !part || part === "." || part === "..")) return "No .. or empty parts";
   return null;
 }
+
+/** Largest memory file the daemon reads, writes or adds (`MEMORY_FILE_MAX`). */
+export const MEMORY_FILE_MAX = 256 * 1024;
+/** Longest name `agent.memory.add` takes (`MEMORY_NAME_MAX`, in UTF-8 bytes). */
+const MEMORY_NAME_MAX = 200;
+/** Control characters, and characters that hide or reorder text (as the daemon refuses them). */
+const SNEAKY = /[\p{Cc}­؜᠎​-‏‪-‮⁠-⁩﻿]/u;
+
+/** Why the daemon would refuse a picked or dropped file's name for `agent.memory.add`, or null.
+ * The same rules as `agents::memory_file_name`: one visible name, no folders, not hidden. */
+export function memoryFileNameError(name: string): string | null {
+  const n = name.trim();
+  if (!n) return "it has no name";
+  if (new TextEncoder().encode(n).length > MEMORY_NAME_MAX) return "its name is too long";
+  if (n.includes("/") || n.includes("\\")) return "its name is a path";
+  if (n.startsWith(".")) return "hidden files (names starting with a dot) aren't added";
+  if (SNEAKY.test(n)) return "its name has control or invisible characters";
+  return null;
+}
+
+/** A picked or dropped file as text for memory/: UTF-8 (a BOM is dropped), at most
+ * `MEMORY_FILE_MAX` bytes, no NUL characters. Otherwise why it is skipped. */
+export async function readMemoryFile(
+  f: Blob & { name: string },
+): Promise<{ text: string } | { skip: string }> {
+  const bad = memoryFileNameError(f.name);
+  if (bad) return { skip: bad };
+  if (f.size > MEMORY_FILE_MAX) return { skip: `larger than ${MEMORY_FILE_MAX / 1024} KB` };
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await f.arrayBuffer();
+  } catch {
+    return { skip: "couldn't be read (a folder?)" };
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return { skip: "not a text file" };
+  }
+  if (text.includes("\0")) return { skip: "not a text file" };
+  return { text };
+}

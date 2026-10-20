@@ -8,6 +8,7 @@
 
 import type { Panel, PanelResource } from "../src/types.ts";
 import { isPreviewUrl } from "../src/panels/preview.ts";
+import { memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
@@ -830,6 +831,37 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         .map(([path, text]) => ({ path, size: text.length, modified: now() }))
         .sort((x, y) => x.path.localeCompare(y.path));
       return { dir: `${a.home_dir}/memory`, files };
+    }
+    // Same rules as the daemon (`agents::memory_add`): one visible name, never replaces (a
+    // taken name gets -2, -3, ...), text only, at most 256 KB.
+    case "agent.memory.add": {
+      const a = agentNamed(p.name);
+      const name = String(p.file_name ?? "").trim();
+      const bad = memoryFileNameError(name);
+      if (bad) throw new Error(`can't add \`${name}\`: ${bad}`);
+      if (typeof p.text !== "string") throw new Error("text is required");
+      if (new TextEncoder().encode(p.text).length > 256 * 1024) throw new Error(`${name} is larger than 256 KB`);
+      if (p.text.includes("\0")) throw new Error(`${name} isn't a text file`);
+      const files = memory.get(a.name) ?? new Map<string, string>();
+      memory.set(a.name, files);
+      const dot = name.lastIndexOf(".");
+      const nth = (i: number) =>
+        i === 1 ? name : dot > 0 ? `${name.slice(0, dot)}-${i}${name.slice(dot)}` : `${name}-${i}`;
+      // A folder (any `name/...` file) takes the name too.
+      const taken = (n: string) => files.has(n) || [...files.keys()].some((k) => k.startsWith(n + "/"));
+      let i = 1;
+      while (i < 100 && taken(nth(i))) i++;
+      if (i === 100) throw new Error(`memory/ already has ${name} and 98 more like it`);
+      files.set(nth(i), p.text);
+      return { path: nth(i), size: p.text.length, renamed: i > 1 };
+    }
+    case "agent.memory.delete": {
+      const a = agentNamed(p.name);
+      const path = String(p.path ?? "").trim();
+      const files = memory.get(a.name) ?? new Map<string, string>();
+      if (!files.has(path)) throw new Error(`memory/${path}: No such file or directory`);
+      files.delete(path);
+      return { path };
     }
     case "agent.memory.read":
     case "agent.memory.write": {

@@ -166,6 +166,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
 | `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`: no absolute path, no `..`, `.` or empty parts. Every component is opened from the one before it (`openat` with `O_NOFOLLOW`, from the home folder's fd), so a link anywhere, also one swapped in during the call, is refused. At most 256 KB, UTF-8 only. |
 | `agent.memory.write` | `{name, path, text}` | `{path, size}`. Same path rules and walk; creates missing folders (`mkdirat`); refuses a link at the path; writes a temporary file of its own (random name, `O_EXCL`) and renames it into place (`renameat`). At most 256 KB. |
+| `agent.memory.add` | `{name, file_name, text}` | `{path, size, renamed}`. Adds a new file at the top of `memory/` (the UI's Add files… and drop) and never replaces anything: a taken name (file, folder or link) gets `-2` … `-99` before its extension (`notes.md` → `notes-2.md`; `renamed` says so). `file_name` (trimmed) is one plain name: at most 200 bytes, no `/` or `\`, not starting with `.` (no `.`, `..` or hidden files), no control characters and no invisible or direction-changing ones (soft hyphen, zero-width, bidi marks, embeddings, overrides, isolates, BOM). `text`: at most 256 KB, no NUL characters (binary); valid UTF-8 by being a JSON string (a lone surrogate escape fails to parse). Written to a temporary file (`O_EXCL`, 0600) in `memory/` (opened as for a read) and linked into place with `linkat`, which fails on any existing entry, so nothing is overwritten or written through. |
+| `agent.memory.delete` | `{name, path}` | `{path}`. Removes one regular file under `memory/` (same path rules and walk as a read); a folder or a link is refused. |
 | `agent.list` | `{}` | `Agent[]` |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
 | `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started}`. The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). Starts are serialized. Emits `agent_upserted`. |
@@ -197,8 +199,9 @@ reply (the same id again). An agent's state changes arrive as its session's `ses
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.
-Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`) need the
-client token; no `agent.*` method has a device scope.
+Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`,
+`agent.memory.add`, `agent.memory.delete`) need the client token; no `agent.*` method has a
+device scope.
 
 Exited sessions keep their scrollback (persisted under `$XDG_DATA_HOME/muster/sessions/<id>/output.log`)
 so they can be attached (replay only) and restarted after a daemon restart. The file is

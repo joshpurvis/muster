@@ -70,6 +70,9 @@ pub struct Sess {
     /// The window the session is a tab in.
     #[serde(default)]
     pub window_id: Option<i64>,
+    /// A named agent's closed tab, still running (`session.hide`).
+    #[serde(default)]
+    pub hidden: bool,
     /// The daemon's JSON as received (for `--json`).
     #[serde(skip)]
     pub raw: Value,
@@ -754,7 +757,7 @@ pub fn ls(d: Option<&Discovery>, all: bool, as_json: bool) -> anyhow::Result<()>
             }
             vec![
                 Cell::plain(s.id.to_string()),
-                Cell::plain(snap.window_of(s).map_or("-".into(), |w| w.to_string())),
+                Cell::plain(if s.hidden { "hidden".into() } else { snap.window_of(s).map_or("-".into(), |w| w.to_string()) }),
                 Cell::plain(clip(ch.map_or("?", |c| c.name.as_str()), 28)),
                 Cell::plain(clip(&s.name, 20)),
                 Cell::plain(s.kind.clone()),

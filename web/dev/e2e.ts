@@ -777,6 +777,41 @@ try {
     await a.wait(`!${M}.windowSessions.value.some((s) => s.id === ${rev})`, 5000);
     check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "pulled, not restarted");
     ok("clicking a running agent in window 2 pulled its tab into window 2's focused group");
+
+    // Closing an agent's tab only hides it: no confirm, the agent runs on, its row shows it again.
+    await b2.key("Alt+W");
+    await b2.wait(`!${M}.windowSessions.value.some((s) => s.id === ${rev})`, 3000);
+    check(
+      await b2.eval(
+        `${M}.sessions.value.get(${rev})?.hidden === true && ${M}.sessions.value.get(${rev}).state !== 'exited'`,
+      ),
+      "the agent's session runs on, hidden",
+    );
+    check(!(await here(a)).includes(rev) && !(await here(b2)).includes(rev), "a tab in no window");
+    check(await b2.eval(`!document.querySelector('.confirm-dlg') && !document.querySelector('.confirm-close')`), "no confirm");
+    check(
+      !(await b2.eval(`document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`)),
+      "its row still shows it running",
+    );
+    await b2.click(`[data-agent="reviewer"]`);
+    await b2.wait(
+      `${M}.focusedSession.value?.id === ${rev} && !${M}.sessions.value.get(${rev}).hidden`,
+      5000,
+    );
+    check(await b2.eval(`${M}.sessions.value.get(${rev}).state !== 'exited'`), "the same session, not restarted");
+    ok("closing an agent's tab hid it (still running); clicking its row brought the same session back");
+
+    // Stop (the row's menu) is what stops it; the tab stays, showing it stopped.
+    await b2.click(`[data-agent="reviewer"]`, { button: "right" });
+    await b2.wait(`!!document.querySelector('.menu')`);
+    check(await menuItem(b2, "Stop"), "the row's menu has Stop");
+    await b2.wait(`${M}.sessions.value.get(${rev}).state === 'exited'`, 5000);
+    await b2.wait(
+      `document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      3000,
+    );
+    check((await here(b2)).includes(rev), "its tab stays");
+    ok("Stop in the agent's menu stopped it");
     await b2.key("Alt+G");
     await b2.wait(`!document.querySelector('.agents-panel')`, 2000);
 

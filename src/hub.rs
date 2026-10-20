@@ -2040,11 +2040,17 @@ impl Hub {
                 w.holder = Some(conn);
             }
             g.launching.remove(&target);
-            // Adopt orphans: live channels whose window is unset or gone.
+            // Adopt orphans: live channels whose window is unset or gone, except a hidden agent's
+            // task (every one of its tabs hidden: `hide_session`).
+            let all_hidden = |cid: ChannelId| {
+                let mut tabs = g.sessions.values().filter(|e| e.info.channel_id == cid).peekable();
+                tabs.peek().is_some() && tabs.all(|e| e.info.hidden)
+            };
             let mut orphans: Vec<(i64, ChannelId)> = g
                 .channels
                 .values()
                 .filter(|c| !c.archived && c.window_id.is_none_or(|w| !g.windows.contains_key(&w)))
+                .filter(|c| !all_hidden(c.id))
                 .map(|c| (c.sort_order, c.id))
                 .collect();
             orphans.sort();
@@ -2065,7 +2071,7 @@ impl Hub {
             let orphans: Vec<SessionId> = g
                 .sessions
                 .values()
-                .filter(|e| e.info.window_id.is_none_or(|w| !g.windows.contains_key(&w)))
+                .filter(|e| !e.info.hidden && e.info.window_id.is_none_or(|w| !g.windows.contains_key(&w)))
                 .map(|e| e.info.id)
                 .collect();
             for sid in orphans {
@@ -2254,13 +2260,14 @@ impl Hub {
             let sids: Vec<SessionId> = g
                 .sessions
                 .values()
-                .filter(|e| e.info.channel_id == id && e.info.window_id != Some(window_id))
+                .filter(|e| e.info.channel_id == id && (e.info.window_id != Some(window_id) || e.info.hidden))
                 .map(|e| e.info.id)
                 .collect();
             for sid in sids {
                 let Some(e) = g.sessions.get_mut(&sid) else { continue };
                 let mut next = e.info.clone();
                 next.window_id = Some(window_id);
+                next.hidden = false;
                 self.store.update_session(&next)?;
                 left.extend(e.info.window_id);
                 e.info = next.clone();
@@ -2553,6 +2560,7 @@ impl Hub {
                 state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),
+                hidden: false,
             };
             let stored = StoredSession {
                 info,
@@ -3164,6 +3172,23 @@ impl Hub {
             .filter(|w| g.windows.contains_key(w))
             .collect();
         let Some(first) = wins.first().copied() else {
+            // Every tab it has left is a hidden agent's (`hide_session`): the task leaves its
+            // window too, so it neither keeps the window alive nor shows up in it.
+            let mut tabs = g.sessions.values().filter(|e| e.info.channel_id == cid).peekable();
+            if let Some(o) = old
+                && tabs.peek().is_some()
+                && tabs.all(|e| e.info.hidden)
+            {
+                let mut nc = c.clone();
+                nc.window_id = None;
+                if let Err(err) = self.store.update_channel(&nc) {
+                    tracing::warn!(channel = cid, "taking a hidden task out of window {o}: {err}");
+                    return;
+                }
+                g.channels.insert(cid, nc.clone());
+                events.push(ServerEvent::ChannelUpserted(nc));
+                self.gc_window_locked(g, o, events);
+            }
             return;
         };
         let target = if wins.iter().all(|w| *w == first) {
@@ -3221,11 +3246,13 @@ impl Hub {
                 let now = from.map_or("none".to_string(), |w| w.to_string());
                 anyhow::bail!("session {id} is no longer in window {expected} (now in {now})");
             }
-            if from == Some(window_id) {
+            if from == Some(window_id) && !e.info.hidden {
                 return Ok(e.info.clone());
             }
             let mut next = e.info.clone();
             next.window_id = Some(window_id);
+            // Showing a hidden agent tab again (the agents panel, Jump, Alt+J pull it here).
+            next.hidden = false;
             self.store.update_session(&next)?;
             e.info = next.clone();
             events.push(ServerEvent::SessionUpserted(next.clone()));
@@ -3241,6 +3268,44 @@ impl Hub {
             next
         };
         Ok(info)
+    }
+
+    /// `session.hide`: close a named agent's tab without stopping it (docs/UI.md "Agents panel").
+    /// The session keeps its process, scrollback and channel; it leaves its window
+    /// (`window_id` None, `hidden`), and so does its task when none of its tabs is left in a
+    /// window, so neither keeps a window alive nor is adopted by `window.claim`. Messages still
+    /// reach it. `session.set_window` shows it again. Only an agent's session can be hidden: any
+    /// other tab would be lost (nothing lists it), so its close stays `session.remove`.
+    pub fn hide_session(&self, id: SessionId) -> anyhow::Result<SessionInfo> {
+        anyhow::ensure!(
+            self.agents.by_session(id).is_some(),
+            "session {id} is not a named agent's; only an agent's tab can be hidden"
+        );
+        let mut events = Vec::new();
+        let mut g = self.inner.lock();
+        let e = g
+            .sessions
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        if e.info.hidden {
+            return Ok(e.info.clone());
+        }
+        let from = e.info.window_id;
+        let mut next = e.info.clone();
+        next.window_id = None;
+        next.hidden = true;
+        self.store.update_session(&next)?;
+        e.info = next.clone();
+        events.push(ServerEvent::SessionUpserted(next.clone()));
+        self.task_follows_locked(&mut g, next.channel_id, None, &mut events);
+        if let Some(w) = from {
+            self.drop_if_unused_locked(&mut g, w, &mut events);
+        }
+        // Published under the lock, as in `set_session_window`.
+        for ev in events.drain(..) {
+            self.emit(ev);
+        }
+        Ok(next)
     }
 
     /// Move a session to another channel (the UI merges a tab into another one as a split).
@@ -4016,6 +4081,35 @@ mod tests {
     }
 
     fn fixture(terminal_host: Option<Arc<TerminalService>>) -> Arc<Hub> {
+        fixture_with(terminal_host, |_| {})
+    }
+
+    /// `move_fixture`, with session 2 (Claude, in channel 1) a named agent's.
+    fn agent_fixture() -> Arc<Hub> {
+        fixture_with(None, |store| {
+            store
+                .insert_agent(&crate::agents::Agent {
+                    account_profile_id: None,
+                    id: 0,
+                    name: "ada".into(),
+                    kind: SessionKind::Claude,
+                    model: None,
+                    effort: None,
+                    persona: String::new(),
+                    home_dir: "/x".into(),
+                    permissions: Permissions::default(),
+                    accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
+                    channel_id: Some(1),
+                    session_id: Some(2),
+                    resume_id: None,
+                    created_at: 0,
+                    autostart: false,
+                })
+                .unwrap();
+        })
+    }
+
+    fn fixture_with(terminal_host: Option<Arc<TerminalService>>, setup: impl FnOnce(&Store)) -> Arc<Hub> {
         let store = Store::open_memory().unwrap();
         let ws = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
         let ch = |name: &str, archived| Channel {
@@ -4053,6 +4147,7 @@ mod tests {
                 })
                 .unwrap();
         }
+        setup(&store);
         let cfg = HubConfig {
             port: 0,
             client_token: "t".into(),
@@ -4797,6 +4892,45 @@ mod tests {
         // Its tab removed, window 2 (not held) goes too.
         hub.remove_session(1).unwrap();
         assert_eq!(drain(&mut rx), ["-s1", "-w2", "c1@w1"]);
+    }
+
+    #[test]
+    fn a_closed_agent_tab_is_hidden_not_stopped() {
+        let hub = agent_fixture();
+        // Only a named agent's tab can be hidden: any other closes for real.
+        let e = hub.hide_session(1).unwrap_err().to_string();
+        assert!(e.contains("not a named agent"), "{e}");
+        // The agent's tab is alone in window 2 (nobody holds it): hidden, it leaves the window,
+        // which goes. Its task keeps window 1, where its other tab is.
+        hub.create_window(None).unwrap();
+        hub.set_session_window(2, 2, None).unwrap();
+        let mut rx = hub.subscribe();
+        let s = hub.hide_session(2).unwrap();
+        assert!(s.hidden && s.window_id.is_none());
+        assert_eq!(drain(&mut rx), ["s2@w-", "-w2"]);
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(1));
+        let stored = |id| hub.store.load_sessions().unwrap().into_iter().find(|x| x.info.id == id).unwrap().info;
+        assert!(stored(2).hidden && stored(2).window_id.is_none(), "kept across restarts");
+        // Again: a no-op.
+        hub.hide_session(2).unwrap();
+        assert!(drain(&mut rx).is_empty());
+        // Its task's other tab closes: the task stays open (the agent runs in it) and leaves
+        // window 1, which keeps only task 2.
+        hub.remove_session(1).unwrap();
+        assert!(!hub.channel(1).unwrap().archived);
+        assert_eq!(hub.channel(1).unwrap().window_id, None);
+        assert_eq!(hub.window(1).unwrap().channel_ids, vec![2]);
+        // (The last `c1` is its name, re-derived without the removed shell's title.)
+        assert_eq!(drain(&mut rx), ["-s1", "c1@w-", "w1", "c1@w-"]);
+        // No window claim adopts the hidden tab or its task.
+        let w = hub.claim_window(5, Some(3)).unwrap();
+        assert!(!w.channel_ids.contains(&1));
+        assert!(hub.session(2).unwrap().hidden && hub.channel(1).unwrap().window_id.is_none());
+        // Shown again (the agents panel pulls it into its window): the task follows.
+        let s = hub.set_session_window(2, 3, None).unwrap();
+        assert!(!s.hidden && s.window_id == Some(3));
+        assert_eq!(hub.channel(1).unwrap().window_id, Some(3));
+        assert!(!stored(2).hidden && stored(2).window_id == Some(3));
     }
 
     #[test]

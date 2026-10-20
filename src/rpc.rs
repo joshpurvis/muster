@@ -412,6 +412,10 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             hub.remove_session(p.id)?;
             Ok(json!({}))
         }
+        "session.hide" => {
+            let p: IdParam<SessionId> = parse(params)?;
+            to_value(hub.hide_session(p.id)?)
+        }
         "session.rename" => {
             let p: Rename<SessionId> = parse(params)?;
             to_value(hub.rename_session(p.id, p.name)?)

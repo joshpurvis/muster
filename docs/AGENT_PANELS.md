@@ -16,6 +16,8 @@ quick-win merging from the overview, and a skill that prepares PRs ahead
 Built on `feature/web-preview`, 2026-10-20: the `web_preview` app, a local dev server live
 beside the agent's terminal (["Showing web pages"](#showing-web-pages); schema and limits in
 [MCP.md](MCP.md#built-in-apps)). The native embedded browser stays deferred.
+Built on `feature/preview-address`: the user can type a local address into the preview's bar;
+it is checked like the agent's, stored, and reported to the agent as a `navigated` event.
 The `diff` app, fetch approval and placement options remain later phases. Nested frames are
 blocked for agent-written apps even for declared loopback dev servers: a child document's
 independent CSP would otherwise bypass the no-fetch policy. `web_preview` does not reopen that:

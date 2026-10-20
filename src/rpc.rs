@@ -169,6 +169,15 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             let p: IdParam<PanelId> = parse(params)?;
             Ok(crate::panels::resource(hub, p.id)?)
         }
+        "panel.navigate" => {
+            // The user's own address bar: desktop client token only (devices have no scope for
+            // it, and `from_session` is an unknown field here).
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: PanelId, url: String }
+            let p: P = parse(params)?;
+            let (url, changed) = crate::panels::navigate(hub, p.id, &p.url)?;
+            Ok(json!({"url": url, "changed": changed}))
+        }
         "panel.preview_check" => {
             let p: IdParam<PanelId> = parse(params)?;
             Ok(crate::web_preview::check_panel(hub, p.id).await?.1)

@@ -243,6 +243,17 @@ in the system browser (native window) or a new tab. Every `panel_update` with da
 page, even at the same URL; a title-only update does not (panels carry `data_revision`, the
 revision of the last update with data).
 
+The address in the bar is editable: the user types a local address and presses Enter (Escape
+restores the current one). Muster completes what a person types (a bare port `3000` becomes
+`http://localhost:3000/`, `localhost:3000/path` gets `http://`), then checks it with the same
+rule as `panel_update`; a refused address shows the reason under the bar and keeps the text.
+An accepted one is stored like an update with data (every window and a restart show it), and
+the agent gets a `navigated` event, `{url, previous}` (both as stored), through
+`wait_for_panel_event` or the idle panel prompt. The address and its event commit together, in
+order, for every change: the apps' 30-events-a-minute limit does not apply to them (the
+200-event queue bound does). Pressing Enter on the current address only
+reloads and sends nothing. Agents still pass full URLs; only the bar completes short forms.
+
 Muster checks the server when the panel opens or changes, and the result's `note` tells the
 agent in one sentence when nothing answers, when the page refuses framing
 (`X-Frame-Options`, CSP `frame-ancestors`), when it redirects to another origin, or when it sent

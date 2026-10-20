@@ -578,7 +578,7 @@ mod tests {
         let panels_desc = frontmatter(get("muster-panels").text).into_iter().find(|(k, _)| k == "description").unwrap().1;
         assert!(!panels_desc.contains("\"show me\"") && panels_desc.contains("in a panel"), "{panels_desc}");
         let panels = get("muster-panels").text;
-        for want in ["ui/initialize", "ui/message", "at most 3", "resourceDomains", "no `fetch`", "panel_open", "wait_for_panel_event", "`web_preview`", "system browser", "`note`"] {
+        for want in ["ui/initialize", "ui/message", "at most 3", "resourceDomains", "no `fetch`", "panel_open", "wait_for_panel_event", "`web_preview`", "system browser", "`note`", "`navigated`"] {
             assert!(panels.contains(want), "{want}");
         }
         let flow = get("muster-pr-review").text;

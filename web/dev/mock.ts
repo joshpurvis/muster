@@ -956,6 +956,25 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       removeWindowIfEmpty(prev);
       return {};
     }
+    case "panel.navigate": {
+      // Like src/panels.rs `navigate`: complete what was typed, check it, store it, tell the agent.
+      const r = panels.get(p.id);
+      if (!r || r.panel.closed || r.panel.app !== "web_preview") throw new Error("only a web preview has an address bar");
+      const t = String(p.url ?? "").trim();
+      const typed = /^\d{1,5}$/.test(t) ? `http://localhost:${t}/` : /^[a-z][a-z0-9+.-]*:\/\//i.test(t) || !t ? t : `http://${t}`;
+      let url: string;
+      try { url = mockPreviewUrl(typed).href; } catch (e) {
+        throw new Error(String((e as Error).message).replace(/web_preview frames only local dev servers.*/, "The preview shows only local dev servers (localhost or 127.0.0.1 with a port); open other pages in your browser."));
+      }
+      const previous = String(r.data.url);
+      if (url === previous) return { url, changed: false };
+      r.panel.revision++;
+      r.panel.data_revision = r.panel.revision;
+      r.data = { url };
+      broadcast("panel_upserted", r.panel);
+      panelEvents.push({ panel_id: p.id, kind: "navigated", payload: { url, previous }, at: now() });
+      return { url, changed: true };
+    }
     case "panel.preview_check": {
       const r = panels.get(p.id);
       if (!r || r.panel.closed || r.panel.app !== "web_preview") throw new Error("panel is not a web_preview");

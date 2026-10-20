@@ -11,7 +11,7 @@ import { IconGlobe, IconRestart } from "../icons.tsx";
 import type { Panel, PanelResource } from "../types.ts";
 import { panelOriginUrl, panelReloads, usePanelPlacement } from "./placement.ts";
 import {
-  isPreviewUrl, type Notice, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, SLOW_MS, SLOW_NOTICE, startChecks,
+  type AddressAction, ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, untouchedSinceSubmit, type Notice, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, SLOW_MS, SLOW_NOTICE, startChecks,
 } from "./preview.ts";
 
 /** Sandboxed, but a real page: its own origin, scripts, forms and popups (which open in the
@@ -40,6 +40,16 @@ export function WebPreview({ panel }: { panel: Panel }) {
   const [dismissedKey, setDismissedKey] = useState("");
   const [checked, setChecked] = useState<{ key: string; check: PreviewCheck | null; retrying: boolean }>({ key: "", check: null, retrying: false });
   const current = checked.key === frameKey ? checked : { check: null, retrying: false };
+  // The ref is the source of truth, so a completion compares against the state it lands in.
+  const addressRef = useRef(ADDRESS_IDLE);
+  const [address, setAddress] = useState(ADDRESS_IDLE);
+  const edit = (a: AddressAction) => {
+    addressRef.current = addressStep(addressRef.current, a);
+    setAddress(addressRef.current);
+  };
+  const requests = useRef(0);
+  // The click that focuses the field must not undo its select-all on mouseup.
+  const justFocused = useRef(false);
 
   useEffect(() => {
     let live = true;
@@ -81,6 +91,24 @@ export function WebPreview({ panel }: { panel: Panel }) {
   }, []);
 
   const reload = () => setLoad((n) => n + 1);
+  /** The user's address goes to the backend, which completes it (`3000`, `localhost:3000`),
+   * checks it with the agent's rule, stores it and tells the agent; the new revision then
+   * reaches every window. The same address only reloads. */
+  const navigate = (field: HTMLInputElement) => {
+    if (addressRef.current.pending) return;
+    // What the field shows: after Escape that is the current address (a reload).
+    const typed = addressText(addressRef.current, url);
+    const id = ++requests.current;
+    edit({ type: "submit", id, text: typed });
+    rpc.call<{ url: string; changed: boolean }>("panel.navigate", { id: panel.id, url: typed }).then((r) => {
+      const fresh = addressRef.current.pending === id && untouchedSinceSubmit(addressRef.current);
+      edit({ type: "done", id });
+      // Like a browser's address bar, the field lets go once the page is on its way (unless
+      // the user has moved on), so the next click selects the whole address again.
+      if (fresh && document.activeElement === field) field.blur();
+      if (!r.changed) reload();
+    }, (e) => edit({ type: "refused", id, reason: String(e?.message ?? e) }));
+  };
   const openInBrowser = () => { if (url) globalThis.open(url, "_blank", "noopener,noreferrer"); };
   const loaded = loadedKey === frameKey;
   const notice: Notice | null = (dismissedKey === frameKey ? null : previewNotice(current.check, current.retrying))
@@ -100,7 +128,40 @@ export function WebPreview({ panel }: { panel: Panel }) {
     >
       <div class="preview-bar">
         <span class="preview-kind">Web preview</span>
-        <span class="preview-url" title={url ?? ""}>{url ?? ""}</span>
+        <input
+          class="preview-url"
+          type="text"
+          inputMode="url"
+          aria-label="Address of the page to preview"
+          title={url ? `${url}\nType a local address (like localhost:3000) and press Enter` : undefined}
+          spellcheck={false}
+          autocomplete="off"
+          autocapitalize="off"
+          aria-invalid={address.error ? true : undefined}
+          aria-describedby={address.error ? `preview-address-error-${panel.id}` : undefined}
+          value={addressText(address, url)}
+          readOnly={address.pending > 0}
+          onFocus={(e) => e.currentTarget.select()}
+          onMouseDown={(e) => { justFocused.current = document.activeElement !== e.currentTarget; }}
+          onMouseUp={(e) => {
+            if (justFocused.current) e.preventDefault();
+            justFocused.current = false;
+          }}
+          onInput={(e) => edit({ type: "input", text: e.currentTarget.value })}
+          onBlur={() => edit({ type: "blur", url: url ?? "" })}
+          onKeyDown={(e) => {
+            if (e.isComposing) return;
+            if (e.key === "Enter") {
+              e.preventDefault();
+              navigate(e.currentTarget);
+            } else if (e.key === "Escape") {
+              // Restores the address and ends the edit; the field keeps focus.
+              e.preventDefault();
+              e.stopPropagation();
+              edit({ type: "cancel" });
+            }
+          }}
+        />
         <button type="button" class="btn btn-sm" onClick={reload} disabled={!url} title="Load the page again">
           <IconRestart size={13} /> Reload
         </button>
@@ -108,6 +169,9 @@ export function WebPreview({ panel }: { panel: Panel }) {
           <IconGlobe size={13} /> Open in browser
         </button>
       </div>
+      {address.error && (
+        <div class="preview-address-error" id={`preview-address-error-${panel.id}`} role="alert">{address.error}</div>
+      )}
       {notice && !notice.blocking && !problem && (
         <div class="preview-hint" role="status" data-preview-notice={notice.kind}>
           <span><strong>{notice.title}</strong> {notice.detail}</span>

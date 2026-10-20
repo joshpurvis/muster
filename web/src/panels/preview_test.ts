@@ -1,5 +1,5 @@
 import {
-  isPreviewUrl, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, RETRY_FOR_MS, RETRY_MS, startChecks,
+  ADDRESS_IDLE, addressStep, addressText, isPreviewUrl, untouchedSinceSubmit, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, RETRY_FOR_MS, RETRY_MS, startChecks,
 } from "./preview.ts";
 
 function check(value: unknown, message = "assertion failed") {
@@ -116,4 +116,54 @@ Deno.test("a working server is checked once; stop cancels a pending retry", asyn
   check(down.pending === 1);
   down.stop();
   check(down.pending === 0, "stopped");
+});
+
+Deno.test("the address bar: typing, Enter on what it shows, a kept refusal, Escape", () => {
+  const url = "http://localhost:5173/";
+  let s = ADDRESS_IDLE;
+  check(addressText(s, url) === url && addressText(s, null) === "");
+  check(addressStep(s, { type: "blur", url }) === s, "focus and leave without typing: nothing changes");
+  s = addressStep(s, { type: "input", text: "3000" });
+  check(addressStep(s, { type: "blur", url }) === s, "typed text survives leaving the field");
+  check(addressText(addressStep(s, { type: "input", text: url }), "x") === url && addressStep(addressStep(s, { type: "input", text: url }), { type: "blur", url }).dirty === false,
+    "an edit back to the address ends on blur");
+  s = addressStep(s, { type: "submit", id: 1, text: addressText(s, url) });
+  check(s.pending === 1 && addressStep(s, { type: "submit", id: 2, text: "x" }) === s, "one navigation at a time");
+  const refused = addressStep(s, { type: "refused", id: 1, reason: "example.com is not this computer." });
+  check(!refused.pending && refused.error.includes("not this computer") && addressText(refused, url) === "3000", "a refusal keeps the text");
+  check(addressStep(refused, { type: "blur", url }) === refused, "a refusal stays after leaving the field");
+  const typing = addressStep(refused, { type: "input", text: "3001" });
+  check(typing.error === "" && typing.draft === "3001", "typing clears the reason");
+  check(addressStep(addressStep(typing, { type: "submit", id: 3, text: "3001" }), { type: "done", id: 3 }) === ADDRESS_IDLE, "success ends the edit");
+});
+
+Deno.test("after Escape, Enter submits the address the field shows (a reload), not an empty draft", () => {
+  const url = "http://localhost:5173/";
+  let s = addressStep(addressStep(ADDRESS_IDLE, { type: "input", text: "300" }), { type: "cancel" });
+  check(addressText(s, url) === url, "Escape shows the address again");
+  s = addressStep(s, { type: "submit", id: 1, text: addressText(s, url) });
+  check(s.sent === url, `submits the shown address: ${JSON.stringify(s.sent)}`);
+});
+
+Deno.test("Escape during a navigation keeps it pending; its late answer does not touch newer text", () => {
+  const url = "http://localhost:5173/";
+  let s = addressStep(ADDRESS_IDLE, { type: "input", text: "example.com" });
+  s = addressStep(s, { type: "submit", id: 1, text: "example.com" });
+  s = addressStep(s, { type: "cancel" });
+  check(s.pending === 1 && addressStep(s, { type: "submit", id: 2, text: url }) === s, "still one navigation at a time after Escape");
+  const late = addressStep(s, { type: "refused", id: 1, reason: "nope" });
+  check(!late.pending && late.error === "" && addressText(late, url) === url, "a refusal after Escape shows nothing against the address");
+  const typed = addressStep(s, { type: "input", text: "4000" });
+  const done = addressStep(typed, { type: "done", id: 1 });
+  check(!done.pending && done.draft === "4000" && done.dirty, "a success after new typing keeps the new text");
+  check(!untouchedSinceSubmit(typed), "the field is not released when the user moved on");
+  check(addressStep(typed, { type: "done", id: 7 }) === typed, "an unknown completion changes nothing");
+});
+
+Deno.test("an untouched field follows the address when it changes elsewhere", () => {
+  // Focus is not an edit: another window or the agent moves the panel; the field shows it.
+  const s = ADDRESS_IDLE;
+  check(addressText(s, "http://localhost:3000/") === "http://localhost:3000/");
+  check(addressText(s, "http://localhost:4000/") === "http://localhost:4000/");
+  check(addressStep(s, { type: "blur", url: "http://localhost:4000/" }) === s);
 });

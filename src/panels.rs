@@ -252,6 +252,19 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     ensure!(html.is_none() || seen.app == "custom", "only custom apps accept HTML updates");
     let title = args.title.as_deref().map(title).transpose()?;
     let data = args.data.map(|d| app_data(hub, &seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
+    let id = args.panel_id;
+    commit(hub, &seen, title, html, data, || {
+        let p = own(hub, session, id)?;
+        caller_in(hub, session, ch.id)?;
+        Ok(p)
+    }, |_, p| hub.store().save_panel(p))
+}
+
+/// Stage files without the lock, then rename and commit under it. `recheck` runs under the
+/// lock and returns the panel as it is now, refusing if the caller may no longer change it;
+/// `write` stores the new row (given the old one), also under the lock.
+fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, data: Option<Vec<u8>>,
+    recheck: impl FnOnce() -> anyhow::Result<Panel>, write: impl FnOnce(&Panel, &mut Panel) -> anyhow::Result<()>) -> anyhow::Result<()> {
     // Unchanged HTML keeps its revision (the app keeps running), if nobody changed it meanwhile.
     let same_html = html.as_ref().is_some_and(|html| std::fs::read_to_string(app_file(hub, &seen)).is_ok_and(|old| old == *html));
     let folder = dir(hub, seen.id);
@@ -266,8 +279,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     if let Err(e) = staged { cleanup(); return Err(e.context("writing panel files (is the panel closed?)")) }
     let result = (|| -> anyhow::Result<(Panel, Panel)> {
         let _op = hub.panels.operations.lock();
-        let mut p = own(hub, session, args.panel_id)?;
-        caller_in(hub, session, ch.id)?;
+        let mut p = recheck()?;
         ensure!(!p.closed, "panel is closed");
         let old = p.clone();
         if let Some(t) = title { p.title = t; }
@@ -283,7 +295,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
             std::fs::rename(&staged_data, data_file(hub, &p))?;
         }
         else { std::fs::hard_link(data_file(hub, &old), data_file(hub, &p))?; }
-        if let Err(e) = hub.store().save_panel(&p) {
+        if let Err(e) = write(&old, &mut p) {
             let _ = std::fs::remove_file(data_file(hub, &p));
             if new_html { let _ = std::fs::remove_file(app_file(hub, &p)); }
             return Err(e);
@@ -297,6 +309,42 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     let _ = std::fs::remove_file(data_file(hub, &old));
     if old.html_revision != p.html_revision { let _ = std::fs::remove_file(app_file(hub, &old)); }
     Ok(())
+}
+
+/// The user typed an address into a web preview's bar (`panel.navigate`, desktop UI only). The
+/// same rule as the agent's `panel_update` decides (src/web_preview.rs), after the forms a person
+/// types are completed (`localhost:3000`, `3000`). The new address is stored like an update with
+/// data, so every window and a restart show it, and the agent gets a `navigated` event
+/// `{url, previous}`: both read and queued in the same locked transaction as the new row, so
+/// concurrent navigations and agent updates queue in commit order with the right `previous`.
+/// It is Muster's own record of a user action, not app input, so the apps' 30-a-minute event
+/// limit does not apply; the queue's 200-event bound does. Returns the stored address and
+/// whether it changed (the same address only reloads and tells the agent nothing).
+pub fn navigate(hub: &Hub, id: PanelId, typed: &str) -> anyhow::Result<(String, bool)> {
+    let seen = get(hub, id)?;
+    ensure!(!seen.closed, "panel is closed");
+    ensure!(seen.app == "web_preview", "only a web preview has an address bar");
+    let url = crate::web_preview::parse_typed(typed, &own_ports(hub)).map_err(|e| anyhow::anyhow!(crate::web_preview::for_user(&e.to_string())))?
+        .url();
+    // A quick answer for the usual Enter on the current address; checked again under the lock.
+    if resource(hub, id)?["data"]["url"].as_str() == Some(url.as_str()) { return Ok((url, false)) }
+    let data = crate::web_preview::data(json!({"url": url}), &own_ports(hub))?;
+    let mut changed = false;
+    commit(hub, &seen, None, None, Some(data), || {
+        let p = get(hub, id)?;
+        ensure!(hub.channel(p.channel_id).is_some_and(|c| !c.archived), "the panel's task is gone");
+        ensure!(p.app == "web_preview", "only a web preview has an address bar");
+        Ok(p)
+    }, |old, p| {
+        let stored: Value = serde_json::from_slice(&std::fs::read(data_file(hub, old))?)?;
+        let previous = stored["url"].as_str().unwrap_or("").to_string();
+        if previous == url { return hub.store().save_panel(p) }
+        changed = true;
+        let event = PanelEvent { id: 0, panel_id: id, kind: "navigated".into(), payload: json!({"url": url, "previous": previous}),
+            at: now_ms(), context: None };
+        hub.store().save_panel_with_event(p, &event)
+    })?;
+    Ok((url, changed))
 }
 
 pub fn resource(hub: &Hub, id: PanelId) -> anyhow::Result<Value> {
@@ -818,6 +866,77 @@ mod tests {
         let out = with_preview_note(&hub, id, json!({"panel_id": id})).await;
         assert!(out["note"].as_str().unwrap().contains("Nothing answers"), "{out}");
         assert!(with_preview_note(&hub, markdown(&hub), json!({})).await.get("note").is_none());
+        archive(&hub, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_user_can_type_an_address_and_the_agent_hears_of_it() {
+        let hub = fixture();
+        hub.panels.port.store(40001, Ordering::Relaxed);
+        let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
+            html: None, html_path: None, csp: None }).unwrap();
+        assert_eq!(navigate(&hub, id, " 3000 ").unwrap(), ("http://localhost:3000/".to_string(), true));
+        let p = get(&hub, id).unwrap();
+        assert_eq!((p.revision, p.data_revision), (2, 2), "stored like a data update");
+        assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://localhost:3000/");
+        let out = wait(&hub, 1, Some(id), 0).await.unwrap();
+        assert_eq!(out["events"][0]["kind"], "navigated");
+        assert_eq!(out["events"][0]["payload"], json!({"url": "http://localhost:3000/", "previous": "http://localhost:5173/"}));
+        // The same address again only reloads: no new revision, no event.
+        assert_eq!(navigate(&hub, id, "localhost:3000").unwrap(), ("http://localhost:3000/".to_string(), false));
+        assert_eq!(get(&hub, id).unwrap().revision, 2);
+        // Refused like an agent's URL, in the user's words, and nothing changes.
+        for bad in ["https://example.com", "user@localhost:3000", "localhost:3000@evil.example", "[::1]:3000", "40001",
+            "localhost:40001", "127.1:3000", "0x7f000001:3000", "local host:3000", "", "localhost.evil.example:3000"] {
+            let err = navigate(&hub, id, bad).unwrap_err().to_string();
+            assert!(!err.contains("web_preview") && !err.contains("the user's"), "{bad:?}: {err}");
+        }
+        hub.store().ack_panel_events(&hub.store().panel_events(&get(&hub, id).unwrap()).unwrap()).unwrap();
+        assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://localhost:3000/");
+        assert!(wait(&hub, 1, Some(id), 0).await.unwrap()["events"].as_array().unwrap().is_empty(), "refusals tell the agent nothing");
+        let md = markdown(&hub);
+        assert!(navigate(&hub, md, "3000").unwrap_err().to_string().contains("only a web preview"));
+        // `previous` is what was stored at commit time, agent updates included.
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:4000/"})), html: None, html_path: None }).unwrap();
+        navigate(&hub, id, "4001").unwrap();
+        let out = wait(&hub, 1, Some(id), 0).await.unwrap();
+        assert_eq!(out["events"][0]["payload"], json!({"url": "http://localhost:4001/", "previous": "http://127.0.0.1:4000/"}));
+        archive(&hub, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_navigation_reaches_the_agent_past_the_app_event_limit() {
+        let hub = fixture();
+        let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
+            html: None, html_path: None, csp: None }).unwrap();
+        // The apps' limit is 30 events a minute; the user's own navigations are not app input.
+        for n in 0..45 { assert!(navigate(&hub, id, &format!("{}", 3000 + n)).unwrap().1); }
+        let out = wait(&hub, 1, Some(id), 0).await.unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 45);
+        assert_eq!(events[44]["payload"]["url"], "http://localhost:3044/");
+        assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://localhost:3044/");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_navigations_queue_in_commit_order() {
+        let hub = fixture();
+        let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
+            html: None, html_path: None, csp: None }).unwrap();
+        let threads: Vec<_> = (0..4).map(|t| {
+            let hub = hub.clone();
+            std::thread::spawn(move || for n in 0..10 { let _ = navigate(&hub, id, &format!("{}", 3000 + t * 100 + n)); })
+        }).collect();
+        for t in threads { t.join().unwrap(); }
+        let out = wait(&hub, 1, Some(id), 0).await.unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 40, "every changed address was reported");
+        // Each event's `previous` is the address the one before it stored: one unbroken chain,
+        // ending at what the panel shows.
+        assert_eq!(events[0]["payload"]["previous"], "http://localhost:5173/");
+        for w in events.windows(2) { assert_eq!(w[1]["payload"]["previous"], w[0]["payload"]["url"], "{w:?}"); }
+        assert_eq!(resource(&hub, id).unwrap()["data"]["url"], events[39]["payload"]["url"]);
         archive(&hub, 1).unwrap();
     }
 

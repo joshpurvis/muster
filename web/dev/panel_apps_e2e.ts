@@ -775,7 +775,7 @@ async function webPreview({ a, R, call, shots, ok, check }: {
     const view = `[data-panel-view="${pid}"]`;
     await a.wait(`!!document.querySelector('${view} iframe') && !document.querySelector('${view} .panel-status')`, 8000);
     await loadedFrom("dev");
-    check((await a.eval(`document.querySelector('${view} .preview-url').textContent`)) === devUrl, "the bar shows the address");
+    check((await a.eval(`document.querySelector('${view} .preview-url').value`)) === devUrl, "the bar shows the address");
     check((await a.eval(`document.querySelector('${view} iframe').src`)).startsWith(`${(await R("hello", {})).panel_origin}/preview?url=`),
       "the frame is the panel server's preview page");
     for (const theme of ["dark", "light"]) {
@@ -815,8 +815,33 @@ async function webPreview({ a, R, call, shots, ok, check }: {
     await a.eval(`__previewMsgs = []`);
     await call("panel.update", { panel_id: pid, data: { url: `http://127.0.0.1:${second.addr.port}/` } });
     await loadedFrom("second");
-    await a.wait(`document.querySelector('${view} .preview-url').textContent.includes(':${second.addr.port}/')`);
+    await a.wait(`document.querySelector('${view} .preview-url').value.includes(':${second.addr.port}/')`);
     ok("web_preview: panel_update moves the frame to the new address");
+
+    // The user types an address (no scheme) and presses Enter: the frame moves, the agent hears.
+    const field = `${view} input.preview-url`;
+    await call("panel.wait", { panel_id: pid, timeout_seconds: 0 });
+    await a.eval(`__previewMsgs = []`);
+    await a.click(field);
+    check(await a.eval(`(() => { const f = document.querySelector('${field}'); return document.activeElement === f && f.selectionStart === 0 && f.selectionEnd === f.value.length; })()`),
+      "a click selects the whole address");
+    await a.type(`127.0.0.1:${dev.addr.port}`);
+    await a.key("Enter");
+    await loadedFrom("dev");
+    await a.wait(`document.querySelector('${field}').value === ${JSON.stringify(devUrl)}`);
+    const heard = (await call("panel.wait", { panel_id: pid, timeout_seconds: 0 })).events as any[];
+    check(heard.length === 1 && heard[0].kind === "navigated" && heard[0].payload.url === devUrl, `the agent gets a navigated event: ${JSON.stringify(heard)}`);
+    // A refused address shows the reason and keeps the text; Escape restores the address.
+    await a.click(field);
+    await a.type("example.com");
+    await a.key("Enter");
+    await a.wait(`document.querySelector('${view} .preview-address-error')?.textContent.includes('local dev servers')`, 5000);
+    check((await a.eval(`document.querySelector('${field}').value`)) === "example.com", "a refused address keeps the typed text");
+    await a.shot(`${shots}/panel-web-preview-address-refused-dark.png`, (await a.rect(view))!);
+    await a.key("Escape");
+    await a.wait(`!document.querySelector('${view} .preview-address-error') && document.querySelector('${field}').value === ${JSON.stringify(devUrl)}`);
+    check(!((await call("panel.wait", { panel_id: pid, timeout_seconds: 0 })).events as any[]).length, "a refused address tells the agent nothing");
+    ok("web_preview: the user types an address and Enter moves the frame and tells the agent; a refused one says why and Escape restores");
 
     // A page that leaves for another origin stays blocked in the frame.
     await a.eval(`__previewMsgs = []`);

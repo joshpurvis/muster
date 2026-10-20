@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 18] = [
+pub const TOOL_NAMES: [&str; 23] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -35,6 +35,7 @@ pub const TOOL_NAMES: [&str; 18] = [
     "list_agents",
     "ask_agent",
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
+    "note_list", "note_read", "note_write", "note_append", "note_open",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -260,6 +261,19 @@ pub fn tool_definitions() -> Vec<Value> {
         tool("panel_event", "Fetch panel event", "Fetch the full payload of a user event that a panel prompt showed only as a placeholder because it was too long. Fetching consumes it.",
             json!({"type":"object","properties":{"panel_id":{"type":"integer"},"event_id":{"type":"integer"}},"required":["panel_id","event_id"],"additionalProperties":false}), true),
     ]);
+    let note_id = json!({"type":"integer","minimum":1,"description":"The note's id (see note_list)."});
+    tools.extend([
+        tool("note_list", "List notes", "List Muster's notes: plain-text notes the human and every agent share, shown as editor tabs in the UI. Each has id, title, rev (its text revision), bytes, lines, updated_at, updated_by (human, or which agent) and open (shown in a window). No text: use note_read.",
+            empty_schema(), true),
+        tool("note_read", "Read note", "Read a note's whole text with its current rev. Pass that rev to note_write.",
+            json!({"type":"object","properties":{"note_id":note_id},"required":["note_id"],"additionalProperties":false}), true),
+        tool("note_write", "Write note", "Without note_id: create a note (title optional) holding text; returns its note_id. With note_id: replace its whole text (and title, if given). rev is required then: the rev from your note_read. If the note changed since (the human typed, or another agent wrote), the write is refused: read it again, redo your change on the new text and write with the new rev. To add lines at the end, use note_append instead. Plain text, at most 1 MiB.",
+            json!({"type":"object","properties":{"note_id":note_id,"title":{"type":"string","maxLength":200},"text":{"type":"string"},"rev":{"type":"integer","minimum":1,"description":"The rev note_read returned (required with note_id)."}},"required":["text"],"additionalProperties":false}), false),
+        tool("note_append", "Append to note", "Add text at the end of a note, on a new line. Needs no rev and never conflicts: use it for logs, findings and to-do items while the human may be typing.",
+            json!({"type":"object","properties":{"note_id":note_id,"text":{"type":"string"}},"required":["note_id","text"],"additionalProperties":false}), false),
+        tool("note_open", "Show note", "Show a note to the human as a tab beside your terminal (moving it from another window).",
+            json!({"type":"object","properties":{"note_id":note_id},"required":["note_id"],"additionalProperties":false}), false),
+    ]);
     tools
 }
 
@@ -449,6 +463,7 @@ pub async fn call_tool<B: Backend>(
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
+        "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
         _ => return Err(()),
     };
     Ok(match res {
@@ -480,6 +495,21 @@ async fn panel_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str,
         }
     }
     st.backend.panel_tool(caller, name, Value::Object(args.clone())).await
+        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+}
+
+/// Notes are shared by every session (not task-scoped). Writes and appends share the post rate
+/// limit, so a runaway loop can't flood the human's notes.
+fn note_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: &Map<String, Value>) -> TResult {
+    caller_session(st, caller)?;
+    if matches!(name, "note_write" | "note_append") {
+        if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+            caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+        ))? {
+            return Err(format!("rate limit: at most {} note writes, panel updates or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
+        }
+    }
+    st.backend.note_tool(caller, name, Value::Object(args.clone()))
         .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 

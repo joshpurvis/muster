@@ -18,7 +18,7 @@ restores that window's groups and tabs.
 - **Group**: a leaf of the window's split tree, with its own tab strip and one visible tab. The
   layout JSON calls it a `pane` (`{type:"pane", id, tabs: session ids, active}`); v1's pane code
   and drag and drop carry over, now at window level.
-- **Tab**: one **session** (a Claude, Codex or shell terminal). Each session belongs to one
+- **Tab**: one **session** (a Claude, Codex or shell terminal), or an agent panel or a note (see below). Each session belongs to one
   window (`SessionInfo.window_id`).
 - **Task**: what the API calls a **channel**, no longer shown as its own UI. It holds a
   session's folder (`cwd`), optional git worktree and branch, permissions profile, port block
@@ -162,8 +162,53 @@ the app never sent `ui/initialize`, or it never sent `ui/notifications/initializ
 app's last error and Reload panel. A load cut off by a dropped connection retries on reconnect.
 Jump lists every panel by title (pulling one from another window), and the status line counts
 panel tabs with terminals.
-Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`;
+Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`, note tab IDs `-(2^40 + note_id)`;
 `-1` remains the internal empty-pane sentinel. Old session-only layouts need no migration.
+
+### Notes
+
+A note is plain text that the human and every agent share (gedit-simple: no formatting, no
+heavy editor). It is a tab like a terminal or a panel: it drags between groups, onto an edge
+(a new split) and to other windows, splits, zooms, goes fullscreen, and Alt+1..9, Ctrl+Tab and
+Alt+[ / ] select it. Agents read and write it through MCP (`note_read`, `note_append`, …,
+docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
+
+- **Opening**: "New note" in the palette or in a strip's `▾` menu (a tab in that group, the
+  keyboard in its editor). "Notes…" (palette, `▾`, a note tab's menu) lists every note, open or
+  closed, newest first, with where it is (open here / in window N / closed), its first line, who
+  edited it last and when: type to find one by its name or text, Enter opens it here (from
+  closed, or pulled from another window), Ctrl+Enter makes a new note named after what was typed,
+  Shift+Delete (or the row's bin) asks to delete it. Jump lists every note too, by its title and
+  by its text (two letters or more: the daemon searches, `note.search`, and the matching line is shown). An agent's `note_open` shows
+  the note in the group to its right, or a new split there, as a panel opens.
+- **Editor**: a monospace `<textarea>` with line wrap on the terminal's background. Typing saves
+  by itself half a second after it stops (Ctrl+S saves at once, and never opens the browser's
+  "Save page"); leaving the editor, closing the tab, moving it to another window and reloading
+  the window save first. A status line under it: Saved / Edited / Saving… / the reason a save
+  failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
+  with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
+  its editor (hidden behind the visible tab), so switching tabs keeps the undo history (Ctrl+Z);
+  moving the tab to another group or window, or someone else's change, starts it afresh.
+- **Never lost**: typing not yet saved is kept in this browser until the daemon has it. After a
+  reload, a closed window or a crash, the window's next page brings it back (a bar says so),
+  merged onto the note as it is by then, and saves it. Reload window and Close window first wait
+  for saves on their way; when typing can be neither saved nor kept, they ask first.
+- **Live**: an agent's change appears at once in the open editor, with the caret and scroll kept
+  where they were. Typing that isn't saved yet is merged with it, never lost: changes in
+  different places both apply; changes to the same lines keep the human's and then the agent's
+  version between marker lines, and a bar above the status line says so (docs/PROTOCOL.md
+  "Notes", concurrent edits).
+- **Tab**: note icon and title; double-click or F2 renames (one field, "Note"); `×`, middle-click
+  and Alt+W (with focus on the strip, not in the text) close it. Closing keeps the note; only
+  **Delete note…** (tab menu, palette "Delete this note…", the notes list) removes it, after the
+  app's confirm dialog (Cancel focused). Menu: Rename, Split right / down, Zoom group,
+  Fullscreen, Move to window ▸, All notes…, Close note, Delete note….
+- **Keys**: in the editor, Muster's shortcuts that work in text fields still do (Ctrl+Space,
+  Ctrl+K, Ctrl+Shift+P, Ctrl+Tab, Alt+Shift+…); Alt+letters and Alt+arrows stay with the text, as
+  in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
+  the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
+  arrow keys move the selected row, which screen readers announce.
+- The status line's tab count includes notes. The phone UI has no notes (it receives none).
 
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
@@ -278,7 +323,7 @@ of the same kind arrives; the next waiting update shows meanwhile.
   session in **all windows**, and folders for "new tab here" (recent folders and known
   workspaces; choosing one opens a tab there with the last agent kind), and every named agent,
   stopped ones too (choosing one starts it and pulls its tab here; its session isn't listed a
-  second time). Rows show the state dot,
+  second time), and every note, open or closed, by its title and text (see "Notes"). Rows show the state dot,
   label, window (for other windows), folder and state detail; one row per tab (session).
   Sessions that need you come first, then recent ones, then this window's tabs in order. Plain queries also match commands (ranked
   last). `>` switches to commands (Ctrl+Shift+P opens with `>`), and every command lists its

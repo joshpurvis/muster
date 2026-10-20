@@ -6,6 +6,7 @@ import {
   focusedTask,
   meta,
   needsYou,
+  windowNotes,
   windowPanels,
   windowSessions,
   workspaceById,
@@ -29,8 +30,8 @@ export function StatusLine() {
   const c = focusedTask.value;
   const n = needsYou.value.length;
   const status = connStatus.value;
-  // Terminal and panel tabs alike.
-  const count = windowSessions.value.length + windowPanels.value.length;
+  // Terminal, panel and note tabs alike.
+  const count = windowSessions.value.length + windowPanels.value.length + windowNotes.value.length;
   const s = focusedSession.value;
   // Where the focused tab is now: a shell's `cd` or Claude's `/cd` moves it off the task folder.
   const live = s && c && s.channel_id === c.id ? s.live_cwd : undefined;

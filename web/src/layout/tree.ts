@@ -8,9 +8,17 @@
 export type Dir = "row" | "col";
 
 // Session ids are positive u32s. Panels use -(id + 1); -1 stays the internal empty-pane
-// sentinel. Keeping numeric tabs means existing saved layouts load without migration.
+// sentinel. Notes use -(2^40 + id), far below any panel's. Keeping numeric tabs means existing
+// saved layouts load without migration.
+const NOTE_BASE = 2 ** 40;
 export const panelTab = (id: number): number => -id - 1;
-export const panelId = (tab: number): number | null => Number.isSafeInteger(tab) && tab <= -2 ? -tab - 1 : null;
+export const panelId = (tab: number): number | null =>
+  Number.isSafeInteger(tab) && tab <= -2 && tab > -NOTE_BASE ? -tab - 1 : null;
+export const noteTab = (id: number): number => -NOTE_BASE - id;
+export const noteId = (tab: number): number | null =>
+  Number.isSafeInteger(tab) && tab < -NOTE_BASE ? -tab - NOTE_BASE : null;
+/** A tab that is a terminal (a session), not a panel or a note. */
+export const isSessionTab = (tab: number): boolean => tab > 0;
 
 export interface PaneNode {
   type: "pane";
@@ -278,7 +286,12 @@ export function reconcile(s: LayoutState, live: number[]): LayoutState {
 
 /** A new panel joins the group immediately to its opener's right, or splits there. */
 export function placePanel(s: LayoutState, id: number, opener: number): LayoutState {
-  const tab = panelTab(id);
+  return placeBeside(s, panelTab(id), opener);
+}
+
+/** Tab `tab` (a panel's or a note's) joins the group to the right of session `opener`'s, or
+ * splits there; without the opener in the layout, beside the focused group. */
+export function placeBeside(s: LayoutState, tab: number, opener: number): LayoutState {
   if (paneOfSession(s.root, tab)) return s;
   const origin = paneOfSession(s.root, opener)?.id ?? s.focus;
   const right = neighbour(s.root, origin, "right");

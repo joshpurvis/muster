@@ -2,8 +2,11 @@
 // (+ approval banner, exited bar, find bar). The top-right group's strip also carries the
 // window controls.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { panelId, panelTab, type PaneNode } from "./tree.ts";
+import { noteId, noteTab, panelId, panelTab, type PaneNode } from "./tree.ts";
 import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
+import { NoteView } from "../components/NoteView.tsx";
+import { notes, notesSupported } from "../notes.ts";
+import type { NoteInfo } from "../types.ts";
 import {
   accountProfiles,
   agents,
@@ -39,6 +42,7 @@ import {
   IconCodex,
   IconMaximize,
   IconMinimize,
+  IconNote,
   IconPlus,
   IconPanel,
   IconRestart,
@@ -235,9 +239,12 @@ export function Group(
   },
 ) {
   const all = sessions.value;
-  const tabs = pane.tabs.filter((id) => all.has(id) || panels.value.has(panelId(id) ?? -1));
+  const tabs = pane.tabs.filter((id) =>
+    all.has(id) || panels.value.has(panelId(id) ?? -1) || notes.value.has(noteId(id) ?? -1)
+  );
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
   const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
+  const activeNote = pane.active !== null ? notes.value.get(noteId(pane.active) ?? -1) : undefined;
   const find = A.findOpen.value;
   const dragging = drag.value;
 
@@ -267,9 +274,9 @@ export function Group(
       onPointerDownCapture={() => A.focusGroup(pane.id)}
     >
       {!fullscreen && <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />}
-      {fullscreen && active && (
+      {fullscreen && (active || activeNote) && (
         // Terminals keep Esc (agents and editors use it), so a terminal shown fullscreen gets
-        // this way back; a panel has the same button in the strip above it.
+        // this way back (a note's editor keeps Esc too); a panel has the same button in its strip.
         <button
           type="button"
           class="fs-exit"
@@ -297,6 +304,9 @@ export function Group(
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
         {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
+        {tabs.map((t) => noteId(t)).filter((n): n is number => n !== null).map((n) => (
+          <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
+        ))}
         {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (
@@ -344,6 +354,13 @@ function newTabMenu(paneId: string): MenuItem[] {
     "sep",
     { header: "New tab here with" },
     ...spawnMenuItems((k) => A.newTabHere({ agent: k, group: paneId })),
+    ...(notesSupported.value
+      ? [
+        "sep" as const,
+        { label: "New note", icon: <IconNote size={14} />, run: () => A.newNote(paneId) },
+        { label: "Notes…", run: () => A.openNotesList() },
+      ]
+      : []),
   ];
 }
 
@@ -403,8 +420,13 @@ function TabStrip(
       [
         { header: `${tabs.length} tabs in this group` },
         ...tabs.map((id, i): MenuItem => ({
-          label: panels.value.get(panelId(id) ?? -1)?.title ?? tabText(labelOf(sessions.value.get(id)!)),
-          icon: panelId(id) !== null ? <IconPanel size={13} /> : <StateDot state={sessions.value.get(id)!.state} />,
+          label: panels.value.get(panelId(id) ?? -1)?.title ?? notes.value.get(noteId(id) ?? -1)?.title ??
+            tabText(labelOf(sessions.value.get(id)!)),
+          icon: panelId(id) !== null
+            ? <IconPanel size={13} />
+            : noteId(id) !== null
+            ? <IconNote size={13} />
+            : <StateDot state={sessions.value.get(id)!.state} />,
           keys: focused && i < 9 ? `Alt+${i + 1}` : undefined,
           checked: id === pane.active,
           run: () => A.revealSession(id),
@@ -429,7 +451,9 @@ function TabStrip(
       return;
     } else if (e.key === "F2" && pane.active !== null) {
       e.preventDefault();
-      A.startRename(pane.active);
+      const note = noteId(pane.active);
+      if (note !== null) A.startNoteRename(note);
+      else A.startRename(pane.active);
       return;
     }
     if (next < 0 || !tabs[next]) return;
@@ -456,6 +480,8 @@ function TabStrip(
         {tabs.map((id, i) => {
           const panel = panels.value.get(panelId(id) ?? -1);
           if (panel) return <PanelTab key={id} panel={panel} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
+          const note = notes.value.get(noteId(id) ?? -1);
+          if (note) return <NoteTab key={id} note={note} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           const s = sessions.value.get(id)!;
           return (
           <GroupTab
@@ -558,6 +584,64 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
       <span class="tab-name"><span class="tab-task">{panel.title}</span></span>
       <button type="button" class="tab-close" aria-label={`Close ${panel.title}`} data-tip="Close panel"
         onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>
+    </div>
+  );
+}
+
+function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
+  note: NoteInfo; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
+}) {
+  const id = noteTab(note.id);
+  const renamingThis = A.renamingNote.value === note.id;
+  const menu: MenuItem[] = [
+    { label: "Rename", keys: "F2", run: () => A.startNoteRename(note.id) },
+    { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
+    { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
+    { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
+    { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
+    ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
+    { label: "All notes…", run: () => A.openNotesList() },
+    "sep",
+    { label: "Close note", keys: "Alt+W", run: () => A.closeTab(id) },
+    { label: "Delete note…", danger: true, run: () => A.deleteNoteAsk(note.id) },
+  ];
+  const tip = `${note.title} · Note · edited by ${note.updated_by.kind === "human" ? "you" : note.updated_by.name || "an agent"}`;
+  return (
+    <div class={cx("tab", "note-tab", active && "active", active && focused && "focused", drag.value?.sid === id && "dragging",
+      renamingThis && "renaming")}
+      role="tab" aria-selected={active} aria-label={note.title} tabIndex={active ? 0 : -1}
+      data-tab-sid={id} data-tip={renamingThis ? undefined : tip}
+      onPointerDown={(e) => {
+        if (renamingThis || (e.target as HTMLElement).closest("button")) return;
+        startTabDrag(e, { id, kind: "note" }, note.title, () => A.revealSession(id));
+      }}
+      onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); A.closeTab(id); } }}
+      onMouseDown={(e) => e.button === 1 && e.preventDefault()}
+      onDblClick={(e) => { if (!(e.target as HTMLElement).closest("button")) A.startNoteRename(note.id); }}
+      onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
+      {altHeld.value && focused && index < 9 && <span class="tab-num">{index + 1}</span>}
+      <IconNote size={14} />
+      {renamingThis
+        ? (
+          <InlineEdit
+            fields={[{ value: note.title, label: "Note name", tag: "Note" }]}
+            class="tab-edit"
+            onCommit={([title], byKey) => {
+              A.renamingNote.value = null;
+              if (title) A.renameNote(note.id, title);
+              if (byKey) document.querySelector<HTMLElement>(`.tab[data-tab-sid="${id}"]`)?.focus();
+            }}
+            onCancel={(byKey) => {
+              if (A.renamingNote.value === note.id) A.renamingNote.value = null;
+              if (byKey) document.querySelector<HTMLElement>(`.tab[data-tab-sid="${id}"]`)?.focus();
+            }}
+          />
+        )
+        : <span class="tab-name"><span class="tab-task">{note.title}</span></span>}
+      {!renamingThis && (
+        <button type="button" class="tab-close" aria-label={`Close ${note.title}`} data-tip="Close note (it stays in Notes…)"
+          onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>
+      )}
     </div>
   );
 }

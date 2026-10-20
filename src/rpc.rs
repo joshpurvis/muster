@@ -93,6 +93,7 @@ pub fn hello(hub: &Hub) -> Value {
         "sessions": hub.sessions(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
+        "notes": crate::notes::list(hub).unwrap_or_default(),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": crate::adapters::shell::user_shell(),
@@ -152,9 +153,86 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 if let Some(fields) = result.as_object_mut() {
                     fields.remove("panels");
                     fields.remove("panel_origin");
+                    fields.remove("notes");
                 }
             }
             Ok(result)
+        }
+
+        // Notes (docs/PROTOCOL.md "Notes"). `from_session` (the CLI inside a session) only says
+        // who wrote; without it the change is the human's.
+        "note.list" => to_value(crate::notes::list(hub)?),
+        "note.search" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { query: String }
+            let p: P = parse(params)?;
+            Ok(json!(crate::notes::search(hub, &p.query)?))
+        }
+        "note.get" => {
+            let p: IdParam<NoteId> = parse(params)?;
+            to_value(crate::notes::get(hub, p.id)?)
+        }
+        // An agent's writes through the CLI run as its MCP note tools: the same rate limit and
+        // audit as over MCP (docs/MCP.md "Notes").
+        "note.create" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { #[serde(default)] title: Option<String>, #[serde(default)] body: String,
+                #[serde(default)] window_id: Option<WindowId>, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            if let Some(s) = agent_session(hub, p.from_session)? {
+                let mut n = agent_note(hub, s, "note_write", json!({"title": p.title, "text": p.body})).await?;
+                if let Some(w) = p.window_id { n = crate::notes::open(hub, n.id, w, None)?; }
+                return to_value(n);
+            }
+            to_value(crate::notes::create(hub, p.title.as_deref(), &p.body, crate::notes::author(hub, p.from_session)?, p.window_id, None)?)
+        }
+        "note.write" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, body: String, base_rev: i64, #[serde(default)] title: Option<String>,
+                #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            if let Some(s) = agent_session(hub, p.from_session)? {
+                return to_value(agent_note(hub, s, "note_write",
+                    json!({"note_id": p.id, "text": p.body, "rev": p.base_rev, "title": p.title})).await?);
+            }
+            to_value(crate::notes::write(hub, p.id, &p.body, p.base_rev, crate::notes::author(hub, p.from_session)?, p.title.as_deref())?)
+        }
+        "note.append" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, text: String, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            if let Some(s) = agent_session(hub, p.from_session)? {
+                return to_value(agent_note(hub, s, "note_append", json!({"note_id": p.id, "text": p.text})).await?);
+            }
+            to_value(crate::notes::append(hub, p.id, &p.text, crate::notes::author(hub, p.from_session)?)?)
+        }
+        "note.rename" => {
+            let p: Rename<NoteId> = parse(params)?;
+            to_value(crate::notes::rename(hub, p.id, &p.name)?)
+        }
+        "note.open" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, #[serde(default)] window_id: Option<WindowId>, #[serde(default)] beside: Option<SessionId>,
+                #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            // No window: beside the calling session (the CLI's `muster note open` in a session).
+            let (window, beside) = match (p.window_id, p.from_session) {
+                (Some(w), _) => (w, p.beside),
+                (None, Some(s)) => (crate::notes::window_of(hub, s)?, Some(s)),
+                (None, None) => return Err(RpcError("note.open needs window_id (or from_session)".into())),
+            };
+            to_value(crate::notes::open(hub, p.id, window, beside)?)
+        }
+        "note.close" => {
+            let p: IdParam<NoteId> = parse(params)?;
+            to_value(crate::notes::close(hub, p.id)?)
+        }
+        "note.delete" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, #[serde(default)] from_session: Option<SessionId> }
+            let p: P = parse(params)?;
+            crate::notes::check_delete_from(hub, p.from_session)?;
+            crate::notes::delete(hub, p.id)?;
+            Ok(json!({}))
         }
 
         "panel.open" | "panel.update" | "panel.close" | "panel.list" | "panel.wait" | "panel.fetch_event" => {
@@ -1028,6 +1106,20 @@ fn spawn_prov(
 }
 
 /// An MCP tool's text result as the RPC result (JSON when it is JSON).
+/// `from_session` when it is an agent's (Claude or Codex) session: its note writes go through
+/// its MCP tools. A shell tab, or no session, writes as the human.
+fn agent_session(hub: &Hub, from: Option<SessionId>) -> Result<Option<SessionId>, RpcError> {
+    Ok(if crate::notes::author(hub, from)?.kind == "agent" { from } else { None })
+}
+
+/// Run note tool `tool` as agent session `caller`, then return the whole note it touched.
+async fn agent_note(hub: &Arc<Hub>, caller: SessionId, tool: &str, mut args: Value) -> Result<Note, RpcError> {
+    if let Some(o) = args.as_object_mut() { o.retain(|_, v| !v.is_null()); }
+    let out = mcp_json(crate::mcp::call_as(hub, caller, tool, args).await)?;
+    let id = out["note_id"].as_i64().ok_or_else(|| RpcError(format!("{tool} returned no note")))?;
+    Ok(crate::notes::get(hub, id)?)
+}
+
 fn mcp_json(r: Result<String, String>) -> RpcResult {
     let text = r.map_err(RpcError)?;
     Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
@@ -1221,13 +1313,15 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
-            // Named agents aren't on the phone (no agent.* method is either; docs/ANDROID.md).
+            // Named agents, panels and notes aren't on the phone (no agent.*, panel.* or note.*
+            // method is either; docs/ANDROID.md).
             let forward = |ev: ServerEvent| {
                 if is_device
                     && matches!(
                         ev,
                         ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
                         | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
+                        | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
                     )
                 {
                     return None;
@@ -1646,6 +1740,31 @@ mod tests {
         // The call is audited like an MCP call.
         let tl = hub.timeline(1, None, 100);
         assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["args"]["via"] == "cli"));
+    }
+
+    #[tokio::test]
+    async fn cli_note_writes_from_an_agent_share_its_mcp_rate_limit() {
+        let (hub, st) = fixture();
+        let n = call(&hub, "note.create", json!({"title": "Shared", "body": "a", "from_session": 3})).await.unwrap();
+        assert_eq!(n["updated_by"]["kind"], "agent");
+        let id = n["id"].as_i64().unwrap();
+        let n = call(&hub, "note.append", json!({"id": id, "text": "b", "from_session": 3})).await.unwrap();
+        assert_eq!((n["body"].as_str(), n["rev"].as_i64()), (Some("a\nb"), Some(2)));
+        for _ in 0..30 {
+            st.guard.lock().posts.check_and_record(3, now_ms(), 30, 60_000).ok();
+        }
+        for (method, params) in [
+            ("note.append", json!({"id": id, "text": "c", "from_session": 3})),
+            ("note.write", json!({"id": id, "body": "c", "base_rev": 2, "from_session": 3})),
+            ("note.create", json!({"body": "c", "from_session": 3})),
+        ] {
+            let e = call(&hub, method, params).await.unwrap_err();
+            assert!(e.contains("rate limit"), "{method}: {e}");
+        }
+        // The human (no session) isn't limited.
+        assert_eq!(call(&hub, "note.append", json!({"id": id, "text": "c"})).await.unwrap()["rev"], 3);
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["tool"] == "note_append"), "audited like MCP");
     }
 
     #[tokio::test]

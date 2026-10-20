@@ -21,7 +21,8 @@ use crate::hub::{Hub, ServerEvent};
 pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     Ok(Router::new()
         .route("/api/health", get(health))
-        .route("/api/rpc", post(rpc_http))
+        // Room for a 1 MiB note or panel HTML even when every character arrives JSON-escaped.
+        .route("/api/rpc", post(rpc_http).layer(axum::extract::DefaultBodyLimit::max(crate::mcp::BODY_MAX)))
         .route("/api/events", get(events_stream))
         .route("/api/launch-code", post(launch_code))
         .route("/api/exchange", post(exchange))

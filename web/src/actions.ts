@@ -51,7 +51,9 @@ import {
   workspaces,
 } from "./state.ts";
 import * as native from "./native.ts";
-import { panelId, panelTab } from "./layout/tree.ts";
+import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
+import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
+import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import type {
   Agent,
@@ -254,7 +256,9 @@ export async function moveTabToWindow(sid: SessionId, target: WindowId | "new") 
   const s = sessions.value.get(sid);
   const pid = panelId(sid);
   const panel = pid === null ? undefined : panels.value.get(pid);
-  if (!s && !panel) return;
+  const nid = noteId(sid);
+  const note = nid === null ? undefined : notes.value.get(nid);
+  if (!s && !panel && !note) return;
   try {
     let to: WindowId;
     if (target === "new") {
@@ -263,6 +267,10 @@ export async function moveTabToWindow(sid: SessionId, target: WindowId | "new") 
       to = w.id;
     } else to = target;
     if (panel) await rpc.call("panel.move", { id: panel.id, window_id: to });
+    else if (note) {
+      await flushDraft(note.id);
+      knowNote(await rpc.call<Note>("note.open", { id: note.id, window_id: to }));
+    }
     else if (s) await setSessionWindow(s, to, windowId.value);
     const w = windows.value.find((x) => x.id === to);
     if (target === "new" || (w && !w.open)) openClientWindow(to);
@@ -319,6 +327,84 @@ export async function gotoPanel(id: number) {
   revealSession(tab);
 }
 
+/** Show note `id`: selected here, or opened here (from closed, or from another window; with
+ * "Jump focuses the other window", that window is raised instead when it can be). */
+export async function gotoNote(id: number, group?: string) {
+  const n = notes.value.get(id);
+  if (!n) return;
+  const tab = noteTab(id);
+  pushRecent("n:" + id);
+  if (!hereIds.value.has(tab)) {
+    const here = windowId.value;
+    if (here === null) return;
+    const other = n.window_id !== null && windows.value.some((w) => w.id === n.window_id) ? n.window_id : null;
+    if (prefs.value.jumpRaises && other !== null && other !== here) {
+      const raised = await rpc.call<{ raised: boolean }>("window.raise", { id: other })
+        .then((r) => !!r?.raised).catch(() => false);
+      if (raised) return;
+    }
+    if (group) focusGroup(group);
+    try {
+      knowNote(await rpc.call<Note>("note.open", { id, window_id: here }));
+    } catch (e) {
+      toast("error", `Couldn't open the note: ${errText(e)}`);
+      return;
+    }
+  }
+  revealSession(tab);
+}
+
+/** New note, as a tab of the focused group (or `group`), with the keyboard in it. */
+export async function newNote(group?: string, title?: string) {
+  const here = windowId.value;
+  if (here === null) return toast("error", "Notes need a window: reconnect first");
+  if (group) focusGroup(group);
+  try {
+    const n = await rpc.call<Note>("note.create", { window_id: here, ...(title ? { title } : {}) });
+    knowNote(n);
+    revealSession(noteTab(n.id));
+  } catch (e) {
+    toast("error", `Couldn't create a note: ${errText(e)}`);
+  }
+}
+
+/** The notes list (open and closed notes; reopen, delete, new). */
+export function openNotesList() {
+  overlay.value = { kind: "notes" };
+}
+
+/** Delete note `id` for good, after the app's confirm. */
+export function deleteNoteAsk(id: number, after?: () => void) {
+  const n = notes.value.get(id);
+  if (!n) return;
+  const lines = n.lines;
+  overlay.value = {
+    kind: "confirm",
+    title: `Delete “${n.title}”?`,
+    body: [
+      lines ? `Its ${lines === 1 ? "line" : `${lines} lines`} of text go for good, for you and for every agent.` : "It is empty.",
+      "Closing its tab keeps a note; this removes it.",
+    ],
+    confirmLabel: "Delete note",
+    danger: true,
+    run: () => {
+      rpc.call("note.delete", { id }).then(() => after?.()).catch(fail("Delete failed")).catch(() => {});
+    },
+  };
+}
+
+/** Rename note `id` (inline, in its tab). */
+export const renamingNote = signal<number | null>(null);
+
+export function startNoteRename(id: number) {
+  exitFullscreen(false);
+  renamingNote.value = id;
+}
+
+export function renameNote(id: number, title: string) {
+  rpc.call<Note>("note.rename", { id, name: title }).then(knowNote).catch(fail("Rename failed")).catch(() => {});
+}
+
 /** Alt+J: the next session that needs you, in any window. */
 let lastNeedsYou: SessionId | null = null;
 
@@ -353,7 +439,9 @@ export function focusActiveTerminalSoon() {
       else {
         const tab = focusedTabId.value;
         const id = tab === null ? null : panelId(tab);
+        const note = tab === null ? null : noteId(tab);
         if (id !== null) document.querySelector<HTMLIFrameElement>(`iframe[data-panel-id="${id}"]`)?.focus();
+        else if (note !== null) document.querySelector<HTMLTextAreaElement>(`textarea[data-note-id="${note}"]`)?.focus();
       }
     })
   );
@@ -392,9 +480,11 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   revealSession(tab, false);
   focusGroup(pane.id);
   fullscreen.value = pane.id;
-  const terminal = panelId(tab) === null;
-  toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
-  if (terminal) focusActiveTerminalSoon();
+  const note = noteId(tab) !== null;
+  const terminal = panelId(tab) === null && !note;
+  toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
+    : note ? "Fullscreen. Alt+Shift+Z goes back" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
+  if (terminal || note) focusActiveTerminalSoon();
   else refocusIfLost();
 }
 
@@ -601,6 +691,16 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
  * agent's session), so closing before the agent list has loaded can't stop one.
  */
 export function closeTab(sid: SessionId, force = false) {
+  const nid = noteId(sid);
+  if (nid !== null) {
+    // Closing a note's tab keeps the note (the notes list and Jump reopen it). Unsaved typing
+    // goes first, so the reopened note has it.
+    flushDraft(nid).then(() => rpc.call<Note>("note.close", { id: nid })).then((n) => {
+      knowNote(n);
+      focusActiveTerminalSoon();
+    }).catch(fail("Close failed")).catch(() => {});
+    return;
+  }
   const pid = panelId(sid);
   if (pid !== null) {
     // Focus was on the panel or its close button: once it is gone, the tab that takes its
@@ -1016,19 +1116,47 @@ export function openJump(initial = "") {
 // ---------- window and Muster lifecycle ----------
 
 /** Save a layout change that is still waiting, but never hold the page up for long. */
+/** Save the layout and unsaved note typing before the page goes. Note typing is kept in this
+ * browser first (notes.ts), so a save still on its way when the wait ends isn't lost: the next
+ * page of this window saves it. */
 function settleLayout(): Promise<unknown> {
-  return Promise.race([saveLayoutNow(), new Promise((r) => setTimeout(r, 500))]);
+  persistAllDrafts();
+  return Promise.race([Promise.all([saveLayoutNow(), flushAllDrafts()]), new Promise((r) => setTimeout(r, 2000))]);
+}
+
+// A page going away (closed, reloaded by the browser) keeps and sends unsaved note typing first.
+addEventListener("pagehide", () => void flushAllDrafts());
+
+/** Go ahead with `go` (`what`: "Reload", "Close") unless note typing is neither saved nor kept
+ * in this browser (storage full or blocked): then ask first. */
+function leaveUnlessUnsaved(what: string, go: () => void) {
+  const left = unsavedNotes();
+  if (!left.length || persistAllDrafts()) return go();
+  const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
+  overlay.value = {
+    kind: "confirm",
+    title: "Some note text isn't saved yet",
+    body: [
+      `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
+      `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
+    ],
+    confirmLabel: `${what} anyway`,
+    danger: true,
+    run: go,
+  };
 }
 
 /** Ctrl+Shift+R: reload this window, which also loads the active UI release. */
 export function reloadWindow() {
-  settleLayout().finally(() => location.reload());
+  settleLayout().finally(() => leaveUnlessUnsaved("Reload", () => location.reload()));
 }
 
 /** Close this window only; its tabs stay in it for the next `muster`. */
 export async function closeWindow() {
   await settleLayout();
-  if (!(await native.closeWindow())) toast("warn", "This browser won't let Muster close the window. Close it yourself.");
+  leaveUnlessUnsaved("Close", async () => {
+    if (!(await native.closeWindow())) toast("warn", "This browser won't let Muster close the window. Close it yourself.");
+  });
 }
 
 /** Show or hide the native windows' system title bar (every window, and new ones). Shown at

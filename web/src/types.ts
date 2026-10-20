@@ -253,6 +253,8 @@ export interface OpenRouterModels {
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
+  | { event: "note_upserted"; data: Note }
+  | { event: "note_removed"; data: { id: number } }
   | { event: "account_profiles_changed"; data: AccountProfile[] }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
@@ -284,6 +286,8 @@ export interface WindowPrefs {
 export interface HelloResult {
   panels?: Panel[];
   panel_origin?: string;
+  /** Missing from backends without notes. */
+  notes?: NoteSummary[];
   account_profiles?: AccountProfile[];
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
@@ -330,6 +334,43 @@ export interface Panel {
   updated_at: number;
   closed: boolean;
 }
+
+/** Who last changed a note's text. */
+export interface NoteAuthor {
+  kind: "human" | "agent";
+  name?: string | null;
+  session_id?: SessionId | null;
+}
+
+/** A plain-text note shared by the human and agents (docs/PROTOCOL.md "Notes"). */
+export interface Note {
+  id: number;
+  title: string;
+  body: string;
+  /** Counts changes to `body`. */
+  rev: number;
+  created_at: number;
+  updated_at: number;
+  updated_by: NoteAuthor;
+  /** The window showing its tab; null while closed. */
+  window_id: WindowId | null;
+  /** Shown beside this session when it first appears (`note_open`). */
+  beside: SessionId | null;
+  /** Raised by every change (text, title, window): the newer record wins. */
+  version: number;
+}
+
+/** A note without its text (`hello.notes`, `note.list`). */
+export interface NoteSummary extends Omit<Note, "body"> {
+  open: boolean;
+  bytes: number;
+  lines: number;
+  /** The first non-blank line, at most 120 characters. */
+  preview: string;
+}
+
+/** What the UI knows of a note: its summary, and its text once fetched or sent by an event. */
+export type NoteInfo = Omit<NoteSummary, "open"> & { body?: string };
 
 export interface PanelResource {
   panel: Panel;

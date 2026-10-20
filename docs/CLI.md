@@ -52,6 +52,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
+| `muster note ls/new/read/write/append/rename/open/close/rm` | Plain-text notes shared with agents. See "Notes" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
@@ -102,6 +103,31 @@ must stay in the task cwd. Omit the ID on `wait` for any panel in the task; time
 seconds (default 300). A timeout prints `{events: [], remaining: 0, timed_out: true}` and exits
 successfully; a wait fails if the session moves to another task or restarts. `event` fetches
 the full event that a panel prompt showed only as a placeholder (panel ID, then event ID).
+
+## Notes
+
+Plain-text notes you and agents share (docs/UI.md "Notes", docs/PROTOCOL.md "Notes"). Work
+inside or outside a session; inside one, writes are attributed to that session's agent and share its MCP rate limit (a shell
+tab counts as you). `<note>` is an id (all digits), an exact title (case-insensitive) or a unique
+title prefix; ambiguous or unknown ones exit 2.
+
+| Command | What it does |
+|---|---|
+| `muster note ls [--json]` (alias `list`) | `ID  REV  BYTES  OPEN  UPDATED  BY  TITLE`. `--json` prints `note.list`. |
+| `muster note new [--title T] [TEXT...]` | Create a note (empty without TEXT; `-` reads stdin). Prints its id. Not shown until opened. |
+| `muster note read <note> [--json]` | Print the text exactly (no newline added). `--json` prints the whole note, with its `rev`. |
+| `muster note write <note> --rev N [TEXT...]` | Replace the text (none or `-`: stdin, as is). `--rev` is the revision you read; refused when the note changed since. Prints `note ID: rev R`. |
+| `muster note append <note> [TEXT...]` | Add at the end, on a new line (none or `-`: stdin, trailing newlines dropped). Never conflicts. |
+| `muster note rename <note> <title>` | Rename it. |
+| `muster note open <note> [--window N]` | Show its tab in window N, else beside this session (needs a session). |
+| `muster note close <note>` | Close its tab; the note stays. |
+| `muster note rm <note>` | Delete it for good. Refused from an agent's session. |
+
+```sh
+muster note new --title "Release checklist" "- [ ] changelog"
+echo "- [ ] tag v0.4" | muster note append release
+muster note read release --json | jq .rev     # then: muster note write release --rev 3 - < plan.txt
+```
 
 ## Agent skills
 

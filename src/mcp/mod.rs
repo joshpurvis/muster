@@ -110,6 +110,10 @@ pub fn spawn_tracker<B: Backend>(st: &Arc<McpState<B>>) {
     });
 }
 
+/// Largest request body for `POST /mcp` and `POST /api/rpc`: a 1 MiB note or panel HTML whose
+/// every character arrives `\uXXXX`-escaped is about 6 MiB (Axum's default would be 2 MiB).
+pub const BODY_MAX: usize = 8 * 1024 * 1024;
+
 pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     let limits = guard::Limits::from_env();
     if limits.allow_shell {
@@ -128,7 +132,7 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     hub.set_mcp(Arc::downgrade(&st));
     spawn_tracker(&st);
     Ok(Router::new()
-        .route("/", post(handle_post).get(not_allowed).delete(not_allowed))
+        .route("/", post(handle_post).layer(axum::extract::DefaultBodyLimit::max(BODY_MAX)).get(not_allowed).delete(not_allowed))
         .with_state(st))
 }
 

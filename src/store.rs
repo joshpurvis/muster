@@ -331,12 +331,32 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
     "#,
-    // v17: where an agent's model runs (src/openrouter.rs); existing agents keep the
+    // v17: plain-text notes shared by the human and agents (src/notes.rs).
+    r#"
+    CREATE TABLE notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        rev INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by TEXT NOT NULL,
+        window_id INTEGER,
+        beside INTEGER,
+        version INTEGER NOT NULL DEFAULT 1
+    );
+    "#,
+    // v18: where an agent's model runs (src/openrouter.rs); existing agents keep the
     // subscription. Never a key: that stays in the daemon's memory.
     r#"
     ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
     "#,
 ];
+
+/// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
+pub fn preview(head: &str) -> String {
+    head.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").chars().take(120).collect()
+}
 
 /// Panel events moving with a prompt-queue change (`Store::save_prompt_queues`).
 #[derive(Debug, Default)]
@@ -569,6 +589,79 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ----- notes -----
+
+    fn note_row(r: &Row) -> rusqlite::Result<Note> {
+        let by: String = r.get(6)?;
+        Ok(Note { id: r.get(0)?, title: r.get(1)?, body: r.get(2)?, rev: r.get(3)?, created_at: r.get(4)?,
+            updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
+            window_id: r.get(7)?, beside: r.get(8)?, version: r.get(9)? })
+    }
+
+    /// Every note without its text: sizes and a preview are worked out by SQLite, so only the
+    /// first 240 characters of each text leave the database.
+    pub fn load_note_summaries(&self) -> anyhow::Result<Vec<NoteSummary>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id,title,rev,version,created_at,updated_at,updated_by,window_id,beside,
+            length(CAST(body AS BLOB)),
+            CASE WHEN body = '' THEN 0 ELSE length(body) - length(replace(body, char(10), '')) + (substr(body, -1) != char(10)) END,
+            substr(body, 1, 240)
+            FROM notes ORDER BY id")?;
+        let rows = q.query_map([], |r| {
+            let by: String = r.get(6)?;
+            let head: String = r.get(11)?;
+            let window_id: Option<WindowId> = r.get(7)?;
+            Ok(NoteSummary { id: r.get(0)?, title: r.get(1)?, rev: r.get(2)?, version: r.get(3)?, created_at: r.get(4)?,
+                updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
+                window_id, beside: r.get(8)?, open: window_id.is_some(), bytes: r.get(9)?, lines: r.get(10)?,
+                preview: preview(&head) })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Notes whose text holds `query` (ASCII case-insensitive), at most `limit`, each with up to
+    /// 400 characters of text around the first match (never a whole text).
+    pub fn search_notes(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(NoteId, String)>> {
+        let conn = self.conn.lock();
+        let mut q = conn.prepare("SELECT id, substr(body, max(1, instr(lower(body), lower(?1)) - 200), 400 + length(?1))
+            FROM notes WHERE instr(lower(body), lower(?1)) > 0 ORDER BY updated_at DESC LIMIT ?2")?;
+        let rows = q.query_map(params![query, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn load_note(&self, id: NoteId) -> anyhow::Result<Option<Note>> {
+        Ok(self.conn.lock().query_row(
+            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside,version FROM notes WHERE id=?1",
+            [id], Self::note_row).optional()?)
+    }
+
+    pub fn count_notes(&self) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0))? as usize)
+    }
+
+    /// Insert `note`; its id is assigned here.
+    pub fn create_note(&self, note: &mut Note) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("INSERT INTO notes(title,body,rev,created_at,updated_at,updated_by,window_id,beside,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![note.title, note.body, note.rev, note.created_at, note.updated_at,
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version])?;
+        note.id = conn.last_insert_rowid();
+        Ok(())
+    }
+
+    pub fn save_note(&self, note: &Note) -> anyhow::Result<()> {
+        let n = self.conn.lock().execute(
+            "UPDATE notes SET title=?2,body=?3,rev=?4,updated_at=?5,updated_by=?6,window_id=?7,beside=?8,version=?9 WHERE id=?1",
+            params![note.id, note.title, note.body, note.rev, note.updated_at,
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version])?;
+        anyhow::ensure!(n == 1, "note {} not found", note.id);
+        Ok(())
+    }
+
+    pub fn delete_note(&self, id: NoteId) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute("DELETE FROM notes WHERE id=?1", [id])? == 1)
     }
 
     pub fn delete_panel(&self, id: PanelId) -> anyhow::Result<()> {
@@ -1256,9 +1349,28 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_window(&self, id: WindowId) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM windows WHERE id = ?1", [id])?;
-        Ok(())
+    /// Delete a window. Notes shown there close with it, in the same transaction: window ids are
+    /// reused, so a later window with this id must not inherit them. Returns those notes' ids.
+    pub fn delete_window(&self, id: WindowId) -> anyhow::Result<Vec<NoteId>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let notes = {
+            let mut q = tx.prepare("SELECT id FROM notes WHERE window_id = ?1")?;
+            q.query_map([id], |r| r.get(0))?.collect::<Result<Vec<NoteId>, _>>()?
+        };
+        tx.execute("UPDATE notes SET window_id = NULL, beside = NULL, version = version + 1 WHERE window_id = ?1", [id])?;
+        tx.execute("DELETE FROM windows WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(notes)
+    }
+
+    /// Close notes whose window no longer exists (a crash between the two writes of an older
+    /// build, or records from before windows were deleted with their notes).
+    pub fn close_orphan_notes(&self) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().execute(
+            "UPDATE notes SET window_id = NULL, beside = NULL, version = version + 1 WHERE window_id IS NOT NULL AND window_id NOT IN (SELECT id FROM windows)",
+            [],
+        )?)
     }
 
     // ----- sessions -----

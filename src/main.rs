@@ -14,6 +14,7 @@ mod hub;
 mod inject;
 mod mcp;
 mod model;
+mod notes;
 mod panels;
 mod panel_apps;
 mod panel_kit;
@@ -66,6 +67,11 @@ enum Cmd {
     Panel {
         #[command(subcommand)]
         action: cli::PanelCmd,
+    },
+    /// Plain-text notes shared by you and agents: list, read, write, append, open.
+    Note {
+        #[command(subcommand)]
+        action: cli::NoteCmd,
     },
     /// Read-only GitHub PR fetches for reviews: the open PR list, or one PR's snapshot (JSON).
     Pr {
@@ -556,6 +562,7 @@ fn main() -> ExitCode {
 fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Panel { action } => cli::panel(d, action),
+        Cmd::Note { action } => cli::note(d, action),
         Cmd::Read {
             target,
             lines,

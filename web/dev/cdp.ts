@@ -30,6 +30,7 @@ const KEYS: Record<string, { key: string; code: string; vk: number }> = {
   Tab: { key: "Tab", code: "Tab", vk: 9 },
   Space: { key: " ", code: "Space", vk: 32 },
   Backspace: { key: "Backspace", code: "Backspace", vk: 8 },
+  Delete: { key: "Delete", code: "Delete", vk: 46 },
   Left: { key: "ArrowLeft", code: "ArrowLeft", vk: 37 },
   Up: { key: "ArrowUp", code: "ArrowUp", vk: 38 },
   Right: { key: "ArrowRight", code: "ArrowRight", vk: 39 },

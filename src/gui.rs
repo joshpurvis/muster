@@ -61,28 +61,33 @@ fn decorations(d: &crate::paths::Discovery) -> bool {
 
 /// Whether the native window may load `target` (wry's navigation handler: main frame and
 /// subframes alike, which it cannot tell apart). The daemon's own UI, `about:blank`, and for
-/// agent panels (docs/AGENT_PANELS.md) exactly the panel server's sandbox proxy page
-/// (`http://127.0.0.1:<panel_port>/proxy?...`) and the proxy's inline app frame
-/// (`about:srcdoc`). `panel_port` is asked for only when a proxy URL is seen, so a backend
+/// agent panels (docs/AGENT_PANELS.md) exactly the panel server's sandbox proxy and web
+/// preview pages (`http://127.0.0.1:<panel_port>/proxy?...`, `/preview?...`), the proxy's
+/// inline app frame (`about:srcdoc`), and the loopback dev servers a web preview frames
+/// (http(s) on localhost or 127.0.0.1, never the UI's or the panel server's port).
+/// `panel_port` is asked for only when a panel page or a loopback URL is seen, so a backend
 /// reload that moved the panel server is followed. Everything else stays blocked.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn allow_navigation(origin: &str, target: &str, panel_port: impl FnOnce() -> Option<u16>) -> bool {
     if target == origin || target.starts_with(&format!("{origin}/")) || target == "about:blank" || target == "about:srcdoc" {
         return true;
     }
-    let Some(rest) = target.strip_prefix("http://127.0.0.1:") else { return false };
-    let Some((port, path)) = rest.split_once('/') else { return false };
-    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
+    let panel_page = target.strip_prefix("http://127.0.0.1:").and_then(|rest| {
+        let (port, path) = rest.split_once('/')?;
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let path = path.split_once('#').map_or(path, |(p, _)| p);
+        let page = ["proxy", "preview"].iter().any(|p| path == *p || path.starts_with(&format!("{p}?")));
+        if page { port.parse::<u16>().ok() } else { None }
+    });
+    if let Some(port) = panel_page {
+        return port != 0 && panel_port() == Some(port);
     }
-    let path = path.split_once('#').map_or(path, |(p, _)| p);
-    if path != "proxy" && !path.starts_with("proxy?") {
-        return false;
-    }
-    match (port.parse::<u16>(), panel_port()) {
-        (Ok(p), Some(want)) => p != 0 && p == want,
-        _ => false,
-    }
+    // A web preview's frame. Its page's CSP already holds it to one dev server's origin.
+    let Ok(dev) = crate::web_preview::parse(target, &[]) else { return false };
+    let ui_port = origin.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+    Some(dev.port) != ui_port && panel_port() != Some(dev.port)
 }
 
 /// A message the page sends the native window (`window.ipc.postMessage`, JSON).
@@ -523,10 +528,11 @@ mod native {
                 NewWindowResponse::Deny
             })
             // Keep the window on the daemon's own origin; panel frames load only the panel
-            // server's proxy. wry does not say whether a navigation is the main frame's, so a
-            // top-level load of the proxy is allowed too: it holds no token or IPC capability
-            // and does nothing outside a frame (web/panels/proxy.html). The UI's frames are
-            // sandboxed without top navigation, so only the UI itself could navigate there.
+            // server's pages and, inside a web preview, loopback dev servers. wry does not say
+            // whether a navigation is the main frame's, so a top-level load of those is allowed
+            // too: they get no token or IPC capability (the init script checks the origin), and
+            // the proxy does nothing outside a frame (web/panels/proxy.html). The UI's frames
+            // are sandboxed without top navigation, so only the UI itself could navigate there.
             .with_navigation_handler(move |target| {
                 super::allow_navigation(&origin, &target, || {
                     let mut known = nav_panel_port.lock().unwrap_or_else(|e| e.into_inner());
@@ -629,6 +635,16 @@ mod tests {
             assert!(!allow(ui, bad, port), "{bad}");
         }
         assert!(!allow(ui, "http://127.0.0.1:40001/proxy", || None), "an older daemon has no panel server");
+        // A web preview: its page on the panel server, and the loopback dev servers it frames.
+        for ok in ["http://127.0.0.1:40001/preview?url=http%3A%2F%2Flocalhost%3A5173%2F", "http://localhost:5173/",
+            "http://127.0.0.1:8000/app?x=1#y", "https://localhost:8443/"] {
+            assert!(allow(ui, ok, port), "{ok}");
+        }
+        for bad in ["http://localhost:7433/", "http://[::1]:3000/", "http://[::1]:7433/", "http://localhost:40001/preview", "http://127.0.0.1:40002/preview",
+            "http://localhost:5173@evil.example/", "http://localhost.evil.example:5173/", "http://192.168.1.2:5173/",
+            "http://2130706433:5173/", "ws://localhost:5173/"] {
+            assert!(!allow(ui, bad, port), "{bad}");
+        }
         let mut asked = false;
         assert!(allow(ui, "http://127.0.0.1:7433/x", || { asked = true; None }) && !asked, "UI loads never read discovery");
     }

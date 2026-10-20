@@ -7,6 +7,7 @@
 // Not part of the production bundle.
 
 import type { Panel, PanelResource } from "../src/types.ts";
+import { isPreviewUrl } from "../src/panels/preview.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -16,6 +17,35 @@ const panelProxy = await Deno.readTextFile(new URL("../panels/proxy.html", impor
 const builtinApps: Record<string, string> = {};
 for (const app of ["markdown", "image", "chart", "table", "pr_decision", "pr_overview"]) {
   builtinApps[app] = await Deno.readTextFile(new URL(`../panels/${app}.html`, import.meta.url));
+}
+// Drawn by the UI around the panel server's /preview page (src/web_preview.rs).
+builtinApps.web_preview = "<!doctype html><!-- web_preview -->";
+const previewPage = await Deno.readTextFile(new URL("../panels/preview.html", import.meta.url));
+/** Like src/web_preview.rs `parse`, loosely: a loopback http(s) URL, never one of the mock's ports. */
+function mockPreviewUrl(url: unknown): URL {
+  if (!isPreviewUrl(url)) throw new Error("web_preview frames only local dev servers; open other pages in the user's system browser instead");
+  const u = new URL(url);
+  const port = Number(u.port || (u.protocol === "https:" ? 443 : 80));
+  if (port === PORT || port === panelServer.addr.port) throw new Error(`port ${port} is Muster's own`);
+  return u;
+}
+/** Like src/web_preview.rs `check`, loosely: is it up, does it refuse framing, does it redirect away. */
+async function mockPreviewCheck(url: string) {
+  let res: Response;
+  try {
+    res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(3000) });
+  } catch {
+    return { reachable: false };
+  }
+  await res.body?.cancel();
+  const xfo = (res.headers.get("x-frame-options") ?? "").toLowerCase();
+  const ancestors = /frame-ancestors([^;,]*)/i.exec(res.headers.get("content-security-policy") ?? "")?.[1]?.trim();
+  const refused = ancestors !== undefined
+    ? (/\*|http:|127\.0\.0\.1:\*/.test(ancestors) ? null : `Content-Security-Policy frame-ancestors ${ancestors}`)
+    : xfo.includes("deny") ? "X-Frame-Options: DENY" : xfo.includes("sameorigin") ? "X-Frame-Options: SAMEORIGIN" : null;
+  const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+  const away = location && /^[a-z]+:\/\//i.test(location) && new URL(location).origin !== new URL(url).origin ? location : null;
+  return { reachable: true, answered: true, status: res.status, refused, leaves_to: away };
 }
 /** Like src/panel_apps.rs: an image `path` becomes a data URI; a `url` origin joins resourceDomains.
  * Each picture in a pr_decision panel's `media` is read the same way, from a path only. */
@@ -29,6 +59,10 @@ async function mockPanelData(app: string, cwd: string, data: any, csp: any, open
       media.push({ kind: "image", ...(await mockImage(cwd, rest, csp, opening)) });
     }
     return { ...data, media };
+  }
+  if (app === "web_preview") {
+    if (Object.keys(data ?? {}).some((k) => k !== "url")) throw new Error("web_preview takes only `url`");
+    return { url: mockPreviewUrl(data?.url).href };
   }
   if (app !== "image") return data;
   return await mockImage(cwd, data, csp, opening);
@@ -65,6 +99,18 @@ let panelSeq = 0;
 let panelResourceDelay = 0;
 const panelServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, (req) => {
   const u = new URL(req.url);
+  if (u.pathname === "/preview" && ["GET", "HEAD"].includes(req.method)) {
+    let target: URL;
+    try { target = mockPreviewUrl(u.searchParams.get("url")); } catch (e) { return new Response(String(e), { status: 400 }); }
+    const frameSrc = target.origin;
+    const attr = target.href.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return new Response(previewPage.replace("__MUSTER_PREVIEW_URL__", attr), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; frame-src ${frameSrc}; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:${PORT} http://localhost:${PORT}`,
+      },
+    });
+  }
   if (u.pathname !== "/proxy" || !["GET", "HEAD"].includes(req.method)) return new Response("Not found", { status: 404 });
   const csp = JSON.parse(u.searchParams.get("csp") || "{}");
   const resources = (csp.resourceDomains ?? []).filter((s: unknown) => typeof s === "string" && /^https?:\/\/[\w.*:[\]-]+\/?$/.test(s)).join(" ");
@@ -864,7 +910,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const data = await mockPanelData(args.app, channels.find((c) => c.id === s.channel_id)?.cwd ?? HOME, args.data ?? {}, csp, true);
       const id = ++panelSeq;
       const panel: Panel = { id, title: args.title, app: args.app, channel_id: s.channel_id, session_id: s.id,
-        window_id: s.window_id, csp, revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
+        window_id: s.window_id, csp, revision: 1, data_revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
       panels.set(id, { panel, html: args.app === "custom" ? args.html : builtinApps[args.app], data });
       broadcast("panel_upserted", panel);
       return { panel_id: id };
@@ -885,6 +931,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (args.data !== undefined) {
         const cwd = channels.find((c) => c.id === resource.panel.channel_id)?.cwd ?? HOME;
         resource.data = await mockPanelData(resource.panel.app, cwd, args.data, structuredClone(resource.panel.csp), false);
+        resource.panel.data_revision = resource.panel.revision;
       }
       if (args.title !== undefined) resource.panel.title = args.title;
       broadcast("panel_upserted", resource.panel);
@@ -908,6 +955,11 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       broadcast("panel_upserted", r.panel);
       removeWindowIfEmpty(prev);
       return {};
+    }
+    case "panel.preview_check": {
+      const r = panels.get(p.id);
+      if (!r || r.panel.closed || r.panel.app !== "web_preview") throw new Error("panel is not a web_preview");
+      return await mockPreviewCheck(String(r.data.url));
     }
     case "panel.event":
       if (!panels.has(p.panel_id)) throw new Error("panel not found");

@@ -273,9 +273,11 @@ export interface Panel {
   session_id: SessionId;
   window_id: WindowId | null;
   title: string;
-  app: "markdown" | "image" | "chart" | "table" | "pr_decision" | "pr_overview" | "custom";
+  app: "markdown" | "image" | "chart" | "table" | "pr_decision" | "pr_overview" | "web_preview" | "custom";
   csp: PanelCsp;
   revision: number;
+  /** The revision whose `panel_update` last carried data (absent from older backends). */
+  data_revision?: number;
   html_revision: number;
   created_at: number;
   updated_at: number;

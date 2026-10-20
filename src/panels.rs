@@ -132,6 +132,15 @@ fn input_html(cwd: &Path, inline: Option<String>, path: Option<String>) -> anyho
     Ok(html)
 }
 
+/// Muster's own ports: the UI and the panel server, which a web preview may never frame.
+pub fn own_ports(hub: &Hub) -> [u16; 2] { [hub.port(), hub.panels.port.load(Ordering::Relaxed)] }
+
+/// The stored input for `app` (a web preview's URL is checked against Muster's own ports).
+fn app_data(hub: &Hub, app: &str, cwd: &Path, data: Value, csp: &mut PanelCsp, opening: bool) -> anyhow::Result<Vec<u8>> {
+    if app == "web_preview" { return crate::web_preview::data(data, &own_ports(hub)) }
+    crate::panel_apps::data(app, cwd, data, csp, opening)
+}
+
 pub(crate) fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
     ensure!(data.is_object(), "panel data must be an object");
     let data = serde_json::to_vec(data)?;
@@ -185,7 +194,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
     let html = match builtin { None => supplied.context("custom apps need html or html_path")?,
         Some(html) => { ensure!(supplied.is_none(), "{} does not accept custom HTML", args.app); html.to_string() } };
     let mut csp = args.csp.unwrap_or_default();
-    let data = crate::panel_apps::data(&args.app, Path::new(&ch.cwd), args.data.unwrap_or_else(|| json!({})), &mut csp, true)?;
+    let data = app_data(hub, &args.app, Path::new(&ch.cwd), args.data.unwrap_or_else(|| json!({})), &mut csp, true)?;
     validate_csp(&csp)?;
     let title = title(&args.title)?;
     // Write the files under a temporary name first; the row commit names them.
@@ -205,7 +214,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
         ensure!(open.len() < MAX_OPEN_TOTAL, "Muster already has {MAX_OPEN_TOTAL} open panels; close some first");
         let now = now_ms();
         let mut panel = Panel { id: 0, channel_id: ch.id, session_id: s.id, window_id: s.window_id.or(ch.window_id),
-            title, app: args.app, csp, revision: 1, html_revision: 1,
+            title, app: args.app, csp, revision: 1, data_revision: 1, html_revision: 1,
             created_at: now, updated_at: now, closed: false, context: None, dropped_events: 0 };
         let mut placed = None;
         let created = hub.store().create_panel(&mut panel, |p| {
@@ -242,7 +251,7 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     let html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
     ensure!(html.is_none() || seen.app == "custom", "only custom apps accept HTML updates");
     let title = args.title.as_deref().map(title).transpose()?;
-    let data = args.data.map(|d| crate::panel_apps::data(&seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
+    let data = args.data.map(|d| app_data(hub, &seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
     // Unchanged HTML keeps its revision (the app keeps running), if nobody changed it meanwhile.
     let same_html = html.as_ref().is_some_and(|html| std::fs::read_to_string(app_file(hub, &seen)).is_ok_and(|old| old == *html));
     let folder = dir(hub, seen.id);
@@ -269,7 +278,10 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
             p.html_revision = p.revision;
             std::fs::rename(&staged_html, app_file(hub, &p))?;
         }
-        if data.is_some() { std::fs::rename(&staged_data, data_file(hub, &p))?; }
+        if data.is_some() {
+            p.data_revision = p.revision;
+            std::fs::rename(&staged_data, data_file(hub, &p))?;
+        }
         else { std::fs::hard_link(data_file(hub, &old), data_file(hub, &p))?; }
         if let Err(e) = hub.store().save_panel(&p) {
             let _ = std::fs::remove_file(data_file(hub, &p));
@@ -544,10 +556,30 @@ pub fn spawn(hub: Arc<Hub>) {
     });
 }
 
+/// A web preview's result tells the agent when its dev server is down, refuses framing or
+/// redirects away, so it can fix that without asking the user what the panel shows.
+async fn with_preview_note(hub: &Hub, id: PanelId, mut result: Value) -> Value {
+    if get(hub, id).is_ok_and(|p| p.app == "web_preview")
+        && let Ok((url, check)) = crate::web_preview::check_panel(hub, id).await
+        && let Some(note) = crate::web_preview::agent_note(&url, &check)
+    {
+        result["note"] = json!(note);
+    }
+    result
+}
+
 pub async fn tool(hub: &Arc<Hub>, session: SessionId, name: &str, args: Value) -> anyhow::Result<Value> {
     match name {
-        "panel_open" => Ok(json!({"panel_id": open(hub, session, serde_json::from_value(args)?)?})),
-        "panel_update" => { update(hub, session, serde_json::from_value(args)?)?; Ok(json!({})) },
+        "panel_open" => {
+            let id = open(hub, session, serde_json::from_value(args)?)?;
+            Ok(with_preview_note(hub, id, json!({"panel_id": id})).await)
+        },
+        "panel_update" => {
+            let args: Update = serde_json::from_value(args)?;
+            let (id, new_data) = (args.panel_id, args.data.is_some());
+            update(hub, session, args)?;
+            Ok(if new_data { with_preview_note(hub, id, json!({})).await } else { json!({}) })
+        },
         "panel_close" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { panel_id: PanelId }
             let p: P = serde_json::from_value(args)?;
@@ -756,6 +788,37 @@ mod tests {
         assert!(policy.contains("frame-src 'self'") && policy.contains("frame-ancestors http://127.0.0.1:7433"));
         assert!(validate_csp(&PanelCsp { frame_domains:vec!["https://example.com".into()], ..Default::default() }).is_err());
         assert!(PROXY.contains("event.source === frame.contentWindow") && PROXY.contains("uiOrigins.includes(event.origin)"));
+    }
+
+    #[tokio::test]
+    async fn web_previews_take_only_local_dev_servers() {
+        let hub = fixture();
+        hub.panels.port.store(40001, Ordering::Relaxed);
+        let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None };
+        let id = open(&hub, 1, preview("http://LOCALHOST:5173")).unwrap();
+        assert_eq!(resource(&hub, id).unwrap()["data"], json!({"url": "http://localhost:5173/"}));
+        for bad in ["https://github.com/", "http://127.0.0.1:40001/proxy", "http://localhost:5173@evil.example/", "http://[::1]:5173/"] {
+            assert!(open(&hub, 1, preview(bad)).is_err(), "{bad}");
+        }
+        let mut with_html = preview("http://localhost:5173");
+        with_html.html = Some("<p>x</p>".into());
+        assert!(open(&hub, 1, with_html).is_err(), "a web preview takes no HTML");
+        update(&hub, 1, Update { panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None }).unwrap();
+        let p = get(&hub, id).unwrap();
+        assert_eq!((p.revision, p.data_revision), (2, 1), "a title-only update keeps the data revision (no page reload)");
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None }).unwrap();
+        let p = get(&hub, id).unwrap();
+        assert_eq!((p.revision, p.data_revision), (3, 3), "a data update advances it");
+        assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://127.0.0.1:8000/docs");
+        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None }).is_err());
+        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None }).is_err());
+        // Nothing listens on the stored port (bound and released): the agent gets a note.
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": format!("http://127.0.0.1:{free}/")})), html: None, html_path: None }).unwrap();
+        let out = with_preview_note(&hub, id, json!({"panel_id": id})).await;
+        assert!(out["note"].as_str().unwrap().contains("Nothing answers"), "{out}");
+        assert!(with_preview_note(&hub, markdown(&hub), json!({})).await.get("note").is_none());
+        archive(&hub, 1).unwrap();
     }
 
     #[test]

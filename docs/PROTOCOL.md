@@ -1,7 +1,7 @@
 # Muster client protocol (v1)
 
 The daemon serves its UI and API on one localhost port (default 7433, else a free port).
-Panels use a second, ephemeral `127.0.0.1` listener serving only `GET /proxy`.
+Panels use a second, ephemeral `127.0.0.1` listener serving only `GET /proxy` and `GET /preview`.
 Discovery file: `$XDG_RUNTIME_DIR/muster/daemon.json` (fallback `~/.local/state/muster/daemon.json`),
 mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client token>", "version": "0.1.0"}`.
 
@@ -230,6 +230,7 @@ neither panel records nor panel events. The proxy listener has no daemon routes 
 |---|---|---|
 | `panel.open/update/close/list/wait/fetch_event` | `{from_session, arguments}` | Corresponding MCP tool result (`fetch_event` is `panel_event`); same task scope and guards |
 | `panel.resource` | `{id}` | `{panel, html, data}` |
+| `panel.preview_check` | `{id}` | A `web_preview` panel's dev server, checked by the backend at its stored URL only: `{reachable, answered?, status?, refused?, leaves_to?}` (below) |
 | `panel.event` | `{panel_id, kind, payload}` | `{}`; 16 KiB payload limit, 30 events/minute/panel |
 | `panel.context` | `{panel_id, context}` | `{}`; latest context, 16 KiB limit |
 | `panel.dismiss` | `{id}` | `{}`; close with a human `closed` event |
@@ -239,7 +240,7 @@ neither panel records nor panel events. The proxy listener has no daemon routes 
 WebSocket pushes: `panel_upserted` carries a full panel, `panel_removed` carries `{id}`.
 `hello.panels` contains open panels and `panel_origin` is `http://127.0.0.1:<panel_port>`.
 Records contain `id`, `channel_id`, `session_id` (opener), `window_id`, `title`, `app`, `csp`,
-`revision`, `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
+`revision`, `data_revision` (the revision of the last update that carried data), `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
 Schema v14 stores records in `panels` and queued events in `panel_events`; v15 adds `parked`
 (events a prompt showed as a placeholder, kept for `panel_event`). Immutable revision files
 under `<data>/panels/<id>/` are written, mode 0600, under temporary names outside the panel
@@ -257,6 +258,21 @@ The UI embeds `/proxy?csp=<JSON>` on the separate origin, with sandbox permissio
 CSP and the app's prepended meta CSP block connections, forms, objects and nested app frames.
 Asset sources extend only script/style/image/font/media directives. `connectDomains` are
 stored for future per-panel approval and grant no access. No token enters either frame.
+
+A `web_preview` panel skips the proxy: the UI draws its bar and embeds
+`/preview?url=<url>` on the panel origin, sandboxed with `allow-scripts allow-same-origin
+allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads` (no top
+navigation). The listener checks the URL again (loopback http(s), not the UI's or its own port)
+and answers a page with no script whose iframe loads the URL with the same sandbox, under the
+CSP `default-src 'none'; style-src 'unsafe-inline'; frame-src <the URL's origin>; ...;
+frame-ancestors <UI origins>`, so the dev page may navigate and redirect only within its own
+origin. IPv6 literals are refused, since a CSP source cannot name an IPv6 host.
+`panel.preview_check` connects to the stored URL (localhost tries 127.0.0.1, then ::1);
+for http it sends one `GET` and reads the response head: `refused` names an `X-Frame-Options`
+or `frame-ancestors` that would block the panel's frame, `leaves_to` a redirect to another
+origin; `answered: false` means no head within 3 s; https is only connected to
+(`answered: null`). Muster's own HTML pages send `X-Frame-Options: DENY` and
+`frame-ancestors 'none'`, so they cannot be framed by a preview or any site.
 
 The bridge speaks MCP Apps 2026-01-26 JSON-RPC: sandbox-ready/resource-ready handshake,
 initialize/initialized, tool-input/result, host-context-changed, size-changed, open-link,

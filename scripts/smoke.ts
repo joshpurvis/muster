@@ -422,6 +422,29 @@ exec cat > '${BASE}/fake-input'
     const response = await fetch(proxyOrigin + path); await response.body?.cancel(); return response.status;
   }));
   ok(deniedRoutes.every((status) => status === 404), "panel origin serves only /proxy");
+  // web_preview: a local dev server, checked by the backend and framed through /preview.
+  const devServer = Deno.serve({ port: 0, hostname: "127.0.0.1", onListen() {} }, () => new Response("<h1>dev</h1>", { headers: { "content-type": "text/html" } }));
+  const devUrl = `http://127.0.0.1:${devServer.addr.port}/`;
+  const preview = await mcp(shellToken, "panel_open", { title: "Smoke preview", app: "web_preview", data: { url: devUrl } });
+  ok(typeof preview.panel_id === "number" && preview.note === undefined, `web_preview opens on a running dev server without a note: ${JSON.stringify(preview)}`);
+  ok((await c.call("panel.preview_check", { id: preview.panel_id })).status === 200, "panel.preview_check reads the dev server");
+  const framed = await fetch(`${proxyOrigin}/preview?url=${encodeURIComponent(devUrl)}`);
+  const framedHtml = await framed.text();
+  ok(framed.status === 200 && framed.headers.get("content-security-policy")?.includes(`frame-src http://127.0.0.1:${devServer.addr.port};`)
+    && framedHtml.includes(`src="${devUrl}"`) && !framedHtml.includes("<script") && !framedHtml.includes(d.token), "/preview frames only the dev server's origin, with no script or token");
+  for (const bad of ["https://example.com/", `http://127.0.0.1:${PORT}/`, `${proxyOrigin}/proxy`]) {
+    const r = await fetch(`${proxyOrigin}/preview?url=${encodeURIComponent(bad)}`);
+    await r.body?.cancel();
+    ok(r.status === 400, `/preview refuses ${bad}`);
+    ok(await mcp(shellToken, "panel_open", { title: "Bad", app: "web_preview", data: { url: bad } }).then(() => false, (e) => /system browser|Muster's own/.test(String(e))), `web_preview panel_open refuses ${bad}`);
+  }
+  await devServer.shutdown();
+  const down = await mcp(shellToken, "panel_update", { panel_id: preview.panel_id, data: { url: devUrl } });
+  ok(String(down.note).includes("Nothing answers"), `a stopped dev server gives the agent a note: ${JSON.stringify(down)}`);
+  await mcp(shellToken, "panel_close", { panel_id: preview.panel_id });
+  const page = await fetch(`http://127.0.0.1:${PORT}/`);
+  await page.body?.cancel();
+  ok(page.headers.get("x-frame-options") === "DENY" && page.headers.get("content-security-policy") === "frame-ancestors 'none'", "Muster's own page refuses to be framed");
   await c.call("panel.context", { panel_id: pid, context: { structuredContent: { selection: 2 } } });
   const waiting = mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 5 });
   await sleep(150);

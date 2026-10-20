@@ -37,8 +37,28 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
 }
 
 /// This listener has no Hub, credentials, sessions, middleware or daemon routes.
-pub fn panel_router(ui_port: u16) -> Router {
-    Router::new().route("/proxy", get(panel_proxy)).with_state(ui_port)
+pub fn panel_router(ui_port: u16, panel_port: u16) -> Router {
+    Router::new()
+        .route("/proxy", get(panel_proxy)).with_state(ui_port)
+        .route("/preview", get(panel_preview)).with_state((ui_port, panel_port))
+}
+
+#[derive(Deserialize)]
+struct PanelPreviewQuery { url: String }
+
+/// A web_preview panel's frame (src/web_preview.rs): the dev server's URL, checked again here.
+async fn panel_preview(State((ui_port, panel_port)): State<(u16, u16)>, Query(query): Query<PanelPreviewQuery>) -> Response {
+    let (csp, html) = match crate::web_preview::page(&query.url, ui_port, panel_port) {
+        Ok(page) => page,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+         (header::CONTENT_SECURITY_POLICY, csp),
+         (header::CACHE_CONTROL, "no-store".to_string()),
+         (header::REFERRER_POLICY, "no-referrer".to_string()),
+         (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string())], html,
+    ).into_response()
 }
 
 #[derive(Deserialize)]

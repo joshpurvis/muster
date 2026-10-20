@@ -32,6 +32,10 @@ pub struct Panel {
     pub app: String,
     pub csp: PanelCsp,
     pub revision: i64,
+    /// The revision whose update last carried `data` (0 in records from before it existed).
+    /// A web preview reloads its page on a data change, not on a title-only update.
+    #[serde(default)]
+    pub data_revision: i64,
     pub html_revision: i64,
     pub created_at: i64,
     pub updated_at: i64,

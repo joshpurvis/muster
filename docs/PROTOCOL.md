@@ -163,6 +163,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.create` | `{name, kind? = "claude", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). Emits `agent_upserted`. |
 | `agent.update` | `{name, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Model, effort and permissions apply from its next start. Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
+| `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `agent.messages` | `{agent?, before?, limit? = 50 (max 200)}` | `{messages: AgentMessage[], more: bool}`, newest first: messages to `agent` (else every agent) with id below `before`. |
 | `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
 | `agent.memory.read` | `{name, path}` | `{path, text, size}`. `path` is relative to `memory/`: no absolute path, no `..`, `.` or empty parts. Every component is opened from the one before it (`openat` with `O_NOFOLLOW`, from the home folder's fd), so a link anywhere, also one swapped in during the call, is refused. At most 256 KB, UTF-8 only. |
@@ -188,6 +189,9 @@ type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "h
 type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
              model: string | null; effort: string | null; persona: string; permissions: Permissions;
              accepts: Origin[]; autostart: boolean };
+type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null;
+             efforts: string[] | null /* this model's levels where they differ; null: the CLI's */ }[];
+             efforts: string[] /* passed to --effort / -c model_reasoning_effort= */ };
 ```
 
 Agent events (also on `GET /api/events`; never sent to paired devices):

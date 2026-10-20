@@ -154,7 +154,7 @@ function render(el: Host) {
   const stacked = !!spec.stacked && (type === "area" || type === "bar");
   const narrow = width < 420;
   const height = Math.round(o.height || clamp(width * 0.44, 200, 380));
-  const title = spec.title || "Chart";
+  const title = spec.title || TYPE[type];
   const hadFocus = el.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
 
   if (isEmpty(spec) || !vis.length && !series.length) {
@@ -426,11 +426,15 @@ export function chart(el: HTMLElement, spec: KitChartSpec, o: ChartOptions = {})
     render(host);
   });
   el.addEventListener("focusout", (e) => {
-    const st = host._mk!;
-    if (e.target instanceof SVGElement && !el.contains(e.relatedTarget as Node | null)) {
+    if (!(e.target instanceof SVGElement)) return;
+    // A redraw replaces the focused SVG and puts focus back on the new one; only a real leave
+    // (focus now outside the chart) drops the tooltip.
+    setTimeout(() => {
+      const st = host._mk!;
+      if (el.contains(document.activeElement)) return;
       const pinned = st.o.pin ?? st.spec.pin ?? null;
       if (st.focus !== pinned) { st.focus = pinned; schedule(host); }
-    }
+    }, 0);
   });
   el.addEventListener("click", (e) => {
     const b = (e.target as Element).closest?.("[data-series]") as HTMLElement | null;

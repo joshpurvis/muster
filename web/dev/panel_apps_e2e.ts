@@ -5,7 +5,7 @@
 // Part of dev/e2e.ts; also runs alone (same flags as e2e.ts):
 //
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots>,src,dev,panels \
-//     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo>
+//     --allow-write=<shots>,/tmp dev/panel_apps_e2e.ts http://127.0.0.1:17761/#token=dev <shots> <repo> [cdp-port]
 import { type Browser, launch } from "./cdp.ts";
 import {
   actionsSample, chartSample, HEAD_SHA, lineSample, overviewSample, prMediaSample, prQuestionsSample, prSample, QUICK_SHA, tableSample,
@@ -93,7 +93,16 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
 
   const open = async (app: string, title: string, data: unknown) => {
     const pid = (await call("panel.open", { title, app, data })).panel_id as number;
-    return { pid, ...(await attach(pid)) };
+    const p = await attach(pid);
+    // The new tab's group may still be settling: click only once the app's width holds still.
+    let last = -1;
+    for (let i = 0; i < 40; i++) {
+      const w = await p.inApp("innerWidth");
+      if (w === last && w > 0) break;
+      last = w;
+      await a.sleep(120);
+    }
+    return { pid, ...p };
   };
   const close = (pid: number) => call("panel.close", { panel_id: pid });
   /** "?" (Shift+/), which the key helper cannot type. */
@@ -119,9 +128,10 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
   {
     const p = await open("image", "Icon", { path: "web/m/icon-512.png", alt: "Muster icon", caption: "The app icon, 512 px" });
     await p.waitIn(`document.querySelector('.stage img')?.naturalWidth === 512`);
+    check((await p.inApp(`[...document.querySelectorAll('.cap .mk-chip')].map((c) => c.textContent).join('|')`)).includes("512 × 512"), "the file facts show as chips");
     check(await p.inApp(`document.querySelector('.stage img').src.startsWith('data:image/png;base64,')`), "image arrives as a data URI");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('fit')`), "starts zoomed to fit");
-    await p.click(".bar button");
+    await p.click("#zoom-actual");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('actual')`), "button switches to actual size");
     await a.key("z");
     check(await p.inApp(`document.querySelector('.stage').classList.contains('fit')`), "Z switches back to fit");
@@ -143,22 +153,26 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     const p = await open("chart", "CI minutes", chartSample);
     await p.waitIn(`document.querySelector('svg[role=img]')`);
     check((await p.inApp(`document.querySelector('svg title').textContent`)) === "CI minutes per day", "svg title");
-    check((await p.inApp(`document.querySelector('svg desc').textContent`)).includes("Bar chart of 2 series"), "svg desc");
-    check((await p.inApp(`document.querySelectorAll('rect.bar').length`)) === 13, "13 bars (one null skipped)");
-    check((await p.inApp(`document.querySelectorAll('.sr-only table.data tbody tr').length`)) === 7, "hidden data table");
-    const [x, y] = await p.where(`rect.bar[data-i="3"]`);
+    check((await p.inApp(`document.querySelector('svg desc').textContent`)).includes("Bar chart of master, PRs"), "svg desc");
+    check((await p.inApp(`document.querySelectorAll('path.bar').length`)) === 13, "13 bars (one null skipped)");
+    check((await p.inApp(`document.querySelectorAll('.mk-sr table tbody tr').length`)) === 7, "hidden data table");
+    const [x, y] = await p.where(`path.bar[data-i="3"]`);
     await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    await p.waitIn(`!document.querySelector('.tip').hidden`);
-    const tip: string = await p.inApp(`document.querySelector('.tip').textContent`);
+    await p.waitIn(`document.querySelector('.mk-tip')`);
+    const tip: string = await p.inApp(`document.querySelector('.mk-tip').textContent`);
     check(tip.includes("Thu") && tip.includes("61") && tip.includes("110"), `hover tooltip: ${tip}`);
     await a.clickAt(x, y);
     await a.key("Right");
-    check((await p.inApp(`document.querySelector('[aria-live]').textContent`)).startsWith("Fri: master 70"), "arrow keys move the tooltip");
+    await p.waitIn(`document.querySelector('.mk-live').textContent.startsWith("Fri: master 70")`);
+    check((await p.inApp(`document.querySelector('.mk-live').textContent`)).includes("vs Thu"), "the live region reads the change from the day before");
+    await p.click("#toggle-table");
+    await p.waitIn(`document.querySelector('.mk-data table') && document.querySelector('#toggle-table').getAttribute('aria-expanded') === 'true'`);
+    await p.click("#toggle-table");
     await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 5, y: 5 });
     await p.shots2("chart-bar");
     await close(p.pid);
     const l = await open("chart", "Latency", lineSample);
-    await l.waitIn(`document.querySelectorAll('.marks path').length === 3`);
+    await l.waitIn(`document.querySelectorAll('path.line').length === 3`);
     await l.shots2("chart-line");
     await close(l.pid);
     ok("chart: bars and a gapped line render as SVG with title, desc, data table, hover and keyboard values");
@@ -504,11 +518,11 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     const order = () => ov.inApp(`[...document.querySelectorAll('.card')].map((c) => Number(c.id.slice(3)))`);
     const selectedNow = () => ov.inApp(`Number(document.querySelector('.card.selected')?.id.slice(3))`);
     check(JSON.stringify(await order()) === "[801,812,820,815]", `riskiest first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'quick'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-quick");
     check(JSON.stringify(await order()) === "[815,812,820,801]", `quick wins first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'oldest'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-oldest");
     check(JSON.stringify(await order()) === "[801,812,815,820]", `oldest first: ${await order()}`);
-    await ov.inApp(`(() => { const s = document.querySelector('#sort'); s.value = 'risk'; s.dispatchEvent(new Event('change')); })()`);
+    await ov.click("#sort-risk");
     await ov.click("h1");
     await question();
     await ov.waitIn(`document.querySelector('.shortcuts')?.textContent.includes('Hold: put aside for later') && document.activeElement?.id === 'shortcuts-close'`);
@@ -534,7 +548,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await a.key("Down");
     await a.key("Up");
     check((await selectedNow()) === 812, "J and the arrows move too");
-    check((await ov.inApp(`document.querySelector('#pr-801 .chips').textContent`)).includes("Checks failing"), "checks badge");
+    check((await ov.inApp(`document.querySelector('#pr-801 .meta').textContent`)).includes("Checks failing"), "checks: an icon and a word");
     check((await ov.inApp(`document.querySelector('#pr-801 .meta').textContent`)).includes("Draft"), "draft flag");
     check((await events(ov.pid)).length === 0, "moving sends nothing");
     await ov.shots2("pr-overview");
@@ -589,7 +603,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await events(d.pid);
     ok("pr_decision: an enlarged picture is modal (confirm closed, background inert, Tab trapped, keys blocked), zooms to actual size with Z, and closes when the agent replaces it");
     await d.waitIn(`document.querySelector('.media-chart svg[role=img]')`);
-    check((await d.inApp(`document.querySelectorAll('.media-chart rect.bar').length`)) === 6, "media chart drawn with the chart app's code");
+    check((await d.inApp(`document.querySelectorAll('.media-chart path.bar').length`)) === 6, "media chart drawn with the chart app's code");
     check((await d.inApp(`document.querySelector('.media-chart svg title').textContent`)) === "Bar chart", "chart title");
     // Clear of the sticky action bar at the bottom.
     await d.inApp(`document.querySelector('#media-0').scrollIntoView({ block: 'center' })`);
@@ -613,7 +627,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     await close(d.pid);
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held", "Put aside from the decision panel."), current: undefined } });
     await ov.waitIn(`document.querySelector('.group.g-held') && [...document.querySelectorAll('.card')].pop()?.id === 'pr-812'`);
-    check((await ov.inApp(`document.querySelector('.repo').textContent`)).includes("1 held"), "header counts the held PR");
+    check((await ov.inApp(`document.querySelector('#counts').textContent`)).includes("1 held"), "header counts the held PR");
     check((await ov.inApp(`getComputedStyle(document.querySelector('#pr-812')).opacity`)) === "1", "a held card keeps full-contrast text");
     ok("pr_decision: H sends one hold event; the overview groups the held PR at the end");
 
@@ -649,11 +663,11 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     // Quick wins: a reviewed card merges from here, behind the same confirm and exact command.
     await a.sleep(5600);
     await call("panel.update", { panel_id: ov.pid, data: { ...status(812, "held"), current: undefined } });
-    await ov.waitIn(`document.querySelector('#pr-815 .badge.quick') && document.querySelector('#quick-only')?.textContent === 'Quick wins (1)'`);
+    await ov.waitIn(`document.querySelector('#pr-815 .quick') && document.querySelector('#quick-only')?.textContent === 'Only quick wins (1)'`);
     await ov.click("#quick-only");
     await ov.waitIn(`document.querySelectorAll('.card').length === 1 && document.querySelector('#pr-815')`);
     await ov.click("#pr-815 .title");
-    check(await ov.inApp(`!!document.querySelector('#merge')`), "a selected quick win shows Merge");
+    check(await ov.inApp(`!!document.querySelector('#pr-815 #merge-815')`), "a quick win carries its own Merge");
     await a.key("m");
     await ov.waitIn(`document.querySelector('.drawer pre.command') && document.activeElement?.id === 'confirm-merge'`);
     const qcmd: string = await ov.inApp(`document.querySelector('.drawer pre.command').textContent`);
@@ -676,7 +690,7 @@ export async function panelApps({ a, repo, shots, ok, check }: PanelAppsContext)
     check(got.length === 1 && got[0].kind === "merge" && JSON.stringify(got[0].payload._meta.muster.data) === JSON.stringify({ action: "merge", repo: "acme/api",
       number: 815, base: "master", method: "squash", delete_branch: true, head_sha: QUICK_SHA, answers: {}, options: [] }), `quick merge event: ${JSON.stringify(got)}`);
     check(String(got[0].payload.content.text).endsWith(qcmd), "the event text ends with the command");
-    check(await ov.inApp(`document.querySelector('#merge').disabled`), "Merge waits for the agent");
+    check(await ov.inApp(`document.querySelector('#merge-815').disabled`), "Merge waits for the agent");
     await call("panel.update", { panel_id: ov.pid, data: quick({ status: "merged", status_detail: "Merged as 4c2e1aa." }) });
     await ov.waitIn(`!document.querySelector('#pr-815') || document.querySelector('#pr-815 .badge.status')?.textContent === 'Merged'`);
     await ov.click("#quick-only");
@@ -886,12 +900,14 @@ async function webPreview({ a, R, call, shots, ok, check }: {
 }
 
 if (import.meta.main) {
-  const [url, shots, repo] = Deno.args;
+  const [url, shots, repo, cdp] = Deno.args;
   if (!url || !shots || !repo) {
     console.error("usage: panel_apps_e2e.ts <url#token=..> <shots-dir> <repo-path>");
     Deno.exit(2);
   }
-  const a = await launch(9351, "/tmp/muster-cdp-panel-apps");
+  // A CDP port of the caller's choosing (default 9351), so parallel runs never share a browser.
+  const port = Number(cdp ?? 9351);
+  const a = await launch(port, `/tmp/muster-cdp-panel-apps-${port}`);
   let step = 0;
   try {
     await a.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });

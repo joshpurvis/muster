@@ -2,15 +2,15 @@
 // (placement.ts). A web preview is drawn by WebPreview.tsx instead of the sandbox proxy.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { focusedTabId, helloEpoch, layout, meta, updateLayout, windowPanels } from "../state.ts";
-import { focusActiveTerminalSoon, focusGroup } from "../actions.ts";
+import { channels, focusedTabId, helloEpoch, layout, meta, sessions, updateLayout, windowPanels } from "../state.ts";
+import { closeTab, focusActiveTerminalSoon, focusGroup } from "../actions.ts";
+import { panelTab } from "../layout/tree.ts";
+import { ago, APP_KIND, KitIcon } from "./KitIcon.tsx";
 import { panelChords, runPanelKey } from "../keys.ts";
 import type { Panel, PanelResource } from "../types.ts";
 import { ACTIVATION, PanelBridge } from "./bridge.ts";
 import { panelOriginUrl, panelReloads, reloadPanel, slots, slotsChanged, usePanelPlacement } from "./placement.ts";
 import { WebPreview } from "./WebPreview.tsx";
-
-const APP_NAMES: Record<string, string> = { markdown: "Markdown", image: "Image", chart: "Chart", table: "Table", pr_decision: "PR decision", pr_overview: "PR overview" };
 
 export { reloadPanel };
 
@@ -43,6 +43,18 @@ export function PanelLayer() {
 
 type Stage = "resource" | "proxy" | "app" | "init" | "ready";
 
+/** Where a panel stalled, as the error's evidence line. */
+const STAGE_STEP: Record<Exclude<Stage, "ready">, string> = {
+  resource: "panel.resource", proxy: "the sandbox proxy", app: "ui/initialize", init: "ui/notifications/initialized",
+};
+/** The same, in plain words for the error's sentence (STALLED below carries the technical one too). */
+const STALLED_TEXT: Record<Exclude<Stage, "ready">, string> = {
+  resource: "Muster could not hand this panel its content.",
+  proxy: "The panel's sandbox did not load, so it can't show anything.",
+  app: "The agent's page never answered Muster's hello, so it can't show anything.",
+  init: "The agent's page answered Muster's hello but never said it was ready.",
+};
+
 const STALLED: Record<Exclude<Stage, "ready">, string> = {
   resource: "The panel's content did not arrive from Muster.",
   proxy: "The panel sandbox did not load: the panel server is unreachable or this window blocked it.",
@@ -59,6 +71,7 @@ function PanelView({ panel }: { panel: Panel }) {
   const generation = useRef(0);
   const { ref, visible, paneId, tab, active, zoomed, split, dim } = usePanelPlacement(panel.id, iframe);
   const stageRef = useRef<Stage>("resource");
+  const stallAt = useRef<Exclude<Stage, "ready">>("resource");
   const timer = useRef(0);
   // A failed resource fetch, and an app that stalled during its handshake.
   const [error, setError] = useState("");
@@ -195,6 +208,7 @@ function PanelView({ panel }: { panel: Panel }) {
       });
       timer.current = setTimeout(() => {
         if (run !== generation.current || stageRef.current === "ready") return;
+        stallAt.current = stageRef.current as Exclude<Stage, "ready">;
         const stalled = STALLED[stageRef.current];
         setStall(appErrorRef.current ? `${stalled} The app reported: ${appErrorRef.current}` : stalled);
       }, LOAD_TIMEOUT_MS);
@@ -215,23 +229,77 @@ function PanelView({ panel }: { panel: Panel }) {
       // Host controls (Reload panel) select the group when tabbed to, as the app frame does.
       onFocusCapture={() => { if (paneId.current) focusGroup(paneId.current); }}
     >
-      <div class="panel-sandbox-label">Panel · {APP_NAMES[panel.app] ?? "Custom app"}</div>
+      <PanelStrip panel={panel} state={error || stall ? "err" : stage !== "ready" ? "loading" : "live"} />
       <div class="panel-body">
         <div class="panel-frame-host" ref={frameHost} />
         {error || stall
         ? (
-          <div class="panel-status" role="alert">
-            <p>{error || stall}</p>
-            <button type="button" class="btn" onClick={() => reloadPanel(panel.id)}>Reload panel</button>
+          <div class="panel-status failed" role="alert">
+            <div class="ps-card">
+              <span class="ps-orb bad"><KitIcon name="alert" size={20} /></span>
+              <h3>{error ? "This panel could not be loaded" : "This panel didn't finish starting"}</h3>
+              <p>{error ? "Muster could not load this panel. Reload tries again." : STALLED_TEXT[stallAt.current]}</p>
+              <pre class="panel-status-detail">{error ? error : [
+                `Stalled at: ${STAGE_STEP[stallAt.current]}`,
+                stall,
+                `Waited: ${LOAD_TIMEOUT_MS / 1000} s · revision ${panel.revision}`,
+              ].join("\n")}</pre>
+              <div class="ps-acts">
+                <button type="button" class="btn btn-primary" onClick={() => reloadPanel(panel.id)}><KitIcon name="refresh" /> Reload</button>
+                <button type="button" class="btn btn-ghost" onClick={() => closeTab(panelTab(panel.id))}>Close panel</button>
+              </div>
+            </div>
           </div>
         )
         : stage !== "ready" && (
-          <div class="panel-status" role="status">
-            <p>Loading panel…</p>
+          <div class="panel-status loading" role="status">
+            <Skeleton app={panel.app} />
+            <p class="ps-loading">Loading panel…</p>
             {appError && <p class="panel-status-detail">The app reported: {appError}</p>}
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** The strip above a panel: what it is, who opened it, how fresh it is, and that it is sandboxed. */
+function PanelStrip({ panel, state }: { panel: Panel; state: "live" | "loading" | "err" }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    // "updated 14 s ago" keeps itself current.
+    const t = setInterval(() => tick((n) => n + 1), 15_000);
+    return () => clearInterval(t);
+  }, []);
+  const [icon, name] = APP_KIND[panel.app] ?? APP_KIND.custom;
+  const s = sessions.value.get(panel.session_id);
+  const ch = channels.value.find((c) => c.id === panel.channel_id);
+  const who = s ? (ch && ch.name !== s.name ? `${s.name} in ${ch.name}` : s.name) : ch?.name;
+  const live = state === "err" ? "stopped starting" : state === "loading" ? "loading…" : `updated ${ago(panel.updated_at)}`;
+  return (
+    <div class="panel-strip panel-sandbox-label">
+      <span class="ps-kind"><KitIcon name={icon} />{name}</span>
+      {who && <span class="ps-sep" aria-hidden="true">·</span>}
+      {who && <span class="ps-who">opened by <b>{who}</b></span>}
+      <span class="ps-r">
+        <span class={`ps-live ${state}`}>{live}</span>
+        <span class="ps-lock" title="Runs in a sandbox on its own origin, with no network"><KitIcon name="lock" size={12} />sandboxed</span>
+      </span>
+    </div>
+  );
+}
+
+/** A skeleton of the panel the app will become, while it loads. */
+function Skeleton({ app }: { app: string }) {
+  const bars = app === "chart" || app === "board";
+  return (
+    <div class="ps-skel" aria-hidden="true">
+      <div class="skel" style="height:12px;width:34%" />
+      <div class="skel" style="height:22px;width:62%" />
+      <div class="skel" style="height:12px;width:84%" />
+      {bars
+        ? <div class="skel-chart">{[46, 70, 40, 82, 100, 22, 14].map((h, i) => <div key={i} class="skel" style={`height:${h}%`} />)}</div>
+        : <div class="skel-rows">{[1, 2, 3, 4, 5].map((i) => <div key={i} class="skel" style="height:14px" />)}</div>}
     </div>
   );
 }

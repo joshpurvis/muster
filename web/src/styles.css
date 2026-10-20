@@ -3704,12 +3704,36 @@ textarea {
   pointer-events: none;
   box-shadow: inset 1px 0 0 var(--pane-focus-ring), inset -1px 0 0 var(--pane-focus-ring), inset 0 -1px 0 var(--pane-focus-ring);
 }
-.panel-sandbox-label {
-  padding: 3px 12px;
-  font-size: 11px;
-  color: var(--text-muted);
+/* The strip above a panel: the app and who opened it, how fresh it is, and that it is
+   sandboxed. "loading…" in grey while it starts, "stopped starting" in red if it never did. */
+.panel-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  flex: none;
+  padding: 0 12px 0 10px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
+  font-size: 12px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  container-type: inline-size;
 }
+.panel-strip .ps-kind { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-weight: 600; flex: none; }
+.panel-strip .ps-kind svg { color: var(--accent-strong); }
+.panel-strip .ps-sep { opacity: .5; }
+.panel-strip .ps-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.panel-strip .ps-who b { color: var(--text-muted); font-weight: 500; }
+.panel-strip .ps-r { margin-left: auto; display: flex; align-items: center; gap: 10px; flex: none; }
+.panel-strip .ps-live { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); }
+.panel-strip .ps-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--st-idle); }
+.panel-strip .ps-live.loading::before { background: var(--text-faint); }
+.panel-strip .ps-live.err { color: var(--st-error); }
+.panel-strip .ps-live.err::before { background: var(--st-error); }
+.panel-strip .ps-lock { display: inline-flex; align-items: center; gap: 4px; }
+@container (max-width: 460px) { .panel-strip .ps-who, .panel-strip .ps-sep, .panel-strip .ps-lock { display: none; } }
 .panel-body { flex: 1; min-height: 0; position: relative; }
 .panel-frame-host { position: absolute; inset: 0; }
 .panel-frame { display: block; width: 100%; height: 100%; border: 0; }
@@ -3719,7 +3743,6 @@ textarea {
   inset: 0;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: 10px;
   padding: 18px 20px;
   overflow: auto;
@@ -3730,44 +3753,70 @@ textarea {
 }
 .panel-status p { margin: 0; max-width: 70ch; overflow-wrap: anywhere; }
 .panel-status-detail { color: var(--text-muted); }
+/* A failure or a web preview notice: what happened, why, the evidence, and what to do. */
+.panel-status.failed, .panel-status.pv-notice { display: grid; place-items: center; padding: 24px; }
+.ps-card { max-width: 460px; width: 100%; display: flex; flex-direction: column; gap: 0; }
+.ps-orb { width: 48px; height: 48px; border-radius: 14px; display: grid; place-items: center; margin-bottom: 16px; --vc: var(--st-attn); color: var(--vc); background: color-mix(in srgb, var(--vc) 14%, transparent); }
+.ps-orb.bad { --vc: var(--st-error); }
+.ps-orb.warn { --vc: var(--st-attn); }
+.ps-orb.info { --vc: var(--st-working); }
+.ps-card h3 { margin: 0; font-size: 17px; letter-spacing: -0.015em; color: var(--text); font-weight: 640; line-height: 1.3; }
+.ps-card > p { margin: 6px 0 0; font-size: 14px; color: var(--text-muted); line-height: 1.55; }
+.ps-card pre.panel-status-detail, .ps-card .pv-why {
+  margin: 12px 0 0; padding: 9px 11px; border-radius: 8px; background: var(--bg-0); border: 1px solid var(--border);
+  font: 12px/1.55 var(--font-mono); color: var(--text-muted); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.ps-acts, .preview-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.pv-tick { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12px; color: var(--text-faint); flex-wrap: wrap; }
+.pv-tick .pbar { flex: 1 1 40px; min-width: 40px; height: 3px; border-radius: 2px; background: var(--bg-3); overflow: hidden; }
+.pv-tick .pbar i { display: block; height: 100%; background: var(--st-attn); border-radius: 2px; }
+.ps-card .preview-status-url { margin-top: 10px; font-size: 12px; color: var(--text-faint); }
+/* Loading: a skeleton of the panel it will become. */
+.panel-status.loading { background: var(--bg-1); }
+.ps-skel { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+.ps-skel .skel { border-radius: 6px; background: linear-gradient(90deg, var(--bg-3) 0%, var(--bg-4) 40%, var(--bg-3) 80%) 0 0/300% 100%; animation: ps-shimmer 1.6s linear infinite; }
+.ps-skel .skel-chart { flex: 1; min-height: 80px; max-height: 220px; display: flex; align-items: flex-end; gap: 14px; margin-top: 16px; padding: 0 4px; border-bottom: 1px solid var(--border); }
+.ps-skel .skel-chart .skel { flex: 1; border-radius: 5px 5px 0 0; }
+.ps-skel .skel-rows { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+.ps-loading { color: var(--text-faint); font-size: 13px; }
+@keyframes ps-shimmer { to { background-position: -150% 0; } }
+@media (prefers-reduced-motion: reduce) { .ps-skel .skel { animation: none; } }
 body.dragging .panel-view { pointer-events: none; }
-/* Web preview (panels/WebPreview.tsx): the host's own bar above a local dev server's page. It
-   wraps by the panel's own width (a narrow split in a wide window): the address takes its own
-   row and the buttons never leave the panel. */
+/* Web preview (panels/WebPreview.tsx): the host's own bar above a local dev server's page: an
+   address field with a status dot (green: showing; amber: the server answered but the page can't
+   be shown here; hollow: waiting), a "local only" tag, Reload and Open in browser. It wraps by
+   the panel's own width (a narrow split in a wide window); the buttons never leave the panel. */
 .panel-view[data-web-preview] { container-type: inline-size; }
 .preview-bar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 8px;
+  gap: 6px 8px;
   min-width: 0;
-  padding: 4px 8px 4px 12px;
+  padding: 6px 8px 6px 10px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg-1);
   font-size: 12px;
 }
-.preview-kind { flex: none; color: var(--text-muted); font-size: 11px; }
-/* The address: an input that reads as a label until hovered or focused. */
-.preview-url {
-  flex: 1 1 14ch;
-  min-width: 0;
-  width: auto;
-  height: 24px;
-  padding: 0 6px;
-  border: 1px solid transparent;
-  border-radius: var(--r);
-  background: transparent;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font: inherit;
-  font-family: var(--font-mono);
-  color: var(--text);
+.pv-addr {
+  flex: 1 1 18ch; min-width: 0; display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px;
+  border-radius: 8px; background: var(--bg-0); box-shadow: inset 0 0 0 1px var(--border);
 }
-.preview-url:hover { border-color: var(--border); }
-/* Keyboard and mouse focus alike: the accent border and ring (the label look gives no other cue). */
-.preview-url:focus { border-color: var(--accent); background: var(--bg-2); outline: none; box-shadow: 0 0 0 1px var(--accent); }
-.preview-url[aria-invalid] { border-color: var(--st-error); }
+.pv-addr:focus-within { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 1px var(--accent); }
+.pv-st { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--st-idle); }
+.pv-st.wait { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-faint); }
+.pv-st.warn { background: var(--st-attn); }
+/* The address: an input that reads as a label until focused. */
+.preview-url {
+  flex: 1 1 auto; min-width: 0; width: auto; height: 26px; padding: 0; border: 0; background: transparent;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 13px var(--font-mono); color: var(--text); outline: none;
+}
+.pv-addr input.preview-url { border: 0; border-radius: 0; background: transparent; box-shadow: none; padding: 0; }
+.preview-url[aria-invalid] { color: var(--st-error); }
 .preview-url[readonly] { color: var(--text-muted); }
+.pv-tag { margin-left: auto; flex: none; display: inline-flex; gap: 4px; align-items: center; font-size: 11px; color: var(--text-faint); }
+.pv-btn { flex: none; height: 28px; border-radius: 8px; }
+.pv-btn.icon { width: 28px; padding: 0; }
 .preview-address-error {
   padding: 5px 12px;
   border-bottom: 1px solid var(--border);
@@ -3777,20 +3826,28 @@ body.dragging .panel-view { pointer-events: none; }
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-.preview-bar .btn { flex: none; max-width: 100%; }
 @container (max-width: 440px) {
-  .preview-kind { display: none; }
-  .preview-url { flex-basis: 100%; }
+  .pv-addr { flex-basis: 100%; }
+  .pv-tag { display: none; }
 }
+.pv-progress { height: 2px; flex: none; background: linear-gradient(90deg, transparent, var(--accent) 40%, var(--accent) 60%, transparent) 0 0/200% 100%; animation: pv-sweep 1.4s linear infinite; }
+@keyframes pv-sweep { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+@media (prefers-reduced-motion: reduce) { .pv-progress { animation: none; } }
 .preview-hint {
-  padding: 5px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
   border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-  color: var(--text-muted);
-  font-size: 12px;
+  background: var(--attn-bg);
+  color: var(--text);
+  font-size: 13px;
   line-height: 1.4;
 }
 .preview-hint strong { color: var(--text); font-weight: 600; }
+.preview-hint .btn { margin-left: auto; flex: none; }
+.pv-spin { width: 13px; height: 13px; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--st-attn) 30%, transparent); border-top-color: var(--st-attn); flex: none; animation: pv-rot .8s linear infinite; }
+@keyframes pv-rot { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .pv-spin { animation: none; } }
 .preview-frame { background: #fff; }
 .preview-status-url { font-family: var(--font-mono); overflow-wrap: anywhere; }
-.preview-actions { display: flex; flex-wrap: wrap; gap: 8px; }

@@ -551,8 +551,8 @@ main { max-width: none; display: flex; flex-direction: column; height: 100vh; }
 .img-zoom[hidden], .mk-chip[hidden] { display: none; }
 .cap { flex: none; display: flex; justify-content: space-between; align-items: center; gap: 10px 16px; margin-top: 14px; font-size: 14px; color: var(--mk-text-2); flex-wrap: wrap; }
 .cap .caption { min-width: 0; }
-.cap .meta { display: flex; gap: 8px; flex-wrap: wrap; }
-.cap .mk-chip.source { max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 22px; }
+.cap .meta { display: flex; gap: 8px; flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.cap .mk-chip.source { max-width: min(40ch, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 22px; }
 @media (max-width: 520px) {
   .img-stage { padding: 12px; }
   .img-tools { top: 8px; right: 8px; }

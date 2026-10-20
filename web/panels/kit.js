@@ -505,7 +505,7 @@
     const stacked = !!spec.stacked && (type === "area" || type === "bar");
     const narrow = width < 420;
     const height = Math.round(o.height || clamp(width * 0.44, 200, 380));
-    const title = spec.title || "Chart";
+    const title = spec.title || TYPE[type];
     const hadFocus = el.contains(document.activeElement) ? document.activeElement : null;
     if (isEmpty(spec) || !vis.length && !series.length) {
       el.innerHTML = `<div class="mk-empty" role="img" aria-label="${esc(title)}: no data" style="min-height:${Math.min(height, 200)}px">${icon("chart")}<b>No data to show</b><span>${esc(spec.empty || "The agent sent this chart without any values.")}</span></div>`;
@@ -855,14 +855,16 @@
       render(host);
     });
     el.addEventListener("focusout", (e) => {
-      const st = host._mk;
-      if (e.target instanceof SVGElement && !el.contains(e.relatedTarget)) {
+      if (!(e.target instanceof SVGElement)) return;
+      setTimeout(() => {
+        const st = host._mk;
+        if (el.contains(document.activeElement)) return;
         const pinned = st.o.pin ?? st.spec.pin ?? null;
         if (st.focus !== pinned) {
           st.focus = pinned;
           schedule(host);
         }
-      }
+      }, 0);
     });
     el.addEventListener("click", (e) => {
       const b = e.target.closest?.("[data-series]");

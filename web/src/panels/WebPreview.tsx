@@ -11,7 +11,7 @@ import { IconGlobe, IconRestart } from "../icons.tsx";
 import type { Panel, PanelResource } from "../types.ts";
 import { panelOriginUrl, panelReloads, usePanelPlacement } from "./placement.ts";
 import {
-  isPreviewUrl, type Notice, type PreviewCheck, previewFrameSrc, previewNotice, RETRY_FOR_MS, RETRY_MS, SLOW_MS, SLOW_NOTICE,
+  isPreviewUrl, type Notice, type PreviewCheck, previewFrameSrc, previewNotice, previewRevision, SLOW_MS, SLOW_NOTICE, startChecks,
 } from "./preview.ts";
 
 /** Sandboxed, but a real page: its own origin, scripts, forms and popups (which open in the
@@ -22,21 +22,24 @@ export function WebPreview({ panel }: { panel: Panel }) {
   const iframe = useRef<HTMLIFrameElement | null>(null);
   const { ref, paneId, split, dim } = usePanelPlacement(panel.id, iframe);
   const origin = panelOriginUrl();
-  // The address, and the panel revision it came with: every panel_update loads the page again
-  // (even at the same address, for servers that do not reload by themselves).
+  // The address, and the data revision it came with: each data update loads the page again
+  // (even at the same address, for servers that do not reload by themselves); a title-only
+  // update does not.
   const [shown, setShown] = useState<{ url: string | null; revision: number }>({ url: null, revision: 0 });
   const url = shown.url;
   const [error, setError] = useState("");
   // Bumped by Reload (and by the server coming up): a new frame loads the page afresh.
   const [load, setLoad] = useState(0);
-  const [loaded, setLoaded] = useState(false);
-  const [slow, setSlow] = useState(false);
-  const [check, setCheck] = useState<PreviewCheck | null>(null);
-  const [retrying, setRetrying] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
   const reloads = panelReloads.value.get(panel.id) ?? 0;
   const epoch = helloEpoch.value;
   const frameKey = `${url}#${shown.revision}#${load}#${reloads}`;
+  // Per-frame state is stamped with the frame it belongs to, so a new frame starts clean
+  // without a reset that could land after its own load event.
+  const [loadedKey, setLoadedKey] = useState("");
+  const [slowKey, setSlowKey] = useState("");
+  const [dismissedKey, setDismissedKey] = useState("");
+  const [checked, setChecked] = useState<{ key: string; check: PreviewCheck | null; retrying: boolean }>({ key: "", check: null, retrying: false });
+  const current = checked.key === frameKey ? checked : { check: null, retrying: false };
 
   useEffect(() => {
     let live = true;
@@ -44,8 +47,9 @@ export function WebPreview({ panel }: { panel: Panel }) {
       if (!live) return;
       // The backend accepts only these; refuse anything else here too rather than frame it.
       const next = isPreviewUrl(r.data.url) ? r.data.url : null;
+      const revision = previewRevision(r.panel);
       setError(next ? "" : "This preview's address is not a local dev server, so Muster will not show it here.");
-      setShown((old) => old.url === next && old.revision === r.panel.revision ? old : { url: next, revision: r.panel.revision });
+      setShown((old) => old.url === next && old.revision === revision ? old : { url: next, revision });
     }).catch((e) => { if (live) setError(`Could not load the panel: ${String(e?.message ?? e)}`); });
     return () => { live = false; };
   }, [panel.id, panel.revision, reloads, epoch]);
@@ -53,36 +57,17 @@ export function WebPreview({ panel }: { panel: Panel }) {
   // Each new frame: a load timeout, and the backend's check, repeated while nothing answers.
   useEffect(() => {
     if (!url || !origin) return;
-    let live = true;
-    setLoaded(false);
-    setSlow(false);
-    setCheck(null);
-    setDismissed(false);
-    setRetrying(false);
-    const slowTimer = setTimeout(() => { if (live) setSlow(true); }, SLOW_MS);
-    const until = Date.now() + RETRY_FOR_MS;
-    let retry = 0;
-    let wasDown = false;
-    const run = () => {
-      rpc.call<PreviewCheck>("panel.preview_check", { id: panel.id }).then((c) => {
-        if (!live) return;
-        if (c.reachable && wasDown) {
-          // The server came up: load the page now rather than leave a browser error showing.
-          setLoad((n) => n + 1);
-          return;
-        }
-        wasDown = !c.reachable;
-        const again = wasDown && Date.now() < until;
-        setRetrying(again);
-        setCheck(c);
-        if (again) retry = setTimeout(run, RETRY_MS);
-      }).catch(() => { /* An older backend, or the panel closed: the frame alone it is. */ });
-    };
-    run();
+    const key = frameKey;
+    const slowTimer = setTimeout(() => setSlowKey(key), SLOW_MS);
+    const stop = startChecks({
+      check: () => rpc.call<PreviewCheck>("panel.preview_check", { id: panel.id }),
+      report: (check, retrying) => setChecked({ key, check, retrying }),
+      // The server came up: load the page now rather than leave a browser error showing.
+      up: () => setLoad((n) => n + 1),
+    });
     return () => {
-      live = false;
       clearTimeout(slowTimer);
-      clearTimeout(retry);
+      stop();
     };
   }, [frameKey, origin]);
 
@@ -97,7 +82,9 @@ export function WebPreview({ panel }: { panel: Panel }) {
 
   const reload = () => setLoad((n) => n + 1);
   const openInBrowser = () => { if (url) globalThis.open(url, "_blank", "noopener,noreferrer"); };
-  const notice: Notice | null = (dismissed ? null : previewNotice(check, retrying)) ?? (slow && !loaded ? SLOW_NOTICE : null);
+  const loaded = loadedKey === frameKey;
+  const notice: Notice | null = (dismissedKey === frameKey ? null : previewNotice(current.check, current.retrying))
+    ?? (slowKey === frameKey && !loaded ? SLOW_NOTICE : null);
   const problem = !origin ? "The backend did not provide a separate panel origin." : error;
 
   return (
@@ -107,6 +94,9 @@ export function WebPreview({ panel }: { panel: Panel }) {
       data-panel-view={panel.id}
       data-web-preview=""
       onPointerDown={() => { if (paneId.current) focusGroup(paneId.current); }}
+      // Tabbing onto the bar's buttons selects this panel's group, like a click, so group
+      // commands (Alt+W) act on it.
+      onFocusCapture={() => { if (paneId.current) focusGroup(paneId.current); }}
     >
       <div class="preview-bar">
         <span class="preview-kind">Web preview</span>
@@ -137,7 +127,7 @@ export function WebPreview({ panel }: { panel: Panel }) {
               allow="clipboard-write; fullscreen"
               referrerPolicy="no-referrer"
               src={previewFrameSrc(origin, url)}
-              onLoad={() => setLoaded(true)}
+              onLoad={() => setLoadedKey(frameKey)}
               onFocus={() => { if (paneId.current) focusGroup(paneId.current); }}
             />
           )}
@@ -156,7 +146,7 @@ export function WebPreview({ panel }: { panel: Panel }) {
               <div class="preview-actions">
                 <button type="button" class="btn" onClick={reload}>Reload</button>
                 <button type="button" class="btn" onClick={openInBrowser}>Open in browser</button>
-                {notice.kind !== "down" && <button type="button" class="btn" onClick={() => setDismissed(true)}>Show the page anyway</button>}
+                {notice.kind !== "down" && <button type="button" class="btn" onClick={() => setDismissedKey(frameKey)}>Hide this notice</button>}
               </div>
             </div>
           )}

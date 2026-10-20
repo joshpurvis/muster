@@ -212,6 +212,8 @@ function PanelView({ panel }: { panel: Panel }) {
       class={dim ? "panel-view dim" : split ? "panel-view ring" : "panel-view"}
       data-panel-view={panel.id}
       onPointerDown={() => { if (paneId.current) focusGroup(paneId.current); }}
+      // Host controls (Reload panel) select the group when tabbed to, as the app frame does.
+      onFocusCapture={() => { if (paneId.current) focusGroup(paneId.current); }}
     >
       <div class="panel-sandbox-label">Panel · {APP_NAMES[panel.app] ?? "Custom app"}</div>
       <div class="panel-body">

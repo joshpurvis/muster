@@ -6,8 +6,10 @@
 //! or redirect only within its own origin, never to Muster's own ports or off loopback, and
 //! agent-written apps gain nothing: nested frames stay blocked in the sandbox.
 //!
-//! Only loopback http(s) URLs are accepted (`localhost`, `127.0.0.1`, `[::1]`, any port but
-//! Muster's own), checked here at `panel_open`/`panel_update` and again when `/preview` is served.
+//! Only loopback http(s) URLs are accepted (`localhost` or `127.0.0.1`, any port but Muster's
+//! own), checked here at `panel_open`/`panel_update` and again when `/preview` is served. IPv6
+//! literals (`[::1]`) are refused: browsers cannot name an IPv6 host in a CSP source, so such a
+//! frame could not be held to its origin; `localhost` reaches a server on ::1 too.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -22,20 +24,21 @@ pub const PAGE: &str = include_str!("../web/panels/preview.html");
 const MAX_URL: usize = 2048;
 
 /// Where any refusal points the agent instead.
-const ELSEWHERE: &str = "web_preview frames only local dev servers: http(s)://localhost, 127.0.0.1 or [::1], \
+const ELSEWHERE: &str = "web_preview frames only local dev servers: http(s)://localhost or 127.0.0.1, \
     with a port. To show any other page, open it in the user's system browser instead (xdg-open URL on Linux, open URL on macOS)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Host { Localhost, V4, V6 }
+pub enum Host { Localhost, V4 }
 
 impl Host {
     fn as_str(self) -> &'static str {
-        match self { Host::Localhost => "localhost", Host::V4 => "127.0.0.1", Host::V6 => "[::1]" }
+        match self { Host::Localhost => "localhost", Host::V4 => "127.0.0.1" }
     }
+    /// Where the check connects: `localhost` may be a server listening on ::1 only.
     fn addrs(self, port: u16) -> Vec<SocketAddr> {
         let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
-        match self { Host::Localhost => vec![v4, v6], Host::V4 => vec![v4], Host::V6 => vec![v6] }
+        match self { Host::Localhost => vec![v4, v6], Host::V4 => vec![v4] }
     }
 }
 
@@ -53,12 +56,9 @@ impl Target {
     pub fn scheme(&self) -> &'static str { if self.https { "https" } else { "http" } }
     pub fn origin(&self) -> String { format!("{}://{}:{}", self.scheme(), self.host.as_str(), self.port) }
     pub fn url(&self) -> String { format!("{}{}", self.origin(), self.rest) }
-    /// The `frame-src` that holds the frame to this origin. Browsers cannot name an IPv6
-    /// address in a CSP source (Chromium ignores it and blocks everything), so `[::1]` gets
-    /// its scheme only: such a frame may navigate off the dev server (docs/MCP.md).
-    pub fn frame_src(&self) -> String {
-        if self.host == Host::V6 { format!("{}:", self.scheme()) } else { self.origin() }
-    }
+    /// The `frame-src` that holds the frame to this origin: always the exact origin (which is
+    /// why no IPv6 literal is ever a Target).
+    pub fn frame_src(&self) -> String { self.origin() }
 }
 
 /// Parse a loopback dev-server URL. `reserved` are Muster's own ports (the UI and the panel
@@ -83,12 +83,14 @@ pub fn parse(url: &str, reserved: &[u16]) -> anyhow::Result<Target> {
     let (authority, rest) = after.split_at(end);
     ensure!(!authority.contains('@'), "web_preview url must not contain a user name or password. {ELSEWHERE}");
     let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
-        let (ip, tail) = inner.split_once(']').context("web_preview url has an unclosed [ in its host")?;
-        let port = match tail { "" => None, t => Some(t.strip_prefix(':').context("web_preview url has text after its IPv6 host")?) };
-        let ip: Ipv6Addr = ip.parse().with_context(|| format!("web_preview url host [{ip}] is not an IPv6 address. {ELSEWHERE}"))?;
-        ensure!(!ip.is_unspecified(), "[::] means \"every interface\" to a server; use http://localhost:PORT instead");
-        ensure!(ip.is_loopback(), "web_preview url host [{ip}] is not this computer. {ELSEWHERE}");
-        (Host::V6, port)
+        // A browser cannot hold a frame to an IPv6 address (CSP sources cannot name one), so
+        // the frame could leave the dev server: refuse every IPv6 literal, [::1] included.
+        let ip = inner.split_once(']').map_or(inner, |(ip, _)| ip);
+        match ip.parse::<Ipv6Addr>() {
+            Ok(ip) if ip.is_loopback() || ip.is_unspecified() =>
+                bail!("web_preview cannot show an IPv6 address like [{ip}]; use http://localhost:PORT instead, which reaches the same server"),
+            _ => bail!("web_preview url host [{ip}] is not this computer. {ELSEWHERE}"),
+        }
     } else {
         let (name, port) = match authority.rsplit_once(':') { Some((h, p)) => (h, Some(p)), None => (authority, None) };
         let host = match name.to_ascii_lowercase().as_str() {
@@ -311,8 +313,6 @@ mod tests {
             ("http://LOCALHOST:5173/app?x=1#top", "http://localhost:5173/app?x=1#top"),
             ("HTTP://127.0.0.1:8000/", "http://127.0.0.1:8000/"),
             ("https://localhost:8443/a/b", "https://localhost:8443/a/b"),
-            ("http://[::1]:3000/", "http://[::1]:3000/"),
-            ("http://[0:0:0:0:0:0:0:1]:3000", "http://[::1]:3000/"),
             ("http://localhost", "http://localhost:80/"),
             ("https://127.0.0.1", "https://127.0.0.1:443/"),
             ("http://localhost:5173?q=1", "http://localhost:5173/?q=1"),
@@ -322,8 +322,11 @@ mod tests {
         ] {
             assert_eq!(parse(input, RESERVED).unwrap().url(), want, "{input}");
         }
-        let t = parse("http://[::1]:3000", RESERVED).unwrap();
-        assert_eq!((t.host, t.frame_src()), (Host::V6, "http:".to_string()));
+        // IPv6 literals cannot be held to their origin by a CSP: refused, pointing at localhost.
+        for v6 in ["http://[::1]:3000/", "http://[0:0:0:0:0:0:0:1]:3000", "https://[::1]:8443/", "http://[::]:3000/"] {
+            let err = parse(v6, RESERVED).unwrap_err().to_string();
+            assert!(err.contains("http://localhost:PORT"), "{v6}: {err}");
+        }
         assert_eq!(parse("http://localhost:5173/x", RESERVED).unwrap().frame_src(), "http://localhost:5173");
     }
 

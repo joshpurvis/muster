@@ -793,6 +793,24 @@ async function webPreview({ a, R, call, shots, ok, check }: {
     check((await a.eval(`__openedLinks`)).includes(devUrl), `Open in browser opens the address: ${JSON.stringify(await a.eval(`__openedLinks`))}`);
     ok("web_preview: a local dev server shows live, with its address, Reload and Open in browser");
 
+    // A fast load never leaves the "still loading" hint behind; a title-only update keeps the page.
+    await a.sleep(10_700);
+    check(!(await a.eval(`!!document.querySelector('${view} [data-preview-notice="slow"]')`)), "no slow-load hint after a fast load");
+    await a.eval(`__previewMsgs = []`);
+    const before = hits.length;
+    await call("panel.update", { panel_id: pid, title: "Renamed app" });
+    await a.sleep(1500);
+    check(hits.length === before && !(await a.eval(`__previewMsgs.length`)), `a title-only update does not reload the page: ${hits.slice(before).join(" ")}`);
+    // Narrow panel: the bar wraps and its buttons stay inside the panel.
+    await a.size(560, 900);
+    await a.sleep(400);
+    const fits = await a.eval(`(() => { const v = document.querySelector('${view}').getBoundingClientRect();
+      return [...document.querySelectorAll('${view} .preview-bar button, ${view} .preview-url')].every((e) => { const r = e.getBoundingClientRect(); return r.right <= v.right + 1 && r.width > 0; }); })()`);
+    await a.shot(`${shots}/panel-web-preview-narrow-dark.png`, (await a.rect(view))!);
+    await a.size(1440, 900);
+    check(fits, "a narrow preview keeps its address and buttons inside the panel");
+    ok("web_preview: no stale loading hint, title-only updates keep the page, the bar wraps when narrow");
+
     // The agent changes the address; the frame follows.
     await a.eval(`__previewMsgs = []`);
     await call("panel.update", { panel_id: pid, data: { url: `http://127.0.0.1:${second.addr.port}/` } });
@@ -830,7 +848,7 @@ async function webPreview({ a, R, call, shots, ok, check }: {
     ok("web_preview: a server that is not up yet gets a notice, and shows by itself once it starts");
 
     // Anything but a local dev server is refused, pointing at the system browser.
-    for (const url of ["https://example.com/", "http://localhost.evil.example:5173/", `http://127.0.0.1:${new URL(await a.eval("location.href")).port}/`]) {
+    for (const url of ["https://example.com/", "http://localhost.evil.example:5173/", "http://[::1]:5173/", `http://127.0.0.1:${new URL(await a.eval("location.href")).port}/`]) {
       const err = await call("panel.update", { panel_id: pid, data: { url } }).then(() => "", (e) => String(e?.message ?? e));
       check(err.includes("system browser") || err.includes("Muster's own"), `${url} refused: ${err}`);
     }

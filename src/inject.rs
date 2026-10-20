@@ -1230,7 +1230,7 @@ mod tests {
     fn panel_store() -> (crate::store::Store, Panel) {
         let store = crate::store::Store::open_memory().unwrap();
         let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(),
-            app: "markdown".into(), csp: Default::default(), revision: 1, html_revision: 1, created_at: 0,
+            app: "markdown".into(), csp: Default::default(), revision: 1, data_revision: 1, html_revision: 1, created_at: 0,
             updated_at: 0, closed: false, context: None, dropped_events: 0 };
         store.create_panel(&mut panel, |_| Ok(())).unwrap();
         for n in 0..3 { push(&store, &mut panel, n); }

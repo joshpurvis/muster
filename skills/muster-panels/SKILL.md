@@ -50,8 +50,8 @@ When you run a dev server (Vite, Next, `deno task dev`, `python -m http.server`)
 wants to see the result, open `web_preview` with its local address and keep working: the page
 updates as the server reloads, and the user has Reload and Open in browser.
 
-- Only `http(s)://localhost`, `127.0.0.1` or `[::1]` with a port is accepted (prefer
-  `localhost`). For any other page (a deployed site, GitHub, docs), do not use a panel: open it
+- Only `http(s)://localhost` or `127.0.0.1` with a port is accepted (prefer `localhost`; for
+  a server on `[::1]` use `localhost` too, IPv6 addresses are refused). For any other page (a deployed site, GitHub, docs), do not use a panel: open it
   in the user's system browser (`xdg-open URL` on Linux, `open URL` on macOS) or give the link.
 - If the server prints `0.0.0.0`, use `localhost` with the same port.
 - Read `note` in the result: it says when nothing answers yet (start the server; the panel

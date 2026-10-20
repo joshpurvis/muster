@@ -64,7 +64,7 @@ fn decorations(d: &crate::paths::Discovery) -> bool {
 /// agent panels (docs/AGENT_PANELS.md) exactly the panel server's sandbox proxy and web
 /// preview pages (`http://127.0.0.1:<panel_port>/proxy?...`, `/preview?...`), the proxy's
 /// inline app frame (`about:srcdoc`), and the loopback dev servers a web preview frames
-/// (http(s) on localhost, 127.0.0.1 or [::1], never the UI's or the panel server's port).
+/// (http(s) on localhost or 127.0.0.1, never the UI's or the panel server's port).
 /// `panel_port` is asked for only when a panel page or a loopback URL is seen, so a backend
 /// reload that moved the panel server is followed. Everything else stays blocked.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
@@ -637,10 +637,10 @@ mod tests {
         assert!(!allow(ui, "http://127.0.0.1:40001/proxy", || None), "an older daemon has no panel server");
         // A web preview: its page on the panel server, and the loopback dev servers it frames.
         for ok in ["http://127.0.0.1:40001/preview?url=http%3A%2F%2Flocalhost%3A5173%2F", "http://localhost:5173/",
-            "http://127.0.0.1:8000/app?x=1#y", "http://[::1]:3000/", "https://localhost:8443/"] {
+            "http://127.0.0.1:8000/app?x=1#y", "https://localhost:8443/"] {
             assert!(allow(ui, ok, port), "{ok}");
         }
-        for bad in ["http://localhost:7433/", "http://[::1]:7433/", "http://localhost:40001/preview", "http://127.0.0.1:40002/preview",
+        for bad in ["http://localhost:7433/", "http://[::1]:3000/", "http://[::1]:7433/", "http://localhost:40001/preview", "http://127.0.0.1:40002/preview",
             "http://localhost:5173@evil.example/", "http://localhost.evil.example:5173/", "http://192.168.1.2:5173/",
             "http://2130706433:5173/", "ws://localhost:5173/"] {
             assert!(!allow(ui, bad, port), "{bad}");

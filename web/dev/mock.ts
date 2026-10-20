@@ -102,7 +102,7 @@ const panelServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, (req) => {
   if (u.pathname === "/preview" && ["GET", "HEAD"].includes(req.method)) {
     let target: URL;
     try { target = mockPreviewUrl(u.searchParams.get("url")); } catch (e) { return new Response(String(e), { status: 400 }); }
-    const frameSrc = target.hostname === "[::1]" ? target.protocol : target.origin;
+    const frameSrc = target.origin;
     const attr = target.href.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     return new Response(previewPage.replace("__MUSTER_PREVIEW_URL__", attr), {
       headers: {
@@ -910,7 +910,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       const data = await mockPanelData(args.app, channels.find((c) => c.id === s.channel_id)?.cwd ?? HOME, args.data ?? {}, csp, true);
       const id = ++panelSeq;
       const panel: Panel = { id, title: args.title, app: args.app, channel_id: s.channel_id, session_id: s.id,
-        window_id: s.window_id, csp, revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
+        window_id: s.window_id, csp, revision: 1, data_revision: 1, html_revision: 1, created_at: now(), updated_at: now(), closed: false };
       panels.set(id, { panel, html: args.app === "custom" ? args.html : builtinApps[args.app], data });
       broadcast("panel_upserted", panel);
       return { panel_id: id };
@@ -931,6 +931,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (args.data !== undefined) {
         const cwd = channels.find((c) => c.id === resource.panel.channel_id)?.cwd ?? HOME;
         resource.data = await mockPanelData(resource.panel.app, cwd, args.data, structuredClone(resource.panel.csp), false);
+        resource.panel.data_revision = resource.panel.revision;
       }
       if (args.title !== undefined) resource.panel.title = args.title;
       broadcast("panel_upserted", resource.panel);

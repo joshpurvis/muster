@@ -240,7 +240,7 @@ neither panel records nor panel events. The proxy listener has no daemon routes 
 WebSocket pushes: `panel_upserted` carries a full panel, `panel_removed` carries `{id}`.
 `hello.panels` contains open panels and `panel_origin` is `http://127.0.0.1:<panel_port>`.
 Records contain `id`, `channel_id`, `session_id` (opener), `window_id`, `title`, `app`, `csp`,
-`revision`, `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
+`revision`, `data_revision` (the revision of the last update that carried data), `html_revision`, timestamps, `closed`, latest `context`, and `dropped_events`.
 Schema v14 stores records in `panels` and queued events in `panel_events`; v15 adds `parked`
 (events a prompt showed as a placeholder, kept for `panel_event`). Immutable revision files
 under `<data>/panels/<id>/` are written, mode 0600, under temporary names outside the panel
@@ -266,8 +266,8 @@ navigation). The listener checks the URL again (loopback http(s), not the UI's o
 and answers a page with no script whose iframe loads the URL with the same sandbox, under the
 CSP `default-src 'none'; style-src 'unsafe-inline'; frame-src <the URL's origin>; ...;
 frame-ancestors <UI origins>`, so the dev page may navigate and redirect only within its own
-origin (`[::1]` gets `frame-src http:` or `https:`, since browsers cannot name an IPv6 host in
-CSP). `panel.preview_check` connects to the stored URL (localhost tries 127.0.0.1, then ::1);
+origin. IPv6 literals are refused, since a CSP source cannot name an IPv6 host.
+`panel.preview_check` connects to the stored URL (localhost tries 127.0.0.1, then ::1);
 for http it sends one `GET` and reads the response head: `refused` names an `X-Frame-Options`
 or `frame-ancestors` that would block the panel's frame, `leaves_to` a redirect to another
 origin; `answered: false` means no head within 3 s; https is only connected to

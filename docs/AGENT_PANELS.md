@@ -288,9 +288,8 @@ action; the phone comes last.
 - `wait_for_panel_event` and `panel_event` delete the events they return as the result is
   built. If the backend dies, or the caller's connection drops, before the caller reads it,
   those events are lost. Chosen over redelivering events the agent may already have acted on.
-- `web_preview` at `[::1]`: browsers cannot name an IPv6 address in a CSP, so that frame is
-  held to its scheme, not its origin (the native window still blocks non-loopback pages).
-  `localhost` reaches the same server and keeps the stricter rule.
+- `web_preview` refuses IPv6 literals (`[::1]`): a CSP cannot name an IPv6 host, so such a
+  frame could not be held to its dev server. `localhost` reaches a server on ::1 too.
 - `web_preview` checks read only the first response head (https servers are only connected
   to), so a page can still fail in the frame for reasons the panel cannot name, and Muster's
   keyboard shortcuts do not reach a focused dev page.

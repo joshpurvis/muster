@@ -228,20 +228,20 @@ filter box (`/`) matches every word in any column, and the header stays visible 
 
 **`web_preview`** ([AGENT_PANELS.md](AGENT_PANELS.md#showing-web-pages)): `{url}`, the agent's
 running local dev server, live beside its terminal. Only loopback http(s) is accepted:
-`localhost`, `127.0.0.1` or `[::1]`, any port except Muster's own (its window and its panel
-server). Everything else is refused with an error that says to open the page in the user's
+`localhost` or `127.0.0.1`, any port except Muster's own (its window and its panel server).
+Everything else is refused with an error that says to open the page in the user's
 system browser instead, as are credentials (`user@`), other spellings of 127.0.0.1
-(`127.1`, `2130706433`, `0177.0.0.1`), `0.0.0.0`, spaces, control and non-ASCII characters, and
+(`127.1`, `2130706433`, `0177.0.0.1`), `0.0.0.0`, IPv6 literals such as `[::1]` (a browser
+cannot hold a frame to an IPv6 address; `localhost` reaches a server listening on ::1 too), spaces, control and non-ASCII characters, and
 backslashes; the URL is stored rebuilt from its checked parts (`http://LOCALHOST:5173` becomes
 `http://localhost:5173/`). The panel shows the address, Reload and Open in browser (the system
 browser in the native window), and frames the page through the panel server's `/preview` page
 (docs/PROTOCOL.md), which holds the frame to the URL's origin: the page may navigate and
 redirect within it, but a link or redirect to another origin (another port, a login site) is
 blocked in the frame, and Open in browser is the way out. A popup or `target=_blank` link opens
-in the system browser (native window) or a new tab. Exception: browsers cannot name an IPv6
-address in a CSP, so a `[::1]` preview's frame is held to its scheme only (the native window
-still blocks non-loopback pages); prefer `localhost`, which reaches a server listening on ::1
-too. Every `panel_update` with data reloads the page, even at the same URL.
+in the system browser (native window) or a new tab. Every `panel_update` with data reloads the
+page, even at the same URL; a title-only update does not (panels carry `data_revision`, the
+revision of the last update with data).
 
 Muster checks the server when the panel opens or changes, and the result's `note` tells the
 agent in one sentence when nothing answers, when the page refuses framing

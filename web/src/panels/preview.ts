@@ -30,7 +30,8 @@ export const RETRY_FOR_MS = 120_000;
 /** A frame that has not finished loading by then gets a hint. */
 export const SLOW_MS = 10_000;
 
-const HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+// Not [::1]: browsers cannot hold a frame to an IPv6 address (src/web_preview.rs).
+const HOSTS = new Set(["localhost", "127.0.0.1"]);
 
 /** The UI's own check, after the backend's: only loopback http(s) without credentials. */
 export function isPreviewUrl(value: unknown): value is string {
@@ -86,6 +87,59 @@ export function previewNotice(check: PreviewCheck | null, retrying: boolean): No
     };
   }
   return null;
+}
+
+/** Which input a frame shows: it loads again when the agent sends data (even the same URL), not
+ * on a title-only update. Backends before `data_revision` fall back to the revision. */
+export function previewRevision(panel: { revision: number; data_revision?: number }): number {
+  return panel.data_revision || panel.revision;
+}
+
+export interface CheckLoop {
+  check: () => Promise<PreviewCheck>;
+  /** The latest result (null before any arrived); `retrying`: it is down and another check is due. */
+  report: (check: PreviewCheck | null, retrying: boolean) => void;
+  /** It answered after being down: load the page again. */
+  up: () => void;
+  now?: () => number;
+  later?: (run: () => void, ms: number) => number;
+  cancel?: (timer: number) => void;
+}
+
+/** Check a frame's server now and, while it is down or a check fails (a dropped connection),
+ * every RETRY_MS until RETRY_FOR_MS after the start; then stop and report `retrying: false`.
+ * Returns the stop function. */
+export function startChecks(o: CheckLoop): () => void {
+  const now = o.now ?? Date.now;
+  const later = o.later ?? ((run, ms) => setTimeout(run, ms));
+  const cancel = o.cancel ?? clearTimeout;
+  const until = now() + RETRY_FOR_MS;
+  let live = true, timer = 0, down = false;
+  let last: PreviewCheck | null = null;
+  const again = () => {
+    if (now() >= until) return false;
+    timer = later(run, RETRY_MS);
+    return true;
+  };
+  function run() {
+    o.check().then((c) => {
+      if (!live) return;
+      if (c.reachable && down) return o.up();
+      down = !c.reachable;
+      last = c;
+      o.report(c, down && again());
+    }, () => {
+      if (!live) return;
+      // Retried within the same deadline; the notice keeps what the last check found.
+      const retrying = again();
+      o.report(last, down && retrying);
+    });
+  }
+  run();
+  return () => {
+    live = false;
+    cancel(timer);
+  };
 }
 
 export const SLOW_NOTICE: Notice = {

@@ -214,7 +214,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
         ensure!(open.len() < MAX_OPEN_TOTAL, "Muster already has {MAX_OPEN_TOTAL} open panels; close some first");
         let now = now_ms();
         let mut panel = Panel { id: 0, channel_id: ch.id, session_id: s.id, window_id: s.window_id.or(ch.window_id),
-            title, app: args.app, csp, revision: 1, html_revision: 1,
+            title, app: args.app, csp, revision: 1, data_revision: 1, html_revision: 1,
             created_at: now, updated_at: now, closed: false, context: None, dropped_events: 0 };
         let mut placed = None;
         let created = hub.store().create_panel(&mut panel, |p| {
@@ -278,7 +278,10 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
             p.html_revision = p.revision;
             std::fs::rename(&staged_html, app_file(hub, &p))?;
         }
-        if data.is_some() { std::fs::rename(&staged_data, data_file(hub, &p))?; }
+        if data.is_some() {
+            p.data_revision = p.revision;
+            std::fs::rename(&staged_data, data_file(hub, &p))?;
+        }
         else { std::fs::hard_link(data_file(hub, &old), data_file(hub, &p))?; }
         if let Err(e) = hub.store().save_panel(&p) {
             let _ = std::fs::remove_file(data_file(hub, &p));
@@ -794,13 +797,18 @@ mod tests {
         let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None };
         let id = open(&hub, 1, preview("http://LOCALHOST:5173")).unwrap();
         assert_eq!(resource(&hub, id).unwrap()["data"], json!({"url": "http://localhost:5173/"}));
-        for bad in ["https://github.com/", "http://127.0.0.1:40001/proxy", "http://localhost:5173@evil.example/"] {
+        for bad in ["https://github.com/", "http://127.0.0.1:40001/proxy", "http://localhost:5173@evil.example/", "http://[::1]:5173/"] {
             assert!(open(&hub, 1, preview(bad)).is_err(), "{bad}");
         }
         let mut with_html = preview("http://localhost:5173");
         with_html.html = Some("<p>x</p>".into());
         assert!(open(&hub, 1, with_html).is_err(), "a web preview takes no HTML");
+        update(&hub, 1, Update { panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None }).unwrap();
+        let p = get(&hub, id).unwrap();
+        assert_eq!((p.revision, p.data_revision), (2, 1), "a title-only update keeps the data revision (no page reload)");
         update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None }).unwrap();
+        let p = get(&hub, id).unwrap();
+        assert_eq!((p.revision, p.data_revision), (3, 3), "a data update advances it");
         assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://127.0.0.1:8000/docs");
         assert!(update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None }).is_err());
         assert!(update(&hub, 1, Update { panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None }).is_err());

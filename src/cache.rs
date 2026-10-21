@@ -237,9 +237,17 @@ fn advance(info: &mut SessionInfo, at: i64) -> bool {
 /// agent's last request ended about then. Only for an agent resting now (not working, starting
 /// or exited) that has had a turn, which the task title its CLI sets shows (Claude Code and Codex
 /// name the conversation after its first prompt; a fresh session at its first prompt has none).
+/// Codex's default title is the project folder's name even before the first prompt, so a title
+/// that only names the session's folder doesn't count.
 /// Read from the saved row at startup, before recovery rewrites a dialog's `state_since`.
 pub fn estimated_turn(info: &SessionInfo) -> Option<i64> {
-    let had_turn = info.title.as_deref().and_then(|t| crate::hub::clean_title(t, info.kind)).is_some();
+    let folder = |dir: &str| std::path::Path::new(dir).file_name().map(|n| n.to_string_lossy().to_lowercase());
+    let names_folder = |t: &str| {
+        let t = t.trim().to_lowercase();
+        [Some(info.cwd.as_str()), info.live_cwd.as_deref()].into_iter().flatten().any(|d| folder(d).as_deref() == Some(t.as_str()))
+    };
+    let had_turn = info.title.as_deref().and_then(|t| crate::hub::clean_title(t, info.kind))
+        .is_some_and(|t| !names_folder(&t));
     (info.last_turn_at.is_none() && info.kind != SessionKind::Shell && waiting(info.state) && had_turn
         && info.state_since > 0)
         .then_some(info.state_since)
@@ -466,6 +474,14 @@ mod tests {
             s.title = title.map(str::to_string);
             assert_eq!(estimated_turn(&s), None, "{title:?}");
         }
+        // Codex names a fresh session after its folder before any prompt.
+        let mut codex = sess(SessionKind::Codex, Provider::Subscription);
+        codex.cwd = "/home/me/projects/muster".into();
+        codex.state_since = 10 * MIN;
+        codex.title = Some("muster".into());
+        assert_eq!(estimated_turn(&codex), None, "folder-name title");
+        codex.title = Some("Fix the login bug".into());
+        assert_eq!(estimated_turn(&codex), Some(10 * MIN));
         // Shells never.
         let mut shell = sess(SessionKind::Shell, Provider::Subscription);
         shell.title = Some("make test".into());

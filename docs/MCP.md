@@ -184,7 +184,10 @@ agent that has been idle for hours, any prompt makes it read its whole conversat
 its prompt cache expired, which costs real usage for news it rarely needs. The notice waits in
 the queue: `wait_for_panel_event` returns it, and it comes along in the next panel prompt that a
 real user action starts for that opener (it does not ride on other prompts, such as messages
-from agents or the human). A closed panel drops out of `list_panels`. Open a panel with
+from agents or the human). In that prompt user actions go first and notices take only the room
+left, so a pile of notices never pushes a click out; an untyped prompt an older backend queued
+with only notices goes back to the panel queue at startup or before typing. A closed panel drops
+out of `list_panels`. Open a panel with
 `notify_on_close: true` when closing it means something (a "pick one" panel where closing is the
 answer "none"): then the `closed` event prompts the idle opener like a click. No built-in sets
 it; closing a `pr_decision` or `pr_overview` panel is not a decision. The `overflow` notice

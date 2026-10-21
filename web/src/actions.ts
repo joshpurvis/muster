@@ -5,8 +5,15 @@ import { signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
 import {
   agentBySession,
+  agentMessages,
   agents,
   agentsPanelOpen,
+  knowRun,
+  knowSchedule,
+  scheduleHistoryOpen,
+  scheduleRuns,
+  schedules,
+  scheduleSettings,
   BUSY_STATES,
   channelById,
   confirmClose,
@@ -55,9 +62,13 @@ import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { providerPendingNote } from "./agents.ts";
+import { providerPendingNote, upsertMessage } from "./agents.ts";
+import { nextWhen, upsertRun } from "./schedules.ts";
 import type {
   Agent,
+  Schedule,
+  ScheduleRun,
+  ScheduleSettings,
   Channel,
   ChannelId,
   Decision,
@@ -1336,8 +1347,116 @@ export function removeAgent(a: Agent) {
   };
 }
 
-export function newAgentDialog() {
-  overlay.value = { kind: "agent" };
+export function newAgentDialog(template?: string) {
+  overlay.value = { kind: "agent", template };
+}
+
+// ---------- schedules (docs/UI.md "Agents panel", docs/PROTOCOL.md "Schedules") ----------
+
+/** New schedule; `agent` preselects that agent when it takes scheduled work. */
+export function newScheduleDialog(agent?: string) {
+  overlay.value = { kind: "schedule", agent };
+}
+
+export function editSchedule(id: number) {
+  overlay.value = { kind: "schedule", id };
+}
+
+export function scheduleSettingsDialog() {
+  overlay.value = { kind: "schedule_settings" };
+}
+
+/** A `schedule.*` call that answers with the schedule: recorded at once, errors toasted. */
+function scheduleCall(method: string, params: Record<string, unknown>, what: string, done?: (s: Schedule) => void) {
+  rpc.call<Schedule>(method, params).then((s) => {
+    knowSchedule(s);
+    done?.(s);
+  }).catch(fail(what)).catch(() => {});
+}
+
+export function pauseSchedule(s: Schedule, on: boolean) {
+  scheduleCall("schedule.pause", { id: s.id, on }, on ? "Couldn't pause it" : "Couldn't resume it");
+}
+
+export function skipNextRun(s: Schedule, on: boolean) {
+  scheduleCall("schedule.skip", { id: s.id, on }, "Couldn't change Skip next", (r) => {
+    if (on && r.next_run !== null) toast("info", `${r.name}: the run ${nextWhen(r.next_run, Date.now())} will be skipped`, 3000);
+  });
+}
+
+export function renewSchedule(s: Schedule) {
+  scheduleCall("schedule.renew", { id: s.id }, "Couldn't renew it", (r) => {
+    toast("success", `Renewed ${r.name} for 7 days`, 3000);
+  });
+}
+
+/** Run now: outside its timing and quiet hours; the agent's own caps still apply. Its history
+ * opens so the run shows. */
+export function runScheduleNow(s: Schedule) {
+  rpc.call<ScheduleRun>("schedule.run", { id: s.id }).then((r) => {
+    knowRun(r);
+    if (!scheduleHistoryOpen.value.has(s.id)) toggleScheduleHistory(s.id);
+    if (r.outcome === "skipped") toast("warn", `${s.name}: skipped${r.reason ? `, ${r.reason}` : ""}`, 5000);
+    else toast("info", `${s.name}: sent to ${s.agent ?? "its agent"}`, 2500);
+  }).catch(fail("Couldn't run it")).catch(() => {});
+}
+
+export function removeSchedule(s: Schedule) {
+  overlay.value = {
+    kind: "confirm",
+    title: `Remove ${s.name}?`,
+    body: `It won't run again, and its run history goes with it. Messages it already sent stay in the log${
+      s.note_title ? `, and its replies stay in the note ${s.note_title}` : ""
+    }.`,
+    confirmLabel: "Remove schedule",
+    danger: true,
+    run: () =>
+      rpc.call("schedule.remove", { id: s.id }).then(() => {
+        schedules.value = schedules.value.filter((x) => x.id !== s.id);
+      }).catch(fail("Remove failed")).catch(() => {}),
+  };
+}
+
+/** Show or hide a schedule's run history under its row; its runs load the first time. */
+export function toggleScheduleHistory(id: number) {
+  const open = new Set(scheduleHistoryOpen.value);
+  if (open.has(id)) open.delete(id);
+  else {
+    open.add(id);
+    if (!scheduleRuns.value.has(id)) loadScheduleRuns(id);
+  }
+  scheduleHistoryOpen.value = open;
+}
+
+/** The newest 20 runs, or the next 20 below the oldest loaded (`older`). */
+export async function loadScheduleRuns(id: number, older = false) {
+  const cur = scheduleRuns.value.get(id);
+  const before = older ? cur?.runs.at(-1)?.id : undefined;
+  try {
+    const r = await rpc.call<{ runs: ScheduleRun[]; more: boolean }>("schedule.runs", { id, before, limit: 20 });
+    const base = older ? scheduleRuns.value.get(id)?.runs ?? [] : [];
+    let runs = base;
+    for (const x of r.runs) runs = upsertRun(runs, x);
+    scheduleRuns.value = new Map(scheduleRuns.value).set(id, { runs, more: r.more });
+  } catch (e) {
+    toast("error", `Couldn't load the run history: ${errText(e)}`);
+  }
+}
+
+/** Open a run's message and reply in the message overlay (the log may not have it loaded). */
+export function openRunMessage(r: ScheduleRun) {
+  const m = r.message;
+  if (!m) return;
+  agentMessages.value = upsertMessage(agentMessages.value, m, Math.max(300, agentMessages.value.length + 1));
+  overlay.value = { kind: "agent_message", id: m.id };
+}
+
+/** "Pause all schedules": every schedule's slots are skipped (recorded once) until resumed. */
+export function setAllSchedulesPaused(paused: boolean) {
+  rpc.call<ScheduleSettings>("schedule.settings.set", { paused }).then((s) => {
+    scheduleSettings.value = s;
+    toast("info", paused ? "All schedules paused" : "Schedules resumed", 2500);
+  }).catch(fail(paused ? "Couldn't pause schedules" : "Couldn't resume schedules")).catch(() => {});
 }
 
 export function editAgent(name: string, tab: "settings" | "memory" = "settings") {

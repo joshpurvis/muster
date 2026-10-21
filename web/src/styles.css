@@ -4240,3 +4240,506 @@ body.dragging .panel-view { pointer-events: none; }
   .notes-list .sw-detail { display: none; }
   .notes-list .note-del { opacity: 1; }
 }
+
+/* ---------------- schedules (docs/UI.md "Agents panel") ---------------- */
+
+.ap-head .ap-head-more {
+  margin-left: auto;
+}
+
+.ap-head .ap-head-more + .ap-head-x {
+  margin-left: 0;
+}
+
+/* "All schedules paused · Resume", under the header. */
+.sch-paused-note {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 6px 0;
+  padding: 5px 8px;
+  border-radius: var(--r);
+  font-size: 11.5px;
+  font-weight: 550;
+  color: var(--st-attn);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+}
+
+.sch-paused-note .sch-link {
+  margin-left: auto;
+}
+
+.sch-link {
+  font-size: inherit;
+  font-weight: 600;
+  color: var(--accent-strong);
+  padding: 0 2px;
+  border-radius: 3px;
+}
+
+.sch-link:hover {
+  text-decoration: underline;
+}
+
+/* An agent's schedules hang under its row, on a thin guide line. */
+.sch-list {
+  margin: 0 0 4px 12px;
+  padding-left: 2px;
+  border-left: 1px solid var(--border-strong);
+}
+
+.sch-row {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 4px 4px 4px 5px;
+  border-radius: var(--r);
+  cursor: pointer;
+  outline: none;
+  transition: background var(--t) var(--ease);
+}
+
+.sch-row:hover,
+.sch-row.open {
+  background: var(--hover);
+}
+
+.sch-row:focus-visible {
+  box-shadow: inset 0 0 0 1.5px var(--pane-focus-ring);
+}
+
+.sch-icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--text-faint);
+}
+
+.sch-row.paused .sch-icon,
+.sch-row.idle .sch-icon {
+  opacity: 0.6;
+}
+
+.sch-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sch-name {
+  padding-right: 18px;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sch-row.paused .sch-name,
+.sch-row.idle .sch-name {
+  color: var(--text-muted);
+}
+
+.sch-sub {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.sch-next {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Pause all is on: the time stands, but nothing runs. */
+.sch-next.held {
+  text-decoration: line-through;
+  text-decoration-color: var(--text-faint);
+}
+
+.sch-next.expired {
+  color: var(--st-attn);
+}
+
+.sch-badge {
+  flex: none;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: var(--bg-3);
+  border: 1px solid var(--border-strong);
+}
+
+/* The last run's outcome. */
+.sch-chip {
+  flex: none;
+  margin-left: auto;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--bg-3);
+  color: var(--text-faint);
+}
+
+.sch-chip.sch-ok {
+  color: var(--st-idle);
+  background: var(--add-bg);
+}
+
+.sch-chip.sch-bad {
+  color: var(--st-error);
+  background: var(--del-bg);
+}
+
+.sch-chip.sch-wait {
+  color: var(--st-working);
+  background: var(--accent-softer);
+}
+
+.sch-expires {
+  font-size: 11px;
+  color: var(--st-attn);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sch-more {
+  top: 3px;
+}
+
+.sch-row:hover .sch-more,
+.sch-row:focus-within .sch-more,
+.sch-row.open .sch-more {
+  opacity: 1;
+}
+
+/* Run history, under an open schedule. */
+.sch-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 1px 0 4px 14px;
+}
+
+.sch-runs-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.sch-run {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  text-align: left;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sch-run.has-msg {
+  cursor: pointer;
+}
+
+.sch-run.has-msg:hover {
+  background: var(--hover-strong);
+}
+
+.sch-run-top {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sch-run-line {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sch-run .ap-chip {
+  font-size: 9.5px;
+  line-height: 13px;
+  padding: 0 4px;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+
+.sch-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.sch-dot.sch-ok {
+  background: var(--st-idle);
+}
+
+.sch-dot.sch-bad {
+  background: var(--st-error);
+}
+
+.sch-dot.sch-wait {
+  background: var(--st-working);
+}
+
+.sch-dot.sch-skip {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--text-faint);
+}
+
+.sch-run-bad .sch-run-line,
+.sch-run-bad .sch-run-reason {
+  color: var(--st-error);
+}
+
+.sch-run-skip .sch-run-line,
+.sch-run-skip .sch-run-reason {
+  color: var(--text-faint);
+}
+
+.sch-run-reason {
+  padding-left: 11px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.sch-older {
+  margin: 2px 6px 0;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* ---------------- New / Edit schedule, Scheduling settings ---------------- */
+
+.sch-dlg {
+  width: 620px;
+}
+
+.sch-agent-fixed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.sch-none {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--r);
+  border: 1px dashed var(--border-strong);
+  background: var(--bg-1);
+}
+
+.sch-none p {
+  flex: 1;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.sch-claude-warn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: -6px;
+  padding: 8px 10px;
+  border-radius: var(--r);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+}
+
+.sch-claude-warn .field-hint {
+  color: var(--text-muted);
+  padding-left: 19px;
+}
+
+.sch-prompt {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.field-hint.sch-hint-wrap {
+  display: block;
+  line-height: 1.45;
+}
+
+.field-hint.sch-hint-wrap code {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--bg-3);
+}
+
+.sch-when {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sch-when .sch-preset {
+  flex: 0 1 250px;
+}
+
+.sch-at {
+  flex: none;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.field .sch-time {
+  width: 72px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.sch-when .sch-minute {
+  width: 92px;
+}
+
+.sch-when .sch-day {
+  width: 140px;
+}
+
+.field .sch-cron {
+  flex: 1;
+  min-width: 180px;
+  width: auto;
+  font-family: var(--font-mono);
+}
+
+.field input[type="datetime-local"] {
+  width: 220px;
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  padding: 0 9px;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+}
+
+.field input[type="datetime-local"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-softer);
+}
+
+.sch-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 42px;
+  padding: 8px 10px;
+  border-radius: var(--r);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.sch-reading {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sch-next-runs {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sch-next-run.quiet {
+  color: var(--text-faint);
+}
+
+.sch-quiet {
+  font-style: italic;
+}
+
+.sch-sep {
+  color: var(--text-faint);
+}
+
+.sch-expiry-note {
+  color: var(--st-attn);
+}
+
+.sch-seg {
+  align-self: flex-start;
+  flex-wrap: wrap;
+}
+
+.sch-more-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 6px 0 2px;
+  border-radius: var(--r);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.sch-more-toggle:hover {
+  color: var(--text);
+}
+
+.sch-more-toggle[aria-expanded="true"] .ap-chev {
+  transform: rotate(90deg);
+}
+
+.sch-more {
+  margin-top: -4px;
+}
+
+.sch-settings-dlg {
+  width: 480px;
+}
+
+.sch-quiet-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field .sch-unattended {
+  width: 90px;
+}

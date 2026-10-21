@@ -12,6 +12,9 @@ import type {
   ChannelId,
   HelloResult,
   Panel,
+  Schedule,
+  ScheduleRun,
+  ScheduleSettings,
   ServerEvent,
   SessionId,
   SessionInfo,
@@ -27,6 +30,7 @@ import { sessionSizeChanged } from "./terms.ts";
 import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupported, restoreDrafts } from "./notes.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
+import { newerRun, upsertRun } from "./schedules.ts";
 import { type Dismissed, releaseOfScript, type UpdateStatus } from "./updates.ts";
 import {
   allSessions,
@@ -158,6 +162,7 @@ function sortAgents(list: Agent[]): Agent[] {
 }
 
 async function loadAgents() {
+  loadSchedules();
   try {
     const [list, log] = await Promise.all([
       rpc.call<Agent[]>("agent.list"),
@@ -169,6 +174,74 @@ async function loadAgents() {
   } catch (e) {
     if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) agentsSupported.value = false;
   }
+}
+
+// ---------------- schedules (docs/UI.md "Agents panel", docs/PROTOCOL.md "Schedules") ----------------
+
+/** Every schedule (`schedule.list` after each hello, then `schedule_*` events). */
+export const schedules = signal<Schedule[]>([]);
+/** The backend has schedules (false: an older one answered "unknown method"; all schedule UI hides). */
+export const schedulesSupported = signal(false);
+/** Pause all, quiet hours, the unattended cap. */
+export const scheduleSettings = signal<ScheduleSettings | null>(null);
+/** History lists loaded so far (`schedule.runs`), by schedule id, newest first. */
+export const scheduleRuns = signal<Map<number, { runs: ScheduleRun[]; more: boolean }>>(new Map());
+/** Schedules whose history is shown under their row. */
+export const scheduleHistoryOpen = signal<ReadonlySet<number>>(new Set());
+
+async function loadSchedules() {
+  try {
+    const r = await rpc.call<{ schedules: Schedule[]; settings: ScheduleSettings }>("schedule.list");
+    batch(() => {
+      schedulesSupported.value = true;
+      schedules.value = r.schedules;
+      scheduleSettings.value = r.settings;
+      // Histories loaded before a reconnect may have missed runs: they load again when shown.
+      scheduleRuns.value = new Map();
+    });
+  } catch (e) {
+    if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) {
+      batch(() => {
+        schedulesSupported.value = false;
+        schedules.value = [];
+        scheduleSettings.value = null;
+      });
+    }
+  }
+}
+
+/** Record a schedule from an RPC reply (its schedule_upserted event may lag). */
+export function knowSchedule(s: Schedule) {
+  schedules.value = upsertBy(schedules.value, s);
+}
+
+/** Record a run (an event, or a Run now reply): the schedule's last run and any loaded history. */
+export function knowRun(r: ScheduleRun) {
+  batch(() => {
+    const s = schedules.value.find((x) => x.id === r.schedule_id);
+    if (s) {
+      const last = newerRun(s.last_run, r);
+      if (last !== s.last_run) knowSchedule({ ...s, last_run: last });
+    }
+    const h = scheduleRuns.value.get(r.schedule_id);
+    if (h) scheduleRuns.value = new Map(scheduleRuns.value).set(r.schedule_id, { ...h, runs: upsertRun(h.runs, r) });
+  });
+}
+
+function forgetSchedule(id: number) {
+  batch(() => {
+    schedules.value = schedules.value.filter((s) => s.id !== id);
+    if (scheduleRuns.value.has(id)) {
+      const m = new Map(scheduleRuns.value);
+      m.delete(id);
+      scheduleRuns.value = m;
+    }
+    if (scheduleHistoryOpen.value.has(id)) {
+      const open = new Set(scheduleHistoryOpen.value);
+      open.delete(id);
+      scheduleHistoryOpen.value = open;
+    }
+  });
 }
 
 /** The window a session is a tab in (null: none). Without window support: this one. */
@@ -309,8 +382,12 @@ export type Overlay =
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
   | { kind: "shutdown" }
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
-  | { kind: "agent"; name?: string; tab?: "settings" | "memory" }
+  | { kind: "agent"; name?: string; tab?: "settings" | "memory"; template?: string }
   | { kind: "agent_message"; id: number }
+  /** New schedule (no `id`; `agent` preselects one) or Edit schedule. */
+  | { kind: "schedule"; id?: number; agent?: string }
+  /** Scheduling settings: pause all, quiet hours, the unattended cap. */
+  | { kind: "schedule_settings" }
   | {
     kind: "confirm";
     title: string;
@@ -753,9 +830,27 @@ export function applyEvent(ev: ServerEvent) {
     case "agent_removed":
       agents.value = agents.value.filter((a) => a.id !== ev.data.id);
       if (agentFilter.value === ev.data.id) agentFilter.value = null;
+      // Removing an agent removes its schedules (their events may come later, or not at all).
+      for (const s of schedules.value) if (s.agent_id === ev.data.id) forgetSchedule(s.id);
       break;
     case "agent_message":
       agentMessages.value = upsertMessage(agentMessages.value, ev.data);
+      break;
+    case "schedule_upserted": {
+      // An upsert carries the schedule's own last run; one recorded since (by `schedule_run`) stays.
+      const cur = schedules.value.find((s) => s.id === ev.data.id);
+      const last = cur?.last_run && ev.data.last_run ? newerRun(cur.last_run, ev.data.last_run) : ev.data.last_run ?? cur?.last_run ?? null;
+      knowSchedule({ ...ev.data, last_run: last });
+      break;
+    }
+    case "schedule_removed":
+      forgetSchedule(ev.data.id);
+      break;
+    case "schedule_run":
+      knowRun(ev.data);
+      break;
+    case "schedule_settings":
+      scheduleSettings.value = ev.data;
       break;
     case "updates_changed":
       updateStatus.value = ev.data;

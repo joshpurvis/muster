@@ -13,6 +13,7 @@ import { type Browser, launch } from "./cdp.ts";
 import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
 import { panelChecks } from "./e2e_panels.ts";
 import { noteChecks } from "./e2e_notes.ts";
+import { scheduleChecks } from "./e2e_schedules.ts";
 import { panelApps } from "./panel_apps_e2e.ts";
 
 const [url, shots, repo, mode] = Deno.args;
@@ -1243,6 +1244,9 @@ try {
     await a.wait(`!!document.querySelector('.agents-panel')`, 3000);
     ok("the agents panel came back open with the window (per-window, in its layout)");
   }
+
+  // ---- schedules (dev/e2e_schedules.ts)
+  if (!real) await scheduleChecks(a, { shots, ok, check });
 
   // ---- the update banner, the shutdown dialog, Ctrl+Shift+R (mock only: mock.updates)
   if (!real) {

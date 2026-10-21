@@ -35,6 +35,7 @@ import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfileSelect } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
 import { agentStatus } from "../agents.ts";
@@ -157,9 +158,22 @@ export function Overlays() {
     case "permissions":
       return <PermissionsDialog key={o.channelId} channelId={o.channelId} Modal={Modal} close={close} />;
     case "agent":
-      return <AgentDialog key={o.name ?? "new"} name={o.name} tab={o.tab} Modal={Modal} close={close} />;
+      return (
+        <AgentDialog
+          key={o.name ?? "new:" + (o.template ?? "")}
+          name={o.name}
+          tab={o.tab}
+          template={o.template}
+          Modal={Modal}
+          close={close}
+        />
+      );
     case "agent_message":
       return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
+    case "schedule":
+      return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} Modal={Modal} close={close} />;
+    case "schedule_settings":
+      return <ScheduleSettingsDialog Modal={Modal} close={close} />;
   }
 }
 

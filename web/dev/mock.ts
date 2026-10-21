@@ -10,6 +10,7 @@ import type { Note, NoteAuthor, NoteSummary, Panel, PanelResource } from "../src
 import { isPreviewUrl } from "../src/panels/preview.ts";
 import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
+import { scheduleMock } from "./mock_schedules.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -764,6 +765,97 @@ function pushAgentMessage(m: any) {
   return msg;
 }
 
+// ---------- schedules (dev/mock_schedules.ts) ----------
+
+const sched = scheduleMock({
+  now,
+  nextId: () => seq++,
+  broadcast,
+  agents: () => agentList,
+  sendMessage: (a, from, text, refused = null) =>
+    pushAgentMessage({ from, to: a.name, to_agent: a.id, origin: "schedule", hop: 0, text, refused }),
+  reply: (m, text) => {
+    m.reply = text;
+    m.replied_at = now();
+    broadcast("agent_message", m);
+  },
+  note: (c) => {
+    if (c.id !== undefined) {
+      const n = getNote(c.id);
+      return { id: n.id, title: n.title };
+    }
+    const t = String(c.title ?? "").trim();
+    const hit = [...notes.values()].find((n) => n.title.toLowerCase() === t.toLowerCase());
+    const n = hit ?? (noteMethod("note.create", { title: t, body: "" }) as Note);
+    return { id: n.id, title: n.title };
+  },
+  noteTitle: (id) => notes.get(id)?.title ?? null,
+});
+
+// Seed (before the conversation below, so these older messages sort under it): a Codex worker
+// with a weekday summary (mixed history) and a paused hourly check, and a Claude subscription
+// agent that opted in to scheduled work, whose schedule expires tomorrow.
+{
+  const worker = newAgent({ ...AGENT_TEMPLATES[5], autostart: false });
+  const digest = newAgent({
+    name: "digest",
+    kind: "claude",
+    persona: "You write a short morning digest of what changed overnight.",
+    accepts: ["human", "schedule"],
+  });
+  worker.created_at = digest.created_at = now() - 8 * 24 * 3600_000;
+  const day = (n: number) => sched.weekdayAt(n);
+  sched.seed(
+    {
+      agent: worker.name,
+      name: "Daily PR summary",
+      prompt: "Summarise the pull requests opened since {last_run} and post the summary to your channel.",
+      when: { kind: "cron", cron: "0 9 * * 1-5" },
+    },
+    9 * 24 * 3600_000,
+    [
+      { slot: day(4), outcome: "replied", mins: 4, reply: "3 PRs opened: #812 (auth retry), #815 (docs), #816 (deps). None blocked." },
+      { slot: day(3), outcome: "skipped", reason: "busy: the agent was busy for an hour" },
+      {
+        slot: day(2),
+        outcome: "refused",
+        reason: "agent worker already got 24 unattended (scheduled or triggered) messages in the last 24 hours",
+      },
+      {
+        slot: day(1) + 2 * 3600_000,
+        kind: "catch_up",
+        outcome: "replied",
+        mins: 6,
+        reason: "catch-up: missed while Muster was off or asleep",
+        reply: "1 PR opened: #820 (schedules UI). CI is green.",
+      },
+      { slot: day(0), outcome: "replied", mins: 4, reply: "2 PRs opened: #821 (mock), #822 (e2e). #821 waits for review." },
+    ],
+  );
+  const ci = sched.seed(
+    {
+      agent: worker.name,
+      name: "CI check",
+      prompt: "Check CI on master and say if anything is red.",
+      when: { kind: "cron", cron: "0 * * * *" },
+      paused: true,
+    },
+    3 * 24 * 3600_000,
+    [{ slot: now() - 26 * 3600_000, outcome: "blocked", mins: 2, reason: "stopped on an approval prompt: gh run list" }],
+  );
+  void ci;
+  sched.seed(
+    {
+      agent: digest.name,
+      name: "Morning digest",
+      prompt: "Write this morning's digest of what changed overnight ({date}).",
+      when: { kind: "cron", cron: "30 8 * * *" },
+    },
+    6.5 * 24 * 3600_000,
+    [{ slot: day(0) - 30 * 60_000, outcome: "replied", mins: 3, reply: "Overnight: 2 merges, no failed builds." }],
+  );
+}
+
 // Seed: two agents and a short conversation, so the panel has something to show.
 {
   const orch = newAgent({ ...AGENT_TEMPLATES[1], accepts: ["human"] });
@@ -1154,6 +1246,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   if (method === "openrouter.models") {
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
+  if (method.startsWith("schedule.")) return sched.handle(method, p);
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   if (method.startsWith("note.")) return noteMethod(method, p);
   switch (method) {

@@ -564,6 +564,52 @@ terminal generation and resets on an explicit terminal restart. Hook-derived sta
 count, grace timestamp and reply attribution commit with the inbox cursor, so a
 callback recovered after a lost acknowledgement cannot increment the count twice.
 
+## Cold prompt cache
+
+Claude and Codex cache the conversation they send their model; a request after the cache has
+expired re-reads the whole conversation at full cost. Code: `src/cache.rs`.
+
+`SessionInfo.last_turn_at` (unix ms or null) is the last model request the daemon saw for a
+Claude or Codex session: set when its state enters or leaves `working` (hooks or the screen), and
+on a turn's end even when the state was already `idle` (Claude `Stop`/`StopFailure`, Codex
+`notify` `agent-turn-complete`). It is null before the conversation's first turn and for shells.
+Claude's `SessionStart` with `source: "clear"` (`/clear`) clears it, and so does any new run
+that doesn't continue its conversation (only Claude's `--resume`/`--continue` do: a named
+Claude agent's restart keeps it). Stored with the session (migration v20), so it survives a
+backend reload and restart.
+
+`SessionInfo.cache_cold_at` = `last_turn_at` + the lifetime for the session's kind and
+`provider` from the shared preferences, or null (shells, no turn yet, or `cache_warn` off).
+Derived, not stored: every session follows a `prefs.set` at once (`session_upserted` for each
+that changed). A session is **cold** while it waits (any state but `working`, `starting` and
+`exited`) and now >= `cache_cold_at`.
+
+Why this clock: both providers refresh the cache on each request that reads it, and Claude Code
+itself treats the cache as warm "for one cache TTL after Claude Code last sent a request in this
+conversation or Claude last responded" (https://code.claude.com/docs/en/prompt-caching). The
+end of the last turn is the newest request the daemon can observe.
+
+Default lifetimes (`prefs.cache_ttl`, minutes; researched 2026-10):
+
+| Key | Default | Source |
+|---|---|---|
+| `claude` (Claude Code, subscription) | 60 | Claude Code asks for a 1-hour cache for the main conversation while within the plan's usage (5 min on usage credits); `promptCacheTtl` / `CLAUDE_CODE_PROMPT_CACHE_TTL` change it. code.claude.com/docs/en/prompt-caching |
+| `claude_openrouter` | 5 | Anthropic's API default is 5 min; 1 h only when Claude Code is set to ask for it (`ENABLE_PROMPT_CACHING_1H`, `promptCacheTtl: "1h"`). platform.claude.com/docs/en/build-with-claude/prompt-caching, openrouter.ai/docs/features/prompt-caching |
+| `codex` (ChatGPT plan) | 30 | guess: not documented for ChatGPT plans; OpenAI's API default for GPT-5.6 and later is 30 min (a 12 h option exists but Codex doesn't ask for it). developers.openai.com/api/docs/guides/prompt-caching |
+| `codex_openrouter` | 10 | guess: OpenRouter's sticky routing ends after 10 idle minutes, after which a request may reach another provider's (cold) cache. openrouter.ai/docs/features/prompt-caching |
+
+Settings: `prefs.get`/`prefs.set` (see "Updates and window preferences") carry `cache_warn`
+(bool, default true) and `cache_ttl` (`{claude, claude_openrouter, codex, codex_openrouter}`,
+each 1 to 1440 minutes). `prefs.set {cache_ttl: {codex: 720}}` changes only the fields given;
+an out-of-range value or unknown key refuses the whole call.
+
+**Cold sends.** When the injector submits a prompt Muster delivers (an agent message, a
+schedule run's message, panel events; not the human's own `session.send`) to a cold session, it
+is still delivered, and recorded: the agent message gets `cold_idle_ms` (how long the agent had
+been idle; also on the `agent_message` event and in a schedule run's `message`), and the
+channel's timeline a `system` event `{text, level: "info", cold_start: {session_id, idle_ms,
+msg_id, panel}}`.
+
 ## Groups layout (v2)
 
 The UI's structure is window → split groups → tabs, where a tab is one session. So a session
@@ -961,8 +1007,8 @@ watcher and no polling by clients.
 | `daemon.reload_handoff` | `{exe}` | `{exe}`. The backend restarts itself: it runs `<its launch path> reload` detached with its own environment plus its OpenRouter key (if any), as `daemon.reload` does. `muster reload` asks for it when run without `OPENROUTER_API_KEY` while the backend has a key (so the key carries over), and always from a command that can't see the backend's process (a sandboxed command in its own PID namespace, which couldn't signal it). Refused (an error starting `handoff refused:`; the CLI then reloads the usual way where it can) without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
-| `prefs.get` | `{}` | `{decorations, shell?, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
-| `prefs.set` | `{decorations?, shell?}` | The new preferences; fields left out stay, unknown fields are refused. `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
+| `prefs.get` | `{}` | `{decorations, shell?, cache_warn, cache_ttl, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
+| `prefs.set` | `{decorations?, shell?, cache_warn?, cache_ttl?}` | The new preferences; fields left out stay, unknown fields are refused. `cache_warn`, `cache_ttl`: see "Cold prompt cache". `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
 
 What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.shutdown` (and `prefs.set`, which needs
 the client token too): they are refused to paired devices (no device scope), to MCP (no tool)

@@ -426,6 +426,16 @@ pub struct SessionInfo {
     /// Runtime only: sampled every second or so, None until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_cwd: Option<String>,
+    /// Unix ms of the last model request the daemon saw (entering or leaving `Working`, or a
+    /// turn-end hook); None before the conversation's first turn, and for shells. Kept across
+    /// restarts that resume the conversation (src/cache.rs).
+    #[serde(default)]
+    pub last_turn_at: Option<i64>,
+    /// When the prompt cache has likely expired: `last_turn_at` plus the provider's cache
+    /// lifetime (`UiPrefs.cache_ttl`). None for shells, before the first turn, or with the
+    /// warning off. Cold while waiting (not working, starting or exited) and now >= this.
+    #[serde(default)]
+    pub cache_cold_at: Option<i64>,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).
@@ -500,13 +510,17 @@ pub struct UiPrefs {
     /// (`adapters::shell::user_shell`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// Warn when an agent's prompt cache has likely expired (src/cache.rs).
+    pub cache_warn: bool,
+    /// Each CLI/provider pair's prompt-cache lifetime, in minutes.
+    pub cache_ttl: crate::cache::CacheTtl,
     /// Raised by every `prefs.set`, so a client can tell a stale reply from a newer change.
     pub revision: u64,
 }
 
 impl Default for UiPrefs {
     fn default() -> Self {
-        Self { decorations: true, shell: None, revision: 0 }
+        Self { decorations: true, shell: None, cache_warn: true, cache_ttl: Default::default(), revision: 0 }
     }
 }
 
@@ -517,6 +531,8 @@ pub struct UiPrefsChange {
     pub decorations: Option<bool>,
     /// A path or a name on `PATH`; "" goes back to the login shell.
     pub shell: Option<String>,
+    pub cache_warn: Option<bool>,
+    pub cache_ttl: Option<crate::cache::CacheTtlChange>,
 }
 
 pub fn now_ms() -> i64 {

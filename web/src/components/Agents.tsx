@@ -8,6 +8,7 @@ import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from
 import {
   schedulesSupported,
   agentFilter,
+  cacheNow,
   agentMessages,
   agents,
   agentsPanelOpen,
@@ -75,6 +76,7 @@ import {
   IconX,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
+import { idleText, isCold } from "../cache.ts";
 
 /** Re-render every `ms` (the "time in state" column). */
 function useNow(ms = 30_000): number {
@@ -177,6 +179,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
   const billing = agentBilling(a, s);
+  const cold = !!s && isCold(s, cacheNow());
   const persona = firstLine(a.persona);
   const open = () => {
     agentFilter.value = a.id;
@@ -189,7 +192,9 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}`}
+      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${
+        cold ? ", prompt cache likely expired" : ""
+      }`}
       onClick={open}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -218,6 +223,11 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.label}
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
+          {cold && (
+            <span class="ap-cold" data-tip="Its prompt cache has likely expired: the next message re-reads the whole conversation">
+              cold
+            </span>
+          )}
         </span>
         {billing.badge && (
           <span
@@ -322,6 +332,18 @@ function OriginChip({ origin }: { origin: Origin }) {
   return <span class={cx("ap-chip", origin !== "human" && "ap-chip-unattended")}>{origin}</span>;
 }
 
+/** Muster typed this message in after the agent's cache had likely expired. */
+export function ColdChip({ ms }: { ms: number }) {
+  return (
+    <span
+      class="ap-chip ap-chip-cold"
+      data-tip={`Sent after ${idleText(ms)} idle: the agent re-read its whole conversation uncached`}
+    >
+      cold start
+    </span>
+  );
+}
+
 function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
   return (
     <button
@@ -341,6 +363,7 @@ function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
         <OriginChip origin={m.origin} />
         <span class="ap-chip">hop {m.hop}</span>
         {m.reply !== null && <span class="ap-chip ap-chip-ok">replied</span>}
+        {m.cold_idle_ms != null && <ColdChip ms={m.cold_idle_ms} />}
       </span>
       {m.refused && (
         <span class="ap-msg-refused">
@@ -1603,6 +1626,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
         <span class="muted msg-meta">
           Message {m.id} · {when} · <OriginChip origin={m.origin} /> <span class="ap-chip">hop {m.hop}</span>
           {m.reply_to !== null && ` · while handling message ${m.reply_to}`}
+          {m.cold_idle_ms != null && <>{" · "}<ColdChip ms={m.cold_idle_ms} /></>}
         </span>
       </div>
       <div class="dlg-body">

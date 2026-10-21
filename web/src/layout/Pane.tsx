@@ -9,8 +9,11 @@ import { notes, notesSupported } from "../notes.ts";
 import type { NoteInfo } from "../types.ts";
 import {
   accountProfiles,
+  agentBySession,
   altHeld,
+  cacheNow,
   channelById,
+  coldDismissed,
   confirmClose,
   meta,
   renaming,
@@ -19,9 +22,11 @@ import {
   sessionsByChannel,
   unread,
   windowId,
+  windowPrefs,
   windowsSupported,
   workspaceById,
 } from "../state.ts";
+import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
 import { OPENROUTER_BADGE, sessionOnOpenRouter } from "../agents.ts";
@@ -258,7 +263,7 @@ export function Group(
   };
 
   const onContext = (e: MouseEvent) => {
-    if (!active || (e.target as HTMLElement).closest?.(".approval, .exited-bar, .input-paused-bar, .findbar, input")) return;
+    if (!active || (e.target as HTMLElement).closest?.(".approval, .exited-bar, .input-paused-bar, .cache-bar, .findbar, input")) return;
     // Never the browser's own menu over a terminal. The right button is Muster's even over a
     // program that tracks the mouse; terms.ts keeps its reports from the program.
     e.preventDefault();
@@ -307,6 +312,9 @@ export function Group(
           <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
         ))}
         {active && active.input_interrupted && active.state !== "exited" && <InputPausedBar s={active} />}
+        {active && isCold(active, cacheNow()) && !coldDismissed.value.includes(coldKey(active)) && (
+          <CacheBar s={active} />
+        )}
         {active && active.state === "exited" && <ExitedBar s={active} />}
         {active && connStatus.value !== "open" && (
           <div class="term-veil" role="status">
@@ -678,9 +686,11 @@ function GroupTab(
 
   const home = meta.value.home;
   const onOpenRouter = sessionOnOpenRouter(s);
+  const cold = isCold(s, cacheNow());
   const tip = [
     tabText(label),
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
+    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
@@ -761,6 +771,7 @@ function GroupTab(
         </span>
       )}
       {onOpenRouter && <span class="tab-or" aria-label={OPENROUTER_BADGE}>OpenRouter</span>}
+      {cold && <span class="tab-cold" aria-label="Prompt cache likely expired">cold</span>}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}
       <button
@@ -849,6 +860,49 @@ function InputPausedBar({ s }: { s: SessionInfo }) {
       <span>Typing is paused: some input may not have reached this terminal. Check the screen first.</span>
       <button type="button" class="link-btn" onClick={() => A.continueInput(s.id)}>
         Continue typing
+      </button>
+    </div>
+  );
+}
+
+/** The agent idled past its prompt cache's lifetime (src/cache.ts). Never takes the keyboard:
+ * its buttons don't take focus on press, and the terminal keeps it. Dismissed for this idle
+ * period only: it comes back once a later turn goes cold too. */
+function CacheBar({ s }: { s: SessionInfo }) {
+  const agent = agentBySession.value.get(s.id);
+  const ttl = ttlFor(s, windowPrefs.value?.cache_ttl ?? DEFAULT_CACHE_TTL);
+  const keepFocus = (e: MouseEvent) => e.preventDefault();
+  return (
+    <div class="cache-bar" role="note" aria-label="Prompt cache likely expired">
+      <span class="cache-dot" aria-hidden="true" />
+      <span
+        class="cache-text"
+        data-tip={ttl !== null
+          ? `Its provider keeps the cache about ${ttlText(ttl)} after the last turn. Change it in Cache warning settings.`
+          : undefined}
+      >
+        {coldText(s, cacheNow())}
+      </span>
+      {agent && (
+        <button
+          type="button"
+          class="link-btn"
+          data-tip="A new conversation, when the old context isn't needed"
+          onMouseDown={keepFocus}
+          onClick={() => A.openAgent(agent.name, true)}
+        >
+          Start fresh
+        </button>
+      )}
+      <button
+        type="button"
+        class="cache-x"
+        aria-label="Dismiss until the next idle period"
+        data-tip="Dismiss until the next idle period"
+        onMouseDown={keepFocus}
+        onClick={() => (coldDismissed.value = addDismissal(coldDismissed.value, coldKey(s)))}
+      >
+        <IconX size={12} />
       </button>
     </div>
   );

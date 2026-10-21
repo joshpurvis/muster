@@ -308,6 +308,8 @@ mod tests {
             size_owner: None,
             input_interrupted: false,
             live_cwd: None,
+            last_turn_at: None,
+            cache_cold_at: None,
             state_seq: 0,
             created_at: 0,
             window_id: None,

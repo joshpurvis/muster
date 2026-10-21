@@ -953,7 +953,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         }
         AfterTyping::Fail(msg) => anyhow::bail!(msg),
     }
-    let seq_before = {
+    let (seq_before, cold) = {
         let _op = item.panel.as_ref().map(|_| hub.panels.operations.lock());
         if let Some(batch) = &item.panel && !panel_bound(hub, id, batch) {
             // Typed but not submitted: take the text back out; the events return to the panel.
@@ -968,12 +968,22 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             return Ok(true);
         }
         // The prompt runs from here on: the session now handles a message from `source`.
-        hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;
+        let now = crate::model::now_ms();
+        hub.note_prompt_delivery(id, generation, item.source, now)?;
+        // Muster's own sends (not the human's) to an agent whose cache has likely expired are
+        // recorded once submitted, never held back (src/cache.rs).
+        let cold = match item.source {
+            crate::agents::Source::Chain(_) => hub.cache_cold(id, now),
+            crate::agents::Source::Human => None,
+        };
         mark_stage(hub, id, generation, Stage::Submitting)?;
         let seq_before = hub.output_seq(id);
         hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
-        seq_before
+        (seq_before, cold)
     };
+    if let (Some(idle), crate::agents::Source::Chain(prov)) = (cold, item.source) {
+        hub.note_cold_send(id, prov, item.panel.is_some(), idle);
+    }
 
     // 3. Verify. Submit once more only if our text demonstrably still sits in the input box
     //    (or the box is unreadable and nothing happened at all).

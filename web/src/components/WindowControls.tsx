@@ -44,6 +44,14 @@ function moreMenu(): MenuItem[] {
     ...(accountProfilesSupported.value
       ? [{ label: "Claude profiles…", run: () => (overlay.value = { kind: "account_profiles" }) }]
       : []),
+    // Backends with the cold prompt cache warning (src/cache.rs).
+    ...(shared?.cache_warn !== undefined
+      ? [{
+        label: "Cache warning…",
+        hint: shared.cache_warn ? "on" : "off",
+        run: () => (overlay.value = { kind: "cache_settings" }),
+      }]
+      : []),
     {
       label: "Terminal gets Alt keys",
       checked: p.altToTerminal,

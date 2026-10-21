@@ -137,6 +137,22 @@ export const dismissedUpdates = signal<Dismissed>(load<Dismissed>("dismissedUpda
 effect(() => save("dismissedUpdates", dismissedUpdates.value));
 /** Preferences every window shares (`prefs.get`); null from backends without them. */
 export const windowPrefs = signal<WindowPrefs | null>(null);
+
+// ---------------- cold prompt cache (src/cache.ts) ----------------
+
+/** The clock the cold-cache bar and markers read: ticks every 20 s (they show minutes). */
+export const cacheClock = signal(Date.now());
+setInterval(() => (cacheClock.value = Date.now()), 20_000);
+/** Now, for cold-cache rendering: subscribes to the tick, but never reads a stale time when
+ * something else (a session update) re-renders between ticks. */
+export function cacheNow(): number {
+  return Math.max(cacheClock.value, Date.now());
+}
+/** Idle periods (`coldKey`) whose bar this viewer dismissed; the next turn's period is new. */
+export const coldDismissed = signal<string[]>(
+  ((d: unknown) => Array.isArray(d) ? d.filter((k) => typeof k === "string") : [])(load("coldDismissed", [])),
+);
+effect(() => save("coldDismissed", coldDismissed.value));
 /** The backend announced a full shutdown (`daemon_stopping`): this page stops reconnecting. */
 export const daemonStopped = signal(false);
 
@@ -423,6 +439,8 @@ export type Overlay =
   | { kind: "notes" }
   /** "Shell for new terminals…": the shell new shell tabs run. */
   | { kind: "shell" }
+  /** "Cache warning…": the cold prompt cache bar and each provider's cache lifetime. */
+  | { kind: "cache_settings" }
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
   | { kind: "shutdown" }
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */

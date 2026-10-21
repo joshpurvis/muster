@@ -6,6 +6,7 @@ import type { ComponentChildren } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import {
+  agentMessages,
   agents,
   agentsPanelOpen,
   knowSchedule,
@@ -58,6 +59,7 @@ import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, openMenuAt } from "./Menu.tsx";
 import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert } from "../icons.tsx";
 import { cx } from "../util.ts";
+import { idleText } from "../cache.ts";
 
 type ModalT = (
   p: { children: ComponentChildren; class?: string; label: string; onClose?: () => void },
@@ -266,15 +268,26 @@ function RunEntry({ r, now }: { r: ScheduleRun; now: number }) {
   const tone = outcomeTone(r.outcome);
   const kind = runKindLabel(r);
   const reason = runReason(r);
+  // The message's live copy (a cold start is marked once the prompt is typed in).
+  const msg = (r.msg_id !== null ? agentMessages.value.find((m) => m.id === r.msg_id) : undefined) ?? r.message;
+  const cold = msg?.cold_idle_ms ?? null;
   const body = (
     <>
       <span class="sch-run-top">
         <span class={cx("sch-dot", "sch-" + tone)} aria-hidden="true" />
         <span class="sch-run-line">{runLine(r, now)}</span>
       </span>
-      {(kind || reason || r.late_reply) && (
+      {(kind || reason || r.late_reply || cold !== null) && (
         <span class="sch-run-reason">
           {kind && <span class="ap-chip">{kind}</span>}
+          {cold !== null && (
+            <span
+              class="ap-chip ap-chip-cold"
+              data-tip={`Sent after ${idleText(cold)} idle: the agent re-read its whole conversation uncached`}
+            >
+              cold start
+            </span>
+          )}
           {r.late_reply && <span class="ap-chip" data-tip="The reply came after the run stopped waiting">late reply</span>}
           {reason}
         </span>

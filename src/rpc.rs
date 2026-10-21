@@ -2132,15 +2132,24 @@ mod tests {
     async fn window_prefs_persist_and_broadcast() {
         let (hub, _st) = fixture();
         let mut rx = hub.subscribe();
-        assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap(), json!({"decorations": true, "revision": 0}));
-        let set = json!({"decorations": false, "revision": 1});
+        let ttl = json!({"claude": 60, "claude_openrouter": 5, "codex": 30, "codex_openrouter": 10});
+        let prefs = |d: bool, r: u64| json!({"decorations": d, "cache_warn": true, "cache_ttl": ttl, "revision": r});
+        assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap(), prefs(true, 0));
+        let set = prefs(false, 1);
         assert_eq!(call(&hub, "prefs.set", json!({"decorations": false})).await.unwrap(), set);
         assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["prefs"], set);
         let ev = serde_json::to_value(rx.recv().await.unwrap()).unwrap();
         assert_eq!(ev, json!({"event": "prefs_changed", "data": set}));
         // Fields not given stay (each write still counts); unknown ones are refused.
-        assert_eq!(call(&hub, "prefs.set", json!({})).await.unwrap(), json!({"decorations": false, "revision": 2}));
+        assert_eq!(call(&hub, "prefs.set", json!({})).await.unwrap(), prefs(false, 2));
         assert!(call(&hub, "prefs.set", json!({"theme": "dark"})).await.is_err());
+        // The cold-cache warning: one lifetime at a time, in minutes (1 to a day).
+        let p = call(&hub, "prefs.set", json!({"cache_warn": false, "cache_ttl": {"codex": 720}})).await.unwrap();
+        assert_eq!((p["cache_warn"].clone(), p["cache_ttl"]["codex"].clone(), p["cache_ttl"]["claude"].clone()),
+            (json!(false), json!(720), json!(60)));
+        for bad in [json!({"codex": 0}), json!({"claude": 1441}), json!({"gemini": 5})] {
+            assert!(call(&hub, "prefs.set", json!({"cache_ttl": bad})).await.is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]
@@ -2157,7 +2166,8 @@ mod tests {
         assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap()["shell"], json!(sh));
         // "" goes back to the login shell: the field disappears.
         let cleared = call(&hub, "prefs.set", json!({"shell": ""})).await.unwrap();
-        assert_eq!(cleared, json!({"decorations": true, "revision": 2}));
+        assert_eq!(cleared["revision"], json!(2));
+        assert!(cleared.get("shell").is_none());
         let hello = call(&hub, "hello", json!({})).await.unwrap();
         assert!(hello["login_shell"].as_str().is_some_and(|s| s.starts_with('/')));
         // A program the backend runs: never chosen from a paired device.

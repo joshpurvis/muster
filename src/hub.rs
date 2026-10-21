@@ -468,6 +468,8 @@ pub struct Hub {
     updates: crate::updates::Updates,
     /// Serializes `set_ui_prefs`.
     prefs_lock: Mutex<()>,
+    /// The cold-cache rules from the shared preferences (`UiPrefs.cache_*`, src/cache.rs).
+    cache_rules: Mutex<crate::cache::CacheRules>,
     /// OpenRouter's model list (`openrouter.models`).
     openrouter_models: Arc<crate::openrouter::ModelCache>,
     weak: Weak<Hub>,
@@ -562,11 +564,78 @@ impl Hub {
                 s => Some(crate::adapters::shell::resolve_shell(s)?),
             };
         }
+        if let Some(on) = change.cache_warn {
+            p.cache_warn = on;
+        }
+        if let Some(ttl) = change.cache_ttl {
+            p.cache_ttl.apply(ttl)?;
+        }
         p.revision += 1;
         self.store.save_runtime(UI_PREFS_KEY, &p)?;
         crate::adapters::shell::set_configured_shell(p.shell.clone());
         self.emit(ServerEvent::PrefsChanged(p.clone()));
+        self.set_cache_rules(crate::cache::CacheRules::from_prefs(&p));
         Ok(p)
+    }
+
+    /// New cold-cache rules: every session's `cache_cold_at` follows (derived, not stored).
+    fn set_cache_rules(&self, rules: crate::cache::CacheRules) {
+        let mut g = self.inner.lock();
+        {
+            let mut current = self.cache_rules.lock();
+            if *current == rules {
+                return;
+            }
+            *current = rules;
+        }
+        for e in g.sessions.values_mut() {
+            if rules.refresh(&mut e.info) {
+                self.publish_session(&e.info);
+            }
+        }
+    }
+
+    /// Record that Muster typed a prompt (`prov`; `panel`: panel events) into session `id`
+    /// after it had been idle `idle_ms`, past its cache lifetime: the agent message gets
+    /// `cold_idle_ms` (so do the schedule runs that sent it), and the timeline a notice.
+    /// Never fails a delivery.
+    pub(crate) fn note_cold_send(&self, id: SessionId, prov: crate::agents::Prov, panel: bool, idle_ms: i64) {
+        let Some(info) = self.session(id) else { return };
+        if let Some(msg) = prov.msg_id {
+            match self.store.set_agent_message_cold(msg, idle_ms) {
+                Ok(true) => crate::agents::publish_message(self, msg),
+                // Recorded already: the same prompt submitted again.
+                Ok(false) => return,
+                Err(error) => tracing::warn!(session = id, msg, "marking a cold start: {error:#}"),
+            }
+        }
+        let what = if panel {
+            "panel events"
+        } else {
+            match prov.origin {
+                crate::agents::Origin::Schedule => "a scheduled message",
+                crate::agents::Origin::Webhook => "a webhook message",
+                crate::agents::Origin::Human => "a message",
+            }
+        };
+        let text = format!(
+            "Cold start: Muster sent {what} to {} after {} idle. Its prompt cache had likely expired, so it re-read the whole conversation at full cost.",
+            info.name,
+            crate::cache::idle_text(idle_ms)
+        );
+        tracing::info!(session = id, idle_ms, "{text}");
+        self.log_event(Some(info.channel_id), Some(id), EventKind::System, serde_json::json!({
+            "text": text, "level": "info",
+            "cold_start": {"session_id": id, "idle_ms": idle_ms, "msg_id": prov.msg_id, "panel": panel},
+        }));
+    }
+
+    /// Session `id`'s next message would re-read its whole conversation uncached (src/cache.rs):
+    /// how long it has been idle, else None.
+    pub fn cache_cold(&self, id: SessionId, now: i64) -> Option<i64> {
+        let g = self.inner.lock();
+        let info = &g.sessions.get(&id)?.info;
+        crate::cache::is_cold(info, now).then(|| now - info.last_turn_at.unwrap_or(now))
     }
 
     pub fn terminal_host_info(&self) -> Option<muster_terminal_protocol::Hello> {
@@ -633,6 +702,8 @@ impl Hub {
             Err(e) => tracing::warn!("pruning events: {e}"),
         }
         let mut inner = Inner::default();
+        let cache_rules = crate::cache::CacheRules::from_prefs(
+            &store.load_runtime::<UiPrefs>(UI_PREFS_KEY).ok().flatten().unwrap_or_default());
         for w in store.load_workspaces()? {
             inner.workspaces.insert(w.id, w);
         }
@@ -655,6 +726,7 @@ impl Hub {
                 .filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
             let last_hook_at = hook.map_or(0, |saved| saved.last_hook_at);
+            cache_rules.refresh(&mut info);
             store.update_session(&info)?;
             if let Some(token) = &token { inner.tokens.insert(token.clone(), info.id); }
             let usable_title = info.title.as_deref().and_then(|t| clean_title(t, info.kind));
@@ -744,6 +816,7 @@ impl Hub {
             rt: tokio::runtime::Handle::try_current().ok(),
             updates: Default::default(),
             prefs_lock: Mutex::new(()),
+            cache_rules: Mutex::new(cache_rules),
             openrouter_models: Arc::new(crate::openrouter::ModelCache::new(paths::data_dir().join("openrouter-models.json"))),
             weak: weak.clone(),
         });
@@ -1393,6 +1466,9 @@ impl Hub {
             e.info.state_seq = next_seq;
             e.info.state = update.state;
             e.info.state_detail = update.detail.clone();
+            if crate::cache::note_state(&mut e.info, from, update.state, now) {
+                self.cache_rules.lock().refresh(&mut e.info);
+            }
             if let Err(err) = self.store.update_session(&e.info) {
                 tracing::warn!(session = id, "persisting session: {err}");
             }
@@ -2642,6 +2718,8 @@ impl Hub {
                 size_owner: None,
                 input_interrupted: false,
                 live_cwd: None,
+                last_turn_at: None,
+                cache_cold_at: None,
                 state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),
@@ -2853,6 +2931,7 @@ impl Hub {
             permissions,
         };
         let mut spec = adapter_for(info.kind).command(&ctx)?;
+        let continues = crate::cache::continues_conversation(info.kind, &ctx.extra_args);
         let provider = self.session_provider(id);
         let openrouter = match provider {
             crate::openrouter::Provider::OpenRouter => {
@@ -2923,6 +3002,9 @@ impl Hub {
             info.state_since = now_ms();
             // What this run bills to (the badge follows the run, not the agent's saved setting).
             info.provider = provider;
+            // A new conversation has nothing cached to lose; a resumed one keeps its clock.
+            if !continues { info.last_turn_at = None; }
+            self.cache_rules.lock().refresh(&mut info);
             info.pid = None;
             info.exit_code = None;
             info.subagents = 0;
@@ -3614,6 +3696,11 @@ impl Hub {
                 if let Some(delta) = subagent_delta(event, &payload) {
                     info.subagents = delta.map_or(0, |d| info.subagents.saturating_add_signed(d));
                 }
+                let to = info.state;
+                let turn = crate::cache::note_state(&mut info, from, to, now);
+                if crate::cache::note_hook(&mut info, event, &payload, now) || turn {
+                    self.cache_rules.lock().refresh(&mut info);
+                }
             } else {
                 info.subagents = 0;
             }
@@ -3624,7 +3711,8 @@ impl Hub {
             let fx = self.agents.on_hook_session_checkpoint(&self.store, &entry.info, event, &payload,
                 cursor, Some((&info, &runtime)), arrival)?;
             if fx.duplicate { return Ok(()) }
-            let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents;
+            let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents
+                || info.cache_cold_at != entry.info.cache_cold_at;
             entry.info = info.clone();
             entry.last_hook_at = last_hook_at;
             if changed {
@@ -4455,7 +4543,7 @@ mod tests {
         hub.inner.lock().sessions.get_mut(&2).unwrap().generation = 42;
         let message = || hub.store.insert_agent_message(&AgentMessage { id: 0, from: "fixture".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 1,
-            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None }).unwrap();
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None }).unwrap();
         let first = message();
         let next = message();
         let source = |msg| Source::Chain(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(msg) });
@@ -5402,5 +5490,87 @@ mod tests {
         assert_eq!((v.channel_ids, v.open, v.name.as_str()), (vec![13], false, "2"));
         assert_eq!(clean_window_name(Some("  a\u{1b}b ".into())).as_deref(), Some("ab"));
         assert_eq!(clean_window_name(Some(" ".into())), None);
+    }
+
+    #[test]
+    fn cache_goes_cold_a_ttl_after_the_last_turn_and_follows_the_prefs() {
+        let hub = move_fixture();
+        hub.inner.lock().tokens.insert("cache-token".into(), 2);
+        hub.set_state_for_test(1, AgentState::Idle);
+        hub.set_state_for_test(2, AgentState::Idle);
+        assert_eq!(hub.session(2).unwrap().cache_cold_at, None, "no turn yet: nothing cached");
+        let before = now_ms();
+        hub.handle_hook("cache-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"})).unwrap();
+        hub.handle_hook("cache-token", "Stop", serde_json::json!({})).unwrap();
+        let s = hub.session(2).unwrap();
+        let at = s.last_turn_at.expect("a turn ended");
+        assert!(at >= before);
+        assert_eq!(s.cache_cold_at, Some(at + 60 * 60_000), "Claude on its subscription: 1 h");
+        assert_eq!(hub.cache_cold(2, at + 59 * 60_000), None);
+        assert_eq!(hub.cache_cold(2, at + 61 * 60_000), Some(61 * 60_000));
+        let stored = hub.store.load_sessions().unwrap().into_iter().find(|x| x.info.id == 2).unwrap().info;
+        assert_eq!(stored.last_turn_at, Some(at), "kept across a backend restart");
+        // Shells have no model and no cache.
+        assert!(hub.set_state_checked(1, StateUpdate::new(AgentState::Working), StateSource::Screen, None));
+        assert!(hub.set_state_checked(1, StateUpdate::new(AgentState::Idle), StateSource::Screen, None));
+        assert_eq!((hub.session(1).unwrap().last_turn_at, hub.cache_cold(1, i64::MAX)), (None, None));
+        // A shorter lifetime, then the warning off: every session follows, and says so.
+        let mut events = hub.subscribe();
+        hub.set_ui_prefs(UiPrefsChange {
+            cache_ttl: Some(crate::cache::CacheTtlChange { claude: Some(5), ..Default::default() }),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(hub.session(2).unwrap().cache_cold_at, Some(at + 5 * 60_000));
+        let mut upserted = false;
+        while let Ok(e) = events.try_recv() {
+            upserted |= matches!(e, ServerEvent::SessionUpserted(ref i) if i.id == 2 && i.cache_cold_at == Some(at + 5 * 60_000));
+        }
+        assert!(upserted, "clients hear the new cold time");
+        hub.set_ui_prefs(UiPrefsChange { cache_warn: Some(false), ..Default::default() }).unwrap();
+        assert_eq!(hub.cache_cold(2, i64::MAX), None);
+        assert!(hub.set_ui_prefs(UiPrefsChange {
+            cache_ttl: Some(crate::cache::CacheTtlChange { codex: Some(0), ..Default::default() }),
+            ..Default::default()
+        }).is_err());
+    }
+
+    #[test]
+    fn a_cold_send_marks_its_message_and_the_timeline() {
+        use crate::agents::{AgentMessage, Origin, Prov};
+        let hub = agent_fixture();
+        hub.set_state_for_test(2, AgentState::Idle);
+        let now = now_ms();
+        {
+            let mut g = hub.inner.lock();
+            let info = &mut g.sessions.get_mut(&2).unwrap().info;
+            info.last_turn_at = Some(now - 90 * 60_000);
+            hub.cache_rules.lock().refresh(info);
+        }
+        let idle = hub.cache_cold(2, now).expect("idle 1 h 30 m past a 1 h cache");
+        assert_eq!(idle, 90 * 60_000);
+        let msg = hub.store.insert_agent_message(&AgentMessage { id: 0, from: "schedule:1".into(),
+            from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 0,
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: Some("digest".into()),
+            refused: None, to_name: None, cold_idle_ms: None }).unwrap();
+        let mut events = hub.subscribe();
+        hub.note_cold_send(2, Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) }, false, idle);
+        assert_eq!(hub.store.agent_message(msg).unwrap().unwrap().cold_idle_ms, Some(idle));
+        // A retry of the same prompt is recorded once.
+        hub.note_cold_send(2, Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) }, false, idle + 5);
+        assert_eq!(hub.store.agent_message(msg).unwrap().unwrap().cold_idle_ms, Some(idle));
+        let mut published = false;
+        while let Ok(e) = events.try_recv() {
+            if let ServerEvent::AgentMessage(m) = e { published |= m["id"] == msg && m["cold_idle_ms"] == idle; }
+        }
+        assert!(published, "clients hear the message is a cold start");
+        let channel = hub.session(2).unwrap().channel_id;
+        let logged = hub.store.timeline(channel, None, 50).unwrap();
+        assert_eq!(logged.iter().filter(|e| e.data.get("cold_start").is_some()).count(), 1, "one notice");
+        let note = logged.iter().find(|e| e.data.get("cold_start").is_some()).expect("a timeline notice");
+        assert!(note.data["text"].as_str().unwrap().contains("after 1 h 30 m idle"), "{}", note.data["text"]);
+        // Warm, working or a shell: never cold.
+        hub.set_state_for_test(2, AgentState::Working);
+        assert_eq!(hub.cache_cold(2, now), None);
+        assert_eq!(hub.cache_cold(1, i64::MAX), None);
     }
 }

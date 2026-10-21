@@ -481,6 +481,25 @@ exec cat > /dev/null
   const fake = await c.call("session.spawn", { channel_id: ch.id, kind: "codex" });
   await c.waitFor("fake idle agent", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === fake.id && e.data.state === "idle"));
   const fakeToken = await Deno.readTextFile(`${BASE}/fake-token`);
+  // Cold prompt cache (src/cache.rs): a turn's end starts the clock, the lifetime comes from the
+  // shared prefs (Codex on its plan: 30 min), and changing it moves every session's cold time.
+  const fakeInfo = async () => (await c.call("hello")).sessions.find((x: Json) => x.id === fake.id);
+  ok((await fakeInfo()).cache_cold_at === null, "cache: no cold time before the agent's first turn");
+  const notified = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+    method: "POST", headers: { Authorization: `Bearer ${fakeToken}` },
+    body: JSON.stringify({ type: "agent-turn-complete", "last-assistant-message": "done" }),
+  });
+  ok(notified.ok, "cache: Codex's turn-complete notify accepted");
+  await c.waitFor("a turn's end", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === fake.id && e.data.last_turn_at));
+  const turned = await fakeInfo();
+  ok(turned.cache_cold_at === turned.last_turn_at + 30 * 60_000, "cache: Codex on its plan goes cold 30 min after its last turn");
+  const shellInfo = (await c.call("hello")).sessions.find((x: Json) => x.kind === "shell");
+  ok(shellInfo && shellInfo.cache_cold_at === null && shellInfo.last_turn_at === null, "cache: shells never get a cold time");
+  await c.call("prefs.set", { cache_ttl: { codex: 1 } });
+  ok((await fakeInfo()).cache_cold_at === turned.last_turn_at + 60_000, "cache: a 1-minute lifetime moves its cold time");
+  await c.call("prefs.set", { cache_warn: false });
+  ok((await fakeInfo()).cache_cold_at === null, "cache: the warning off clears it");
+  await c.call("prefs.set", { cache_warn: true, cache_ttl: { codex: 30 } });
   const fakePanel = (await mcp(fakeToken, "panel_open", { title: "Idle delivery", app: "markdown" })).panel_id;
   // Registering a wait suppresses automatic injection even for an idle opener.
   const idleWait = mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 5 });

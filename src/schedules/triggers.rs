@@ -54,6 +54,15 @@ const LIST_MAX: usize = 10;
 const GIT_EVERY: Duration = Duration::from_secs(15);
 const GH_BACKOFF_MAX_MS: i64 = 60 * plan::MINUTE_MS;
 
+/// Debug builds only (the smoke test): `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet
+/// minutes, `MUSTER_TEST_WATCH_EVERY_MS` the git look and the GitHub poll interval.
+fn test_ms(var: &str) -> Option<i64> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var(var).ok().and_then(|v| v.parse().ok()).filter(|v: &i64| *v > 0)
+}
+
 // ----- live watcher state (not stored) -----
 
 /// How a watcher is doing, for the panel (`schedule.watch`).
@@ -354,7 +363,7 @@ pub fn note_changed(hub: &Hub, note: &Note) {
             continue;
         }
         let text = format!("The note “{}” was edited by {who} (now at revision {}).", note.title, note.rev);
-        let at = now + quiet_min as i64 * plan::MINUTE_MS;
+        let at = now + test_ms("MUSTER_TEST_TRIGGER_DELAY_MS").unwrap_or(quiet_min as i64 * plan::MINUTE_MS);
         if let Err(e) = hold(hub, s.id, &text, None, at, true) {
             tracing::warn!(schedule = s.id, "holding a note change: {e:#}");
         }
@@ -641,7 +650,7 @@ fn url_part(s: &str) -> String {
 /// The delay before the next poll after `errors` failures in a row: the trigger's interval,
 /// doubling per failure, at most an hour.
 pub fn gh_backoff_ms(every_min: u32, errors: u32) -> i64 {
-    let base = every_min as i64 * plan::MINUTE_MS;
+    let base = test_ms("MUSTER_TEST_WATCH_EVERY_MS").unwrap_or(every_min as i64 * plan::MINUTE_MS);
     if errors == 0 {
         return base;
     }
@@ -746,8 +755,9 @@ pub fn spawn(hub: Arc<Hub>) {
                 }
             }
             check_github(&hub);
+            let every = test_ms("MUSTER_TEST_WATCH_EVERY_MS").map_or(GIT_EVERY, |ms| Duration::from_millis(ms as u64));
             tokio::select! {
-                _ = tokio::time::sleep(GIT_EVERY) => {}
+                _ = tokio::time::sleep(every) => {}
                 _ = hub.triggers.wake.notified() => {}
             }
             if hub.is_shutting_down() {

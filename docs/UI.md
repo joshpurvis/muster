@@ -210,6 +210,13 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
   the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
   arrow keys move the selected row, which screen readers announce.
+- **Allow triggers**: a small switch in the status line (a lightning icon, `triggers off` /
+  `triggers on · N` with the number of triggers watching the note; role switch; the tooltip says
+  what it does and that agents can't change it) and a checked **Allow triggers** item in the tab
+  menu. Off for every note until you switch it on; only then can a schedule's note trigger fire on
+  the note's changes (docs/PROTOCOL.md "Schedules", Phase 2). While on, the tab shows a small amber
+  lightning after its title (", triggers allowed" in its name and tooltip). Backends without it
+  show neither.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
 
 ### Dragging tabs
@@ -419,13 +426,13 @@ terminal tab; there is no chat view.
 | Part | What |
 |---|---|
 | Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token), followed by what it spent today once read (`· $0.42 today`, OpenRouter's UTC day; see Scheduling settings). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
 | Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
-| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name, then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. |
-| Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). |
-| Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run` (also while a page loads; pages merge in). After a reconnect, histories are thrown away and the open ones load again; a failed load says so with Try again. |
+| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name, then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git or GitHub watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`; the tooltip says what to do). |
+| Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). A trigger has no Skip next; Run now runs it without an event. A URL trigger adds **Copy trigger command** (a `curl` line with its URL and secret, `trigger.secret`; the toast says to keep it private) and **New secret…** (confirm; the old secret stops working). A note trigger whose note has triggers off adds **Allow triggers on <note>**. |
+| Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run` (also while a page loads; pages merge in). After a reconnect, histories are thrown away and the open ones load again; a failed load says so with Try again. A triggered run has a `triggered` chip and the first line of what happened (`+N more` for merged events). A "Then…" step reads right under the run it follows, indented on a guide line, with a `then: <agent>` chip; it never becomes the row's last outcome. |
 | + New agent | Under the list: the New agent dialog. |
 | Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, a `cold start` chip when it was typed into an agent whose cache had likely expired, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
 
@@ -443,7 +450,13 @@ its runs, recorded once, until resumed), quiet hours from / to (`HH:MM`, this co
 named in the hint; they apply to schedules with quiet hours on, the default for Claude
 subscription agents), and "Unattended messages per agent per day" (1–200, default 24: scheduled
 and triggered messages, not the human's, over any 24 hours; past it the message is refused with
-the reason). Save sends only what changed (`schedule.settings.set`).
+the reason), and, with a Phase 2 backend, **OpenRouter spend**: today's spend of the cap
+(`$1.84 today of $5.00 · resets at 00:00 UTC (OpenRouter's day) · read 3 m ago`, red at the cap;
+"Not read yet today" or why it couldn't be read; "No OpenRouter key" when the backend has none),
+the daily cap for all OpenRouter agents in dollars (always on), and one row per OpenRouter agent
+with what it spent today and its own optional cap ("no own cap"). Opening it asks the backend
+again (it re-reads the key when its reading is over a minute old; the numbers update live). Save
+sends only what changed (`schedule.settings.set`). The dialog scrolls in a short window.
 
 **New / Edit schedule dialog** (header `⋯`, an agent's menu, the palette, a schedule's Edit…):
 
@@ -485,6 +498,28 @@ the reason). Save sends only what changed (`schedule.settings.set`).
   backend's refusals (an agent that doesn't take scheduled work, a bad cron line) show in the
   dialog.
 
+**Triggers and "Then…" in the dialog** (Phase 2 backends, whose settings carry the spend):
+
+- **When** is a radio group: **At a time** (everything above) · **When something happens**. The
+  second shows an event picker: *A note changes* (a note's title from a list, "after N minutes of
+  quiet"), *A branch moves in a git repository* (its folder, `~/` works, and the branch, default
+  master), *GitHub: a pull request is opened* (OWNER/NAME, a github.com URL works, "checked every
+  N min", default 5), *GitHub: CI fails* (also an optional branch), *Its trigger URL is called*
+  (a name, suggested from the schedule's name). Under it the preview reads it ("When the note
+  “Ideas” changes (after 2 minutes of quiet)"); for a note whose triggers are off it adds, in
+  amber, "Triggers are off for this note, so it won't fire yet. **Allow triggers on it**" (your
+  click switches it on). A hint per kind says how it watches (the note rules and why it can't
+  loop, git read every 15 seconds with no hooks, your own gh login, a URL on this computer only
+  with a secret). If missed is hidden; the prompt hint adds `{event}` (and `{payload}` for a URL).
+- In that mode the Agent list is of agents that accept triggered work (the Webhook origin), with
+  the same grouping and hints ("tick Webhook (triggered) in Edit agent").
+- **Then…** (after "Also put the reply in"): "When it replies, ask [nobody · an agent]" with a
+  prompt box when an agent is picked, and "When it fails (blocked, refused, no reply, an error)"
+  as Nothing more · Notify me · Ask an agent (an agent and a prompt). The hint explains `{reply}`
+  and `{outcome}` and that each step is one hop further (4 at most), or, for Notify me, that a
+  failure always notifies then. Missing agents or prompts block Save with the reason.
+- More options: a trigger's daily cap shows "10 (a trigger's default)" when empty.
+
 **New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
 
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
@@ -514,7 +549,7 @@ the reason). Save sends only what changed (`schedule.settings.set`).
   shows as Custom with its text, and Custom stays chosen (also with its field cleared) until
   another entry is picked. Effort lists the chosen model's levels where they differ from the
   CLI's; changing the model puts a listed level it doesn't offer back to Default (a custom one
-  stays). Switching kind puts a model or level the new kind doesn't list back to Default. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook checkboxes,
+  stays). Switching kind puts a model or level the new kind doesn't list back to Default. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook (triggered) checkboxes,
   at least one), the Permissions section showing only the control for the agent's kind, and an
   Autostart toggle.
 - Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are

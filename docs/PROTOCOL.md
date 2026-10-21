@@ -17,6 +17,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
+| `POST /api/trigger/<name>` | `Authorization: Bearer <the trigger's secret>` | Fire a URL trigger (body: up to 16 KiB of data, handed to its agent as quoted untrusted text). This machine only; see "Schedules", Phase 2. |
 | `POST /api/rpc` | `Authorization: Bearer <client token>` | Same JSON methods as the WebSocket (body `{id?, method, params}`, reply `{id, result}` / `{id, error}`), except `session.attach`/`session.detach`. Used by the CLI. |
 | `GET /api/events` | `Authorization: Bearer <client token>` | The event stream as NDJSON (below). Used by `muster events`. Like `/ws`, a request with a foreign `Origin` gets `403`. |
 | `POST /api/launch-code` | `Authorization: Bearer <client token>` | `{"code": "<64 hex>"}`: a single-use launch code, valid 60 s. Used by the CLI to open the UI. |
@@ -309,7 +310,8 @@ token only: devices have no `note.*` methods and get neither `hello.notes` nor n
 type Note = { id: number; title: string; body: string; rev: number; version: number /* raised by every change */;
               created_at: number; updated_at: number;
               updated_by: { kind: "human" | "agent"; name?: string; session_id?: number };
-              window_id: number | null /* its tab's window; null: closed */; beside: number | null };
+              window_id: number | null /* its tab's window; null: closed */; beside: number | null;
+              triggers: boolean /* "Allow triggers": note triggers may fire on it (default false) */ };
 type NoteSummary = Omit<Note, "body"> & { open: boolean; bytes: number; lines: number; preview: string /* first non-blank line, ≤120 chars */ };
 ```
 
@@ -331,6 +333,7 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
 | `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
 | `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
+| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. |
 
 `from_session` (the CLI passes `$MUSTER_SESSION_ID`) says who wrote: a shell tab, or no
 `from_session`, is the human. An agent's session (Claude or Codex) makes `updated_by` that agent
@@ -500,6 +503,126 @@ message is refused `agent X already got N unattended … messages in the last 24
 Debug builds only: `MUSTER_TEST_CLOCK_OFFSET_MS` shifts the scheduler's clock and
 `MUSTER_TEST_CATCHUP_GAP_MS` replaces the 30 s catch-up spacing (the smoke test uses both).
 Store migration v19 adds `schedules` and `schedule_runs`.
+
+### Triggers, "Then…" steps and the spend cap (Phase 2)
+
+Code: `src/schedules/triggers.rs`, `src/schedules/run.rs` (steps), `src/spend.rs`.
+
+```ts
+// More kinds of `When` (and of `WhenInput`, which may name a note by title: {kind:"note", note:"Ideas"}).
+type TriggerWhen =
+  | { kind: "note"; note_id: number; quiet_min: number /* 1..120, default 2 */ }
+  | { kind: "git"; repo: string /* absolute, resolved */; branch: string }
+  | { kind: "github"; repo: string /* OWNER/NAME */; event: "pr_opened" | "ci_failed"; branch: string | null; every_min: number /* 2..60, default 5 */ }
+  | { kind: "url"; name: string /* a-z 0-9 - _, 1-40, unique */ };
+type Step = { notify: boolean /* failure only */; agent: string | null; agent_id: number | null; prompt: string; then: Then | null };
+type Then = { on_success: Step | null; on_failure: Step | null };
+// Added to Schedule:
+//   trigger: boolean; origin: "schedule" | "webhook"; then: Then | null;
+//   pending: { at, text, count, payload: boolean } | null   // an event waiting for its run (at next_run)
+//   watch: { state: "ok" | "waiting" | "gh_not_signed_in" | "gh_missing" | "error"; detail; checked_at; next_at } | null  // git, github
+//   note: { id, title, triggers: boolean } | null          // a note trigger's note
+//   url: string | null                                     // a URL trigger's address (never its secret)
+// Added to Run: kind "triggered" | "chain"; parent_run, step ("s"/"f" per level), agent (a step's), event ({at,text,count,payload}).
+// Added to ScheduleSettings: spend: { key_present, today: number | null, cap, other, agents: {id,name,spent,cap|null}[], checked_at, error, resets_at }.
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `schedule.create` / `.update` | also `when: TriggerWhen`, `then: {on_success?: {agent, prompt}, on_failure?: {notify: true} \| {agent, prompt}} \| null` (steps may nest `then`, at most 4 levels) | `Schedule`. A trigger needs an agent that accepts `webhook` (a step's agent the schedule's origin); `daily_cap` defaults to 10 for a trigger. A URL trigger gets a secret. |
+| `schedule.preview` | also `id` (the schedule being edited) | For a trigger: `{reading, trigger: true, next: [], note_triggers_off, daily_cap_default, expires, …}` |
+| `schedule.settings.set` | also `spend_cap` (dollars, 0.01..1000; it can't be cleared) and `agent_spend_caps: {name: dollars \| null}` | `ScheduleSettings`. `schedule.settings.get` also reads the key again when the last reading is over a minute old (a `schedule_settings` event follows). |
+| `trigger.fire` | `{name, payload?}` | `{queued, trigger, runs_at}`. `muster trigger`: the human's client, no secret. |
+| `trigger.secret` | `{id} \| {name}, rotate?` | `{name, url, secret, curl}`. `rotate`: a new secret; the old one stops working. |
+| `note.set_triggers` | `{id, on}` | `Note`. "Allow triggers" on a note. |
+
+`trigger.*`, `note.set_triggers` and every schedule change are the human's: refused from an
+agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
+an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
+
+**Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
+daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
+most 16 KiB, else 413) is the payload. No secret: 401; a wrong secret or an unknown name: 403
+(the same answer for both). Answers `{queued: true, runs_at}`.
+
+**How a trigger runs.** An event never sends anything by itself: it is held on its schedule
+(`pending`, merged with one already waiting: the lines join, `count` rises, the newest payload
+wins) with a time to run (`next_run`), and the scheduler handles it like a due slot, as a run of
+kind `triggered`, origin `webhook`, sender `trigger:<id>`, at hop 0. So pause, Pause all, the
+7-day expiry (a trigger with a Claude subscription agent anywhere in it), quiet hours (checked
+when it runs), the daily caps, the busy rule, alerts, the reply note and cold-start recording all
+apply as for a timed run; a paused or expired trigger drops its events (recorded once). Never
+sooner than 15 minutes after its last run: an event in that time waits for it. An event while
+its previous run is still going waits a minute at a time. The prompt's `{event}` is what
+happened and `{payload}` the data sent, each quoted line by line under a label saying it comes
+from outside Muster and is data, not instructions (cut to 8 KiB and 16 KiB); a prompt that uses
+neither gets them added at its end. Placeholders are filled in one pass, so nothing put in is read
+for placeholders again. Run now on a trigger runs it without an event. Skip next doesn't apply.
+
+- **Note**: on each change of the note's text (`note.write`, `note.append`, MCP or CLI), only
+  while the note's `triggers` ("Allow triggers") is on (off for every note until the human
+  switches it on; no write of the text can change it, and there is no MCP tool for it). Changes
+  that never count: by the trigger's own agent, by any session whose provenance is a scheduled or
+  triggered chain (every run a trigger started is one), and Muster's own append of a run's reply.
+  Debounced: the run is `quiet_min` minutes after the last counting edit. At most 10 runs a day
+  across the triggers on one note (`refused: daily cap …`); switching "Allow triggers" off drops
+  any event waiting on it, and a due run of a note whose switch is off is skipped.
+- **Git**: the branch's commit is read from the repository's ref files (`refs/heads/<branch>`,
+  else `packed-refs`; git itself only for a reftable repository) every 15 s while the trigger is
+  active; no hook is installed. The first look records it; a change holds an event with the
+  subjects of up to 10 new commits (`git log old..new`), or says it was rewound. The commit last
+  seen is kept with the schedule, so a move while Muster was off fires once after it starts.
+- **GitHub**: `gh api repos/<repo>/pulls?state=open…` (PR opened) or
+  `…/actions/runs?status=failure[&branch=…]` (CI failed) through the safe runner of src/pr.rs,
+  with the owner's own `gh` login (Muster never sees or stores a token), every `every_min`
+  minutes while active. The first poll records the newest PR number or run id; later ones hold
+  an event for each newer one (number, author, title, URL; workflow, branch, conclusion). A
+  failure backs off (the interval doubling, at most an hour) and shows in `watch`:
+  `gh_not_signed_in` (run `gh auth login`), `gh_missing`, or `error` with the detail.
+- **URL**: `trigger.fire` or the trigger URL hold an event at once.
+
+What it costs while idle: a note or URL trigger nothing at all; a git trigger a stat and a small
+read of one or two files every 15 s; a GitHub trigger one `gh api` call (one GitHub API request)
+per interval. A paused or expired trigger costs nothing.
+
+**"Then…" steps.** When a run (or a step) ends `replied`, its `on_success` step runs; when it
+fails (blocked, no reply, ended, timed out, refused, failed), its `on_failure` step; a skip starts
+nothing. A notify step is a notice and a desktop notification. An ask step is a run of kind
+`chain` (`parent_run`, `step`, its own `agent`), sent to that agent as a message one hop past the
+run it follows (`reply_to` that run's message; sender `<schedule's sender>/then:<run id>`), so
+the 4-hop limit bounds a chain and every delivery rule applies to it; the schedule's own daily cap
+and 15-minute floor don't count steps. Its prompt may use `{reply}` (the previous reply, quoted as
+earlier output), `{outcome}` (`replied`, `blocked: …`) and `{event}`. A step's reply doesn't go to
+the schedule's note, and the row's `last_run` is the schedule's own run. Steps don't hold back the
+schedule's next run.
+
+**Spend cap.** For agents on OpenRouter (their record, or their running process), an overall
+daily cap (`spend_cap`, default $5, always on) and optional per-agent caps. At a cap, every
+message to such an agent whose origin isn't the human's (scheduled, triggered, or an agent's ask on
+such a chain) is refused `budget: …` (checked in `agents::precheck` before anything is started,
+and again in `deliver`), with one alert per cap per day; a run already going finishes, and what the
+human types is never blocked. Spent is read from OpenRouter's `GET /api/v1/key` with the daemon's
+own key (passed to curl as a config on its stdin, never in an argument, the environment, a log or a
+reply): `usage_daily` (OpenRouter's UTC day) for the overall cap; per agent, each rise in `usage`
+between two readings goes to the OpenRouter agents seen working in between (split evenly), or to
+`other` when none was. The key is read while an OpenRouter agent works (at most every minute, and
+once when they all stop), before an unattended message when the last reading is over a minute old,
+and when the settings are read; never while they are idle. With no reading in the last 15 minutes
+(OpenRouter unreachable), unattended work on OpenRouter is refused too. Kept in `runtime_state`
+`openrouter-spend`. Why this source: it is what OpenRouter bills (cache discounts, reasoning
+tokens and the provider it routed to included), for every request through the key; the CLIs don't
+report OpenRouter's price, and the per-generation stats endpoint
+(`GET /api/v1/generation?id=…`, `total_cost` in USD) needs generation ids that Claude Code and
+Codex don't show. Sources (checked 2026-10-21):
+[limits and the key endpoint](https://openrouter.ai/docs/api/reference/limits),
+[generation stats](https://openrouter.ai/docs/api/api-reference/generations/get-generation).
+guess: one credit is one dollar, as OpenRouter's dashboard shows it.
+
+Store migration v21 adds `schedule_runs.parent_run`, `step`, `agent_id` and `event`, keeps
+timed slots (`scheduled`, `catch_up`) unique per schedule, and adds `notes.triggers`. Debug builds
+only: `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet minutes, `MUSTER_TEST_WATCH_EVERY_MS`
+the git and GitHub intervals, `MUSTER_TEST_GH` the `gh` program and
+`MUSTER_TEST_OPENROUTER_KEY_URL` the key endpoint (http allowed there).
 
 ## Windows, tabs and naming
 

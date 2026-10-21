@@ -387,7 +387,7 @@ type ModalT = (
 const ORIGINS: { o: Origin; label: string; hint: string }[] = [
   { o: "human", label: "Human", hint: "you, or an agent working on something you started" },
   { o: "schedule", label: "Schedule", hint: "a timer" },
-  { o: "webhook", label: "Webhook", hint: "an outside trigger" },
+  { o: "webhook", label: "Webhook (triggered)", hint: "a trigger: a note changes, a branch moves, GitHub, a trigger URL" },
 ];
 
 /** One entry of a Model or Effort select. */

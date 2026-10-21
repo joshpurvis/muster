@@ -52,8 +52,9 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
-| `muster note ls/new/read/write/append/rename/open/close/rm` | Plain-text notes shared with agents. See "Notes" below. |
-| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history` | Recurring and one-off messages to a named agent. See "Schedules" below. |
+| `muster note ls/new/read/write/append/rename/open/close/rm/triggers` | Plain-text notes shared with agents. See "Notes" below. |
+| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:`). See "Schedules" below. |
+| `muster trigger <name> [DATA...]` / `--url <name>` | Fire a URL trigger now, or print its URL and secret. See "Triggers and Then" under "Schedules" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
@@ -123,6 +124,7 @@ title prefix; ambiguous or unknown ones exit 2.
 | `muster note open <note> [--window N]` | Show its tab in window N, else beside this session (needs a session). |
 | `muster note close <note>` | Close its tab; the note stays. |
 | `muster note rm <note>` | Delete it for good. Refused from an agent's session. |
+| `muster note triggers <note> [on\|off]` | "Allow triggers": only then can a schedule's note trigger fire on its changes (off by default). Refused from an agent's session. |
 
 ```sh
 muster note new --title "Release checklist" "- [ ] changelog"
@@ -155,6 +157,47 @@ muster schedule add worker --weekdays 09:00 --note "PR summaries" Summarise the 
 muster schedule add worker --at +20m Check whether the deploy finished
 muster schedule ls
 muster schedule history 3
+```
+
+### Triggers and Then (Phase 2)
+
+`muster schedule add` takes `--on EVENT` instead of a timing: a **trigger**, whose runs have
+origin `webhook` ("Triggered"), so its agent must accept it (`--accepts human,webhook`; a Codex
+agent does by default). Triggers run at most every 15 minutes and 10 times a day unless
+`--max-per-day` says otherwise (docs/PROTOCOL.md "Schedules", Phase 2).
+
+| EVENT | Fires when | Options |
+|---|---|---|
+| `note:<note>` | the note's text changes, then stays quiet for a while. **Only once you allow triggers on that note** (`muster note triggers <note> on`, or its status line): off by default. Edits by its own agent, by scheduled or triggered work, and Muster's own reply appends never count. | `--quiet-min N` (1-120, default 2) |
+| `git:<repo>@<branch>` | the branch moves in that local repository (`~/` works; read every 15 s, no hook installed) | |
+| `gh:<owner/repo>:pr-opened` | a pull request is opened (polled with your own `gh` login) | `--poll-min N` (2-60, default 5) |
+| `gh:<owner/repo>:ci-failed[@branch]` | a GitHub Actions run fails (on that branch only, if given) | `--poll-min N` |
+| `url:<name>` | its trigger URL is called with its secret, or `muster trigger <name>` | |
+
+The prompt may use `{event}` (what happened) and, for a URL trigger, `{payload}` (the data sent),
+both quoted as untrusted data; a prompt that uses neither gets them added at its end.
+
+`--then "AGENT: prompt"` asks another agent when a run replies; `--on-failure notify` notifies you
+when it fails, or `--on-failure "AGENT: prompt"` asks an agent. A step's prompt may quote the reply
+as `{reply}` and say how the run ended with `{outcome}`; each step is one hop further down the same
+chain. (Deeper chains: `schedule.create` with nested `then`, at most 4 levels.)
+
+| Command | What it does |
+|---|---|
+| `muster trigger <name> [DATA...]` | Fire URL trigger `<name>` now, with DATA (words joined by spaces; `-` reads stdin) handed to its agent as quoted untrusted data. Prints when it runs (`at most every 15 minutes`). |
+| `muster trigger --url <name> [--rotate]` | Print the trigger's loopback URL, its secret and a ready `curl` line (`--rotate`: a new secret; the old one stops working). |
+| `muster note triggers <note> [on\|off]` | Allow triggers on a note, or not (no argument: say which). |
+
+Like schedule changes, these are refused from an agent's session or a shell an agent drives.
+
+```sh
+muster note triggers Ideas on
+muster schedule add researcher --on note:Ideas Expand the new items into a short plan each.
+muster schedule add worker --on git:~/projects/muster@master Update the changelog note with: {event}
+muster schedule add reviewer --on gh:octo/repo:pr-opened --poll-min 10 Review the new pull request.
+muster schedule add worker --on url:deploy-done "The deploy finished: {payload}. Check the site."
+muster trigger --url deploy-done        # then, from a script: curl … --data-binary @- <url>
+muster schedule add worker --daily 02:00 --then "reviewer: Last night's failures: {reply}" --on-failure notify Run the test suite.
 ```
 
 ## Agent skills

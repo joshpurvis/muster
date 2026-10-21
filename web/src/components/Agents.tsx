@@ -1,10 +1,12 @@
 // Named agents (docs/UI.md "Agents panel"): the left dock (rows, message log), the New / Edit
 // agent dialog with its Memory tab, and the message overlay. Talking to an agent happens in its
 // own terminal tab; the panel only starts, finds and configures agents.
-import type { ComponentChildren } from "preact";
+import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
+import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
+  schedulesSupported,
   agentFilter,
   agentMessages,
   agents,
@@ -96,9 +98,21 @@ export function AgentsPanel() {
         <IconAgents size={14} />
         <span class="ap-title">Agents</span>
         {list.length > 0 && <span class="ap-count">{list.length}</span>}
+        {agentsSupported.value && (
+          <button
+            type="button"
+            class="ap-icon-btn ap-head-more"
+            aria-label="Agents and schedules menu"
+            aria-haspopup="menu"
+            data-tip={schedulesSupported.value ? "New agent or schedule, pause all, settings" : "New agent"}
+            onClick={(e) => agentsHeaderMenu(e.currentTarget)}
+          >
+            <IconMore size={13} />
+          </button>
+        )}
         <button
           type="button"
-          class="ap-icon-btn"
+          class="ap-icon-btn ap-head-x"
           aria-label="Hide the agents panel"
           data-tip="Hide"
           data-keys="Alt+G"
@@ -107,6 +121,7 @@ export function AgentsPanel() {
           <IconX size={13} />
         </button>
       </div>
+      {agentsSupported.value && <SchedulesPausedNotice />}
       {!agentsSupported.value
         ? <div class="ap-empty">This daemon has no agents. Update muster to use them.</div>
         : (
@@ -116,7 +131,12 @@ export function AgentsPanel() {
                 Persistent agents with their own folder and memory, which you and other agents can ask things.
               </div>
             )}
-            {list.map((a) => <AgentRow key={a.id} a={a} now={now} selected={sel === a.id} />)}
+            {list.map((a) => (
+              <Fragment key={a.id}>
+                <AgentRow a={a} now={now} selected={sel === a.id} />
+                <AgentSchedules agent={a} now={now} />
+              </Fragment>
+            ))}
             <button type="button" class="ap-new" onClick={() => A.newAgentDialog()}>
               <IconPlus size={12} /> New agent
             </button>
@@ -137,6 +157,7 @@ function agentMenu(a: Agent, x: number, y: number) {
       { header: a.name },
       { label: "Edit…", run: () => A.editAgent(a.name) },
       { label: "Memory…", run: () => A.editAgent(a.name, "memory") },
+      ...(schedulesSupported.value ? [{ label: "New schedule…", run: () => A.newScheduleDialog(a.name) }] : []),
       "sep",
       { label: live ? "Show" : "Start", run: () => A.openAgent(a.name) },
       {
@@ -175,10 +196,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           e.preventDefault();
           open();
         } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-          e.preventDefault();
-          const rows = [...document.querySelectorAll<HTMLElement>(".ap-row")];
-          const i = rows.indexOf(e.currentTarget as HTMLElement);
-          rows[i + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
+          moveRow(e);
         } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
           e.preventDefault();
           const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -640,22 +658,25 @@ let templateCache: AgentTemplate[] | null = null;
 let catalogCache: ModelCatalog | null = null;
 
 export function AgentDialog(
-  { name, tab: tabInit, Modal, close }: {
+  { name, tab: tabInit, template, Modal, close }: {
     name?: string;
     tab?: "settings" | "memory";
+    /** New only: start from this template (e.g. "worker" from the New schedule dialog). */
+    template?: string;
     Modal: ModalT;
     close: () => void;
   },
 ) {
   const editing = name !== undefined;
   const agent = editing ? agents.value.find((a) => a.name === name) : undefined;
+  const startTpl = !editing && template ? templateCache?.find((t) => t.id === template) : undefined;
   const [tab, setTab] = useState<"settings" | "memory">(editing ? tabInit ?? "settings" : "settings");
   const [templates, setTemplates] = useState<AgentTemplate[]>(templateCache ?? []);
   const [catalog, setCatalog] = useState<ModelCatalog | null>(catalogCache);
   const [orList, setOrList] = useState<OpenRouterModels | null>(orCache?.list ?? null);
   const [orLoading, setOrLoading] = useState(false);
-  const [tpl, setTpl] = useState("blank");
-  const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : BLANK);
+  const [tpl, setTpl] = useState(startTpl?.id ?? "blank");
+  const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : startTpl ? fromTemplate(startTpl) : BLANK);
   /** Model / Effort show Custom… until another entry is picked (`choiceOf`). */
   const [custom, setCustom] = useState({ model: false, effort: false });
   const [nameTouched, setNameTouched] = useState(false);
@@ -674,6 +695,11 @@ export function AgentDialog(
     rpc.call<AgentTemplate[]>("agent.templates").then((t) => {
       templateCache = t;
       setTemplates(t);
+      const want = template ? t.find((x) => x.id === template) : undefined;
+      if (want) {
+        setTpl(want.id);
+        setD((x) => ({ ...fromTemplate(want), name: x.name.trim() ? x.name : want.name }));
+      }
     }).catch(() => {});
   }, []);
   // Daemons without `agent.models` leave only Default and Custom… in the selects.

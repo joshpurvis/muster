@@ -57,6 +57,15 @@ pub struct HookSession {
     pub last_hook_at: i64,
 }
 
+/// Which daily cap refused a message (`insert_agent_message_capped`), with the count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapHit {
+    /// Messages of any origin.
+    All(usize),
+    /// Unattended messages (any origin but the human's).
+    Unattended(usize),
+}
+
 #[derive(Clone)]
 pub struct Store {
     conn: std::sync::Arc<Mutex<Connection>>,
@@ -354,6 +363,34 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
     ALTER TABLE sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'subscription';
+    "#,
+    // v19: schedules (src/schedules/): each one's settings and timing as a JSON record, and one
+    // row per run. A run's text and reply stay in agent_messages (`msg_id`); the row holds when,
+    // how it went and why. A slot (the planned time) is claimed at most once per schedule:
+    // the unique index is what keeps a schedule from firing twice for one time.
+    r#"
+    CREATE TABLE schedules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER NOT NULL,
+        record TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX schedules_agent ON schedules(agent_id);
+    CREATE TABLE schedule_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schedule_id INTEGER NOT NULL,
+        slot INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        msg_id INTEGER,
+        outcome TEXT NOT NULL,
+        reason TEXT,
+        finished_at INTEGER,
+        noted INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX schedule_runs_schedule ON schedule_runs(schedule_id, id);
+    CREATE INDEX schedule_runs_msg ON schedule_runs(msg_id);
+    CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind != 'manual';
     "#,
 ];
 
@@ -1022,7 +1059,8 @@ impl Store {
         m: &crate::agents::AgentMessage,
         since: i64,
         cap: usize,
-    ) -> anyhow::Result<Result<i64, usize>> {
+        unattended_cap: Option<usize>,
+    ) -> anyhow::Result<Result<i64, CapHit>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let n: i64 = tx.query_row(
@@ -1032,7 +1070,13 @@ impl Store {
         )?;
         let n = n.max(0) as usize;
         if n >= cap {
-            return Ok(Err(n));
+            return Ok(Err(CapHit::All(n)));
+        }
+        if let Some(ucap) = unattended_cap {
+            let u = Self::count_unattended_on(&tx, m.to_agent, since)?;
+            if u >= ucap {
+                return Ok(Err(CapHit::Unattended(u)));
+            }
         }
         Self::insert_agent_message_on(&tx, m, None)?;
         let id = tx.last_insert_rowid();
@@ -1114,6 +1158,241 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
+    }
+
+    fn count_unattended_on(conn: &Connection, agent_id: i64, since: i64) -> rusqlite::Result<usize> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE to_agent = ?1 AND created_at >= ?2 AND refused IS NULL
+             AND origin != 'human'",
+            params![agent_id, since],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    /// Unattended (scheduled or triggered: origin other than `human`) messages delivered to
+    /// `agent_id` since `since`: the unattended daily cap.
+    pub fn count_unattended_since(&self, agent_id: i64, since: i64) -> anyhow::Result<usize> {
+        Ok(Self::count_unattended_on(&self.conn.lock(), agent_id, since)?)
+    }
+
+    /// The newest message to `agent_id` from sender `from` created at or after `since`: a
+    /// schedule run whose delivery happened just before a restart finds its message again.
+    pub fn find_agent_message_from(&self, agent_id: i64, from: &str, since: i64) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.lock().query_row(
+            "SELECT id FROM agent_messages WHERE to_agent = ?1 AND from_label = ?2 AND created_at >= ?3
+             AND refused IS NULL ORDER BY id DESC LIMIT 1",
+            params![agent_id, from, since],
+            |r| r.get(0),
+        ).optional()?)
+    }
+
+    // ----- schedules (src/schedules/) -----
+
+    pub fn load_schedules(&self) -> anyhow::Result<Vec<crate::schedules::Schedule>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT id, agent_id, record FROM schedules ORDER BY id")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, agent_id, record) = row?;
+            match serde_json::from_str::<crate::schedules::Schedule>(&record) {
+                Ok(mut s) => {
+                    s.id = id;
+                    s.agent_id = agent_id;
+                    out.push(s);
+                }
+                Err(e) => tracing::warn!(schedule = id, "unreadable schedule record, ignored: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn insert_schedule(&self, s: &crate::schedules::Schedule) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO schedules (agent_id, record, created_at) VALUES (?1, ?2, ?3)",
+            params![s.agent_id, serde_json::to_string(s)?, s.created_at],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn save_schedule_on(conn: &Connection, s: &crate::schedules::Schedule) -> anyhow::Result<()> {
+        let n = conn.execute("UPDATE schedules SET record = ?2 WHERE id = ?1", params![s.id, serde_json::to_string(s)?])?;
+        anyhow::ensure!(n == 1, "schedule {} was removed", s.id);
+        Ok(())
+    }
+
+    pub fn save_schedule(&self, s: &crate::schedules::Schedule) -> anyhow::Result<()> {
+        Self::save_schedule_on(&self.conn.lock(), s)
+    }
+
+    /// The schedule and its runs.
+    pub fn delete_schedule(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM schedule_runs WHERE schedule_id = ?1", [id])?;
+        tx.execute("DELETE FROM schedules WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save `s` (its slot moved on) and record `run` for one of its slots, together. `Ok(None)`:
+    /// that slot already has a run (claimed before a crash or a clock change): nothing is
+    /// recorded, only the schedule is saved.
+    pub fn claim_run(&self, s: &crate::schedules::Schedule, run: &crate::schedules::Run) -> anyhow::Result<Option<i64>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "INSERT OR IGNORE INTO schedule_runs (schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
+                run.reason, run.finished_at],
+        )?;
+        let id = (n == 1).then(|| tx.last_insert_rowid());
+        Self::save_schedule_on(&tx, s)?;
+        if id.is_some() {
+            Self::prune_runs_on(&tx, run.schedule_id, crate::schedules::RUNS_KEEP)?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// A run that is no slot of the schedule's timing (Run now).
+    pub fn insert_run(&self, run: &crate::schedules::Run) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO schedule_runs (schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
+                run.reason, run.finished_at],
+        )?;
+        let id = conn.last_insert_rowid();
+        Self::prune_runs_on(&conn, run.schedule_id, crate::schedules::RUNS_KEEP)?;
+        Ok(id)
+    }
+
+    pub fn update_run(&self, run: &crate::schedules::Run) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE schedule_runs SET msg_id = ?2, outcome = ?3, reason = ?4, finished_at = ?5 WHERE id = ?1",
+            params![run.id, run.msg_id, run.outcome.as_str(), run.reason, run.finished_at],
+        )?;
+        Ok(())
+    }
+
+    fn row_run(r: &Row) -> rusqlite::Result<crate::schedules::Run> {
+        let kind: String = r.get(3)?;
+        let outcome: String = r.get(6)?;
+        Ok(crate::schedules::Run {
+            id: r.get(0)?,
+            schedule_id: r.get(1)?,
+            slot: r.get(2)?,
+            kind: crate::schedules::RunKind::parse(&kind),
+            started_at: r.get(4)?,
+            msg_id: r.get(5)?,
+            outcome: crate::schedules::Outcome::parse(&outcome),
+            reason: r.get(7)?,
+            finished_at: r.get(8)?,
+        })
+    }
+
+    const RUN_COLUMNS: &str = "id, schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at";
+
+    pub fn run(&self, id: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(&format!("SELECT {} FROM schedule_runs WHERE id = ?1", Self::RUN_COLUMNS), [id], Self::row_run)
+            .optional()?)
+    }
+
+    /// Newest first: runs of `schedule` with id below `before`, at most `limit`.
+    pub fn runs(&self, schedule: i64, before: Option<i64>, limit: usize) -> anyhow::Result<Vec<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT {} FROM schedule_runs WHERE schedule_id = ?1 AND (?2 IS NULL OR id < ?2) ORDER BY id DESC LIMIT ?3",
+            Self::RUN_COLUMNS
+        ))?;
+        let rows = st.query_map(params![schedule, before, limit as i64], Self::row_run)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn pending_runs(&self) -> anyhow::Result<Vec<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT {} FROM schedule_runs WHERE outcome = 'pending' ORDER BY id",
+            Self::RUN_COLUMNS
+        ))?;
+        let rows = st.query_map([], Self::row_run)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Timed runs of `schedule` (not Run now: the schedule's own cap is about its timing; the
+    /// agent's caps count every message) whose message was sent at or after `since` (unix ms on
+    /// the daemon's clock: the message's own time, not when the run was taken up), leaving out
+    /// message `except` (the one about to be submitted).
+    pub fn count_delivered_runs_since(&self, schedule: i64, since: i64, except: Option<i64>) -> anyhow::Result<u32> {
+        let n: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
+             WHERE r.schedule_id = ?1 AND m.created_at >= ?2 AND r.kind != 'manual' AND (?3 IS NULL OR m.id != ?3)",
+            params![schedule, since, except],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// The run whose message is `msg`.
+    pub fn run_by_msg(&self, msg: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(&format!("SELECT {} FROM schedule_runs WHERE msg_id = ?1", Self::RUN_COLUMNS), [msg], Self::row_run)
+            .optional()?)
+    }
+
+    /// The newest run of `schedule` below run `before` that sent a message.
+    pub fn latest_sent_run(&self, schedule: i64, before: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            &format!("SELECT {} FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                Self::RUN_COLUMNS),
+            params![schedule, before],
+            Self::row_run,
+        ).optional()?)
+    }
+
+    /// Mark run `id`'s reply as put in its note; true only for the first caller.
+    pub fn mark_run_noted(&self, id: i64) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute("UPDATE schedule_runs SET noted = 1 WHERE id = ?1 AND noted = 0", [id])? == 1)
+    }
+
+    /// Run `id` no longer has a message (it was never typed and was taken back).
+    pub fn clear_run_msg(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE schedule_runs SET msg_id = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// The newest delivered run of `schedule` (for `{last_run}` / `{last_reply}`), and the newest
+    /// one that got a reply, with that reply.
+    pub fn last_runs_for_prompt(&self, schedule: i64, before_run: i64) -> anyhow::Result<(Option<i64>, Option<String>)> {
+        let conn = self.conn.lock();
+        let last: Option<i64> = conn.query_row(
+            "SELECT slot FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            params![schedule, before_run],
+            |r| r.get(0),
+        ).optional()?;
+        let reply: Option<String> = conn.query_row(
+            "SELECT m.reply FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
+             WHERE r.schedule_id = ?1 AND r.id < ?2 AND m.reply IS NOT NULL ORDER BY r.id DESC LIMIT 1",
+            params![schedule, before_run],
+            |r| r.get(0),
+        ).optional()?;
+        Ok((last, reply))
+    }
+
+    /// Keep the newest `keep` runs of `schedule` (and any still pending). Every insert does it.
+    fn prune_runs_on(conn: &Connection, schedule: i64, keep: usize) -> rusqlite::Result<usize> {
+        conn.execute(
+            "DELETE FROM schedule_runs WHERE schedule_id = ?1 AND outcome != 'pending' AND id NOT IN (
+                SELECT id FROM schedule_runs WHERE schedule_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![schedule, keep as i64],
+        )
     }
 
     // ----- Claude account profile references -----
@@ -2049,8 +2328,8 @@ mod tests {
         assert!(s.agent_message(id).unwrap().is_none());
         // The cap is checked with the insert.
         let fresh = AgentMessage { created_at: 5_000, ..m.clone() };
-        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1).unwrap().map(|_| ()), Ok(()));
-        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1).unwrap(), Err(1));
+        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1, None).unwrap().map(|_| ()), Ok(()));
+        assert_eq!(s.insert_agent_message_capped(&fresh, 4_000, 1, None).unwrap(), Err(CapHit::All(1)));
         assert_eq!(s.count_agent_messages_since(b.id, 4_000).unwrap(), 1);
         s.delete_agent(b.id).unwrap();
         assert!(s.load_agents().unwrap().is_empty());
@@ -2105,7 +2384,7 @@ mod tests {
         r.created_at = 300;
         let rid = s.insert_refused_agent_message(&r, "Ada accepts only human").unwrap();
         assert_eq!(s.count_agent_messages_since(3, 0).unwrap(), 2);
-        assert_eq!(s.insert_agent_message_capped(&r, 0, 2).unwrap(), Err(2));
+        assert_eq!(s.insert_agent_message_capped(&r, 0, 2, None).unwrap(), Err(CapHit::All(2)));
         // Newest first, filtered, paged.
         let ids = |v: Vec<crate::agents::AgentMessage>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
         assert_eq!(ids(s.agent_messages(None, None, 10).unwrap()), vec![rid, 2, 1]);
@@ -2178,7 +2457,7 @@ mod tests {
             for _ in 0..16 {
                 sc.spawn(|| {
                     for _ in 0..5 {
-                        if s.insert_agent_message_capped(&m, 0, 7).unwrap().is_ok() {
+                        if s.insert_agent_message_capped(&m, 0, 7, None).unwrap().is_ok() {
                             ok.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                     }

@@ -253,6 +253,106 @@ export interface OpenRouterModels {
   error: string | null;
 }
 
+// ---------------- schedules (docs/PROTOCOL.md "Schedules") ----------------
+
+/** When a schedule runs: a 5-field cron line (or `@daily` and friends), or once at a time. */
+export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number };
+/** What `schedule.create` / `.update` / `.preview` take: a one-off may also be a wall-clock time
+ * ("2026-10-21T15:30") the backend reads in the schedule's `tz`. */
+export type WhenInput = When | { kind: "once"; local: string };
+
+export type MissedRule = "auto" | "run_once" | "skip";
+export type RunOutcome =
+  | "pending"
+  | "replied"
+  | "blocked"
+  | "no_reply"
+  | "ended"
+  | "timed_out"
+  | "refused"
+  | "skipped"
+  | "failed";
+
+/** One run of a schedule (`schedule.runs`, `schedule_run`, `Schedule.last_run`). */
+export interface ScheduleRun {
+  id: number;
+  schedule_id: number;
+  /** The planned time (unix ms); now for Run now. */
+  slot: number;
+  kind: "scheduled" | "catch_up" | "manual";
+  started_at: number;
+  finished_at: number | null;
+  outcome: RunOutcome;
+  /** Replied after the wait ended (the outcome reads "replied"). */
+  late_reply: boolean;
+  /** Why it was skipped, refused, blocked or failed; a catch-up's note. */
+  reason: string | null;
+  msg_id: number | null;
+  /** The message it sent, with its reply, as `agent.messages` has it. */
+  message: AgentMessage | null;
+}
+
+/** A recurring or one-off message to a named agent (`schedule.list`, `schedule_upserted`). */
+export interface Schedule {
+  id: number;
+  agent_id: number;
+  agent: string | null;
+  name: string;
+  prompt: string;
+  when: When;
+  /** IANA name, e.g. "Europe/London". */
+  tz: string;
+  /** "At 09:00, Monday to Friday", "Once, Tue 21 Oct 2026 at 15:30". */
+  reading: string;
+  missed: MissedRule;
+  missed_effective: "run_once" | "skip";
+  conversation: "continue" | "fresh";
+  notify: "on_failure" | "always" | "never";
+  note_id: number | null;
+  note_title: string | null;
+  quiet_hours: boolean;
+  daily_cap: number | null;
+  paused: boolean;
+  /** The next slot will be skipped. */
+  skip_next: boolean;
+  /** Null: a one-off that ran. */
+  next_run: number | null;
+  last_slot: number | null;
+  status: "active" | "paused" | "expired" | "done";
+  /** Claude subscription agents' recurring schedules only. */
+  expires_at: number | null;
+  expires_soon: boolean;
+  created_at: number;
+  updated_at: number;
+  last_run: ScheduleRun | null;
+}
+
+/** Scheduling settings (`schedule.settings.get` / `.set`, `schedule_settings`). */
+export interface ScheduleSettings {
+  /** "Pause all schedules". */
+  paused: boolean;
+  /** "HH:MM". */
+  quiet_start: string;
+  quiet_end: string;
+  /** Unattended (scheduled or triggered) messages per agent per 24 hours. */
+  unattended_cap: number;
+  /** This machine's zone (read-only). */
+  tz: string;
+}
+
+/** `schedule.preview`: what a timing means, before saving it. */
+export interface SchedulePreview {
+  reading: string;
+  tz: string;
+  /** Up to 3 next runs (unix ms). */
+  next: number[];
+  /** Each of those falls in quiet hours (and quiet hours apply). */
+  quiet: boolean[];
+  quiet_hours_default: boolean;
+  missed_default: "run_once" | "skip";
+  expires: boolean;
+}
+
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
@@ -272,6 +372,10 @@ export type ServerEvent =
   | { event: "agent_upserted"; data: Agent }
   | { event: "agent_removed"; data: { id: number; name: string } }
   | { event: "agent_message"; data: AgentMessage }
+  | { event: "schedule_upserted"; data: Schedule }
+  | { event: "schedule_removed"; data: { id: number; agent_id: number } }
+  | { event: "schedule_run"; data: ScheduleRun }
+  | { event: "schedule_settings"; data: ScheduleSettings }
   | { event: "updates_changed"; data: UpdateStatus }
   | { event: "prefs_changed"; data: WindowPrefs }
   | { event: "daemon_stopping"; data: { reason: string } };

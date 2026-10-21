@@ -1272,6 +1272,9 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
         hub.set_permissions(c.id, next.permissions)?;
     }
     publish(hub, &next);
+    if next.provider != cur.provider || next.accepts_origins != cur.accepts_origins {
+        crate::schedules::agent_changed(hub, next.id);
+    }
     Ok(next)
 }
 
@@ -1286,6 +1289,7 @@ pub fn remove(hub: &Hub, name: &str) -> anyhow::Result<Agent> {
         tracing::warn!(agent = agent.name, "removing its session: {e:#}");
     }
     hub.agents().remove(hub.store(), agent.id)?;
+    crate::schedules::remove_for_agent(hub, agent.id);
     hub.emit(ServerEvent::AgentRemoved { id: agent.id, name: agent.name.clone() });
     Ok(agent)
 }
@@ -1337,8 +1341,45 @@ pub async fn start(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Windo
 }
 
 async fn start_inner(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>) -> anyhow::Result<AgentSession> {
+    start_guarded(hub, name, fresh, window, None).await
+}
+
+/// `fresh_if` refused to restart a running agent (it is in a turn, or the human typed).
+#[derive(Debug)]
+pub struct NotIdle;
+
+impl std::fmt::Display for NotIdle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the agent is busy")
+    }
+}
+
+impl std::error::Error for NotIdle {}
+
+/// A new conversation for agent `name`, but a running agent is restarted only if `ok` still
+/// holds for its session once the start lock is held (checked and restarted with no await in
+/// between that another start could slip into). Otherwise `NotIdle`.
+pub async fn start_fresh_if(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bool + Sync)) -> anyhow::Result<AgentSession> {
+    let r = start_guarded(hub, name, true, None, Some(ok)).await;
+    if let Ok(s) = &r {
+        publish(hub, &s.agent);
+    }
+    r
+}
+
+async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
+    fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
     let _one = hub.agents().start_lock.lock().await;
     let mut agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
+    if let Some(ok) = fresh_if
+        && let Some(sid) = agent.session_id
+        && let Some(session) = hub.session(sid)
+        && session.state != AgentState::Exited
+        && hub.live_session_ids().contains(&sid)
+        && !ok(&session)
+    {
+        return Err(NotIdle.into());
+    }
     // Disabling a profile prevents new runs, not messages to an already running agent.
     if !fresh
         && let Some(sid) = agent.session_id
@@ -1530,26 +1571,55 @@ pub fn record_refused(hub: &Hub, m: &AgentMessage, why: &str) {
     }
 }
 
-/// Start the agent if needed, record the message (checking the daily cap in the same
-/// transaction), and send it (envelope first) through the injection queue.
-pub async fn deliver(hub: &Arc<Hub>, out: Outgoing) -> anyhow::Result<Delivery> {
+/// A message an agent's policy refused (origin, hop limit, a daily cap): recorded with the reason
+/// (`record_refused`), never delivered. Its text is the reason.
+#[derive(Debug, Clone)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The unattended cap that applies to a message on `route` (None: the human's).
+fn unattended_cap(hub: &Hub, route: Route) -> Option<u32> {
+    (route.origin != Origin::Human).then(|| hub.schedules.settings().unattended_cap)
+}
+
+/// Start the agent if needed, record the message (checking the daily caps in the same
+/// transaction), and send it (envelope first) through the injection queue. A cap refusal is a
+/// `Refused` error.
+pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delivery> {
+    // Plain text only, whoever built it (a schedule's prompt quotes stored replies): no control
+    // character, such as the end of a bracketed paste, reaches the agent's input.
+    out.text = crate::mcp::tools::clean_text(&out.text);
     let bs = start(hub, &out.agent, false, None).await?;
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);
     msg.to_session = Some(sid);
     let now = msg.created_at;
+    let ucap = unattended_cap(hub, out.route);
     let msg_id = match hub.store().insert_agent_message_capped(
         &msg,
         now - guard::AGENT_CAP_WINDOW_MS,
         guard::AGENT_DAILY_PROMPT_CAP,
+        ucap.map(|c| c as usize),
     )? {
         Ok(id) => id,
-        Err(n) => {
-            let why = guard::check_agent_delivery(&bs.agent.name, &bs.agent.accepts_origins, out.route.origin, out.route.hop, n)
-                .err()
-                .unwrap_or_else(|| "daily cap reached".into());
+        Err(hit) => {
+            let why = match hit {
+                crate::store::CapHit::All(n) => {
+                    guard::check_agent_delivery(&bs.agent.name, &bs.agent.accepts_origins, out.route.origin, out.route.hop, n)
+                        .err()
+                        .unwrap_or_else(|| "daily cap reached".into())
+                }
+                crate::store::CapHit::Unattended(n) => guard::unattended_cap_refusal(&bs.agent.name, n, ucap.unwrap_or(0)),
+            };
             record_refused(hub, &msg, &why);
-            anyhow::bail!(why);
+            return Err(Refused(why).into());
         }
     };
     let text = format!("{}\n{}", envelope(msg_id, &out.from, out.route.origin, out.route.hop), out.text);
@@ -1581,10 +1651,61 @@ pub async fn deliver(hub: &Arc<Hub>, out: Outgoing) -> anyhow::Result<Delivery> 
     }
 }
 
+/// Route a message from sender `from` (provenance `prov`, or the daemon's own `forced` origin),
+/// check the agent's policy (recording and returning a refusal as `Refused`), then deliver it.
+/// The one path `agent.ask` and schedule runs share, so every guard applies to both.
+pub async fn send_checked(
+    hub: &Arc<Hub>,
+    agent: &Agent,
+    text: String,
+    from: String,
+    from_session: Option<SessionId>,
+    prov: Option<Prov>,
+    forced: Option<Origin>,
+) -> anyhow::Result<(Delivery, Route)> {
+    let route = precheck(hub, agent, &text, &from, from_session, prov, forced)?;
+    let d = deliver(hub, Outgoing { agent: agent.name.clone(), text, from, from_session, route }).await?;
+    Ok((d, route))
+}
+
+/// The policy half of `send_checked`: the route, the origin rule, hop limit and both daily caps,
+/// before anything is started or restarted. A refusal is recorded and returned as `Refused`.
+pub fn precheck(
+    hub: &Hub,
+    agent: &Agent,
+    text: &str,
+    from: &str,
+    from_session: Option<SessionId>,
+    prov: Option<Prov>,
+    forced: Option<Origin>,
+) -> anyhow::Result<Route> {
+    let since = now_ms() - guard::AGENT_CAP_WINDOW_MS;
+    let recent = hub.store().count_agent_messages_since(agent.id, since)?;
+    let proposed = proposed_route(prov, forced);
+    let mut checked = route(agent, prov, forced, recent);
+    // The unattended cap, before the agent is started for a message that would be refused
+    // (`deliver` checks it again with the insert).
+    if checked.is_ok()
+        && let Some(cap) = unattended_cap(hub, proposed)
+    {
+        let n = hub.store().count_unattended_since(agent.id, since)?;
+        if n >= cap as usize {
+            checked = Err(guard::unattended_cap_refusal(&agent.name, n, cap));
+        }
+    }
+    match checked {
+        Ok(r) => Ok(r),
+        Err(why) => {
+            record_refused(hub, &message_record(agent, from, from_session, proposed, text), &why);
+            Err(Refused(why).into())
+        }
+    }
+}
+
 /// `agent.ask` for the human (no session) or a shell session (a human typing in a shell tab,
 /// carrying that shell's provenance). Agent sessions ask through MCP `ask_agent` (rpc.rs routes
-/// them there), so their asks get the same guards. `forced` is daemon-internal (tests now,
-/// schedules and webhooks later); no client can set it.
+/// them there), so their asks get the same guards. `forced` is daemon-internal (tests now;
+/// schedule runs go through `send_checked` with origin schedule); no client can set it.
 pub async fn ask(
     hub: &Arc<Hub>,
     name: &str,
@@ -1604,22 +1725,11 @@ pub async fn ask(
         anyhow::bail!("an agent can't ask itself");
     }
     let prov = from_session.and_then(|s| hub.agents().prov(s));
-    let recent = hub
-        .store()
-        .count_agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS)?;
-    let proposed = proposed_route(prov, forced);
     let from = match from_session {
         Some(s) => format!("session:{s}"),
-        None => proposed.origin.as_str().to_string(),
+        None => proposed_route(prov, forced).origin.as_str().to_string(),
     };
-    let route = match route(&agent, prov, forced, recent) {
-        Ok(r) => r,
-        Err(why) => {
-            record_refused(hub, &message_record(&agent, &from, from_session, proposed, &text), &why);
-            anyhow::bail!(why);
-        }
-    };
-    let d = deliver(hub, Outgoing { agent: agent.name.clone(), text, from, from_session, route }).await?;
+    let (d, route) = send_checked(hub, &agent, text, from, from_session, prov, forced).await?;
     let mut rx = hub.subscribe();
     let (info, verdict, waited_ms) = wait_for_reply(
         &mut rx,

@@ -14,6 +14,8 @@ import {
   overlay,
   renaming,
   prefs,
+  schedulesSupported,
+  scheduleSettings,
   setPref,
   toast,
   windowId,
@@ -412,6 +414,34 @@ export const commands: Command[] = [
     group: "Agents",
     enabled: () => agentsSupported.value,
     run: () => A.newAgentDialog(),
+  },
+  {
+    id: "new-schedule",
+    title: "New schedule…",
+    group: "Agents",
+    enabled: () => schedulesSupported.value,
+    run: () => A.newScheduleDialog(),
+  },
+  {
+    id: "pause-schedules",
+    title: "Pause all schedules",
+    group: "Agents",
+    enabled: () => schedulesSupported.value && !scheduleSettings.value?.paused,
+    run: () => A.setAllSchedulesPaused(true),
+  },
+  {
+    id: "resume-schedules",
+    title: "Resume all schedules",
+    group: "Agents",
+    enabled: () => schedulesSupported.value && !!scheduleSettings.value?.paused,
+    run: () => A.setAllSchedulesPaused(false),
+  },
+  {
+    id: "schedule-settings",
+    title: "Scheduling settings…",
+    group: "Agents",
+    enabled: () => schedulesSupported.value,
+    run: () => A.scheduleSettingsDialog(),
   },
 
   // Groups

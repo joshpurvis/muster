@@ -2,9 +2,44 @@
 
 ## Plain English
 
-Today Muster can't run anything on a schedule. The pieces that make it safe are in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. But nothing actually fires. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
+Phase 1 of this plan is built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes (see "Status"). Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
 
-## Today
+## Status
+
+**Phase 1 is built** (2026-10-20, branch `feature/schedules`): features 1 to 6, plus quiet hours
+and the count caps from 7, with the owner's decisions below. Code in `src/schedules/`; how it
+behaves is in docs/PROTOCOL.md "Schedules", docs/CLI.md "Schedules" and docs/UI.md "Agents
+panel". Choices made while building it:
+
+- Cron lines are parsed by Muster itself (`src/schedules/cron.rs`, five fields with ranges,
+  steps, lists, names and the `@daily`-style macros); time zones and daylight saving come from the
+  `jiff` crate, which reads the system's time-zone database.
+- Every schedule runs at most every 15 minutes, for every agent (custom cron lines too).
+- "If missed: Auto" runs once for one-offs and anything slower than hourly, and skips for
+  hourly-or-faster schedules. A slot up to 10 minutes late (a reload, a short sleep) still counts as
+  on time.
+- The busy rule waits at most an hour in line; a sent run waits at most an hour for its reply.
+- The per-agent unattended cap defaults to 24 messages a day and counts every message whose
+  origin isn't the human's, at any hop.
+- Quiet hours are one window for the whole machine (default 23:00 to 07:00, its local time), and
+  each schedule chooses whether it respects them. Run now ignores quiet hours and the
+  schedule's own daily cap, but not the agent's caps.
+- "Fresh each run" never restarts within two minutes of the human typing into the agent.
+- A slot less than 15 minutes after the last run (its slot, or when its prompt was really
+  submitted) is skipped when it comes, even where a daylight-saving change bunches a cron line's
+  times.
+- Cron's day rule is cronie's: a day field starting with `*` is a wildcard, and then both day
+  fields must match.
+- A schedule's prompt that waits in the agent's queue is checked again right before it is typed
+  and before Enter; paused, removed, expired or out of time, it is taken back, never typed.
+- `{last_reply}` is quoted and labelled as earlier output (data, not instructions).
+- Each run is one row in a small runs table (time, outcome, reason) pointing at its agent
+  message, which keeps the text and the reply.
+
+Not built yet: Phase 2 (spend caps, chaining, triggers) and Phase 3 (agents proposing schedules).
+The "Today" section below describes the code before Phase 1.
+
+## Today (before Phase 1)
 
 - **No triggers.** Nothing in the daemon fires on time or on events. Schedules and webhooks are listed as deferred in PLAN.md §10.
 - **The policy exists.** There are three origins: human, schedule and webhook. Each agent has a list of the origins it accepts. Claude agents default to human only, Codex agents to all three. The New/Edit agent dialog shows an amber warning when you tick Schedule or Webhook on a Claude agent. Chains stop after 4 hops, and each agent takes at most 200 messages per rolling 24 hours. Both limits count every origin, the human's included.
@@ -99,7 +134,7 @@ PLAN.md §3 notes that Claude subscription limits assume "ordinary, individual u
 
 ## Suggested phases
 
-**Phase 1: Schedules you can trust (features 1–6, plus quiet hours and count caps from 7).** Recurring and one-off schedules, run history, pause/skip/run now, missed-run and busy rules, failure alerts, replies into notes, `muster schedule`, and the Claude rules (opt-in, warning, 7-day expiry). This is useful on its own: the daily PR summary and nightly checks work end to end. Size: M to L.
+**Phase 1: Schedules you can trust (features 1–6, plus quiet hours and count caps from 7). Built.** Recurring and one-off schedules, run history, pause/skip/run now, missed-run and busy rules, failure alerts, replies into notes, `muster schedule`, and the Claude rules (opt-in, warning, 7-day expiry). This is useful on its own: the daily PR summary and nightly checks work end to end. Size: M to L.
 
 **Phase 2: Triggers and money (7's spend cap, 8, 9).** Chaining, the note-changed trigger, the local git watcher, GitHub polling, the local trigger URL with `muster trigger`, and OpenRouter spend caps once that branch is merged. Size: L, splittable per trigger.
 

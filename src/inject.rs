@@ -278,6 +278,31 @@ pub fn restore(hub: &Hub) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Take agent message `msg`'s prompt out of every queue where it still waits (not one being
+/// typed: the submission check stops that). True when one was removed.
+pub fn drop_message(hub: &Hub, msg: i64) -> anyhow::Result<bool> {
+    let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
+    let sessions: Vec<SessionId> = hub.injection.inner.lock().iter()
+        .filter(|(_, q)| q.items.iter().any(is)).map(|(id, _)| *id).collect();
+    let mut dropped = false;
+    for id in sessions {
+        dropped |= hub.injection.edit_with(id, Unsent::Discard, |q| {
+            let before = q.items.len();
+            q.items.retain(|item| !is(item));
+            q.items.len() != before
+        })?;
+        sync_queued(hub, id);
+    }
+    Ok(dropped)
+}
+
+/// Is agent message `msg` still in a prompt queue (waiting, or being typed)?
+pub fn holds_message(hub: &Hub, msg: i64) -> bool {
+    let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
+    hub.injection.inner.lock().values()
+        .any(|q| q.items.iter().any(is) || q.active.as_ref().is_some_and(|a| is(&a.item)))
+}
+
 pub fn paused(hub: &Hub) -> Vec<SessionId> {
     hub.injection.inner.lock().iter().filter(|(_, queue)| queue.blocked)
         .map(|(id, _)| *id).collect()
@@ -805,6 +830,12 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         tracing::debug!(session = id, "not typing: {why}");
         return requeue(item);
     }
+    // A schedule's prompt that may no longer go (paused, expired, removed, timed out while it
+    // waited here) is taken back, never typed (src/schedules/ `submit_gate`).
+    if let Some(no) = crate::schedules::submit_gate(hub, &item.source, false) {
+        crate::schedules::not_submitted(hub, &item.source, no);
+        return Ok(true);
+    }
 
     // 1. Leftover text in the input box. Clear it if muster put it there (Claude restores an
     //    interrupted prompt) or on interrupt-mode sends; otherwise it's the human's draft:
@@ -874,6 +905,12 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
             mark_stage(hub, id, generation, Stage::Selected)?;
             return Ok(false);
+        }
+        // Checked again right before Enter (the rules may have changed while it was typed).
+        if let Some(no) = crate::schedules::submit_gate(hub, &item.source, true) {
+            if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
+            crate::schedules::not_submitted(hub, &item.source, no);
+            return Ok(true);
         }
         // The prompt runs from here on: the session now handles a message from `source`.
         hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;

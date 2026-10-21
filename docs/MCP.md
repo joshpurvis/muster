@@ -723,12 +723,17 @@ keys` and `muster new` carry its provenance and the Claude origin rule. A shell 
 typing in a shell tab, with that shell's provenance if an agent ever typed into it.
 
 **Refusals are logged.** A message refused by the agent's policy (`ask_agent`'s permission
-check, origin rule, hop limit or daily cap, and the same checks behind `muster ask`) is kept in
+check, origin rule, hop limit, daily cap or unattended cap, and the same checks behind `muster ask`) is kept in
 `agent_messages` with the reason and shown in the agents panel's log (`agent.messages`,
 `agent_message` events). It is never delivered and never counts toward the cap. Bounded: per
 sender at most 10 refusals per 10 minutes are stored (more are only counted, and the next stored
 one says how many), the text is cut to 2 KB, and refused rows are pruned to the last 30 days and
 the newest 1000.
+
+**Unattended cap.** On a chain a schedule (or later a trigger) started, every message counts
+toward the receiving agent's unattended cap: at most 24 a day by default (the scheduling
+settings), at any hop, on top of the 200-a-day cap. So an agent running a scheduled job can't
+fan out unbounded work to others (docs/PROTOCOL.md "Schedules").
 
 **Old names.** `ask_bot` (argument `bot` or `agent`) and `list_bots`, the first pass's names
 that older persona files still use, are accepted with the same guards but not listed. The

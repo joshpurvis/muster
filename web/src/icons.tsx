@@ -159,6 +159,19 @@ export const IconGlobe = (p: P) => (
     <path d="M12 3.5c2.3 2.4 3.4 5.2 3.4 8.5s-1.1 6.1-3.4 8.5c-2.3-2.4-3.4-5.2-3.4-8.5S9.7 5.9 12 3.5z" />
   </Svg>
 );
+/** A clock face: schedules. */
+export const IconClock = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 7.5V12l3 2" />
+  </Svg>
+);
+/** Two bars: paused. */
+export const IconPause = (p: P) => (
+  <Svg {...p}>
+    <path d="M9 6v12M15 6v12" />
+  </Svg>
+);
 /** Two heads: named agents (the agents panel). */
 export const IconAgents = (p: P) => (
   <Svg {...p}>

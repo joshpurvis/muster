@@ -74,6 +74,16 @@ pub enum ServerEvent {
     },
     /// A message to an agent was recorded, refused or replied to (`agents::message_json`).
     AgentMessage(serde_json::Value),
+    /// A schedule was created or changed, or its next run moved (`schedules::schedule_json`).
+    ScheduleUpserted(serde_json::Value),
+    ScheduleRemoved {
+        id: i64,
+        agent_id: i64,
+    },
+    /// A schedule run was recorded or changed (`schedules::run_json`).
+    ScheduleRun(serde_json::Value),
+    /// The scheduling settings changed (`schedules::settings_json`).
+    ScheduleSettings(serde_json::Value),
     /// What `hello.updates` says changed (`updates::Status`).
     UpdatesChanged(crate::updates::Status),
     /// The shared window preferences changed (`prefs.set`).
@@ -319,6 +329,9 @@ pub(crate) struct HumanInputQueue {
     /// Per session, the first and last sequence number of its uncommitted keystrokes.
     pending: Mutex<BTreeMap<SessionId, (u64, u64)>>,
     wake: parking_lot::Condvar,
+    /// Per session, the sequence number and time of its newest keystroke (memory only): a
+    /// schedule's fresh restart never wipes what the human is typing (`human_input_of`).
+    latest: Mutex<HashMap<SessionId, (u64, std::time::Instant)>>,
 }
 
 impl HumanInputQueue {
@@ -326,6 +339,7 @@ impl HumanInputQueue {
         let mut pending = self.pending.lock();
         // Numbered under the lock, so a later number is never recorded before an earlier one.
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.latest.lock().insert(id, (seq, std::time::Instant::now()));
         match pending.entry(id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((seq, seq));
@@ -409,6 +423,8 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 pub struct Hub {
     pub panels: crate::panels::Panels,
     pub notes: crate::notes::Notes,
+    /// Schedules and their runs (src/schedules/).
+    pub schedules: crate::schedules::Schedules,
     cfg: HubConfig,
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
@@ -698,11 +714,13 @@ impl Hub {
         }
         let devices = crate::devices::Registry::load(&store)?;
         let agents = crate::agents::Registry::load(&store)?;
+        let schedules = crate::schedules::Schedules::load(&store, Arc::new(crate::schedules::SystemClock::from_env()))?;
         let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let hub = Arc::new_cyclic(|weak| Hub {
             panels: crate::panels::Panels::default(),
             notes: crate::notes::Notes::default(),
+            schedules,
             cfg,
             devices,
             agents,
@@ -3524,6 +3542,12 @@ impl Hub {
         self.human_input.now()
     }
 
+    /// The sequence number and time of the human's newest keystroke into session `id` (None:
+    /// none since this backend started).
+    pub fn human_input_of(&self, id: SessionId) -> Option<(u64, std::time::Instant)> {
+        self.human_input.latest.lock().get(&id).copied()
+    }
+
     /// A legacy HTTP callback that arrived when the human-input sequence was at `arrival`.
     /// It may wait for the callback boundary while later keystrokes are recorded and even
     /// committed (by the attribution worker); a prompt callback consumes the human-input
@@ -3603,7 +3627,10 @@ impl Hub {
             (info, from, fx)
         };
         let id = info.id;
-        if let Some(m) = fx.replied { crate::agents::publish_message(self, m); }
+        if let Some(m) = fx.replied {
+            crate::agents::publish_message(self, m);
+            crate::schedules::on_reply(self, m);
+        }
         if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
         self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
             serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));

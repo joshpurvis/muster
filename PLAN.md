@@ -205,15 +205,28 @@ its terminal tab. Templates: the Researcher's "read-only plus web" is Claude **p
 only read-only Claude profile (it can't write memory/, so its persona asks it to list findings
 for memory/ until the human widens its mode).
 
+**Schedules, Phase 1 (built; docs/SCHEDULING_PLAN.md).** Recurring and one-off schedules per
+agent (presets, "Once at…", custom cron with a plain-English reading, a named time zone so
+09:00 stays 09:00 across daylight saving, `{date}` `{last_run}` `{last_reply}` in the prompt).
+Each run is an agent message with origin `schedule` at hop 0 through the same path as
+`agent.ask`, so every guard applies. A run history with outcomes; pause, skip next, run now and a
+global "Pause all"; missed runs after downtime (daily and slower run once, hourly-or-faster
+skip; catch-ups one at a time per agent, spread out); the busy rule (skip while the same
+schedule's run is still going, else wait in line up to an hour); "fresh each run"; alerts on
+failure (desktop and in-app) and replies into a note; quiet hours, a per-schedule daily cap and a
+per-agent unattended cap (24 a day by default). Claude subscription agents: only with the
+Schedule opt-in, recurring schedules expire after 7 days unless renewed (a notice the day
+before), quiet hours on by default; Claude on OpenRouter doesn't expire. `muster schedule`,
+`schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (spend caps, chaining,
+triggers) and Phase 3 (agents proposing schedules) are not built.
+
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
   `agent.*` method and no agent events).
 - Sleep and wake: stop an idle agent's process, resume it on the next message.
-- Schedules and webhooks: the origins, the policy and the Background worker template exist; the
-  triggers don't (the daemon-internal `agents::ask` takes an origin; no client can set one).
-  Rules for when they're built: a Claude agent's schedules mirror Anthropic's bounds (at least a
-  1-minute interval, a recurring schedule expires after 7 days unless renewed, quiet hours
-  supported); webhook triggers are never exposed to anyone but the user.
+- Webhooks and other triggers (docs/SCHEDULING_PLAN.md Phases 2 and 3): the `webhook` origin and
+  its policy exist; nothing fires it yet. Webhook triggers are never exposed to anyone but the
+  user. (Schedules are built: above.)
 - Codex resume (`codex resume <id>`; the thread id is already captured).
 - An async `reply(msg_id)` tool, so an agent can answer later instead of in the same turn.

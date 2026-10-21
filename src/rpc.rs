@@ -1056,6 +1056,88 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
         }
 
+        // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes or changes them: a call
+        // on an agent session's behalf is refused (agents proposing schedules is a later phase).
+        m if m.starts_with("schedule.") => {
+            require_local(who, method)?;
+            let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
+            let reads = matches!(method, "schedule.list" | "schedule.runs" | "schedule.preview" | "schedule.settings.get");
+            if !reads && let Caller::Agent(_) = caller(hub, from)? {
+                return Err(RpcError(format!(
+                    "{method} can't be called from an agent's session: only the human makes and changes schedules"
+                )));
+            }
+            #[derive(Deserialize)]
+            struct Id {
+                id: i64,
+                #[serde(default)]
+                #[allow(dead_code)]
+                from_session: Option<SessionId>,
+            }
+            match method {
+                "schedule.list" => {
+                    #[derive(Deserialize)]
+                    struct P {
+                        #[serde(default)]
+                        agent: Option<String>,
+                    }
+                    let p: P = parse(params)?;
+                    Ok(crate::schedules::list(hub, p.agent.as_deref())?)
+                }
+                "schedule.create" => Ok(crate::schedules::create(hub, parse(params)?)?),
+                "schedule.update" => Ok(crate::schedules::update(hub, parse(params)?)?),
+                "schedule.remove" => Ok(crate::schedules::remove(hub, parse::<Id>(params)?.id)?),
+                "schedule.pause" | "schedule.skip" => {
+                    #[derive(Deserialize)]
+                    struct P {
+                        id: i64,
+                        #[serde(default = "yes")]
+                        on: bool,
+                    }
+                    fn yes() -> bool {
+                        true
+                    }
+                    let p: P = parse(params)?;
+                    Ok(if method == "schedule.pause" {
+                        crate::schedules::set_paused(hub, p.id, p.on)?
+                    } else {
+                        crate::schedules::set_skip(hub, p.id, p.on)?
+                    })
+                }
+                "schedule.renew" => Ok(crate::schedules::renew(hub, parse::<Id>(params)?.id)?),
+                "schedule.run" => Ok(crate::schedules::run_now(hub, parse::<Id>(params)?.id)?),
+                "schedule.runs" => {
+                    #[derive(Deserialize)]
+                    struct P {
+                        id: i64,
+                        #[serde(default)]
+                        before: Option<i64>,
+                        #[serde(default)]
+                        limit: Option<usize>,
+                    }
+                    let p: P = parse(params)?;
+                    Ok(crate::schedules::runs(hub, p.id, p.before, p.limit)?)
+                }
+                "schedule.preview" => {
+                    #[derive(Deserialize)]
+                    struct P {
+                        when: crate::schedules::When,
+                        #[serde(default)]
+                        tz: Option<String>,
+                        #[serde(default)]
+                        quiet_hours: Option<bool>,
+                        #[serde(default)]
+                        agent: Option<String>,
+                    }
+                    let p: P = parse(params)?;
+                    Ok(crate::schedules::preview(hub, &p.when, p.tz.as_deref(), p.quiet_hours, p.agent.as_deref())?)
+                }
+                "schedule.settings.get" => Ok(crate::schedules::settings_json(&hub.schedules.settings())),
+                "schedule.settings.set" => Ok(crate::schedules::set_settings(hub, parse(params)?)?),
+                _ => Err(RpcError(format!("unknown method: {method}"))),
+            }
+        }
+
         "session.attach" | "session.detach" | "window.claim" => {
             Err(RpcError(format!("{method} is only available over the WebSocket")))
         }
@@ -1337,6 +1419,8 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     && matches!(
                         ev,
                         ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
+                        | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
+                        | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
                         | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
                         | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
                     )

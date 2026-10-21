@@ -17,6 +17,8 @@ const ENV = {
   HOME: `${BASE}/home`, MUSTER_URL: "", MUSTER_TOKEN: "", MUSTER_BIN: "",
   MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "", MUSTER_RUN: "",
   PATH: `${BASE}/bin:/usr/bin:/bin`, MUSTER_CODEX_HOOKS: "0",
+  // No desktop notifications from the test daemon (schedule alerts would reach the real desktop).
+  MUSTER_NO_NOTIFY: "1",
 };
 
 let passed = 0;
@@ -1054,6 +1056,7 @@ exec cat > /dev/null
   ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");
   await c.call("agent.remove", { name: "bg" });
 
+  ({ c, d } = await schedules(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
 }
@@ -1090,6 +1093,147 @@ async function filesContaining(dir: string, needle: string): Promise<string[]> {
 
 const cli = (args: string[], env: Record<string, string>) =>
   new Deno.Command(BIN, { args, env, stdin: "null", stdout: "piped", stderr: "piped" }).output();
+
+/** Schedules (src/schedules/): made and listed through the CLI, a run is an agent message with
+ * origin schedule, refusals, pause and skip, the busy rule, the reply in a note, and the missed-run
+ * rule across a backend restart (a debug-build clock offset stands in for two days off). Returns
+ * the client and backend it ends with. */
+async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
+  const sch = async (...args: string[]) => {
+    const o = await cli(["schedule", ...args], env);
+    return { ok: o.success, out: dec.decode(o.stdout), err: dec.decode(o.stderr) };
+  };
+  const input = () => Deno.readTextFile(`${BASE}/fake-input`).catch(() => "");
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 15000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await cond()) return;
+      await sleep(100);
+    }
+    throw new Error(`timeout waiting for ${what}`);
+  };
+  const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+
+  // A Claude agent that doesn't take scheduled work is refused, through the CLI too.
+  await c.call("agent.create", { name: "nosched", kind: "claude" });
+  const refused = await sch("add", "nosched", "--daily", "09:00", "hello");
+  ok(!refused.ok && refused.err.includes("doesn't take scheduled work") && refused.err.includes("Codex or OpenRouter"),
+    `schedule: a Claude agent without the Schedule origin is refused (${refused.err.trim()})`);
+  await c.call("agent.create", { name: "sched", kind: "codex" });
+  const fast = await sch("add", "sched", "--cron", "*/5 * * * *", "too often");
+  ok(!fast.ok && fast.err.includes("every 15 minutes"), "schedule: faster than every 15 minutes is refused");
+  const add = await sch("add", "sched", "--weekdays", "09:00", "--tz", "Europe/London", "--note", "Sched replies",
+    "Summary for {date}, since {last_run}");
+  ok(add.ok && /schedule \d+: At 09:00, Monday to Friday \(Europe\/London\); next /.test(add.out), `muster schedule add (${add.out.trim()}${add.err})`);
+  const id = Number(add.out.match(/schedule (\d+)/)![1]);
+  const ls = JSON.parse((await sch("ls", "--json")).out);
+  const mine = ls.schedules.find((s: Json) => s.id === id);
+  ok(mine && mine.agent === "sched" && mine.status === "active" && mine.next_run > Date.now() && mine.quiet_hours === false &&
+    mine.expires_at === null && mine.note_title === "Sched replies", "muster schedule ls --json: the schedule, Codex: no expiry, quiet hours off");
+  ok((await sch("ls")).out.includes("Summary for {date}"), "muster schedule ls: a table row");
+  await c.waitFor("schedule_upserted", () => c.events.some((e) => e.event === "schedule_upserted" && e.data.id === id));
+  ok(true, "schedule_upserted reaches clients");
+
+  // Run now: an agent message from schedule:<id>, origin schedule, hop 0, prompt filled in.
+  const ran = await sch("run", String(id));
+  ok(ran.ok && ran.out.includes("started"), `muster schedule run (${ran.out.trim()}${ran.err})`);
+  await until("the run's prompt", async () => (await input()).includes(`from schedule:${id} origin=schedule hop=0]`));
+  const typed = await input();
+  ok(typed.includes("since never (this is the first run)") && /Summary for \d{4}-\d\d-\d\d/.test(typed),
+    "the run reaches the agent as an envelope with origin schedule, placeholders filled");
+  const token = await Deno.readTextFile(`${BASE}/fake-token`);
+  let r = (await runs(id))[0];
+  ok(r.kind === "manual" && r.outcome === "pending" && r.message?.origin === "schedule" && r.message.hop === 0 &&
+    r.message.from === `schedule:${id}`, "history: a pending manual run with its message");
+
+  // Busy: another run while that one waits for its reply is skipped.
+  await c.call("schedule.run", { id });
+  await until("the busy skip", async () => (await runs(id))[0].outcome === "skipped");
+  ok((await runs(id))[0].reason.includes("previous run is still going"), "busy: a run is skipped while the previous one is going");
+
+  // The reply (Stop hook): the run is replied, and the reply lands in the note. The prompt is
+  // pasted before Enter is pressed (and the message attributed): give it a moment.
+  await sleep(1500);
+  const hook = await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ last_assistant_message: "3 PRs open" }),
+  });
+  ok(hook.ok, "Stop hook accepted");
+  await until("the replied run", async () => (await runs(id)).some((x) => x.outcome === "replied"));
+  r = (await runs(id)).find((x) => x.outcome === "replied")!;
+  ok(r.message.reply === "3 PRs open" && r.finished_at >= r.started_at, "history: replied, with the reply");
+  const notes = await c.call("note.list");
+  const note = await c.call("note.get", { id: notes.find((n: Json) => n.title === "Sched replies").id });
+  ok(/^## \w{3} \d+ \w{3} \d{4} \d\d:\d\d · Summary for \{date\}, since \{last_run\}\n\n3 PRs open\n$/.test(note.body) &&
+    note.updated_by.name === "sched", `the reply is appended to the note under a date heading (${JSON.stringify(note.body)})`);
+  const hist = await sch("history", String(id));
+  ok(hist.ok && hist.out.includes("replied") && hist.out.includes("skipped") && hist.out.includes("previous run is still going"),
+    "muster schedule history");
+  await c.waitFor("schedule_run event", () => c.events.some((e) => e.event === "schedule_run" && e.data.outcome === "replied"));
+  ok(true, "schedule_run events reach clients");
+
+  // The second run's {last_run} names the first.
+  await c.call("schedule.run", { id });
+  await until("the second prompt", async () => /since \d{4}-\d\d-\d\d \d\d:\d\d/.test(await input()));
+  ok(true, "{last_run} names the previous run");
+  await sleep(1500);
+  await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ last_assistant_message: "still 3" }),
+  });
+  await until("the second reply", async () => (await runs(id))[0].outcome === "replied");
+
+  // Pause, resume, skip next.
+  ok((await sch("pause", String(id))).out.includes("paused"), "muster schedule pause");
+  ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).paused, "paused shows in schedule.list");
+  ok((await sch("resume", String(id))).out.includes("active"), "muster schedule resume");
+  ok((await sch("skip", String(id))).out.includes("skipping the run at"), "muster schedule skip");
+  ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === true, "skip_next is set");
+  await sch("skip", String(id), "--undo");
+  ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === false, "skip --undo");
+  ok((await sch("pause", "--all")).ok && (await c.call("schedule.settings.get")).paused === true, "muster schedule pause --all");
+  await sch("resume", "--all");
+
+  // The unattended cap: two schedule messages already today; at a cap of 2 the next is refused.
+  await c.call("schedule.settings.set", { unattended_cap: 2 });
+  await c.call("schedule.run", { id });
+  await until("the refused run", async () => (await runs(id))[0].outcome === "refused");
+  ok((await runs(id))[0].reason.includes("unattended"), "a run past the unattended cap is refused, with the reason");
+  const refusedMsgs = (await c.call("agent.messages", { agent: "sched" })).messages.filter((m: Json) => m.refused);
+  ok(refusedMsgs.some((m: Json) => m.refused.includes("unattended") && m.origin === "schedule"), "the refusal is in the agent's message log");
+  await c.call("schedule.settings.set", { unattended_cap: 24 });
+  await c.call("agent.remove", { name: "nosched" });
+
+  // Missed runs across a restart: Muster is "off" for two days (a test clock offset), landing at
+  // half past an hour. The daily schedule runs once as a catch-up; the hourly one skips.
+  await sch("rm", String(id));
+  const made = async (...args: string[]) => {
+    const o = await sch("add", "sched", ...args);
+    ok(o.ok, `muster schedule add ${args[0]} (${o.out.trim()}${o.err.trim()})`);
+    return Number(o.out.match(/schedule (\d+)/)![1]);
+  };
+  const daily = await made("--daily", "09:00", "daily catch-up check");
+  const hourly = await made("--hourly", "hourly check");
+  const minute = new Date().getMinutes();
+  const offset = 2 * 86_400_000 + ((90 - minute) % 60) * 60_000;
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({ MUSTER_TEST_CLOCK_OFFSET_MS: String(offset), MUSTER_TEST_CATCHUP_GAP_MS: "300" });
+  c = new Client(d.token);
+  await c.open();
+  await until("the catch-up", async () => (await runs(daily)).some((x) => x.kind === "catch_up" && x.msg_id));
+  const cu = (await runs(daily))[0];
+  ok(cu.kind === "catch_up" && cu.reason.startsWith("catch-up") && (await input()).includes("daily catch-up check"),
+    "after downtime a daily schedule runs once, as a catch-up");
+  ok((await runs(daily)).length === 1, "once, not once per missed day");
+  await until("the hourly skip", async () => (await runs(hourly)).length > 0);
+  const hs = await runs(hourly);
+  ok(hs.length === 1 && hs[0].outcome === "skipped" && hs[0].reason.startsWith("missed"), `an hourly schedule skips missed runs (${hs[0].reason})`);
+  ok((await c.call("schedule.list")).schedules.every((s: Json) => s.next_run > Date.now() + offset - 60_000),
+    "next runs move past the downtime");
+  await c.call("agent.remove", { name: "sched" });
+  ok((await c.call("schedule.list")).schedules.length === 0, "removing an agent removes its schedules");
+  return { c, d };
+}
 
 /** OpenRouter (src/openrouter.rs): the key comes from the backend's environment and only an
  * OpenRouter agent's session gets it. Ends with the backend stopped. */

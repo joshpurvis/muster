@@ -74,6 +74,16 @@ pub enum ServerEvent {
     },
     /// A message to an agent was recorded, refused or replied to (`agents::message_json`).
     AgentMessage(serde_json::Value),
+    /// A schedule was created or changed, or its next run moved (`schedules::schedule_json`).
+    ScheduleUpserted(serde_json::Value),
+    ScheduleRemoved {
+        id: i64,
+        agent_id: i64,
+    },
+    /// A schedule run was recorded or changed (`schedules::run_json`).
+    ScheduleRun(serde_json::Value),
+    /// The scheduling settings changed (`schedules::settings_json`).
+    ScheduleSettings(serde_json::Value),
     /// What `hello.updates` says changed (`updates::Status`).
     UpdatesChanged(crate::updates::Status),
     /// The shared window preferences changed (`prefs.set`).
@@ -409,6 +419,8 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 pub struct Hub {
     pub panels: crate::panels::Panels,
     pub notes: crate::notes::Notes,
+    /// Schedules and their runs (src/schedules/).
+    pub schedules: crate::schedules::Schedules,
     cfg: HubConfig,
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
@@ -698,11 +710,13 @@ impl Hub {
         }
         let devices = crate::devices::Registry::load(&store)?;
         let agents = crate::agents::Registry::load(&store)?;
+        let schedules = crate::schedules::Schedules::load(&store, Arc::new(crate::schedules::SystemClock::from_env()))?;
         let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let hub = Arc::new_cyclic(|weak| Hub {
             panels: crate::panels::Panels::default(),
             notes: crate::notes::Notes::default(),
+            schedules,
             cfg,
             devices,
             agents,

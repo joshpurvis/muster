@@ -1,4 +1,4 @@
-//! OS notifications when a session needs the human. OWNER: agents implementer.
+//! OS notifications when a session needs the human (and schedule alerts, `alert`). OWNER: agents implementer.
 //!
 //! Listens to `SessionUpserted` events; when a session enters a `needs_human()` state (or the
 //! detail of such a state changes, e.g. a second approval), shows "#channel · session" with the
@@ -31,12 +31,24 @@ struct Note {
     body: String,
 }
 
+/// The worker, for alerts that aren't about a session's state (`alert`).
+static WORKER: std::sync::OnceLock<SyncSender<Note>> = std::sync::OnceLock::new();
+
+/// A desktop notification from elsewhere in the daemon (a schedule run's outcome). Dropped when
+/// notifications are off (MUSTER_NO_NOTIFY) or the worker is busy.
+pub fn alert(summary: &str, body: &str) {
+    if let Some(tx) = WORKER.get() {
+        let _ = tx.try_send(Note { summary: summary.to_string(), body: body.to_string() });
+    }
+}
+
 /// Called once at daemon start.
 pub fn spawn(hub: Arc<Hub>) {
     if std::env::var_os("MUSTER_NO_NOTIFY").is_some_and(|v| v != "0") {
         return;
     }
     let tx = start_worker();
+    let _ = WORKER.set(tx.clone());
     let mut rx = hub.subscribe();
     tokio::spawn(async move {
         let mut seen: HashMap<SessionId, Seen> = HashMap::new();

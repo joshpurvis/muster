@@ -111,6 +111,18 @@ pub const MAX_AGENT_HOPS: u32 = 4;
 /// Messages muster delivers to one agent per rolling 24 hours (any origin, the human's included).
 pub const AGENT_DAILY_PROMPT_CAP: usize = 200;
 pub const AGENT_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+/// Unattended messages (scheduled or triggered: any origin but the human's, at any hop) one
+/// agent takes per rolling 24 hours, unless the human changes it in the scheduling settings
+/// (`schedules::Settings::unattended_cap`, at most `AGENT_DAILY_PROMPT_CAP`).
+pub const UNATTENDED_DAILY_CAP_DEFAULT: u32 = 24;
+
+/// Why an unattended message was refused at the unattended cap.
+pub fn unattended_cap_refusal(agent: &str, recent: usize, cap: u32) -> String {
+    format!(
+        "agent {agent} already got {recent} unattended (scheduled or triggered) messages in the last 24 hours \
+         (cap {cap}, set in the scheduling settings). The next one goes through once the oldest is a day old."
+    )
+}
 
 /// May a message with `origin` at `hop` be delivered to agent `agent` (which accepts `accepts`
 /// and was sent `recent` messages in the last 24 hours)?

@@ -717,6 +717,310 @@ pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
     }
 }
 
+// ----- schedules (docs/CLI.md "Schedules") -----
+
+#[derive(clap::Subcommand)]
+pub enum ScheduleCmd {
+    /// Schedule a message to an agent. Give one timing: --every, --hourly, --daily, --weekdays,
+    /// --weekly, --cron or --at. PROMPT words are joined by spaces; `-` reads stdin. The prompt may
+    /// use {date}, {last_run} and {last_reply}.
+    #[command(after_help = "Examples:\n  muster schedule add worker --weekdays 09:00 Summarise the PRs opened since {last_run}\n  \
+        muster schedule add worker --every 30m --note \"CI checks\" Check CI on master\n  \
+        muster schedule add worker --at 15:30 Has the deploy finished?\n  \
+        muster schedule add worker --cron \"0 18 * * 5\" --fresh Weekly cleanup")]
+    Add {
+        agent: String,
+        prompt: Vec<String>,
+        /// Every 15m, 30m, 1h, 2h, 3h, 4h, 6h, 8h or 12h.
+        #[arg(long)] every: Option<String>,
+        /// Every hour, on the hour; `--hourly=:05` at that minute.
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0")] hourly: Option<String>,
+        /// Every day at HH:MM.
+        #[arg(long)] daily: Option<String>,
+        /// Monday to Friday at HH:MM.
+        #[arg(long)] weekdays: Option<String>,
+        /// On these days at a time: `mon@09:00`, `mon,thu@17:30`.
+        #[arg(long)] weekly: Option<String>,
+        /// A cron line: minute hour day-of-month month day-of-week (e.g. "0 9 * * 1-5").
+        #[arg(long)] cron: Option<String>,
+        /// Once: `HH:MM` (the next one), `YYYY-MM-DD HH:MM`, or `+20m` / `+2h` from now.
+        #[arg(long)] at: Option<String>,
+        #[arg(long)] name: Option<String>,
+        /// IANA time zone (default: this machine's).
+        #[arg(long)] tz: Option<String>,
+        /// What a run missed while Muster was off does (auto: daily and slower run once, hourly
+        /// and faster skip).
+        #[arg(long, value_parser = ["auto", "run", "skip"])] if_missed: Option<String>,
+        /// A new conversation for each run.
+        #[arg(long)] fresh: bool,
+        #[arg(long, value_parser = ["failure", "always", "never"])] notify: Option<String>,
+        /// Also append each reply to this note (id or title; a new title makes a note).
+        #[arg(long)] note: Option<String>,
+        /// Skip runs in the quiet hours (default: on for Claude subscription agents).
+        #[arg(long, value_parser = ["on", "off"])] quiet_hours: Option<String>,
+        /// At most N runs reach the agent per 24 hours.
+        #[arg(long)] max_per_day: Option<u32>,
+        /// Create it paused.
+        #[arg(long)] paused: bool,
+    },
+    /// List schedules: ID  AGENT  STATUS  NEXT  LAST  NAME.
+    #[command(alias = "list")]
+    Ls {
+        agent: Option<String>,
+        #[arg(long)] json: bool,
+    },
+    /// Remove a schedule (and its history).
+    Rm { id: i64 },
+    /// Pause a schedule; `--all` pauses every schedule.
+    Pause {
+        #[arg(required_unless_present = "all")] id: Option<i64>,
+        #[arg(long)] all: bool,
+    },
+    /// Resume a paused schedule; `--all` lifts "Pause all schedules".
+    Resume {
+        #[arg(required_unless_present = "all")] id: Option<i64>,
+        #[arg(long)] all: bool,
+    },
+    /// Run a schedule now (origin schedule, like a timed run); prints the run.
+    Run { id: i64 },
+    /// Skip a schedule's next run (`--undo`: don't).
+    Skip {
+        id: i64,
+        #[arg(long)] undo: bool,
+    },
+    /// Renew a Claude subscription agent's schedule for 7 more days.
+    Renew { id: i64 },
+    /// A schedule's runs, newest first: RUN  TIME  KIND  OUTCOME  REASON.
+    History {
+        id: i64,
+        #[arg(long, default_value_t = 20)] limit: usize,
+        #[arg(long)] json: bool,
+    },
+}
+
+/// `--every 30m` etc. as a cron line.
+fn every_cron(spec: &str) -> anyhow::Result<String> {
+    let s = spec.trim().to_ascii_lowercase();
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u32 = n.parse().map_err(|_| exit(2, format!("--every {spec}: use 15m, 30m, 1h, 2h, 3h, 4h, 6h, 8h or 12h")))?;
+    match (unit, n) {
+        ("m" | "min", 15 | 30) => Ok(format!("*/{n} * * * *")),
+        ("m" | "min", 60) | ("h", 1) => Ok("0 * * * *".into()),
+        ("h", 2 | 3 | 4 | 6 | 8 | 12) => Ok(format!("0 */{n} * * *")),
+        _ => Err(exit(2, format!("--every {spec}: use 15m, 30m, 1h, 2h, 3h, 4h, 6h, 8h or 12h (or --cron)"))),
+    }
+}
+
+fn hhmm(s: &str, flag: &str) -> anyhow::Result<(u32, u32)> {
+    let m = crate::schedules::parse_hhmm(s).ok_or_else(|| exit(2, format!("--{flag} {s}: use HH:MM, e.g. 09:00")))?;
+    Ok((m / 60, m % 60))
+}
+
+/// The `when` of `muster schedule add`: exactly one timing flag.
+#[allow(clippy::too_many_arguments)]
+fn schedule_when(every: Option<String>, hourly: Option<String>, daily: Option<String>, weekdays: Option<String>,
+    weekly: Option<String>, cron: Option<String>, at: Option<String>, tz: Option<&str>) -> anyhow::Result<Value> {
+    let given = [&every, &hourly, &daily, &weekdays, &weekly, &cron, &at].iter().filter(|o| o.is_some()).count();
+    if given != 1 {
+        return Err(exit(2, "give exactly one timing: --every, --hourly, --daily, --weekdays, --weekly, --cron or --at"));
+    }
+    let line = if let Some(e) = every {
+        every_cron(&e)?
+    } else if let Some(m) = hourly {
+        let m: u32 = m.trim_start_matches(':').parse().ok().filter(|m| *m < 60)
+            .ok_or_else(|| exit(2, format!("--hourly {m}: a minute 0-59")))?;
+        format!("{m} * * * *")
+    } else if let Some(t) = daily {
+        let (h, m) = hhmm(&t, "daily")?;
+        format!("{m} {h} * * *")
+    } else if let Some(t) = weekdays {
+        let (h, m) = hhmm(&t, "weekdays")?;
+        format!("{m} {h} * * 1-5")
+    } else if let Some(w) = weekly {
+        let (days, t) = w.split_once('@').ok_or_else(|| exit(2, format!("--weekly {w}: use DAY@HH:MM, e.g. mon@09:00")))?;
+        let (h, m) = hhmm(t, "weekly")?;
+        format!("{m} {h} * * {}", days.trim().to_ascii_lowercase())
+    } else if let Some(c) = cron {
+        c
+    } else {
+        let at = at.unwrap_or_default();
+        return Ok(json!({"kind": "once", "at": once_at(&at, tz)?}));
+    };
+    Ok(json!({"kind": "cron", "cron": line}))
+}
+
+/// `--at`: `+20m`/`+2h`, `HH:MM` (the next one), or `YYYY-MM-DD HH:MM`, in `tz` (else local).
+fn once_at(s: &str, tz: Option<&str>) -> anyhow::Result<i64> {
+    let s = s.trim();
+    let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
+    if let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
+        let rel = rel.trim();
+        let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+        let n: i64 = n.parse().map_err(|_| bad())?;
+        let ms = match unit.trim() {
+            "m" | "min" | "mins" | "minutes" => n * 60_000,
+            "h" | "hour" | "hours" => n * 3_600_000,
+            "d" | "day" | "days" => n * 86_400_000,
+            _ => return Err(bad()),
+        };
+        return Ok(now_ms() + ms);
+    }
+    let zone = match tz {
+        Some(t) => crate::schedules::cron::zone(t).map_err(|e| exit(2, e))?,
+        None => jiff::tz::TimeZone::system(),
+    };
+    let now = jiff::Timestamp::now().to_zoned(zone.clone());
+    let dt: jiff::civil::DateTime = if let Some(m) = crate::schedules::parse_hhmm(s) {
+        let today = now.date().at((m / 60) as i8, (m % 60) as i8, 0, 0);
+        if zone.to_ambiguous_timestamp(today).compatible().map_err(|_| bad())? > now.timestamp() {
+            today
+        } else {
+            now.date().tomorrow().map_err(|_| bad())?.at((m / 60) as i8, (m % 60) as i8, 0, 0)
+        }
+    } else {
+        s.replacen(' ', "T", 1).parse().map_err(|_| bad())?
+    };
+    Ok(zone.to_ambiguous_timestamp(dt).compatible().map_err(|_| bad())?.as_millisecond())
+}
+
+/// `Mon 20 Oct 09:00` in this machine's zone.
+fn local_time(ms: i64) -> String {
+    crate::schedules::cron::format(&jiff::tz::TimeZone::system(), ms, "%a %-d %b %H:%M")
+}
+
+fn schedule_line(s: &Value) -> String {
+    let next = match (s["status"].as_str(), s["next_run"].as_i64()) {
+        (Some("expired"), _) => "expired (renew)".to_string(),
+        (_, Some(t)) => local_time(t),
+        (_, None) => "-".into(),
+    };
+    let last = match s["last_run"].as_object() {
+        Some(r) => format!("{} {}", r.get("outcome").and_then(|v| v.as_str()).unwrap_or("?"),
+            r.get("slot").and_then(|v| v.as_i64()).map(local_time).unwrap_or_default()),
+        None => "-".into(),
+    };
+    format!("{:<4} {:<14} {:<8} {:<18} {:<26} {}  ({})", s["id"], s["agent"].as_str().unwrap_or("?"),
+        s["status"].as_str().unwrap_or("?"), next, last, s["name"].as_str().unwrap_or(""), s["reading"].as_str().unwrap_or(""))
+}
+
+fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option<i64>, all: bool, pause: bool) -> anyhow::Result<()> {
+    if all {
+        one("schedule.settings.set", json!({"paused": pause}))?;
+        println!("{}", if pause { "all schedules paused" } else { "schedules resumed (each one's own pause stays)" });
+        return Ok(());
+    }
+    let id = id.ok_or_else(|| exit(2, "give a schedule id, or --all"))?;
+    let s = one("schedule.pause", json!({"id": id, "on": pause}))?;
+    println!("schedule {id}: {}", s["status"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
+    let from = env_session();
+    let one = |method: &str, p: Value| -> anyhow::Result<Value> {
+        let mut p = p;
+        p["from_session"] = json!(from);
+        client::rpc(d, method, p)
+    };
+    match cmd {
+        ScheduleCmd::Add { agent, prompt, every, hourly, daily, weekdays, weekly, cron, at, name, tz, if_missed, fresh,
+            notify, note, quiet_hours, max_per_day, paused } => {
+            let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let note = note.map(|n| match n.parse::<i64>() {
+                Ok(id) => json!({"id": id}),
+                Err(_) => json!({"title": n}),
+            });
+            let mut p = json!({
+                "agent": agent, "prompt": text, "when": when, "name": name, "tz": tz,
+                "missed": if_missed.map(|m| if m == "run" { "run_once".to_string() } else { m }),
+                "conversation": if fresh { Some("fresh") } else { None },
+                "notify": notify.map(|n| if n == "failure" { "on_failure".to_string() } else { n }),
+                "note": note, "quiet_hours": quiet_hours.map(|q| q == "on"), "daily_cap": max_per_day,
+                "paused": paused.then_some(true),
+            });
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let s = one("schedule.create", p)?;
+            let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
+            println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
+            if s["expires_at"].is_i64() {
+                println!("  {} is a Claude subscription agent: this schedule stops after 7 days unless you renew it \
+                    (`muster schedule renew {}`). Quiet hours: {}.", s["agent"].as_str().unwrap_or("it"), s["id"],
+                    if s["quiet_hours"].as_bool() == Some(true) { "on" } else { "off" });
+            }
+            Ok(())
+        }
+        ScheduleCmd::Ls { agent, json } => {
+            let v = client::rpc(d, "schedule.list", json!({"agent": agent}))?;
+            if json { return print_json(&v) }
+            if v["settings"]["paused"].as_bool() == Some(true) {
+                println!("All schedules are paused (`muster schedule resume --all`).");
+            }
+            let list = v["schedules"].as_array().cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("no schedules");
+                return Ok(());
+            }
+            println!("{:<4} {:<14} {:<8} {:<18} {:<26} NAME  (WHEN)", "ID", "AGENT", "STATUS", "NEXT", "LAST");
+            for s in &list {
+                println!("{}", schedule_line(s));
+            }
+            Ok(())
+        }
+        ScheduleCmd::Rm { id } => {
+            one("schedule.remove", json!({"id": id}))?;
+            println!("removed schedule {id}");
+            Ok(())
+        }
+        ScheduleCmd::Pause { id, all } => schedule_pause(&one, id, all, true),
+        ScheduleCmd::Resume { id, all } => schedule_pause(&one, id, all, false),
+        ScheduleCmd::Run { id } => {
+            let r = one("schedule.run", json!({"id": id}))?;
+            match r["outcome"].as_str() {
+                Some("pending") => println!("run {}: started (see `muster schedule history {id}`)", r["id"]),
+                o => println!("run {}: {} {}", r["id"], o.unwrap_or("?"), r["reason"].as_str().unwrap_or("")),
+            }
+            Ok(())
+        }
+        ScheduleCmd::Skip { id, undo } => {
+            let s = one("schedule.skip", json!({"id": id, "on": !undo}))?;
+            match (undo, s["next_run"].as_i64()) {
+                (false, Some(t)) => println!("schedule {id}: skipping the run at {}", local_time(t)),
+                _ => println!("schedule {id}: not skipping"),
+            }
+            Ok(())
+        }
+        ScheduleCmd::Renew { id } => {
+            let s = one("schedule.renew", json!({"id": id}))?;
+            match s["expires_at"].as_i64() {
+                Some(e) => println!("schedule {id}: runs until {}", local_time(e)),
+                None => println!("schedule {id}: doesn't expire"),
+            }
+            Ok(())
+        }
+        ScheduleCmd::History { id, limit, json } => {
+            let v = client::rpc(d, "schedule.runs", json!({"id": id, "limit": limit}))?;
+            if json { return print_json(&v) }
+            let runs = v["runs"].as_array().cloned().unwrap_or_default();
+            if runs.is_empty() {
+                println!("no runs yet");
+                return Ok(());
+            }
+            println!("{:<6} {:<18} {:<9} {:<10} REASON", "RUN", "TIME", "KIND", "OUTCOME");
+            for r in runs {
+                let took = match (r["started_at"].as_i64(), r["finished_at"].as_i64()) {
+                    (Some(a), Some(b)) if r["msg_id"].is_i64() => format!(" · {}", format_duration(b - a)),
+                    _ => String::new(),
+                };
+                println!("{:<6} {:<18} {:<9} {:<10} {}{took}", r["id"], r["slot"].as_i64().map(local_time).unwrap_or_default(),
+                    r["kind"].as_str().unwrap_or("?").replace('_', "-"), r["outcome"].as_str().unwrap_or("?"),
+                    r["reason"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// `muster pair`: start a pairing, print how to reach the daemon from the phone (the
 /// `tailscale serve` lines when it isn't set up), a QR code and the short code, then wait for
 /// the phone.
@@ -2289,6 +2593,32 @@ mod tests {
         assert_eq!(t, "1  \x1b[32midle\x1b[0m  x\n");
         let t = render_table(None, &rows, None, false);
         assert_eq!(t, "1  idle  x\n");
+    }
+
+    #[test]
+    fn schedule_timings_become_cron_lines() {
+        let w = |every: Option<&str>, hourly: Option<&str>, daily: Option<&str>, weekdays: Option<&str>, weekly: Option<&str>| {
+            schedule_when(every.map(Into::into), hourly.map(Into::into), daily.map(Into::into), weekdays.map(Into::into),
+                weekly.map(Into::into), None, None, None)
+                .map(|v| v["cron"].as_str().unwrap().to_string())
+        };
+        assert_eq!(w(Some("15m"), None, None, None, None).unwrap(), "*/15 * * * *");
+        assert_eq!(w(Some("1h"), None, None, None, None).unwrap(), "0 * * * *");
+        assert_eq!(w(Some("6h"), None, None, None, None).unwrap(), "0 */6 * * *");
+        assert!(w(Some("5m"), None, None, None, None).is_err());
+        assert_eq!(w(None, Some("0"), None, None, None).unwrap(), "0 * * * *");
+        assert_eq!(w(None, Some(":05"), None, None, None).unwrap(), "5 * * * *");
+        assert_eq!(w(None, None, Some("09:30"), None, None).unwrap(), "30 9 * * *");
+        assert_eq!(w(None, None, None, Some("9:00"), None).unwrap(), "0 9 * * 1-5");
+        assert_eq!(w(None, None, None, None, Some("Mon,Thu@17:30")).unwrap(), "30 17 * * mon,thu");
+        assert!(w(None, None, Some("25:00"), None, None).is_err());
+        assert!(w(Some("15m"), None, Some("09:00"), None, None).is_err(), "one timing only");
+        assert!(w(None, None, None, None, None).is_err());
+        let soon = once_at("+20m", None).unwrap();
+        assert!((soon - now_ms() - 20 * 60_000).abs() < 5_000);
+        let next = once_at("2030-01-02 03:04", Some("UTC")).unwrap();
+        assert_eq!(next, 1893553440000);
+        assert!(once_at("tomorrow-ish", None).is_err());
     }
 
     #[test]

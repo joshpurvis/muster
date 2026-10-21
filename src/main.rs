@@ -27,6 +27,7 @@ mod pr;
 mod renderer;
 mod pty;
 mod rpc;
+mod schedules;
 mod server;
 mod store;
 mod terminal;
@@ -72,6 +73,12 @@ enum Cmd {
     Note {
         #[command(subcommand)]
         action: cli::NoteCmd,
+    },
+    /// Schedules: recurring or one-off messages to a named agent (add, ls, rm, pause, resume,
+    /// run, skip, renew, history).
+    Schedule {
+        #[command(subcommand)]
+        action: cli::ScheduleCmd,
     },
     /// Read-only GitHub PR fetches for reviews: the open PR list, or one PR's snapshot (JSON).
     Pr {
@@ -563,6 +570,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Panel { action } => cli::panel(d, action),
         Cmd::Note { action } => cli::note(d, action),
+        Cmd::Schedule { action } => cli::schedule(d, action),
         Cmd::Read {
             target,
             lines,
@@ -1208,6 +1216,8 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Resu
         let hub = hub.clone();
         tokio::spawn(async move { agents::autostart(&hub).await });
     }
+    // Schedules: finish runs a previous backend left, then fire on time (src/schedules/).
+    schedules::spawn(hub.clone());
 
     // Event log retention (also applied at startup).
     {

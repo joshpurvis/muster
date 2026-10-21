@@ -7,6 +7,7 @@ import { rpc } from "../rpc.ts";
 import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   schedulesSupported,
+  scheduleSettings,
   agentFilter,
   cacheNow,
   agentMessages,
@@ -179,6 +180,8 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
   const billing = agentBilling(a, s);
+  // What it billed to OpenRouter today (UTC day), once read (src/spend.rs).
+  const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
   const cold = !!s && isCold(s, cacheNow());
   const persona = firstLine(a.persona);
   const open = () => {
@@ -235,6 +238,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
             data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
           >
             {billing.label}
+            {spent !== undefined && <span class="or-spent"> · ${spent.toFixed(2)} today</span>}
           </span>
         )}
       </span>

@@ -146,7 +146,7 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
     let (run, s) = {
         let mut g = sched.inner.lock();
         let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
-        let last = hub.store().runs(id, None, 1)?.into_iter().next();
+        let last = hub.store().runs(id, None, 10)?.into_iter().find(|r| r.kind != RunKind::Chain);
         let today = runs_today(hub, id)?;
         let Some(mut due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
             return Ok(None);

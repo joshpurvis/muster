@@ -6,6 +6,35 @@ import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, 
 import { mapOffset } from "../note_merge.ts";
 import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
+import { schedules } from "../state.ts";
+import { setNoteTriggers } from "../actions.ts";
+import { IconZap } from "../icons.tsx";
+import { cx } from "../util.ts";
+
+/** "Allow triggers" in a note's status line: off by default, and only you switch it (agents
+ * can't). With it off, a schedule's note trigger never fires on this note's changes. */
+function TriggerSwitch({ id, on, title }: { id: number; on: boolean; title: string }) {
+  const watching = schedules.value.filter((s) => s.when.kind === "note" && s.when.note_id === id).length;
+  const what = watching === 0 ? "no trigger watches it yet" : watching === 1 ? "1 trigger watches it" : `${watching} triggers watch it`;
+  const tip = on
+    ? `Triggers allowed: changes to “${title}” can start runs of the triggers that watch it (${what}). Click to switch off.`
+    : `Triggers off: changes to “${title}” never start a run (${what}). Click to allow them; agents can't.`;
+  return (
+    <button
+      type="button"
+      class={cx("note-trig", on && "on")}
+      role="switch"
+      aria-checked={on}
+      aria-label={`Allow triggers on this note (${what})`}
+      data-tip={tip}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={() => setNoteTriggers(id, !on)}
+    >
+      <IconZap size={11} />
+      {on ? `triggers on${watching ? ` · ${watching}` : ""}` : "triggers off"}
+    </button>
+  );
+}
 
 const MAX_BYTES = 1024 * 1024;
 
@@ -134,6 +163,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           edited by {authorName(by)} · {ago(n.updated_at, now)}
         </span>
         <span class="note-spacer" />
+        {n.triggers !== undefined && <TriggerSwitch id={id} on={!!n.triggers} title={n.title} />}
         <span class="note-pos">Ln {pos.line}, Col {pos.col}</span>
         <span class="note-size">{lines} {lines === 1 ? "line" : "lines"} · {size(bytes)}</span>
       </div>

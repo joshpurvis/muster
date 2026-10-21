@@ -52,14 +52,33 @@ import {
   whenOfDraft,
   whenToSend,
   segStep,
+  blankThen,
+  blankTrigger,
+  draftOfThen,
+  draftOfTrigger,
+  isTrigger,
+  slug,
+  type ThenDraft,
+  thenOfDraft,
+  TRIGGER_KINDS,
+  type TriggerDraft,
+  type TriggerKind,
+  watchLabel,
+  whenOfTrigger,
+  withSteps,
 } from "../schedules.ts";
-import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings } from "../types.ts";
+import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, openMenuAt } from "./Menu.tsx";
-import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert } from "../icons.tsx";
+import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconZap } from "../icons.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
+
+/** "$1.23". */
+export function money(v: number): string {
+  return `$${v.toFixed(2)}`;
+}
 
 type ModalT = (
   p: { children: ComponentChildren; class?: string; label: string; onClose?: () => void },
@@ -106,15 +125,24 @@ function scheduleMenu(s: Schedule, x: number, y: number) {
     items: [
       { header: s.name },
       { label: "Edit…", run: () => A.editSchedule(s.id) },
-      { label: "Run now", hint: "outside its timing", run: () => A.runScheduleNow(s) },
+      { label: "Run now", hint: s.trigger ? "without an event" : "outside its timing", run: () => A.runScheduleNow(s) },
+      ...(s.url
+        ? [
+          { label: "Copy trigger command", hint: "curl, with its secret", run: () => A.copyTriggerCommand(s) },
+          { label: "New secret…", run: () => A.rotateTriggerSecret(s) },
+        ]
+        : []),
+      ...(s.note && !s.note.triggers
+        ? [{ label: `Allow triggers on ${s.note.title}`, run: () => A.setNoteTriggers(s.note!.id, true) }]
+        : []),
       "sep",
       { label: s.paused ? "Resume" : "Pause", run: () => A.pauseSchedule(s, !s.paused) },
-      {
+      ...(s.trigger ? [] : [{
         label: s.skip_next ? "Don't skip next run" : "Skip next run",
         hint: !s.skip_next && s.next_run !== null && !over ? nextWhen(s.next_run, Date.now()) : undefined,
         disabled: !s.skip_next && (over || s.paused),
         run: () => A.skipNextRun(s, !s.skip_next),
-      },
+      }]),
       ...(s.expires_at !== null ? [{ label: "Renew", hint: "7 more days", run: () => A.renewSchedule(s) }] : []),
       { label: "History", checked: open, run: () => A.toggleScheduleHistory(s.id) },
       "sep",
@@ -149,6 +177,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
   const open = scheduleHistoryOpen.value.has(s.id);
   const next = nextLabel(s, now);
   const exp = expiresLabel(s, now);
+  const watch = watchLabel(s);
   const last = s.last_run;
   const allPaused = !!scheduleSettings.value?.paused;
   const toggle = () => A.toggleScheduleHistory(s.id);
@@ -160,6 +189,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
     s.name,
     s.reading,
     next.text,
+    watch?.text,
     exp,
     last ? `last run ${OUTCOME_LABEL[last.outcome]}` : "no runs yet",
   ].filter(Boolean).join(", ");
@@ -192,13 +222,14 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
           scheduleMenu(s, e.clientX, e.clientY);
         }}
       >
-        <IconClock size={12} class="sch-icon" />
+        {s.trigger ? <IconZap size={12} class="sch-icon sch-icon-trig" /> : <IconClock size={12} class="sch-icon" />}
         <span class="sch-text">
           <span class="sch-name">{s.name}</span>
           <span class="sch-sub">
-            {next.tone === "paused"
+            {next.tone === "paused" && s.paused
               ? <span class="sch-badge">paused</span>
               : <span class={cx("sch-next", next.tone, allPaused && next.tone === "next" && "held")}>{next.text}</span>}
+            {watch && <span class="sch-chip sch-bad sch-watch" data-tip={watch.tip}>{watch.text}</span>}
             {next.tone === "expired" && s.expires_at !== null && (
               <button type="button" class="sch-link" onClick={renew}>Renew</button>
             )}
@@ -241,7 +272,7 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
     <div role="listitem" class="sch-runs" aria-label={`Runs of ${s.name}`}>
       {loading && runs.length === 0 && <span class="sch-runs-note"><Spinner size={10} /> Loading runs…</span>}
       {h && !h.loading && !h.error && runs.length === 0 && <span class="sch-runs-note">No runs yet.</span>}
-      {runs.map((r) => <RunEntry key={r.id} r={r} now={now} />)}
+      {withSteps(runs).map(({ run, depth }) => <RunEntry key={run.id} r={run} now={now} depth={depth} />)}
       {h?.error && !h.loading && (
         <span class="sch-runs-note sch-runs-err">
           Couldn't load runs.{" "}
@@ -264,10 +295,14 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
   );
 }
 
-function RunEntry({ r, now }: { r: ScheduleRun; now: number }) {
+function RunEntry({ r, now, depth = 0 }: { r: ScheduleRun; now: number; depth?: number }) {
   const tone = outcomeTone(r.outcome);
   const kind = runKindLabel(r);
-  const reason = runReason(r);
+  // A triggered run says what happened (its first line), unless it has a reason of its own.
+  const happened = r.kind === "triggered" && r.event
+    ? r.event.text.split("\n").find((l) => l.trim() && !l.startsWith("(earlier")) ?? null
+    : null;
+  const reason = runReason(r) ?? (happened && r.event && r.event.count > 1 ? `${happened} (+${r.event.count - 1} more)` : happened);
   // The message's live copy (a cold start is marked once the prompt is typed in).
   const msg = (r.msg_id !== null ? agentMessages.value.find((m) => m.id === r.msg_id) : undefined) ?? r.message;
   const cold = msg?.cold_idle_ms ?? null;
@@ -294,7 +329,7 @@ function RunEntry({ r, now }: { r: ScheduleRun; now: number }) {
       )}
     </>
   );
-  const cls = cx("sch-run", "sch-run-" + tone);
+  const cls = cx("sch-run", "sch-run-" + tone, (depth > 0 || r.kind === "chain") && "sch-run-step");
   if (!r.message) return <div class={cls} data-run={r.id}>{body}</div>;
   return (
     <button
@@ -358,7 +393,11 @@ interface Draft {
   agent: string;
   name: string;
   prompt: string;
+  /** "At a time" or "When something happens" (a trigger). */
+  mode: "time" | "event";
   when: WhenDraft;
+  trig: TriggerDraft;
+  then: ThenDraft;
   tz: string;
   missed: Schedule["missed"];
   conversation: Schedule["conversation"];
@@ -385,7 +424,10 @@ function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
       agent,
       name: "",
       prompt: "",
+      mode: "time",
       when: blankWhen(now, tz),
+      trig: blankTrigger(),
+      then: blankThen(),
       tz,
       missed: "auto",
       conversation: "continue",
@@ -400,8 +442,11 @@ function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
     agent: s.agent ?? "",
     name: s.name,
     prompt: s.prompt,
+    mode: isTrigger(s.when) ? "event" : "time",
     // A one-off shows at its wall-clock time in the schedule's own zone.
     when: draftOfWhen(s.when, blankWhen(now, s.tz), s.tz),
+    trig: draftOfTrigger(s.when, blankTrigger(), (id) => notes.value.get(id)?.title ?? s.note?.title ?? ""),
+    then: draftOfThen(s.then),
     tz: s.tz,
     missed: s.missed,
     conversation: s.conversation,
@@ -413,11 +458,12 @@ function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
   };
 }
 
-const GROUP_LABEL: Record<AgentChoice["group"], string> = {
-  unattended: "Best for scheduled work: Codex and OpenRouter",
-  claude: "Claude subscription (you opted in)",
-  off: "Don't take scheduled work",
-};
+const groupLabel = (g: AgentChoice["group"], work: string) =>
+  g === "unattended"
+    ? `Best for ${work} work: Codex and OpenRouter`
+    : g === "claude"
+    ? "Claude subscription (you opted in)"
+    : `Don't take ${work} work`;
 
 const MINUTES = Array.from({ length: 60 }, (_, i) => i);
 
@@ -426,13 +472,15 @@ export function ScheduleDialog(
 ) {
   const editing = id !== undefined;
   const sched = editing ? schedules.value.find((s) => s.id === id) : undefined;
-  const choices = useMemo(() => scheduleAgents(agents.value), [agents.value]);
-  const [d, setD] = useState<Draft>(() => draftOf(sched, defaultScheduleAgent(choices, wanted), Date.now()));
+  const timeChoices = useMemo(() => scheduleAgents(agents.value), [agents.value]);
+  const [d, setD] = useState<Draft>(() => draftOf(sched, defaultScheduleAgent(timeChoices, wanted), Date.now()));
   /** The fields as the dialog opened: Save sends `when` only when the timing controls changed. */
   const [initial] = useState(d);
   const [preview, setPreview] = useState<SchedulePreview | null>(null);
   const [pErr, setPErr] = useState<string | null>(null);
   const [pBusy, setPBusy] = useState(false);
+  /** Asks the backend again (after "Allow triggers" on the watched note). */
+  const [pAgain, setPAgain] = useState(0);
   const [more, setMore] = useState(() => !!sched && (sched.daily_cap !== null || sched.tz !== browserZone()));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -441,14 +489,23 @@ export function ScheduleDialog(
   const seq = useRef(0);
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }));
   const setWhen = (p: Partial<WhenDraft>) => setD((x) => ({ ...x, when: { ...x.when, ...p } }));
+  const setTrig = (p: Partial<TriggerDraft>) => setD((x) => ({ ...x, trig: { ...x.trig, ...p } }));
+  const setThen = (p: Partial<ThenDraft>) => setD((x) => ({ ...x, then: { ...x.then, ...p } }));
 
+  /** Triggers and "Then…" (Phase 2 backends: their settings carry the OpenRouter spend). */
+  const phase2 = !!scheduleSettings.value?.spend || sched?.trigger !== undefined;
+  const event = d.mode === "event";
+  const origin = event ? "webhook" : "schedule";
+  const choices = useMemo(() => scheduleAgents(agents.value, origin), [agents.value, origin]);
   const chosen = agents.value.find((a) => a.name === d.agent);
   const choice = choices.find((c) => c.agent.name === d.agent);
   const subClaude = !!chosen && isSubscriptionClaude(chosen);
   const eligible = choices.filter((c) => c.group !== "off");
   const wantedOff = !editing && wanted && choices.find((c) => c.agent.name === wanted)?.group === "off";
-  const w = whenOfDraft(d.when);
+  const noteList = [...notes.value.values()];
+  const w = event ? whenOfTrigger(d.trig, noteList) : whenOfDraft(d.when);
   const whenKey = "when" in w ? JSON.stringify(w.when) : "";
+  const steps = thenOfDraft(d.then);
   const quietOn = d.quiet ?? preview?.quiet_hours_default ?? subClaude;
   const cap = parseCap(d.cap);
   const settings = scheduleSettings.value;
@@ -476,6 +533,7 @@ export function ScheduleDialog(
         tz: d.tz.trim() || undefined,
         quiet_hours: d.quiet ?? undefined,
         agent: d.agent || undefined,
+        id: sched && isTrigger(w.when) ? sched.id : undefined,
       }).then((p) => {
         if (seq.current !== mine) return;
         setPreview(p);
@@ -489,24 +547,36 @@ export function ScheduleDialog(
       });
     }, 250);
     return () => clearTimeout(t);
-  }, [whenKey, d.tz, d.quiet, d.agent]);
+  }, [whenKey, d.tz, d.quiet, d.agent, pAgain]);
 
   if (editing && !sched) return null;
 
-  const note = noteChoice(d.noteOn, d.noteTitle, [...notes.value.values()]);
+  const note = noteChoice(d.noteOn, d.noteTitle, noteList);
   const noteBad = d.noteOn && !d.noteTitle.trim();
-  const canSave = !busy && !!d.prompt.trim() && "when" in w && !("error" in cap) && !noteBad &&
+  const canSave = !busy && !!d.prompt.trim() && "when" in w && !("error" in cap) && !noteBad && "then" in steps &&
     (editing || (!!choice && choice.group !== "off"));
+  /** What Save sends as `when`: a changed trigger, a switch between time and event, or the
+   * timing controls' own rule. */
+  const whenForSave = (): WhenInput | null => {
+    if (!("when" in w)) return null;
+    if (d.mode !== initial.mode) return w.when;
+    if (event) {
+      const was = whenOfTrigger(initial.trig, noteList);
+      return "when" in was && JSON.stringify(was.when) === JSON.stringify(w.when) ? null : w.when;
+    }
+    return whenToSend(initial.when, d.when, d.tz.trim() !== initial.tz.trim());
+  };
 
   const save = async () => {
-    if (!canSave || !("when" in w) || "error" in cap) return;
+    if (!canSave || !("when" in w) || "error" in cap || !("then" in steps)) return;
     setBusy(true);
     setErr(null);
     const fields: ScheduleFields = {
       name: d.name,
       prompt: d.prompt,
       // Unchanged timing controls send no `when`: a stored `@daily` stays `@daily`.
-      when: whenToSend(initial.when, d.when, d.tz.trim() !== initial.tz.trim()),
+      when: whenForSave(),
+      then: phase2 ? steps.then : undefined,
       tz: d.tz,
       missed: d.missed,
       conversation: d.conversation,
@@ -529,14 +599,18 @@ export function ScheduleDialog(
           note: note ?? undefined,
           // Left alone, the backend's default for the agent (on for Claude subscription agents).
           quiet_hours: d.quiet ?? undefined,
+          // Left empty for a trigger: the backend's default cap (10 a day).
           daily_cap: cap.cap ?? undefined,
+          then: steps.then ?? undefined,
         });
         knowSchedule(s);
         overlay.value = null;
         if (!agentsPanelOpen.value) A.toggleAgentsPanel();
         toast(
           "success",
-          `Scheduled ${s.name} for ${s.agent ?? d.agent}${s.next_run !== null ? `: next ${nextWhen(s.next_run, Date.now())}` : ""}.`,
+          s.trigger
+            ? `${s.name} for ${s.agent ?? d.agent}: ${s.reading.replace(/^When /, "runs when ")}.`
+            : `Scheduled ${s.name} for ${s.agent ?? d.agent}${s.next_run !== null ? `: next ${nextWhen(s.next_run, Date.now())}` : ""}.`,
         );
         A.focusActiveTerminalSoon();
         return;
@@ -555,6 +629,9 @@ export function ScheduleDialog(
     }
   };
 
+  const work = event ? "triggered" : "scheduled";
+  const tick = event ? "Webhook (triggered)" : "Schedule";
+
   const agentField = editing
     ? (
       <div class="field">
@@ -571,13 +648,13 @@ export function ScheduleDialog(
         <span class="field-label">Agent</span>
         <div class="sch-none" role="note">
           <p>
-            None of your agents takes scheduled work yet. A Codex agent made from the Background worker template is
+            None of your agents takes {work} work yet. A Codex agent made from the Background worker template is
             the usual fit.
           </p>
           <button type="button" class="btn btn-sm" onClick={() => A.newAgentDialog("worker")}>New agent…</button>
         </div>
         {choices.length > 0 && (
-          <span class="field-hint">Or tick Schedule under "Takes messages started by" in an agent's Edit agent.</span>
+          <span class="field-hint">Or tick {tick} under "Takes messages started by" in an agent's Edit agent.</span>
         )}
       </div>
     )
@@ -596,7 +673,7 @@ export function ScheduleDialog(
               const items = choices.filter((c) => c.group === g);
               if (!items.length) return null;
               return (
-                <optgroup key={g} label={GROUP_LABEL[g]}>
+                <optgroup key={g} label={groupLabel(g, work)}>
                   {items.map((c) => (
                     <option key={c.agent.id} value={c.agent.name} disabled={g === "off"}>
                       {c.agent.name} ({KIND_LABEL[c.agent.kind]}
@@ -611,12 +688,12 @@ export function ScheduleDialog(
         </span>
         {wantedOff && (
           <span class="field-hint field-bad">
-            {wanted} doesn't take scheduled work: tick Schedule in its Edit agent first.
+            {wanted} doesn't take {work} work: tick {tick} in its Edit agent first.
           </span>
         )}
         {!wantedOff && choices.some((c) => c.group === "off") && (
           <span class="field-hint">
-            Greyed-out agents don't take scheduled work; tick Schedule in their Edit agent to use them.
+            Greyed-out agents don't take {work} work; tick {tick} in their Edit agent to use them.
           </span>
         )}
       </label>
@@ -703,6 +780,128 @@ export function ScheduleDialog(
     }
   })();
 
+  /** "When something happens": the event picker and its fields. */
+  const num = (cls: string, value: string, label: string, onInput: (v: string) => void) => (
+    <input
+      class={cx("sch-num", cls)}
+      value={value}
+      inputMode="numeric"
+      aria-label={label}
+      onInput={(e) => onInput((e.target as HTMLInputElement).value)}
+    />
+  );
+  const triggerInputs = (() => {
+    const t = d.trig;
+    switch (t.kind) {
+      case "note":
+        return (
+          <>
+            <input
+              class="sch-trig-note"
+              list="sch-trig-notes"
+              value={t.note}
+              aria-label="The note to watch"
+              placeholder="A note's title"
+              spellcheck={false}
+              onInput={(e) => setTrig({ note: (e.target as HTMLInputElement).value })}
+            />
+            <datalist id="sch-trig-notes">
+              {noteList.map((n) => <option key={n.id} value={n.title} />)}
+            </datalist>
+            <span class="sch-at">after</span>
+            {num("sch-trig-quiet", t.quiet, "Minutes of quiet after the last edit", (quiet) => setTrig({ quiet }))}
+            <span class="sch-at">minutes of quiet</span>
+          </>
+        );
+      case "git":
+        return (
+          <>
+            <input
+              class="sch-trig-repo"
+              value={t.repo}
+              aria-label="The repository's folder"
+              placeholder="~/projects/muster"
+              spellcheck={false}
+              onInput={(e) => setTrig({ repo: (e.target as HTMLInputElement).value })}
+            />
+            <span class="sch-at">branch</span>
+            <input
+              class="sch-trig-branch"
+              value={t.branch}
+              aria-label="Branch"
+              placeholder="master"
+              spellcheck={false}
+              onInput={(e) => setTrig({ branch: (e.target as HTMLInputElement).value })}
+            />
+          </>
+        );
+      case "pr_opened":
+      case "ci_failed":
+        return (
+          <>
+            <input
+              class="sch-trig-gh"
+              value={t.ghRepo}
+              aria-label="GitHub repository, OWNER/NAME"
+              placeholder="owner/repo"
+              spellcheck={false}
+              onInput={(e) => setTrig({ ghRepo: (e.target as HTMLInputElement).value })}
+            />
+            {t.kind === "ci_failed" && (
+              <>
+                <span class="sch-at">on</span>
+                <input
+                  class="sch-trig-branch"
+                  value={t.ghBranch}
+                  aria-label="Only CI on this branch (empty: any branch)"
+                  placeholder="any branch"
+                  spellcheck={false}
+                  onInput={(e) => setTrig({ ghBranch: (e.target as HTMLInputElement).value })}
+                />
+              </>
+            )}
+            <span class="sch-at">checked every</span>
+            {num("sch-trig-every", t.every, "Minutes between checks", (every) => setTrig({ every }))}
+            <span class="sch-at">min</span>
+          </>
+        );
+      case "url":
+        return (
+          <>
+            <span class="sch-at">named</span>
+            <input
+              class="sch-trig-name"
+              value={t.name}
+              aria-label="Trigger name (goes in the URL)"
+              placeholder={slug(d.name || d.prompt.split("\n")[0] || "") || "deploy-done"}
+              spellcheck={false}
+              onInput={(e) => setTrig({ name: (e.target as HTMLInputElement).value })}
+            />
+          </>
+        );
+    }
+  })();
+  const triggerHint: Record<TriggerKind, string> = {
+    note: "Fires only on notes where you switched on Allow triggers. Edits by its own agent, or by any scheduled or " +
+      "triggered work, never fire it, so it can't loop.",
+    git: "Muster reads the branch every 15 seconds (no hooks are installed). The new commits' subjects are passed on as data.",
+    pr_opened: "Polled with your own gh login; nothing from GitHub reaches Muster. The first check only notes what is open.",
+    ci_failed: "Polled with your own gh login; nothing from GitHub reaches Muster. The first check only notes past failures.",
+    url: "This computer only, with a secret: after saving, copy the ready-made command from the schedule's menu. " +
+      "Data sent with it is handed to the agent as untrusted text.",
+  };
+  const watchedNote = event && d.trig.kind === "note" && "when" in w && w.when.kind === "note" ? w.when.note_id : null;
+  const stepAgents = choices.filter((c) => c.group !== "off");
+  const stepAgentSelect = (value: string, label: string, onChange: (v: string) => void, none?: string) => (
+    <span class="select-wrap">
+      <select aria-label={label} value={value} onChange={(e) => onChange(e.currentTarget.value)}>
+        {none !== undefined ? <option value="">{none}</option> : !value && <option value="">Pick an agent</option>}
+        {stepAgents.map((c) => <option key={c.agent.id} value={c.agent.name}>{c.agent.name} ({KIND_LABEL[c.agent.kind]})</option>)}
+      </select>
+      <IconChevronDown size={14} />
+    </span>
+  );
+
   const missedOptions = [
     { v: "auto" as const, label: "Automatic" },
     { v: "run_once" as const, label: "Run once when Muster is back" },
@@ -728,6 +927,8 @@ export function ScheduleDialog(
           <span class="muted">
             {sched
               ? sched.reading
+              : event
+              ? "A message Muster sends an agent when something happens, marked as triggered."
               : "A message Muster sends an agent on a timer, as if from you but marked as scheduled."}
           </span>
         </div>
@@ -757,6 +958,16 @@ export function ScheduleDialog(
               <span>
                 Filled in each run: <code>{"{date}"}</code> the run's date, <code>{"{last_run}"}</code>{" "}
                 when it last ran, <code>{"{last_reply}"}</code> the newest reply.
+                {event && (
+                  <>
+                    {" "}
+                    <code>{"{event}"}</code> what happened{d.trig.kind === "url" && (
+                      <>
+                        , <code>{"{payload}"}</code> the data sent with it
+                      </>
+                    )}, quoted as data (added at the end when the prompt doesn't use it).
+                  </>
+                )}
               </span>
             </span>
           </label>
@@ -773,25 +984,75 @@ export function ScheduleDialog(
             />
           </label>
           <div class="field">
-            <span class="field-label" id="sch-when-label">When</span>
-            <div class="sch-when" role="group" aria-labelledby="sch-when-label">
-              <span class="select-wrap sch-preset">
-                <select
-                  aria-label="Timing"
-                  value={d.when.preset}
-                  onChange={(e) => setWhen({ preset: e.currentTarget.value as WhenDraft["preset"] })}
-                >
-                  {PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-                </select>
-                <IconChevronDown size={14} />
-              </span>
-              {whenInputs}
-            </div>
+            {phase2
+              ? (
+                <Seg
+                  label="When"
+                  value={d.mode}
+                  options={[{ v: "time", label: "At a time" }, { v: "event", label: "When something happens" }]}
+                  onChange={(mode) => set({ mode, quiet: null })}
+                />
+              )
+              : <span class="field-label" id="sch-when-label">When</span>}
+            {event
+              ? (
+                <div class="sch-when sch-trig" role="group" aria-label="What happens">
+                  <span class="select-wrap sch-preset">
+                    <select
+                      aria-label="Event"
+                      class="sch-trig-kind"
+                      value={d.trig.kind}
+                      onChange={(e) => setTrig({ kind: e.currentTarget.value as TriggerKind })}
+                    >
+                      {TRIGGER_KINDS.map((k) => <option key={k.id} value={k.id}>{k.label}</option>)}
+                    </select>
+                    <IconChevronDown size={14} />
+                  </span>
+                  {triggerInputs}
+                </div>
+              )
+              : (
+                <div class="sch-when" role="group" aria-label="Timing" aria-labelledby={phase2 ? undefined : "sch-when-label"}>
+                  <span class="select-wrap sch-preset">
+                    <select
+                      aria-label="Timing"
+                      value={d.when.preset}
+                      onChange={(e) => setWhen({ preset: e.currentTarget.value as WhenDraft["preset"] })}
+                    >
+                      {PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+                    </select>
+                    <IconChevronDown size={14} />
+                  </span>
+                  {whenInputs}
+                </div>
+              )}
             <div class="sch-preview" aria-live="polite">
               {"error" in w
                 ? <span class="field-bad">{w.error}</span>
                 : pErr
                 ? <span class="field-bad sch-preview-err">{pErr}</span>
+                : preview && event
+                ? (
+                  <>
+                    <span class="sch-reading">{preview.reading}</span>
+                    {preview.note_triggers_off && watchedNote !== null && (
+                      <span class="sch-trig-off">
+                        Triggers are off for this note, so it won't fire yet.{" "}
+                        <button
+                          type="button"
+                          class="sch-link"
+                          onClick={() => {
+                            A.setNoteTriggers(watchedNote, true);
+                            setTimeout(() => setPAgain((n) => n + 1), 300);
+                          }}
+                        >
+                          Allow triggers on it
+                        </button>
+                      </span>
+                    )}
+                    {preview.expires && <span class="sch-expiry-note">Stops after 7 days unless you renew it.</span>}
+                  </>
+                )
                 : preview
                 ? (
                   <>
@@ -815,21 +1076,24 @@ export function ScheduleDialog(
                 : <span class="muted">{pBusy ? <Spinner size={10} /> : null} Reading it…</span>}
             </div>
           </div>
-          <div class="field">
-            <Seg
-              label="If missed (Muster was off or asleep)"
-              value={d.missed}
-              options={missedOptions}
-              onChange={(missed) => set({ missed })}
-            />
-            <span class="field-hint">
-              {d.missed === "auto"
-                ? `Automatic: ${missedAutoText(preview?.missed_default)}`
-                : d.missed === "run_once"
-                ? "The newest missed run happens once, shortly after Muster is back."
-                : "Missed runs are recorded as skipped; it waits for its next time."}
-            </span>
-          </div>
+          {event && <span class="field-hint sch-trig-hint">{triggerHint[d.trig.kind]}</span>}
+          {!event && (
+            <div class="field">
+              <Seg
+                label="If missed (Muster was off or asleep)"
+                value={d.missed}
+                options={missedOptions}
+                onChange={(missed) => set({ missed })}
+              />
+              <span class="field-hint">
+                {d.missed === "auto"
+                  ? `Automatic: ${missedAutoText(preview?.missed_default)}`
+                  : d.missed === "run_once"
+                  ? "The newest missed run happens once, shortly after Muster is back."
+                  : "Missed runs are recorded as skipped; it waits for its next time."}
+              </span>
+            </div>
+          )}
           <div class="field-row">
             <div class="field">
               <Seg
@@ -898,6 +1162,59 @@ export function ScheduleDialog(
               </>
             )}
           </div>
+          {phase2 && (
+            <fieldset class="field sch-then">
+              <legend class="field-label">Then…</legend>
+              <div class="sch-then-row">
+                <span class="sch-at">When it replies, ask</span>
+                {stepAgentSelect(d.then.okAgent, "Agent to ask when it replies", (okAgent) => setThen({ okAgent }), "nobody")}
+              </div>
+              {d.then.okAgent && (
+                <textarea
+                  class="sch-then-ok"
+                  rows={2}
+                  aria-label={`What to ask ${d.then.okAgent} when it replies`}
+                  value={d.then.okPrompt}
+                  placeholder="e.g. Here are the results: {reply} File a note with the likely causes."
+                  onInput={(e) => setThen({ okPrompt: (e.target as HTMLTextAreaElement).value })}
+                />
+              )}
+              <Seg
+                label="When it fails (blocked, refused, no reply, an error)"
+                value={d.then.failMode}
+                options={[{ v: "none", label: "Nothing more" }, { v: "notify", label: "Notify me" }, {
+                  v: "ask",
+                  label: "Ask an agent",
+                }]}
+                onChange={(failMode) => setThen({ failMode })}
+              />
+              {d.then.failMode === "ask" && (
+                <>
+                  <div class="sch-then-row">
+                    <span class="sch-at">Ask</span>
+                    {stepAgentSelect(d.then.failAgent, "Agent to ask when it fails", (failAgent) => setThen({ failAgent }))}
+                  </div>
+                  <textarea
+                    class="sch-then-fail"
+                    rows={2}
+                    aria-label="What to ask when it fails"
+                    value={d.then.failPrompt}
+                    placeholder="e.g. The nightly check ended {outcome}. Look into why."
+                    onInput={(e) => setThen({ failPrompt: (e.target as HTMLTextAreaElement).value })}
+                  />
+                </>
+              )}
+              <span class={cx("field-hint", "sch-hint-wrap", "error" in steps && "field-bad")}>
+                <span>
+                  {"error" in steps
+                    ? steps.error
+                    : d.then.failMode === "notify"
+                    ? "A failure also sends you a notice and a desktop notification, whatever Notify me says."
+                    : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 4 hops).</>}
+                </span>
+              </span>
+            </fieldset>
+          )}
           <label class="toggle">
             <input
               type="checkbox"
@@ -932,12 +1249,12 @@ export function ScheduleDialog(
                   class="sch-cap"
                   value={d.cap}
                   inputMode="numeric"
-                  placeholder="No cap"
+                  placeholder={event && !editing ? "10 (a trigger's default)" : "No cap"}
                   aria-invalid={"error" in cap}
                   onInput={(e) => set({ cap: (e.target as HTMLInputElement).value })}
                 />
                 <span class={cx("field-hint", "error" in cap && "field-bad")}>
-                  {"error" in cap ? cap.error : "Run now doesn't count."}
+                  {"error" in cap ? cap.error : event ? "Run now doesn't count. A note's triggers also stop at 10 runs a day together." : "Run now doesn't count."}
                 </span>
               </label>
               <label class="field">
@@ -977,24 +1294,50 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
   const [from, setFrom] = useState(cur?.quiet_start ?? "23:00");
   const [to, setTo] = useState(cur?.quiet_end ?? "07:00");
   const [capText, setCapText] = useState(String(cur?.unattended_cap ?? 24));
+  const [spendText, setSpendText] = useState(cur?.spend ? String(cur.spend.cap) : "5");
+  /** Per-agent caps as typed, by agent name (empty: none). */
+  const [agentCaps, setAgentCaps] = useState<Record<string, string>>(() =>
+    Object.fromEntries((cur?.spend?.agents ?? []).map((a) => [a.name, a.cap === null ? "" : String(a.cap)]))
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const first = useRef<HTMLInputElement>(null);
   useLayoutEffect(() => first.current?.focus(), []);
   useEffect(() => {
-    if (cur) return;
+    // Always asked again: today's spend and the OpenRouter agents may have changed (the backend
+    // also reads the key again when its reading is over a minute old, and says so with an event).
     rpc.call<ScheduleSettings>("schedule.settings.get").then((s) => {
+      scheduleSettings.value = s;
+      if (cur) {
+        // Fields already showing stay as typed; agents new to the list get theirs.
+        setCur(s);
+        setAgentCaps((m) => ({
+          ...Object.fromEntries((s.spend?.agents ?? []).map((a) => [a.name, a.cap === null ? "" : String(a.cap)])),
+          ...m,
+        }));
+        return;
+      }
       setCur(s);
       setPaused(s.paused);
       setFrom(s.quiet_start);
       setTo(s.quiet_end);
       setCapText(String(s.unattended_cap));
+      if (s.spend) {
+        setSpendText(String(s.spend.cap));
+        setAgentCaps(Object.fromEntries(s.spend.agents.map((a) => [a.name, a.cap === null ? "" : String(a.cap)])));
+      }
     }).catch((e) => setErr(e instanceof Error ? e.message : String(e)));
   }, []);
+  // The latest reading of today's spend (the settings event keeps it current).
+  const spend = scheduleSettings.value?.spend ?? cur?.spend;
   const hhmm = (t: string) => /^([01]\d|2[0-3]):[0-5]\d$/.test(t.trim());
   const capN = /^\d+$/.test(capText.trim()) ? Number(capText.trim()) : NaN;
   const capOk = capN >= 1 && capN <= 200;
-  const ok = !busy && hhmm(from) && hhmm(to) && capOk;
+  const dollars = (t: string) => /^\$?\d+(\.\d{1,2})?$/.test(t.trim()) ? Number(t.trim().replace("$", "")) : NaN;
+  const spendN = dollars(spendText);
+  const spendOk = !spend || (spendN >= 0.01 && spendN <= 1000);
+  const agentCapBad = Object.values(agentCaps).some((t) => t.trim() !== "" && !(dollars(t) >= 0.01 && dollars(t) <= 1000));
+  const ok = !busy && hhmm(from) && hhmm(to) && capOk && spendOk && !agentCapBad;
   const save = async () => {
     if (!ok) return;
     const change: Record<string, unknown> = {};
@@ -1002,6 +1345,16 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
     if (!cur || from.trim() !== cur.quiet_start) change.quiet_start = from.trim();
     if (!cur || to.trim() !== cur.quiet_end) change.quiet_end = to.trim();
     if (!cur || capN !== cur.unattended_cap) change.unattended_cap = capN;
+    if (cur?.spend) {
+      if (spendN !== cur.spend.cap) change.spend_cap = spendN;
+      const caps: Record<string, number | null> = {};
+      for (const a of cur.spend.agents) {
+        const t = (agentCaps[a.name] ?? "").trim();
+        const v = t === "" ? null : dollars(t);
+        if (v !== a.cap) caps[a.name] = v;
+      }
+      if (Object.keys(caps).length) change.agent_spend_caps = caps;
+    }
     if (!Object.keys(change).length) return close();
     setBusy(true);
     setErr(null);
@@ -1015,7 +1368,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
     }
   };
   return (
-    <Modal class="dialog sch-settings-dlg" label="Scheduling settings">
+    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1099,6 +1452,63 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
               </span>
             </span>
           </label>
+          {spend && (
+            <div class="field sch-spend">
+              <span class="field-label">OpenRouter spend</span>
+              <div class="sch-spend-today" role="status">
+                {!spend.key_present
+                  ? <span class="muted">No OpenRouter key on this backend: nothing is billed per token.</span>
+                  : spend.today === null
+                  ? (
+                    <span class="muted">
+                      {spend.error ? `Couldn't read today's spend: ${spend.error}` : "Not read yet today: it is read while an OpenRouter agent works."}
+                    </span>
+                  )
+                  : (
+                    <>
+                      <span class={cx("sch-spend-num", spend.today >= spend.cap && "over")}>{money(spend.today)}</span>
+                      <span class="muted"> today of {money(spend.cap)} · resets at 00:00 UTC (OpenRouter's day)</span>
+                      {spend.checked_at && <span class="muted"> · read {idleText(Date.now() - spend.checked_at)} ago</span>}
+                    </>
+                  )}
+              </div>
+              <label class="sch-spend-cap">
+                <span>Daily cap for all OpenRouter agents, in dollars</span>
+                <input
+                  class="sch-spend-input"
+                  value={spendText}
+                  inputMode="decimal"
+                  aria-invalid={!spendOk}
+                  onInput={(e) => setSpendText((e.target as HTMLInputElement).value)}
+                />
+              </label>
+              {spend.agents.length > 0 && (
+                <div class="sch-spend-agents" role="group" aria-label="Per-agent caps">
+                  {spend.agents.map((a) => (
+                    <label key={a.id} class="sch-spend-agent">
+                      <span class="sch-spend-name">{a.name}</span>
+                      <span class="muted sch-spend-spent">{money(a.spent)} today</span>
+                      <input
+                        class="sch-spend-input"
+                        value={agentCaps[a.name] ?? ""}
+                        placeholder="no own cap"
+                        inputMode="decimal"
+                        aria-label={`Daily cap for ${a.name}, in dollars`}
+                        onInput={(e) => setAgentCaps({ ...agentCaps, [a.name]: (e.target as HTMLInputElement).value })}
+                      />
+                    </label>
+                  ))}
+                </div>
+              )}
+              <span class={cx("field-hint", "sch-hint-wrap", (!spendOk || agentCapBad) && "field-bad")}>
+                <span>
+                  {!spendOk || agentCapBad
+                    ? "Dollars from 0.01 to 1000 (the overall cap is always on)."
+                    : "At a cap, scheduled and triggered messages to OpenRouter agents are refused (\"budget\") with one alert; a run already going finishes, and what you type always goes. Read from OpenRouter's own count for the key."}
+                </span>
+              </span>
+            </div>
+          )}
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">

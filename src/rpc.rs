@@ -1201,7 +1201,15 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     let p: P = parse(params)?;
                     to_value(crate::notes::set_triggers(hub, p.id, p.on)?)
                 }
-                "schedule.settings.get" => Ok(crate::schedules::settings_json(hub, &hub.schedules.settings())),
+                "schedule.settings.get" => {
+                    // Today's OpenRouter spend is shown with them: read the key again when the
+                    // last reading is over a minute old (`schedule_settings` follows).
+                    if hub.spend.key_present() {
+                        let h = hub.clone();
+                        tokio::spawn(async move { h.spend.ensure_fresh(&h).await });
+                    }
+                    Ok(crate::schedules::settings_json(hub, &hub.schedules.settings()))
+                }
                 "schedule.settings.set" => Ok(crate::schedules::set_settings(hub, parse(params)?)?),
                 _ => Err(RpcError(format!("unknown method: {method}"))),
             }

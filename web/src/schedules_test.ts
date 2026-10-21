@@ -27,6 +27,16 @@ import {
   newerRun,
   type WhenDraft,
   whenOfDraft,
+  blankThen,
+  blankTrigger,
+  draftOfThen,
+  draftOfTrigger,
+  isTrigger,
+  slug,
+  thenOfDraft,
+  watchLabel,
+  whenOfTrigger,
+  withSteps,
 } from "./schedules.ts";
 import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
 
@@ -219,9 +229,14 @@ Deno.test("history lists merge runs newest first; the newer last run wins", () =
   const a = run({ id: 3 }), b = run({ id: 5 }), c = run({ id: 4 });
   eq(upsertRun(upsertRun(upsertRun([], a), b), c).map((r) => r.id), [5, 4, 3]);
   eq(upsertRun([b, a], { ...a, outcome: "failed" }).map((r) => `${r.id}${r.outcome}`), ["5replied", "3failed"]);
-  eq(newerRun(b, a).id, 5);
-  eq(newerRun(a, b).id, 5);
-  eq(newerRun(null, a).id, 3);
+  eq(newerRun(b, a)?.id, 5);
+  eq(newerRun(a, b)?.id, 5);
+  eq(newerRun(null, a)?.id, 3);
+  // A "Then…" step never becomes the row's last run, and reads under its run in the history.
+  const step = run({ id: 6, kind: "chain", parent_run: 3 });
+  eq(newerRun(b, step)?.id, 5);
+  eq(withSteps([step, b, a]).map((x) => `${x.run.id}:${x.depth}`), ["5:0", "3:0", "6:1"]);
+  eq(withSteps([run({ id: 9, kind: "chain", parent_run: 1 })]).map((x) => x.depth), [0], "its run not loaded: it stays");
 });
 
 const sched = (p: Partial<Schedule>): Schedule => ({
@@ -327,4 +342,86 @@ Deno.test("Save sends only what changed", () => {
   eq(schedulePatch(before, { ...same, note: { title: "Other" } }), { note: { title: "Other" } });
   eq(schedulePatch(before, { ...same, name: "  ", conversation: "fresh" }), { name: "", conversation: "fresh" });
   eq(schedulePatch(before, { ...same, tz: " " }), {}, "an emptied zone field keeps the zone");
+});
+
+// ---------------- Phase 2: triggers and "Then…" ----------------
+
+Deno.test("trigger fields: each kind, checked", () => {
+  const notes = [{ id: 4, title: "Ideas" }];
+  const t = { ...blankTrigger(), note: "ideas" };
+  eq(whenOfTrigger(t, notes), { when: { kind: "note", note_id: 4, quiet_min: 2 } }, "a note by its title, any case");
+  eq("error" in whenOfTrigger({ ...t, note: "Nope" }, notes), true);
+  eq("error" in whenOfTrigger({ ...t, quiet: "0" }, notes), true);
+  eq(whenOfTrigger({ ...t, kind: "git", repo: " ~/x ", branch: "master" }, notes), {
+    when: { kind: "git", repo: "~/x", branch: "master" },
+  });
+  eq("error" in whenOfTrigger({ ...t, kind: "git", repo: "~/x", branch: "two words" }, notes), true);
+  eq(whenOfTrigger({ ...t, kind: "pr_opened", ghRepo: "https://github.com/o/r/" }, notes), {
+    when: { kind: "github", repo: "o/r", event: "pr_opened", branch: null, every_min: 5 },
+  });
+  eq(whenOfTrigger({ ...t, kind: "ci_failed", ghRepo: "o/r", ghBranch: "master", every: "10" }, notes), {
+    when: { kind: "github", repo: "o/r", event: "ci_failed", branch: "master", every_min: 10 },
+  });
+  eq("error" in whenOfTrigger({ ...t, kind: "pr_opened", ghRepo: "o/r", every: "1" }, notes), true, "at least every 2 minutes");
+  eq(whenOfTrigger({ ...t, kind: "url", name: "Deploy-Done" }, notes), { when: { kind: "url", name: "deploy-done" } });
+  eq("error" in whenOfTrigger({ ...t, kind: "url", name: "has space" }, notes), true);
+  eq(slug("Deploy finished!  (prod)"), "deploy-finished-prod");
+  // A stored trigger fills the fields back.
+  const back = draftOfTrigger({ kind: "github", repo: "o/r", event: "ci_failed", branch: null, every_min: 7 }, blankTrigger(), () => "");
+  eq([back.kind, back.ghRepo, back.ghBranch, back.every], ["ci_failed", "o/r", "", "7"]);
+  eq(draftOfTrigger({ kind: "note", note_id: 4, quiet_min: 3 }, blankTrigger(), () => "Ideas").note, "Ideas");
+  eq(isTrigger({ kind: "url", name: "x" }), true);
+  eq(isTrigger({ kind: "cron", cron: "* * * * *" }), false);
+});
+
+Deno.test("Then… steps: drafts and what is sent", () => {
+  eq(thenOfDraft(blankThen()), { then: null });
+  eq(thenOfDraft({ ...blankThen(), okAgent: "rev", okPrompt: "Look: {reply}" }), {
+    then: { on_success: { agent: "rev", prompt: "Look: {reply}" } },
+  });
+  eq("error" in thenOfDraft({ ...blankThen(), okAgent: "rev", okPrompt: " " }), true);
+  eq(thenOfDraft({ ...blankThen(), failMode: "notify" }), { then: { on_failure: { notify: true } } });
+  eq("error" in thenOfDraft({ ...blankThen(), failMode: "ask" }), true, "an agent to ask is needed");
+  const stored = {
+    on_success: { notify: false, agent: "rev", agent_id: 3, prompt: "Look: {reply}", then: null },
+    on_failure: { notify: true, agent: null, agent_id: null, prompt: "", then: null },
+  };
+  const d = draftOfThen(stored);
+  eq([d.okAgent, d.failMode], ["rev", "notify"]);
+  const before = sched({ then: stored });
+  const fields = {
+    name: "Daily PR summary",
+    prompt: "Summarise PRs",
+    when: null as WhenInput | null,
+    tz: "Europe/London",
+    missed: "auto" as const,
+    conversation: "continue" as const,
+    notify: "on_failure" as const,
+    note: null,
+    quiet_hours: false,
+    daily_cap: null,
+  };
+  eq(
+    schedulePatch(before, {
+      ...fields,
+      then: { on_success: { agent: "rev", prompt: "Look: {reply}" }, on_failure: { notify: true } },
+    }),
+    {},
+    "the same steps send nothing",
+  );
+  eq(schedulePatch(before, { ...fields, then: null }), { then: null });
+});
+
+Deno.test("a trigger's row and its runs", () => {
+  const trig = sched({ trigger: true, when: { kind: "url", name: "x" }, next_run: null });
+  eq(nextLabel(trig, NOW), { text: "waiting", tone: "next" });
+  eq(nextLabel({ ...trig, next_run: at(2026, 10, 20, 10, 2) }, NOW).text, "runs: today 10:02");
+  eq(nextLabel({ ...trig, note: { id: 1, title: "Ideas", triggers: false } }, NOW).text, "triggers off for its note");
+  eq(watchLabel({ ...trig, watch: { state: "gh_not_signed_in", detail: null, checked_at: 1, next_at: 2 } })?.text, "gh not signed in");
+  eq(watchLabel({ ...trig, watch: { state: "ok", detail: null, checked_at: 1, next_at: 2 } }), null);
+  const r = run({ kind: "chain", agent: "rev" });
+  eq(runKindLabel(r), "then: rev");
+  eq(runKindLabel({ ...r, kind: "triggered" }), "triggered");
+  const subs = scheduleAgents([agent("a", "codex", ["human", "schedule"]), agent("b", "codex", ["human", "webhook"])], "webhook");
+  eq(subs.map((c) => [c.agent.name, c.group]), [["b", "unattended"], ["a", "off"]], "triggers need the webhook origin");
 });

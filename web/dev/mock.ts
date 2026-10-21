@@ -795,7 +795,15 @@ const sched = scheduleMock({
   broadcast,
   agents: () => agentList,
   sendMessage: (a, from, text, refused = null) =>
-    pushAgentMessage({ from, to: a.name, to_agent: a.id, origin: "schedule", hop: 0, text, refused }),
+    pushAgentMessage({
+      from,
+      to: a.name,
+      to_agent: a.id,
+      origin: from.startsWith("trigger:") ? "webhook" : "schedule",
+      hop: from.includes("/then:") ? 1 : 0,
+      text,
+      refused,
+    }),
   reply: (m, text) => {
     m.reply = text;
     m.replied_at = now();
@@ -812,6 +820,7 @@ const sched = scheduleMock({
     return { id: n.id, title: n.title };
   },
   noteTitle: (id) => notes.get(id)?.title ?? null,
+  noteTriggers: (id) => (notes.has(id) ? !!notes.get(id)!.triggers : null),
 });
 
 // Seed (before the conversation below, so these older messages sort under it): a Codex worker
@@ -1004,7 +1013,7 @@ function noteMethod(method: string, p: any): unknown {
       if (p.window_id != null && !winById(p.window_id)) throw new Error(`no window with id ${p.window_id}`);
       const id = ++noteSeq;
       const n: Note = { id, title: String(p.title ?? "").trim() || `Note ${id}`, body, rev: 1, created_at: now(), updated_at: now(),
-        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null, version: 0 };
+        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null, version: 0, triggers: false };
       notes.set(id, n);
       return saveNote(n);
     }
@@ -1017,8 +1026,20 @@ function noteMethod(method: string, p: any): unknown {
       if (new TextEncoder().encode(body).length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB (1048576 bytes)");
       if (body === n.body && p.title === undefined) return n;
       if (p.title !== undefined) n.title = String(p.title).trim();
-      if (body !== n.body) Object.assign(n, { body, rev: n.rev + 1, updated_at: now(), updated_by: noteAuthor(p.from_session) });
-      return saveNote(n);
+      const changed = body !== n.body;
+      if (changed) Object.assign(n, { body, rev: n.rev + 1, updated_at: now(), updated_by: noteAuthor(p.from_session) });
+      saveNote(n);
+      if (changed && n.updated_by.kind === "human") sched.noteChanged(n.id, n.title);
+      return n;
+    }
+    case "note.set_triggers": {
+      // The human's switch only (src/rpc.rs refuses it from an agent's session).
+      if (noteAuthor(p.from_session).kind !== "human") throw new Error("only the human allows triggers on a note");
+      const n = getNote(p.id);
+      n.triggers = !!p.on;
+      saveNote(n);
+      sched.noteTriggersChanged(n.id);
+      return n;
     }
     case "note.append": {
       const n = getNote(p.id);
@@ -1027,7 +1048,9 @@ function noteMethod(method: string, p: any): unknown {
       const sep = n.body === "" || n.body.endsWith("\n") ? "" : "\n";
       if (new TextEncoder().encode(n.body + sep + text).length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB");
       Object.assign(n, { body: n.body + sep + text, rev: n.rev + 1, updated_at: now(), updated_by: noteAuthor(p.from_session) });
-      return saveNote(n);
+      saveNote(n);
+      if (n.updated_by.kind === "human") sched.noteChanged(n.id, n.title);
+      return n;
     }
     case "note.rename": {
       const n = getNote(p.id);
@@ -1279,7 +1302,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   if (method === "openrouter.models") {
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
-  if (method.startsWith("schedule.")) return sched.handle(method, p);
+  if (method.startsWith("schedule.") || method.startsWith("trigger.")) return sched.handle(method, p);
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   if (method.startsWith("note.")) return noteMethod(method, p);
   switch (method) {

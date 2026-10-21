@@ -23,6 +23,13 @@ function Svg(props: P & { children: JSX.Element | JSX.Element[] }) {
   );
 }
 
+/** A trigger: something happens, then a run (Lucide "zap"). */
+export const IconZap = (p: P) => (
+  <Svg {...p}>
+    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" />
+  </Svg>
+);
+
 export const IconSearch = (p: P) => (
   <Svg {...p}>
     <circle cx="11" cy="11" r="6.5" />

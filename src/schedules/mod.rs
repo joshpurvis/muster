@@ -725,7 +725,13 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
         (When::Once { .. }, None) => "Once".into(),
         (w, _) => triggers::describe(hub, w),
     };
-    let last_run = hub.store().runs(s.id, None, 1).ok().and_then(|r| r.into_iter().next()).map(|r| run_json(hub, &r));
+    // Its own newest run ("Then…" steps are other agents' runs, shown in the history).
+    let last_run = hub
+        .store()
+        .runs(s.id, None, 10)
+        .ok()
+        .and_then(|r| r.into_iter().find(|r| r.kind != RunKind::Chain))
+        .map(|r| run_json(hub, &r));
     let note_title = s.note_id.and_then(|n| hub.store().load_note(n).ok().flatten()).map(|n| n.title);
     // A note trigger's note: its title, and whether the human allows triggers on it.
     let watched_note = match &s.when {

@@ -3,6 +3,8 @@
 // (only Run now sends), and a run's reply comes a second later. dev/mock.ts routes `schedule.*`
 // here and seeds a few schedules with history.
 
+import { localInput, zonedToMs } from "../src/schedules.ts";
+
 /** What the mock knows of an agent. */
 export interface SchedAgent {
   id: number;
@@ -165,9 +167,12 @@ function describe(c: Cron): string {
   return `${when}, ${days}${months}`;
 }
 
-function fmtLong(ms: number): string {
-  const d = new Date(ms);
-  return `${DAY_SHORT[d.getDay()]} ${d.getDate()} ${MON_SHORT[d.getMonth()]} ${d.getFullYear()} at ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+/** "Tue 21 Oct 2026 at 15:30", in zone `tz`. */
+function fmtLong(ms: number, tz: string): string {
+  const [date, time] = localInput(ms, tz).split("T");
+  const [y, mo, d] = date.split("-").map(Number);
+  const dow = new Date(Date.UTC(y, mo - 1, d)).getUTCDay();
+  return `${DAY_SHORT[dow]} ${d} ${MON_SHORT[mo - 1]} ${y} at ${time}`;
 }
 
 // ---------------- the store ----------------
@@ -231,7 +236,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     return first;
   }
 
-  const reading = (when: When) => when.kind === "once" ? `Once, ${fmtLong(when.at)}` : describe(parseCron(when.cron));
+  const reading = (when: When, tz: string) => when.kind === "once" ? `Once, ${fmtLong(when.at, tz)}` : describe(parseCron(when.cron));
 
   function inQuiet(ms: number): boolean {
     const [sh, sm] = settings.quiet_start.split(":").map(Number), [eh, em] = settings.quiet_end.split(":").map(Number);
@@ -260,7 +265,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       prompt: s.prompt,
       when: s.when,
       tz: s.tz,
-      reading: reading(s.when),
+      reading: reading(s.when, s.tz),
       missed: s.missed,
       missed_effective: s.missed === "auto" ? missedDefault(s.when) : s.missed,
       conversation: s.conversation,
@@ -386,12 +391,25 @@ export function scheduleMock(deps: ScheduleDeps) {
     return sent;
   }
 
+  /** A timing as sent: a one-off may be a wall-clock `local` time, read in zone `tz`. */
+  function whenIn(raw: any, tz: string): When {
+    if (raw?.kind === "cron" && typeof raw.cron === "string") return { kind: "cron", cron: raw.cron };
+    if (raw?.kind === "once" && typeof raw.local === "string") {
+      const at = zonedToMs(raw.local, tz);
+      if (!Number.isFinite(at)) throw new Error(`\`${raw.local}\` isn't a date and time like 2026-10-21T15:30`);
+      return { kind: "once", at };
+    }
+    if (raw?.kind === "once" && typeof raw.at === "number") return { kind: "once", at: raw.at };
+    throw new Error('when is required: {kind: "cron", cron}, {kind: "once", at} or {kind: "once", local}');
+  }
+
   function create(p: any) {
     const a = agentNamed(p.agent);
     checkAgent(a);
     const prompt = String(p.prompt ?? "");
     if (!prompt.trim()) throw new Error("the prompt must not be empty");
-    if (!p.when || (p.when.kind !== "cron" && p.when.kind !== "once")) throw new Error("when is required: {kind: \"cron\", cron} or {kind: \"once\", at}");
+    const tz = String(p.tz ?? "").trim() || localZone();
+    const when = whenIn(p.when, tz);
     if (list.length >= 200) throw new Error("200 schedules in all is the limit");
     const t = now();
     const s: Sched = {
@@ -399,8 +417,8 @@ export function scheduleMock(deps: ScheduleDeps) {
       agent_id: a.id,
       name: cleanName(p.name, prompt),
       prompt,
-      when: p.when,
-      tz: String(p.tz ?? "").trim() || localZone(),
+      when,
+      tz,
       missed: p.missed ?? "auto",
       conversation: p.conversation ?? "continue",
       notify: p.notify ?? "on_failure",
@@ -409,7 +427,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       daily_cap: capOf(p.daily_cap),
       paused: !!p.paused,
       skip_next: false,
-      next_run: firstSlot(p.when, t),
+      next_run: firstSlot(when, t),
       last_slot: null,
       window_from: t,
       created_at: t,
@@ -422,13 +440,16 @@ export function scheduleMock(deps: ScheduleDeps) {
   function update(p: any) {
     const s = get(p.id);
     if ("agent" in p) throw new Error("a schedule's agent can't change: make a new schedule");
-    const when = p.when ?? s.when;
-    if (p.when !== undefined || p.tz !== undefined) {
+    const tz = p.tz !== undefined ? String(p.tz).trim() || localZone() : s.tz;
+    const when = p.when !== undefined ? whenIn(p.when, tz) : s.when;
+    // As the backend: an equal timing (compared by meaning, roughly) keeps Skip next.
+    const same = JSON.stringify(when) === JSON.stringify(s.when) && tz === s.tz;
+    if (!same) {
       s.next_run = firstSlot(when, now());
       s.skip_next = false;
     }
     s.when = when;
-    if (p.tz !== undefined) s.tz = String(p.tz).trim() || localZone();
+    s.tz = tz;
     if (p.prompt !== undefined) {
       if (!String(p.prompt).trim()) throw new Error("the prompt must not be empty");
       s.prompt = String(p.prompt);
@@ -497,8 +518,8 @@ export function scheduleMock(deps: ScheduleDeps) {
         return { runs: all.slice(0, limit), more: all.length > limit };
       }
       case "schedule.preview": {
-        const when: When = p.when;
-        if (!when || (when.kind !== "cron" && when.kind !== "once")) throw new Error("when is required");
+        const tz = String(p.tz ?? "").trim() || localZone();
+        const when = whenIn(p.when, tz);
         const a = p.agent ? agentNamed(p.agent) : undefined;
         const next: number[] = [];
         const first = firstSlot(when, now());
@@ -513,8 +534,8 @@ export function scheduleMock(deps: ScheduleDeps) {
         }
         const quietOn = p.quiet_hours ?? subClaude(a);
         return {
-          reading: reading(when),
-          tz: String(p.tz ?? "").trim() || localZone(),
+          reading: reading(when, tz),
+          tz,
           next,
           quiet: next.map((t) => quietOn && inQuiet(t)),
           quiet_hours_default: subClaude(a),

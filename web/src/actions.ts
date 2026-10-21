@@ -10,6 +10,7 @@ import {
   agentsPanelOpen,
   knowRun,
   knowSchedule,
+  loadScheduleRuns,
   scheduleHistoryOpen,
   scheduleRuns,
   schedules,
@@ -63,7 +64,7 @@ import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedN
 import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { providerPendingNote, upsertMessage } from "./agents.ts";
-import { nextWhen, upsertRun } from "./schedules.ts";
+import { nextWhen } from "./schedules.ts";
 import type {
   Agent,
   Schedule,
@@ -1423,24 +1424,11 @@ export function toggleScheduleHistory(id: number) {
   if (open.has(id)) open.delete(id);
   else {
     open.add(id);
-    if (!scheduleRuns.value.has(id)) loadScheduleRuns(id);
+    // Loaded once, a history is kept current by `schedule_run` events; a failed one tries again.
+    const h = scheduleRuns.value.get(id);
+    if (!h || (h.error && !h.loading)) loadScheduleRuns(id);
   }
   scheduleHistoryOpen.value = open;
-}
-
-/** The newest 20 runs, or the next 20 below the oldest loaded (`older`). */
-export async function loadScheduleRuns(id: number, older = false) {
-  const cur = scheduleRuns.value.get(id);
-  const before = older ? cur?.runs.at(-1)?.id : undefined;
-  try {
-    const r = await rpc.call<{ runs: ScheduleRun[]; more: boolean }>("schedule.runs", { id, before, limit: 20 });
-    const base = older ? scheduleRuns.value.get(id)?.runs ?? [] : [];
-    let runs = base;
-    for (const x of r.runs) runs = upsertRun(runs, x);
-    scheduleRuns.value = new Map(scheduleRuns.value).set(id, { runs, more: r.more });
-  } catch (e) {
-    toast("error", `Couldn't load the run history: ${errText(e)}`);
-  }
 }
 
 /** Open a run's message and reply in the message overlay (the log may not have it loaded). */

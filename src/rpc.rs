@@ -1062,10 +1062,21 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             require_local(who, method)?;
             let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
             let reads = matches!(method, "schedule.list" | "schedule.runs" | "schedule.preview" | "schedule.settings.get");
-            if !reads && let Caller::Agent(_) = caller(hub, from)? {
-                return Err(RpcError(format!(
-                    "{method} can't be called from an agent's session: only the human makes and changes schedules"
-                )));
+            // An agent's session, or a shell tab an agent has typed into (its provenance is an
+            // agent's chain): only a shell the human drives may make or change schedules, so
+            // unattended work can't set up more of itself.
+            if !reads {
+                let refused = match caller(hub, from)? {
+                    Caller::Human => false,
+                    Caller::Agent(_) => true,
+                    Caller::Shell(s) => hub.agents().prov(s).is_some(),
+                };
+                if refused {
+                    return Err(RpcError(format!(
+                        "{method} can't be called from an agent's session, or from a shell an agent has typed into: \
+                         only the human makes and changes schedules"
+                    )));
+                }
             }
             #[derive(Deserialize)]
             struct Id {
@@ -1121,7 +1132,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 "schedule.preview" => {
                     #[derive(Deserialize)]
                     struct P {
-                        when: crate::schedules::When,
+                        when: crate::schedules::WhenInput,
                         #[serde(default)]
                         tz: Option<String>,
                         #[serde(default)]

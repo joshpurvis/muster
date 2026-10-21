@@ -11,6 +11,7 @@ import {
   knowSchedule,
   overlay,
   scheduleHistoryOpen,
+  loadScheduleRuns,
   scheduleRuns,
   schedules,
   scheduleSettings,
@@ -27,6 +28,7 @@ import {
   defaultScheduleAgent,
   draftOfWhen,
   expiresLabel,
+  isExpired,
   isSubscriptionClaude,
   longWhen,
   missedAutoText,
@@ -47,6 +49,8 @@ import {
   sortSchedules,
   type WhenDraft,
   whenOfDraft,
+  whenToSend,
+  segStep,
 } from "../schedules.ts";
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
@@ -92,7 +96,7 @@ export function SchedulesPausedNotice() {
 
 function scheduleMenu(s: Schedule, x: number, y: number) {
   const open = scheduleHistoryOpen.value.has(s.id);
-  const over = s.status === "done" || s.status === "expired" || s.next_run === null;
+  const over = s.status === "done" || isExpired(s, Date.now()) || s.next_run === null;
   openMenu({
     x,
     y,
@@ -229,21 +233,29 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
 
 function RunHistory({ s, now }: { s: Schedule; now: number }) {
   const h = scheduleRuns.value.get(s.id);
-  const [busy, setBusy] = useState(false);
-  const older = async () => {
-    if (busy) return;
-    setBusy(true);
-    await A.loadScheduleRuns(s.id, true);
-    setBusy(false);
-  };
+  const loading = !h || h.loading;
+  const runs = h?.runs ?? [];
   return (
     <div role="listitem" class="sch-runs" aria-label={`Runs of ${s.name}`}>
-      {!h && <span class="sch-runs-note"><Spinner size={10} /> Loading runs…</span>}
-      {h && h.runs.length === 0 && <span class="sch-runs-note">No runs yet.</span>}
-      {h?.runs.map((r) => <RunEntry key={r.id} r={r} now={now} />)}
-      {h?.more && (
-        <button type="button" class="ap-older sch-older" disabled={busy} onClick={older}>
-          {busy ? <Spinner size={10} /> : null} Older runs
+      {loading && runs.length === 0 && <span class="sch-runs-note"><Spinner size={10} /> Loading runs…</span>}
+      {h && !h.loading && !h.error && runs.length === 0 && <span class="sch-runs-note">No runs yet.</span>}
+      {runs.map((r) => <RunEntry key={r.id} r={r} now={now} />)}
+      {h?.error && !h.loading && (
+        <span class="sch-runs-note sch-runs-err">
+          Couldn't load runs.{" "}
+          <button type="button" class="sch-link" data-tip={h.error} onClick={() => loadScheduleRuns(s.id)}>
+            Try again
+          </button>
+        </span>
+      )}
+      {h?.more && !h.error && (
+        <button
+          type="button"
+          class="ap-older sch-older"
+          disabled={h.loading}
+          onClick={() => loadScheduleRuns(s.id, true)}
+        >
+          {h.loading ? <Spinner size={10} /> : null} Older runs
         </button>
       )}
     </div>
@@ -296,16 +308,27 @@ function Seg<T extends string>(
   },
 ) {
   const id = useId();
+  // One Tab stop (the chosen option); arrows, Home and End move and pick, as Permissions' do.
+  const move = (e: KeyboardEvent) => {
+    const i = Math.max(0, options.findIndex((o) => o.v === value));
+    const to = segStep(i, options.length, e.key);
+    if (to === null) return;
+    e.preventDefault();
+    onChange(options[to].v);
+    const group = e.currentTarget as HTMLElement;
+    requestAnimationFrame(() => group.querySelector<HTMLElement>(".seg-btn.on")?.focus());
+  };
   return (
     <>
       <span class="field-label" id={id}>{label}</span>
-      <div class="seg sch-seg" role="radiogroup" aria-labelledby={id}>
+      <div class="seg sch-seg" role="radiogroup" aria-labelledby={id} onKeyDown={move}>
         {options.map((o) => (
           <button
             key={o.v}
             type="button"
             role="radio"
             aria-checked={value === o.v}
+            tabIndex={value === o.v ? 0 : -1}
             data-value={o.v}
             class={cx("seg-btn", value === o.v && "on")}
             onClick={() => onChange(o.v)}
@@ -343,14 +366,14 @@ const browserZone = () => {
 };
 
 function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
-  const base = blankWhen(now);
   if (!s) {
+    const tz = browserZone() || scheduleSettings.value?.tz || "";
     return {
       agent,
       name: "",
       prompt: "",
-      when: base,
-      tz: browserZone() || scheduleSettings.value?.tz || "",
+      when: blankWhen(now, tz),
+      tz,
       missed: "auto",
       conversation: "continue",
       notify: "on_failure",
@@ -364,7 +387,8 @@ function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
     agent: s.agent ?? "",
     name: s.name,
     prompt: s.prompt,
-    when: draftOfWhen(s.when, base),
+    // A one-off shows at its wall-clock time in the schedule's own zone.
+    when: draftOfWhen(s.when, blankWhen(now, s.tz), s.tz),
     tz: s.tz,
     missed: s.missed,
     conversation: s.conversation,
@@ -391,6 +415,8 @@ export function ScheduleDialog(
   const sched = editing ? schedules.value.find((s) => s.id === id) : undefined;
   const choices = useMemo(() => scheduleAgents(agents.value), [agents.value]);
   const [d, setD] = useState<Draft>(() => draftOf(sched, defaultScheduleAgent(choices, wanted), Date.now()));
+  /** The fields as the dialog opened: Save sends `when` only when the timing controls changed. */
+  const [initial] = useState(d);
   const [preview, setPreview] = useState<SchedulePreview | null>(null);
   const [pErr, setPErr] = useState<string | null>(null);
   const [pBusy, setPBusy] = useState(false);
@@ -413,6 +439,8 @@ export function ScheduleDialog(
   const quietOn = d.quiet ?? preview?.quiet_hours_default ?? subClaude;
   const cap = parseCap(d.cap);
   const settings = scheduleSettings.value;
+  /** The zone the times are read in (a one-off's date and time too). */
+  const zone = d.tz.trim() || browserZone() || "this computer's time zone";
   const quietHours = settings ? `${settings.quiet_start}–${settings.quiet_end}` : "";
 
   useLayoutEffect(() => {
@@ -464,7 +492,8 @@ export function ScheduleDialog(
     const fields: ScheduleFields = {
       name: d.name,
       prompt: d.prompt,
-      when: w.when,
+      // Unchanged timing controls send no `when`: a stored `@daily` stays `@daily`.
+      when: whenToSend(initial.when, d.when, d.tz.trim() !== initial.tz.trim()),
       tz: d.tz,
       missed: d.missed,
       conversation: d.conversation,
@@ -632,13 +661,18 @@ export function ScheduleDialog(
         );
       case "once":
         return (
-          <input
-            type="datetime-local"
-            class="sch-once"
-            aria-label="Date and time"
-            value={d.when.once}
-            onInput={(e) => setWhen({ once: (e.target as HTMLInputElement).value })}
-          />
+          <>
+            <input
+              type="datetime-local"
+              class="sch-once"
+              aria-label={`Date and time, in ${zone}`}
+              value={d.when.once}
+              onInput={(e) => setWhen({ once: (e.target as HTMLInputElement).value })}
+            />
+            <span class="sch-at sch-zone" data-tip="The time zone it's read in: change it under More options">
+              in <span class="sch-zone-name">{zone}</span>
+            </span>
+          </>
         );
       case "custom":
         return (

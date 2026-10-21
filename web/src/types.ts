@@ -257,6 +257,9 @@ export interface OpenRouterModels {
 
 /** When a schedule runs: a 5-field cron line (or `@daily` and friends), or once at a time. */
 export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number };
+/** What `schedule.create` / `.update` / `.preview` take: a one-off may also be a wall-clock time
+ * ("2026-10-21T15:30") the backend reads in the schedule's `tz`. */
+export type WhenInput = When | { kind: "once"; local: string };
 
 export type MissedRule = "auto" | "run_once" | "skip";
 export type RunOutcome =

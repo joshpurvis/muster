@@ -3,7 +3,7 @@
 // signals, no DOM: unit tested (schedules_test.ts). Cron lines are read by the backend
 // (`schedule.preview`); here they are only matched against the presets' shapes.
 
-import type { Agent, RunOutcome, Schedule, ScheduleRun, When } from "./types.ts";
+import type { Agent, RunOutcome, Schedule, ScheduleRun, When, WhenInput } from "./types.ts";
 
 // ---------------- timing presets ----------------
 
@@ -35,7 +35,8 @@ export interface WhenDraft {
   minute: number;
   /** 0-6, Sunday first: Once a week. */
   day: number;
-  /** A datetime-local value, "YYYY-MM-DDTHH:MM" (this browser's zone): Once. */
+  /** A datetime-local value, "YYYY-MM-DDTHH:MM", a wall-clock time in the schedule's time zone
+   * (the backend reads it there): Once. */
   once: string;
   /** Custom. */
   cron: string;
@@ -43,22 +44,58 @@ export interface WhenDraft {
 
 const pad = (n: number) => String(n).padStart(2, "0");
 
-/** A datetime-local value for `ms`, in this browser's zone. */
-export function localInput(ms: number): string {
+/** Year, month (1-12), day, hour, minute of `ms` in zone `tz` (this browser's when `tz` is empty
+ * or not a zone this browser knows). */
+function partsIn(ms: number, tz: string): [number, number, number, number, number] {
+  if (tz.trim()) {
+    try {
+      const f = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz.trim(),
+        hourCycle: "h23",
+        year: "numeric",
+        month: "numeric",
+        day: "numeric",
+        hour: "numeric",
+        minute: "numeric",
+      });
+      const p = Object.fromEntries(f.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+      return [Number(p.year), Number(p.month), Number(p.day), Number(p.hour) % 24, Number(p.minute)];
+    } catch { /* an unknown zone: this browser's */ }
+  }
   const d = new Date(ms);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return [d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes()];
 }
 
-/** The next whole hour at least an hour from `now`: a one-off's starting value. */
-export function defaultOnce(now: number): string {
-  const d = new Date(now + 60 * 60_000);
-  d.setMinutes(0, 0, 0);
-  if (d.getTime() <= now + 30 * 60_000) d.setHours(d.getHours() + 1);
-  return localInput(d.getTime());
+/** A datetime-local value for `ms`: its wall-clock time in zone `tz` (default: this browser's). */
+export function localInput(ms: number, tz = ""): string {
+  const [y, mo, d, h, mi] = partsIn(ms, tz);
+  return `${y}-${pad(mo)}-${pad(d)}T${pad(h)}:${pad(mi)}`;
 }
 
-export function blankWhen(now: number): WhenDraft {
-  return { preset: "weekdays", time: "09:00", minute: 0, day: 1, once: defaultOnce(now), cron: "0 9 * * 1-5" };
+/** The instant a wall-clock `local` ("YYYY-MM-DDTHH:MM") is in zone `tz`; NaN when it isn't one.
+ * A time the clocks skip lands after the change. (The backend does this for real; the mock and
+ * tests use it.) */
+export function zonedToMs(local: string, tz: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(local);
+  if (!m) return NaN;
+  const wall = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  const offset = (ms: number) => {
+    const [y, mo, d, h, mi] = partsIn(ms, tz);
+    return Date.UTC(y, mo - 1, d, h, mi) - Math.floor(ms / 60_000) * 60_000;
+  };
+  let ms = wall - offset(wall);
+  ms = wall - offset(ms);
+  return ms;
+}
+
+/** The whole hour at least half an hour ahead of an hour from now, in zone `tz`: a one-off's
+ * starting value. */
+export function defaultOnce(now: number, tz = ""): string {
+  return localInput(now + 90 * 60_000, tz).slice(0, 14) + "00";
+}
+
+export function blankWhen(now: number, tz = ""): WhenDraft {
+  return { preset: "weekdays", time: "09:00", minute: 0, day: 1, once: defaultOnce(now, tz), cron: "0 9 * * 1-5" };
 }
 
 /** "HH:MM" (or "H:MM") to [hour, minute]; null when it isn't a time of day. */
@@ -76,9 +113,10 @@ const num = (s: string, max: number): number | null => {
 };
 
 /** The dialog's fields for a stored timing: the preset whose cron shape it has, else Custom (a
- * one-off is Once). Fields the timing doesn't set keep `base`'s values. */
-export function draftOfWhen(when: When, base: WhenDraft): WhenDraft {
-  if (when.kind === "once") return { ...base, preset: "once", once: localInput(when.at) };
+ * one-off is Once, shown at its wall-clock time in the schedule's zone `tz`). Fields the timing
+ * doesn't set keep `base`'s values. */
+export function draftOfWhen(when: When, base: WhenDraft, tz = ""): WhenDraft {
+  if (when.kind === "once") return { ...base, preset: "once", once: localInput(when.at, tz) };
   const cron = when.cron.trim().replace(/\s+/g, " ");
   const d: WhenDraft = { ...base, preset: "custom", cron };
   if (cron === "*/15 * * * *") return { ...d, preset: "every15" };
@@ -100,9 +138,10 @@ export function draftOfWhen(when: When, base: WhenDraft): WhenDraft {
   return d;
 }
 
-/** The timing the fields describe, or what is wrong with them. */
-export function whenOfDraft(d: WhenDraft): { when: When } | { error: string } {
-  const cron = (c: string): { when: When } => ({ when: { kind: "cron", cron: c } });
+/** The timing the fields describe, or what is wrong with them. A one-off is sent as its
+ * wall-clock time (`local`), which the backend reads in the schedule's time zone. */
+export function whenOfDraft(d: WhenDraft): { when: WhenInput } | { error: string } {
+  const cron = (c: string): { when: WhenInput } => ({ when: { kind: "cron", cron: c } });
   switch (d.preset) {
     case "every15":
       return cron("*/15 * * * *");
@@ -120,9 +159,8 @@ export function whenOfDraft(d: WhenDraft): { when: When } | { error: string } {
       return cron(`${t[1]} ${t[0]} * * ${days}`);
     }
     case "once": {
-      const at = d.once ? new Date(d.once).getTime() : NaN;
-      if (!Number.isFinite(at)) return { error: "Pick a date and time" };
-      return { when: { kind: "once", at } };
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(d.once)) return { error: "Pick a date and time" };
+      return { when: { kind: "once", local: d.once } };
     }
     case "custom": {
       const c = d.cron.trim().replace(/\s+/g, " ");
@@ -132,9 +170,24 @@ export function whenOfDraft(d: WhenDraft): { when: When } | { error: string } {
   }
 }
 
-export function sameWhen(a: When, b: When): boolean {
-  if (a.kind === "once" || b.kind === "once") return a.kind === b.kind && (a as { at: number }).at === (b as { at: number }).at;
-  return a.cron.trim().replace(/\s+/g, " ") === b.cron.trim().replace(/\s+/g, " ");
+/** What Save sends as `when` when editing: nothing unless a timing control changed what the
+ * fields describe (a stored `@daily` shown as "Every day at 00:00" is left as it is), or a
+ * one-off's time zone changed (its wall-clock time is then read in the new zone). */
+export function whenToSend(initial: WhenDraft, cur: WhenDraft, tzChanged: boolean): WhenInput | null {
+  const now = whenOfDraft(cur);
+  if (!("when" in now)) return null;
+  const was = whenOfDraft(initial);
+  const changed = !("when" in was) || JSON.stringify(was.when) !== JSON.stringify(now.when);
+  return changed || (tzChanged && now.when.kind === "once") ? now.when : null;
+}
+
+/** Arrow keys, Home and End in a radio group: the option they move to, or null for other keys. */
+export function segStep(i: number, n: number, key: string): number | null {
+  if (key === "ArrowRight" || key === "ArrowDown") return (i + 1) % n;
+  if (key === "ArrowLeft" || key === "ArrowUp") return (i - 1 + n) % n;
+  if (key === "Home") return 0;
+  if (key === "End") return n - 1;
+  return null;
 }
 
 // ---------------- which agents can take scheduled work ----------------
@@ -208,9 +261,15 @@ export function longWhen(ms: number): string {
 }
 
 /** What a schedule row's second line says about its next run. */
+/** Expired: the backend says so, or its `expires_at` has passed (between slots the backend may
+ * not have said yet; the panel's clock does). */
+export function isExpired(s: Schedule, now: number): boolean {
+  return s.status === "expired" || (s.expires_at !== null && now >= s.expires_at);
+}
+
 export function nextLabel(s: Schedule, now: number): { text: string; tone: "next" | "paused" | "expired" | "done" } {
   if (s.status === "done" || (s.next_run === null && s.when.kind === "once")) return { text: "done", tone: "done" };
-  if (s.status === "expired") return { text: "expired", tone: "expired" };
+  if (isExpired(s, now)) return { text: "expired", tone: "expired" };
   if (s.paused) return { text: "paused", tone: "paused" };
   if (s.next_run === null) return { text: "no next run", tone: "done" };
   const at = nextWhen(s.next_run, now);
@@ -220,7 +279,7 @@ export function nextLabel(s: Schedule, now: number): { text: string; tone: "next
 /** "expires today", "expires tomorrow", "expires Mon 09:00" (Claude subscription agents' recurring
  * schedules, shown the day before), or null. */
 export function expiresLabel(s: Schedule, now: number): string | null {
-  if (!s.expires_soon || s.expires_at === null || s.status === "expired") return null;
+  if (!s.expires_soon || s.expires_at === null || isExpired(s, now)) return null;
   const at = nextWhen(s.expires_at, now);
   return at.startsWith("today") ? "expires today" : at.startsWith("tomorrow") ? "expires tomorrow" : `expires ${at}`;
 }
@@ -317,7 +376,8 @@ export function noteChoice(on: boolean, title: string, notes: { id: number; titl
 export interface ScheduleFields {
   name: string;
   prompt: string;
-  when: When;
+  /** null: the timing controls weren't changed (`whenToSend`), so the stored timing stays as is. */
+  when: WhenInput | null;
   tz: string;
   missed: Schedule["missed"];
   conversation: Schedule["conversation"];
@@ -332,7 +392,7 @@ export function schedulePatch(before: Schedule, f: ScheduleFields): Partial<Sche
   const p: Partial<ScheduleFields> = {};
   if (f.name.trim() !== before.name) p.name = f.name.trim();
   if (f.prompt !== before.prompt) p.prompt = f.prompt;
-  if (!sameWhen(f.when, before.when)) p.when = f.when;
+  if (f.when !== null) p.when = f.when;
   if (f.tz.trim() && f.tz.trim() !== before.tz) p.tz = f.tz.trim();
   if (f.missed !== before.missed) p.missed = f.missed;
   if (f.conversation !== before.conversation) p.conversation = f.conversation;

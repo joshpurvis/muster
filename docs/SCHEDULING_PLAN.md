@@ -24,6 +24,10 @@ panel". Choices made while building it:
 - Quiet hours are one window for the whole machine (default 23:00 to 07:00, its local time), and
   each schedule chooses whether it respects them. Run now ignores quiet hours and the
   schedule's own daily cap, but not the agent's caps.
+- "Fresh each run" never restarts within two minutes of the human typing into the agent.
+- A slot less than 15 minutes after the last run is skipped when it comes, even where a
+  daylight-saving change bunches a cron line's times.
+- `{last_reply}` is quoted and labelled as earlier output (data, not instructions).
 - Each run is one row in a small runs table (time, outcome, reason) pointing at its agent
   message, which keeps the text and the reply.
 

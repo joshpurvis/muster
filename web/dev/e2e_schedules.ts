@@ -87,6 +87,14 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   );
   await a.key("Escape");
   await a.wait(`!document.querySelector('.msg-dlg')`, 2000);
+  // A reconnect (a new hello) reloads the open history instead of leaving it on "Loading runs…".
+  const epoch: number = await a.eval(`${M}.helloEpoch.value`);
+  await R("mock.drop_clients", {});
+  await a.wait(`${M}.helloEpoch.value > ${epoch}`, 8000);
+  await a.wait(
+    `document.querySelectorAll('.sch-runs .sch-run').length >= 5 && !document.querySelector('.sch-runs')?.textContent.includes('Loading')`,
+    4000,
+  );
   await a.click(await rowSel("Daily PR summary"));
   await a.wait(`!document.querySelector('.sch-runs')`, 2000);
   ok("clicking a schedule shows its runs (failures red, skips grey, catch-up chip); a run opens its message and reply");
@@ -132,9 +140,19 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   await a.type("Check the open issues and post the three oldest.\nKeep it short.");
   await a.sleep(150);
   await shot("new-schedule-dialog", ".sch-dlg", 8);
-  // Once at…: a date and time; the reading says when.
+  // Once at…: a date and time, read in the schedule's time zone (named beside it).
   await setValue(".sch-preset select", "once", "change");
   await a.wait(`document.querySelector('.sch-reading')?.textContent.startsWith('Once, ')`, 3000);
+  check(
+    (await a.eval(`document.querySelector('.sch-zone-name')?.textContent`)) ===
+      (await a.eval(`Intl.DateTimeFormat().resolvedOptions().timeZone`)),
+    "the one-off's field names its zone",
+  );
+  const onceAt: string = await a.eval(`document.querySelector('.sch-once').value`);
+  check(
+    (await a.eval(`document.querySelector('.sch-reading').textContent`)).endsWith(onceAt.slice(11)),
+    `the reading has the typed time: ${onceAt}`,
+  );
   await shot("new-schedule-once", ".sch-dlg", 8);
   await setValue(".sch-preset select", "weekdays", "change");
   await a.wait(`document.querySelector('.sch-reading')?.textContent === 'At 09:00, Monday to Friday'`, 3000);
@@ -231,6 +249,36 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
     (await R("schedule.list", {})).schedules.find((s: any) => s.id === made.id).when.cron === "30 10 * * 1-5",
     "Save sent the new time",
   );
+  // A CLI-made `@daily` with Skip next on: editing only the prompt leaves both alone.
+  const cli: any = await R("schedule.create", { agent: "worker", prompt: "Nightly tidy", when: { kind: "cron", cron: "@daily" } });
+  await R("schedule.skip", { id: cli.id, on: true });
+  await a.wait(`!!${row("Nightly tidy")}`, 2000);
+  await openMenu("Nightly tidy");
+  check(await menuItem("Edit…"), "Edit… for the CLI-made one");
+  await a.wait(`!!document.querySelector('.sch-dlg')`, 2000);
+  check(await a.eval(`document.querySelector('.sch-preset select').value`) === "daily", "@daily shows as Every day");
+  await a.eval(`(() => { const t = document.querySelector('.sch-prompt'); t.focus(); t.setSelectionRange(t.value.length, t.value.length); })()`);
+  await a.type(" and empty the trash");
+  // Segmented controls: one Tab stop; arrows move and pick.
+  check(
+    await a.eval(`[...document.querySelectorAll('.sch-seg')].every((g) => g.querySelectorAll('[tabindex="0"]').length === 1)`),
+    "each segmented control is one Tab stop",
+  );
+  await a.eval(`document.querySelector('.sch-seg [data-value="continue"]').focus()`);
+  await a.key("Right");
+  await a.wait(`document.activeElement?.dataset.value === 'fresh' && document.activeElement.getAttribute('aria-checked') === 'true'`, 1000);
+  await a.key("Home");
+  await a.wait(`document.activeElement?.dataset.value === 'continue'`, 1000);
+  await a.click(".sch-dlg button[type=submit]");
+  await a.wait(`!document.querySelector('.sch-dlg')`, 2000);
+  const tidy = (await R("schedule.list", {})).schedules.find((s: any) => s.id === cli.id);
+  check(
+    tidy.prompt === "Nightly tidy and empty the trash" && tidy.when.cron === "@daily" && tidy.skip_next,
+    `only the prompt changed: ${JSON.stringify([tidy.prompt, tidy.when, tidy.skip_next])}`,
+  );
+  await R("schedule.remove", { id: cli.id });
+  ok("editing only the prompt of a CLI-made @daily kept its timing and Skip next; segmented controls take arrows");
+
   await openMenu(made.name);
   check(await menuItem("Remove…"), "Remove… in the menu");
   await a.wait(`!!document.querySelector('.confirm-dlg')`, 2000);

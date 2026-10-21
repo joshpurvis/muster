@@ -1143,6 +1143,7 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok(typed.includes("since never (this is the first run)") && /Summary for \d{4}-\d\d-\d\d/.test(typed),
     "the run reaches the agent as an envelope with origin schedule, placeholders filled");
   const token = await Deno.readTextFile(`${BASE}/fake-token`);
+  const agentSession: number = (await c.call("agent.list")).find((a: Json) => a.name === "sched").session_id;
   let r = (await runs(id))[0];
   ok(r.kind === "manual" && r.outcome === "pending" && r.message?.origin === "schedule" && r.message.hop === 0 &&
     r.message.from === `schedule:${id}`, "history: a pending manual run with its message");
@@ -1181,6 +1182,24 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
     method: "POST", headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ last_assistant_message: "still 3" }),
   });
   await until("the second reply", async () => (await runs(id))[0].outcome === "replied");
+
+  // A shell tab an agent spawned (or typed into) carries the agent's chain: the CLI there (which
+  // sends that shell's session id) can't make or change schedules; the agent itself can't either.
+  const spawnRes = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "spawn_session", arguments: { kind: "shell" } } }),
+  });
+  const spawned = await spawnRes.json();
+  ok(spawnRes.ok && !spawned.result?.isError, `the agent spawns a shell (${JSON.stringify(spawned).slice(0, 200)})`);
+  const spawnOut = JSON.parse(spawned.result.content[0].text);
+  const sh = { id: Number(spawnOut.session_id ?? spawnOut.session?.id ?? spawnOut.id) };
+  const fromShell = await cli(["schedule", "add", "sched", "--daily", "09:00", "more work"], { ...env, MUSTER_SESSION_ID: String(sh.id) });
+  ok(!fromShell.success && dec.decode(fromShell.stderr).includes("a shell an agent has typed into"),
+    "schedule changes from a shell an agent typed into are refused");
+  const fromAgent = await cli(["schedule", "resume", "--all"], { ...env, MUSTER_SESSION_ID: String(agentSession) });
+  ok(!fromAgent.success && dec.decode(fromAgent.stderr).includes("agent's session"), "and from the agent's own session");
+  ok((await sch("ls")).ok, "reading schedules is still fine");
+  await c.call("session.kill", { id: sh.id });
 
   // Pause, resume, skip next.
   ok((await sch("pause", String(id))).out.includes("paused"), "muster schedule pause");

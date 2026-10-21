@@ -1249,6 +1249,9 @@ impl Store {
         )?;
         let id = (n == 1).then(|| tx.last_insert_rowid());
         Self::save_schedule_on(&tx, s)?;
+        if id.is_some() {
+            Self::prune_runs_on(&tx, run.schedule_id, crate::schedules::RUNS_KEEP)?;
+        }
         tx.commit()?;
         Ok(id)
     }
@@ -1262,7 +1265,9 @@ impl Store {
             params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
                 run.reason, run.finished_at],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = conn.last_insert_rowid();
+        Self::prune_runs_on(&conn, run.schedule_id, crate::schedules::RUNS_KEEP)?;
+        Ok(id)
     }
 
     pub fn update_run(&self, run: &crate::schedules::Run) -> anyhow::Result<()> {
@@ -1318,10 +1323,12 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Runs of `schedule` that reached the agent (a message was sent) since `since`.
+    /// Runs of `schedule` whose message was sent at or after `since` (unix ms on the daemon's
+    /// clock: the message's own time, not when the run was taken up).
     pub fn count_delivered_runs_since(&self, schedule: i64, since: i64) -> anyhow::Result<u32> {
         let n: i64 = self.conn.lock().query_row(
-            "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id = ?1 AND started_at >= ?2 AND msg_id IS NOT NULL",
+            "SELECT COUNT(*) FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
+             WHERE r.schedule_id = ?1 AND m.created_at >= ?2",
             params![schedule, since],
             |r| r.get(0),
         )?;
@@ -1346,13 +1353,13 @@ impl Store {
         Ok((last, reply))
     }
 
-    /// Keep the newest `keep` runs of `schedule`.
-    pub fn prune_runs(&self, schedule: i64, keep: usize) -> anyhow::Result<usize> {
-        Ok(self.conn.lock().execute(
+    /// Keep the newest `keep` runs of `schedule` (and any still pending). Every insert does it.
+    fn prune_runs_on(conn: &Connection, schedule: i64, keep: usize) -> rusqlite::Result<usize> {
+        conn.execute(
             "DELETE FROM schedule_runs WHERE schedule_id = ?1 AND outcome != 'pending' AND id NOT IN (
                 SELECT id FROM schedule_runs WHERE schedule_id = ?1 ORDER BY id DESC LIMIT ?2)",
             params![schedule, keep as i64],
-        )?)
+        )
     }
 
     // ----- Claude account profile references -----

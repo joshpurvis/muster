@@ -378,12 +378,16 @@ Phase 1). Each run is an ordinary agent message with origin `schedule` at hop 0 
 sent through the same path as `agent.ask`, so the agent's accepted origins, the hop limit, the
 200-a-day cap and the unattended cap all apply, and a refusal is recorded like any other
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
-events. Only the human makes or changes schedules: a mutating call with an agent session's
-`from_session` is refused (agents proposing schedules is Phase 3).
+events. Only the human makes or changes schedules: a mutating call whose `from_session` is an
+agent's session, or a shell tab with an agent's provenance (one an agent spawned or typed into),
+is refused (agents proposing schedules is Phase 3).
 
 ```ts
 type When = { kind: "cron"; cron: string /* 5 fields, or @hourly/@daily/@weekly/@monthly/@yearly */ }
           | { kind: "once"; at: number /* unix ms */ };
+// What clients send: a When, or a one-off as a wall-clock time read in the schedule's `tz`
+// (a time skipped by a daylight-saving change moves after it). Stored and returned as `at`.
+type WhenInput = When | { kind: "once"; local: string /* "YYYY-MM-DDTHH:MM" */ };
 type Schedule = {
   id: number; agent_id: number; agent: string | null; name: string; prompt: string;
   when: When; tz: string /* IANA name, e.g. "Europe/London" */;
@@ -410,15 +414,15 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | Method | Params | Result |
 |---|---|---|
 | `schedule.list` | `{agent?}` | `{schedules: Schedule[], settings: ScheduleSettings}` |
-| `schedule.create` | `{agent, prompt, when, name?, tz? = local zone, missed? = "auto", conversation? = "continue", notify? = "on_failure", note?: {id} \| {title}, quiet_hours?, daily_cap?, paused? = false, from_session?}` | `Schedule`. Refused when the agent doesn't accept the `schedule` origin (a Claude agent only does if the human ticked Schedule, with its warning). `name` defaults to the prompt's first line (60 bytes). `note: {title}` uses the note with that title (case-insensitive) or makes one. `quiet_hours` defaults on for a Claude agent on its subscription, off for Codex and OpenRouter agents. `daily_cap`: runs that reach the agent per 24 hours (1–200, `null` or 0: none). A cron line may not run more often than every 15 minutes; a one-off must be in the future and at most a year ahead. Prompt up to 16 KB; 200 schedules in all. |
-| `schedule.update` | `{id, ...any create field but agent}` | `Schedule`. Changing `when` or `tz` recomputes the next run and clears Skip next. `note: null` and `daily_cap: null` clear them. |
+| `schedule.create` | `{agent, prompt, when: WhenInput, name?, tz? = local zone, missed? = "auto", conversation? = "continue", notify? = "on_failure", note?: {id} \| {title}, quiet_hours?, daily_cap?, paused? = false, from_session?}` | `Schedule`. Refused when the agent doesn't accept the `schedule` origin (a Claude agent only does if the human ticked Schedule, with its warning). `name` defaults to the prompt's first line (60 bytes). `note: {title}` uses the note with that title (case-insensitive) or makes one. `quiet_hours` defaults on for a Claude agent on its subscription, off for Codex and OpenRouter agents. `daily_cap`: runs that reach the agent per 24 hours (1–200, `null` or 0: none). A cron line may not run more often than every 15 minutes; a one-off must be in the future and at most a year ahead. Prompt up to 16 KB; 200 schedules in all. |
+| `schedule.update` | `{id, ...any create field but agent}` | `Schedule`. A `when` or `tz` that fires at other times recomputes the next run and clears Skip next; the same timing written differently (`@daily` for `0 0 * * *`) changes nothing. `note: null` and `daily_cap: null` clear them. |
 | `schedule.remove` | `{id}` | `{removed: id}`; its runs go too. Removing an agent removes its schedules. |
 | `schedule.pause` | `{id, on? = true}` | `Schedule`. Paused, its slots are recorded once as `skipped: paused` and pass. |
 | `schedule.skip` | `{id, on? = true}` | `Schedule`. Skip the next run (`skip_next`), or undo that. |
 | `schedule.run` | `{id}` | `Run` (pending, or skipped when its previous run is still going). Runs now as origin `schedule`, outside its timing, quiet hours and its daily cap; the agent's caps still apply. |
 | `schedule.renew` | `{id}` | `Schedule`. Restarts the 7-day window of a Claude subscription agent's recurring schedule; an expired one runs again from its next time. |
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
-| `schedule.preview` | `{when, tz?, quiet_hours?, agent?}` | `{reading, tz, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
+| `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
 | `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. |
 
@@ -426,7 +430,8 @@ Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
 (sent, finished), and `schedule_settings` (`ScheduleSettings`).
 
-**Timing.** A cron line is read in the schedule's time zone, so 09:00 stays 09:00 across daylight
+**Timing.** As in Vixie cron, when both day fields are restricted a day matches either; only a
+bare `*` leaves a day field open (`*/2` restricts it). A cron line is read in the schedule's time zone, so 09:00 stays 09:00 across daylight
 saving: a time skipped when the clocks go forward runs just after the change (02:30 becomes
 03:30), and a time that happens twice when they go back runs once, the first time. The
 scheduler sleeps on the monotonic clock until the next slot, at most a minute at a time, then
@@ -436,30 +441,46 @@ per schedule and slot, saved together with the schedule's next slot) before the 
 so a slot never runs twice: not after a crash, a reload or the clock going back.
 
 **What a due slot does**, in this order: a Claude subscription agent's recurring schedule more
-than 7 days past its creation or renewal is `skipped: expired` (one notice, and a notice and
-desktop notification the day before); "Pause all" or the schedule's own pause skips it (recorded
+than 7 days past its creation or renewal (at the time it would run, so a late catch-up counts) is
+`skipped: expired` (one notice, a `schedule_upserted` when it expires, and a notice and desktop
+notification the day before). The agent counts as on its subscription while either its record or
+its running process is (a switch to OpenRouter applies from the next start); "Pause all" or the schedule's own pause skips it (recorded
 once per paused stretch); a slot more than 10 minutes late (Muster was off or asleep) follows
 "If missed": `auto` runs once (the newest missed slot, as a `catch_up` run) for one-offs and
 schedules that run less often than hourly, and skips (`missed: … (N runs)`) for hourly-or-faster
-ones; Skip next skips it; quiet hours skip it (`quiet hours (23:00–07:00)`, checked at the slot's
+ones; Skip next skips that one occurrence (a later catch-up still runs); a slot less than 15
+minutes after the last one that ran is skipped (`too soon…`: daylight-saving changes can bunch a
+cron line's times); quiet hours skip it (`quiet hours (23:00–07:00)`, checked at the slot's
 time, or for a catch-up at the time it would run, in this machine's zone); the schedule's daily
 cap refuses it. Otherwise it runs.
 
-**A run.** Skipped when the same schedule's previous run is still going. Otherwise it waits in
-line: one schedule run at a time per agent, and until the agent is between turns with nothing
+**A run.** Skipped when the same schedule's previous run is still going: pending, or sent and its
+turn still running in the agent although the run stopped waiting for it (timed out, or blocked on
+an unanswered prompt). `schedule.run` answers that at once (a `skipped` run). Otherwise it waits
+in line: one schedule run at a time per agent, and until the agent is between turns with nothing
 queued (an agent that isn't running is started), for up to an hour from when it was due, then
-`skipped: busy`. Catch-ups after a start wait 30 s, and 30 s after one another. With
-"Conversation: fresh each run" the agent is restarted in a new conversation once it is between
-turns, so a turn the human started is never cut into. The prompt's `{date}` (the slot's date in
-the schedule's zone), `{last_run}` (the previous run that reached the agent, `YYYY-MM-DD HH:MM`,
-or "never") and `{last_reply}` (the newest reply, up to 4000 bytes) are filled in. The run then
-waits up to an hour for the reply and ends `replied`, `blocked` (an approval prompt, a question
+`skipped: busy` (also when the hour passed while the machine slept). Catch-ups after a start
+wait 30 s, and 30 s after one another. Just before sending, an automatic run checks again what
+may have changed while it waited (pauses, expiry, quiet hours, its daily cap), then every
+delivery check (origin, hop, both daily caps) runs before anything is restarted, so a refused run
+leaves the conversation alone. With "Conversation: fresh each run" the agent is restarted in a new
+conversation only if, checked under the agent start lock together with the restart, it is
+between turns and the human hasn't typed into it in the last two minutes; otherwise the run goes
+back in line. The prompt's `{date}` (the slot's date in the schedule's zone), `{last_run}` (the
+previous run that reached the agent, `YYYY-MM-DD HH:MM`, or "never") and `{last_reply}` (the
+newest reply, up to 4000 bytes, quoted line by line under a label saying it is earlier output and
+data, not instructions) are filled in. Every message muster delivers to an agent is plain text
+(control characters dropped), so stored text can't end a bracketed paste or press keys. The run
+then waits for the reply until an hour after the message was sent (across restarts) and ends `replied`, `blocked` (an approval prompt, a question
 or an error: never approved for you), `no_reply`, `ended`, `timed_out`, `refused` (with the
 agent's reason) or `failed`. A reply is also appended to the schedule's note, if it has one,
 under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent. "Notify me": an in-app
 notice and a desktop notification on failure (blocked, no reply, ended, timed out, refused,
 failed), on every outcome (`always`), or never. A backend restart picks up unfinished runs: one
-already sent waits for its reply again, one still in line goes back in line until its hour is up.
+already sent waits for its reply again; one whose message was recorded but never typed and is in
+no prompt queue (the backend stopped in between) is `failed`; one still in line goes back in line
+until its hour is up. The daily caps count a run by when its message was sent. The newest 500 runs
+per schedule are kept, whichever way they were made.
 
 **Caps.** Besides the 200-a-day cap, each agent takes at most `unattended_cap` (default 24)
 messages a day whose origin isn't `human` (scheduled or triggered, at any hop): over it, a

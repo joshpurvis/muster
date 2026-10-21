@@ -15,7 +15,10 @@ import {
   runKindLabel,
   runLine,
   runReason,
-  sameWhen,
+  segStep,
+  whenToSend,
+  zonedToMs,
+  isExpired,
   scheduleAgents,
   schedulePatch,
   shortWhen,
@@ -25,7 +28,7 @@ import {
   type WhenDraft,
   whenOfDraft,
 } from "./schedules.ts";
-import type { Agent, Schedule, ScheduleRun, When } from "./types.ts";
+import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
 
 function eq<T>(a: T, b: T, msg = "") {
   const x = JSON.stringify(a), y = JSON.stringify(b);
@@ -74,11 +77,13 @@ Deno.test("cron lines that aren't a preset's shape stay Custom, as typed", () =>
 });
 
 Deno.test("one-offs and bad fields", () => {
+  // A one-off is sent as its wall-clock time; the backend reads it in the schedule's zone.
   const once = whenOfDraft({ ...base, preset: "once", once: "2026-10-21T15:30" });
-  eq(once, { when: { kind: "once", at: at(2026, 10, 21, 15, 30) } });
+  eq(once, { when: { kind: "once", local: "2026-10-21T15:30" } });
   const d = draftOfWhen({ kind: "once", at: at(2026, 10, 21, 15, 30) }, base);
   eq([d.preset, d.once], ["once", "2026-10-21T15:30"]);
   eq("error" in whenOfDraft({ ...base, preset: "once", once: "" }), true, "no date");
+  eq("error" in whenOfDraft({ ...base, preset: "once", once: "2026-10-21" }), true, "no time");
   eq("error" in whenOfDraft({ ...base, preset: "daily", time: "25:00" }), true, "bad hour");
   eq("error" in whenOfDraft({ ...base, preset: "daily", time: "9am" }), true, "not HH:MM");
   eq("error" in whenOfDraft({ ...base, preset: "custom", cron: "  " }), true, "empty cron");
@@ -91,12 +96,47 @@ Deno.test("one-offs and bad fields", () => {
   eq(defaultOnce(at(2026, 10, 20, 10, 40)), "2026-10-20T12:00");
 });
 
-Deno.test("sameWhen ignores spacing and tells kinds apart", () => {
-  const c = (cron: string): When => ({ kind: "cron", cron });
-  eq(sameWhen(c("0 9 * * 1-5"), c("0  9 * * 1-5")), true);
-  eq(sameWhen(c("0 9 * * 1-5"), c("0 9 * * *")), false);
-  eq(sameWhen({ kind: "once", at: 5 }, { kind: "once", at: 5 }), true);
-  eq(sameWhen({ kind: "once", at: 5 }, c("0 9 * * *")), false);
+Deno.test("a one-off's time is read and shown in the schedule's time zone, not the browser's", () => {
+  // 14:30 UTC on 21 Oct 2026 is 15:30 in London (BST), 10:30 in New York (EDT), 23:30 in Tokyo.
+  const t = Date.UTC(2026, 9, 21, 14, 30);
+  eq(localInput(t, "Europe/London"), "2026-10-21T15:30");
+  eq(localInput(t, "America/New_York"), "2026-10-21T10:30");
+  eq(localInput(t, "Asia/Tokyo"), "2026-10-21T23:30");
+  eq(draftOfWhen({ kind: "once", at: t }, base, "Asia/Tokyo").once, "2026-10-21T23:30", "Edit shows it in its zone");
+  eq(zonedToMs("2026-10-21T15:30", "Europe/London"), t);
+  eq(zonedToMs("2026-10-21T10:30", "America/New_York"), t);
+  eq(zonedToMs("2026-12-21T15:30", "Europe/London"), Date.UTC(2026, 11, 21, 15, 30), "GMT in winter");
+  // A time the clocks skip (01:30 on 29 Mar 2026 in London) lands after the change: 02:30 BST.
+  eq(zonedToMs("2026-03-29T01:30", "Europe/London"), Date.UTC(2026, 2, 29, 1, 30));
+  eq(Number.isNaN(zonedToMs("tomorrow", "Europe/London")), true);
+  // An unknown zone falls back to this browser's.
+  eq(localInput(at(2026, 1, 2, 3, 4), "Not/AZone"), "2026-01-02T03:04");
+  // The starting value is in the chosen zone too.
+  eq(defaultOnce(Date.UTC(2026, 9, 20, 9, 0), "Asia/Tokyo"), "2026-10-20T19:00");
+});
+
+Deno.test("Edit sends `when` only when a timing control changed", () => {
+  const daily = draftOfWhen({ kind: "cron", cron: "@daily" }, base);
+  eq(daily.preset, "daily");
+  // Untouched (only the prompt changed): the stored `@daily` is not rewritten to `0 0 * * *`.
+  eq(whenToSend(daily, daily, false), null);
+  // Another preset is a change; switching back (or a field the preset doesn't use) is none.
+  eq(whenToSend(daily, { ...daily, preset: "weekly", time: "00:00" }, false), { kind: "cron", cron: "0 0 * * 1" });
+  eq(whenToSend(daily, { ...daily, preset: "daily", day: 3, minute: 30 }, false), null);
+  eq(whenToSend(daily, { ...daily, time: "07:00" }, false), { kind: "cron", cron: "0 7 * * *" });
+  const custom = draftOfWhen({ kind: "cron", cron: "0 9,17 * * *" }, base);
+  eq(whenToSend(custom, custom, true), null, "a recurring timing doesn't need re-sending for a new zone");
+  // A one-off whose zone changed is re-sent, so its wall-clock time is read in the new zone.
+  const once = draftOfWhen({ kind: "once", at: at(2026, 10, 21, 15, 30) }, base);
+  eq(whenToSend(once, once, false), null);
+  eq(whenToSend(once, once, true), { kind: "once", local: "2026-10-21T15:30" });
+  eq(whenToSend(once, { ...once, preset: "custom", cron: "" }, false), null, "invalid fields send nothing");
+});
+
+Deno.test("segmented radio groups: arrows, Home and End", () => {
+  eq([segStep(0, 3, "ArrowRight"), segStep(2, 3, "ArrowRight"), segStep(0, 3, "ArrowLeft")], [1, 0, 2]);
+  eq([segStep(1, 3, "ArrowDown"), segStep(1, 3, "ArrowUp")], [2, 0]);
+  eq([segStep(1, 3, "Home"), segStep(1, 3, "End"), segStep(1, 3, "Enter")], [0, 2, null]);
 });
 
 const agent = (name: string, kind: Agent["kind"], accepts: Agent["accepts_origins"], provider?: Agent["provider"]): Agent => ({
@@ -222,6 +262,13 @@ Deno.test("a row's next-run line", () => {
   eq(nextLabel(sched({ skip_next: true }), NOW).text, "skips next: tomorrow 09:00");
   eq(nextLabel(sched({ paused: true, status: "paused" }), NOW).tone, "paused");
   eq(nextLabel(sched({ status: "expired" }), NOW).text, "expired");
+  // Its expiry passed between slots: expired by the panel's clock, before the backend says so.
+  const soon = sched({ expires_at: NOW + 60_000, expires_soon: true });
+  eq(nextLabel(soon, NOW).tone, "next");
+  eq(expiresLabel(soon, NOW), "expires today");
+  eq(isExpired(soon, NOW + 60_000), true);
+  eq(nextLabel(soon, NOW + 60_000), { text: "expired", tone: "expired" });
+  eq(expiresLabel(soon, NOW + 60_000), null, "no 'expires' line once it has");
   eq(nextLabel(sched({ when: { kind: "once", at: 1 }, next_run: null, status: "done" }), NOW).text, "done");
   eq(nextWhen(at(2026, 10, 21, 0, 5), NOW), "tomorrow 00:05");
   eq(shortWhen(at(2026, 10, 25, 9, 0), NOW), "Sun 09:00");
@@ -262,7 +309,7 @@ Deno.test("Save sends only what changed", () => {
   const same = {
     name: "Daily PR summary",
     prompt: "Summarise PRs",
-    when: { kind: "cron", cron: "0  9 * * 1-5" } as When,
+    when: null as WhenInput | null,
     tz: "Europe/London",
     missed: "auto" as const,
     conversation: "continue" as const,

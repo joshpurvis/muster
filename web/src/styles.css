@@ -4616,7 +4616,14 @@ body.dragging .panel-view { pointer-events: none; }
 }
 
 .sch-when .sch-preset {
-  flex: 0 1 250px;
+  flex: 0 1 230px;
+}
+
+.sch-zone {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sch-at {
@@ -4647,7 +4654,7 @@ body.dragging .panel-view { pointer-events: none; }
 }
 
 .field input[type="datetime-local"] {
-  width: 220px;
+  width: 200px;
   background: var(--bg-1);
   border: 1px solid var(--border-strong);
   border-radius: var(--r);

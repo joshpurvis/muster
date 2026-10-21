@@ -184,10 +184,49 @@ export const schedules = signal<Schedule[]>([]);
 export const schedulesSupported = signal(false);
 /** Pause all, quiet hours, the unattended cap. */
 export const scheduleSettings = signal<ScheduleSettings | null>(null);
-/** History lists loaded so far (`schedule.runs`), by schedule id, newest first. */
-export const scheduleRuns = signal<Map<number, { runs: ScheduleRun[]; more: boolean }>>(new Map());
+/** A schedule's history as loaded so far (`schedule.runs`, then `schedule_run` events), newest
+ * first. `loading`: a page is on its way; `error`: the last load failed. */
+export interface RunHistory {
+  runs: ScheduleRun[];
+  more: boolean;
+  loading: boolean;
+  error: string | null;
+}
+/** History lists, by schedule id. */
+export const scheduleRuns = signal<Map<number, RunHistory>>(new Map());
 /** Schedules whose history is shown under their row. */
 export const scheduleHistoryOpen = signal<ReadonlySet<number>>(new Set());
+/** Bumped when histories are thrown away (each hello): loads started before are ignored. */
+let runsEpoch = 0;
+
+function setHistory(id: number, h: RunHistory) {
+  scheduleRuns.value = new Map(scheduleRuns.value).set(id, h);
+}
+
+/** Load a schedule's newest 20 runs, or (`older`) the 20 below the oldest loaded. Runs already
+ * there (from events meanwhile) are kept: pages are merged in, never replace. */
+export async function loadScheduleRuns(id: number, older = false) {
+  const epoch = runsEpoch;
+  const cur = scheduleRuns.value.get(id);
+  const before = older ? cur?.runs.at(-1)?.id : undefined;
+  setHistory(id, { runs: cur?.runs ?? [], more: cur?.more ?? false, loading: true, error: null });
+  try {
+    const r = await rpc.call<{ runs: ScheduleRun[]; more: boolean }>("schedule.runs", { id, before, limit: 20 });
+    if (epoch !== runsEpoch) return;
+    let runs = scheduleRuns.value.get(id)?.runs ?? [];
+    for (const x of r.runs) runs = upsertRun(runs, x);
+    setHistory(id, { runs, more: r.more, loading: false, error: null });
+  } catch (e) {
+    if (epoch !== runsEpoch) return;
+    const h = scheduleRuns.value.get(id);
+    setHistory(id, {
+      runs: h?.runs ?? [],
+      more: h?.more ?? false,
+      loading: false,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
 
 async function loadSchedules() {
   try {
@@ -196,9 +235,13 @@ async function loadSchedules() {
       schedulesSupported.value = true;
       schedules.value = r.schedules;
       scheduleSettings.value = r.settings;
-      // Histories loaded before a reconnect may have missed runs: they load again when shown.
+      // Histories loaded before a reconnect may have missed runs: thrown away, and the ones on
+      // screen load again now (the rest when they are next shown).
+      runsEpoch++;
       scheduleRuns.value = new Map();
     });
+    const known = new Set(r.schedules.map((s) => s.id));
+    for (const id of scheduleHistoryOpen.value) if (known.has(id)) loadScheduleRuns(id);
   } catch (e) {
     if (/^unknown method/i.test(e instanceof Error ? e.message : String(e))) {
       batch(() => {
@@ -223,8 +266,9 @@ export function knowRun(r: ScheduleRun) {
       const last = newerRun(s.last_run, r);
       if (last !== s.last_run) knowSchedule({ ...s, last_run: last });
     }
+    // A history being loaded takes it too (the page merges in when it arrives).
     const h = scheduleRuns.value.get(r.schedule_id);
-    if (h) scheduleRuns.value = new Map(scheduleRuns.value).set(r.schedule_id, { ...h, runs: upsertRun(h.runs, r) });
+    if (h) setHistory(r.schedule_id, { ...h, runs: upsertRun(h.runs, r) });
   });
 }
 

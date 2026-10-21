@@ -6,7 +6,8 @@
 //! Syntax: `*`, numbers, ranges `a-b`, steps `*/n` and `a-b/n`, lists `a,b`, month names
 //! (`jan`…`dec`) and day names (`sun`…`sat`; 0 and 7 are Sunday), and the macros `@hourly`,
 //! `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. As in Vixie cron, when
-//! both day fields are restricted a day matches either of them.
+//! both day fields are restricted a day matches either of them; only a bare `*` leaves a day
+//! field unrestricted (a step such as `*/2` restricts it).
 //!
 //! Daylight saving: a time that doesn't exist that day (the clocks went forward) fires at the
 //! same wall-clock offset after the change (02:30 becomes 03:30); a time that happens twice (the
@@ -130,8 +131,10 @@ impl Cron {
             dom,
             months,
             dow: dow as u8,
-            dom_star: parts[2].starts_with('*'),
-            dow_star: parts[4].starts_with('*'),
+            // Only a bare `*` leaves a day field open: `*/2` is a restriction like any other
+            // (so `0 9 */2 * 1` is every other day of the month, or a Monday).
+            dom_star: parts[2] == "*",
+            dow_star: parts[4] == "*",
         };
         // `0 0 31 2 *` never happens: say so now rather than never firing.
         if !c.dom_star && c.dow_star {
@@ -467,6 +470,20 @@ mod tests {
             assert!(n > t);
             t = n;
         }
+    }
+
+    #[test]
+    fn a_stepped_day_field_restricts_the_days() {
+        let tz = zone("UTC").unwrap();
+        // Every other day of the month (odd days), not every day.
+        let c = Cron::parse("0 9 */2 * *").unwrap();
+        let a = c.next_after(&tz, ms(&tz, "2026-10-20T10:00")).unwrap();
+        assert_eq!(fmt(&tz, a), "2026-10-21 09:00 UTC");
+        assert_eq!(fmt(&tz, c.next_after(&tz, a).unwrap()), "2026-10-23 09:00 UTC");
+        // Both restricted: either matches (a Monday, or an odd day).
+        let c = Cron::parse("0 9 */2 * 1").unwrap();
+        assert_eq!(fmt(&tz, c.next_after(&tz, ms(&tz, "2026-10-23T10:00")).unwrap()), "2026-10-25 09:00 UTC");
+        assert_eq!(fmt(&tz, c.next_after(&tz, ms(&tz, "2026-10-25T10:00")).unwrap()), "2026-10-26 09:00 UTC");
     }
 
     #[test]

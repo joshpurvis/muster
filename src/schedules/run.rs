@@ -20,6 +20,10 @@ fn catchup_gap_ms() -> i64 {
     30_000
 }
 
+/// A fresh conversation never starts within this long of the human typing into the agent's
+/// terminal (they may be writing a prompt that a restart would wipe).
+const HUMAN_QUIET: Duration = Duration::from_secs(120);
+
 /// The sender label of a schedule's messages (the envelope's `from`).
 pub fn sender(schedule: i64) -> String {
     format!("schedule:{schedule}")
@@ -57,27 +61,31 @@ pub async fn scheduler_loop(hub: Arc<Hub>) {
     }
 }
 
-/// Handle every due slot, and the expiry notices. Returns the runs to start.
+/// Handle every due slot, the expiry notices, and tell clients when a schedule expires (no slot
+/// may be due then). Returns the runs to start.
 pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
     let settings = hub.schedules.settings();
     let quiet = quiet_of(&settings);
     let mut start = Vec::new();
     for s in hub.schedules.list() {
         let Some(agent) = hub.agents().by_id(s.agent_id) else { continue };
-        let f = facts(&agent);
+        let f = facts(hub, &agent);
         if plan::warn_expiry(&s, &f, now) {
             match hub.schedules.edit(s.id, |x| {
                 x.expiry_warned = true;
                 Ok(())
             }) {
                 Ok(x) => {
-                    let when = plan::expires_at(&x, &f).map(|e| fmt_local(e)).unwrap_or_default();
+                    let when = plan::expires_at(&x, &f).map(fmt_local).unwrap_or_default();
                     alert(hub, "warn", &format!("{}: schedule \"{}\" expires {when}", agent.name, x.name),
                         "Claude subscription agents' schedules stop after 7 days. Renew it in the Agents panel to keep it running.");
                     publish(hub, &x);
                 }
                 Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
             }
+        }
+        if plan::expires_at(&s, &f).is_some_and(|e| now >= e) && hub.schedules.expired_seen.lock().insert(s.id) {
+            publish(hub, &s);
         }
         if s.next_run.is_none_or(|t| t > now) {
             continue;
@@ -91,6 +99,12 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
     start
 }
 
+/// Runs of `schedule` whose messages reached the agent in the last 24 hours (by the time each
+/// message was sent: the daemon's clock, which agent messages are stamped with).
+fn runs_today(hub: &Hub, schedule: i64) -> anyhow::Result<u32> {
+    hub.store().count_delivered_runs_since(schedule, now_ms() - plan::DAY_MS)
+}
+
 /// Act on schedule `id`'s due slot: claim it (with its run row) and say whether to start it.
 fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, quiet: &plan::Quiet, f: &plan::Facts, agent: &str) -> anyhow::Result<Option<Run>> {
     let sched = &hub.schedules;
@@ -98,8 +112,8 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
         let mut g = sched.inner.lock();
         let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
         let last = hub.store().runs(id, None, 1)?.into_iter().next();
-        let runs_today = hub.store().count_delivered_runs_since(id, now - plan::DAY_MS)?;
-        let Some(due) = plan::due(&s, now, settings, quiet, f, runs_today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
+        let today = runs_today(hub, id)?;
+        let Some(due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
             return Ok(None);
         };
         let mut next = s.clone();
@@ -107,6 +121,9 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
         next.last_slot = Some(due.slot);
         if next.skip_slot.is_some_and(|k| k <= due.slot) {
             next.skip_slot = None;
+        }
+        if matches!(due.action, Action::Fire(_)) {
+            next.last_fired = Some(due.slot);
         }
         next.updated_at = now;
         let mut run = Run {
@@ -151,7 +168,6 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
         return Ok(None);
     };
     publish_run(hub, &run);
-    let _ = hub.store().prune_runs(id, super::RUNS_KEEP);
     if run.outcome == Outcome::Pending {
         return Ok(Some(run));
     }
@@ -177,104 +193,154 @@ pub fn spawn_execute(hub: Arc<Hub>, run: Run) {
     });
 }
 
-/// Is the agent in a turn, or does its session have prompts waiting? (Not running: not busy;
-/// sending starts it.)
-fn agent_busy(hub: &Hub, agent_id: i64) -> Option<SessionId> {
-    let a = hub.agents().by_id(agent_id)?;
-    let sid = a.session_id?;
-    let s = hub.session(sid)?;
-    let busy = s.state != AgentState::Exited
+/// A session in a turn, or with prompts waiting.
+fn session_busy(s: &SessionInfo) -> bool {
+    s.state != AgentState::Exited
         && (s.queued > 0
-            || matches!(s.state, AgentState::Starting | AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck));
-    busy.then_some(sid)
+            || matches!(s.state, AgentState::Starting | AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck))
 }
 
-/// Take a run from pending to its outcome: wait in line, start fresh if asked, send, wait.
+/// The agent's session when it is busy (not running: not busy; sending starts it).
+fn agent_busy(hub: &Hub, agent_id: i64) -> Option<SessionId> {
+    let sid = hub.agents().by_id(agent_id)?.session_id?;
+    hub.session(sid).filter(session_busy).map(|_| sid)
+}
+
+/// Is an earlier run of schedule `schedule` (before run `before`) still going? A pending one
+/// is; so is the newest one whose message's turn is still running in the agent although the run
+/// stopped waiting for it (timed out, or blocked on a prompt nobody has answered yet).
+pub(super) fn previous_running(hub: &Hub, schedule: i64, before: i64) -> anyhow::Result<bool> {
+    if hub.store().pending_runs()?.iter().any(|r| r.schedule_id == schedule && r.id < before) {
+        return Ok(true);
+    }
+    let sent = hub.store().runs(schedule, Some(before), 20)?.into_iter().find(|r| r.msg_id.is_some());
+    let Some(msg) = sent.and_then(|r| r.msg_id) else { return Ok(false) };
+    let st = hub.agents().msg_status(hub.store(), msg);
+    if st.reply.is_some() || !st.active {
+        return Ok(false);
+    }
+    let session = hub.store().agent_message(msg)?.and_then(|m| m.to_session).and_then(|s| hub.session(s));
+    Ok(session.is_some_and(|s| s.state != AgentState::Idle && s.state != AgentState::Exited))
+}
+
+fn refusal(e: &anyhow::Error) -> Option<String> {
+    e.downcast_ref::<crate::agents::Refused>().map(|r| r.0.clone())
+}
+
+/// Take a run from pending to its outcome: wait in line, check again, start fresh if asked,
+/// send, wait for the reply.
 async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
     let sched = &hub.schedules;
     let Some(s) = sched.get(run.schedule_id) else { return Ok(()) };
     let Some(agent) = hub.agents().by_id(s.agent_id) else {
         return finish(hub, &s, &mut run, Outcome::Failed, Some("its agent was removed".into()));
     };
+    let line = sched.line(agent.id);
     // Already sent (a restart while it waited for the reply): just wait.
-    if run.msg_id.is_none() {
-        let previous = hub.store().pending_runs()?.iter().any(|r| r.schedule_id == run.schedule_id && r.id < run.id);
-        if let Gate::Skip(why) = plan::gate(previous, false, 0) {
-            return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
+    if run.msg_id.is_some() {
+        let _line = line.lock_owned().await;
+        return wait_reply(hub, &s, &mut run).await;
+    }
+    if let Gate::Skip(why) = plan::gate(previous_running(hub, run.schedule_id, run.id)?, false, 0) {
+        return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
+    }
+    if run.kind == RunKind::CatchUp {
+        let mut last = sched.catchup.lock().await;
+        let gap = catchup_gap_ms();
+        let at = last.map_or(sched.started_at() + gap, |t| t + gap).max(sched.started_at() + gap);
+        let wait = at - sched.now();
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_millis(wait as u64)).await;
         }
-        if run.kind == RunKind::CatchUp {
-            let mut last = sched.catchup.lock().await;
-            let gap = catchup_gap_ms();
-            let at = last.map_or(sched.started_at() + gap, |t| t + gap).max(sched.started_at() + gap);
-            let wait = at - sched.now();
-            if wait > 0 {
-                tokio::time::sleep(Duration::from_millis(wait as u64)).await;
-            }
-            *last = Some(sched.now());
-        }
-        // One run at a time per agent, waiting in line behind its other work.
-        let line = sched.line(agent.id);
-        let deadline = run.started_at + plan::LINE_WAIT_MS;
-        let left = |now: i64| Duration::from_millis((deadline - now).max(0) as u64);
-        // Held until the reply (or the end of the wait for it).
-        let _line = match tokio::time::timeout(left(sched.now()), line.lock_owned()).await {
-            Ok(g) => g,
-            Err(_) => return finish(hub, &s, &mut run, Outcome::Skipped, plan_skip(plan::gate(false, true, plan::LINE_WAIT_MS))),
-        };
-        let mut rx = hub.subscribe();
-        loop {
-            let busy = agent_busy(hub, agent.id);
-            match plan::gate(false, busy.is_some(), sched.now() - run.started_at) {
-                Gate::Go => break,
-                Gate::Skip(why) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
-                Gate::Wait => {
-                    if let Some(sid) = busy {
-                        crate::mcp::wait::next_change(&mut rx, sid, left(sched.now()).min(Duration::from_secs(5))).await;
-                    }
+        *last = Some(sched.now());
+    }
+    // One run at a time per agent, waiting in line behind its other work.
+    let deadline = run.started_at + plan::LINE_WAIT_MS;
+    let left = |now: i64| Duration::from_millis((deadline - now).max(0) as u64);
+    // Held until the reply (or the end of the wait for it).
+    let _line = match tokio::time::timeout(left(sched.now()), line.lock_owned()).await {
+        Ok(g) => g,
+        Err(_) => return finish(hub, &s, &mut run, Outcome::Skipped, Some("busy: the agent was busy for an hour".into())),
+    };
+    let mut rx = hub.subscribe();
+    let (s, d) = loop {
+        let busy = agent_busy(hub, agent.id);
+        match plan::gate(false, busy.is_some(), sched.now() - run.started_at) {
+            Gate::Go => {}
+            Gate::Skip(why) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
+            Gate::Wait => {
+                if let Some(sid) = busy {
+                    crate::mcp::wait::next_change(&mut rx, sid, left(sched.now()).min(Duration::from_secs(5))).await;
                 }
+                continue;
             }
         }
-        // The schedule may have changed (or gone) while it waited.
+        // It may have waited a while: the schedule (or its agent, the settings) may have
+        // changed. An automatic run checks its rules again; Run now is the human's call.
         let Some(s) = sched.get(run.schedule_id) else { return Ok(()) };
         let Some(agent) = hub.agents().by_id(s.agent_id) else {
             return finish(hub, &s, &mut run, Outcome::Failed, Some("its agent was removed".into()));
         };
-        if s.conversation == Conversation::Fresh {
-            // Between turns (checked above), so this never cuts into the human's own turn.
-            if let Err(e) = crate::agents::start(hub, &agent.name, true, None).await {
-                return finish(hub, &s, &mut run, Outcome::Failed, Some(format!("couldn't start a fresh conversation: {e:#}")));
+        if run.kind != RunKind::Manual {
+            let settings = sched.settings();
+            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), runs_today(hub, s.id)?) {
+                Some(Action::Skip(why)) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
+                Some(Action::Refuse(why)) => return finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
+                _ => {}
             }
         }
         let tz = super::cron::zone(&s.tz).unwrap_or(jiff::tz::TimeZone::UTC);
         let (last_run, last_reply) = hub.store().last_runs_for_prompt(s.id, run.id)?;
         let text = plan::fill_prompt(&s.prompt, &tz, run.slot, last_run, last_reply.as_deref());
-        let sent = crate::agents::send_checked(hub, &agent, text, sender(s.id), None, None, Some(Origin::Schedule)).await;
-        match sent {
-            Ok((d, _)) => {
-                run.msg_id = Some(d.msg_id);
-                hub.store().update_run(&run)?;
-                publish_run(hub, &run);
-            }
+        // Every delivery check before anything is restarted: a refused run leaves the agent's
+        // conversation as it was.
+        let route = match crate::agents::precheck(hub, &agent, &text, &sender(s.id), None, None, Some(Origin::Schedule)) {
+            Ok(r) => r,
             Err(e) => {
-                let refused = e.downcast_ref::<crate::agents::Refused>().map(|r| r.0.clone());
-                return match refused {
+                return match refusal(&e) {
+                    Some(why) => finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
+                    None => finish(hub, &s, &mut run, Outcome::Failed, Some(format!("{e:#}"))),
+                };
+            }
+        };
+        if s.conversation == Conversation::Fresh {
+            // Checked again under the start lock, together with the restart: never while the
+            // agent is in a turn, and never within two minutes of (or since this check of) the
+            // human typing into it.
+            let seen = agent.session_id.and_then(|sid| hub.human_input_of(sid));
+            let quiet_human = seen.is_none_or(|(_, at)| at.elapsed() >= HUMAN_QUIET);
+            let ok = |info: &SessionInfo| quiet_human && !session_busy(info) && hub.human_input_of(info.id) == seen;
+            match crate::agents::start_fresh_if(hub, &agent.name, &ok).await {
+                Ok(_) => {}
+                Err(e) if e.downcast_ref::<crate::agents::NotIdle>().is_some() => {
+                    // Back in line: the hour still counts.
+                    match agent.session_id {
+                        Some(sid) => crate::mcp::wait::next_change(&mut rx, sid, left(sched.now()).min(Duration::from_secs(5))).await,
+                        None => tokio::time::sleep(Duration::from_secs(1)).await,
+                    }
+                    if sched.now() - run.started_at >= plan::LINE_WAIT_MS {
+                        return finish(hub, &s, &mut run, Outcome::Skipped, Some("busy: you were using the agent, so no fresh conversation started within the hour".into()));
+                    }
+                    continue;
+                }
+                Err(e) => return finish(hub, &s, &mut run, Outcome::Failed, Some(format!("couldn't start a fresh conversation: {e:#}"))),
+            }
+        }
+        let out = crate::agents::Outgoing { agent: agent.name.clone(), text, from: sender(s.id), from_session: None, route };
+        match crate::agents::deliver(hub, out).await {
+            Ok(d) => break (s, d),
+            Err(e) => {
+                return match refusal(&e) {
                     Some(why) => finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
                     None => finish(hub, &s, &mut run, Outcome::Failed, Some(format!("{e:#}"))),
                 };
             }
         }
-        return wait_reply(hub, &s, &mut run).await;
-    }
-    let line = sched.line(agent.id);
-    let _line = line.lock_owned().await;
+    };
+    run.msg_id = Some(d.msg_id);
+    hub.store().update_run(&run)?;
+    publish_run(hub, &run);
     wait_reply(hub, &s, &mut run).await
-}
-
-fn plan_skip(g: Gate) -> Option<String> {
-    match g {
-        Gate::Skip(why) => Some(why),
-        _ => None,
-    }
 }
 
 async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Result<()> {
@@ -285,12 +351,13 @@ async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Resu
     let Some(sid) = m.to_session else {
         return finish(hub, s, run, Outcome::Failed, Some("its message reached no session".into()));
     };
-    let left = (run.started_at + plan::LINE_WAIT_MS + plan::RUN_TIMEOUT_MS - hub.schedules.now()).max(60_000);
+    // The hour for the reply counts from when the message was sent, across restarts.
+    let left = (m.created_at + plan::RUN_TIMEOUT_MS - now_ms()).max(1000);
     let mut rx = hub.subscribe();
     let waited = crate::agents::wait_for_reply(
         &mut rx,
         sid,
-        Duration::from_millis(left.min(plan::RUN_TIMEOUT_MS) as u64),
+        Duration::from_millis(left as u64),
         || hub.session(sid),
         || hub.agents().msg_status(hub.store(), msg),
     )
@@ -375,9 +442,11 @@ fn fmt_local(ms: i64) -> String {
     super::cron::format(&jiff::tz::TimeZone::system(), ms, "%a %-d %b at %H:%M")
 }
 
-/// At start: runs a previous backend left pending. One whose message was sent waits for its
-/// reply again; one that was still in line goes back in line until its hour is up (its message
-/// is looked up first, in case the backend stopped right after sending it).
+/// At start: runs a previous backend left pending. One whose message was typed waits for its
+/// reply again (until an hour after it was sent); one whose message was recorded but is in no
+/// prompt queue and was never typed (the backend stopped in between) failed; one that was still
+/// in line goes back in line until its hour is up (its message is looked up first, in case the
+/// backend stopped right after sending it).
 pub fn recover(hub: &Arc<Hub>) {
     let pending = match hub.store().pending_runs() {
         Ok(p) => p,
@@ -390,12 +459,19 @@ pub fn recover(hub: &Arc<Hub>) {
     for mut run in pending {
         let Some(s) = hub.schedules.get(run.schedule_id) else { continue };
         if run.msg_id.is_none()
-            && let Ok(Some(m)) = hub.store().find_agent_message_from(s.agent_id, &sender(s.id), run_started_real(hub, &run))
+            && let Ok(Some(m)) = hub.store().find_agent_message_from(s.agent_id, &super::run::sender(s.id), run_started_real(hub, &run))
         {
             run.msg_id = Some(m);
             let _ = hub.store().update_run(&run);
         }
-        if run.msg_id.is_none() && now - run.started_at >= plan::LINE_WAIT_MS {
+        if let Some(msg) = run.msg_id {
+            let st = hub.agents().msg_status(hub.store(), msg);
+            if st.delivered_at.is_none() && st.reply.is_none() && !crate::inject::holds_message(hub, msg) {
+                let _ = finish(hub, &s, &mut run, Outcome::Failed,
+                    Some("Muster stopped before the message was typed; nothing reached the agent".into()));
+                continue;
+            }
+        } else if now - run.started_at >= plan::LINE_WAIT_MS {
             let _ = finish(hub, &s, &mut run, Outcome::Skipped, Some("Muster restarted while it waited in line".into()));
             continue;
         }

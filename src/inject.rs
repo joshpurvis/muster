@@ -278,6 +278,13 @@ pub fn restore(hub: &Hub) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Is agent message `msg` still in a prompt queue (waiting, or being typed)?
+pub fn holds_message(hub: &Hub, msg: i64) -> bool {
+    let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
+    hub.injection.inner.lock().values()
+        .any(|q| q.items.iter().any(is) || q.active.as_ref().is_some_and(|a| is(&a.item)))
+}
+
 pub fn paused(hub: &Hub) -> Vec<SessionId> {
     hub.injection.inner.lock().iter().filter(|(_, queue)| queue.blocked)
         .map(|(id, _)| *id).collect()

@@ -329,6 +329,9 @@ pub(crate) struct HumanInputQueue {
     /// Per session, the first and last sequence number of its uncommitted keystrokes.
     pending: Mutex<BTreeMap<SessionId, (u64, u64)>>,
     wake: parking_lot::Condvar,
+    /// Per session, the sequence number and time of its newest keystroke (memory only): a
+    /// schedule's fresh restart never wipes what the human is typing (`human_input_of`).
+    latest: Mutex<HashMap<SessionId, (u64, std::time::Instant)>>,
 }
 
 impl HumanInputQueue {
@@ -336,6 +339,7 @@ impl HumanInputQueue {
         let mut pending = self.pending.lock();
         // Numbered under the lock, so a later number is never recorded before an earlier one.
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.latest.lock().insert(id, (seq, std::time::Instant::now()));
         match pending.entry(id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((seq, seq));
@@ -3536,6 +3540,12 @@ impl Hub {
     /// request arrives: keystrokes numbered later came after it.
     pub fn human_input_seq(&self) -> u64 {
         self.human_input.now()
+    }
+
+    /// The sequence number and time of the human's newest keystroke into session `id` (None:
+    /// none since this backend started).
+    pub fn human_input_of(&self, id: SessionId) -> Option<(u64, std::time::Instant)> {
+        self.human_input.latest.lock().get(&id).copied()
     }
 
     /// A legacy HTTP callback that arrived when the human-input sequence was at `arrival`.

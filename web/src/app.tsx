@@ -20,6 +20,7 @@ import {
   focusedSession,
   focusedTabId,
   helloDone,
+  helloEpoch,
   hereIds,
   layout,
   meta,
@@ -162,6 +163,7 @@ rpc.start();
   schedules,
   scheduleRuns,
   scheduleSettings,
+  helloEpoch,
   fullscreen,
   prefs,
   termText: (sid: number) => {

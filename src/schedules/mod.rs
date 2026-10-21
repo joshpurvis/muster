@@ -154,6 +154,8 @@ pub struct Schedule {
     pub next_run: Option<i64>,
     /// The newest slot handled (run or skipped).
     pub last_slot: Option<i64>,
+    /// The newest slot that ran (the 15-minute floor counts from it).
+    pub last_fired: Option<i64>,
     /// Start of the 7-day window of a Claude subscription agent's recurring schedule.
     pub renewed_at: i64,
     /// The "expires tomorrow" notice was given for this window.
@@ -181,6 +183,7 @@ impl Default for Schedule {
             skip_slot: None,
             next_run: None,
             last_slot: None,
+            last_fired: None,
             renewed_at: 0,
             expiry_warned: false,
             created_at: 0,
@@ -367,6 +370,8 @@ pub struct Schedules {
     catchup: tokio::sync::Mutex<Option<i64>>,
     /// When this backend's scheduler started (scheduler clock).
     started_at: std::sync::atomic::AtomicI64,
+    /// Schedules already announced as expired (`run::tick`), so clients hear of it once.
+    pub(crate) expired_seen: Mutex<std::collections::HashSet<i64>>,
 }
 
 impl Schedules {
@@ -382,6 +387,7 @@ impl Schedules {
             agent_lines: Default::default(),
             catchup: Default::default(),
             started_at: started_at.into(),
+            expired_seen: Default::default(),
         })
     }
 
@@ -430,10 +436,20 @@ impl Schedules {
     }
 }
 
-/// Facts about a schedule's agent that the rules read.
-pub fn facts(agent: &Agent) -> Facts {
+/// Facts about a schedule's agent that the rules read. A Claude agent counts as on its
+/// subscription when either its record or its running process says so: a switch to OpenRouter
+/// only takes effect at the next start, and until then the subscription's rules (expiry, quiet
+/// hours by default) still apply.
+pub fn facts(hub: &Hub, agent: &Agent) -> Facts {
+    use crate::openrouter::Provider;
+    let running = agent
+        .session_id
+        .and_then(|s| hub.session(s))
+        .filter(|s| s.state != AgentState::Exited)
+        .map(|s| s.provider);
     Facts {
-        subscription_claude: agent.kind == SessionKind::Claude && agent.provider == crate::openrouter::Provider::Subscription,
+        subscription_claude: agent.kind == SessionKind::Claude
+            && (agent.provider == Provider::Subscription || running == Some(Provider::Subscription)),
     }
 }
 
@@ -447,7 +463,7 @@ fn quiet_of(settings: &Settings) -> Quiet {
 pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
     let agent = hub.agents().by_id(s.agent_id);
     let now = hub.schedules.now();
-    let f = agent.as_ref().map(facts).unwrap_or_default();
+    let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
     let expires_at = plan::expires_at(s, &f);
     let expired = expires_at.is_some_and(|e| now >= e);
     let status = if expired {
@@ -543,6 +559,50 @@ fn publish_run(hub: &Hub, r: &Run) {
 
 // ----- operations (RPC and CLI) -----
 
+/// `when` as clients send it: a cron line, or once at a unix ms or at a wall-clock time
+/// (`YYYY-MM-DDTHH:MM`) read in the schedule's time zone.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WhenInput {
+    Cron { cron: String },
+    Once {
+        #[serde(default)]
+        at: Option<i64>,
+        #[serde(default)]
+        local: Option<String>,
+    },
+}
+
+impl WhenInput {
+    /// The stored `When`, with a local time converted in `tz` (a time skipped by a
+    /// daylight-saving change moves after it, as cron times do).
+    pub fn resolve(&self, tz: &str) -> anyhow::Result<When> {
+        match self {
+            WhenInput::Cron { cron } => Ok(When::Cron { cron: cron.clone() }),
+            WhenInput::Once { at: Some(at), local: None } => Ok(When::Once { at: *at }),
+            WhenInput::Once { at: None, local: Some(l) } => {
+                let zone = cron::zone(tz).map_err(anyhow::Error::msg)?;
+                let dt: jiff::civil::DateTime = l.trim().replacen(' ', "T", 1).parse()
+                    .map_err(|_| anyhow::anyhow!("`{l}` isn't a date and time: use YYYY-MM-DDTHH:MM"))?;
+                let at = zone.to_ambiguous_timestamp(dt).compatible()
+                    .map_err(|e| anyhow::anyhow!("`{l}` in {tz}: {e}"))?;
+                Ok(When::Once { at: at.as_millisecond() })
+            }
+            WhenInput::Once { .. } => anyhow::bail!("a one-off needs exactly one of `at` (unix ms) or `local` (YYYY-MM-DDTHH:MM)"),
+        }
+    }
+}
+
+/// Two timings that fire at the same times in `tz` (`@daily` is `0 0 * * *`).
+fn same_timing(a: &When, b: &When) -> bool {
+    match (a, b) {
+        (When::Cron { cron: x }, When::Cron { cron: y }) => {
+            x.trim() == y.trim() || matches!((cron::Cron::parse(x), cron::Cron::parse(y)), (Ok(p), Ok(q)) if p == q)
+        }
+        _ => a == b,
+    }
+}
+
 /// Where replies also go: an existing note, or one found (or made) by its title.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -564,7 +624,7 @@ pub struct ScheduleInput {
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
-    pub when: Option<When>,
+    pub when: Option<WhenInput>,
     #[serde(default)]
     pub tz: Option<String>,
     #[serde(default)]
@@ -641,9 +701,9 @@ pub fn first_slot(when: &When, tz: &str, now: i64) -> anyhow::Result<Option<i64>
 }
 
 /// The agent may take scheduled work (the same rule the delivery check applies).
-fn check_agent(agent: &Agent) -> anyhow::Result<()> {
+fn check_agent(hub: &Hub, agent: &Agent) -> anyhow::Result<()> {
     if !agent.accepts_origins.contains(&Origin::Schedule) {
-        let extra = if facts(agent).subscription_claude {
+        let extra = if facts(hub, agent).subscription_claude {
             " Claude subscription agents take scheduled work only if you opt in (read the warning there first); \
               a Codex or OpenRouter agent is the better fit."
         } else {
@@ -676,10 +736,11 @@ fn resolve_note(hub: &Hub, choice: &NoteChoice) -> anyhow::Result<NoteId> {
 pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
     let name = req.agent.as_deref().context("agent is required")?;
     let agent = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
-    check_agent(&agent)?;
+    check_agent(hub, &agent)?;
     let prompt = clean_prompt(req.prompt.as_deref().context("prompt is required")?)?;
     let when = req.when.context("when is required: {\"kind\":\"cron\",\"cron\":\"0 9 * * 1-5\"} or {\"kind\":\"once\",\"at\":<unix ms>}")?;
     let tz = req.tz.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).unwrap_or_else(cron::local_zone_name);
+    let when = when.resolve(&tz)?;
     let now = hub.schedules.now();
     let next = first_slot(&when, &tz, now)?;
     ensure!(hub.schedules.inner.lock().list.len() < MAX_SCHEDULES, "Muster already has {MAX_SCHEDULES} schedules; remove some first");
@@ -691,7 +752,7 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         Some(c) => Some(resolve_note(hub, &c)?),
         None => None,
     };
-    let f = facts(&agent);
+    let f = facts(hub, &agent);
     let mut s = Schedule {
         id: 0,
         agent_id: agent.id,
@@ -710,6 +771,7 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         skip_slot: None,
         next_run: next,
         last_slot: None,
+        last_fired: None,
         renewed_at: now,
         expiry_warned: false,
         created_at: now,
@@ -741,14 +803,17 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         if req.name.is_some() || req.prompt.is_some() {
             s.name = clean_name(req.name.as_deref().or(Some(&s.name)), &s.prompt)?;
         }
-        let when_changed = req.when.as_ref().is_some_and(|w| *w != s.when) || req.tz.as_ref().is_some_and(|t| t.trim() != s.tz);
-        if let Some(w) = req.when.clone() {
-            s.when = w;
-        }
-        if let Some(t) = &req.tz {
-            s.tz = t.trim().to_string();
-        }
+        let tz = req.tz.as_deref().map(str::trim).unwrap_or(&s.tz).to_string();
+        let when = match &req.when {
+            Some(w) => w.resolve(&tz)?,
+            None => s.when.clone(),
+        };
+        // Compared by what it does: re-sending the same timing (or `@daily` for `0 0 * * *`)
+        // keeps the next run and Skip next as they are.
+        let when_changed = !same_timing(&when, &s.when) || tz != s.tz;
         if when_changed {
+            s.when = when;
+            s.tz = tz;
             s.next_run = first_slot(&s.when, &s.tz, now)?;
             s.skip_slot = None;
         }
@@ -847,6 +912,7 @@ pub fn renew(hub: &Hub, id: i64) -> anyhow::Result<Value> {
         }
         Ok(())
     })?;
+    hub.schedules.expired_seen.lock().remove(&id);
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
@@ -876,8 +942,9 @@ pub fn runs(hub: &Hub, id: i64, before: Option<i64>, limit: Option<usize>) -> an
 }
 
 /// `schedule.preview`: the reading and the next runs of `when`, without saving anything.
-pub fn preview(hub: &Hub, when: &When, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>) -> anyhow::Result<Value> {
+pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>) -> anyhow::Result<Value> {
     let tz = tz.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(cron::local_zone_name);
+    let when = &when.resolve(&tz)?;
     let now = hub.schedules.now();
     let first = first_slot(when, &tz, now)?;
     let zone = cron::zone(&tz).map_err(anyhow::Error::msg)?;
@@ -898,7 +965,7 @@ pub fn preview(hub: &Hub, when: &When, tz: Option<&str>, quiet_hours: Option<boo
         Some(n) => Some(hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?),
         None => None,
     };
-    let f = agent.as_ref().map(facts).unwrap_or_default();
+    let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
     let quiet_on = quiet_hours.unwrap_or(f.subscription_claude);
     let quiet = quiet_of(&hub.schedules.settings());
     let probe = Schedule { when: when.clone(), tz: tz.clone(), ..Default::default() };
@@ -909,6 +976,7 @@ pub fn preview(hub: &Hub, when: &When, tz: Option<&str>, quiet_hours: Option<boo
     Ok(json!({
         "reading": reading,
         "tz": tz,
+        "when": when,
         "next": next,
         "quiet": next.iter().map(|t| quiet_on && quiet.contains(*t)).collect::<Vec<_>>(),
         "quiet_hours_default": f.subscription_claude,
@@ -970,7 +1038,7 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
 pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
     let s = hub.schedules.get(id).with_context(|| format!("no schedule {id}"))?;
     let agent = hub.agents().by_id(s.agent_id).context("this schedule's agent was removed")?;
-    check_agent(&agent)?;
+    check_agent(hub, &agent)?;
     let now = hub.schedules.now();
     let mut r = Run {
         id: 0,
@@ -984,7 +1052,7 @@ pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
         finished_at: None,
     };
     // The busy rule, answered now: the same schedule's previous run is still going.
-    if hub.store().pending_runs()?.iter().any(|p| p.schedule_id == id)
+    if run::previous_running(hub, id, i64::MAX)?
         && let plan::Gate::Skip(why) = plan::gate(true, false, 0)
     {
         r.outcome = Outcome::Skipped;

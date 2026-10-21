@@ -136,7 +136,8 @@ Recurring or one-off messages to a named agent (docs/PROTOCOL.md "Schedules", do
 panel"). Each run is an ordinary message with origin `schedule` at hop 0, so the agent must accept
 scheduled work (`muster agent edit <name> --accepts human,schedule`; a Codex agent does by
 default) and its caps apply. Only you make or change schedules: these commands are refused from an
-agent's session (a shell tab counts as you). Times print in this machine's zone.
+agent's session, or from a shell tab an agent spawned or typed into (any other shell tab counts as
+you). Times print in this machine's zone.
 
 | Command | What it does |
 |---|---|

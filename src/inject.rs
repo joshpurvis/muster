@@ -1266,7 +1266,7 @@ mod tests {
 
     fn panel_store() -> (crate::store::Store, Panel) {
         let store = crate::store::Store::open_memory().unwrap();
-        let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(), kit: false,
+        let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(), kit: false, notify_on_close: false,
             app: "markdown".into(), csp: Default::default(), revision: 1, data_revision: 1, html_revision: 1, created_at: 0,
             updated_at: 0, closed: false, context: None, dropped_events: 0 };
         store.create_panel(&mut panel, |_| Ok(())).unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
     fn moving_the_opener_returns_its_unsent_panel_batch() {
         let hub = hub_fixture();
         let id = crate::panels::open(&hub, 1, crate::panels::Open { title: "Review".into(), app: "markdown".into(),
-            data: None, html: None, html_path: None, csp: None, kit: None }).unwrap();
+            data: None, html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         crate::panels::event(&hub, id, "approve".into(), json!({})).unwrap();
         let panel = crate::panels::get(&hub, id).unwrap();
         let events = hub.store().panel_events(&panel).unwrap();

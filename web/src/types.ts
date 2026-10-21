@@ -437,6 +437,8 @@ export interface Panel {
   html_revision: number;
   /** A custom panel opened with `kit: true`: Muster puts the kit in front of its HTML. */
   kit?: boolean;
+  /** Opened with `notify_on_close: true`: closing it prompts the idle agent (absent from older backends). */
+  notify_on_close?: boolean;
   created_at: number;
   updated_at: number;
   closed: boolean;

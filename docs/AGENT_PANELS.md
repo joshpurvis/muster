@@ -91,6 +91,12 @@ the agent one of two ways:
   hunks; comments on src/auth.rs:40 ...`. The queue already handles busy agents, restarts and
   backend reloads.
 
+Only a user action starts that prompt. The user closing a panel queues a `closed` notice, which
+waits for a `wait_for_panel_event` or the next panel prompt instead of waking an idle agent
+(after hours idle, a prompt makes the agent re-read its whole conversation without the prompt
+cache). A panel opened with `notify_on_close: true` keeps the old behaviour: closing it prompts
+the idle agent ([MCP.md](MCP.md#panels)).
+
 An app can only send an event in direct response to the user (a click or key in the panel). A
 panel that renders a stranger's PR must not be able to type instructions to the agent on its own.
 

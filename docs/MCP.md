@@ -108,7 +108,7 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)) | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)), `notify_on_close?` (see below) | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
 | `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?`, `kit?` (custom only; switching it reloads the app) | `{note?}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
@@ -176,8 +176,21 @@ only while its opener is still in the panels' task and run: if the opener moves,
 restarts before the prompt is typed, its events go back to the panel queue. Once typing has
 begun the prompt is never resent; if its run then ends, a notice says the events may not have
 arrived. Clearing a session's prompt queue discards panel prompts in it. Shell, exited and
-moved-to-another-task openers keep events queued. A human closing a tab queues `closed`;
-agent `panel_close` does not. Archiving the task, including when its last session closes or
+moved-to-another-task openers keep events queued.
+
+Only a user action starts a panel prompt. A human closing a tab queues a `closed` event (agent
+`panel_close` queues nothing), but on its own it does not prompt an idle opener: typed into an
+agent that has been idle for hours, any prompt makes it read its whole conversation again with
+its prompt cache expired, which costs real usage for news it rarely needs. The notice waits in
+the queue: `wait_for_panel_event` returns it, and it comes along in the next panel prompt that a
+real user action starts for that opener (it does not ride on other prompts, such as messages
+from agents or the human). A closed panel drops out of `list_panels`. Open a panel with
+`notify_on_close: true` when closing it means something (a "pick one" panel where closing is the
+answer "none"): then the `closed` event prompts the idle opener like a click. No built-in sets
+it; closing a `pr_decision` or `pr_overview` panel is not a decision. The `overflow` notice
+never starts a prompt either (it only accompanies real events). At startup, Muster forgets a
+closed panel whose queue holds only such notices once it was closed more than 7 days ago.
+Archiving the task, including when its last session closes or
 moves out, removes panels, files and events.
 
 #### The kit (`kit: true`)

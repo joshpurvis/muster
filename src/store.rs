@@ -714,6 +714,12 @@ impl Store {
         Ok(())
     }
 
+    /// Does the panel keep events a placeholder announced, for `panel_event`?
+    pub fn panel_has_parked_events(&self, panel: PanelId) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().query_row("SELECT EXISTS (SELECT 1 FROM panel_events WHERE panel_id=?1 AND parked=1)",
+            [panel], |r| r.get(0))?)
+    }
+
     /// Closed panels with nothing left to deliver or fetch.
     pub fn idle_closed_panels(&self) -> anyhow::Result<Vec<PanelId>> {
         let conn = self.conn.lock();

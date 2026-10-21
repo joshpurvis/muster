@@ -494,6 +494,14 @@ exec cat > /dev/null
   for (let n = 0; n < 100; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (injected.includes("approved from panel")) break; await sleep(100); }
   ok(injected.includes('[panel "Idle delivery" #') && injected.includes("approved from panel"), "idle agent stand-in receives the marked panel prompt");
   ok((await mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 0 })).timed_out, "injected event is not returned again by wait");
+  // The user closing a panel is only a notice: no prompt of its own, it rides with the next one.
+  const dismissed = (await mcp(fakeToken, "panel_open", { title: "Dismissed", app: "markdown" })).panel_id;
+  await c.call("panel.dismiss", { id: dismissed });
+  await sleep(1200);
+  ok(!(await Deno.readTextFile(`${BASE}/fake-input`)).includes('"kind":"closed"'), "closing a panel does not prompt the idle agent");
+  await c.call("panel.event", { panel_id: fakePanel, kind: "approve", payload: { message: "after the close" } });
+  for (let n = 0; n < 100; n++) { injected = await Deno.readTextFile(`${BASE}/fake-input`); if (injected.includes("after the close")) break; await sleep(100); }
+  ok(injected.includes('[panel "Dismissed" #') && injected.includes('"kind":"closed"') && injected.includes("after the close"), "the close notice comes with the next panel prompt");
   // Three ~9 KiB comments exceed one 24 KiB prompt: each arrives whole, over two prompts.
   const tails = [0, 1, 2].map((n) => `END-OF-COMMENT-${n}`);
   for (const tail of tails) await c.call("panel.event", { panel_id: fakePanel, kind: "comment", payload: { text: "x".repeat(9000) + tail } });

@@ -1467,6 +1467,12 @@ impl Hub {
         }
     }
 
+    /// Tests: put a restored (exited) session in another state without a terminal.
+    #[cfg(test)]
+    pub(crate) fn set_state_for_test(&self, id: SessionId, state: AgentState) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.info.state = state; }
+    }
+
     /// Mutate a session's info under the lock, persist, broadcast.
     fn update_session_info(&self, id: SessionId, f: impl FnOnce(&mut SessionInfo)) -> anyhow::Result<SessionInfo> {
         self.update_session_info_checked(id, None, f)

@@ -99,6 +99,11 @@ pub struct Panel {
     /// (src/panel_kit.rs). False in records from before it existed.
     #[serde(default)]
     pub kit: bool,
+    /// Opened with `notify_on_close: true`: the user closing it is news worth a prompt to the
+    /// idle opener. Without it the `closed` notice waits for the next panel prompt or a wait
+    /// (src/panels.rs `wakes`). False in records from before it existed.
+    #[serde(default)]
+    pub notify_on_close: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub closed: bool,

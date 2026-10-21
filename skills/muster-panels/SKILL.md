@@ -17,8 +17,11 @@ the same as the tools.)
 
 ## Tools
 
-- `panel_open {title, app, data?, html?, html_path?, csp?, kit?}` → `{panel_id}`. A refused call
-  names the bad field: fix it and call again.
+- `panel_open {title, app, data?, html?, html_path?, csp?, kit?, notify_on_close?}` →
+  `{panel_id}`. A refused call names the bad field: fix it and call again. The user closing a
+  panel does not prompt you: its `closed` event comes with the next panel prompt or
+  `wait_for_panel_event`. Pass `notify_on_close: true` only when closing it is an answer you
+  must act on (closing a `pr_decision` panel is not a decision).
 - `panel_update {panel_id, data?, title?, html?, html_path?, kit?}`: `data` replaces the whole
   input, so send every field; the app updates in place.
 - `panel_close {panel_id}`, `list_panels {}`.

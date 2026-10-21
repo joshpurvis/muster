@@ -53,6 +53,9 @@ pub struct Open {
     /// Custom apps only: put the Muster Kit (kit.css, kit.js and the fonts) in front of the
     /// HTML when it is served. It does not count toward the 1 MiB.
     pub kit: Option<bool>,
+    /// The user closing this panel wakes the idle opener with a `closed` prompt, as a click
+    /// would. Off by default: a close is then only a notice (see [`wakes`]).
+    pub notify_on_close: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -229,7 +232,7 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
         let now = now_ms();
         let mut panel = Panel { id: 0, channel_id: ch.id, session_id: s.id, window_id: s.window_id.or(ch.window_id),
             title, app: args.app, csp, revision: 1, data_revision: 1, html_revision: 1, kit: args.kit == Some(true),
-            created_at: now, updated_at: now, closed: false, context: None, dropped_events: 0 };
+            notify_on_close: args.notify_on_close == Some(true), created_at: now, updated_at: now, closed: false, context: None, dropped_events: 0 };
         let mut placed = None;
         let created = hub.store().create_panel(&mut panel, |p| {
             // No committed row names this id, so anything there is a leftover of a failed
@@ -486,8 +489,9 @@ pub fn archive(hub: &Hub, channel: ChannelId) -> anyhow::Result<()> {
 }
 
 /// At startup, before any UI or delivery: finish interrupted archives, forget closed panels
-/// with nothing left to deliver, and remove files no committed record names (staged writes,
-/// old revisions, closed or deleted panels).
+/// with nothing left to deliver (or, after [`NOTICE_KEEP_MS`], only notices nothing asked for),
+/// and remove files no committed record names (staged writes, old revisions, closed or deleted
+/// panels).
 pub fn recover(hub: &Hub) -> anyhow::Result<()> {
     for panel in list(hub)? {
         if hub.channel(panel.channel_id).is_none_or(|c| c.archived) { archive(hub, panel.channel_id)?; }
@@ -495,6 +499,12 @@ pub fn recover(hub: &Hub) -> anyhow::Result<()> {
     let queued = crate::inject::queued_panel_ids(hub);
     for id in hub.store().idle_closed_panels()? {
         if !queued.contains(&id) { hub.store().delete_panel(id)?; }
+    }
+    let stale = now_ms() - NOTICE_KEEP_MS;
+    for p in list(hub)?.into_iter().filter(|p| p.closed && p.updated_at < stale && !queued.contains(&p.id)) {
+        if !hub.store().panel_has_parked_events(p.id)? && hub.store().panel_events(&p)?.iter().all(|e| !wakes(&p, e)) {
+            hub.store().delete_panel(p.id)?;
+        }
     }
     let panels: BTreeMap<PanelId, Panel> = list(hub)?.into_iter().map(|p| (p.id, p)).collect();
     let Ok(entries) = std::fs::read_dir(hub.store().panels_root()) else { return Ok(()) };
@@ -600,10 +610,37 @@ pub fn fetch_event(hub: &Hub, session: SessionId, panel: PanelId, event: i64) ->
     }
 }
 
+/// Does this queued event justify typing a prompt into an idle opener? Real user actions do.
+/// Notices Muster queues on its own do not: the user closing a panel opened without
+/// `notify_on_close`, and the `overflow` count (which only ever accompanies real events). A
+/// prompt typed into an agent idle for longer than its model's prompt cache lasts makes it read
+/// its whole conversation again, uncached, for news it rarely needs. Such notices stay queued
+/// and go with the next panel prompt for that agent, or to `wait_for_panel_event`.
+pub(crate) fn wakes(panel: &Panel, event: &PanelEvent) -> bool {
+    match event.kind.as_str() {
+        "closed" => panel.notify_on_close,
+        "overflow" => false,
+        _ => true,
+    }
+}
+
+/// How long a closed panel whose queue holds only notices (see [`wakes`]) is kept for a wait or
+/// a later panel prompt; the startup sweep forgets it after that.
+const NOTICE_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 /// Called without an await under the operation lock. Queue acceptance and event removal
 /// commit together; waits never observe events which were already accepted for injection.
+/// A session is prompted only when one of its panels has an event that [`wakes`] it; the
+/// prompt then carries every queued event of its panels, notices included.
 pub fn deliver_pending(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let _op = hub.panels.operations.lock();
+    for (session, panels) in due(hub)? { crate::inject::enqueue_panels(hub, session, &panels)?; }
+    Ok(())
+}
+
+/// The panel prompts due now, per idle opener, with each panel's queued events. Called under
+/// the operation lock.
+fn due(hub: &Hub) -> anyhow::Result<BTreeMap<SessionId, Vec<(Panel, Vec<PanelEvent>)>>> {
     let panels = list(hub)?;
     // Only a wait still bound to its caller's task and run holds events back.
     let waits: Vec<WaitReg> = hub.panels.waiters.lock().values().copied().collect();
@@ -617,8 +654,8 @@ pub fn deliver_pending(hub: &Arc<Hub>) -> anyhow::Result<()> {
         let events = hub.store().panel_events(&p)?;
         if !events.is_empty() { batches.entry(s.id).or_default().push((p, events)); }
     }
-    for (session, panels) in batches { crate::inject::enqueue_panels(hub, session, &panels)?; }
-    Ok(())
+    batches.retain(|_, panels| panels.iter().any(|(p, events)| events.iter().any(|e| wakes(p, e))));
+    Ok(batches)
 }
 
 pub fn spawn(hub: Arc<Hub>) {
@@ -686,7 +723,10 @@ mod tests {
     use super::*;
     use crate::store::{Store, StoredSession};
 
-    fn fixture() -> Arc<Hub> {
+    fn fixture() -> Arc<Hub> { fixture_with(SessionKind::Shell) }
+
+    /// Each task's session is an idle agent of `kind`.
+    fn fixture_with(kind: SessionKind) -> Arc<Hub> {
         let store = Store::open_memory().unwrap();
         store.insert_workspace("test", "/tmp", false, 0).unwrap();
         store.upsert_window(1, "1", 0, 0).unwrap();
@@ -697,15 +737,18 @@ mod tests {
             let mut info = crate::mcp::guard::test_session(0, None);
             info.channel_id = ch;
             info.window_id = Some(1);
+            info.kind = kind;
             store.insert_session(&StoredSession { info, extra_args: vec![] }).unwrap();
         }
-        Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
-            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
+        let hub = Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
+            muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap();
+        if kind != SessionKind::Shell { for id in [1, 2] { hub.set_state_for_test(id, AgentState::Idle); } }
+        hub
     }
 
     fn markdown(hub: &Hub) -> PanelId {
         open(hub, 1, Open { title: "Review".into(), app: "markdown".into(), data: Some(json!({"markdown":"# Hello"})),
-            html: None, html_path: None, csp: None, kit: None }).unwrap()
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap()
     }
 
     #[test]
@@ -732,7 +775,7 @@ mod tests {
     #[test]
     fn only_changed_html_advances_html_revision() {
         let hub = fixture();
-        let id = open(&hub, 1, Open { title:"Custom".into(), app:"custom".into(), data:None, html:Some("a".into()), html_path:None, csp:None, kit: None }).unwrap();
+        let id = open(&hub, 1, Open { title:"Custom".into(), app:"custom".into(), data:None, html:Some("a".into()), html_path:None, csp:None, kit: None, notify_on_close: None }).unwrap();
         for (html, expected) in [("a", 1), ("b", 3)] {
             update(&hub, 1, Update { panel_id:id, title:None, data:None, html:Some(html.into()), html_path:None, kit: None }).unwrap();
             assert_eq!(get(&hub, id).unwrap().html_revision, expected);
@@ -744,7 +787,7 @@ mod tests {
     fn the_kit_goes_in_front_of_custom_html_only_when_asked() {
         let hub = fixture();
         let custom = |kit: Option<bool>| Open { title: "Deploys".into(), app: "custom".into(), data: None, html: Some("<main class=\"mk-page\">hi</main>".into()),
-            html_path: None, csp: None, kit };
+            html_path: None, csp: None, kit, notify_on_close: None };
         let plain = open(&hub, 1, custom(None)).unwrap();
         assert!(!get(&hub, plain).unwrap().kit);
         assert_eq!(resource(&hub, plain).unwrap()["html"], "<main class=\"mk-page\">hi</main>");
@@ -775,11 +818,11 @@ mod tests {
         assert_eq!(resource(&hub, plain).unwrap()["html"], "<p>newer</p>");
         // Built-ins already use the kit: asking for it is refused, naming the field.
         let e = open(&hub, 1, Open { title: "C".into(), app: "chart".into(), data: Some(json!({"type":"bar","x":{"values":[]},"series":[]})),
-            html: None, html_path: None, csp: None, kit: Some(true) }).unwrap_err().to_string();
+            html: None, html_path: None, csp: None, kit: Some(true), notify_on_close: None }).unwrap_err().to_string();
         assert!(e.contains("kit applies to custom apps only"), "{e}");
         // A built-in's served HTML has its fonts in place of the marker.
         let chart = open(&hub, 1, Open { title: "C".into(), app: "chart".into(), data: Some(json!({"type":"bar","x":{"values":[]},"series":[]})),
-            html: None, html_path: None, csp: None, kit: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         let html = resource(&hub, chart).unwrap()["html"].as_str().unwrap().to_string();
         assert!(html.contains("@font-face{font-family:\"MK Inter\"") && !html.contains(crate::panel_kit::FONT_MARKER));
         // The proxy CSP lets those data: fonts load and still blocks the network.
@@ -917,7 +960,7 @@ mod tests {
     async fn web_previews_take_only_local_dev_servers() {
         let hub = fixture();
         hub.panels.port.store(40001, Ordering::Relaxed);
-        let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None, kit: None };
+        let preview = |url: &str| Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": url})), html: None, html_path: None, csp: None, kit: None, notify_on_close: None };
         let id = open(&hub, 1, preview("http://LOCALHOST:5173")).unwrap();
         assert_eq!(resource(&hub, id).unwrap()["data"], json!({"url": "http://localhost:5173/"}));
         for bad in ["https://github.com/", "http://127.0.0.1:40001/proxy", "http://localhost:5173@evil.example/", "http://[::1]:5173/"] {
@@ -949,7 +992,7 @@ mod tests {
         let hub = fixture();
         hub.panels.port.store(40001, Ordering::Relaxed);
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None, kit: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         assert_eq!(navigate(&hub, id, " 3000 ").unwrap(), ("http://localhost:3000/".to_string(), true));
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (2, 2), "stored like a data update");
@@ -983,7 +1026,7 @@ mod tests {
     async fn every_navigation_reaches_the_agent_past_the_app_event_limit() {
         let hub = fixture();
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None, kit: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         // The apps' limit is 30 events a minute; the user's own navigations are not app input.
         for n in 0..45 { assert!(navigate(&hub, id, &format!("{}", 3000 + n)).unwrap().1); }
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
@@ -998,7 +1041,7 @@ mod tests {
     async fn concurrent_navigations_queue_in_commit_order() {
         let hub = fixture();
         let id = open(&hub, 1, Open { title: "App".into(), app: "web_preview".into(), data: Some(json!({"url": "http://localhost:5173"})),
-            html: None, html_path: None, csp: None, kit: None }).unwrap();
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         let threads: Vec<_> = (0..4).map(|t| {
             let hub = hub.clone();
             std::thread::spawn(move || for n in 0..10 { let _ = navigate(&hub, id, &format!("{}", 3000 + t * 100 + n)); })
@@ -1032,10 +1075,10 @@ mod tests {
     fn open_panels_per_task_are_bounded() {
         let hub = fixture();
         for _ in 0..MAX_OPEN_PER_TASK { markdown(&hub); }
-        let err = open(&hub, 1, Open { title: "One more".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None }).unwrap_err();
+        let err = open(&hub, 1, Open { title: "One more".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap_err();
         assert!(err.to_string().contains("open panels"), "{err}");
         // Another task has its own allowance; closing one frees a slot.
-        open(&hub, 2, Open { title: "Other".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None }).unwrap();
+        open(&hub, 2, Open { title: "Other".into(), app: "markdown".into(), data: None, html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         close(&hub, Some(1), 1, false).unwrap();
         markdown(&hub);
         archive(&hub, 1).unwrap();
@@ -1129,6 +1172,73 @@ mod tests {
         // A single event larger than the budget still goes out whole.
         let (events, remaining) = take_events(std::slice::from_ref(&p), queued, 10);
         assert_eq!((events.len(), remaining), (1, 2));
+        archive(&hub, 1).unwrap();
+    }
+    fn kinds(due: &BTreeMap<SessionId, Vec<(Panel, Vec<PanelEvent>)>>, session: SessionId) -> Vec<(PanelId, String)> {
+        due.get(&session).into_iter().flatten().flat_map(|(p, events)| events.iter().map(|e| (p.id, e.kind.clone()))).collect()
+    }
+
+    #[tokio::test]
+    async fn a_close_alone_never_wakes_an_idle_agent() {
+        let hub = fixture_with(SessionKind::Claude);
+        assert_eq!(hub.session(1).unwrap().state, AgentState::Idle);
+        let id = markdown(&hub);
+        event(&hub, id, "approve".into(), json!({})).unwrap();
+        assert_eq!(kinds(&due(&hub).unwrap(), 1), [(id, "approve".to_string())], "a real event is due for the idle agent");
+        wait(&hub, 1, Some(id), 0).await.unwrap();
+        close(&hub, None, id, true).unwrap();
+        assert!(due(&hub).unwrap().is_empty(), "the user closing a panel does not prompt an idle agent");
+        assert_eq!(hub.store().panel_events(&get(&hub, id).unwrap()).unwrap().len(), 1, "the notice stays queued");
+        let out = wait(&hub, 1, None, 0).await.unwrap();
+        assert_eq!(out["events"][0]["kind"], "closed", "a wait still returns it");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn notify_on_close_keeps_the_close_prompt() {
+        let hub = fixture_with(SessionKind::Claude);
+        let id = open(&hub, 1, Open { title: "Pick one".into(), app: "markdown".into(), data: None, html: None,
+            html_path: None, csp: None, kit: None, notify_on_close: Some(true) }).unwrap();
+        assert!(get(&hub, id).unwrap().notify_on_close);
+        close(&hub, None, id, true).unwrap();
+        assert_eq!(kinds(&due(&hub).unwrap(), 1), [(id, "closed".to_string())]);
+        // The agent closing its own panel queues nothing, as before.
+        let own = markdown(&hub);
+        close(&hub, Some(1), own, false).unwrap();
+        assert!(hub.store().panel_events(&get(&hub, own).unwrap()).unwrap().is_empty());
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn a_real_event_carries_the_queued_closed_notices() {
+        let hub = fixture_with(SessionKind::Claude);
+        let (gone, live) = (markdown(&hub), markdown(&hub));
+        close(&hub, None, gone, true).unwrap();
+        assert!(due(&hub).unwrap().is_empty());
+        event(&hub, live, "approve".into(), json!({})).unwrap();
+        assert_eq!(kinds(&due(&hub).unwrap(), 1), [(gone, "closed".to_string()), (live, "approve".to_string())]);
+        // An overflow count alone is a notice too.
+        let p = get(&hub, live).unwrap();
+        assert!(!wakes(&p, &PanelEvent { id: 0, panel_id: live, kind: "overflow".into(), payload: json!({"dropped": 1}), at: 0, context: None }));
+        assert!(wakes(&p, &PanelEvent { id: 1, panel_id: live, kind: "navigated".into(), payload: json!({}), at: 0, context: None }));
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn startup_forgets_old_closed_panels_holding_only_notices() {
+        let hub = fixture();
+        let (recent, old, old_real) = (markdown(&hub), markdown(&hub), markdown(&hub));
+        event(&hub, old_real, "approve".into(), json!({})).unwrap();
+        for id in [recent, old, old_real] { close(&hub, None, id, true).unwrap(); }
+        for id in [old, old_real] {
+            let mut p = get(&hub, id).unwrap();
+            p.updated_at -= NOTICE_KEEP_MS + 1;
+            hub.store().save_panel(&p).unwrap();
+        }
+        recover(&hub).unwrap();
+        assert!(get(&hub, recent).is_ok(), "a recent close notice waits for the agent");
+        assert!(get(&hub, old).is_err(), "an old one nothing asked for is forgotten");
+        assert!(get(&hub, old_real).is_ok(), "a closed panel with a real event stays, however old");
         archive(&hub, 1).unwrap();
     }
 }

@@ -1407,7 +1407,7 @@ mod tests {
         let rel = format!("muster-panel-apps-core-{}.png", std::process::id());
         std::fs::write(Path::new("/tmp").join(&rel), PNG).unwrap();
         let open = |app: &str, data: Value| crate::panels::open(&hub, 1, Open { title: "Shot".into(), app: app.into(),
-            data: Some(data), html: None, html_path: None, csp: None, kit: None });
+            data: Some(data), html: None, html_path: None, csp: None, kit: None, notify_on_close: None });
         let id = open("image", json!({"path": rel})).unwrap();
         let res = crate::panels::resource(&hub, id).unwrap();
         assert!(res["data"]["src"].as_str().unwrap().starts_with("data:image/png;base64,"));
@@ -1429,7 +1429,7 @@ mod tests {
         }
         assert!(open("diff", json!({})).unwrap_err().to_string().contains("pr_decision"));
         assert!(crate::panels::open(&hub, 1, Open { title: "x".into(), app: "chart".into(), data: None,
-            html: Some("<p>".into()), html_path: None, csp: None, kit: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
+            html: Some("<p>".into()), html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap_err().to_string().contains("does not accept custom HTML"));
         crate::panels::archive(&hub, 1).unwrap();
         std::fs::remove_file(Path::new("/tmp").join(&rel)).unwrap();
     }

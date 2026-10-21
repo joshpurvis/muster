@@ -505,6 +505,9 @@ pub enum PanelCmd {
         #[arg(long)] csp: Option<String>,
         /// Custom apps: put the Muster Kit (styles, components, fonts, handshake) in front of the HTML.
         #[arg(long)] kit: bool,
+        /// Prompt this session when the user closes the panel, even if it is idle (by default a
+        /// close only rides along with the next panel prompt or wait).
+        #[arg(long)] notify_on_close: bool,
     },
     /// Update input, HTML or title of a panel in this task.
     Update {
@@ -535,8 +538,9 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
         s.map(|s| serde_json::from_str(&s).context("invalid JSON argument")).transpose().map(|v| v.unwrap_or(Value::Null))
     };
     let (method, mut args, timeout) = match cmd {
-        PanelCmd::Open { title, app, data, html, html_path, csp, kit } => ("panel.open",
-            json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?,"kit":kit.then_some(true)}), 30),
+        PanelCmd::Open { title, app, data, html, html_path, csp, kit, notify_on_close } => ("panel.open",
+            json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?,"kit":kit.then_some(true),
+                "notify_on_close":notify_on_close.then_some(true)}), 30),
         PanelCmd::Update { panel_id, title, data, html, html_path, kit } => ("panel.update",
             json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"html":html,"html_path":html_path,"kit":kit}), 30),
         PanelCmd::Close { panel_id } => ("panel.close", json!({"panel_id":panel_id}), 30),

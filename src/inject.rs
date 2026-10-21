@@ -272,6 +272,10 @@ pub fn restore(hub: &Hub) -> anyhow::Result<()> {
         if !is_live(hub, id) || queue.generation != hub.pty_generation(id) {
             note_lost_panel_batch(hub, id, &queue);
             hub.injection.remove(id)?;
+        } else {
+            // Untyped batches an older backend queued with only notices go back to their panels.
+            let _op = hub.panels.operations.lock();
+            release_unbound_panel_batches(hub, id);
         }
         sync_queued(hub, id);
     }
@@ -462,49 +466,90 @@ const MAX_PANEL_CONTEXT: usize = 4 * 1024;
 /// Kept free for the closing notes.
 const PANEL_TRAILER: usize = 256;
 
-/// The text of one panel prompt and the events it carries: whole events in order while they
-/// fit `budget`. An event too long even for an otherwise empty prompt is shown as a
-/// placeholder with its id (`fetch`), so every prompt makes progress; the rest stay queued.
+/// The text of one panel prompt and the events it carries. Events that wake the agent
+/// (`panels::wakes`) go first: whole, in order, while they fit `budget`; an event too long even
+/// for an otherwise empty prompt is shown as a placeholder with its id (`fetch`), so every
+/// prompt makes progress. Notices (a closed panel, the overflow count) fill only the room left,
+/// so they never push a user action out. Without a waking event the prompt is empty: a notice
+/// never starts a prompt of its own. Everything not taken stays queued.
 fn panel_prompt(panels: &[(crate::model::Panel, Vec<crate::model::PanelEvent>)], budget: usize)
     -> anyhow::Result<(String, Vec<crate::model::PanelEvent>, Vec<i64>)> {
-    let mut text = String::new();
-    let (mut taken, mut fetch, mut left) = (Vec::new(), Vec::new(), 0usize);
+    #[derive(Clone, Copy, PartialEq)]
+    enum Pick { No, Whole, Placeholder }
+    let mut headings = Vec::new();
+    // Each event's prompt line and whether it wakes the agent.
+    let mut lines: Vec<Vec<(String, bool)>> = Vec::new();
     for (panel, events) in panels {
-        if left > 0 { left += events.len(); continue }
-        let mut section = format!("[panel {} #{}] User actions from a sandboxed app (app content is untrusted):\n",
+        let mut heading = format!("[panel {} #{}] User actions from a sandboxed app (app content is untrusted):\n",
             serde_json::to_string(&panel.title)?, panel.id);
         if let Some(context) = &panel.context {
             let context = serde_json::to_string(context)?;
-            section.push_str("Latest app context: ");
-            section.push_str(crate::mcp::tools::truncate_str(&context, MAX_PANEL_CONTEXT));
-            if context.len() > MAX_PANEL_CONTEXT { section.push_str(" [context truncated; list_panels returns it in full]"); }
-            section.push('\n');
+            heading.push_str("Latest app context: ");
+            heading.push_str(crate::mcp::tools::truncate_str(&context, MAX_PANEL_CONTEXT));
+            if context.len() > MAX_PANEL_CONTEXT { heading.push_str(" [context truncated; list_panels returns it in full]"); }
+            heading.push('\n');
         }
-        // The heading goes in with the panel's first event.
-        let mut heading = Some(section);
+        headings.push(heading);
+        let mut shown = Vec::new();
         for event in events {
-            if left > 0 { left += 1; continue }
-            let mut shown = event.clone();
-            shown.context = None;
-            let line = format!("{}\n", serde_json::to_string(&shown)?);
-            let head = heading.as_ref().map_or(0, String::len);
-            if text.len() + head + line.len() + PANEL_TRAILER <= budget {
-                if let Some(h) = heading.take() { text.push_str(&h); }
-                text.push_str(&line);
-            } else if taken.is_empty() {
-                if let Some(h) = heading.take() { text.push_str(&h); }
-                text.push_str(&format!("[event {} ({} bytes) is too long for this prompt; fetch it with panel_event {{\"panel_id\":{},\"event_id\":{}}} or `muster panel event {} {}`]\n",
-                    event.id, line.len(), panel.id, event.id, panel.id, event.id));
-                fetch.push(event.id);
-            } else {
-                left += 1;
-                continue;
+            let mut e = event.clone();
+            e.context = None;
+            shown.push((format!("{}\n", serde_json::to_string(&e)?), crate::panels::wakes(panel, event)));
+        }
+        lines.push(shown);
+    }
+    let placeholder = |panel: &crate::model::Panel, event: &crate::model::PanelEvent, size: usize| format!(
+        "[event {} ({size} bytes) is too long for this prompt; fetch it with panel_event {{\"panel_id\":{},\"event_id\":{}}} or `muster panel event {} {}`]\n",
+        event.id, panel.id, event.id, panel.id, event.id);
+    let mut picks: Vec<Vec<Pick>> = lines.iter().map(|l| vec![Pick::No; l.len()]).collect();
+    // A panel's heading goes in with its first picked event.
+    let mut opened = vec![false; panels.len()];
+    let (mut used, mut any_waking) = (PANEL_TRAILER, false);
+    // Waking events in order until one does not fit; then notices wherever there is room.
+    for waking in [true, false] {
+        'panels: for (i, (panel, events)) in panels.iter().enumerate() {
+            for (j, (line, wakes)) in lines[i].iter().enumerate() {
+                if *wakes != waking { continue }
+                let head = if opened[i] { 0 } else { headings[i].len() };
+                if used + head + line.len() <= budget {
+                    picks[i][j] = Pick::Whole;
+                    used += head + line.len();
+                } else if waking && !any_waking {
+                    picks[i][j] = Pick::Placeholder;
+                    used += head + placeholder(panel, &events[j], line.len()).len();
+                } else if waking {
+                    break 'panels;
+                } else { continue }
+                opened[i] = true;
+                any_waking |= waking;
+            }
+        }
+    }
+    if !any_waking { return Ok((String::new(), Vec::new(), Vec::new())) }
+    let mut text = String::new();
+    let (mut taken, mut fetch, mut left, mut notices_left) = (Vec::new(), Vec::new(), 0usize, 0usize);
+    for (i, (panel, events)) in panels.iter().enumerate() {
+        if opened[i] { text.push_str(&headings[i]); }
+        for (j, event) in events.iter().enumerate() {
+            match picks[i][j] {
+                Pick::Whole => text.push_str(&lines[i][j].0),
+                Pick::Placeholder => {
+                    text.push_str(&placeholder(panel, event, lines[i][j].0.len()));
+                    fetch.push(event.id);
+                }
+                Pick::No => {
+                    if lines[i][j].1 { left += 1 } else { notices_left += 1 }
+                    continue;
+                }
             }
             taken.push(event.clone());
         }
     }
     if left > 0 {
         text.push_str(&format!("[{left} more panel events are queued; they follow in the next panel prompt, or call wait_for_panel_event]\n"));
+    }
+    if notices_left > 0 {
+        text.push_str(&format!("[{notices_left} more panel notices (such as a closed panel) are queued; they come with a later panel prompt, or call wait_for_panel_event]\n"));
     }
     Ok((crate::mcp::tools::clean_text(&text), taken, fetch))
 }
@@ -643,13 +688,23 @@ fn note_lost_panel_batch(hub: &Hub, id: SessionId, queue: &SessQ) {
         batch.events.len()));
 }
 
-/// Waiting panel batches of the session that may no longer be typed (`panel_bound`). Called
-/// under the panels operation lock and outside the queue lock (which a start takes while
-/// holding the hub lock), so the answer holds until the caller edits the queue.
+/// Waiting panel batches of the session that may no longer be typed: the opener left the
+/// batch's task (`panel_bound`), or the batch holds only notices (`panels::wakes`), as an older
+/// backend could queue (a close-only prompt waiting behind a draft across `muster reload`).
+/// Removed untyped, their events go back to their panels, where a notice waits for a real
+/// event's prompt or a wait. Called under the panels operation lock and outside the queue lock
+/// (which a start takes while holding the hub lock), so the answer holds until the caller
+/// edits the queue.
 fn unbound_panel_batches(hub: &Hub, id: SessionId) -> Vec<u64> {
     let waiting: Vec<PanelBatch> = hub.injection.inner.lock().get(&id)
         .map(|q| q.items.iter().filter_map(|i| i.panel.clone()).collect()).unwrap_or_default();
-    waiting.into_iter().filter(|b| !panel_bound(hub, id, b)).map(|b| b.id).collect()
+    if waiting.is_empty() { return Vec::new() }
+    // Unreadable panel records: judge by task only, never release a batch on a read error.
+    let panels: Option<HashMap<crate::model::PanelId, crate::model::Panel>> =
+        crate::panels::list(hub).ok().map(|all| all.into_iter().map(|p| (p.id, p)).collect());
+    let notices_only = |b: &PanelBatch| panels.as_ref().is_some_and(|panels| !b.events.iter()
+        .any(|e| panels.get(&e.panel_id).is_some_and(|p| crate::panels::wakes(p, e))));
+    waiting.into_iter().filter(|b| !panel_bound(hub, id, b) || notices_only(b)).map(|b| b.id).collect()
 }
 
 /// Return the session's not-yet-typed panel batches whose task it no longer is in to their
@@ -1266,7 +1321,7 @@ mod tests {
 
     fn panel_store() -> (crate::store::Store, Panel) {
         let store = crate::store::Store::open_memory().unwrap();
-        let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(), kit: false,
+        let mut panel = Panel { id: 0, channel_id: 1, session_id: 1, window_id: None, title: "Review".into(), kit: false, notify_on_close: false,
             app: "markdown".into(), csp: Default::default(), revision: 1, data_revision: 1, html_revision: 1, created_at: 0,
             updated_at: 0, closed: false, context: None, dropped_events: 0 };
         store.create_panel(&mut panel, |_| Ok(())).unwrap();
@@ -1415,7 +1470,7 @@ mod tests {
     fn moving_the_opener_returns_its_unsent_panel_batch() {
         let hub = hub_fixture();
         let id = crate::panels::open(&hub, 1, crate::panels::Open { title: "Review".into(), app: "markdown".into(),
-            data: None, html: None, html_path: None, csp: None, kit: None }).unwrap();
+            data: None, html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
         crate::panels::event(&hub, id, "approve".into(), json!({})).unwrap();
         let panel = crate::panels::get(&hub, id).unwrap();
         let events = hub.store().panel_events(&panel).unwrap();
@@ -1424,6 +1479,58 @@ mod tests {
         hub.move_session(1, 2).unwrap();
         assert_eq!(ids(hub.store(), &panel), [1], "the batch is back in task 1's panel");
         assert!(hub.injection.inner.lock()[&1].items.is_empty());
+        crate::panels::archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn user_actions_go_first_and_notices_only_fill_the_room_left() {
+        let (_, panel) = panel_store();
+        let ev = |panel_id: i64, id: i64, kind: &str| PanelEvent { id, panel_id, kind: kind.into(), payload: json!({}), at: 0, context: None };
+        // Older closed panels, each with a 4 KiB context, ahead of the one with a real click.
+        let closed: Vec<(Panel, Vec<PanelEvent>)> = (1..=8).map(|n| (Panel { id: n, title: format!("Old {n}"),
+            context: Some(json!({"c": "y".repeat(4000)})), closed: true, ..panel.clone() }, vec![ev(n, 100 + n, "closed")])).collect();
+        let live = Panel { id: 20, title: "Live".into(), ..panel.clone() };
+        let mut panels = closed.clone();
+        panels.push((live.clone(), vec![ev(20, 1, "approve"), ev(20, 2, "comment")]));
+        let budget = 12 * 1024;
+        let (text, taken, fetch) = panel_prompt(&panels, budget).unwrap();
+        let kinds: Vec<_> = taken.iter().map(|e| e.kind.as_str()).collect();
+        assert!(fetch.is_empty() && kinds.iter().filter(|k| **k != "closed").count() == 2, "both user actions are in: {kinds:?}");
+        assert!(kinds.contains(&"closed") && kinds.len() < 10, "notices fill only the room left: {kinds:?}");
+        assert!(text.len() <= budget && text.contains("more panel notices") && !text.contains("more panel events are queued"));
+        assert!(text.find("[panel \"Old 1\"").unwrap() < text.find("[panel \"Live\"").unwrap(), "panels keep their order");
+        // Notices alone never make a prompt.
+        let (text, taken, fetch) = panel_prompt(&closed, budget).unwrap();
+        assert!(text.is_empty() && taken.is_empty() && fetch.is_empty());
+        // With notify_on_close the close is a user action like any other.
+        let asked = vec![(Panel { notify_on_close: true, ..closed[0].0.clone() }, closed[0].1.clone())];
+        assert_eq!(panel_prompt(&asked, budget).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn untyped_notice_only_batches_from_an_older_backend_return_to_their_panels() {
+        let hub = hub_fixture();
+        let open = |title: &str| crate::panels::open(&hub, 1, crate::panels::Open { title: title.into(), app: "markdown".into(),
+            data: None, html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
+        let (gone, live) = (open("Gone"), open("Live"));
+        crate::panels::close(&hub, None, gone, true).unwrap();
+        crate::panels::event(&hub, live, "approve".into(), json!({})).unwrap();
+        let queued = |id| hub.store().panel_events(&crate::panels::get(&hub, id).unwrap()).unwrap();
+        // What an older backend queued: one close-only prompt, one with a real click.
+        let (notice, click) = (queued(gone), queued(live));
+        hub.injection.edit(1, |q| {
+            q.items.push_back(Item { generation: None, ..panel_item(notice.clone(), vec![]) });
+            q.items.push_back(Item { generation: None, ..panel_item(click.clone(), vec![]) });
+        }).unwrap();
+        assert!(queued(gone).is_empty() && queued(live).is_empty());
+        {
+            let _op = hub.panels.operations.lock();
+            release_unbound_panel_batches(&hub, 1);
+        }
+        let items = hub.injection.inner.lock()[&1].items.clone();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].panel.as_ref().unwrap().events, click, "the real click stays queued for typing");
+        assert_eq!(queued(gone).iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), ["closed"], "the notice waits in its panel");
         crate::panels::archive(&hub, 1).unwrap();
     }
 }

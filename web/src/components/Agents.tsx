@@ -7,6 +7,7 @@ import { rpc } from "../rpc.ts";
 import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   schedulesSupported,
+  scheduleSettings,
   agentFilter,
   cacheNow,
   agentMessages,
@@ -179,6 +180,8 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
   const billing = agentBilling(a, s);
+  // What it billed to OpenRouter today (UTC day), once read (src/spend.rs).
+  const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
   const cold = !!s && isCold(s, cacheNow());
   const persona = firstLine(a.persona);
   const open = () => {
@@ -235,6 +238,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
             data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
           >
             {billing.label}
+            {spent !== undefined && <span class="or-spent" data-tip="Estimated from the key's spend while it worked (OpenRouter's UTC day)"> · ~${spent.toFixed(2)} today (est.)</span>}
           </span>
         )}
       </span>
@@ -383,7 +387,7 @@ type ModalT = (
 const ORIGINS: { o: Origin; label: string; hint: string }[] = [
   { o: "human", label: "Human", hint: "you, or an agent working on something you started" },
   { o: "schedule", label: "Schedule", hint: "a timer" },
-  { o: "webhook", label: "Webhook", hint: "an outside trigger" },
+  { o: "webhook", label: "Webhook (triggered)", hint: "a trigger: a note changes, a branch moves, GitHub, a trigger URL" },
 ];
 
 /** One entry of a Model or Effort select. */

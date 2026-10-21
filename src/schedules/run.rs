@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::plan::{self, Action, Gate};
-use super::{Conversation, Notify, Outcome, Run, RunKind, Schedule, facts, publish, publish_run, quiet_of};
-use crate::agents::{AskVerdict, Origin};
+use super::{Conversation, Notify, Outcome, Run, RunKind, Schedule, When, facts, publish, publish_run, quiet_of};
+use crate::agents::AskVerdict;
 use crate::hub::Hub;
 use crate::model::*;
 
@@ -24,9 +24,28 @@ fn catchup_gap_ms() -> i64 {
 /// terminal (they may be writing a prompt that a restart would wipe).
 const HUMAN_QUIET: Duration = Duration::from_secs(120);
 
-/// The sender label of a schedule's messages (the envelope's `from`).
+/// The sender label of a timed schedule's messages (the envelope's `from`).
 pub fn sender(schedule: i64) -> String {
     format!("schedule:{schedule}")
+}
+
+/// A schedule's own sender: `schedule:<id>`, or `trigger:<id>` for a trigger.
+pub fn sender_of(schedule: i64, trigger: bool) -> String {
+    if trigger { format!("trigger:{schedule}") } else { sender(schedule) }
+}
+
+/// A "Then…" step's sender: its schedule's, then `/then:<run id>`.
+pub fn step_sender(s: &Schedule, run: i64) -> String {
+    format!("{}/then:{run}", s.sender())
+}
+
+/// The schedule (and, for a step, the run) a sender label names.
+pub fn parse_sender(from: &str) -> Option<(i64, Option<i64>)> {
+    let rest = from.strip_prefix("schedule:").or_else(|| from.strip_prefix("trigger:"))?;
+    match rest.split_once("/then:") {
+        Some((id, run)) => Some((id.parse().ok()?, Some(run.parse().ok()?))),
+        None => Some((rest.parse().ok()?, None)),
+    }
 }
 
 pub async fn scheduler_loop(hub: Arc<Hub>) {
@@ -69,7 +88,7 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
     let mut start = Vec::new();
     for s in hub.schedules.list() {
         let Some(agent) = hub.agents().by_id(s.agent_id) else { continue };
-        let f = facts(hub, &agent);
+        let f = super::facts_for(hub, &agent, &s);
         if plan::warn_expiry(&s, &f, now) {
             match hub.schedules.edit(s.id, |x| {
                 x.expiry_warned = true;
@@ -91,6 +110,40 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
         if s.next_run.is_none_or(|t| t > now) {
             continue;
         }
+        // A trigger's event is never spent on a run the 15-minute floor would skip: it stays held
+        // until the floor (from the last run's slot and from when its prompt was really
+        // submitted) has passed.
+        if s.when.is_trigger() && !s.paused && !settings.paused {
+            let wait = s
+                .last_fired
+                .map(|t| t + plan::MIN_GAP_MS - now)
+                .into_iter()
+                .chain(s.last_sent.map(|t| t + plan::MIN_GAP_MS - now_ms()))
+                .max()
+                .unwrap_or(0);
+            if wait > 0 {
+                match hub.schedules.edit(s.id, |x| {
+                    x.next_run = Some(now + wait);
+                    Ok(())
+                }) {
+                    Ok(x) => publish(hub, &x),
+                    Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
+                }
+                continue;
+            }
+        }
+        // A trigger's event waits while its previous run is still going (it would be skipped
+        // as busy and the event lost): it looks again in a minute.
+        if s.when.is_trigger() && !s.paused && !settings.paused && previous_running(hub, s.id, i64::MAX).unwrap_or(false) {
+            match hub.schedules.edit(s.id, |x| {
+                x.next_run = Some(now + plan::MINUTE_MS);
+                Ok(())
+            }) {
+                Ok(x) => publish(hub, &x),
+                Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
+            }
+            continue;
+        }
         match handle_due(hub, s.id, now, &settings, &quiet, &f, &agent.name) {
             Ok(Some(run)) => start.push(run),
             Ok(None) => {}
@@ -109,14 +162,40 @@ fn runs_today(hub: &Hub, schedule: i64) -> anyhow::Result<u32> {
 /// Act on schedule `id`'s due slot: claim it (with its run row) and say whether to start it.
 fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, quiet: &plan::Quiet, f: &plan::Facts, agent: &str) -> anyhow::Result<Option<Run>> {
     let sched = &hub.schedules;
-    let (run, s) = {
+    // Read before the lock (they read the schedule list too): a note trigger's note and its
+    // "Allow triggers" switch, and the triggers that share the note's daily cap.
+    let snapshot = sched.get(id);
+    let note_block = snapshot.as_ref().and_then(|s| super::triggers::note_flag(hub, s));
+    let note_cap = snapshot.as_ref().and_then(|s| match s.when {
+        When::Note { note_id, .. } => Some((
+            hub.store().load_note(note_id).ok().flatten().map(|n| n.title).unwrap_or_default(),
+            super::triggers::note_trigger_ids(hub, note_id),
+        )),
+        _ => None,
+    });
+    let (run, s, then) = {
         let mut g = sched.inner.lock();
         let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
-        let last = hub.store().runs(id, None, 1)?.into_iter().next();
+        let last = hub.store().runs(id, None, 10)?.into_iter().find(|r| r.kind != RunKind::Chain);
         let today = runs_today(hub, id)?;
-        let Some(due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
+        let Some(mut due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
             return Ok(None);
         };
+        // A note trigger also needs its note and its "Allow triggers" switch, and the note's
+        // cap: counted here, under the lock every claim takes, from runs claimed (not only
+        // sent), so triggers on one note due together can't all pass it.
+        if matches!(due.action, Action::Fire(_)) {
+            let capped = match &note_cap {
+                Some((title, ids)) => {
+                    super::triggers::note_cap(title, hub.store().count_trigger_runs_taken(ids, now - plan::DAY_MS)?)
+                }
+                None => None,
+            };
+            if let Some(a) = note_block.clone().or(capped) {
+                due.action = a;
+                due.record = true;
+            }
+        }
         let mut next = s.clone();
         next.next_run = due.next_run;
         next.last_slot = Some(due.slot);
@@ -127,17 +206,11 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
             next.last_fired = Some(due.slot);
         }
         next.updated_at = now;
-        let mut run = Run {
-            id: 0,
-            schedule_id: id,
-            slot: due.slot,
-            kind: RunKind::Scheduled,
-            started_at: now,
-            msg_id: None,
-            outcome: Outcome::Pending,
-            reason: None,
-            finished_at: None,
-        };
+        let mut run = Run::new(id, due.slot, if s.when.is_trigger() { RunKind::Triggered } else { RunKind::Scheduled }, now);
+        // A trigger's run takes the event with it (a skipped one records what it skipped).
+        if let Some(ev) = next.event.take() {
+            run.event = serde_json::to_string(&ev).ok();
+        }
         match &due.action {
             Action::Fire(kind) => {
                 run.kind = *kind;
@@ -155,16 +228,18 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
                 run.finished_at = Some(now);
             }
         }
+        // A refusal (a daily cap) is a failure: its "Then…" step is recorded with it.
+        let then = if run.outcome.is_failure() { next_step(&next, &run, now) } else { Next::Nothing };
         let claimed = if due.record {
-            hub.store().claim_run(&next, &run)?
+            hub.store().claim_run_with_child(&next, &run, then.child())?
         } else {
             hub.store().save_schedule(&next)?;
             None
         };
         g.list.insert(id, next.clone());
-        (claimed.map(|rid| Run { id: rid, ..run }), next)
+        (claimed.map(|(rid, child)| (Run { id: rid, ..run }, child)), next, then)
     };
-    let Some(run) = run else {
+    let Some((run, child)) = run else {
         publish(hub, &s);
         return Ok(None);
     };
@@ -175,6 +250,7 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
     // Expiry is worth telling even when this schedule only notifies on failure.
     let expired = run.reason.as_deref() == Some(plan::EXPIRED);
     notify_outcome(hub, &s, agent, &run, expired);
+    start_next(hub, &s, &run, then, child);
     Ok(None)
 }
 
@@ -211,7 +287,7 @@ fn agent_busy(hub: &Hub, agent_id: i64) -> Option<SessionId> {
 /// is; so is the newest one whose message's turn is still running in the agent although the run
 /// stopped waiting for it (timed out, or blocked on a prompt nobody has answered yet).
 pub(super) fn previous_running(hub: &Hub, schedule: i64, before: i64) -> anyhow::Result<bool> {
-    if hub.store().pending_runs()?.iter().any(|r| r.schedule_id == schedule && r.id < before) {
+    if hub.store().pending_runs()?.iter().any(|r| r.schedule_id == schedule && r.id < before && r.kind != RunKind::Chain) {
         return Ok(true);
     }
     // The newest run that sent a message, however many skips came after it.
@@ -234,7 +310,24 @@ fn refusal(e: &anyhow::Error) -> Option<String> {
 async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
     let sched = &hub.schedules;
     let Some(s) = sched.get(run.schedule_id) else { return Ok(()) };
-    let Some(agent) = hub.agents().by_id(s.agent_id) else {
+    let step = run.kind == RunKind::Chain;
+    // A "Then…" step goes to its own agent, read with its prompt from the schedule as it is now
+    // (one version for both: it may have been edited since the step was recorded).
+    let target = if step {
+        match step_target(&s, &run) {
+            Ok(a) => {
+                if run.agent_id != Some(a) {
+                    run.agent_id = Some(a);
+                    hub.store().update_run(&run)?;
+                }
+                a
+            }
+            Err(why) => return finish(hub, &s, &mut run, Outcome::Failed, Some(why)),
+        }
+    } else {
+        s.agent_id
+    };
+    let Some(agent) = hub.agents().by_id(target) else {
         return finish(hub, &s, &mut run, Outcome::Failed, Some("its agent was removed".into()));
     };
     let line = sched.line(agent.id);
@@ -243,7 +336,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         let _line = line.lock_owned().await;
         return wait_reply(hub, &s, &mut run).await;
     }
-    if let Gate::Skip(why) = plan::gate(previous_running(hub, run.schedule_id, run.id)?, false, 0) {
+    if !step && let Gate::Skip(why) = plan::gate(previous_running(hub, run.schedule_id, run.id)?, false, 0) {
         return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
     }
     if run.kind == RunKind::CatchUp {
@@ -280,24 +373,53 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         // It may have waited a while: the schedule (or its agent, the settings) may have
         // changed. An automatic run checks its rules again; Run now is the human's call.
         let Some(s) = sched.get(run.schedule_id) else { return Ok(()) };
-        let Some(agent) = hub.agents().by_id(s.agent_id) else {
+        if step && step_target(&s, &run) != Ok(target) {
+            return finish(hub, &s, &mut run, Outcome::Failed, Some("its \"Then…\" step was changed while it waited in line".into()));
+        }
+        let Some(agent) = hub.agents().by_id(target) else {
             return finish(hub, &s, &mut run, Outcome::Failed, Some("its agent was removed".into()));
         };
+        // A note trigger's run: its note must still allow triggers (switched off while it waited).
+        if run.kind == RunKind::Triggered
+            && let Some(Action::Skip(why) | Action::Refuse(why)) = super::triggers::note_flag(hub, &s)
+        {
+            return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
+        }
         if run.kind != RunKind::Manual {
             let settings = sched.settings();
-            let since = s.last_sent.map(|t| now_ms() - t);
-            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), runs_today(hub, s.id)?, since) {
+            // A step belongs to its run: the schedule's daily cap and floor were the run's.
+            let (today, since) = if step { (0, None) } else { (runs_today(hub, s.id)?, s.last_sent.map(|t| now_ms() - t)) };
+            let f = match hub.agents().by_id(s.agent_id) {
+                Some(own) => super::facts_for(hub, &own, &s),
+                None => facts(hub, &agent),
+            };
+            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &f, today, since) {
                 Some(Action::Skip(why)) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
                 Some(Action::Refuse(why)) => return finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
                 _ => {}
             }
         }
         let tz = super::cron::zone(&s.tz).unwrap_or(jiff::tz::TimeZone::UTC);
-        let (last_run, last_reply) = hub.store().last_runs_for_prompt(s.id, run.id)?;
-        let text = plan::fill_prompt(&s.prompt, &tz, run.slot, last_run, last_reply.as_deref());
+        let (text, from, prov, forced) = if step {
+            let c = match step_context(hub, &s, &run, &tz) {
+                Ok(c) => c,
+                Err(e) => return finish(hub, &s, &mut run, Outcome::Failed, Some(format!("{e:#}"))),
+            };
+            (c.0, step_sender(&s, run.id), Some(c.1), None)
+        } else {
+            let (last_run, last_reply) = hub.store().last_runs_for_prompt(s.id, run.id)?;
+            let ev = run.pending_event();
+            let x = plan::Extra { event: ev.as_ref(), append_event: s.when.is_trigger(), ..Default::default() };
+            let text = plan::fill_all(&s.prompt, &tz, run.slot, last_run, last_reply.as_deref(), &x);
+            (text, s.sender(), None, Some(s.origin()))
+        };
+        // The spend caps need a fresh reading of what OpenRouter has billed today.
+        if crate::spend::applies(hub, &agent, s.origin()) {
+            hub.spend.ensure_fresh(hub).await;
+        }
         // Every delivery check before anything is restarted: a refused run leaves the agent's
         // conversation as it was.
-        let route = match crate::agents::precheck(hub, &agent, &text, &sender(s.id), None, None, Some(Origin::Schedule)) {
+        let route = match crate::agents::precheck(hub, &agent, &text, &from, None, prov, forced) {
             Ok(r) => r,
             Err(e) => {
                 return match refusal(&e) {
@@ -306,7 +428,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
                 };
             }
         };
-        if s.conversation == Conversation::Fresh {
+        if s.conversation == Conversation::Fresh && !step {
             // Checked again under the start lock, together with the restart: never while the
             // agent is in a turn, and never within two minutes of (or since this check of) the
             // human typing into it.
@@ -329,7 +451,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
                 Err(e) => return finish(hub, &s, &mut run, Outcome::Failed, Some(format!("couldn't start a fresh conversation: {e:#}"))),
             }
         }
-        let out = crate::agents::Outgoing { agent: agent.name.clone(), text, from: sender(s.id), from_session: None, route };
+        let out = crate::agents::Outgoing { agent: agent.name.clone(), text, from, from_session: None, route };
         match crate::agents::deliver(hub, out).await {
             Ok(d) => break (s, d),
             Err(e) => {
@@ -404,18 +526,122 @@ async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Resu
     finish(hub, s, run, outcome, reason)
 }
 
-/// Record the outcome, then alert and file the reply as the schedule says.
-fn finish(hub: &Hub, s: &Schedule, run: &mut Run, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
+/// A "Then…" step's prompt (its `{reply}` and `{outcome}` from the run it follows, `{event}`
+/// from the trigger's) and its place on the chain: one hop past the run it follows.
+pub(super) fn step_context(hub: &Hub, s: &Schedule, run: &Run, tz: &jiff::tz::TimeZone) -> anyhow::Result<(String, crate::agents::Prov)> {
+    let path = run.step.as_deref().unwrap_or("");
+    let st = super::step_at(s.then.as_ref(), path).ok_or_else(|| anyhow::anyhow!("its step was removed from the schedule"))?;
+    let parent = run.parent.and_then(|p| hub.store().run(p).ok().flatten()).ok_or_else(|| anyhow::anyhow!("the run it follows is gone"))?;
+    let pmsg = parent.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten());
+    let parent_agent = hub.agents().by_id(parent.agent_id.unwrap_or(s.agent_id)).map(|a| a.name).unwrap_or_else(|| "the agent".into());
+    // The outcome's word is Muster's own; its reason can come from the agent's screen (a question,
+    // a tool's arguments): quoted as data.
+    let outcome = match &parent.reason {
+        Some(r) if parent.outcome != Outcome::Replied => format!("{}{}", parent.outcome.label(), plan::quote_reason(r)),
+        _ => parent.outcome.label().to_string(),
+    };
+    let ev = run.pending_event();
+    let x = plan::Extra {
+        event: ev.as_ref(),
+        reply_of: Some(&parent_agent),
+        reply: pmsg.as_ref().and_then(|m| m.reply.as_deref()),
+        outcome: Some(outcome),
+        append_event: false,
+    };
+    let text = plan::fill_all(&st.prompt, tz, run.slot, None, None, &x);
+    // The run it follows was on hop `h` (a run that never sent anything sits where it would have).
+    let hop = pmsg.as_ref().map_or(path.len().saturating_sub(1) as u32, |m| m.hop);
+    Ok((text, crate::agents::Prov { origin: s.origin(), hop, msg_id: parent.msg_id }))
+}
+
+/// The agent a "Then…" step asks, from schedule `s` as it is now.
+fn step_target(s: &Schedule, run: &Run) -> Result<i64, String> {
+    let st = super::step_at(s.then.as_ref(), run.step.as_deref().unwrap_or(""))
+        .ok_or_else(|| "its \"Then…\" step was removed from the schedule".to_string())?;
+    st.agent_id.filter(|_| !st.notify).ok_or_else(|| "its \"Then…\" step no longer asks an agent".to_string())
+}
+
+/// What follows a run that ended (its schedule's "Then…" step on that branch).
+pub(super) enum Next {
+    Nothing,
+    /// A notify step: alert.
+    Notify,
+    /// An ask step: this chain run (its `parent` is set when it is stored with the run's end).
+    Step(Box<Run>),
+}
+
+impl Next {
+    pub(super) fn child(&self) -> Option<&Run> {
+        match self {
+            Next::Step(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// The step after run `run` ended, read from schedule `s` as it is now: a reply takes the
+/// success branch, a failure the failure branch, a skip nothing.
+pub(super) fn next_step(s: &Schedule, run: &Run, now: i64) -> Next {
+    let success = run.outcome == Outcome::Replied;
+    if !success && !run.outcome.is_failure() {
+        return Next::Nothing;
+    }
+    let base = run.step.clone().unwrap_or_default();
+    let then = if base.is_empty() { s.then.as_ref() } else { super::step_at(s.then.as_ref(), &base).and_then(|st| st.then.as_deref()) };
+    let Some(then) = then else { return Next::Nothing };
+    let (branch, st) = if success { ('s', then.on_success.as_ref()) } else { ('f', then.on_failure.as_ref()) };
+    let Some(st) = st else { return Next::Nothing };
+    if st.notify {
+        return Next::Notify;
+    }
+    let mut r = Run::new(s.id, now, RunKind::Chain, now);
+    r.parent = Some(run.id);
+    r.step = Some(format!("{base}{branch}"));
+    r.agent_id = st.agent_id;
+    r.event = run.event.clone();
+    Next::Step(Box::new(r))
+}
+
+/// After the run's end (and its step, `child`: its stored id) were saved together: alert for a
+/// notify step, or start the step.
+pub(super) fn start_next(hub: &Hub, s: &Schedule, run: &Run, next: Next, child: Option<i64>) {
+    match next {
+        Next::Nothing => {}
+        Next::Notify => {
+            let who = hub.agents().by_id(run.agent_id.unwrap_or(s.agent_id)).map(|a| a.name).unwrap_or_else(|| "?".into());
+            alert(hub, "warn", &format!("{who}: \"{}\" {}", s.name, run.outcome.label()), run.reason.as_deref().unwrap_or(""));
+        }
+        Next::Step(mut r) => {
+            let Some(id) = child else { return };
+            r.id = id;
+            r.parent = Some(run.id);
+            publish_run(hub, &r);
+            match hub.arc() {
+                Some(h) => spawn_execute(h, *r),
+                None => tracing::warn!("the hub is going away; chain step {id} not run"),
+            }
+        }
+    }
+}
+
+/// Record the outcome (together with the "Then…" step it starts, so a restart can't lose the
+/// step), then alert and file the reply as the schedule says, and start the step.
+pub(super) fn finish(hub: &Hub, s: &Schedule, run: &mut Run, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
     run.outcome = outcome;
     run.reason = reason;
     run.finished_at = Some(hub.schedules.now());
-    hub.store().update_run(run)?;
-    let agent = hub.agents().by_id(s.agent_id).map(|a| a.name).unwrap_or_else(|| "?".into());
-    if outcome == Outcome::Replied {
+    // The step comes from the schedule as it is now (it may have been edited while this ran).
+    let current = hub.schedules.get(s.id).unwrap_or_else(|| s.clone());
+    let next = next_step(&current, run, hub.schedules.now());
+    let child = hub.store().finish_run_with_child(run, next.child())?;
+    let agent = hub.agents().by_id(run.agent_id.unwrap_or(s.agent_id)).map(|a| a.name).unwrap_or_else(|| "?".into());
+    // A step's reply is the step agent's: only the schedule's own replies go to its note.
+    if outcome == Outcome::Replied && run.kind != RunKind::Chain {
         reply_to_note_once(hub, s, run);
     }
     publish_run(hub, run);
     notify_outcome(hub, s, &agent, run, false);
+    start_next(hub, &current, run, next, child);
     Ok(())
 }
 
@@ -478,8 +704,16 @@ pub(super) fn run_for_msg(hub: &Hub, msg: i64, from: &str) -> Option<Run> {
     if let Ok(Some(r)) = hub.store().run_by_msg(msg) {
         return Some(r);
     }
-    let schedule: i64 = from.strip_prefix("schedule:")?.parse().ok()?;
-    hub.store().pending_runs().ok()?.into_iter().filter(|r| r.schedule_id == schedule && r.msg_id.is_none()).max_by_key(|r| r.id)
+    let (schedule, step) = parse_sender(from)?;
+    if let Some(run) = step {
+        return hub.store().run(run).ok().flatten().filter(|r| r.schedule_id == schedule);
+    }
+    hub.store()
+        .pending_runs()
+        .ok()?
+        .into_iter()
+        .filter(|r| r.schedule_id == schedule && r.msg_id.is_none() && r.kind != RunKind::Chain)
+        .max_by_key(|r| r.id)
 }
 
 /// Take back the prompts of pending runs (of `schedule`, else of every schedule) that are still
@@ -560,7 +794,11 @@ pub fn recover(hub: &Arc<Hub>) {
     for mut run in pending {
         let Some(s) = hub.schedules.get(run.schedule_id) else { continue };
         if run.msg_id.is_none()
-            && let Ok(Some(m)) = hub.store().find_agent_message_from(s.agent_id, &super::run::sender(s.id), run_started_real(hub, &run))
+            && let Ok(Some(m)) = hub.store().find_agent_message_from(
+                run.agent_id.unwrap_or(s.agent_id),
+                &if run.kind == RunKind::Chain { step_sender(&s, run.id) } else { s.sender() },
+                run_started_real(hub, &run),
+            )
         {
             run.msg_id = Some(m);
             let _ = hub.store().update_run(&run);

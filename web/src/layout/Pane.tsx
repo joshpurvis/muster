@@ -47,6 +47,7 @@ import {
   IconMaximize,
   IconMinimize,
   IconNote,
+  IconZap,
   IconPlus,
   IconPanel,
   IconRestart,
@@ -608,15 +609,18 @@ function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
     { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
     { label: "All notes…", run: () => A.openNotesList() },
+    ...(note.triggers !== undefined
+      ? [{ label: "Allow triggers", checked: !!note.triggers, run: () => A.setNoteTriggers(note.id, !note.triggers) }]
+      : []),
     "sep",
     { label: "Close note", keys: "Alt+W", run: () => A.closeTab(id) },
     { label: "Delete note…", danger: true, run: () => A.deleteNoteAsk(note.id) },
   ];
-  const tip = `${note.title} · Note · edited by ${note.updated_by.kind === "human" ? "you" : note.updated_by.name || "an agent"}`;
+  const tip = `${note.title} · Note · edited by ${note.updated_by.kind === "human" ? "you" : note.updated_by.name || "an agent"}${note.triggers ? " · triggers allowed" : ""}`;
   return (
     <div class={cx("tab", "note-tab", active && "active", active && focused && "focused", drag.value?.sid === id && "dragging",
       renamingThis && "renaming")}
-      role="tab" aria-selected={active} aria-label={note.title} tabIndex={active ? 0 : -1}
+      role="tab" aria-selected={active} aria-label={note.triggers ? `${note.title}, triggers allowed` : note.title} tabIndex={active ? 0 : -1}
       data-tab-sid={id} data-tip={renamingThis ? undefined : tip}
       onPointerDown={(e) => {
         if (renamingThis || (e.target as HTMLElement).closest("button")) return;
@@ -645,6 +649,7 @@ function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
           />
         )
         : <span class="tab-name"><span class="tab-task">{note.title}</span></span>}
+      {note.triggers && <span class="tab-trig" aria-hidden="true"><IconZap size={10} /></span>}
       {!renamingThis && (
         <button type="button" class="tab-close" aria-label={`Close ${note.title}`} data-tip="Close note (it stays in Notes…)"
           onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>

@@ -3,7 +3,7 @@
 // signals, no DOM: unit tested (schedules_test.ts). Cron lines are read by the backend
 // (`schedule.preview`); here they are only matched against the presets' shapes.
 
-import type { Agent, RunOutcome, Schedule, ScheduleRun, When, WhenInput } from "./types.ts";
+import type { Agent, RunOutcome, Schedule, ScheduleRun, Then, ThenInput, When, WhenInput } from "./types.ts";
 
 // ---------------- timing presets ----------------
 
@@ -117,6 +117,7 @@ const num = (s: string, max: number): number | null => {
  * doesn't set keep `base`'s values. */
 export function draftOfWhen(when: When, base: WhenDraft, tz = ""): WhenDraft {
   if (when.kind === "once") return { ...base, preset: "once", once: localInput(when.at, tz) };
+  if (when.kind !== "cron") return base;
   const cron = when.cron.trim().replace(/\s+/g, " ");
   const d: WhenDraft = { ...base, preset: "custom", cron };
   if (cron === "*/15 * * * *") return { ...d, preset: "every15" };
@@ -181,6 +182,211 @@ export function whenToSend(initial: WhenDraft, cur: WhenDraft, tzChanged: boolea
   return changed || (tzChanged && now.when.kind === "once") ? now.when : null;
 }
 
+// ---------------- triggers: "When something happens" (Phase 2) ----------------
+
+export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url";
+
+export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
+  { id: "note", label: "A note changes" },
+  { id: "git", label: "A branch moves in a git repository" },
+  { id: "pr_opened", label: "GitHub: a pull request is opened" },
+  { id: "ci_failed", label: "GitHub: CI fails" },
+  { id: "url", label: "Its trigger URL is called (scripts, muster trigger)" },
+];
+
+/** What the "When something happens" fields hold (each kind's fields are kept while another is
+ * picked). */
+export interface TriggerDraft {
+  kind: TriggerKind;
+  /** The watched note, by id (titles needn't be unique); null: none picked yet. */
+  note: number | null;
+  /** Minutes of quiet after the last edit. */
+  quiet: string;
+  repo: string;
+  branch: string;
+  /** GitHub OWNER/NAME. */
+  ghRepo: string;
+  /** CI on this branch only (empty: any). */
+  ghBranch: string;
+  /** Minutes between GitHub checks. */
+  every: string;
+  /** A URL trigger's name. */
+  name: string;
+}
+
+export function blankTrigger(): TriggerDraft {
+  return { kind: "note", note: null, quiet: "2", repo: "", branch: "master", ghRepo: "", ghBranch: "", every: "5", name: "" };
+}
+
+export function isTrigger(w: When | WhenInput): boolean {
+  return w.kind !== "cron" && w.kind !== "once";
+}
+
+/** The dialog's fields for a stored trigger. */
+export function draftOfTrigger(w: When, base: TriggerDraft): TriggerDraft {
+  switch (w.kind) {
+    case "note":
+      return { ...base, kind: "note", note: w.note_id, quiet: String(w.quiet_min) };
+    case "git":
+      return { ...base, kind: "git", repo: w.repo, branch: w.branch };
+    case "github":
+      return { ...base, kind: w.event, ghRepo: w.repo, ghBranch: w.branch ?? "", every: String(w.every_min) };
+    case "url":
+      return { ...base, kind: "url", name: w.name };
+    default:
+      return base;
+  }
+}
+
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+/** The note picker's entries, newest first: a title, and where titles repeat, its first line
+ * and id, so two notes of one name can be told apart. */
+export function noteOptions(notes: { id: number; title: string; preview?: string; updated_at?: number }[]): { id: number; label: string }[] {
+  const count = new Map<string, number>();
+  for (const n of notes) count.set(n.title.trim().toLowerCase(), (count.get(n.title.trim().toLowerCase()) ?? 0) + 1);
+  return [...notes]
+    .sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0) || b.id - a.id)
+    .map((n) => {
+      const dup = (count.get(n.title.trim().toLowerCase()) ?? 0) > 1;
+      const first = (n.preview ?? "").trim();
+      return { id: n.id, label: dup ? `${n.title} (note ${n.id}${first ? `: ${first.slice(0, 40)}` : ""})` : n.title };
+    });
+}
+
+/** "a few words" -> "a-few-words": a URL trigger's name from its schedule's name. */
+export function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "");
+}
+
+/** The trigger the fields describe, or what is wrong with them. A note is found by its title. */
+export function whenOfTrigger(d: TriggerDraft, notes: { id: number; title: string }[]): { when: WhenInput } | { error: string } {
+  const int = (s: string, lo: number, hi: number) => {
+    const n = /^\d+$/.test(s.trim()) ? Number(s.trim()) : NaN;
+    return n >= lo && n <= hi ? n : null;
+  };
+  switch (d.kind) {
+    case "note": {
+      if (d.note === null) return { error: "Pick the note to watch" };
+      const n = notes.find((x) => x.id === d.note);
+      if (!n) return { error: "That note was deleted: pick another" };
+      const quiet = int(d.quiet, 1, 120);
+      if (quiet === null) return { error: "Wait 1 to 120 minutes of quiet" };
+      return { when: { kind: "note", note_id: n.id, quiet_min: quiet } };
+    }
+    case "git": {
+      if (!d.repo.trim()) return { error: "The repository's folder, like ~/projects/muster" };
+      if (!d.branch.trim() || /\s/.test(d.branch.trim())) return { error: "A branch name, like master" };
+      return { when: { kind: "git", repo: d.repo.trim(), branch: d.branch.trim() } };
+    }
+    case "pr_opened":
+    case "ci_failed": {
+      const repo = d.ghRepo.trim().replace(/^https:\/\/github\.com\//, "").replace(/\/$/, "");
+      if (!REPO_RE.test(repo)) return { error: "The repository as OWNER/NAME, like octocat/hello-world" };
+      const every = int(d.every, 2, 60);
+      if (every === null) return { error: "Check every 2 to 60 minutes" };
+      const branch = d.kind === "ci_failed" && d.ghBranch.trim() ? d.ghBranch.trim() : null;
+      return { when: { kind: "github", repo, event: d.kind, branch, every_min: every } };
+    }
+    case "url": {
+      const n = d.name.trim().toLowerCase();
+      if (!NAME_RE.test(n)) return { error: "A name of a-z, 0-9, - and _ (it goes in the URL)" };
+      return { when: { kind: "url", name: n } };
+    }
+  }
+}
+
+// ---------------- "Then…" steps ----------------
+
+export interface ThenDraft {
+  /** When it replies: ask this agent (empty: nothing). */
+  okAgent: string;
+  okPrompt: string;
+  /** When it fails: nothing, notify, or ask an agent. */
+  failMode: "none" | "notify" | "ask";
+  failAgent: string;
+  failPrompt: string;
+}
+
+export function blankThen(): ThenDraft {
+  return { okAgent: "", okPrompt: "", failMode: "none", failAgent: "", failPrompt: "" };
+}
+
+export function draftOfThen(t: Then | null | undefined): ThenDraft {
+  const d = blankThen();
+  if (!t) return d;
+  if (t.on_success && !t.on_success.notify) {
+    d.okAgent = t.on_success.agent ?? "";
+    d.okPrompt = t.on_success.prompt;
+  }
+  if (t.on_failure) {
+    if (t.on_failure.notify) d.failMode = "notify";
+    else {
+      d.failMode = "ask";
+      d.failAgent = t.on_failure.agent ?? "";
+      d.failPrompt = t.on_failure.prompt;
+    }
+  }
+  return d;
+}
+
+/** The steps the fields describe (null: none), or what is wrong with them. */
+/** Stored steps as `schedule.update` takes them, nested ones included. */
+export function thenInputOf(t: Then | null | undefined): ThenInput | null {
+  if (!t) return null;
+  const step = (s: Then["on_success"]) => {
+    if (!s) return null;
+    if (s.notify) return { notify: true as const };
+    const deeper = thenInputOf(s.then);
+    return { agent: s.agent ?? "", prompt: s.prompt, ...(deeper ? { then: deeper } : {}) };
+  };
+  const ok = step(t.on_success);
+  const out: ThenInput = {};
+  if (ok && !("notify" in ok)) out.on_success = ok;
+  const fail = step(t.on_failure);
+  if (fail) out.on_failure = fail;
+  return out.on_success || out.on_failure ? out : null;
+}
+
+/** The steps the fields describe (null: none), or what is wrong with them. The dialog edits one
+ * level; steps nested under a step (made with the API) stay as they are while that step still
+ * asks an agent (`stored`: the steps as stored). */
+export function thenOfDraft(d: ThenDraft, stored?: Then | null): { then: ThenInput | null } | { error: string } {
+  const kept = thenInputOf(stored);
+  const deeper = (s: ThenInput["on_success"] | ThenInput["on_failure"]) =>
+    s && "then" in s && s.then ? { then: s.then } : {};
+  const out: ThenInput = {};
+  if (d.okAgent) {
+    if (!d.okPrompt.trim()) return { error: "Write what to ask when it replies" };
+    out.on_success = { agent: d.okAgent, prompt: d.okPrompt, ...deeper(kept?.on_success) };
+  }
+  if (d.failMode === "notify") out.on_failure = { notify: true };
+  if (d.failMode === "ask") {
+    if (!d.failAgent) return { error: "Pick the agent to ask when it fails" };
+    if (!d.failPrompt.trim()) return { error: "Write what to ask when it fails" };
+    out.on_failure = { agent: d.failAgent, prompt: d.failPrompt, ...deeper(kept?.on_failure) };
+  }
+  return { then: out.on_success || out.on_failure ? out : null };
+}
+
+/** How many levels of steps are nested below the first (the dialog edits only the first). */
+export function nestedSteps(t: Then | null | undefined): number {
+  const depth = (x: Then | null | undefined): number =>
+    x ? 1 + Math.max(depth(x.on_success?.then), depth(x.on_failure?.then)) : 0;
+  return Math.max(0, depth(t) - 1);
+}
+
+/** A trigger's watcher, as its row shows it: "gh isn't signed in", a git error, or null. */
+export function watchLabel(s: Schedule): { text: string; tip: string } | null {
+  const w = s.watch;
+  if (!w) return null;
+  if (w.state === "gh_not_signed_in") return { text: "gh not signed in", tip: "Run gh auth login in a terminal; Muster checks again by itself." };
+  if (w.state === "gh_missing") return { text: "gh not installed", tip: w.detail ?? "Install the GitHub CLI (cli.github.com)." };
+  if (w.state === "error") return { text: "can't check", tip: w.detail ?? "" };
+  return null;
+}
+
 /** Arrow keys, Home and End in a radio group: the option they move to, or null for other keys. */
 export function segStep(i: number, n: number, key: string): number | null {
   if (key === "ArrowRight" || key === "ArrowDown") return (i + 1) % n;
@@ -208,11 +414,11 @@ const GROUP_ORDER = { unattended: 0, claude: 1, off: 2 } as const;
 
 /** The New schedule dialog's agents: Codex and OpenRouter agents first, then Claude subscription
  * agents that accept scheduled work, then the rest (shown, not selectable); by name within each. */
-export function scheduleAgents(list: Agent[]): AgentChoice[] {
+export function scheduleAgents(list: Agent[], origin: "schedule" | "webhook" = "schedule"): AgentChoice[] {
   return list
     .map((agent): AgentChoice => ({
       agent,
-      group: !agent.accepts_origins.includes("schedule")
+      group: !agent.accepts_origins.includes(origin)
         ? "off"
         : isSubscriptionClaude(agent)
         ? "claude"
@@ -271,6 +477,12 @@ export function nextLabel(s: Schedule, now: number): { text: string; tone: "next
   if (s.status === "done" || (s.next_run === null && s.when.kind === "once")) return { text: "done", tone: "done" };
   if (isExpired(s, now)) return { text: "expired", tone: "expired" };
   if (s.paused) return { text: "paused", tone: "paused" };
+  if (s.trigger) {
+    // An event waits for its run (the quiet minutes after a note's edits, or the 15-minute floor).
+    if (s.next_run !== null) return { text: `runs: ${nextWhen(s.next_run, now)}`, tone: "next" };
+    if (s.note && !s.note.triggers) return { text: "triggers off for its note", tone: "paused" };
+    return { text: "waiting", tone: "next" };
+  }
   if (s.next_run === null) return { text: "no next run", tone: "done" };
   const at = nextWhen(s.next_run, now);
   return { text: s.skip_next ? `skips next: ${at}` : `next: ${at}`, tone: "next" };
@@ -323,6 +535,8 @@ export function runLine(r: ScheduleRun, now: number): string {
 
 /** A run's kind chip: catch-ups and Run now; ordinary runs have none. */
 export function runKindLabel(r: ScheduleRun): string | null {
+  if (r.kind === "chain") return `then: ${r.agent ?? "agent"}`;
+  if (r.kind === "triggered") return "triggered";
   return r.kind === "catch_up" ? "catch-up" : r.kind === "manual" ? "run now" : null;
 }
 
@@ -341,8 +555,31 @@ export function upsertRun(list: ScheduleRun[], r: ScheduleRun): ScheduleRun[] {
 }
 
 /** A schedule's last run after `r` was recorded or changed: the newer one wins. */
-export function newerRun(cur: ScheduleRun | null, r: ScheduleRun): ScheduleRun {
+export function newerRun(cur: ScheduleRun | null, r: ScheduleRun): ScheduleRun | null {
+  // A "Then…" step is another agent's: the row's outcome stays its own run's.
+  if (r.kind === "chain") return cur;
   return !cur || r.id >= cur.id ? r : cur;
+}
+
+/** A history in the order it reads: newest run first, each followed by its "Then…" steps
+ * (oldest step first, nested); a step whose run isn't loaded stays where it is. */
+export function withSteps(runs: ScheduleRun[]): { run: ScheduleRun; depth: number }[] {
+  const ids = new Set(runs.map((r) => r.id));
+  const kids = new Map<number, ScheduleRun[]>();
+  for (const r of runs) {
+    if (r.kind === "chain" && r.parent_run != null && ids.has(r.parent_run)) {
+      kids.set(r.parent_run, [...(kids.get(r.parent_run) ?? []), r]);
+    }
+  }
+  const out: { run: ScheduleRun; depth: number }[] = [];
+  const add = (r: ScheduleRun, depth: number) => {
+    out.push({ run: r, depth });
+    for (const k of [...(kids.get(r.id) ?? [])].sort((a, b) => a.id - b.id)) add(k, depth + 1);
+  };
+  for (const r of runs) {
+    if (!(r.kind === "chain" && r.parent_run != null && ids.has(r.parent_run))) add(r, 0);
+  }
+  return out;
 }
 
 /** The panel's order under an agent: soonest next run first, finished ones last, then by name. */
@@ -385,6 +622,8 @@ export interface ScheduleFields {
   note: NoteChoice;
   quiet_hours: boolean;
   daily_cap: number | null;
+  /** The "Then…" steps (null: none). */
+  then?: ThenInput | null;
 }
 
 /** What Save sends to `schedule.update`: only the fields that changed. */
@@ -399,6 +638,7 @@ export function schedulePatch(before: Schedule, f: ScheduleFields): Partial<Sche
   if (f.notify !== before.notify) p.notify = f.notify;
   if (f.quiet_hours !== before.quiet_hours) p.quiet_hours = f.quiet_hours;
   if (f.daily_cap !== before.daily_cap) p.daily_cap = f.daily_cap;
+  if (f.then !== undefined && JSON.stringify(f.then) !== JSON.stringify(thenInputOf(before.then))) p.then = f.then;
   const n = f.note;
   if (n === null ? before.note_id !== null : "id" in n ? n.id !== before.note_id : n.title.toLowerCase() !== (before.note_title ?? "").toLowerCase()) {
     p.note = n;

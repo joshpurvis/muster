@@ -310,6 +310,16 @@ fn capture(program: &OsStr, args: &[String], input: Option<&[u8]>, timeout: Dura
     Ok(Captured { code: status.and_then(|s| s.code()), stdout, stderr, overflow: overflow.load(Ordering::SeqCst), timed_out })
 }
 
+/// Why a trigger's `gh` call failed (`Tools::api_get`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GhError {
+    /// gh isn't installed.
+    Missing,
+    /// gh isn't signed in to GitHub.
+    NotSignedIn(String),
+    Other(String),
+}
+
 #[derive(Debug)]
 enum GhErr {
     Missing,
@@ -449,6 +459,18 @@ impl Tools {
                 None => return Err(classify(what, reply.status, c.code, &stderr)),
             }
         }
+    }
+
+    /// One read-only `gh api <path>` call for the GitHub trigger poller (src/schedules/
+    /// triggers.rs): the path is built from a validated OWNER/NAME and fixed query strings.
+    pub(crate) fn api_get(&self, what: &str, path: &str) -> Result<Value, GhError> {
+        let out = self.gh(what, vec!["api".into(), "--method".into(), "GET".into(), path.into()]).map_err(|e| match e {
+            GhErr::Missing => GhError::Missing,
+            GhErr::Auth(d) => GhError::NotSignedIn(d),
+            GhErr::RateLimited(d, reset) => GhError::Other(match reset { Some(r) => format!("{d}; it resets at {r}"), None => d }),
+            GhErr::NotFound(d) | GhErr::Failed(d) | GhErr::TooLarge(d) => GhError::Other(d),
+        })?;
+        serde_json::from_slice(&out).map_err(|e| GhError::Other(format!("{what}: GitHub's reply is not JSON: {e}")))
     }
 
     /// One GraphQL query (a constant); variables go as separate `-f`/`-F` arguments, so no value

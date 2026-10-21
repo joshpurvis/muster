@@ -267,11 +267,54 @@ export interface OpenRouterModels {
 
 // ---------------- schedules (docs/PROTOCOL.md "Schedules") ----------------
 
-/** When a schedule runs: a 5-field cron line (or `@daily` and friends), or once at a time. */
-export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number };
+/** The GitHub events a trigger polls for. */
+export type GhEvent = "pr_opened" | "ci_failed";
+/** What a trigger waits for (Phase 2): runs have origin `webhook`, shown as "Triggered". */
+export type TriggerWhen =
+  | { kind: "note"; note_id: number; quiet_min: number }
+  | { kind: "git"; repo: string; branch: string }
+  | { kind: "github"; repo: string; event: GhEvent; branch: string | null; every_min: number }
+  | { kind: "url"; name: string };
+/** When a schedule runs: a 5-field cron line (or `@daily` and friends), once at a time, or when
+ * something happens (a trigger). */
+export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number } | TriggerWhen;
 /** What `schedule.create` / `.update` / `.preview` take: a one-off may also be a wall-clock time
  * ("2026-10-21T15:30") the backend reads in the schedule's `tz`. */
-export type WhenInput = When | { kind: "once"; local: string };
+export type WhenInput =
+  | { kind: "cron"; cron: string }
+  | { kind: "once"; at: number }
+  | { kind: "once"; local: string }
+  | { kind: "note"; note_id: number; quiet_min?: number }
+  | { kind: "git"; repo: string; branch: string }
+  | { kind: "github"; repo: string; event: GhEvent; branch?: string | null; every_min?: number }
+  | { kind: "url"; name: string };
+
+/** A "Then…" step: ask an agent (the prompt may quote `{reply}`), or on failure just notify. */
+export interface ThenStep {
+  notify: boolean;
+  agent: string | null;
+  agent_id: number | null;
+  prompt: string;
+  then: Then | null;
+}
+export interface Then {
+  on_success: ThenStep | null;
+  on_failure: ThenStep | null;
+}
+/** What `schedule.create` / `.update` take as `then` (agents by name). */
+export interface ThenInput {
+  on_success?: { agent: string; prompt: string; then?: ThenInput } | null;
+  on_failure?: { notify: true } | { agent: string; prompt: string; then?: ThenInput } | null;
+}
+/** An event a trigger holds for its next run (or recorded with a triggered run). */
+export interface TriggerEvent {
+  at: number;
+  /** What happened, one line per event. */
+  text: string;
+  count: number;
+  /** Data came with it (trigger URL, `muster trigger`). */
+  payload: boolean;
+}
 
 export type MissedRule = "auto" | "run_once" | "skip";
 export type RunOutcome =
@@ -291,7 +334,7 @@ export interface ScheduleRun {
   schedule_id: number;
   /** The planned time (unix ms); now for Run now. */
   slot: number;
-  kind: "scheduled" | "catch_up" | "manual";
+  kind: "scheduled" | "catch_up" | "manual" | "triggered" | "chain";
   started_at: number;
   finished_at: number | null;
   outcome: RunOutcome;
@@ -302,6 +345,20 @@ export interface ScheduleRun {
   msg_id: number | null;
   /** The message it sent, with its reply, as `agent.messages` has it. */
   message: AgentMessage | null;
+  /** A "Then…" step: the run it follows, its place ("s"/"f" per level), its agent. */
+  parent_run?: number | null;
+  step?: string | null;
+  agent?: string | null;
+  /** A triggered run: what happened. */
+  event?: TriggerEvent | null;
+}
+
+/** A git or GitHub trigger's watcher. */
+export interface TriggerWatch {
+  state: "ok" | "waiting" | "gh_not_signed_in" | "gh_missing" | "error";
+  detail: string | null;
+  checked_at: number | null;
+  next_at: number | null;
 }
 
 /** A recurring or one-off message to a named agent (`schedule.list`, `schedule_upserted`). */
@@ -337,6 +394,32 @@ export interface Schedule {
   created_at: number;
   updated_at: number;
   last_run: ScheduleRun | null;
+  /** Phase 2 (absent from older backends): fired by an event, not the clock. */
+  trigger?: boolean;
+  origin?: "schedule" | "webhook";
+  then?: Then | null;
+  /** A trigger's event waiting for its run (at `next_run`). */
+  pending?: TriggerEvent | null;
+  watch?: TriggerWatch | null;
+  /** A note trigger's note, and whether the human allows triggers on it. */
+  note?: { id: number; title: string; triggers: boolean } | null;
+  /** A URL trigger's address (its secret: `trigger.secret`). */
+  url?: string | null;
+}
+
+/** OpenRouter spend today (UTC day) and the daily caps (`ScheduleSettings.spend`). */
+export interface SpendInfo {
+  key_present: boolean;
+  /** Dollars billed to the key today; null before a reading. */
+  today: number | null;
+  /** The overall daily cap (always on). */
+  cap: number;
+  /** Spent while no agent of Muster's was working (other use of the key). */
+  other: number;
+  agents: { id: number; name: string; spent: number; cap: number | null }[];
+  checked_at: number | null;
+  error: string | null;
+  resets_at: number;
 }
 
 /** Scheduling settings (`schedule.settings.get` / `.set`, `schedule_settings`). */
@@ -350,6 +433,8 @@ export interface ScheduleSettings {
   unattended_cap: number;
   /** This machine's zone (read-only). */
   tz: string;
+  /** OpenRouter spend and caps (Phase 2 backends). */
+  spend?: SpendInfo;
 }
 
 /** `schedule.preview`: what a timing means, before saving it. */
@@ -363,6 +448,11 @@ export interface SchedulePreview {
   quiet_hours_default: boolean;
   missed_default: "run_once" | "skip";
   expires: boolean;
+  /** A trigger (no times to list). */
+  trigger?: boolean;
+  /** A note trigger whose note doesn't allow triggers yet. */
+  note_triggers_off?: boolean;
+  daily_cap_default?: number;
 }
 
 export type ServerEvent =
@@ -491,6 +581,8 @@ export interface Note {
   beside: SessionId | null;
   /** Raised by every change (text, title, window): the newer record wins. */
   version: number;
+  /** "Allow triggers": a schedule's note trigger may fire on its changes (the human's switch). */
+  triggers?: boolean;
 }
 
 /** A note without its text (`hello.notes`, `note.list`). */

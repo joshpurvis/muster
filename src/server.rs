@@ -31,6 +31,8 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .route("/api/device/logout", post(device_logout))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
+        // Trigger URLs (src/schedules/triggers.rs): this machine only, each with its secret.
+        .route("/api/trigger/{name}", post(trigger).layer(axum::extract::DefaultBodyLimit::max(crate::schedules::triggers::PAYLOAD_MAX + 1)))
         .with_state(hub.clone())
         .nest("/mcp", crate::mcp::router(hub.clone())?)
         .fallback(crate::assets::serve)
@@ -526,6 +528,34 @@ async fn exchange(
     match hub.exchange_launch_code(req.code.trim()) {
         Some(token) => axum::Json(json!({ "token": token })).into_response(),
         None => forbidden("invalid or expired launch code"),
+    }
+}
+
+/// `POST /api/trigger/<name>` with `Authorization: Bearer <the trigger's secret>`: fire a URL
+/// trigger. Loopback only: a request through a proxy (`tailscale serve`) never gets here (and is
+/// refused here too). The body, at most 16 KiB, reaches the agent as quoted untrusted data.
+async fn trigger(
+    State(hub): State<Arc<Hub>>,
+    Extension(peer): Extension<Peer>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if peer.proxied {
+        return (StatusCode::FORBIDDEN, "trigger URLs answer on this machine only").into_response();
+    }
+    let Some(secret) = bearer(&headers) else {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": { "message": "send the trigger's secret: Authorization: Bearer <secret>" } })))
+            .into_response();
+    };
+    let payload = (!body.is_empty()).then_some(&body[..]);
+    match crate::schedules::triggers::fire_url(&hub, &name, Some(secret), payload, "Its trigger URL was called") {
+        Ok(v) => axum::Json(v).into_response(),
+        Err((code, msg)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+            axum::Json(json!({ "error": { "message": msg } })),
+        )
+            .into_response(),
     }
 }
 

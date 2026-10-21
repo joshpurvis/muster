@@ -1600,6 +1600,17 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
     // Plain text only, whoever built it (a schedule's prompt quotes stored replies): no control
     // character, such as the end of a bracketed paste, reaches the agent's input.
     out.text = crate::mcp::tools::clean_text(&out.text);
+    // The OpenRouter spend caps, for every unattended path (an agent's ask_agent included),
+    // before the agent is started for a message that would be refused.
+    if let Some(a) = hub.agents().get(&out.agent)
+        && crate::spend::applies(hub, &a, out.route.origin)
+    {
+        hub.spend.ensure_fresh(hub).await;
+        if let Err(why) = hub.spend.check(hub, &a, &hub.schedules.settings()) {
+            record_refused(hub, &message_record(&a, &out.from, out.from_session, out.route, &out.text), &why);
+            return Err(Refused(why).into());
+        }
+    }
     let bs = start(hub, &out.agent, false, None).await?;
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);
@@ -1667,6 +1678,9 @@ pub async fn send_checked(
     prov: Option<Prov>,
     forced: Option<Origin>,
 ) -> anyhow::Result<(Delivery, Route)> {
+    if crate::spend::applies(hub, agent, proposed_route(prov, forced).origin) {
+        hub.spend.ensure_fresh(hub).await;
+    }
     let route = precheck(hub, agent, &text, &from, from_session, prov, forced)?;
     let d = deliver(hub, Outgoing { agent: agent.name.clone(), text, from, from_session, route }).await?;
     Ok((d, route))
@@ -1696,6 +1710,13 @@ pub fn precheck(
         if n >= cap as usize {
             checked = Err(guard::unattended_cap_refusal(&agent.name, n, cap));
         }
+    }
+    // The OpenRouter spend caps: unattended work only (what the human types always goes).
+    if checked.is_ok()
+        && crate::spend::applies(hub, agent, proposed.origin)
+        && let Err(why) = hub.spend.check(hub, agent, &hub.schedules.settings())
+    {
+        checked = Err(why);
     }
     match checked {
         Ok(r) => Ok(r),

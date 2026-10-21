@@ -596,6 +596,12 @@ pub enum NoteCmd {
     Close { note: String },
     /// Delete a note for good. Refused from an agent's session: only the human deletes notes.
     Rm { note: String },
+    /// "Allow triggers" on a note (off by default): only then can a schedule's note trigger
+    /// fire on its changes. Without on/off, says whether it is on. Only you can switch it.
+    Triggers {
+        note: String,
+        #[arg(value_parser = ["on", "off"])] state: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -718,6 +724,15 @@ pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
             println!("deleted note {id}");
             Ok(())
         }
+        NoteCmd::Triggers { note, state } => {
+            let id = note_target(d, &note)?;
+            let n = match state {
+                Some(s) => client::rpc(d, "note.set_triggers", json!({"id": id, "on": s == "on", "from_session": from}))?,
+                None => client::rpc(d, "note.get", json!({"id": id}))?,
+            };
+            println!("note {id}: triggers {}", if n["triggers"].as_bool() == Some(true) { "allowed" } else { "off" });
+            Ok(())
+        }
     }
 }
 
@@ -766,6 +781,18 @@ pub enum ScheduleCmd {
         #[arg(long)] max_per_day: Option<u32>,
         /// Create it paused.
         #[arg(long)] paused: bool,
+        /// A trigger instead of a time (runs are origin webhook, "Triggered"): `note:<note>`,
+        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`
+        /// or `url:<name>`.
+        #[arg(long, value_name = "EVENT")] on: Option<String>,
+        /// A note trigger waits this many minutes of quiet after the last edit (default 2).
+        #[arg(long, value_name = "N")] quiet_min: Option<u32>,
+        /// A GitHub trigger checks every N minutes (2 to 60, default 5).
+        #[arg(long, value_name = "N")] poll_min: Option<u32>,
+        /// Then, when a run replies: `AGENT: prompt` (the prompt may quote the reply as {reply}).
+        #[arg(long, value_name = "AGENT: PROMPT")] then: Option<String>,
+        /// When a run fails: `notify`, or `AGENT: prompt` ({reply}, {outcome}).
+        #[arg(long, value_name = "notify|AGENT: PROMPT")] on_failure: Option<String>,
     },
     /// List schedules: ID  AGENT  STATUS  NEXT  LAST  NAME.
     #[command(alias = "list")]
@@ -800,6 +827,50 @@ pub enum ScheduleCmd {
         #[arg(long, default_value_t = 20)] limit: usize,
         #[arg(long)] json: bool,
     },
+}
+
+/// `--on EVENT` as a trigger `when`.
+fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>) -> anyhow::Result<Value> {
+    let bad = |why: &str| exit(2, format!("--on {on}: {why}"));
+    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed or url:<name>"))?;
+    let v = match kind {
+        "note" => json!({"kind": "note", "note_id": note_target(d, rest)?, "quiet_min": quiet_min}),
+        "git" => {
+            let (repo, branch) = rest.rsplit_once('@').ok_or_else(|| bad("give the branch: git:<repo>@<branch>, e.g. git:~/projects/x@master"))?;
+            let repo = match repo.strip_prefix("~/") {
+                Some(r) => crate::paths::home_dir().join(r),
+                None => std::path::absolute(repo).map_err(|e| bad(&e.to_string()))?,
+            };
+            json!({"kind": "git", "repo": repo, "branch": branch})
+        }
+        "gh" | "github" => {
+            let (repo, ev) = rest.rsplit_once(':').ok_or_else(|| bad("say what: gh:<owner/repo>:pr-opened or gh:<owner/repo>:ci-failed"))?;
+            let (ev, branch) = match ev.split_once('@') {
+                Some((e, b)) => (e, Some(b)),
+                None => (ev, None),
+            };
+            let event = match ev {
+                "pr-opened" | "pr_opened" => "pr_opened",
+                "ci-failed" | "ci_failed" => "ci_failed",
+                _ => return Err(bad("the GitHub event is pr-opened or ci-failed")),
+            };
+            json!({"kind": "github", "repo": repo, "event": event, "branch": branch, "every_min": poll_min})
+        }
+        "url" => json!({"kind": "url", "name": rest}),
+        _ => return Err(bad("the kind is note, git, gh or url")),
+    };
+    let mut v = v;
+    v.as_object_mut().unwrap().retain(|_, x| !x.is_null());
+    Ok(v)
+}
+
+/// `--then` / `--on-failure` as a step: `notify`, or `AGENT: prompt`.
+fn step_arg(flag: &str, s: &str, failure: bool) -> anyhow::Result<Value> {
+    if failure && s.trim() == "notify" {
+        return Ok(json!({"notify": true}));
+    }
+    let (agent, prompt) = s.split_once(':').ok_or_else(|| exit(2, format!("--{flag}: use \"AGENT: prompt\"{}", if failure { " or notify" } else { "" })))?;
+    Ok(json!({"agent": agent.trim(), "prompt": prompt.trim()}))
 }
 
 /// `--every 30m` etc. as a cron line.
@@ -928,8 +999,23 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
     };
     match cmd {
         ScheduleCmd::Add { agent, prompt, every, hourly, daily, weekdays, weekly, cron, at, name, tz, if_missed, fresh,
-            notify, note, quiet_hours, max_per_day, paused } => {
-            let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
+            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, then, on_failure } => {
+            let when = match &on {
+                Some(on) => {
+                    if [&every, &hourly, &daily, &weekdays, &weekly, &cron, &at].iter().any(|o| o.is_some()) {
+                        return Err(exit(2, "give a timing or --on EVENT, not both"));
+                    }
+                    trigger_when(d, on, quiet_min, poll_min)?
+                }
+                None => schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?,
+            };
+            let mut steps = serde_json::Map::new();
+            if let Some(t) = &then {
+                steps.insert("on_success".into(), step_arg("then", t, false)?);
+            }
+            if let Some(f) = &on_failure {
+                steps.insert("on_failure".into(), step_arg("on-failure", f, true)?);
+            }
             let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
             let note = note.map(|n| match n.parse::<i64>() {
                 Ok(id) => json!({"id": id}),
@@ -942,11 +1028,26 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 "notify": notify.map(|n| if n == "failure" { "on_failure".to_string() } else { n }),
                 "note": note, "quiet_hours": quiet_hours.map(|q| q == "on"), "daily_cap": max_per_day,
                 "paused": paused.then_some(true),
+                "then": (!steps.is_empty()).then(|| Value::Object(steps)),
             });
             p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
             let s = one("schedule.create", p)?;
-            let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
-            println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
+            if s["trigger"].as_bool() == Some(true) {
+                println!("schedule {}: {} (triggered: origin webhook, at most {} runs a day)", s["id"], s["reading"].as_str().unwrap_or(""),
+                    s["daily_cap"].as_u64().map(|c| c.to_string()).unwrap_or_else(|| "any".into()));
+                if let Some(n) = s["note"].as_object()
+                    && n.get("triggers").and_then(Value::as_bool) != Some(true)
+                {
+                    println!("  Triggers are off for the note {:?}: it fires only once you allow them \
+                        (`muster note triggers {} on`, or the note's status line).", n.get("title").and_then(Value::as_str).unwrap_or(""), n.get("id").unwrap_or(&Value::Null));
+                }
+                if let Some(u) = s["url"].as_str() {
+                    println!("  URL: {u} (POST, with its secret: `muster trigger --url {}`)", s["when"]["name"].as_str().unwrap_or(""));
+                }
+            } else {
+                let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
+                println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
+            }
             if s["expires_at"].is_i64() {
                 println!("  {} is a Claude subscription agent: this schedule stops after 7 days unless you renew it \
                     (`muster schedule renew {}`). Quiet hours: {}.", s["agent"].as_str().unwrap_or("it"), s["id"],
@@ -1023,6 +1124,30 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// `muster trigger <name> [DATA...]` (`trigger.fire`), or `--url` (`trigger.secret`). Only you:
+/// refused from an agent's session or a shell an agent drives.
+pub fn trigger(d: &Discovery, name: &str, data: &[String], url: bool, rotate: bool) -> anyhow::Result<()> {
+    let from = env_session();
+    if url {
+        let v = client::rpc(d, "trigger.secret", json!({"name": name, "rotate": rotate, "from_session": from}))?;
+        if rotate {
+            println!("trigger {name}: a new secret (the old one no longer works)");
+        }
+        println!("URL:    {}", v["url"].as_str().unwrap_or(""));
+        println!("Secret: {}", v["secret"].as_str().unwrap_or(""));
+        println!("Call it (this machine only; data on stdin, at most 16 KiB):");
+        println!("  {}", v["curl"].as_str().unwrap_or(""));
+        return Ok(());
+    }
+    let payload = if data.is_empty() { None } else { Some(note_text(data)?) };
+    let v = client::rpc(d, "trigger.fire", json!({"name": name, "payload": payload, "from_session": from}))?;
+    match v["runs_at"].as_i64() {
+        Some(t) if t > now_ms() + 30_000 => println!("trigger {name}: queued; it runs at {} (at most every 15 minutes)", local_time(t)),
+        _ => println!("trigger {name}: queued; it runs now (see `muster schedule history`)"),
+    }
+    Ok(())
 }
 
 /// `muster pair`: start a pairing, print how to reach the daemon from the phone (the

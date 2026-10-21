@@ -1416,6 +1416,38 @@ export function runScheduleNow(s: Schedule) {
   }).catch(fail("Couldn't run it")).catch(() => {});
 }
 
+/** A URL trigger: copy a ready `curl` line (its loopback URL and secret) for a script. */
+export function copyTriggerCommand(s: Schedule) {
+  rpc.call<{ curl: string; url: string }>("trigger.secret", { id: s.id }).then(async (v) => {
+    if (await copyText(v.curl)) {
+      toast("success", `Copied the command that calls ${s.name} (it holds the secret: keep it private)`, 4000);
+    } else toast("warn", `Couldn't copy it. In a terminal: muster trigger --url ${v.url.split("/").pop()}`, 6000);
+  }).catch(fail("Couldn't read the trigger's secret")).catch(() => {});
+}
+
+/** A URL trigger: a new secret; the old one stops working. */
+export function rotateTriggerSecret(s: Schedule) {
+  overlay.value = {
+    kind: "confirm",
+    title: `New secret for ${s.name}?`,
+    body: "Scripts that call it with the old secret stop working until you give them the new one.",
+    confirmLabel: "New secret",
+    run: () =>
+      rpc.call<{ curl: string }>("trigger.secret", { id: s.id, rotate: true }).then(async (v) => {
+        const copied = await copyText(v.curl);
+        toast("success", copied ? "New secret made; the command with it is copied" : "New secret made; the old one no longer works", 3500);
+      }).catch(fail("Couldn't make a new secret")).catch(() => {}),
+  };
+}
+
+/** "Allow triggers" on a note: only then can note triggers fire on its changes. */
+export function setNoteTriggers(id: number, on: boolean) {
+  rpc.call<Note>("note.set_triggers", { id, on }).then((n) => {
+    knowNote(n);
+    toast("info", on ? `Triggers allowed on ${n.title}: its changes can now start runs` : `Triggers off for ${n.title}`, 3000);
+  }).catch(fail("Couldn't change it")).catch(() => {});
+}
+
 export function removeSchedule(s: Schedule) {
   overlay.value = {
     kind: "confirm",

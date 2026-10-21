@@ -26,6 +26,8 @@ export interface ScheduleDeps {
   /** A note by id, or by title (made when none has it). */
   note: (choice: { id?: number; title?: string }) => { id: number; title: string };
   noteTitle: (id: number) => string | null;
+  /** A note's "Allow triggers" switch (null: no such note). */
+  noteTriggers: (id: number) => boolean | null;
 }
 
 const MIN = 60_000;
@@ -177,9 +179,31 @@ function fmtLong(ms: number, tz: string): string {
 
 // ---------------- the store ----------------
 
-type When = { kind: "cron"; cron: string } | { kind: "once"; at: number };
+type Trig =
+  | { kind: "note"; note_id: number; quiet_min: number }
+  | { kind: "git"; repo: string; branch: string }
+  | { kind: "github"; repo: string; event: "pr_opened" | "ci_failed"; branch: string | null; every_min: number }
+  | { kind: "url"; name: string };
+type When = { kind: "cron"; cron: string } | { kind: "once"; at: number } | Trig;
+const isTrig = (w: When): w is Trig => w.kind !== "cron" && w.kind !== "once";
+
+/** "Then…" steps as stored: agents by id. */
+interface Step {
+  notify: boolean;
+  agent_id: number | null;
+  prompt: string;
+}
+interface ThenSteps {
+  on_success: Step | null;
+  on_failure: Step | null;
+}
 
 interface Sched {
+  then: ThenSteps | null;
+  /** A trigger's held event. */
+  pending: { at: number; text: string; count: number; payload: boolean } | null;
+  watch: { state: string; detail: string | null; checked_at: number | null; next_at: number | null } | null;
+  secret: string | null;
   id: number;
   agent_id: number;
   name: string;
@@ -208,13 +232,44 @@ export function scheduleMock(deps: ScheduleDeps) {
   const { now, broadcast } = deps;
   const list: Sched[] = [];
   const runs = new Map<number, any[]>(); // schedule id -> runs, oldest first
+  /** OpenRouter spend (src/spend.rs): plausible numbers, never fetched. */
+  const spend = {
+    key_present: true,
+    today: 1.84 as number | null,
+    cap: 5,
+    other: 0.12,
+    caps: new Map<number, number>(),
+    spent: new Map<number, number>(),
+    checked_at: now() - 3 * MIN,
+  };
+  const spendJson = () => ({
+    key_present: spend.key_present,
+    today: spend.today,
+    cap: spend.cap,
+    other: spend.other,
+    agents: deps.agents().filter((a) => a.provider === "openrouter").map((a) => ({
+      id: a.id,
+      name: a.name,
+      spent: spend.spent.get(a.id) ?? 0,
+      cap: spend.caps.get(a.id) ?? null,
+    })),
+    checked_at: spend.checked_at,
+    error: null,
+    resets_at: (Math.floor(now() / DAY) + 1) * DAY,
+  });
   const settings = { paused: false, quiet_start: "23:00", quiet_end: "07:00", unattended_cap: 24, tz: localZone() };
+  const settingsJson = () => ({ ...settings, spend: spendJson() });
 
   const agentOf = (s: Sched) => deps.agents().find((a) => a.id === s.agent_id);
   const subClaude = (a: SchedAgent | undefined) => !!a && a.kind === "claude" && a.provider !== "openrouter";
-  const expiresAt = (s: Sched) => subClaude(agentOf(s)) && s.when.kind === "cron" ? s.window_from + 7 * DAY : null;
+  const stepAgentIds = (t: ThenSteps | null) =>
+    [t?.on_success?.agent_id, t?.on_failure?.agent_id].filter((x): x is number => typeof x === "number");
+  const anySubClaude = (s: Sched) =>
+    subClaude(agentOf(s)) || stepAgentIds(s.then).some((id) => subClaude(deps.agents().find((a) => a.id === id)));
+  const expiresAt = (s: Sched) => anySubClaude(s) && s.when.kind !== "once" ? s.window_from + 7 * DAY : null;
 
   function firstSlot(when: When, after: number): number | null {
+    if (isTrig(when)) return null;
     if (when.kind === "once") {
       if (!(when.at > after)) throw new Error("that time has passed: pick a time in the future");
       if (when.at - after > 366 * DAY) throw new Error("a one-off schedule can be at most a year ahead");
@@ -236,7 +291,24 @@ export function scheduleMock(deps: ScheduleDeps) {
     return first;
   }
 
-  const reading = (when: When, tz: string) => when.kind === "once" ? `Once, ${fmtLong(when.at, tz)}` : describe(parseCron(when.cron));
+  function triggerReading(w: Trig): string {
+    switch (w.kind) {
+      case "note":
+        return `When the note “${deps.noteTitle(w.note_id) ?? `note ${w.note_id} (deleted)`}” changes (after ${w.quiet_min} minute${
+          w.quiet_min === 1 ? "" : "s"
+        } of quiet)`;
+      case "git":
+        return `When ${w.branch} moves in ${w.repo}`;
+      case "github":
+        return w.event === "pr_opened"
+          ? `When a pull request is opened on ${w.repo} (checked every ${w.every_min} minutes)`
+          : `When CI fails on ${w.repo}${w.branch ? ` (${w.branch})` : ""} (checked every ${w.every_min} minutes)`;
+      case "url":
+        return `When its trigger URL is called (muster trigger ${w.name})`;
+    }
+  }
+  const reading = (when: When, tz: string) =>
+    isTrig(when) ? triggerReading(when) : when.kind === "once" ? `Once, ${fmtLong(when.at, tz)}` : describe(parseCron(when.cron));
 
   function inQuiet(ms: number): boolean {
     const [sh, sm] = settings.quiet_start.split(":").map(Number), [eh, em] = settings.quiet_end.split(":").map(Number);
@@ -246,7 +318,7 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   /** Daily or slower (and one-offs) run once after downtime; hourly or faster ones skip. */
   function missedDefault(when: When): "run_once" | "skip" {
-    if (when.kind === "once") return "run_once";
+    if (when.kind !== "cron") return "run_once";
     const c = parseCron(when.cron);
     const a = nextAfter(c, now()), b = a !== null ? nextAfter(c, a) : null;
     return a !== null && b !== null && b - a <= HOUR ? "skip" : "run_once";
@@ -278,13 +350,47 @@ export function scheduleMock(deps: ScheduleDeps) {
       skip_next: s.skip_next,
       next_run: s.next_run,
       last_slot: s.last_slot,
-      status: expired ? "expired" : s.next_run === null ? "done" : s.paused ? "paused" : "active",
+      status: expired ? "expired" : s.next_run === null && !isTrig(s.when) ? "done" : s.paused ? "paused" : "active",
       expires_at: exp,
       expires_soon: exp !== null && !expired && exp - now() <= DAY,
       created_at: s.created_at,
       updated_at: s.updated_at,
-      last_run: r.at(-1) ?? null,
+      last_run: r.filter((x) => x.kind !== "chain").at(-1) ?? null,
+      trigger: isTrig(s.when),
+      origin: isTrig(s.when) ? "webhook" : "schedule",
+      then: thenJson(s.then),
+      pending: s.pending,
+      watch: s.when.kind === "git" || s.when.kind === "github" ? s.watch ?? { state: "ok", detail: null, checked_at: now() - MIN, next_at: null } : null,
+      note: s.when.kind === "note"
+        ? { id: s.when.note_id, title: deps.noteTitle(s.when.note_id) ?? "", triggers: !!deps.noteTriggers(s.when.note_id) }
+        : null,
+      url: s.when.kind === "url" ? `http://127.0.0.1:7433/api/trigger/${s.when.name}` : null,
     };
+  }
+
+  const agentName = (id: number | null) => deps.agents().find((a) => a.id === id)?.name ?? null;
+  function thenJson(t: ThenSteps | null) {
+    if (!t) return null;
+    const step = (s: Step | null) => s && { ...s, agent: agentName(s.agent_id), then: null };
+    return { on_success: step(t.on_success), on_failure: step(t.on_failure) };
+  }
+  function thenIn(raw: any, origin: string): ThenSteps | null {
+    if (!raw) return null;
+    const step = (s: any, failure: boolean): Step | null => {
+      if (!s) return null;
+      if (s.notify) {
+        if (!failure) throw new Error("only the failure branch can just notify you (use Notify me: Always for successes)");
+        return { notify: true, agent_id: null, prompt: "" };
+      }
+      const a = agentNamed(s.agent);
+      if (!a.accepts_origins.includes(origin)) {
+        throw new Error(`agent ${a.name} doesn't take ${origin === "webhook" ? "triggered" : "scheduled"} work`);
+      }
+      if (!String(s.prompt ?? "").trim()) throw new Error("the prompt must not be empty");
+      return { notify: false, agent_id: a.id, prompt: String(s.prompt) };
+    };
+    const t = { on_success: step(raw.on_success, false), on_failure: step(raw.on_failure, true) };
+    return t.on_success || t.on_failure ? t : null;
   }
 
   const publish = (s: Sched) => {
@@ -302,8 +408,11 @@ export function scheduleMock(deps: ScheduleDeps) {
     if (!a) throw new Error(`no agent named ${name}`);
     return a;
   };
-  function checkAgent(a: SchedAgent) {
-    if (a.accepts_origins.includes("schedule")) return;
+  function checkAgent(a: SchedAgent, origin = "schedule") {
+    if (a.accepts_origins.includes(origin)) return;
+    if (origin === "webhook") {
+      throw new Error(`agent ${a.name} doesn't take triggered work: tick Webhook (triggered) under "Takes messages started by" in Edit agent.`);
+    }
     throw new Error(
       `agent ${a.name} doesn't take scheduled work: tick Schedule under "Takes messages started by" in Edit agent (or \`muster agent edit ${a.name} --accepts human,schedule\`).${
         subClaude(a)
@@ -362,9 +471,11 @@ export function scheduleMock(deps: ScheduleDeps) {
       record(s, { ...run, outcome: "failed", finished_at: now(), reason: "its agent is gone" });
       return run;
     }
-    if (!a.accepts_origins.includes("schedule")) {
-      const why = `${a.name} accepts only ${a.accepts_origins.join(", ")}-started messages, and this one started from a schedule (origin=schedule)`;
-      const m = deps.sendMessage(a, `schedule:${s.id}`, s.prompt, why);
+    const origin = isTrig(s.when) ? "webhook" : "schedule";
+    const from = `${isTrig(s.when) ? "trigger" : "schedule"}:${s.id}`;
+    if (!a.accepts_origins.includes(origin)) {
+      const why = `${a.name} accepts only ${a.accepts_origins.join(", ")}-started messages, and this one is origin=${origin}`;
+      const m = deps.sendMessage(a, from, s.prompt, why);
       const r = { ...run, outcome: "refused", finished_at: now(), reason: why, msg_id: m.id, message: m };
       record(s, r);
       publish(s);
@@ -374,8 +485,9 @@ export function scheduleMock(deps: ScheduleDeps) {
     const text = s.prompt
       .replaceAll("{date}", new Date(run.slot).toISOString().slice(0, 10))
       .replaceAll("{last_run}", prev ? new Date(prev.started_at).toISOString().slice(0, 16).replace("T", " ") : "never")
-      .replaceAll("{last_reply}", prev?.message?.reply ?? "");
-    const m = deps.sendMessage(a, `schedule:${s.id}`, text);
+      .replaceAll("{last_reply}", prev?.message?.reply ?? "")
+      .replaceAll("{event}", run.event?.text ?? "(no event)");
+    const m = deps.sendMessage(a, from, text);
     const sent = { ...run, msg_id: m.id, message: m };
     record(s, sent);
     publish(s);
@@ -387,12 +499,42 @@ export function scheduleMock(deps: ScheduleDeps) {
         // The real backend appends the reply to the note; the mock only says it would.
       }
       publish(s);
+      // "Then…": the success step, one hop further (the mock replies a second later).
+      const step = s.then?.on_success;
+      const to = step && deps.agents().find((x) => x.id === step.agent_id);
+      if (step && to) {
+        const msg = deps.sendMessage(to, `${from}/then:${r.id}`, step.prompt.replaceAll("{reply}", m.reply ?? ""));
+        const c = newRun(s, { kind: "chain", parent_run: r.id, step: "s", agent: to.name, msg_id: msg.id, message: msg });
+        record(s, c);
+        setTimeout(() => {
+          deps.reply(msg, "Filed a note with the likely causes.");
+          record(s, { ...c, outcome: "replied", finished_at: now(), message: msg });
+        }, 1000);
+      }
     }, 1000);
     return sent;
   }
 
-  /** A timing as sent: a one-off may be a wall-clock `local` time, read in zone `tz`. */
-  function whenIn(raw: any, tz: string): When {
+  /** A timing as sent: a one-off may be a wall-clock `local` time, read in zone `tz`; or a trigger. */
+  function whenIn(raw: any, tz: string, own?: number): When {
+    if (raw?.kind === "note") {
+      if (deps.noteTriggers(raw.note_id) === null) throw new Error(`no note with id ${raw.note_id}`);
+      return { kind: "note", note_id: raw.note_id, quiet_min: raw.quiet_min ?? 2 };
+    }
+    if (raw?.kind === "git") {
+      if (!String(raw.repo).startsWith("/") && !String(raw.repo).startsWith("~")) throw new Error("give the repository as a full path (or ~/…)");
+      return { kind: "git", repo: String(raw.repo), branch: String(raw.branch) };
+    }
+    if (raw?.kind === "github") {
+      if (!/^[\w.-]+\/[\w.-]+$/.test(String(raw.repo))) throw new Error(`\`${raw.repo}\` isn't OWNER/NAME (e.g. octocat/hello-world)`);
+      return { kind: "github", repo: raw.repo, event: raw.event, branch: raw.branch ?? null, every_min: raw.every_min ?? 5 };
+    }
+    if (raw?.kind === "url") {
+      const n = String(raw.name).toLowerCase();
+      if (!/^[a-z0-9][a-z0-9_-]{0,39}$/.test(n)) throw new Error("a trigger name is 1-40 characters of a-z, 0-9, - and _");
+      if (list.some((s) => s.id !== own && s.when.kind === "url" && s.when.name === n)) throw new Error(`there is already a trigger named ${n}`);
+      return { kind: "url", name: n };
+    }
     if (raw?.kind === "cron" && typeof raw.cron === "string") return { kind: "cron", cron: raw.cron };
     if (raw?.kind === "once" && typeof raw.local === "string") {
       const at = zonedToMs(raw.local, tz);
@@ -405,14 +547,19 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   function create(p: any) {
     const a = agentNamed(p.agent);
-    checkAgent(a);
-    const prompt = String(p.prompt ?? "");
-    if (!prompt.trim()) throw new Error("the prompt must not be empty");
     const tz = String(p.tz ?? "").trim() || localZone();
     const when = whenIn(p.when, tz);
+    const origin = isTrig(when) ? "webhook" : "schedule";
+    checkAgent(a, origin);
+    const prompt = String(p.prompt ?? "");
+    if (!prompt.trim()) throw new Error("the prompt must not be empty");
     if (list.length >= 200) throw new Error("200 schedules in all is the limit");
     const t = now();
     const s: Sched = {
+      then: thenIn(p.then, origin),
+      pending: null,
+      watch: null,
+      secret: when.kind === "url" ? crypto.randomUUID().replaceAll("-", "") : null,
       id: deps.nextId(),
       agent_id: a.id,
       name: cleanName(p.name, prompt),
@@ -424,7 +571,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       notify: p.notify ?? "on_failure",
       note_id: noteOf(p.note),
       quiet_hours: p.quiet_hours ?? subClaude(a),
-      daily_cap: capOf(p.daily_cap),
+      daily_cap: p.daily_cap === undefined && isTrig(when) ? 10 : capOf(p.daily_cap),
       paused: !!p.paused,
       skip_next: false,
       next_run: firstSlot(when, t),
@@ -441,12 +588,17 @@ export function scheduleMock(deps: ScheduleDeps) {
     const s = get(p.id);
     if ("agent" in p) throw new Error("a schedule's agent can't change: make a new schedule");
     const tz = p.tz !== undefined ? String(p.tz).trim() || localZone() : s.tz;
-    const when = p.when !== undefined ? whenIn(p.when, tz) : s.when;
+    const when = p.when !== undefined ? whenIn(p.when, tz, s.id) : s.when;
+    const origin = isTrig(when) ? "webhook" : "schedule";
+    if (isTrig(when) !== isTrig(s.when)) checkAgent(agentOf(s)!, origin);
+    if ("then" in p) s.then = thenIn(p.then, origin);
     // As the backend: an equal timing (compared by meaning, roughly) keeps Skip next.
     const same = JSON.stringify(when) === JSON.stringify(s.when) && tz === s.tz;
     if (!same) {
       s.next_run = firstSlot(when, now());
       s.skip_next = false;
+      s.pending = null;
+      if (when.kind === "url" && !s.secret) s.secret = crypto.randomUUID().replaceAll("-", "");
     }
     s.when = when;
     s.tz = tz;
@@ -464,11 +616,47 @@ export function scheduleMock(deps: ScheduleDeps) {
     return publish(s);
   }
 
+  /** Hold an event on trigger `s` (merged with one waiting; runs after the quiet minutes or the
+   * 15-minute floor). The mock never fires on its own; Run now still sends. */
+  function hold(s: Sched, text: string, payload: boolean, debounceMin = 0) {
+    const t = now();
+    s.pending = s.pending
+      ? { ...s.pending, text: `${s.pending.text}\n${text}`, count: s.pending.count + 1, payload: s.pending.payload || payload }
+      : { at: t, text, count: 1, payload };
+    const last = (runs.get(s.id) ?? []).filter((r) => r.msg_id !== null).at(-1)?.started_at;
+    const floor = last ? last + MIN_GAP : 0;
+    s.next_run = Math.max(t + debounceMin * MIN, floor);
+    publish(s);
+  }
+
+  /** A note's text changed (the human's edit, in the mock). */
+  function noteChanged(noteId: number, title: string) {
+    if (!deps.noteTriggers(noteId)) return;
+    for (const s of list) {
+      if (s.when.kind === "note" && s.when.note_id === noteId && !s.paused) {
+        hold(s, `The note “${title}” was edited by you.`, false, s.when.quiet_min);
+      }
+    }
+  }
+
+  /** A note's "Allow triggers" changed: its triggers read it again (off drops a held event). */
+  function noteTriggersChanged(noteId: number) {
+    for (const s of list) {
+      if (s.when.kind === "note" && s.when.note_id === noteId) {
+        if (!deps.noteTriggers(noteId)) {
+          s.pending = null;
+          s.next_run = null;
+        }
+        publish(s);
+      }
+    }
+  }
+
   function handle(method: string, p: any): unknown {
     switch (method) {
       case "schedule.list": {
         const a = p?.agent ? agentNamed(p.agent) : null;
-        return { schedules: list.filter((s) => !a || s.agent_id === a.id).map(json), settings };
+        return { schedules: list.filter((s) => !a || s.agent_id === a.id).map(json), settings: settingsJson() };
       }
       case "schedule.create":
         return create(p);
@@ -517,10 +705,44 @@ export function scheduleMock(deps: ScheduleDeps) {
         const all = [...(runs.get(s.id) ?? [])].reverse().filter((r) => p.before == null || r.id < p.before);
         return { runs: all.slice(0, limit), more: all.length > limit };
       }
+      case "schedule.mock_watch": {
+        // Dev only: how a git or GitHub watcher is doing ({id, state, detail}).
+        const s = get(p.id);
+        s.watch = { state: p.state, detail: p.detail ?? null, checked_at: now(), next_at: now() + 10 * MIN };
+        return publish(s);
+      }
+      case "trigger.secret": {
+        const s = p.id !== undefined ? get(p.id) : list.find((x) => x.when.kind === "url" && x.when.name === p.name);
+        if (!s || s.when.kind !== "url") throw new Error("schedule isn't a trigger URL");
+        if (p.rotate || !s.secret) s.secret = crypto.randomUUID().replaceAll("-", "");
+        const url = `http://127.0.0.1:7433/api/trigger/${s.when.name}`;
+        return { name: s.when.name, url, secret: s.secret, curl: `curl -fsS -X POST -H 'Authorization: Bearer ${s.secret}' --data-binary @- ${url}` };
+      }
+      case "trigger.fire": {
+        const s = list.find((x) => x.when.kind === "url" && x.when.name === String(p.name).toLowerCase());
+        if (!s) throw new Error(`no trigger named ${p.name}`);
+        hold(s, `\`muster trigger ${p.name}\` was run.`, !!p.payload);
+        return { queued: true, trigger: p.name, runs_at: s.next_run };
+      }
       case "schedule.preview": {
         const tz = String(p.tz ?? "").trim() || localZone();
-        const when = whenIn(p.when, tz);
+        const when = whenIn(p.when, tz, p.id);
         const a = p.agent ? agentNamed(p.agent) : undefined;
+        if (isTrig(when)) {
+          return {
+            reading: reading(when, tz),
+            tz,
+            when,
+            next: [],
+            quiet: [],
+            quiet_hours_default: subClaude(a),
+            missed_default: "run_once",
+            expires: subClaude(a),
+            trigger: true,
+            note_triggers_off: when.kind === "note" && !deps.noteTriggers(when.note_id),
+            daily_cap_default: 10,
+          };
+        }
         const next: number[] = [];
         const first = firstSlot(when, now());
         if (first !== null) next.push(first);
@@ -544,8 +766,17 @@ export function scheduleMock(deps: ScheduleDeps) {
         };
       }
       case "schedule.settings.get":
-        return settings;
+        return settingsJson();
       case "schedule.settings.set": {
+        if (p.spend_cap !== undefined) {
+          if (!(p.spend_cap >= 0.01 && p.spend_cap <= 1000)) throw new Error("a daily spend cap is $0.01 to $1000");
+          spend.cap = p.spend_cap;
+        }
+        for (const [name, cap] of Object.entries(p.agent_spend_caps ?? {})) {
+          const a = agentNamed(name);
+          if (cap === null) spend.caps.delete(a.id);
+          else spend.caps.set(a.id, Number(cap));
+        }
         const hhmm = (v: unknown) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v));
         if (p.quiet_start !== undefined && !hhmm(p.quiet_start)) throw new Error("quiet_start is HH:MM, like 23:00");
         if (p.quiet_end !== undefined && !hhmm(p.quiet_end)) throw new Error("quiet_end is HH:MM, like 07:00");
@@ -555,9 +786,9 @@ export function scheduleMock(deps: ScheduleDeps) {
         for (const k of ["paused", "quiet_start", "quiet_end", "unattended_cap"] as const) {
           if (p[k] !== undefined) (settings as any)[k] = p[k];
         }
-        broadcast("schedule_settings", settings);
+        broadcast("schedule_settings", settingsJson());
         for (const s of list) publish(s);
-        return settings;
+        return settingsJson();
       }
     }
     throw new Error(`unknown method ${method}`);
@@ -567,23 +798,38 @@ export function scheduleMock(deps: ScheduleDeps) {
   function seed(
     p: any,
     ageMs: number,
-    history: { slot: number; outcome: string; kind?: string; reason?: string; mins?: number; reply?: string }[] = [],
+    history: {
+      slot: number;
+      outcome: string;
+      kind?: string;
+      reason?: string;
+      mins?: number;
+      reply?: string;
+      /** A triggered run: what happened. */
+      event?: string;
+      /** A chain step: its agent (it follows the run before it). */
+      agent?: string;
+    }[] = [],
   ) {
     const j = create(p) as { id: number };
     const s = get(j.id);
     s.created_at = s.window_from = s.updated_at = now() - ageMs;
-    const a = agentOf(s)!;
     for (const h of history) {
+      const prevRun = (runs.get(s.id) ?? []).at(-1);
+      const a = h.agent ? agentNamed(h.agent) : agentOf(s)!;
       const r = newRun(s, {
         slot: h.slot,
         started_at: h.slot,
         finished_at: h.slot + (h.mins ?? 0) * MIN + 20_000,
-        kind: h.kind ?? "scheduled",
+        kind: h.kind ?? (h.agent ? "chain" : isTrig(s.when) ? "triggered" : "scheduled"),
         outcome: h.outcome,
         reason: h.reason ?? null,
+        event: h.event ? { at: h.slot, text: h.event, count: 1, payload: false } : null,
+        ...(h.agent ? { parent_run: prevRun?.id ?? null, step: "s", agent: a.name } : {}),
       });
       if (h.outcome !== "skipped") {
-        const m = deps.sendMessage(a, `schedule:${s.id}`, s.prompt, h.outcome === "refused" ? h.reason : null);
+        const from = `${isTrig(s.when) ? "trigger" : "schedule"}:${s.id}${h.agent ? `/then:${r.id}` : ""}`;
+        const m = deps.sendMessage(a, from, h.agent ? (s.then?.on_success?.prompt ?? s.prompt) : s.prompt, h.outcome === "refused" ? h.reason : null);
         m.created_at = h.slot;
         if (h.reply) {
           m.reply = h.reply;
@@ -613,5 +859,5 @@ export function scheduleMock(deps: ScheduleDeps) {
     }
   }
 
-  return { handle, seed, weekdayAt };
+  return { handle, seed, weekdayAt, noteChanged, noteTriggersChanged, hold: (id: number, text: string) => hold(get(id), text, false) };
 }

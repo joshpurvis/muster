@@ -6,6 +6,7 @@
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots> --allow-write=<shots>,/tmp \
 //     dev/e2e_schedules.ts http://127.0.0.1:17761/#token=dev <shots-dir>
 import { type Browser, launch } from "./cdp.ts";
+import { triggerChecks } from "./e2e_triggers.ts";
 
 export interface ScheduleCtx {
   shots: string;
@@ -285,6 +286,9 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   await a.click(".confirm-dlg .btn-danger");
   await a.wait(`!${row(made.name)}`, 2000);
   ok("Edit showed Weekdays and saved a new time; Remove… asked, then removed it");
+
+  // Phase 2: triggers, the note's "Allow triggers", Then… steps, the spend in settings.
+  await triggerChecks(a, { shots, ok, check });
 }
 
 if (import.meta.main) {

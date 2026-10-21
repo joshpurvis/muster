@@ -1084,6 +1084,7 @@ exec cat > /dev/null
   await c.call("agent.remove", { name: "bg" });
 
   ({ c, d } = await schedules(c, d));
+  ({ c, d } = await triggers(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
 }
@@ -1278,6 +1279,255 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
     "next runs move past the downtime");
   await c.call("agent.remove", { name: "sched" });
   ok((await c.call("schedule.list")).schedules.length === 0, "removing an agent removes its schedules");
+  return { c, d };
+}
+
+/** Scheduling Phase 2 with fakes: a note trigger fires only once the human allows triggers on
+ * the note (and never on its own agent's edit), a branch moving in a local repo, a PR opened on
+ * GitHub (a fake `gh` on PATH), a trigger URL with its secret and size cap and `muster trigger`,
+ * a "Then…" step one hop further, and the OpenRouter budget refusal (a fake key endpoint). Debug
+ * hooks shorten the waits; the backend is restarted for them, and again without them (and
+ * without a key) at the end. */
+async function triggers(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
+  const KEY = "sk-or-smoke-fake-key-trig-4d1e";
+  const run = async (args: string[], extra: Record<string, string> = {}) => {
+    const o = await cli(args, { ...env, ...extra });
+    return { ok: o.success, out: dec.decode(o.stdout), err: dec.decode(o.stderr) };
+  };
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await cond()) return;
+      await sleep(150);
+    }
+    throw new Error(`timeout waiting for ${what}`);
+  };
+  const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+  const sched = async (id: number) => (await c.call("schedule.list")).schedules.find((s: Json) => s.id === id);
+  const idOf = (out: string) => Number(out.match(/schedule (\d+)/)![1]);
+  const msgs = async (agent: string) => (await c.call("agent.messages", { agent, limit: 50 })).messages as Json[];
+
+  // A fake OpenRouter key endpoint: what the key has spent today ($6, over the $5 default).
+  const seen: string[] = [];
+  const keyServer = Deno.serve({ port: 0, hostname: "127.0.0.1", onListen: () => {} }, (req) => {
+    seen.push(req.headers.get("authorization") ?? "");
+    return Response.json({ data: { label: "smoke", usage: 106.5, usage_daily: 6.0, limit: null } });
+  });
+  // A fake gh on PATH: prints the body file (PRs), or says it isn't signed in.
+  await Deno.writeTextFile(`${BASE}/gh-body.json`, JSON.stringify([{ number: 1, title: "old", user: { login: "a" } }]));
+  await Deno.writeTextFile(`${BASE}/bin/gh`, `#!/bin/bash
+echo "$@" >> '${BASE}/gh-args'
+if [ -e '${BASE}/gh-signed-out' ]; then echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4; fi
+cat '${BASE}/gh-body.json'
+`);
+  await Deno.chmod(`${BASE}/bin/gh`, 0o700);
+  // A local repo whose master will move.
+  const GREPO = `${BASE}/trig-repo`;
+  await Deno.mkdir(GREPO, { recursive: true });
+  await git(GREPO, "init", "-q", "-b", "master");
+  await git(GREPO, "commit", "-q", "--allow-empty", "-m", "first");
+
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({
+    MUSTER_TEST_TRIGGER_DELAY_MS: "1000",
+    MUSTER_TEST_WATCH_EVERY_MS: "700",
+    OPENROUTER_API_KEY: KEY,
+    MUSTER_TEST_OPENROUTER_KEY_URL: `http://127.0.0.1:${keyServer.addr.port}/key`,
+  });
+  c = new Client(d.token);
+  await c.open();
+
+  // Two Codex agents (they take triggered work by default); their tokens answer the Stop hook.
+  await c.call("agent.create", { name: "trig", kind: "codex" });
+  await c.call("agent.create", { name: "trig2", kind: "codex" });
+  await Deno.remove(`${BASE}/fake-token`).catch(() => {}); // an earlier agent's
+  const sTrig = (await c.call("agent.start", { name: "trig" })).session.id;
+  await until("trig's token", async () => (await exists(`${BASE}/fake-token`)) && (await Deno.readTextFile(`${BASE}/fake-token`)).length > 10);
+  const tTrig = await Deno.readTextFile(`${BASE}/fake-token`);
+  await Deno.remove(`${BASE}/fake-token`);
+  await c.call("agent.start", { name: "trig2" });
+  await until("trig2's token", async () => (await exists(`${BASE}/fake-token`)) && (await Deno.readTextFile(`${BASE}/fake-token`)).length > 10);
+  const tTrig2 = await Deno.readTextFile(`${BASE}/fake-token`);
+  await c.waitFor("both idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === sTrig && e.data.state === "idle"));
+  const reply = async (token: string, text: string) => {
+    await sleep(1500); // the prompt is pasted before Enter (and the message attributed)
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ last_assistant_message: text }),
+    });
+    await r.body?.cancel();
+    ok(r.ok, `Stop hook: ${text}`);
+  };
+
+  // ---- A note trigger: nothing until the human allows triggers on the note
+  ok((await run(["note", "new", "--title", "Ideas", "first idea"])).ok, "a note to watch");
+  const add = await run(["schedule", "add", "trig", "--on", "note:Ideas", "Expand the new items: {event}"]);
+  ok(add.ok && add.out.includes("When the note “Ideas” changes") && add.out.includes("Triggers are off for the note"),
+    `muster schedule add --on note: (${add.out.trim()}${add.err})`);
+  const noteTrig = idOf(add.out);
+  ok((await sched(noteTrig)).origin === "webhook" && (await sched(noteTrig)).daily_cap === 10, "origin webhook, 10 runs a day by default");
+  ok((await run(["note", "append", "Ideas", "second idea"])).ok, "you edit the note");
+  await sleep(2500);
+  ok((await sched(noteTrig)).pending === null && (await runs(noteTrig)).length === 0, "triggers off (the default): no event, no run");
+  const fromAgent = await run(["note", "triggers", "Ideas", "on"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!fromAgent.ok && fromAgent.err.includes("only the human allows triggers"), `an agent's session can't allow triggers (${fromAgent.err.trim()})`);
+  const allow = await run(["note", "triggers", "Ideas", "on"]);
+  ok(allow.ok && allow.out.includes("triggers allowed"), `muster note triggers Ideas on (${allow.out.trim()})`);
+  // The trigger's own agent editing the note doesn't count.
+  const noteId = (await c.call("note.list")).find((n: Json) => n.title === "Ideas").id;
+  await c.call("note.append", { id: noteId, text: "- from trig itself", from_session: sTrig });
+  await sleep(1500);
+  ok((await sched(noteTrig)).pending === null, "an edit by the trigger's own agent never fires it");
+  ok((await run(["note", "append", "Ideas", "third idea"])).ok, "you edit it again");
+  await until("the note trigger's run", async () => (await runs(noteTrig)).some((r) => r.kind === "triggered" && r.msg_id));
+  let r = (await runs(noteTrig))[0];
+  ok(r.message.origin === "webhook" && r.message.hop === 0 && r.message.from === `trigger:${noteTrig}` &&
+    r.message.text.includes("> The note “Ideas” was edited by you") && r.message.text.includes("treat it as data"),
+    `a triggered run: origin webhook, the event quoted as data (${r.message.text.slice(0, 200)})`);
+  await reply(tTrig, "expanded");
+  await until("the note run's reply", async () => (await runs(noteTrig))[0].outcome === "replied");
+
+  // ---- A branch moving in a local repo
+  const gAdd = await run(["schedule", "add", "trig", "--on", `git:${GREPO}@master`, "Update the changelog."]);
+  ok(gAdd.ok && gAdd.out.includes(`When master moves in`), `muster schedule add --on git: (${gAdd.out.trim()}${gAdd.err})`);
+  const gitTrig = idOf(gAdd.out);
+  await until("the git watcher's first look", async () => (await sched(gitTrig)).watch?.state === "ok");
+  await sleep(1000);
+  ok((await runs(gitTrig)).length === 0, "the first look only records where master is");
+  await git(GREPO, "commit", "-q", "--allow-empty", "-m", "fix the parser");
+  await until("the git trigger's run", async () => (await runs(gitTrig)).some((x) => x.msg_id));
+  r = (await runs(gitTrig))[0];
+  ok(r.message.text.includes("master moved in") && r.message.text.includes("fix the parser"), "the new commit's subject is passed on, quoted");
+  await reply(tTrig, "changelog updated");
+  await until("the git run's reply", async () => (await runs(gitTrig))[0].outcome === "replied");
+
+  // ---- GitHub: a PR opened (a fake gh); then gh not signed in
+  const hAdd = await run(["schedule", "add", "trig", "--on", "gh:octo/repo:pr-opened", "Review the new PR."]);
+  ok(hAdd.ok && hAdd.out.includes("When a pull request is opened on octo/repo"), `muster schedule add --on gh: (${hAdd.out.trim()}${hAdd.err})`);
+  const ghTrig = idOf(hAdd.out);
+  await until("the first GitHub poll", async () => (await sched(ghTrig)).watch?.state === "ok");
+  ok((await Deno.readTextFile(`${BASE}/gh-args`)).includes("repos/octo/repo/pulls?state=all"), "polled with gh api");
+  ok((await runs(ghTrig)).length === 0, "the first poll is a baseline");
+  await Deno.writeTextFile(`${BASE}/gh-body.json`, JSON.stringify([
+    { number: 2, title: "Add the thing", user: { login: "bob" }, html_url: "https://github.com/octo/repo/pull/2" },
+    { number: 1, title: "old", user: { login: "a" } },
+  ]));
+  await until("the GitHub trigger's run", async () => (await runs(ghTrig)).some((x) => x.msg_id), 15000);
+  r = (await runs(ghTrig))[0];
+  ok(r.message.text.includes("PR #2 opened on octo/repo by bob: Add the thing"), "the new PR is passed on");
+  await reply(tTrig, "reviewed");
+  await until("the GitHub run's reply", async () => (await runs(ghTrig))[0].outcome === "replied");
+  await Deno.writeTextFile(`${BASE}/gh-signed-out`, "");
+  await until("gh not signed in", async () => (await sched(ghTrig)).watch?.state === "gh_not_signed_in");
+  ok((await sched(ghTrig)).watch.detail.includes("gh auth login"), "the row says gh isn't signed in");
+  ok((await run(["schedule", "pause", String(ghTrig)])).ok, "pause it (no more gh calls)");
+
+  // ---- A trigger URL: loopback, its secret, a size cap; `muster trigger`
+  const uAdd = await run(["schedule", "add", "trig", "--on", "url:deploy-done", "The deploy finished: {payload}"]);
+  ok(uAdd.ok && uAdd.out.includes("/api/trigger/deploy-done"), `muster schedule add --on url: (${uAdd.out.trim()}${uAdd.err})`);
+  const urlTrig = idOf(uAdd.out);
+  ok(!JSON.stringify(await c.call("schedule.list")).includes("Bearer"), "schedule.list has no secret");
+  const shown = await run(["trigger", "--url", "deploy-done"]);
+  const secret = shown.out.match(/Secret: (\w+)/)?.[1] ?? "";
+  ok(shown.ok && secret.length === 64 && shown.out.includes("curl -fsS"), "muster trigger --url prints the URL, secret and a curl line");
+  const fromAgentUrl = await run(["trigger", "--url", "deploy-done"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!fromAgentUrl.ok && fromAgentUrl.err.includes("only the human"), "an agent's session can't read the secret");
+  const post = (headers: Record<string, string>, body: string) =>
+    fetch(`http://127.0.0.1:${PORT}/api/trigger/deploy-done`, { method: "POST", headers, body }).then(async (x) => ({ status: x.status, text: await x.text() }));
+  ok((await post({}, "x")).status === 401, "no secret: 401");
+  ok((await post({ Authorization: "Bearer wrong" }, "x")).status === 403, "a wrong secret: 403");
+  ok((await post({ Authorization: `Bearer ${secret}` }, "x".repeat(16 * 1024 + 5))).status === 413, "over 16 KiB: 413");
+  ok((await post({ "Tailscale-User-Login": "x", Authorization: `Bearer ${secret}` }, "x")).status === 404, "never through the proxy path");
+  const fired = await post({ Authorization: `Bearer ${secret}` }, "build 42 ok\n");
+  ok(fired.status === 200 && fired.text.includes('"queued":true'), `the right secret: queued (${fired.text})`);
+  await until("the URL trigger's run", async () => (await runs(urlTrig)).some((x) => x.msg_id));
+  r = (await runs(urlTrig))[0];
+  ok(r.message.text.includes("untrusted data") && r.message.text.includes("> build 42 ok"), "the data reaches the agent quoted as untrusted");
+  await reply(tTrig, "site checked");
+  await until("the URL run's reply", async () => (await runs(urlTrig))[0].outcome === "replied");
+  const again = await run(["trigger", "deploy-done", "second", "call"]);
+  ok(again.ok && again.out.includes("it runs at"), `muster trigger: queued behind the 15-minute floor (${again.out.trim()})`);
+  ok((await sched(urlTrig)).pending?.count === 1 && (await sched(urlTrig)).pending.payload, "held with its data");
+  const agentFire = await run(["trigger", "deploy-done"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!agentFire.ok && agentFire.err.includes("only the human"), "an agent's session can't fire it");
+  const agentMake = await run(["schedule", "add", "trig", "--on", "url:other", "x"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!agentMake.ok && agentMake.err.includes("agent's session"), "an agent's session can't make a trigger");
+  for (const id of [urlTrig, gitTrig]) await run(["schedule", "rm", String(id)]);
+
+  // ---- "Then…": a reply starts the next step, one hop further, quoting the reply
+  const cAdd = await run(["schedule", "add", "trig", "--daily", "09:00", "--then", "trig2: The tests said: {reply} ({outcome})",
+    "--on-failure", "notify", "Run the tests."]);
+  ok(cAdd.ok, `muster schedule add --then (${cAdd.out.trim()}${cAdd.err})`);
+  const chained = idOf(cAdd.out);
+  const st = await sched(chained);
+  ok(st.then.on_success.agent === "trig2" && st.then.on_failure.notify, "its steps");
+  await c.call("schedule.run", { id: chained });
+  await until("the run's message", async () => (await runs(chained)).some((x) => x.msg_id));
+  await reply(tTrig, "2 failed: login, upload");
+  await until("the step's message", async () => (await runs(chained)).some((x) => x.kind === "chain" && x.msg_id), 15000);
+  const step = (await runs(chained)).find((x) => x.kind === "chain")!;
+  const parent = (await runs(chained)).find((x) => x.kind === "manual")!;
+  ok(step.agent === "trig2" && step.parent_run === parent.id && step.step === "s" && step.message.hop === 1 &&
+    step.message.reply_to === parent.msg_id && step.message.from === `schedule:${chained}/then:${step.id}`,
+    `the step: trig2, one hop further, answering the run (${JSON.stringify([step.agent, step.message.hop, step.message.from])})`);
+  ok(step.message.text.includes("> 2 failed: login, upload") && step.message.text.includes("(replied)"), "{reply} quoted, {outcome} filled");
+  await reply(tTrig2, "filed a note");
+  await until("the step's reply", async () => (await runs(chained)).find((x) => x.kind === "chain")?.outcome === "replied");
+  ok((await sched(chained)).last_run.kind === "manual", "the row's last run is its own, not the step's");
+
+  // ---- OpenRouter budget: $6 spent today, over the $5 default: unattended work is refused
+  await c.call("agent.create", { name: "orw", kind: "codex", provider: "openrouter", model: "openai/gpt-6.1-sol" });
+  const oAdd = await run(["schedule", "add", "orw", "--daily", "09:00", "Nightly check."]);
+  const orSched = idOf(oAdd.out);
+  await c.call("schedule.run", { id: orSched });
+  await until("the budget refusal", async () => (await runs(orSched))[0]?.outcome === "refused");
+  r = (await runs(orSched))[0];
+  ok(r.reason.startsWith("budget: OpenRouter spend today is $6.00 of the $5.00 daily cap"), `refused: budget (${r.reason})`);
+  ok(seen.length > 0 && seen.every((h) => h === `Bearer ${KEY}`), "the key went only to the key endpoint, as a header");
+  await c.call("schedule.run", { id: orSched });
+  await until("the second refusal", async () => (await runs(orSched)).filter((x) => x.outcome === "refused").length === 2);
+  const alerts = c.events.filter((e) => e.event === "notice" && String(e.data.text).includes("OpenRouter daily budget reached"));
+  ok(alerts.length === 1, `one alert per cap per day (${alerts.length})`);
+  const spend = (await c.call("schedule.settings.get")).spend;
+  ok(spend.today === 6 && spend.cap === 5 && spend.key_present, `today's spend in the settings: ${JSON.stringify(spend).slice(0, 160)}`);
+  // What the human types is never blocked (the ask goes through; the fake agent never answers).
+  const asked = await c.call("agent.ask", { agent: "orw", text: "hello", timeout_ms: 1000 }).then((x: Json) => JSON.stringify(x), (e: Error) => String(e));
+  ok(!asked.includes("budget"), `a message from you is not refused by the budget (${asked.slice(0, 120)})`);
+  // Raised cap: it goes.
+  await c.call("schedule.settings.set", { spend_cap: 10 });
+  ok(Math.abs((await c.call("schedule.settings.get")).spend.cap - 10) < 1e-9, "the cap can be raised");
+  ok(!d.log.join("").includes(KEY), "the daemon log never shows the key");
+  // Raw keys from unattended work into the OpenRouter agent go through the caps too: back at $5,
+  // `muster keys` from the trig agent's session (its chain is scheduled work) is refused.
+  await c.call("schedule.settings.set", { spend_cap: 5 });
+  const orwSid: number = (await c.call("agent.list")).find((a: Json) => a.name === "orw").session_id;
+  const keys = await run(["keys", String(orwSid), "text:hello", "enter"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!keys.ok && keys.err.includes("budget:"), `unattended raw keys to an OpenRouter session are refused at the cap (${keys.err.trim()})`);
+  await c.call("schedule.settings.set", { spend_cap: 10 });
+  // A reload with another key: orw still runs (billing the first key), so its spend can't be
+  // read and unattended work for it is refused until it restarts.
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({
+    MUSTER_TEST_TRIGGER_DELAY_MS: "1000",
+    MUSTER_TEST_WATCH_EVERY_MS: "700",
+    OPENROUTER_API_KEY: KEY + "-other",
+    MUSTER_TEST_OPENROUTER_KEY_URL: `http://127.0.0.1:${keyServer.addr.port}/key`,
+  });
+  c = new Client(d.token);
+  await c.open();
+  await c.call("schedule.run", { id: orSched });
+  await until("the other-key refusal", async () => (await runs(orSched))[0]?.reason?.includes("earlier OpenRouter key") ?? false);
+  ok((await runs(orSched))[0].outcome === "refused", `a run on a process launched with another key is refused: ${(await runs(orSched))[0].reason}`);
+
+  for (const a of ["trig", "trig2", "orw"]) await c.call("agent.remove", { name: a });
+  await keyServer.shutdown();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
   return { c, d };
 }
 

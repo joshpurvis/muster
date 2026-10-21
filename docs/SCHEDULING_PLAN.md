@@ -2,7 +2,7 @@
 
 ## Plain English
 
-Phase 1 of this plan is built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes (see "Status"). Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
+Phases 1 and 2 of this plan are built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes; then triggers (a note you allow, a branch moving, a PR or CI failure on GitHub, a local trigger URL), "Then…" steps that hand a reply to the next agent, and a daily dollar cap for OpenRouter agents (see "Status"). Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
 
 ## Status
 
@@ -36,7 +36,45 @@ panel". Choices made while building it:
 - Each run is one row in a small runs table (time, outcome, reason) pointing at its agent
   message, which keeps the text and the reply.
 
-Not built yet: Phase 2 (spend caps, chaining, triggers) and Phase 3 (agents proposing schedules).
+**Phase 2 is built** (2026-10-21, branch `feature/schedules-phase2`): chaining (8), triggers
+beyond time (9) and the OpenRouter spend cap (the rest of 7), with the owner's decisions below and
+one more: note triggers are opt-in per note. Code in `src/schedules/triggers.rs`,
+`src/schedules/run.rs` (steps) and `src/spend.rs`; how it behaves is in docs/PROTOCOL.md
+"Schedules" (Phase 2), docs/CLI.md "Triggers and Then" and docs/UI.md "Agents panel" and "Notes".
+Choices made while building it:
+
+- A trigger is a schedule whose `when` is an event (`note`, `git`, `github`, `url`), so it has the
+  same history, pause, alerts, reply note, caps and dialog. Its runs have origin `webhook`
+  ("Triggered") and sender `trigger:<id>`. An event is held on the schedule and run by the
+  scheduler like a due slot; events close together merge into one run.
+- **Note triggers are opt-in** (the owner's word): a note fires nothing until the human switches
+  "Allow triggers" on for it (off by default; the note's status line, its tab menu, the dialog,
+  or `muster note triggers`). Only `note.set_triggers` writes it, refused from agents' sessions and
+  shells they drive; no write of the text touches it. guess: stricter than asked, edits by *any*
+  unattended work (a session on a scheduled or triggered chain) never fire a note trigger, not
+  only the trigger's own runs, so two triggers can't feed each other; edits by the trigger's own
+  agent never count either. Debounce default 2 minutes; at most 10 runs a day per note.
+- Every trigger keeps the 15-minute floor: an event within 15 minutes of its last run waits (it
+  isn't dropped). A trigger's own daily cap defaults to 10.
+- Git is polled from the ref files every 15 s (no inotify, no hooks): cheap, and it works the same
+  for worktrees and packed refs. A move while Muster was off fires once at start.
+- GitHub uses `gh api` REST calls (pulls, actions/runs) through the PR runner, default every 5
+  minutes (2 to 60); the first poll is a baseline; backoff doubles to an hour.
+- A trigger URL is `POST /api/trigger/<name>` with a Bearer secret (64 hex), loopback only; the
+  secret never appears in `schedule.list` (only `trigger.secret`, the human's).
+- "Then…" steps: a success step and a failure step per level (failure may just notify), nested up
+  to 4 levels in the API (the UI and CLI offer one level). Each is a run of kind `chain` one hop
+  further, so the 4-hop limit bounds chains. Steps don't count toward the schedule's daily cap or
+  floor and don't hold back its next run.
+- Spend is read from OpenRouter's `GET /api/v1/key` (`usage_daily` for the overall cap; per agent,
+  rises in `usage` split among the OpenRouter agents working in between). Chosen over price ×
+  tokens from the CLIs (they don't report OpenRouter's prices) and the generation endpoint (needs
+  ids the CLIs don't show). "Today" is OpenRouter's UTC day. Without a reading in 15 minutes,
+  unattended OpenRouter work is refused too (spend unknown). guess: one credit is one dollar.
+- The spend cap applies to every non-human message to an OpenRouter agent (agent asks on an
+  unattended chain included), not only schedule runs.
+
+Not built yet: Phase 3 (agents proposing schedules, the file-change trigger).
 The "Today" section below describes the code before Phase 1.
 
 ## Today (before Phase 1)
@@ -136,13 +174,16 @@ PLAN.md §3 notes that Claude subscription limits assume "ordinary, individual u
 
 **Phase 1: Schedules you can trust (features 1–6, plus quiet hours and count caps from 7). Built.** Recurring and one-off schedules, run history, pause/skip/run now, missed-run and busy rules, failure alerts, replies into notes, `muster schedule`, and the Claude rules (opt-in, warning, 7-day expiry). This is useful on its own: the daily PR summary and nightly checks work end to end. Size: M to L.
 
-**Phase 2: Triggers and money (7's spend cap, 8, 9).** Chaining, the note-changed trigger, the local git watcher, GitHub polling, the local trigger URL with `muster trigger`, and OpenRouter spend caps once that branch is merged. Size: L, splittable per trigger.
+**Phase 2: Triggers and money (7's spend cap, 8, 9). Built.** Chaining, the note-changed trigger (opt-in per note), the local git watcher, GitHub polling, the local trigger URL with `muster trigger`, and OpenRouter spend caps. Size: L, splittable per trigger.
 
 **Phase 3: Agents schedule for themselves (10, and 11 if wanted).** The MCP tools with the approval flow and guard rails, the file-change trigger, and phone push alerts once Android Web Push lands. Size: M.
 
 ## Decisions (owner, 2026-10-20)
 
 The owner took the recommended answer on all six questions below: missed runs (c), busy agent: skip if the same schedule's run is still going, else wait in line up to an hour; agents propose schedules for approval, except one-off self reminders up to 24 h ahead (b); Claude subscription agents opt in with 7-day expiry and quiet hours on (a); spend cap overall $5/day plus optional per-agent caps (c); GitHub events by polling only (a).
+
+For Phase 2 (2026-10-21) the owner added: note-change triggers must be opt-in, not automatic, so
+they can't waste usage.
 
 ## Open questions for the owner (answered above)
 

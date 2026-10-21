@@ -4832,6 +4832,198 @@ body.dragging .panel-view { pointer-events: none; }
   width: 90px;
 }
 
+/* Triggers ("When something happens") and "Then…" steps (scheduling Phase 2). */
+.sch-trig .sch-preset {
+  flex: 0 1 300px;
+}
+
+.field .sch-trig-repo,
+.field .sch-trig-gh {
+  flex: 1 1 180px;
+  min-width: 150px;
+  width: auto;
+}
+
+.field .sch-trig-branch,
+.field .sch-trig-name {
+  width: 130px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field .sch-trig-repo,
+.field .sch-trig-gh {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field .sch-num {
+  width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.sch-trig-off {
+  color: var(--st-attn);
+}
+
+.field-hint.sch-trig-hint {
+  display: block;
+  margin-top: -6px;
+  line-height: 1.45;
+}
+
+fieldset.sch-then {
+  border: 0;
+  margin: 0;
+  padding: 10px 0 0;
+  min-width: 0;
+  border-top: 1px solid var(--border);
+}
+
+fieldset.sch-then > legend {
+  float: left;
+  width: 100%;
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.sch-then-row {
+  clear: both;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.sch-then-row .select-wrap {
+  flex: 0 1 240px;
+}
+
+.sch-then textarea {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 2px 0 4px;
+}
+
+.sch-icon-trig {
+  color: var(--st-attn);
+}
+
+.sch-chip.sch-watch {
+  cursor: help;
+}
+
+.sch-watch-detail {
+  display: block;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--st-error);
+  white-space: normal;
+}
+
+.sch-spend-err {
+  display: block;
+  margin-top: 2px;
+  color: var(--st-attn);
+}
+
+.sch-trig-note-wrap {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+
+.sch-run.sch-run-step {
+  margin-left: 14px;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+
+.sch-spend-today {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sch-spend-num {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sch-spend-num.over {
+  color: var(--st-error);
+}
+
+.sch-spend-cap,
+.sch-spend-agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.sch-spend-agents {
+  display: grid;
+  gap: 4px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+}
+
+.sch-spend-name {
+  flex: 0 1 140px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sch-spend-spent {
+  flex: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.field .sch-spend-input {
+  width: 92px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.or-spent {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A note's "Allow triggers" switch, in its status line, and the marker on its tab. */
+.note-trig {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.note-trig:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.note-trig.on {
+  color: var(--st-attn);
+  border-color: var(--attn-border);
+  background: var(--attn-bg);
+}
+
+.tab-trig {
+  flex: none;
+  display: inline-flex;
+  color: var(--st-attn);
+  margin-left: -2px;
+}
+
 /* Cache warning settings (CacheSettingsDialog). */
 .cache-dlg .dlg-head .muted {
   max-width: 52ch;

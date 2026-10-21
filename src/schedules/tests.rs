@@ -249,7 +249,7 @@ fn run_history_queries() {
     let route = crate::agents::Route { origin: Origin::Schedule, hop: 0, reply_to: None };
     let mut msg = |kind: RunKind, slot: i64| {
         let m = store.insert_agent_message(&crate::agents::message_record(&a, "schedule:1", None, route, "x")).unwrap();
-        let r = Run { id: 0, schedule_id: id, slot, kind, started_at: 1, msg_id: Some(m), outcome: Outcome::Replied, reason: None, finished_at: Some(2) };
+        let r = Run { id: 0, schedule_id: id, slot, kind, started_at: 1, msg_id: Some(m), outcome: Outcome::Replied, reason: None, finished_at: Some(2), ..Run::new(0, 0, RunKind::Scheduled, 0) };
         (store.insert_run(&r).unwrap(), m)
     };
     let (first, first_msg) = msg(RunKind::Scheduled, 10);
@@ -260,7 +260,7 @@ fn run_history_queries() {
     // 30 skips later, the newest run that sent a message is still found.
     for n in 0..30 {
         let skip = Run { id: 0, schedule_id: id, slot: 100 + n, kind: RunKind::Scheduled, started_at: 1, msg_id: None,
-            outcome: Outcome::Skipped, reason: Some("busy".into()), finished_at: Some(1) };
+            outcome: Outcome::Skipped, reason: Some("busy".into()), finished_at: Some(1), ..Run::new(0, 0, RunKind::Scheduled, 0) };
         store.claim_run(&s, &skip).unwrap();
     }
     let latest = store.latest_sent_run(id, i64::MAX).unwrap().unwrap();
@@ -533,7 +533,7 @@ fn migration_v19_adds_the_tables_and_a_slot_is_unique() {
     let s = Schedule { agent_id: 1, ..cron_at("0 9 * * *", 1) };
     let id = store.insert_schedule(&s).unwrap();
     let s = Schedule { id, ..s };
-    let run = Run { id: 0, schedule_id: id, slot: 42, kind: RunKind::Scheduled, started_at: 1, msg_id: None, outcome: Outcome::Pending, reason: None, finished_at: None };
+    let run = Run::new(id, 42, RunKind::Scheduled, 1);
     let first = store.claim_run(&s, &run).unwrap();
     assert!(first.is_some());
     assert_eq!(store.claim_run(&s, &run).unwrap(), None, "the same slot can't be claimed twice");
@@ -547,3 +547,7 @@ fn migration_v19_adds_the_tables_and_a_slot_is_unique() {
     store.delete_schedule(id).unwrap();
     assert!(store.runs(id, None, 10).unwrap().is_empty());
 }
+
+// Phase 2: triggers, chains and the spend caps.
+#[path = "tests_phase2.rs"]
+mod phase2;

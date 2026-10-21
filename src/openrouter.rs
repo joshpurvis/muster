@@ -146,6 +146,14 @@ impl ApiKey {
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
+
+    /// A short, one-way fingerprint of the key (a salted SHA-256, 64 bits shown): tells two keys
+    /// apart (which key an OpenRouter session was launched with) without revealing either.
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(format!("muster-openrouter-key-fingerprint\0{}", self.0).as_bytes());
+        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// The variables to take out of an inherited environment (the daemon's own, or what a session

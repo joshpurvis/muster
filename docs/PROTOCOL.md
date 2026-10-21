@@ -586,7 +586,10 @@ It is null before the conversation's first turn and for shells. Claude's `Sessio
 `source: "clear"` (`/clear`) clears it, and so does any new run that doesn't continue its
 conversation: only Claude's `--resume`/`--continue`, in any spelling the argument check accepts
 (`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), keep it. Stored with the session (migration v20),
-so it survives a backend reload and restart. When a named agent's session is removed (its task
+so it survives a backend reload and restart. A session saved before v20 has none; at the next
+backend start, one that is resting (not `working`, `starting` or `exited`) and has had a turn (its
+CLI has set a task title, which Claude Code and Codex do after the first prompt) gets its
+`state_since` as an estimate. When a named agent's session is removed (its task
 closed), its conversation's clock is kept with the agent (`runtime_state` `agent-turn:<agent>`,
 with its resume id) and given back to the session that resumes that same conversation.
 

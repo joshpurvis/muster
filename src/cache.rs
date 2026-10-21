@@ -3,7 +3,7 @@
 //!
 //! The daemon tracks, per agent session, when it last talked to its model
 //! (`SessionInfo.last_turn_at`: the last time it was seen entering or leaving `Working`, or a
-//! turn-end hook), and publishes `cache_cold_at` = that + the provider's cache lifetime from the
+//! turn-end hook; estimated at startup for sessions saved before it existed), and publishes `cache_cold_at` = that + the provider's cache lifetime from the
 //! shared preferences (`UiPrefs.cache_ttl`). Shells never get one. Every function takes `now`,
 //! so tests choose the clock.
 //!
@@ -232,6 +232,27 @@ fn advance(info: &mut SessionInfo, at: i64) -> bool {
     changed
 }
 
+/// A session saved before the clock existed (store migration v20) has no `last_turn_at`, so it
+/// would never warn. Estimate it as when the session came to rest (`state_since`): a resting
+/// agent's last request ended about then. Only for an agent resting now (not working, starting
+/// or exited) that has had a turn, which the task title its CLI sets shows (Claude Code and Codex
+/// name the conversation after its first prompt; a fresh session at its first prompt has none).
+/// Codex's default title is the project folder's name even before the first prompt, so a title
+/// that only names the session's folder doesn't count.
+/// Read from the saved row at startup, before recovery rewrites a dialog's `state_since`.
+pub fn estimated_turn(info: &SessionInfo) -> Option<i64> {
+    let folder = |dir: &str| std::path::Path::new(dir).file_name().map(|n| n.to_string_lossy().to_lowercase());
+    let names_folder = |t: &str| {
+        let t = t.trim().to_lowercase();
+        [Some(info.cwd.as_str()), info.live_cwd.as_deref()].into_iter().flatten().any(|d| folder(d).as_deref() == Some(t.as_str()))
+    };
+    let had_turn = info.title.as_deref().and_then(|t| crate::hub::clean_title(t, info.kind))
+        .is_some_and(|t| !names_folder(&t));
+    (info.last_turn_at.is_none() && info.kind != SessionKind::Shell && waiting(info.state) && had_turn
+        && info.state_since > 0)
+        .then_some(info.state_since)
+}
+
 /// A new run of a `kind` session started with `args` carries its conversation on (Claude's
 /// `--resume`/`--continue`, in every spelling the argument check accepts), so the cache clock
 /// carries on too. Any other start is a new, empty conversation.
@@ -421,6 +442,51 @@ mod tests {
         assert!(!continues_conversation(SessionKind::Claude, &a(&["--model", "opus"])));
         // Codex's -c is a config override, and Codex runs never resume in Muster.
         assert!(!continues_conversation(SessionKind::Codex, &a(&["-c", "model=x"])));
+    }
+
+    #[test]
+    fn sessions_from_before_the_clock_get_an_estimate() {
+        let rules = CacheRules { enabled: true, ttl: CacheTtl::default() };
+        let mut s = sess(SessionKind::Claude, Provider::Subscription);
+        s.title = Some("✳ Fix the login bug".into());
+        s.state_since = 10 * MIN;
+        s.last_turn_at = estimated_turn(&s);
+        rules.refresh(&mut s);
+        assert!(is_cold(&s, 3 * 60 * MIN), "idle for hours: cold");
+        assert!(!is_cold(&s, 30 * MIN));
+        for state in [AgentState::NeedsApproval, AgentState::AskingQuestion, AgentState::Error, AgentState::Stuck] {
+            s.state = state;
+            s.last_turn_at = None;
+            assert_eq!(estimated_turn(&s), Some(10 * MIN), "{state:?}");
+        }
+        // A clock it already has wins.
+        s.last_turn_at = Some(20 * MIN);
+        assert_eq!(estimated_turn(&s), None);
+        s.last_turn_at = None;
+        // Talking to its model, or gone: no estimate.
+        for state in [AgentState::Working, AgentState::Starting, AgentState::Exited] {
+            s.state = state;
+            assert_eq!(estimated_turn(&s), None, "{state:?}");
+        }
+        s.state = AgentState::Idle;
+        // A fresh session at its first prompt: no task title yet, nothing cached.
+        for title in [None, Some("✳ Claude Code"), Some("codex")] {
+            s.title = title.map(str::to_string);
+            assert_eq!(estimated_turn(&s), None, "{title:?}");
+        }
+        // Codex names a fresh session after its folder before any prompt.
+        let mut codex = sess(SessionKind::Codex, Provider::Subscription);
+        codex.cwd = "/home/me/projects/muster".into();
+        codex.state_since = 10 * MIN;
+        codex.title = Some("muster".into());
+        assert_eq!(estimated_turn(&codex), None, "folder-name title");
+        codex.title = Some("Fix the login bug".into());
+        assert_eq!(estimated_turn(&codex), Some(10 * MIN));
+        // Shells never.
+        let mut shell = sess(SessionKind::Shell, Provider::Subscription);
+        shell.title = Some("make test".into());
+        shell.state_since = 10 * MIN;
+        assert_eq!(estimated_turn(&shell), None);
     }
 
     #[test]

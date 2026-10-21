@@ -752,7 +752,12 @@ impl Hub {
             let generation = record.map_or(0, |r| r.spec.run.generation);
             let token = record.filter(|_| status.is_some_and(|s| s.alive)).map(|r| r.token.clone());
             let port_base = record.map_or(0, |r| r.port_base);
+            // Saved before the cache clock existed: estimate it from the saved row.
+            let estimated_turn = crate::cache::estimated_turn(&info);
             let unverified_working = recover_session_state(&mut info, status, record.is_some(), now_ms());
+            if info.state != AgentState::Exited && info.last_turn_at.is_none() {
+                info.last_turn_at = estimated_turn;
+            }
             // What the run's saved launch says about its cache (credentials: presence only).
             info.cache_basis = record.map_or_else(Default::default, |r| {
                 crate::cache::basis_from_env(info.kind, |k| r.spec.env.get(k).map(String::as_str))

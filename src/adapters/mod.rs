@@ -78,11 +78,18 @@ const CODEX_CONFIG_KEYS: &[&str] = &[
 ];
 
 pub fn check_extra_args(kind: SessionKind, args: &[String]) -> anyhow::Result<()> {
+    parse_extra_args(kind, args).map(|_| ())
+}
+
+/// The allowlisted flags in `args`, each as its long name with its values, exactly as
+/// `check_extra_args` reads them (`--flag v`, `--flag=v`, `-fv`, `-f v`). Shells: none.
+pub fn parse_extra_args<'a>(kind: SessionKind, args: &'a [String]) -> anyhow::Result<Vec<(&'static str, Vec<&'a str>)>> {
     let table = match kind {
         SessionKind::Claude => CLAUDE_ARGS,
         SessionKind::Codex => CODEX_ARGS,
-        SessionKind::Shell => return Ok(()),
+        SessionKind::Shell => return Ok(Vec::new()),
     };
+    let mut out = Vec::new();
     let allowed = || {
         table
             .iter()
@@ -147,8 +154,9 @@ pub fn check_extra_args(kind: SessionKind, args: &[String]) -> anyhow::Result<()
                 }
             }
         }
+        out.push((long, values));
     }
-    Ok(())
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]

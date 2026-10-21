@@ -392,6 +392,13 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX schedule_runs_msg ON schedule_runs(msg_id);
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind != 'manual';
     "#,
+    // v20: cold prompt cache (src/cache.rs): when each agent session last talked to its model,
+    // and, for a message Muster typed into an agent whose cache had likely expired, how long
+    // that agent had been idle (NULL: it was warm, or from before this was kept).
+    r#"
+    ALTER TABLE sessions ADD COLUMN last_turn_at INTEGER;
+    ALTER TABLE agent_messages ADD COLUMN cold_idle_ms INTEGER;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -442,7 +449,7 @@ fn enum_to_str<T: serde::Serialize>(v: &T) -> String {
 
 /// `row_agent_message`'s columns (the recipient's name, while the agent exists).
 const AGENT_MESSAGE_SELECT: &str = "SELECT m.id, m.from_label, m.from_session, m.to_agent, m.to_session, m.origin,
-    m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name
+    m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name, m.cold_idle_ms
     FROM agent_messages m LEFT JOIN agents a ON a.id = m.to_agent";
 
 fn perms_json(p: &Permissions) -> String {
@@ -991,6 +998,7 @@ impl Store {
             text: r.get(11)?,
             refused: r.get(12)?,
             to_name: r.get(13)?,
+            cold_idle_ms: r.get(14)?,
         })
     }
 
@@ -1133,8 +1141,8 @@ impl Store {
                 ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(cursor)?])?;
         }
         if let Some((info, runtime)) = session {
-            tx.execute("UPDATE sessions SET state=?2, state_detail=?3, state_since=?4 WHERE id=?1",
-                params![info.id, info.state.as_str(), info.state_detail, info.state_since])?;
+            tx.execute("UPDATE sessions SET state=?2, state_detail=?3, state_since=?4, last_turn_at=?5 WHERE id=?1",
+                params![info.id, info.state.as_str(), info.state_detail, info.state_since, info.last_turn_at])?;
             tx.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
                 ON CONFLICT(key) DO UPDATE SET record=excluded.record",
                 params![format!("hook-session:{}", info.id), serde_json::to_string(runtime)?])?;
@@ -1146,6 +1154,13 @@ impl Store {
     pub fn load_hook_session(&self, id: SessionId, generation: u64) -> anyhow::Result<Option<HookSession>> {
         Ok(self.load_runtime::<HookSession>(&format!("hook-session:{id}"))?
             .filter(|saved| saved.generation == generation))
+    }
+
+    /// Mark message `id` as typed into an agent whose prompt cache had likely expired. False
+    /// when it was marked already (a prompt submitted again after a retry) or is gone.
+    pub fn set_agent_message_cold(&self, id: i64, idle_ms: i64) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute("UPDATE agent_messages SET cold_idle_ms=?2 WHERE id=?1 AND cold_idle_ms IS NULL",
+            params![id, idle_ms])? == 1)
     }
 
     pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
@@ -1668,7 +1683,8 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
-                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider FROM sessions ORDER BY id",
+                    exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider,
+                    last_turn_at FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -1695,6 +1711,11 @@ impl Store {
                     size_owner: None,
                     input_interrupted: false,
                     live_cwd: None,
+                    last_turn_at: r.get(21)?,
+                    // Derived from the shared preferences by the hub.
+                    cache_cold_at: None,
+                    cache_ttl_min: None,
+                    cache_basis: Default::default(),
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
@@ -1714,8 +1735,9 @@ impl Store {
         let i = &s.info;
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
-                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                                   parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider,
+                                   last_turn_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -1736,7 +1758,8 @@ impl Store {
                 i.window_id,
                 i.account_profile_id,
                 i.hidden,
-                i.provider.as_str()
+                i.provider.as_str(),
+                i.last_turn_at
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -1746,7 +1769,8 @@ impl Store {
     pub fn update_session(&self, i: &SessionInfo) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE sessions SET name=?2, cwd=?3, state=?4, state_detail=?5, state_since=?6, title=?7, pid=?8,
-                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14, hidden=?15, provider=?16 WHERE id=?1",
+                    exit_code=?9, cols=?10, rows=?11, queued=?12, channel_id=?13, window_id=?14, hidden=?15, provider=?16,
+                    last_turn_at=?17 WHERE id=?1",
             params![
                 i.id,
                 i.name,
@@ -1763,7 +1787,8 @@ impl Store {
                 i.channel_id,
                 i.window_id,
                 i.hidden,
-                i.provider.as_str()
+                i.provider.as_str(),
+                i.last_turn_at
             ],
         )?;
         Ok(())
@@ -1783,6 +1808,7 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
         tx.commit()?;
         Ok(())
     }
@@ -1802,6 +1828,7 @@ impl Store {
         }
         transaction.execute("DELETE FROM sessions WHERE id=?1", [id])?;
         transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
         transaction.execute("DELETE FROM events WHERE session_id=?1", [id])?;
         transaction.commit()?;
         Ok(())
@@ -2321,6 +2348,7 @@ mod tests {
             text: None,
             refused: None,
             to_name: None,
+            cold_idle_ms: None,
         };
         let id = s.insert_agent_message(&m).unwrap();
         s.insert_agent_message(&AgentMessage { created_at: 10, ..m.clone() }).unwrap();
@@ -2427,6 +2455,7 @@ mod tests {
             text: Some("x".into()),
             refused: None,
             to_name: None,
+            cold_idle_ms: None,
         };
         let delivered = s.insert_agent_message(&m).unwrap();
         for at in [100, 200, 300, 400, 500] {
@@ -2457,6 +2486,7 @@ mod tests {
             text: None,
             refused: None,
             to_name: None,
+            cold_idle_ms: None,
         };
         let ok = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {

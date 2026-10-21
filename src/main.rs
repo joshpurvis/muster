@@ -2,6 +2,7 @@ mod account_profiles;
 mod adapters;
 mod agents;
 mod assets;
+mod cache;
 mod cli;
 mod client;
 mod detect;

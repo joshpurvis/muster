@@ -81,6 +81,7 @@ import type {
   Win,
   WindowId,
   WindowPrefs,
+  CacheTtl,
   Workspace,
 } from "./types.ts";
 import { KIND_LABEL } from "./types.ts";
@@ -1202,6 +1203,19 @@ export async function setShell(shell: string): Promise<boolean> {
     return true;
   } catch (e) {
     toast("error", `Couldn't change the shell: ${errText(e)}`);
+    return false;
+  }
+}
+
+/** The cold prompt cache warning (`prefs.set {cache_warn, cache_ttl}`). False if refused. */
+export async function setCachePrefs(change: { cache_warn?: boolean; cache_ttl?: Partial<CacheTtl> }): Promise<boolean> {
+  try {
+    const p = await rpc.call<WindowPrefs>("prefs.set", change);
+    if (newerPrefs(windowPrefs.value, p)) windowPrefs.value = p;
+    toast("success", "Cache warning settings saved.", 2500);
+    return true;
+  } catch (e) {
+    toast("error", `Couldn't save the cache warning settings: ${errText(e)}`);
     return false;
   }
 }

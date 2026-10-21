@@ -14,6 +14,7 @@ import { allPanes, type Layout, sig } from "../src/layout/tree.ts";
 import { panelChecks } from "./e2e_panels.ts";
 import { noteChecks } from "./e2e_notes.ts";
 import { scheduleChecks } from "./e2e_schedules.ts";
+import { cacheChecks } from "./e2e_cache.ts";
 import { panelApps } from "./panel_apps_e2e.ts";
 
 const [url, shots, repo, mode] = Deno.args;
@@ -1247,6 +1248,9 @@ try {
 
   // ---- schedules (dev/e2e_schedules.ts)
   if (!real) await scheduleChecks(a, { shots, ok, check });
+
+  // ---- the cold prompt cache bar and its settings (dev/e2e_cache.ts)
+  if (!real) await cacheChecks(a, { shots, ok, check });
 
   // ---- the update banner, the shutdown dialog, Ctrl+Shift+R (mock only: mock.updates)
   if (!real) {

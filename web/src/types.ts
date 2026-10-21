@@ -128,6 +128,15 @@ export interface SessionInfo {
   /** What its current (or last) run bills to, set when it starts: a named agent's provider
    * change shows here only once a restart applies it. Missing from older daemons. */
   provider?: Provider;
+  /** Unix ms of the last model request the daemon saw (a turn's start or end); null before
+   * the conversation's first turn, and for shells. Missing from older daemons. */
+  last_turn_at?: number | null;
+  /** When the prompt cache has likely expired (`last_turn_at` + the provider's lifetime);
+   * null for shells, before the first turn, or with the warning off. */
+  cache_cold_at?: number | null;
+  /** The cache lifetime that applies to this run, in minutes (its kind, provider, launch
+   * environment and the prefs); null like `cache_cold_at`. */
+  cache_ttl_min?: number | null;
 }
 
 export type EventKind =
@@ -201,6 +210,9 @@ export interface AgentMessage {
   replied_at: number | null;
   /** Why the agent's policy refused it (never delivered). */
   refused: string | null;
+  /** Typed in after the agent's prompt cache had likely expired: how long it had been idle
+   * (ms). Null or missing: warm, not delivered yet, or an older daemon. */
+  cold_idle_ms?: number | null;
 }
 
 /** A New agent template (`agent.templates`). */
@@ -381,11 +393,23 @@ export type ServerEvent =
   | { event: "daemon_stopping"; data: { reason: string } };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
+/** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */
+export interface CacheTtl {
+  claude: number;
+  claude_openrouter: number;
+  codex: number;
+  codex_openrouter: number;
+}
+
 export interface WindowPrefs {
   /** Native windows show the system title bar. */
   decorations: boolean;
   /** Shell new shell tabs run; absent: the account's login shell (`hello.login_shell`). */
   shell?: string;
+  /** Warn when an agent's prompt cache has likely expired. Missing from older backends. */
+  cache_warn?: boolean;
+  /** Each CLI/provider pair's prompt-cache lifetime, in minutes. */
+  cache_ttl?: CacheTtl;
   /** Raised by every `prefs.set` (missing from the first builds that had prefs). */
   revision?: number;
 }

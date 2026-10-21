@@ -157,6 +157,11 @@ interface Session {
   window_id: number | null;
   /** A named agent's closed tab, still running (`session.hide`). */
   hidden?: boolean;
+  /** Last model request (src/cache.rs): entering or leaving `working`. */
+  last_turn_at?: number | null;
+  /** `last_turn_at` + the provider's cache lifetime (`prefs.cache_ttl`). */
+  cache_cold_at?: number | null;
+  cache_ttl_min?: number | null;
 }
 
 const now = () => Date.now();
@@ -164,7 +169,20 @@ let seq = 1;
 /** `hello.updates` (docs/PROTOCOL.md "Updates"); `mock.updates` changes it. */
 const updates = { ui_release: null as string | null, backend: null as string | null, host: null as string | null };
 /** Shared window preferences (`prefs.get` / `prefs.set`). */
-const windowPrefs = { decorations: true, revision: 0 };
+const windowPrefs = {
+  decorations: true,
+  cache_warn: true,
+  cache_ttl: { claude: 60, claude_openrouter: 5, codex: 30, codex_openrouter: 10 } as Record<string, number>,
+  revision: 0,
+};
+
+/** src/cache.rs `CacheRules::cold_at` (and `refresh`'s `cache_ttl_min`). */
+function coldAt(s: Session): number | null {
+  const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : "");
+  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] : null;
+  if (s.cache_ttl_min == null || s.last_turn_at == null) return null;
+  return s.last_turn_at + s.cache_ttl_min * 60_000;
+}
 const workspaces: any[] = [];
 const channels: any[] = [];
 const sessions = new Map<number, Session>();
@@ -380,6 +398,10 @@ function setState(s: Session, state: string, detail: string | null = null) {
   s.state = state;
   s.state_detail = detail;
   s.state_since = now();
+  if (s.kind !== "shell" && (from === "working" || state === "working")) {
+    s.last_turn_at = now();
+    s.cache_cold_at = coldAt(s);
+  }
   upsert(s);
   logEvent(s.channel_id, s.id, "state_change", { session_id: s.id, from, to: state, detail });
 }
@@ -1238,6 +1260,17 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     broadcast("updates_changed", updates);
     return updates;
   }
+  if (method === "mock.cache_idle") {
+    // Pretend session `id`'s last turn ended `idle_ms` ago (the cold-cache bar, docs/UI.md).
+    const s = sessions.get(p.id);
+    if (!s) throw new Error("no such session");
+    s.last_turn_at = now() - Number(p.idle_ms);
+    s.state_since = s.last_turn_at;
+    s.cache_cold_at = coldAt(s);
+    if (s.state === "working" || s.state === "starting") s.state = "idle";
+    upsert(s);
+    return s;
+  }
   if (method === "mock.openrouter") {
     // Pretend the backend was (re)started with or without OPENROUTER_API_KEY: {key_present}.
     orKey = !!p.key_present;
@@ -1369,7 +1402,23 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     case "prefs.get":
       return windowPrefs;
     case "prefs.set":
+      for (const [k, v] of Object.entries(p.cache_ttl ?? {})) {
+        if (!(k in windowPrefs.cache_ttl)) throw new Error(`unknown field \`${k}\``);
+        if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 1440) {
+          throw new Error(`cache_ttl.${k}: 1 to 1440 minutes`);
+        }
+      }
       if (typeof p.decorations === "boolean") windowPrefs.decorations = p.decorations;
+      if (typeof p.cache_warn === "boolean") windowPrefs.cache_warn = p.cache_warn;
+      Object.assign(windowPrefs.cache_ttl, p.cache_ttl ?? {});
+      for (const s of sessions.values()) {
+        const ttlBefore = s.cache_ttl_min ?? null;
+        const at = coldAt(s);
+        if (at !== (s.cache_cold_at ?? null) || ttlBefore !== s.cache_ttl_min) {
+          s.cache_cold_at = at;
+          upsert(s);
+        }
+      }
       windowPrefs.revision++;
       broadcast("prefs_changed", windowPrefs);
       return windowPrefs;
@@ -1638,6 +1687,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       await new Promise((r) => setTimeout(r, 200));
       s.state = "starting";
       s.state_since = now();
+      // A new conversation: nothing cached to lose (src/hub.rs start_process; no --resume here).
+      s.last_turn_at = null;
+      s.cache_cold_at = null;
       upsert(s);
       startProcess(s);
       upsert(s);

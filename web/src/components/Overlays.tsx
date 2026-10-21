@@ -30,7 +30,8 @@ import { IconBranch, IconCheck, IconCodex, IconFolder, IconNote, IconPanel, Icon
 import { noteTab, panelTab } from "../layout/tree.ts";
 import { authorName, notes, searchNotes } from "../notes.ts";
 import { ago } from "../agents.ts";
-import type { NoteInfo } from "../types.ts";
+import type { CacheTtl, NoteInfo } from "../types.ts";
+import { CACHE_TTL_MAX, CACHE_TTL_ROWS, DEFAULT_CACHE_TTL, parseTtl, ttlText } from "../cache.ts";
 import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
 import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
@@ -149,6 +150,8 @@ export function Overlays() {
       return <NotesDialog />;
     case "shell":
       return <ShellDialog />;
+    case "cache_settings":
+      return <CacheSettingsDialog />;
     case "shutdown":
       return <Shutdown />;
     case "shortcuts":
@@ -942,6 +945,101 @@ function ShellDialog() {
           <button type="submit" class="btn btn-primary" disabled={busy || shell.trim() === configured}>
             {shell.trim() ? "Use this shell" : "Use login shell"}
           </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/** "Cache warning…": the cold prompt cache bar on or off, and how long each CLI/provider pair
+ * keeps a conversation cached (`prefs.set {cache_warn, cache_ttl}`, src/cache.rs). */
+function CacheSettingsDialog() {
+  // What the dialog opened with: only fields edited here are sent, so a change another window
+  // saved meanwhile to a field left alone is never reverted.
+  const [opened] = useState(() => ({
+    warn: windowPrefs.value?.cache_warn ?? true,
+    ttl: { ...(windowPrefs.value?.cache_ttl ?? DEFAULT_CACHE_TTL) },
+  }));
+  const ttl = opened.ttl;
+  const [on, setOn] = useState(opened.warn);
+  const [texts, setTexts] = useState<Record<keyof CacheTtl, string>>(
+    Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key])])) as Record<keyof CacheTtl, string>,
+  );
+  const [busy, setBusy] = useState(false);
+  const first = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => first.current?.focus(), []);
+  const parsed = CACHE_TTL_ROWS.map((r) => [r.key, parseTtl(texts[r.key])] as const);
+  const ok = !busy && parsed.every(([, v]) => v !== null);
+  const save = async () => {
+    if (!ok) return;
+    const change: { cache_warn?: boolean; cache_ttl?: Partial<CacheTtl> } = {};
+    if (on !== opened.warn) change.cache_warn = on;
+    const t: Partial<CacheTtl> = {};
+    for (const [k, v] of parsed) if (v !== ttl[k]) t[k] = v!;
+    if (Object.keys(t).length) change.cache_ttl = t;
+    if (!Object.keys(change).length) return close();
+    setBusy(true);
+    if (await A.setCachePrefs(change)) {
+      if (overlay.value?.kind === "cache_settings") close();
+    } else setBusy(false);
+  };
+  return (
+    <Modal class="dialog dialog-scroll cache-dlg" label="Cache warning">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          save();
+        }}
+      >
+        <div class="dlg-head">
+          <h2>Cache warning</h2>
+          <span class="muted">
+            After an agent has been idle longer than its provider keeps the conversation cached, its next message
+            re-reads the whole conversation at full cost. A thin bar under its terminal says so.
+          </span>
+        </div>
+        <div class="dlg-body">
+          <label class="toggle">
+            <input
+              ref={first}
+              type="checkbox"
+              class="cache-warn-on"
+              checked={on}
+              onChange={(e) => setOn((e.target as HTMLInputElement).checked)}
+            />
+            <span class="toggle-track">
+              <span class="toggle-thumb" />
+            </span>
+            <span>Warn when an agent's cache has likely expired</span>
+          </label>
+          <div class={cx("cache-ttls", !on && "off")} role="group" aria-label="Cache lifetime, in minutes">
+            {CACHE_TTL_ROWS.map((r) => {
+              const bad = parseTtl(texts[r.key]) === null;
+              return (
+                <label class="field cache-ttl-row" key={r.key}>
+                  <span class="field-label">{r.label}</span>
+                  <span class="cache-ttl-input">
+                    <input
+                      class={`cache-ttl-${r.key}`}
+                      value={texts[r.key]}
+                      inputMode="numeric"
+                      aria-invalid={bad}
+                      aria-describedby={`cache-hint-${r.key}`}
+                      onInput={(e) => setTexts({ ...texts, [r.key]: (e.target as HTMLInputElement).value })}
+                    />
+                    <span class="muted">min</span>
+                  </span>
+                  <span id={`cache-hint-${r.key}`} class={cx("field-hint", bad && "field-bad")}>
+                    {bad ? `A whole number of minutes, 1 to ${CACHE_TTL_MAX}.` : `Default ${ttlText(DEFAULT_CACHE_TTL[r.key])}: ${r.hint}.`}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+        <div class="dlg-foot">
+          <button type="button" class="btn" onClick={close}>Cancel</button>
+          <button type="submit" class="btn btn-primary" disabled={!ok}>Save</button>
         </div>
       </form>
     </Modal>

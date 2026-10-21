@@ -21,6 +21,8 @@ pub struct Hook {
     pub token: String,
     pub event: String,
     pub payload: serde_json::Value,
+    /// When the helper saved it (unix ms); None from helpers older than the column.
+    pub captured_at: Option<i64>,
 }
 
 pub fn path() -> PathBuf {
@@ -47,6 +49,21 @@ impl Inbox {
             CREATE TABLE IF NOT EXISTS hooks(id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL);",
         )?;
+        // When each callback was captured: one replayed after an outage happened then (the
+        // cold-cache clock, src/cache.rs). Older helpers leave it NULL.
+        let has_captured: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('hooks') WHERE name='captured_at')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_captured {
+            // Two openers may race here; the loser's duplicate-column error is harmless.
+            if let Err(error) = connection.execute_batch("ALTER TABLE hooks ADD COLUMN captured_at INTEGER") {
+                if !error.to_string().contains("duplicate column") {
+                    return Err(error.into());
+                }
+            }
+        }
         connection.execute(
             "INSERT OR IGNORE INTO inbox_meta(key,value) VALUES ('instance',?1)",
             [crate::paths::random_token()],
@@ -96,8 +113,8 @@ impl Inbox {
             anyhow::bail!("callback inbox is full; overflow recorded for the backend");
         }
         tx.execute(
-            "INSERT INTO hooks(token,event,payload) VALUES (?1,?2,?3)",
-            params![token, event, payload],
+            "INSERT INTO hooks(token,event,payload,captured_at) VALUES (?1,?2,?3,?4)",
+            params![token, event, payload, crate::model::now_ms()],
         )?;
         tx.commit()?;
         Ok(())
@@ -107,15 +124,15 @@ impl Inbox {
         let after = cursor
             .filter(|cursor| cursor.instance == self.instance)
             .map_or(0, |cursor| cursor.sequence);
-        let row: Option<(i64, String, String, String)> = self
+        let row: Option<(i64, String, String, String, Option<i64>)> = self
             .connection
             .query_row(
-                "SELECT id,token,event,payload FROM hooks WHERE id>?1 ORDER BY id LIMIT 1",
+                "SELECT id,token,event,payload,captured_at FROM hooks WHERE id>?1 ORDER BY id LIMIT 1",
                 [after],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        row.map(|(sequence, token, event, payload)| {
+        row.map(|(sequence, token, event, payload, captured_at)| {
             Ok(Hook {
                 cursor: HookCursor {
                     instance: self.instance.clone(),
@@ -124,6 +141,7 @@ impl Inbox {
                 token,
                 event,
                 payload: serde_json::from_str(&payload).context("reading stored hook payload")?,
+                captured_at,
             })
         })
         .transpose()
@@ -189,7 +207,7 @@ pub fn drain(hub: &crate::hub::Hub, inbox: &Inbox) -> anyhow::Result<()> {
         let Some(hook) = inbox.next(cursor.as_ref())? else {
             break;
         };
-        hub.handle_spooled_hook(&hook.token, &hook.event, hook.payload, &hook.cursor)?;
+        hub.handle_spooled_hook(&hook.token, &hook.event, hook.payload, &hook.cursor, hook.captured_at)?;
         inbox.acknowledge(&hook.cursor)?;
         cursor = Some(hook.cursor);
     }
@@ -253,6 +271,30 @@ pub fn spawn(hub: &std::sync::Arc<crate::hub::Hub>, inbox: Inbox) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callbacks_keep_when_they_were_captured_also_in_an_older_inbox() {
+        let dir = std::env::temp_dir().join(format!("muster-hook-inbox-{}", rand::random::<u64>()));
+        let path = dir.join("inbox.sqlite");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // An inbox from before the column, with a row an older helper wrote.
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch("CREATE TABLE hooks(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL);
+                INSERT INTO hooks(token,event,payload) VALUES ('t','Stop','{}');").unwrap();
+        }
+        let before = crate::model::now_ms();
+        let mut inbox = Inbox::open(&path).unwrap();
+        let old = inbox.next(None).unwrap().unwrap();
+        assert_eq!(old.captured_at, None, "an older helper's row has no capture time");
+        inbox.enqueue("t", "Stop", b"{}").unwrap();
+        let new = inbox.next(Some(&old.cursor)).unwrap().unwrap();
+        assert!(new.captured_at.is_some_and(|t| t >= before));
+        drop(inbox);
+        Inbox::open(&path).unwrap(); // opening again: the column is already there
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn callbacks_survive_reopen_and_acknowledged_ids_are_never_reused() {

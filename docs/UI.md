@@ -277,6 +277,49 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   v1's per-channel layouts are not migrated. Sessions this client creates (new tab, new
   terminal, split) are held out of the layout until their call returns and places them.
 
+### Cold cache bar
+An agent that has sat idle longer than its provider keeps the conversation cached re-reads the
+whole conversation at full cost with its next message. When the active tab is such an agent
+(Claude or Codex, never a shell; idle, waiting for approval or an answer, or in error; past its
+`SessionInfo.cache_cold_at`, see docs/PROTOCOL.md "Cold prompt cache"), a thin, calm bar sits
+right under its terminal, by the CLI's input box, in the exited bar's family (a hollow blue dot,
+a light blue tint):
+
+> Idle 1 h 20 m. The prompt cache has likely expired, so your next message re-reads the whole
+> conversation at full cost. · **Start fresh** · ×
+
+- The idle time is since the agent's last turn (its start or end), counted by this page's clock
+  every 20 s. Hover the sentence for the lifetime that applies ("about 1 h after the last turn").
+- **Start fresh** (named agents only): the agent's Start fresh, a new conversation, for when the
+  old context isn't needed.
+- **×** dismisses the bar for this idle period only (per viewer, kept in localStorage across
+  reloads): once a later turn ends and goes cold too, it comes back.
+- It never takes the keyboard: its buttons don't take focus when pressed and the terminal keeps
+  it. A polite live region inside it says once per idle period (not on each tab switch, and
+  without the ticking time) "<agent>: the prompt cache has likely expired, so the next message
+  re-reads the whole conversation at full cost." It sits above the terminal's canvases, which can
+  overhang it until xterm refits.
+- The tab gets a small **cold** marker (after the OpenRouter badge), a tooltip line and ", prompt
+  cache likely expired" in its accessible name; the agent's row in the Agents panel gets one
+  beside its state (also in its accessible name). The markers stay while the bar is dismissed.
+
+**Cache warning…** (`⋯` "Settings and more", with its state as the hint; palette "Cache warning
+settings…"; backends with `prefs.cache_warn` only): a switch "Warn when an agent's cache has likely
+expired" and the lifetime in minutes (1 to 1440) for Claude on a subscription (default 1 h),
+Claude on OpenRouter or an API key (5 min), Codex on a ChatGPT plan (30 min) and Codex on
+OpenRouter (10 min), each with its default and why under it. A Claude whose launch sets its own
+cache switch follows that instead (docs/PROTOCOL.md "Cold prompt cache"); the bar's tooltip names
+the lifetime that applies. Save sends only the fields edited in this dialog (compared with what
+it opened with, so another window's change to a field left alone stays); every window follows at
+once. Off hides the bar and every marker. Its body scrolls in a short window; Save stays on
+screen.
+
+Muster's own sends are noted too: an agent message, a scheduled run's message or panel events
+typed into a cold agent are still delivered, and recorded as a **cold start**: a `cold start`
+chip on the message in the Agents panel's message log, in its message overlay, and on the
+schedule run that sent it (tooltip: how long it had been idle, and that it likely re-read the
+conversation uncached: an estimate).
+
 ### Status line (optional, on by default, toggle in the palette)
 22px, muted: the focused tab's task name (only once it has a real name, not just its folder's;
 truncated with an ellipsis, the full name in the tooltip, click copies), its folder (truncated
@@ -376,7 +419,7 @@ terminal tab; there is no chat view.
 | Part | What |
 |---|---|
 | Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
 | Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
@@ -384,7 +427,7 @@ terminal tab; there is no chat view.
 | Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). |
 | Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run` (also while a page loads; pages merge in). After a reconnect, histories are thrown away and the open ones load again; a failed load says so with Try again. |
 | + New agent | Under the list: the New agent dialog. |
-| Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
+| Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, a `cold start` chip when it was typed into an agent whose cache had likely expired, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
 
 Live updates come from `agent_upserted`, `agent_removed` and `agent_message` (the agent list and
 the last 100 messages are loaded after each `hello`); states come from the agents' sessions.

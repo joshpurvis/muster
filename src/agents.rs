@@ -145,6 +145,9 @@ pub struct AgentMessage {
     pub refused: Option<String>,
     /// The recipient's name, read back from the store (None once the agent is removed).
     pub to_name: Option<String>,
+    /// Typed into the agent after its prompt cache had likely expired: how long it had been
+    /// idle (ms). None: warm, not delivered yet, or from before this was kept (src/cache.rs).
+    pub cold_idle_ms: Option<i64>,
 }
 
 /// A session's provenance: origin and hop of the message it is handling, and that message's
@@ -1533,6 +1536,7 @@ pub fn message_record(agent: &Agent, from: &str, from_session: Option<SessionId>
         text: Some(text.to_string()),
         refused: None,
         to_name: None,
+        cold_idle_ms: None,
     }
 }
 
@@ -1844,6 +1848,7 @@ pub fn message_json(m: &AgentMessage) -> Value {
         "reply": m.reply,
         "replied_at": m.replied_at,
         "refused": m.refused,
+        "cold_idle_ms": m.cold_idle_ms,
     })
 }
 
@@ -2515,6 +2520,7 @@ mod tests {
                 text: None,
                 refused: None,
                 to_name: None,
+                cold_idle_ms: None,
             })
             .unwrap()
     }

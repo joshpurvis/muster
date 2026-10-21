@@ -387,6 +387,13 @@ export const commands: Command[] = [
     run: () => A.setDecorations(windowPrefs.value?.decorations === false),
   },
   {
+    id: "cache_settings",
+    title: "Cache warning settings…",
+    group: "Window",
+    enabled: () => windowPrefs.value?.cache_warn !== undefined,
+    run: () => (overlay.value = { kind: "cache_settings" }),
+  },
+  {
     id: "shell",
     title: "Shell for new terminals…",
     group: "Window",

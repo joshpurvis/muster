@@ -870,6 +870,20 @@ fn after_typing(state: Option<Unsafe>, attempts: u8) -> AfterTyping {
     }
 }
 
+/// What one delivery is, across its retries: its agent message, its panel batch, else its text.
+fn delivery_identity(item: &Item) -> String {
+    use std::hash::{Hash, Hasher};
+    if let crate::agents::Source::Chain(crate::agents::Prov { msg_id: Some(m), .. }) = item.source {
+        return format!("msg:{m}");
+    }
+    if let Some(batch) = &item.panel {
+        return format!("panel:{}", batch.id);
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (item.generation, &item.text).hash(&mut h);
+    format!("text:{:016x}", h.finish())
+}
+
 /// Type and submit one prompt. Ok(true) = accepted; Ok(false) = put back in the queue.
 async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Result<bool> {
     let info = hub
@@ -968,7 +982,16 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             return Ok(true);
         }
         // The prompt runs from here on: the session now handles a message from `source`.
-        hub.note_prompt_delivery(id, generation, item.source, crate::model::now_ms())?;
+        let now = crate::model::now_ms();
+        hub.note_prompt_delivery(id, generation, item.source, now)?;
+        // Muster's own sends (not the human's) into an agent whose cache has likely expired are
+        // recorded before Enter, so a crash after it can't leave one unmarked; never held back
+        // (src/cache.rs). A retry of the same delivery is recorded once.
+        if let crate::agents::Source::Chain(prov) = item.source
+            && let Some(idle) = hub.cache_cold(id, now)
+        {
+            hub.note_cold_send(id, prov, item.panel.is_some(), &delivery_identity(&item), idle);
+        }
         mark_stage(hub, id, generation, Stage::Submitting)?;
         let seq_before = hub.output_seq(id);
         hub.write_input_generation(id, generation, &adapter.submit_bytes())?;

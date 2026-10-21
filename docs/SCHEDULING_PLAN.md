@@ -105,7 +105,11 @@ PLAN.md §3 notes that Claude subscription limits assume "ordinary, individual u
 
 **Phase 3: Agents schedule for themselves (10, and 11 if wanted).** The MCP tools with the approval flow and guard rails, the file-change trigger, and phone push alerts once Android Web Push lands. Size: M.
 
-## Open questions for the owner
+## Decisions (owner, 2026-10-20)
+
+The owner took the recommended answer on all six questions below: missed runs (c), busy agent: skip if the same schedule's run is still going, else wait in line up to an hour; agents propose schedules for approval, except one-off self reminders up to 24 h ahead (b); Claude subscription agents opt in with 7-day expiry and quiet hours on (a); spend cap overall $5/day plus optional per-agent caps (c); GitHub events by polling only (a).
+
+## Open questions for the owner (answered above)
 
 1. **Missed runs: what should happen by default when Muster was off at a run's time?** If your laptop sleeps over a weekend, a daily report and an hourly check each missed several runs. (a) Run each once when Muster is back. (b) Skip them all and wait for the next time. (c) Daily and weekly schedules run once on return; hourly-or-faster ones skip. *Recommend (c):* a missed daily report is worth getting late, and a missed hourly check is about to run again anyway.
 

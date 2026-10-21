@@ -21,6 +21,7 @@ mod panel_apps;
 mod panel_kit;
 mod web_preview;
 mod skills;
+mod spend;
 mod notify;
 mod openrouter;
 mod paths;
@@ -80,6 +81,17 @@ enum Cmd {
     Schedule {
         #[command(subcommand)]
         action: cli::ScheduleCmd,
+    },
+    /// Fire a trigger (a schedule made with `--on url:<name>`) now, with DATA (words joined by
+    /// spaces, `-` reads stdin) handed to its agent as quoted untrusted data. `--url` prints its
+    /// loopback URL and secret instead (`--rotate`: a new secret).
+    Trigger {
+        name: String,
+        data: Vec<String>,
+        #[arg(long)]
+        url: bool,
+        #[arg(long, requires = "url")]
+        rotate: bool,
     },
     /// Read-only GitHub PR fetches for reviews: the open PR list, or one PR's snapshot (JSON).
     Pr {
@@ -572,6 +584,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Panel { action } => cli::panel(d, action),
         Cmd::Note { action } => cli::note(d, action),
         Cmd::Schedule { action } => cli::schedule(d, action),
+        Cmd::Trigger { name, data, url, rotate } => cli::trigger(d, &name, &data, url, rotate),
         Cmd::Read {
             target,
             lines,
@@ -1217,8 +1230,10 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Resu
         let hub = hub.clone();
         tokio::spawn(async move { agents::autostart(&hub).await });
     }
-    // Schedules: finish runs a previous backend left, then fire on time (src/schedules/).
+    // Schedules: finish runs a previous backend left, then fire on time (src/schedules/); the
+    // trigger watchers (git refs, GitHub through gh) and the OpenRouter spend sampler.
     schedules::spawn(hub.clone());
+    spend::spawn(hub.clone());
 
     // Event log retention (also applied at startup).
     {

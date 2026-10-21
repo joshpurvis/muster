@@ -44,6 +44,10 @@ pub struct Note {
     /// Raised by every change (text, title, window), so clients can tell a newer record from an
     /// older one whatever changed.
     pub version: i64,
+    /// "Allow triggers": a schedule's note trigger may fire on this note's changes. Off until the
+    /// human switches it on (`note.set_triggers`); no write of the text changes it.
+    #[serde(default)]
+    pub triggers: bool,
 }
 
 /// A note without its text (`hello.notes`, `note.list`, `note_list`): bounded however many
@@ -65,6 +69,9 @@ pub struct NoteSummary {
     pub lines: i64,
     /// The first non-blank line, trimmed, at most 120 characters.
     pub preview: String,
+    /// "Allow triggers" (see `Note::triggers`).
+    #[serde(default)]
+    pub triggers: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1058,7 +1058,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
 
         // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes or changes them: a call
         // on an agent session's behalf is refused (agents proposing schedules is a later phase).
-        m if m.starts_with("schedule.") => {
+        m if m.starts_with("schedule.") || m.starts_with("trigger.") || m == "note.set_triggers" => {
             require_local(who, method)?;
             let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
             let reads = matches!(method, "schedule.list" | "schedule.runs" | "schedule.preview" | "schedule.settings.get");
@@ -1072,9 +1072,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     Caller::Shell(s) => hub.agents().prov(s).is_some(),
                 };
                 if refused {
+                    let what = match method {
+                        "note.set_triggers" => "only the human allows triggers on a note",
+                        m if m.starts_with("trigger.") => "only the human fires triggers from Muster or sees their secrets",
+                        _ => "only the human makes and changes schedules",
+                    };
                     return Err(RpcError(format!(
-                        "{method} can't be called from an agent's session, or from a shell an agent has typed into: \
-                         only the human makes and changes schedules"
+                        "{method} can't be called from an agent's session, or from a shell an agent has typed into: {what}"
                     )));
                 }
             }
@@ -1139,11 +1143,65 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                         quiet_hours: Option<bool>,
                         #[serde(default)]
                         agent: Option<String>,
+                        /// The schedule being edited (a URL trigger keeps its own name).
+                        #[serde(default)]
+                        id: Option<i64>,
                     }
                     let p: P = parse(params)?;
-                    Ok(crate::schedules::preview(hub, &p.when, p.tz.as_deref(), p.quiet_hours, p.agent.as_deref())?)
+                    Ok(crate::schedules::preview(hub, &p.when, p.tz.as_deref(), p.quiet_hours, p.agent.as_deref(), p.id)?)
                 }
-                "schedule.settings.get" => Ok(crate::schedules::settings_json(&hub.schedules.settings())),
+                "trigger.fire" => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct P {
+                        name: String,
+                        #[serde(default)]
+                        payload: Option<String>,
+                        #[serde(default)]
+                        #[allow(dead_code)]
+                        from_session: Option<SessionId>,
+                    }
+                    let p: P = parse(params)?;
+                    Ok(crate::schedules::fire(hub, &p.name, p.payload.as_deref())?)
+                }
+                "trigger.secret" => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct P {
+                        #[serde(default)]
+                        id: Option<i64>,
+                        #[serde(default)]
+                        name: Option<String>,
+                        #[serde(default)]
+                        rotate: bool,
+                        #[serde(default)]
+                        #[allow(dead_code)]
+                        from_session: Option<SessionId>,
+                    }
+                    let p: P = parse(params)?;
+                    let id = match (p.id, p.name.as_deref()) {
+                        (Some(id), _) => id,
+                        (None, Some(n)) => crate::schedules::triggers::by_url_name(hub, n)
+                            .map(|s| s.id)
+                            .ok_or_else(|| RpcError(format!("no trigger named {n}")))?,
+                        (None, None) => return Err(RpcError("trigger.secret needs id or name".into())),
+                    };
+                    Ok(crate::schedules::triggers::secret_json(hub, id, p.rotate)?)
+                }
+                "note.set_triggers" => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct P {
+                        id: NoteId,
+                        on: bool,
+                        #[serde(default)]
+                        #[allow(dead_code)]
+                        from_session: Option<SessionId>,
+                    }
+                    let p: P = parse(params)?;
+                    to_value(crate::notes::set_triggers(hub, p.id, p.on)?)
+                }
+                "schedule.settings.get" => Ok(crate::schedules::settings_json(hub, &hub.schedules.settings())),
                 "schedule.settings.set" => Ok(crate::schedules::set_settings(hub, parse(params)?)?),
                 _ => Err(RpcError(format!("unknown method: {method}"))),
             }

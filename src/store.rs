@@ -399,6 +399,21 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sessions ADD COLUMN last_turn_at INTEGER;
     ALTER TABLE agent_messages ADD COLUMN cold_idle_ms INTEGER;
     "#,
+    // v21: scheduling Phase 2 (src/schedules/). Runs started by an event (a note, a branch,
+    // GitHub, a trigger URL) and the "Then…" steps of a chain are runs of their schedule too:
+    // a step names the run it follows (`parent_run`), its place in the chain (`step`: `s`/`f`
+    // per level, success or failure) and its own agent; a triggered run keeps what happened
+    // (`event`, JSON). Only timed slots (scheduled, catch-up) are unique per schedule. A note
+    // fires triggers only once the human switched `triggers` on for it (never an agent).
+    r#"
+    ALTER TABLE schedule_runs ADD COLUMN parent_run INTEGER;
+    ALTER TABLE schedule_runs ADD COLUMN step TEXT;
+    ALTER TABLE schedule_runs ADD COLUMN agent_id INTEGER;
+    ALTER TABLE schedule_runs ADD COLUMN event TEXT;
+    DROP INDEX schedule_runs_slot;
+    CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind IN ('scheduled', 'catch_up');
+    ALTER TABLE notes ADD COLUMN triggers INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -645,7 +660,7 @@ impl Store {
         let by: String = r.get(6)?;
         Ok(Note { id: r.get(0)?, title: r.get(1)?, body: r.get(2)?, rev: r.get(3)?, created_at: r.get(4)?,
             updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
-            window_id: r.get(7)?, beside: r.get(8)?, version: r.get(9)? })
+            window_id: r.get(7)?, beside: r.get(8)?, version: r.get(9)?, triggers: r.get::<_, i64>(10)? != 0 })
     }
 
     /// Every note without its text: sizes and a preview are worked out by SQLite, so only the
@@ -655,7 +670,7 @@ impl Store {
         let mut q = conn.prepare("SELECT id,title,rev,version,created_at,updated_at,updated_by,window_id,beside,
             length(CAST(body AS BLOB)),
             CASE WHEN body = '' THEN 0 ELSE length(body) - length(replace(body, char(10), '')) + (substr(body, -1) != char(10)) END,
-            substr(body, 1, 240)
+            substr(body, 1, 240), triggers
             FROM notes ORDER BY id")?;
         let rows = q.query_map([], |r| {
             let by: String = r.get(6)?;
@@ -664,7 +679,7 @@ impl Store {
             Ok(NoteSummary { id: r.get(0)?, title: r.get(1)?, rev: r.get(2)?, version: r.get(3)?, created_at: r.get(4)?,
                 updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
                 window_id, beside: r.get(8)?, open: window_id.is_some(), bytes: r.get(9)?, lines: r.get(10)?,
-                preview: preview(&head) })
+                preview: preview(&head), triggers: r.get::<_, i64>(12)? != 0 })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -681,7 +696,7 @@ impl Store {
 
     pub fn load_note(&self, id: NoteId) -> anyhow::Result<Option<Note>> {
         Ok(self.conn.lock().query_row(
-            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside,version FROM notes WHERE id=?1",
+            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside,version,triggers FROM notes WHERE id=?1",
             [id], Self::note_row).optional()?)
     }
 
@@ -705,6 +720,14 @@ impl Store {
             params![note.id, note.title, note.body, note.rev, note.updated_at,
                 serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version])?;
         anyhow::ensure!(n == 1, "note {} not found", note.id);
+        Ok(())
+    }
+
+    /// "Allow triggers" on a note: the only write of that column (`save_note` never touches it,
+    /// so no other change, an agent's included, can switch it).
+    pub fn set_note_triggers(&self, id: NoteId, on: bool) -> anyhow::Result<()> {
+        let n = self.conn.lock().execute("UPDATE notes SET triggers=?2, version=version+1 WHERE id=?1", params![id, on as i64])?;
+        anyhow::ensure!(n == 1, "note {id} not found");
         Ok(())
     }
 
@@ -1264,12 +1287,7 @@ impl Store {
     pub fn claim_run(&self, s: &crate::schedules::Schedule, run: &crate::schedules::Run) -> anyhow::Result<Option<i64>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let n = tx.execute(
-            "INSERT OR IGNORE INTO schedule_runs (schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
-                run.reason, run.finished_at],
-        )?;
+        let n = Self::insert_run_on(&tx, run, "INSERT OR IGNORE")?;
         let id = (n == 1).then(|| tx.last_insert_rowid());
         Self::save_schedule_on(&tx, s)?;
         if id.is_some() {
@@ -1279,18 +1297,33 @@ impl Store {
         Ok(id)
     }
 
-    /// A run that is no slot of the schedule's timing (Run now).
+    fn insert_run_on(conn: &Connection, run: &crate::schedules::Run, verb: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            &format!("{verb} INTO schedule_runs (schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at,
+                parent_run, step, agent_id, event)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
+                run.reason, run.finished_at, run.parent, run.step, run.agent_id, run.event],
+        )
+    }
+
+    /// A run that is no slot of the schedule's timing (Run now, a chain step).
     pub fn insert_run(&self, run: &crate::schedules::Run) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO schedule_runs (schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![run.schedule_id, run.slot, run.kind.as_str(), run.started_at, run.msg_id, run.outcome.as_str(),
-                run.reason, run.finished_at],
-        )?;
+        Self::insert_run_on(&conn, run, "INSERT")?;
         let id = conn.last_insert_rowid();
         Self::prune_runs_on(&conn, run.schedule_id, crate::schedules::RUNS_KEEP)?;
         Ok(id)
+    }
+
+    /// Delivered runs (their message reached an agent, any kind but Run now) of any of
+    /// `schedules` since `since`: the per-note cap on trigger runs.
+    pub fn count_delivered_runs_of(&self, schedules: &[i64], since: i64) -> anyhow::Result<u32> {
+        let mut total = 0;
+        for s in schedules {
+            total += self.count_delivered_runs_since(*s, since, None)?;
+        }
+        Ok(total)
     }
 
     pub fn update_run(&self, run: &crate::schedules::Run) -> anyhow::Result<()> {
@@ -1314,10 +1347,15 @@ impl Store {
             outcome: crate::schedules::Outcome::parse(&outcome),
             reason: r.get(7)?,
             finished_at: r.get(8)?,
+            parent: r.get(9)?,
+            step: r.get(10)?,
+            agent_id: r.get(11)?,
+            event: r.get(12)?,
         })
     }
 
-    const RUN_COLUMNS: &str = "id, schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at";
+    const RUN_COLUMNS: &str =
+        "id, schedule_id, slot, kind, started_at, msg_id, outcome, reason, finished_at, parent_run, step, agent_id, event";
 
     pub fn run(&self, id: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
         let conn = self.conn.lock();
@@ -1353,7 +1391,7 @@ impl Store {
     pub fn count_delivered_runs_since(&self, schedule: i64, since: i64, except: Option<i64>) -> anyhow::Result<u32> {
         let n: i64 = self.conn.lock().query_row(
             "SELECT COUNT(*) FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
-             WHERE r.schedule_id = ?1 AND m.created_at >= ?2 AND r.kind != 'manual' AND (?3 IS NULL OR m.id != ?3)",
+             WHERE r.schedule_id = ?1 AND m.created_at >= ?2 AND r.kind NOT IN ('manual', 'chain') AND (?3 IS NULL OR m.id != ?3)",
             params![schedule, since, except],
             |r| r.get(0),
         )?;
@@ -1371,7 +1409,7 @@ impl Store {
     pub fn latest_sent_run(&self, schedule: i64, before: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
         let conn = self.conn.lock();
         Ok(conn.query_row(
-            &format!("SELECT {} FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            &format!("SELECT {} FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL AND kind != 'chain' ORDER BY id DESC LIMIT 1",
                 Self::RUN_COLUMNS),
             params![schedule, before],
             Self::row_run,
@@ -1394,13 +1432,13 @@ impl Store {
     pub fn last_runs_for_prompt(&self, schedule: i64, before_run: i64) -> anyhow::Result<(Option<i64>, Option<String>)> {
         let conn = self.conn.lock();
         let last: Option<i64> = conn.query_row(
-            "SELECT slot FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            "SELECT slot FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL AND kind != 'chain' ORDER BY id DESC LIMIT 1",
             params![schedule, before_run],
             |r| r.get(0),
         ).optional()?;
         let reply: Option<String> = conn.query_row(
             "SELECT m.reply FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
-             WHERE r.schedule_id = ?1 AND r.id < ?2 AND m.reply IS NOT NULL ORDER BY r.id DESC LIMIT 1",
+             WHERE r.schedule_id = ?1 AND r.id < ?2 AND m.reply IS NOT NULL AND r.kind != 'chain' ORDER BY r.id DESC LIMIT 1",
             params![schedule, before_run],
             |r| r.get(0),
         ).optional()?;

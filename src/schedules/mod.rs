@@ -18,10 +18,16 @@
 //!   otherwise it waits in line for up to an hour (`plan::LINE_WAIT_MS`), then is skipped.
 //! - Claude subscription agents: scheduled only if they accept the schedule origin; their
 //!   recurring schedules expire 7 days after they were made or renewed; quiet hours default on.
+//!
+//! Phase 2 adds triggers (a `when` that is an event, `triggers.rs`; runs with origin `webhook`),
+//! "Then…" steps (`Schedule::then`: after a run, ask another agent one hop further down the same
+//! chain, or just notify), and the OpenRouter spend caps (src/spend.rs, checked with every other
+//! delivery rule in `agents::precheck`).
 
 pub mod cron;
 pub mod plan;
 mod run;
+pub mod triggers;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -87,7 +93,8 @@ impl Clock for FakeClock {
 
 // ----- records -----
 
-/// When a schedule fires.
+/// When a schedule fires: at a time (cron, once), or when something happens (a trigger,
+/// Phase 2: its runs have origin `webhook`, shown as "Triggered").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum When {
@@ -95,6 +102,104 @@ pub enum When {
     Cron { cron: String },
     /// Once, at this unix ms.
     Once { at: i64 },
+    /// A note's text changed (only while the human allows triggers on it), then stayed quiet
+    /// for `quiet_min` minutes.
+    Note {
+        note_id: NoteId,
+        #[serde(default = "default_note_quiet")]
+        quiet_min: u32,
+    },
+    /// A branch moved in a local git repository (polled from its ref files).
+    Git { repo: String, branch: String },
+    /// GitHub, polled through `gh` every `every_min` minutes: a PR opened, or a workflow run
+    /// failed (on `branch` only, when given).
+    Github {
+        repo: String,
+        event: GhEvent,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default = "default_gh_every")]
+        every_min: u32,
+    },
+    /// A loopback URL (`POST /api/trigger/<name>` with its secret) or `muster trigger <name>`.
+    Url { name: String },
+}
+
+fn default_note_quiet() -> u32 {
+    triggers::NOTE_QUIET_DEFAULT_MIN
+}
+fn default_gh_every() -> u32 {
+    triggers::GH_EVERY_DEFAULT_MIN
+}
+
+impl When {
+    /// Fired by events, not the clock.
+    pub fn is_trigger(&self) -> bool {
+        !matches!(self, When::Cron { .. } | When::Once { .. })
+    }
+    /// Recurs (expires for Claude subscription agents): cron lines and triggers.
+    pub fn recurs(&self) -> bool {
+        !matches!(self, When::Once { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhEvent {
+    PrOpened,
+    CiFailed,
+}
+
+/// The "Then…" steps of a schedule: what runs after a run (or a step) ends, on success (a
+/// reply) or on failure. Each step is one hop further down the same chain, so the 4-hop limit
+/// bounds chains.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Then {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_success: Option<Step>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<Step>,
+}
+
+/// One step: ask an agent (its prompt may quote the previous reply as `{reply}`), or, on
+/// failure only, just notify the human.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then: Option<Box<Then>>,
+}
+
+/// An event waiting for its trigger's run (debounced, or held by the 15-minute floor).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEvent {
+    /// When the first of these events happened.
+    pub at: i64,
+    /// What happened, one line per event (outside text included: quoted to the agent as data).
+    pub text: String,
+    /// Data sent with a trigger URL or `muster trigger` (untrusted, size-capped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    /// Events merged into this one.
+    pub count: u32,
+}
+
+/// What a watcher has already seen, kept with the schedule so a restart notices what changed
+/// while Muster was off (and fires once for it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchState {
+    /// Git: the branch's commit when last looked at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// GitHub: the newest PR number or workflow run id seen (None: not looked yet; the first
+    /// look only records it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_id: Option<u64>,
 }
 
 /// "If missed": what a slot missed while Muster was off or asleep does.
@@ -165,6 +270,17 @@ pub struct Schedule {
     pub expiry_warned: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// The "Then…" steps after a run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub then: Option<Then>,
+    /// A trigger's event waiting to run at `next_run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<PendingEvent>,
+    /// A watcher's memory (git, GitHub).
+    pub watch: WatchState,
+    /// A URL trigger's secret (never in `schedule.list`: `trigger.secret` gives it to the human).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 impl Default for Schedule {
@@ -192,7 +308,22 @@ impl Default for Schedule {
             expiry_warned: false,
             created_at: 0,
             updated_at: 0,
+            then: None,
+            event: None,
+            watch: WatchState::default(),
+            secret: None,
         }
+    }
+}
+
+impl Schedule {
+    /// The origin of its runs: `schedule` for timed ones, `webhook` ("Triggered") for triggers.
+    pub fn origin(&self) -> Origin {
+        if self.when.is_trigger() { Origin::Webhook } else { Origin::Schedule }
+    }
+    /// The envelope's sender for its own runs.
+    pub fn sender(&self) -> String {
+        run::sender_of(self.id, self.when.is_trigger())
     }
 }
 
@@ -205,6 +336,10 @@ pub enum RunKind {
     CatchUp,
     /// Run now.
     Manual,
+    /// Started by its trigger's event.
+    Triggered,
+    /// A "Then…" step after another run.
+    Chain,
 }
 
 impl RunKind {
@@ -213,12 +348,16 @@ impl RunKind {
             RunKind::Scheduled => "scheduled",
             RunKind::CatchUp => "catch_up",
             RunKind::Manual => "manual",
+            RunKind::Triggered => "triggered",
+            RunKind::Chain => "chain",
         }
     }
     pub fn parse(s: &str) -> RunKind {
         match s {
             "catch_up" => RunKind::CatchUp,
             "manual" => RunKind::Manual,
+            "triggered" => RunKind::Triggered,
+            "chain" => RunKind::Chain,
             _ => RunKind::Scheduled,
         }
     }
@@ -306,6 +445,36 @@ pub struct Run {
     pub outcome: Outcome,
     pub reason: Option<String>,
     pub finished_at: Option<i64>,
+    /// A chain step: the run it follows, its place (`s`/`f` per level) and its agent.
+    pub parent: Option<i64>,
+    pub step: Option<String>,
+    pub agent_id: Option<i64>,
+    /// A triggered run: what happened (`PendingEvent` as JSON).
+    pub event: Option<String>,
+}
+
+impl Run {
+    /// A new pending run of `schedule` at `slot`.
+    pub fn new(schedule_id: i64, slot: i64, kind: RunKind, now: i64) -> Run {
+        Run {
+            id: 0,
+            schedule_id,
+            slot,
+            kind,
+            started_at: now,
+            msg_id: None,
+            outcome: Outcome::Pending,
+            reason: None,
+            finished_at: None,
+            parent: None,
+            step: None,
+            agent_id: None,
+            event: None,
+        }
+    }
+    pub fn pending_event(&self) -> Option<PendingEvent> {
+        self.event.as_deref().and_then(|e| serde_json::from_str(e).ok())
+    }
 }
 
 /// The scheduling settings (Agents panel → Scheduling settings).
@@ -319,6 +488,10 @@ pub struct Settings {
     pub quiet_end: String,
     /// Unattended messages one agent takes per rolling 24 hours.
     pub unattended_cap: u32,
+    /// OpenRouter: the daily dollar cap over every agent, in cents (always on).
+    pub spend_cap_cents: u32,
+    /// OpenRouter: optional per-agent daily caps, in cents, by agent id.
+    pub agent_spend_caps: BTreeMap<i64, u32>,
 }
 
 impl Default for Settings {
@@ -328,6 +501,8 @@ impl Default for Settings {
             quiet_start: "23:00".into(),
             quiet_end: "07:00".into(),
             unattended_cap: crate::mcp::guard::UNATTENDED_DAILY_CAP_DEFAULT,
+            spend_cap_cents: crate::spend::DEFAULT_CAP_CENTS,
+            agent_spend_caps: BTreeMap::new(),
         }
     }
 }
@@ -461,6 +636,65 @@ pub fn facts(hub: &Hub, agent: &Agent) -> Facts {
     }
 }
 
+/// The facts for schedule `s` (of `agent`): a Claude subscription agent anywhere in it, its own
+/// or a "Then…" step's, brings the subscription rules (7-day expiry, quiet hours by default).
+pub fn facts_for(hub: &Hub, agent: &Agent, s: &Schedule) -> Facts {
+    let mut f = facts(hub, agent);
+    if !f.subscription_claude {
+        f.subscription_claude = step_agents(s.then.as_ref())
+            .into_iter()
+            .filter_map(|id| hub.agents().by_id(id))
+            .any(|a| facts(hub, &a).subscription_claude);
+    }
+    f
+}
+
+/// Every agent a schedule's "Then…" steps ask.
+pub fn step_agents(then: Option<&Then>) -> Vec<i64> {
+    let mut out = Vec::new();
+    if let Some(t) = then {
+        for st in [&t.on_success, &t.on_failure].into_iter().flatten() {
+            out.extend(st.agent_id);
+            out.extend(step_agents(st.then.as_deref()));
+        }
+    }
+    out
+}
+
+/// The step at `path` (`s`/`f` per level) of `then`.
+pub fn step_at<'a>(then: Option<&'a Then>, path: &str) -> Option<&'a Step> {
+    let mut cur = then?;
+    let mut found = None;
+    for (i, c) in path.chars().enumerate() {
+        let st = match c {
+            's' => cur.on_success.as_ref(),
+            'f' => cur.on_failure.as_ref(),
+            _ => None,
+        }?;
+        found = Some(st);
+        if i + 1 < path.len() {
+            cur = st.then.as_deref()?;
+        }
+    }
+    found
+}
+
+fn then_json(hub: &Hub, t: &Then) -> Value {
+    let step = |st: &Step| {
+        json!({
+            "notify": st.notify,
+            "agent": st.agent_id.and_then(|a| hub.agents().by_id(a)).map(|a| a.name),
+            "agent_id": st.agent_id,
+            "prompt": st.prompt,
+            "then": st.then.as_deref().map(|t| then_json(hub, t)),
+        })
+    };
+    json!({
+        "on_success": t.on_success.as_ref().map(step),
+        "on_failure": t.on_failure.as_ref().map(step),
+    })
+}
+
 fn quiet_of(settings: &Settings) -> Quiet {
     Quiet::new(settings, jiff::tz::TimeZone::system())
 }
@@ -471,12 +705,13 @@ fn quiet_of(settings: &Settings) -> Quiet {
 pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
     let agent = hub.agents().by_id(s.agent_id);
     let now = hub.schedules.now();
-    let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
+    let f = agent.as_ref().map(|a| facts_for(hub, a, s)).unwrap_or_default();
     let expires_at = plan::expires_at(s, &f);
     let expired = expires_at.is_some_and(|e| now >= e);
+    let trigger = s.when.is_trigger();
     let status = if expired {
         "expired"
-    } else if s.next_run.is_none() {
+    } else if s.next_run.is_none() && !trigger {
         "done"
     } else if s.paused {
         "paused"
@@ -488,10 +723,27 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
         (When::Cron { cron }, _) => cron::Cron::parse(cron).map(|c| c.describe()).unwrap_or_else(|e| e),
         (When::Once { at }, Some(tz)) => format!("Once, {}", cron::format(tz, *at, "%a %-d %b %Y at %H:%M")),
         (When::Once { .. }, None) => "Once".into(),
+        (w, _) => triggers::describe(hub, w),
     };
     let last_run = hub.store().runs(s.id, None, 1).ok().and_then(|r| r.into_iter().next()).map(|r| run_json(hub, &r));
     let note_title = s.note_id.and_then(|n| hub.store().load_note(n).ok().flatten()).map(|n| n.title);
+    // A note trigger's note: its title, and whether the human allows triggers on it.
+    let watched_note = match &s.when {
+        When::Note { note_id, .. } => hub.store().load_note(*note_id).ok().flatten().map(|n| json!({"id": n.id, "title": n.title, "triggers": n.triggers})),
+        _ => None,
+    };
+    let url = match &s.when {
+        When::Url { name } => Some(format!("http://127.0.0.1:{}/api/trigger/{name}", hub.port())),
+        _ => None,
+    };
     json!({
+        "trigger": trigger,
+        "origin": s.origin(),
+        "then": s.then.as_ref().map(|t| then_json(hub, t)),
+        "pending": s.event.as_ref().map(|e| json!({"at": e.at, "text": e.text, "count": e.count, "payload": e.payload.is_some()})),
+        "watch": triggers::watch_json(hub, s),
+        "note": watched_note,
+        "url": url,
         "id": s.id,
         "agent_id": s.agent_id,
         "agent": agent.as_ref().map(|a| a.name.clone()),
@@ -541,17 +793,27 @@ pub fn run_json(hub: &Hub, r: &Run) -> Value {
         "reason": r.reason,
         "msg_id": r.msg_id,
         "message": msg.as_ref().map(crate::agents::message_json),
+        "parent_run": r.parent,
+        "step": r.step,
+        "agent": r.agent_id.and_then(|a| hub.agents().by_id(a)).map(|a| a.name),
+        "event": r.pending_event().map(|e| json!({"at": e.at, "text": e.text, "count": e.count, "payload": e.payload.is_some()})),
     })
 }
 
-pub fn settings_json(s: &Settings) -> Value {
+pub fn settings_json(hub: &Hub, s: &Settings) -> Value {
     json!({
         "paused": s.paused,
         "quiet_start": s.quiet_start,
         "quiet_end": s.quiet_end,
         "unattended_cap": s.unattended_cap,
         "tz": cron::local_zone_name(),
+        "spend": hub.spend.json(hub, s),
     })
+}
+
+/// The OpenRouter spend was read again: clients get it with the settings.
+pub fn spend_changed(hub: &Hub) {
+    hub.emit(ServerEvent::ScheduleSettings(settings_json(hub, &hub.schedules.settings())));
 }
 
 fn publish(hub: &Hub, s: &Schedule) {
@@ -579,9 +841,66 @@ pub enum WhenInput {
         #[serde(default)]
         local: Option<String>,
     },
+    /// A note by id, or by its title (`note`).
+    Note {
+        #[serde(default)]
+        note_id: Option<NoteId>,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        quiet_min: Option<u32>,
+    },
+    Git { repo: String, branch: String },
+    Github {
+        repo: String,
+        event: GhEvent,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        every_min: Option<u32>,
+    },
+    Url { name: String },
 }
 
 impl WhenInput {
+    pub fn is_trigger(&self) -> bool {
+        !matches!(self, WhenInput::Cron { .. } | WhenInput::Once { .. })
+    }
+
+    /// The stored `When`, checked: a time read in `tz`, or an event (its note found, its repo
+    /// made absolute, …; `own`: the schedule being edited, for the URL name's uniqueness).
+    pub fn resolve_in(&self, hub: &Hub, tz: &str, own: Option<i64>) -> anyhow::Result<When> {
+        let mut w = match self {
+            WhenInput::Cron { .. } | WhenInput::Once { .. } => return self.resolve(tz),
+            WhenInput::Note { note_id, note, quiet_min } => {
+                let id = match (note_id, note.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
+                    (Some(id), _) => *id,
+                    (None, Some(t)) => {
+                        let found = crate::notes::list(hub)?.into_iter().find(|n| n.title.eq_ignore_ascii_case(t)).map(|n| n.id);
+                        match found {
+                            Some(id) => id,
+                            None => match t.parse::<NoteId>() {
+                                Ok(id) => id,
+                                Err(_) => anyhow::bail!("no note named “{t}” (a note trigger watches an existing note)"),
+                            },
+                        }
+                    }
+                    (None, None) => anyhow::bail!("a note trigger needs the note (note_id, or its title as note)"),
+                };
+                When::Note { note_id: id, quiet_min: quiet_min.unwrap_or(triggers::NOTE_QUIET_DEFAULT_MIN) }
+            }
+            WhenInput::Git { repo, branch } => When::Git { repo: repo.clone(), branch: branch.clone() },
+            WhenInput::Github { repo, event, branch, every_min } => When::Github {
+                repo: repo.clone(),
+                event: *event,
+                branch: branch.clone(),
+                every_min: every_min.unwrap_or(triggers::GH_EVERY_DEFAULT_MIN),
+            },
+            WhenInput::Url { name } => When::Url { name: name.clone() },
+        };
+        triggers::check_when(hub, &mut w, own)?;
+        Ok(w)
+    }
     /// The stored `When`, with a local time converted in `tz` (a time skipped by a
     /// daylight-saving change moves after it, as cron times do).
     pub fn resolve(&self, tz: &str) -> anyhow::Result<When> {
@@ -597,6 +916,7 @@ impl WhenInput {
                 Ok(When::Once { at: at.as_millisecond() })
             }
             WhenInput::Once { .. } => anyhow::bail!("a one-off needs exactly one of `at` (unix ms) or `local` (YYYY-MM-DDTHH:MM)"),
+            _ => anyhow::bail!("a trigger isn't a time"),
         }
     }
 }
@@ -651,10 +971,68 @@ pub struct ScheduleInput {
     pub daily_cap: Option<Option<u32>>,
     #[serde(default)]
     pub paused: Option<bool>,
+    /// The "Then…" steps, or `null` for none.
+    #[serde(default, deserialize_with = "some")]
+    pub then: Option<Option<ThenInput>>,
     /// The CLI inside a session (`$MUSTER_SESSION_ID`); rpc.rs refuses an agent's.
     #[serde(default)]
     #[allow(dead_code)]
     pub from_session: Option<SessionId>,
+}
+
+/// "Then…" as clients send it: agents by name.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThenInput {
+    #[serde(default)]
+    pub on_success: Option<StepInput>,
+    #[serde(default)]
+    pub on_failure: Option<StepInput>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepInput {
+    /// On failure only: just notify the human.
+    #[serde(default)]
+    pub notify: bool,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub then: Option<Box<ThenInput>>,
+}
+
+/// Check "Then…" steps: each asks an agent that takes work of `origin` with a prompt (or, on
+/// failure, notifies), at most `MAX_AGENT_HOPS` levels deep (each level is one hop further).
+fn resolve_then(hub: &Hub, t: &ThenInput, origin: Origin, depth: u32) -> anyhow::Result<Option<Then>> {
+    let max = crate::mcp::guard::MAX_AGENT_HOPS;
+    ensure!(depth <= max, "a chain is at most {max} steps deep (each step is one hop, and messages stop after {max} hops)");
+    let step = |s: &StepInput, failure: bool| -> anyhow::Result<Option<Step>> {
+        if s.notify {
+            ensure!(failure, "only the failure branch can just notify you (use Notify me: Always for successes)");
+            ensure!(s.agent.is_none() && s.prompt.is_none() && s.then.is_none(), "a step either notifies you or asks an agent, not both");
+            return Ok(Some(Step { notify: true, ..Default::default() }));
+        }
+        let Some(name) = s.agent.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
+            ensure!(s.prompt.as_deref().is_none_or(|p| p.trim().is_empty()), "a step's prompt needs an agent to ask");
+            return Ok(None);
+        };
+        let agent = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
+        check_agent(hub, &agent, origin)?;
+        let prompt = clean_prompt(s.prompt.as_deref().unwrap_or(""))?;
+        let then = match &s.then {
+            Some(t) => resolve_then(hub, t, origin, depth + 1)?.map(Box::new),
+            None => None,
+        };
+        Ok(Some(Step { notify: false, agent_id: Some(agent.id), prompt, then }))
+    };
+    let out = Then {
+        on_success: t.on_success.as_ref().map(|s| step(s, false)).transpose()?.flatten(),
+        on_failure: t.on_failure.as_ref().map(|s| step(s, true)).transpose()?.flatten(),
+    };
+    Ok((out.on_success.is_some() || out.on_failure.is_some()).then_some(out))
 }
 
 /// A field that is present (even `null`) is `Some`.
@@ -705,23 +1083,30 @@ pub fn first_slot(when: &When, tz: &str, now: i64) -> anyhow::Result<Option<i64>
             ensure!(next.is_some(), "`{cron}` never runs");
             Ok(next)
         }
+        // A trigger has no time of its own: an event sets one.
+        _ => Ok(None),
     }
 }
 
-/// The agent may take scheduled work (the same rule the delivery check applies).
-fn check_agent(hub: &Hub, agent: &Agent) -> anyhow::Result<()> {
-    if !agent.accepts_origins.contains(&Origin::Schedule) {
+/// The agent may take work of `origin` (the same rule the delivery check applies): scheduled
+/// work for a timed schedule, triggered (`webhook`) work for a trigger.
+fn check_agent(hub: &Hub, agent: &Agent, origin: Origin) -> anyhow::Result<()> {
+    if !agent.accepts_origins.contains(&origin) {
+        let (what, tick) = if origin == Origin::Webhook { ("triggered", "Webhook (triggered)") } else { ("scheduled", "Schedule") };
         let extra = if facts(hub, agent).subscription_claude {
-            " Claude subscription agents take scheduled work only if you opt in (read the warning there first); \
-              a Codex or OpenRouter agent is the better fit."
+            format!(
+                " Claude subscription agents take {what} work only if you opt in (read the warning there first); \
+                  a Codex or OpenRouter agent is the better fit."
+            )
         } else {
-            ""
+            String::new()
         };
         anyhow::bail!(
-            "agent {} doesn't take scheduled work: tick Schedule under \"Takes messages started by\" in Edit agent \
-             (or `muster agent edit {} --accepts human,schedule`).{extra}",
+            "agent {} doesn't take {what} work: tick {tick} under \"Takes messages started by\" in Edit agent \
+             (or `muster agent edit {} --accepts human,{}`).{extra}",
             agent.name,
-            agent.name
+            agent.name,
+            origin.as_str()
         );
     }
     Ok(())
@@ -744,23 +1129,35 @@ fn resolve_note(hub: &Hub, choice: &NoteChoice) -> anyhow::Result<NoteId> {
 pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
     let name = req.agent.as_deref().context("agent is required")?;
     let agent = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
-    check_agent(hub, &agent)?;
-    let prompt = clean_prompt(req.prompt.as_deref().context("prompt is required")?)?;
     let when = req.when.context("when is required: {\"kind\":\"cron\",\"cron\":\"0 9 * * 1-5\"} or {\"kind\":\"once\",\"at\":<unix ms>}")?;
+    let origin = if when.is_trigger() { Origin::Webhook } else { Origin::Schedule };
+    check_agent(hub, &agent, origin)?;
+    let prompt = clean_prompt(req.prompt.as_deref().context("prompt is required")?)?;
     let tz = req.tz.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).unwrap_or_else(cron::local_zone_name);
-    let when = when.resolve(&tz)?;
+    cron::zone(&tz).map_err(anyhow::Error::msg)?;
+    let when = when.resolve_in(hub, &tz, None)?;
     let now = hub.schedules.now();
     let next = first_slot(&when, &tz, now)?;
     ensure!(hub.schedules.inner.lock().list.len() < MAX_SCHEDULES, "Muster already has {MAX_SCHEDULES} schedules; remove some first");
-    let daily_cap = req.daily_cap.flatten().filter(|c| *c > 0);
+    // A trigger has a daily cap unless one is given (a busy repo or note can't run it all day).
+    let daily_cap = match req.daily_cap {
+        Some(c) => c.filter(|c| *c > 0),
+        None => when.is_trigger().then_some(triggers::DAILY_CAP_DEFAULT),
+    };
     ensure!(daily_cap.is_none_or(|c| c <= 200), "the daily run cap is at most 200");
     let name = clean_name(req.name.as_deref(), &prompt)?;
+    let then = match req.then.flatten() {
+        Some(t) => resolve_then(hub, &t, origin, 1)?,
+        None => None,
+    };
     // Last: it may make the note.
     let note_id = match req.note.flatten() {
         Some(c) => Some(resolve_note(hub, &c)?),
         None => None,
     };
-    let f = facts(hub, &agent);
+    let probe = Schedule { then: then.clone(), ..Default::default() };
+    let f = facts_for(hub, &agent, &probe);
+    let secret = matches!(when, When::Url { .. }).then(crate::paths::random_token);
     let mut s = Schedule {
         id: 0,
         agent_id: agent.id,
@@ -785,6 +1182,10 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         expiry_warned: false,
         created_at: now,
         updated_at: now,
+        then,
+        event: None,
+        watch: WatchState::default(),
+        secret,
     };
     {
         let mut g = hub.schedules.inner.lock();
@@ -792,6 +1193,9 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         g.list.insert(s.id, s.clone());
     }
     hub.schedules.wake.notify_one();
+    if s.when.is_trigger() {
+        triggers::changed(hub, s.id);
+    }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
@@ -805,6 +1209,30 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         None => None,
     };
     let now = hub.schedules.now();
+    let before = hub.schedules.get(id).with_context(|| format!("no schedule {id} (see `muster schedule ls`)"))?;
+    let agent = hub.agents().by_id(before.agent_id).context("this schedule's agent was removed")?;
+    // Checked before the edit (they read the hub): the new timing or trigger, and the steps.
+    let tz_in = req.tz.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(&before.tz).to_string();
+    let new_when = match &req.when {
+        Some(w) => Some(w.resolve_in(hub, &tz_in, Some(id))?),
+        None => None,
+    };
+    let origin = if new_when.as_ref().unwrap_or(&before.when).is_trigger() { Origin::Webhook } else { Origin::Schedule };
+    if origin != before.origin() {
+        check_agent(hub, &agent, origin)?;
+    }
+    let new_then = match &req.then {
+        Some(Some(t)) => Some(resolve_then(hub, t, origin, 1)?),
+        Some(None) => Some(None),
+        // The origin changed: the steps' agents must take the new one too.
+        None if origin != before.origin() => {
+            for a in step_agents(before.then.as_ref()).into_iter().filter_map(|a| hub.agents().by_id(a)) {
+                check_agent(hub, &a, origin)?;
+            }
+            None
+        }
+        None => None,
+    };
     let s = hub.schedules.edit(id, |s| {
         if let Some(p) = &req.prompt {
             s.prompt = clean_prompt(p)?;
@@ -813,18 +1241,30 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
             s.name = clean_name(req.name.as_deref().or(Some(&s.name)), &s.prompt)?;
         }
         let tz = req.tz.as_deref().map(str::trim).unwrap_or(&s.tz).to_string();
-        let when = match &req.when {
-            Some(w) => w.resolve(&tz)?,
-            None => s.when.clone(),
-        };
+        cron::zone(&tz).map_err(anyhow::Error::msg)?;
+        let when = new_when.clone().unwrap_or_else(|| s.when.clone());
         // Compared by what it does: re-sending the same timing (or `@daily` for `0 0 * * *`)
         // keeps the next run and Skip next as they are.
         let when_changed = !same_timing(&when, &s.when) || tz != s.tz;
         if when_changed {
+            let was_trigger = s.when.is_trigger();
             s.when = when;
             s.tz = tz;
             s.next_run = first_slot(&s.when, &s.tz, now)?;
             s.skip_slot = None;
+            // A trigger that watches something else starts afresh: no held event, no memory.
+            if s.when.is_trigger() || was_trigger {
+                s.event = None;
+                s.watch = WatchState::default();
+            }
+            if matches!(s.when, When::Url { .. }) {
+                s.secret.get_or_insert_with(crate::paths::random_token);
+            } else {
+                s.secret = None;
+            }
+        }
+        if let Some(t) = &new_then {
+            s.then = t.clone();
         }
         if let Some(m) = req.missed {
             s.missed = m;
@@ -851,6 +1291,9 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         }
         Ok(())
     })?;
+    if s.when.is_trigger() {
+        triggers::changed(hub, s.id);
+    }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
@@ -864,6 +1307,7 @@ pub fn remove(hub: &Hub, id: i64) -> anyhow::Result<Value> {
         s
     };
     hub.emit(ServerEvent::ScheduleRemoved { id, agent_id: s.agent_id });
+    hub.triggers.forget(id);
     run::cancel_unsent(hub, Some(id), "its schedule was removed", true);
     Ok(json!({ "removed": id }))
 }
@@ -901,6 +1345,7 @@ pub fn set_paused(hub: &Hub, id: i64, paused: bool) -> anyhow::Result<Value> {
 /// "Skip next" (skip the coming slot) or undo it.
 pub fn set_skip(hub: &Hub, id: i64, skip: bool) -> anyhow::Result<Value> {
     let s = hub.schedules.edit(id, |s| {
+        ensure!(!s.when.is_trigger(), "a trigger has no next time to skip: pause it instead");
         if skip {
             s.skip_slot = Some(s.next_run.context("this schedule has no next run to skip")?);
         } else {
@@ -942,7 +1387,7 @@ pub fn list(hub: &Hub, agent: Option<&str>) -> anyhow::Result<Value> {
         .filter(|s| only.is_none_or(|a| s.agent_id == a))
         .map(|s| schedule_json(hub, s))
         .collect();
-    Ok(json!({ "schedules": list, "settings": settings_json(&hub.schedules.settings()) }))
+    Ok(json!({ "schedules": list, "settings": settings_json(hub, &hub.schedules.settings()) }))
 }
 
 pub fn runs(hub: &Hub, id: i64, before: Option<i64>, limit: Option<usize>) -> anyhow::Result<Value> {
@@ -955,9 +1400,33 @@ pub fn runs(hub: &Hub, id: i64, before: Option<i64>, limit: Option<usize>) -> an
 }
 
 /// `schedule.preview`: the reading and the next runs of `when`, without saving anything.
-pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>) -> anyhow::Result<Value> {
+pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>, own: Option<i64>) -> anyhow::Result<Value> {
     let tz = tz.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(cron::local_zone_name);
-    let when = &when.resolve(&tz)?;
+    let when = &when.resolve_in(hub, &tz, own)?;
+    if when.is_trigger() {
+        let agent = match agent {
+            Some(n) => Some(hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?),
+            None => None,
+        };
+        let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
+        let note_off = match when {
+            When::Note { note_id, .. } => hub.store().load_note(*note_id).ok().flatten().is_some_and(|n| !n.triggers),
+            _ => false,
+        };
+        return Ok(json!({
+            "reading": triggers::describe(hub, when),
+            "tz": tz,
+            "when": when,
+            "next": [],
+            "quiet": [],
+            "quiet_hours_default": f.subscription_claude,
+            "missed_default": "run_once",
+            "expires": f.subscription_claude,
+            "trigger": true,
+            "note_triggers_off": note_off,
+            "daily_cap_default": triggers::DAILY_CAP_DEFAULT,
+        }));
+    }
     let now = hub.schedules.now();
     let first = first_slot(when, &tz, now)?;
     let zone = cron::zone(&tz).map_err(anyhow::Error::msg)?;
@@ -985,6 +1454,7 @@ pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Optio
     let reading = match when {
         When::Cron { cron } => cron::Cron::parse(cron).map_err(anyhow::Error::msg)?.describe(),
         When::Once { at } => format!("Once, {}", cron::format(&zone, *at, "%a %-d %b %Y at %H:%M")),
+        w => triggers::describe(hub, w),
     };
     Ok(json!({
         "reading": reading,
@@ -1006,9 +1476,23 @@ pub struct SettingsChange {
     pub quiet_start: Option<String>,
     pub quiet_end: Option<String>,
     pub unattended_cap: Option<u32>,
+    /// OpenRouter: the overall daily cap in dollars (always on: it can't be cleared).
+    pub spend_cap: Option<f64>,
+    /// OpenRouter: per-agent daily caps in dollars by agent name, `null` to clear one.
+    pub agent_spend_caps: Option<BTreeMap<String, Option<f64>>>,
     #[serde(default)]
     #[allow(dead_code)]
     pub from_session: Option<SessionId>,
+}
+
+fn cents(dollars: f64) -> anyhow::Result<u32> {
+    let c = (dollars * 100.0).round();
+    ensure!(
+        dollars.is_finite() && c >= 1.0 && c <= crate::spend::MAX_CAP_CENTS as f64,
+        "a daily spend cap is $0.01 to ${}",
+        crate::spend::MAX_CAP_CENTS / 100
+    );
+    Ok(c as u32)
 }
 
 pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
@@ -1032,6 +1516,24 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
             );
             next.unattended_cap = n;
         }
+        if let Some(d) = c.spend_cap {
+            next.spend_cap_cents = cents(d)?;
+        }
+        if let Some(caps) = &c.agent_spend_caps {
+            for (name, cap) in caps {
+                let a = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
+                match cap {
+                    Some(d) => {
+                        next.agent_spend_caps.insert(a.id, cents(*d)?);
+                    }
+                    None => {
+                        next.agent_spend_caps.remove(&a.id);
+                    }
+                }
+            }
+        }
+        // Caps of agents that are gone go too.
+        next.agent_spend_caps.retain(|id, _| hub.agents().by_id(*id).is_some());
         hub.store().save_runtime(SETTINGS_KEY, &next)?;
         g.settings = next.clone();
         next
@@ -1040,7 +1542,7 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
     if next.paused {
         run::cancel_unsent(hub, None, plan::PAUSED_ALL, false);
     }
-    let v = settings_json(&next);
+    let v = settings_json(hub, &next);
     hub.emit(ServerEvent::ScheduleSettings(v.clone()));
     // Every schedule's status may read differently (paused for all).
     for s in hub.schedules.list() {
@@ -1054,19 +1556,9 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
 pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
     let s = hub.schedules.get(id).with_context(|| format!("no schedule {id}"))?;
     let agent = hub.agents().by_id(s.agent_id).context("this schedule's agent was removed")?;
-    check_agent(hub, &agent)?;
+    check_agent(hub, &agent, s.origin())?;
     let now = hub.schedules.now();
-    let mut r = Run {
-        id: 0,
-        schedule_id: id,
-        slot: now,
-        kind: RunKind::Manual,
-        started_at: now,
-        msg_id: None,
-        outcome: Outcome::Pending,
-        reason: None,
-        finished_at: None,
-    };
+    let mut r = Run::new(id, now, RunKind::Manual, now);
     // The busy rule, answered now: the same schedule's previous run is still going.
     if run::previous_running(hub, id, i64::MAX)?
         && let plan::Gate::Skip(why) = plan::gate(true, false, 0)
@@ -1091,13 +1583,11 @@ pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
 pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> Option<plan::Action> {
     let crate::agents::Source::Chain(p) = source else { return None };
     let msg = p.msg_id?;
-    if p.origin != Origin::Schedule || p.hop != 0 {
+    if p.origin == Origin::Human {
         return None;
     }
     let m = hub.store().agent_message(msg).ok().flatten()?;
-    if !m.from.starts_with("schedule:") {
-        return None;
-    }
+    run::parse_sender(&m.from)?;
     let deny = |why: &str| Some(plan::Action::Skip(why.to_string()));
     let Some(r) = run::run_for_msg(hub, msg, &m.from) else { return deny("its schedule was removed") };
     if r.outcome != Outcome::Pending {
@@ -1107,15 +1597,23 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
     let Some(agent) = hub.agents().by_id(s.agent_id) else { return deny("its agent was removed") };
     if r.kind != RunKind::Manual {
         let settings = hub.schedules.settings();
-        let today = hub.store().count_delivered_runs_since(s.id, now_ms() - plan::DAY_MS, Some(msg)).unwrap_or(0);
-        let since = s.last_sent.map(|t| now_ms() - t);
-        if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), today, since) {
+        // A step is part of its run: the schedule's daily cap and floor were its run's.
+        let (today, since) = if r.kind == RunKind::Chain {
+            (0, None)
+        } else {
+            (
+                hub.store().count_delivered_runs_since(s.id, now_ms() - plan::DAY_MS, Some(msg)).unwrap_or(0),
+                s.last_sent.map(|t| now_ms() - t),
+            )
+        };
+        if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts_for(hub, &agent, &s), today, since) {
             return Some(a);
         }
     }
     // Recorded at the last check, right before Enter, for timed runs (Run now is the human's).
     if commit
         && r.kind != RunKind::Manual
+        && r.kind != RunKind::Chain
         && let Err(e) = hub.schedules.edit(s.id, |x| {
             x.last_sent = Some(now_ms());
             Ok(())
@@ -1138,7 +1636,9 @@ pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, action: pla
 pub fn on_reply(hub: &Hub, msg: i64) {
     let Ok(Some(r)) = hub.store().run_by_msg(msg) else { return };
     let Some(s) = hub.schedules.get(r.schedule_id) else { return };
-    run::reply_to_note_once(hub, &s, &r);
+    if r.kind != RunKind::Chain {
+        run::reply_to_note_once(hub, &s, &r);
+    }
     if r.outcome != Outcome::Pending {
         // Its history line now reads "replied" (late).
         publish_run(hub, &r);
@@ -1147,10 +1647,17 @@ pub fn on_reply(hub: &Hub, msg: i64) {
 
 /// Start the scheduler (once, at daemon start, after agents autostart is under way).
 pub fn spawn(hub: Arc<Hub>) {
+    triggers::spawn(hub.clone());
     tokio::spawn(async move {
         run::recover(&hub);
         run::scheduler_loop(hub).await;
     });
+}
+
+/// `trigger.fire` (`muster trigger <name>`): the human's own client, no secret needed.
+pub fn fire(hub: &Hub, name: &str, payload: Option<&str>) -> anyhow::Result<Value> {
+    triggers::fire_url(hub, name, None, payload.map(str::as_bytes), &format!("`muster trigger {name}` was run"))
+        .map_err(|(_, why)| anyhow::anyhow!(if why.starts_with("unknown") { format!("no trigger named {name} (see `muster schedule ls`)") } else { why }))
 }
 
 #[cfg(test)]

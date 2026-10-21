@@ -428,6 +428,10 @@ pub struct Hub {
     pub notes: crate::notes::Notes,
     /// Schedules and their runs (src/schedules/).
     pub schedules: crate::schedules::Schedules,
+    /// Trigger watchers' live state (src/schedules/triggers.rs).
+    pub triggers: crate::schedules::triggers::Watchers,
+    /// OpenRouter spend and the daily dollar caps (src/spend.rs).
+    pub spend: crate::spend::Spend,
     cfg: HubConfig,
     store: Store,
     tx: broadcast::Sender<ServerEvent>,
@@ -521,6 +525,11 @@ impl Hub {
 
     pub fn openrouter_key(&self) -> Option<&crate::openrouter::ApiKey> {
         self.cfg.openrouter_key.as_ref()
+    }
+
+    /// This hub as an `Arc` (None only while it is being dropped).
+    pub fn arc(&self) -> Option<Arc<Hub>> {
+        self.weak.upgrade()
     }
 
     pub fn openrouter_models(&self) -> &Arc<crate::openrouter::ModelCache> {
@@ -825,10 +834,13 @@ impl Hub {
         let schedules = crate::schedules::Schedules::load(&store, Arc::new(crate::schedules::SystemClock::from_env()))?;
         let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
+        let spend = crate::spend::Spend::load(&store, cfg.openrouter_key.as_ref());
         let hub = Arc::new_cyclic(|weak| Hub {
             panels: crate::panels::Panels::default(),
             notes: crate::notes::Notes::default(),
             schedules,
+            triggers: Default::default(),
+            spend,
             cfg,
             devices,
             agents,

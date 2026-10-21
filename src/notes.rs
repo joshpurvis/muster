@@ -147,7 +147,7 @@ pub fn create(hub: &Hub, title_in: Option<&str>, body: &str, by: NoteAuthor, win
     ensure!(hub.store().count_notes()? < MAX_NOTES, "Muster already has {MAX_NOTES} notes; delete some first");
     let now = now_ms();
     let mut n = Note { id: 0, title: named.clone().unwrap_or_else(|| "Note".into()), body, rev: 1, created_at: now,
-        updated_at: now, updated_by: by, window_id: window, beside: window.and(beside), version: 1 };
+        updated_at: now, updated_by: by, window_id: window, beside: window.and(beside), version: 1, triggers: false };
     hub.store().create_note(&mut n)?;
     if named.is_none() {
         n.title = format!("Note {}", n.id);
@@ -173,7 +173,8 @@ pub fn write(hub: &Hub, id: NoteId, body: &str, base_rev: i64, by: NoteAuthor, n
         n.title = t;
         changed = true;
     }
-    if body != n.body {
+    let text_changed = body != n.body;
+    if text_changed {
         n.body = body;
         n.rev += 1;
         n.updated_at = now_ms();
@@ -181,7 +182,27 @@ pub fn write(hub: &Hub, id: NoteId, body: &str, base_rev: i64, by: NoteAuthor, n
         changed = true;
     }
     if !changed { return Ok(n) }
-    save(hub, n)
+    let n = save(hub, n)?;
+    drop(_g);
+    if text_changed {
+        crate::schedules::triggers::note_changed(hub, &n);
+    }
+    Ok(n)
+}
+
+/// "Allow triggers" on or off: whether note triggers may fire on this note's changes. The
+/// human's switch only (rpc.rs refuses it from an agent's session or a shell an agent drives;
+/// there is no MCP tool for it).
+pub fn set_triggers(hub: &Hub, id: NoteId, on: bool) -> anyhow::Result<Note> {
+    let _g = hub.notes.lock.lock();
+    let n = get(hub, id)?;
+    if n.triggers == on { return Ok(n) }
+    hub.store().set_note_triggers(id, on)?;
+    let n = get(hub, id)?;
+    hub.emit(ServerEvent::NoteUpserted(n.clone()));
+    drop(_g);
+    crate::schedules::triggers::note_triggers_changed(hub, id);
+    Ok(n)
 }
 
 /// Add `text` at the end, on a new line when the note doesn't already end with one.
@@ -197,7 +218,10 @@ pub fn append(hub: &Hub, id: NoteId, text: &str, by: NoteAuthor) -> anyhow::Resu
     n.rev += 1;
     n.updated_at = now_ms();
     n.updated_by = by;
-    save(hub, n)
+    let n = save(hub, n)?;
+    drop(_g);
+    crate::schedules::triggers::note_changed(hub, &n);
+    Ok(n)
 }
 
 pub fn rename(hub: &Hub, id: NoteId, new_title: &str) -> anyhow::Result<Note> {

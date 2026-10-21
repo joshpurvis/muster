@@ -304,9 +304,19 @@ fn tilde(p: &str) -> String {
 /// event (a note) moves its time on with each new edit.
 fn hold(hub: &Hub, id: i64, text: &str, payload: Option<String>, at: i64, debounce: bool) -> anyhow::Result<Schedule> {
     let now = hub.schedules.now();
-    let s = hub.schedules.edit(id, |s| {
+    let s = hub.schedules.edit(id, |s| hold_on(s, text, payload, at, debounce, now))?;
+    super::publish(hub, &s);
+    Ok(s)
+}
+
+/// `hold` on a schedule being edited, so a watcher saves what it has seen (its cursor) and the
+/// event it found in one write: a crash can't keep the one and lose the other. (The scheduler
+/// also keeps a held event until the 15-minute floor has passed.)
+fn hold_on(s: &mut Schedule, text: &str, payload: Option<String>, at: i64, debounce: bool, now: i64) -> anyhow::Result<()> {
+    {
+        let id = s.id;
         ensure!(s.when.is_trigger(), "schedule {id} isn't a trigger");
-        let floor = s.last_fired.into_iter().chain(s.last_sent).max().map_or(i64::MIN, |t| t + plan::MIN_GAP_MS);
+        let floor = s.last_fired.map_or(i64::MIN, |t| t + plan::MIN_GAP_MS);
         let ev = s.event.get_or_insert_with(|| PendingEvent { at: now, ..Default::default() });
         ev.count += 1;
         const CUT: &str = "(earlier events left out)";
@@ -328,9 +338,7 @@ fn hold(hub: &Hub, id: i64, text: &str, payload: Option<String>, at: i64, deboun
             _ => want,
         });
         Ok(())
-    })?;
-    super::publish(hub, &s);
-    Ok(s)
+    }
 }
 
 // ----- notes -----
@@ -375,6 +383,11 @@ pub fn note_triggers_changed(hub: &Hub, note: NoteId) {
     let on = hub.store().load_note(note).ok().flatten().is_some_and(|n| n.triggers);
     for s in hub.schedules.list() {
         if matches!(s.when, When::Note { note_id, .. } if note_id == note) {
+            if !on {
+                // Its prompts still waiting in an agent's queue are taken back; runs still in line
+                // look at the switch again before they send.
+                super::run::cancel_unsent(hub, Some(s.id), "triggers were switched off for its note", false);
+            }
             if !on && s.event.is_some() {
                 match hub.schedules.edit(s.id, |x| {
                     x.event = None;
@@ -391,35 +404,35 @@ pub fn note_triggers_changed(hub: &Hub, note: NoteId) {
     }
 }
 
-/// Runs today of the triggers on `note` (the per-note cap).
-pub fn note_runs_today(hub: &Hub, note: NoteId) -> u32 {
-    let ids: Vec<i64> = hub
-        .schedules
+/// The schedules whose triggers watch `note` (the per-note cap counts their runs together).
+pub fn note_trigger_ids(hub: &Hub, note: NoteId) -> Vec<i64> {
+    hub.schedules
         .list()
         .into_iter()
         .filter(|s| matches!(s.when, When::Note { note_id, .. } if note_id == note))
         .map(|s| s.id)
-        .collect();
-    hub.store().count_delivered_runs_of(&ids, now_ms() - plan::DAY_MS).unwrap_or(0)
+        .collect()
 }
 
-/// Why a note trigger's due run may not go (its note or the switch), or None.
-pub fn note_gate(hub: &Hub, s: &Schedule) -> Option<plan::Action> {
+/// The per-note cap, given the runs of the note's triggers taken up in the last 24 hours (a run
+/// counts from when it is claimed, so several triggers due at once can't all pass it).
+pub fn note_cap(title: &str, taken: u32) -> Option<plan::Action> {
+    (taken >= NOTE_DAILY_FIRES).then(|| {
+        plan::Action::Refuse(format!(
+            "daily cap: triggers on the note “{title}” ran {taken} times in the last 24 hours (at most {NOTE_DAILY_FIRES})"
+        ))
+    })
+}
+
+/// May a note trigger's run go, as far as its note goes: the note exists and the human allows
+/// triggers on it. Checked when the run is claimed, before it is sent and right before its
+/// prompt is submitted (the switch may go off meanwhile). None: yes, or not a note trigger.
+pub fn note_flag(hub: &Hub, s: &Schedule) -> Option<plan::Action> {
     let When::Note { note_id, .. } = s.when else { return None };
     let Some(n) = hub.store().load_note(note_id).ok().flatten() else {
         return Some(plan::Action::Skip("its note was deleted".into()));
     };
-    if !n.triggers {
-        return Some(plan::Action::Skip(format!("triggers are off for the note “{}”", n.title)));
-    }
-    let today = note_runs_today(hub, note_id);
-    if today >= NOTE_DAILY_FIRES {
-        return Some(plan::Action::Refuse(format!(
-            "daily cap: triggers on the note “{}” ran {today} times in the last 24 hours (at most {NOTE_DAILY_FIRES})",
-            n.title
-        )));
-    }
-    None
+    (!n.triggers).then(|| plan::Action::Skip(format!("triggers are off for the note “{}”", n.title)))
 }
 
 // ----- trigger URL and `muster trigger` -----
@@ -538,22 +551,19 @@ pub fn check_git(hub: &Hub) {
         match s.watch.sha.clone() {
             Some(old) if old == sha => {}
             old => {
+                // The first look only records where the branch is; a move saves the new commit
+                // and the event together.
+                let text = old.as_deref().map(|o| git_moved_text(Path::new(repo), branch, o, &sha));
                 let r = hub.schedules.edit(s.id, |x| {
                     x.watch.sha = Some(sha.clone());
-                    Ok(())
-                });
-                if let Err(e) = r {
-                    tracing::warn!(schedule = s.id, "{e:#}");
-                    continue;
-                }
-                // The first look only records where the branch is.
-                if let Some(old) = old {
-                    let text = git_moved_text(Path::new(repo), branch, &old, &sha);
-                    if let Err(e) = hold(hub, s.id, &text, None, now, false) {
-                        tracing::warn!(schedule = s.id, "holding a branch move: {e:#}");
+                    match &text {
+                        Some(t) => hold_on(x, t, None, now, false, now),
+                        None => Ok(()),
                     }
-                } else {
-                    super::publish(hub, &hub.schedules.get(s.id).unwrap_or(s.clone()));
+                });
+                match r {
+                    Ok(x) => super::publish(hub, &x),
+                    Err(e) => tracing::warn!(schedule = s.id, "holding a branch move: {e:#}"),
                 }
             }
         }
@@ -588,8 +598,17 @@ fn git_moved_text(repo: &Path, branch: &str, old: &str, new: &str) -> String {
     }
 }
 
-/// What one GitHub poll found: new items' lines and the newest id.
-pub fn gh_new_items(event: GhEvent, repo: &str, v: &Value, max_seen: Option<u64>) -> (Vec<String>, Option<u64>) {
+/// Failed CI run ids remembered per trigger.
+pub const SEEN_KEEP: usize = 200;
+
+/// What one GitHub poll found: the new items' lines, and what the watcher has seen now.
+/// - PRs (every state, newest created first, so a PR opened and closed or merged between polls
+///   or while Muster was off still counts): a number above the highest seen is new.
+/// - CI: a failed run whose id hasn't been seen is new, whatever its id (a run can fail after a
+///   newer one did: runs are listed by when they were created, not when they failed).
+///
+/// The first poll (nothing seen yet) only records what is there.
+pub fn gh_new_items(event: GhEvent, repo: &str, v: &Value, watch: &super::WatchState) -> (Vec<String>, super::WatchState) {
     let items: Vec<&Value> = match event {
         GhEvent::PrOpened => v.as_array().map(|a| a.iter().collect()).unwrap_or_default(),
         GhEvent::CiFailed => v.get("workflow_runs").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default(),
@@ -598,12 +617,35 @@ pub fn gh_new_items(event: GhEvent, repo: &str, v: &Value, max_seen: Option<u64>
         GhEvent::PrOpened => x.get("number").and_then(Value::as_u64),
         GhEvent::CiFailed => x.get("id").and_then(Value::as_u64),
     };
+    // A failed run's key: its id and attempt (a re-run keeps the id).
+    let key = |x: &Value| format!("{}.{}", id_of(x).unwrap_or(0), x.get("run_attempt").and_then(Value::as_u64).unwrap_or(1));
     let newest = items.iter().filter_map(|x| id_of(x)).max();
-    let Some(seen) = max_seen else {
-        return (Vec::new(), Some(newest.unwrap_or(0)));
+    let mut next = watch.clone();
+    let remember = |next: &mut super::WatchState| {
+        if event == GhEvent::CiFailed {
+            for x in items.iter().rev() {
+                let k = key(x);
+                if !next.seen.contains(&k) {
+                    next.seen.push(k);
+                }
+            }
+            let over = next.seen.len().saturating_sub(SEEN_KEEP);
+            next.seen.drain(..over);
+        }
     };
+    let Some(seen_max) = watch.max_id else {
+        next.max_id = Some(newest.unwrap_or(0));
+        remember(&mut next);
+        return (Vec::new(), next);
+    };
+    let is_new = |x: &Value| match event {
+        GhEvent::PrOpened => id_of(x).is_some_and(|i| i > seen_max),
+        GhEvent::CiFailed => !watch.seen.contains(&key(x)),
+    };
+    next.max_id = Some(newest.unwrap_or(seen_max).max(seen_max));
+    remember(&mut next);
     let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").replace(['\n', '\r'], " ");
-    let mut fresh: Vec<&&Value> = items.iter().filter(|x| id_of(x).is_some_and(|i| i > seen)).collect();
+    let mut fresh: Vec<&&Value> = items.iter().filter(|x| is_new(x)).collect();
     fresh.sort_by_key(|x| id_of(x));
     let lines = fresh
         .iter()
@@ -627,13 +669,13 @@ pub fn gh_new_items(event: GhEvent, repo: &str, v: &Value, max_seen: Option<u64>
             ),
         })
         .collect();
-    (lines, Some(newest.unwrap_or(seen).max(seen)))
+    (lines, next)
 }
 
 /// The `gh api` path a GitHub trigger polls.
 pub fn gh_path(repo: &str, event: GhEvent, branch: Option<&str>) -> String {
     match event {
-        GhEvent::PrOpened => format!("repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=30"),
+        GhEvent::PrOpened => format!("repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page=50"),
         GhEvent::CiFailed => match branch {
             Some(b) => format!("repos/{repo}/actions/runs?status=failure&per_page=20&branch={}", url_part(b)),
             None => format!("repos/{repo}/actions/runs?status=failure&per_page=20"),
@@ -663,22 +705,21 @@ pub fn poll_github(hub: &Hub, id: i64, tools: &crate::pr::Tools) {
     let When::Github { repo, event, branch, every_min } = s.when.clone() else { return };
     let got = tools.api_get(&format!("{repo} {}", if event == GhEvent::PrOpened { "PRs" } else { "workflow runs" }), &gh_path(&repo, event, branch.as_deref()));
     let now = hub.schedules.now();
-    let mut found = Vec::new();
     let ok = got.is_ok();
+    let mut saved = None;
     match got {
         Ok(v) => {
-            let cur = hub.schedules.get(id).map(|x| x.watch.max_id).unwrap_or(s.watch.max_id);
-            let (lines, newest) = gh_new_items(event, &repo, &v, cur);
-            if newest != cur {
-                if let Err(e) = hub.schedules.edit(id, |x| {
-                    x.watch.max_id = newest;
-                    Ok(())
-                }) {
-                    tracing::warn!(schedule = id, "{e:#}");
-                    return;
-                }
+            // What it has seen and the event it found are saved in one write (a crash can't
+            // keep the one and lose the other).
+            let r = hub.schedules.edit(id, |x| {
+                let (lines, watch) = gh_new_items(event, &repo, &v, &x.watch);
+                x.watch = watch;
+                if lines.is_empty() { Ok(()) } else { hold_on(x, &lines.join("\n"), None, now, false, now) }
+            });
+            match r {
+                Ok(x) => saved = Some(x),
+                Err(e) => tracing::warn!(schedule = id, "saving a GitHub poll: {e:#}"),
             }
-            found = lines;
         }
         Err(e) => {
             let (state, detail) = match e {
@@ -704,11 +745,7 @@ pub fn poll_github(hub: &Hub, id: i64, tools: &crate::pr::Tools) {
             l.next_at = now + gh_backoff_ms(every_min, 0);
         });
     }
-    if !found.is_empty() {
-        if let Err(e) = hold(hub, id, &found.join("\n"), None, now, false) {
-            tracing::warn!(schedule = id, "holding a GitHub event: {e:#}");
-        }
-    } else if let Some(x) = hub.schedules.get(id) {
+    if let Some(x) = saved.or_else(|| hub.schedules.get(id)) {
         super::publish(hub, &x);
     }
 }

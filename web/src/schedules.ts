@@ -198,8 +198,8 @@ export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
  * picked). */
 export interface TriggerDraft {
   kind: TriggerKind;
-  /** A note's title. */
-  note: string;
+  /** The watched note, by id (titles needn't be unique); null: none picked yet. */
+  note: number | null;
   /** Minutes of quiet after the last edit. */
   quiet: string;
   repo: string;
@@ -215,7 +215,7 @@ export interface TriggerDraft {
 }
 
 export function blankTrigger(): TriggerDraft {
-  return { kind: "note", note: "", quiet: "2", repo: "", branch: "master", ghRepo: "", ghBranch: "", every: "5", name: "" };
+  return { kind: "note", note: null, quiet: "2", repo: "", branch: "master", ghRepo: "", ghBranch: "", every: "5", name: "" };
 }
 
 export function isTrigger(w: When | WhenInput): boolean {
@@ -223,10 +223,10 @@ export function isTrigger(w: When | WhenInput): boolean {
 }
 
 /** The dialog's fields for a stored trigger. */
-export function draftOfTrigger(w: When, base: TriggerDraft, noteTitle: (id: number) => string): TriggerDraft {
+export function draftOfTrigger(w: When, base: TriggerDraft): TriggerDraft {
   switch (w.kind) {
     case "note":
-      return { ...base, kind: "note", note: noteTitle(w.note_id), quiet: String(w.quiet_min) };
+      return { ...base, kind: "note", note: w.note_id, quiet: String(w.quiet_min) };
     case "git":
       return { ...base, kind: "git", repo: w.repo, branch: w.branch };
     case "github":
@@ -241,6 +241,20 @@ export function draftOfTrigger(w: When, base: TriggerDraft, noteTitle: (id: numb
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 
+/** The note picker's entries, newest first: a title, and where titles repeat, its first line
+ * and id, so two notes of one name can be told apart. */
+export function noteOptions(notes: { id: number; title: string; preview?: string; updated_at?: number }[]): { id: number; label: string }[] {
+  const count = new Map<string, number>();
+  for (const n of notes) count.set(n.title.trim().toLowerCase(), (count.get(n.title.trim().toLowerCase()) ?? 0) + 1);
+  return [...notes]
+    .sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0) || b.id - a.id)
+    .map((n) => {
+      const dup = (count.get(n.title.trim().toLowerCase()) ?? 0) > 1;
+      const first = (n.preview ?? "").trim();
+      return { id: n.id, label: dup ? `${n.title} (note ${n.id}${first ? `: ${first.slice(0, 40)}` : ""})` : n.title };
+    });
+}
+
 /** "a few words" -> "a-few-words": a URL trigger's name from its schedule's name. */
 export function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "");
@@ -254,10 +268,9 @@ export function whenOfTrigger(d: TriggerDraft, notes: { id: number; title: strin
   };
   switch (d.kind) {
     case "note": {
-      const t = d.note.trim();
-      if (!t) return { error: "Pick the note to watch" };
-      const n = notes.find((x) => x.title.trim().toLowerCase() === t.toLowerCase());
-      if (!n) return { error: `No note named ${t}` };
+      if (d.note === null) return { error: "Pick the note to watch" };
+      const n = notes.find((x) => x.id === d.note);
+      if (!n) return { error: "That note was deleted: pick another" };
       const quiet = int(d.quiet, 1, 120);
       if (quiet === null) return { error: "Wait 1 to 120 minutes of quiet" };
       return { when: { kind: "note", note_id: n.id, quiet_min: quiet } };
@@ -319,25 +332,49 @@ export function draftOfThen(t: Then | null | undefined): ThenDraft {
 }
 
 /** The steps the fields describe (null: none), or what is wrong with them. */
-export function thenOfDraft(d: ThenDraft): { then: ThenInput | null } | { error: string } {
+/** Stored steps as `schedule.update` takes them, nested ones included. */
+export function thenInputOf(t: Then | null | undefined): ThenInput | null {
+  if (!t) return null;
+  const step = (s: Then["on_success"]) => {
+    if (!s) return null;
+    if (s.notify) return { notify: true as const };
+    const deeper = thenInputOf(s.then);
+    return { agent: s.agent ?? "", prompt: s.prompt, ...(deeper ? { then: deeper } : {}) };
+  };
+  const ok = step(t.on_success);
+  const out: ThenInput = {};
+  if (ok && !("notify" in ok)) out.on_success = ok;
+  const fail = step(t.on_failure);
+  if (fail) out.on_failure = fail;
+  return out.on_success || out.on_failure ? out : null;
+}
+
+/** The steps the fields describe (null: none), or what is wrong with them. The dialog edits one
+ * level; steps nested under a step (made with the API) stay as they are while that step still
+ * asks an agent (`stored`: the steps as stored). */
+export function thenOfDraft(d: ThenDraft, stored?: Then | null): { then: ThenInput | null } | { error: string } {
+  const kept = thenInputOf(stored);
+  const deeper = (s: ThenInput["on_success"] | ThenInput["on_failure"]) =>
+    s && "then" in s && s.then ? { then: s.then } : {};
   const out: ThenInput = {};
   if (d.okAgent) {
     if (!d.okPrompt.trim()) return { error: "Write what to ask when it replies" };
-    out.on_success = { agent: d.okAgent, prompt: d.okPrompt };
+    out.on_success = { agent: d.okAgent, prompt: d.okPrompt, ...deeper(kept?.on_success) };
   }
   if (d.failMode === "notify") out.on_failure = { notify: true };
   if (d.failMode === "ask") {
     if (!d.failAgent) return { error: "Pick the agent to ask when it fails" };
     if (!d.failPrompt.trim()) return { error: "Write what to ask when it fails" };
-    out.on_failure = { agent: d.failAgent, prompt: d.failPrompt };
+    out.on_failure = { agent: d.failAgent, prompt: d.failPrompt, ...deeper(kept?.on_failure) };
   }
   return { then: out.on_success || out.on_failure ? out : null };
 }
 
-/** The steps as stored, in the shape `thenOfDraft` gives (to tell whether Save changes them). */
-export function thenInputOf(t: Then | null | undefined): ThenInput | null {
-  const r = thenOfDraft(draftOfThen(t));
-  return "then" in r ? r.then : null;
+/** How many levels of steps are nested below the first (the dialog edits only the first). */
+export function nestedSteps(t: Then | null | undefined): number {
+  const depth = (x: Then | null | undefined): number =>
+    x ? 1 + Math.max(depth(x.on_success?.then), depth(x.on_failure?.then)) : 0;
+  return Math.max(0, depth(t) - 1);
 }
 
 /** A trigger's watcher, as its row shows it: "gh isn't signed in", a git error, or null. */

@@ -66,6 +66,8 @@ import {
   watchLabel,
   whenOfTrigger,
   withSteps,
+  nestedSteps,
+  noteOptions,
 } from "../schedules.ts";
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
@@ -189,7 +191,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
     s.name,
     s.reading,
     next.text,
-    watch?.text,
+    watch && `${watch.text}: ${watch.tip}`,
     exp,
     last ? `last run ${OUTCOME_LABEL[last.outcome]}` : "no runs yet",
   ].filter(Boolean).join(", ");
@@ -239,6 +241,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
               </span>
             )}
           </span>
+          {watch && watch.tip && <span class="sch-watch-detail">{watch.tip}</span>}
           {exp && (
             <span class="sch-expires">
               {exp} ·{" "}
@@ -445,7 +448,7 @@ function draftOf(s: Schedule | undefined, agent: string, now: number): Draft {
     mode: isTrigger(s.when) ? "event" : "time",
     // A one-off shows at its wall-clock time in the schedule's own zone.
     when: draftOfWhen(s.when, blankWhen(now, s.tz), s.tz),
-    trig: draftOfTrigger(s.when, blankTrigger(), (id) => notes.value.get(id)?.title ?? s.note?.title ?? ""),
+    trig: draftOfTrigger(s.when, blankTrigger()),
     then: draftOfThen(s.then),
     tz: s.tz,
     missed: s.missed,
@@ -505,7 +508,8 @@ export function ScheduleDialog(
   const noteList = [...notes.value.values()];
   const w = event ? whenOfTrigger(d.trig, noteList) : whenOfDraft(d.when);
   const whenKey = "when" in w ? JSON.stringify(w.when) : "";
-  const steps = thenOfDraft(d.then);
+  const steps = thenOfDraft(d.then, sched?.then);
+  const stepAgentNames = [d.then.okAgent, d.then.failMode === "ask" ? d.then.failAgent : ""].filter(Boolean);
   const quietOn = d.quiet ?? preview?.quiet_hours_default ?? subClaude;
   const cap = parseCap(d.cap);
   const settings = scheduleSettings.value;
@@ -534,6 +538,7 @@ export function ScheduleDialog(
         quiet_hours: d.quiet ?? undefined,
         agent: d.agent || undefined,
         id: sched && isTrigger(w.when) ? sched.id : undefined,
+        then_agents: stepAgentNames,
       }).then((p) => {
         if (seq.current !== mine) return;
         setPreview(p);
@@ -547,7 +552,7 @@ export function ScheduleDialog(
       });
     }, 250);
     return () => clearTimeout(t);
-  }, [whenKey, d.tz, d.quiet, d.agent, pAgain]);
+  }, [whenKey, d.tz, d.quiet, d.agent, pAgain, stepAgentNames.join("\n")]);
 
   if (editing && !sched) return null;
 
@@ -796,18 +801,18 @@ export function ScheduleDialog(
       case "note":
         return (
           <>
-            <input
-              class="sch-trig-note"
-              list="sch-trig-notes"
-              value={t.note}
-              aria-label="The note to watch"
-              placeholder="A note's title"
-              spellcheck={false}
-              onInput={(e) => setTrig({ note: (e.target as HTMLInputElement).value })}
-            />
-            <datalist id="sch-trig-notes">
-              {noteList.map((n) => <option key={n.id} value={n.title} />)}
-            </datalist>
+            <span class="select-wrap sch-trig-note-wrap">
+              <select
+                class="sch-trig-note"
+                aria-label="The note to watch"
+                value={t.note === null ? "" : String(t.note)}
+                onChange={(e) => setTrig({ note: e.currentTarget.value ? Number(e.currentTarget.value) : null })}
+              >
+                {t.note === null && <option value="">Pick a note</option>}
+                {noteOptions(noteList).map((o) => <option key={o.id} value={String(o.id)}>{o.label}</option>)}
+              </select>
+              <IconChevronDown size={14} />
+            </span>
             <span class="sch-at">after</span>
             {num("sch-trig-quiet", t.quiet, "Minutes of quiet after the last edit", (quiet) => setTrig({ quiet }))}
             <span class="sch-at">minutes of quiet</span>
@@ -1213,6 +1218,14 @@ export function ScheduleDialog(
                     : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 4 hops).</>}
                 </span>
               </span>
+              {nestedSteps(sched?.then) > 0 && (
+                <span class="field-hint sch-hint-wrap">
+                  <span>
+                    Its steps go {nestedSteps(sched?.then) + 1} levels deep (made with the API); the deeper ones stay as
+                    they are while the step above them still asks an agent.
+                  </span>
+                </span>
+              )}
             </fieldset>
           )}
           <label class="toggle">
@@ -1457,13 +1470,14 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
               <span class="field-label">OpenRouter spend</span>
               <div class="sch-spend-today" role="status">
                 {!spend.key_present
-                  ? <span class="muted">No OpenRouter key on this backend: nothing is billed per token.</span>
-                  : spend.today === null
                   ? (
                     <span class="muted">
-                      {spend.error ? `Couldn't read today's spend: ${spend.error}` : "Not read yet today: it is read while an OpenRouter agent works."}
+                      No OpenRouter key on this backend, so spend can't be read: scheduled and triggered work on an
+                      OpenRouter agent still running from before is refused.
                     </span>
                   )
+                  : spend.today === null
+                  ? <span class="muted">{spend.error ? "" : "Not read yet today: it is read while an OpenRouter agent works."}</span>
                   : (
                     <>
                       <span class={cx("sch-spend-num", spend.today >= spend.cap && "over")}>{money(spend.today)}</span>
@@ -1471,6 +1485,15 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
                       {spend.checked_at && <span class="muted"> · read {idleText(Date.now() - spend.checked_at)} ago</span>}
                     </>
                   )}
+                {spend.key_present && spend.error && (
+                  <span class="sch-spend-err">The last reading failed: {spend.error}</span>
+                )}
+                {spend.key_present && (spend.checked_at === null || Date.now() - spend.checked_at > 15 * 60_000) && (
+                  <span class="sch-spend-err">
+                    {spend.checked_at === null ? "No reading yet" : "No reading in the last 15 minutes"}: scheduled and triggered
+                    work on OpenRouter is refused until one succeeds (what you type still goes).
+                  </span>
+                )}
               </div>
               <label class="sch-spend-cap">
                 <span>Daily cap for all OpenRouter agents, in dollars</span>
@@ -1487,7 +1510,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
                   {spend.agents.map((a) => (
                     <label key={a.id} class="sch-spend-agent">
                       <span class="sch-spend-name">{a.name}</span>
-                      <span class="muted sch-spend-spent">{money(a.spent)} today</span>
+                      <span class="muted sch-spend-spent" data-tip="Estimated: what the key spent while this agent was working (shared evenly when several were)">~{money(a.spent)} today (estimated)</span>
                       <input
                         class="sch-spend-input"
                         value={agentCaps[a.name] ?? ""}

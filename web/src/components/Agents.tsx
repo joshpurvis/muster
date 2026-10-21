@@ -238,7 +238,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
             data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
           >
             {billing.label}
-            {spent !== undefined && <span class="or-spent"> · ${spent.toFixed(2)} today</span>}
+            {spent !== undefined && <span class="or-spent" data-tip="Estimated from the key's spend while it worked (OpenRouter's UTC day)"> · ~${spent.toFixed(2)} today (est.)</span>}
           </span>
         )}
       </span>

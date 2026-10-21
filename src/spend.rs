@@ -70,8 +70,10 @@ struct Ledger {
     agents: BTreeMap<i64, f64>,
     /// Dollars spent through the key while no OpenRouter agent of Muster's was working.
     other: f64,
-    /// The key's all-time usage at the last reading.
+    /// The key's all-time usage at the last reading, and the UTC day of that reading: a rise
+    /// across midnight counts toward today only up to the new day's `usage_daily`.
     last_usage: Option<f64>,
+    last_usage_day: String,
     /// Caps already alerted today: "all", or an agent id.
     alerted: BTreeSet<String>,
 }
@@ -85,10 +87,10 @@ struct State {
     fetched_at: Option<i64>,
     /// The last reading failed: why.
     error: Option<String>,
-    /// OpenRouter agents seen working since the last reading.
+    /// OpenRouter agents seen in a turn (or sent an unattended prompt) since the last reading.
     active: BTreeSet<i64>,
-    /// Any was working at the last tick.
-    working: bool,
+    /// OpenRouter agents in a turn now (from session events).
+    working_now: BTreeSet<i64>,
 }
 
 pub struct Spend {
@@ -162,13 +164,16 @@ impl Spend {
         let changed = {
             let mut st = self.state.lock();
             let day = utc_day(now);
-            if st.ledger.day != day {
-                st.ledger = Ledger { day, last_usage: st.ledger.last_usage, ..Default::default() };
-            }
+            Self::roll(&mut st, &day);
             match got {
                 Ok(u) => {
                     if let Some(last) = st.ledger.last_usage {
-                        let delta = u.usage - last;
+                        let mut delta = u.usage - last;
+                        // The previous reading was another day's: only what the key spent today
+                        // (OpenRouter's `usage_daily`) can be today's; the rest was yesterday's.
+                        if st.ledger.last_usage_day != day {
+                            delta = delta.min(u.usage_daily.unwrap_or(0.0).max(0.0));
+                        }
                         if delta > 0.0 {
                             let active: Vec<i64> = std::mem::take(&mut st.active).into_iter().collect();
                             if active.is_empty() {
@@ -181,8 +186,10 @@ impl Spend {
                             }
                         }
                     }
-                    st.active.clear();
+                    // Agents still working stay marked: their turn goes on into the next reading.
+                    st.active = st.working_now.clone();
                     st.ledger.last_usage = Some(u.usage);
+                    st.ledger.last_usage_day = day.clone();
                     let sum: f64 = st.ledger.agents.values().sum::<f64>() + st.ledger.other;
                     st.today = Some(u.usage_daily.unwrap_or(sum));
                     st.fetched_at = Some(now);
@@ -204,28 +211,45 @@ impl Spend {
         }
     }
 
-    /// Refresh when the last reading is older than `FRESH_MS`.
+    /// A new UTC day: today's totals start at zero (the last reading stays, as yesterday's).
+    fn roll(st: &mut State, day: &str) {
+        if st.ledger.day != day {
+            st.ledger = Ledger {
+                day: day.to_string(),
+                last_usage: st.ledger.last_usage,
+                last_usage_day: std::mem::take(&mut st.ledger.last_usage_day),
+                ..Default::default()
+            };
+            st.today = None;
+        }
+    }
+
+    /// Refresh when the last reading is older than `FRESH_MS` or from another UTC day.
     pub async fn ensure_fresh(&self, hub: &Hub) {
-        let stale = self.state.lock().fetched_at.is_none_or(|t| self.now() - t >= FRESH_MS);
+        let now = self.now();
+        let stale = self.state.lock().fetched_at.is_none_or(|t| now - t >= FRESH_MS || utc_day(t) != utc_day(now));
         if stale {
             self.refresh(hub).await;
         }
     }
 
     /// May an unattended message go to OpenRouter agent `agent` now? `Err(reason)` at a cap
-    /// (alerting once per cap per day) or when spend can't be read.
+    /// (alerting once per cap per day), or when today's spend can't be read: no key in this
+    /// backend (an OpenRouter process from an earlier one may still be running with its own), no
+    /// reading yet, or none in the last 15 minutes or of today.
     pub fn check(&self, hub: &Hub, agent: &Agent, settings: &crate::schedules::Settings) -> Result<(), String> {
         if !self.key_present() {
-            return Ok(()); // It can't run on OpenRouter at all; its start says why.
+            return Err(
+                "budget: this backend has no OpenRouter key, so it can't read today's spend; unattended work on OpenRouter \
+                 is refused until it has one (`env OPENROUTER_API_KEY=… muster reload`)"
+                    .into(),
+            );
         }
         let now = self.now();
         let mut st = self.state.lock();
         let day = utc_day(now);
-        if st.ledger.day != day {
-            st.ledger = Ledger { day, last_usage: st.ledger.last_usage, ..Default::default() };
-            st.today = None;
-        }
-        let fresh = st.fetched_at.is_some_and(|t| now - t < STALE_MS && utc_day(t) == utc_day(now));
+        Self::roll(&mut st, &day);
+        let fresh = st.fetched_at.is_some_and(|t| now - t < STALE_MS && utc_day(t) == day);
         if !fresh {
             let why = st.error.clone().unwrap_or_else(|| "no reading yet".into());
             return Err(format!(
@@ -292,34 +316,66 @@ impl Spend {
 
     /// One tick of the sampler: note which OpenRouter agents work, and read the key while they
     /// do (and once when they stop).
+    /// A session changed (every state change is an event, so a turn of any length is seen at
+    /// its start): an OpenRouter agent in a turn is marked active until the reading after it.
+    /// Returns whether the key should be read now: the last OpenRouter turn just ended.
+    pub fn observe(&self, hub: &Hub, info: &SessionInfo) -> bool {
+        let Some(agent) = hub.agents().by_session(info.id) else { return false };
+        let turn = info.provider == Provider::OpenRouter
+            && matches!(info.state, AgentState::Working | AgentState::Starting | AgentState::Stuck);
+        let mut st = self.state.lock();
+        let was = !st.working_now.is_empty();
+        if turn {
+            st.working_now.insert(agent.id);
+            st.active.insert(agent.id);
+        } else {
+            st.working_now.remove(&agent.id);
+        }
+        was && st.working_now.is_empty()
+    }
+
+    /// A unattended prompt was submitted to OpenRouter agent `agent` (the injector): its turn
+    /// starts now, whatever the screen shows yet.
+    pub fn note_submitted(&self, agent: i64) {
+        let mut st = self.state.lock();
+        st.active.insert(agent);
+    }
+
+    /// The periodic part: while an OpenRouter agent works or has prompts waiting, read the key
+    /// at most every minute (so queued unattended prompts are judged on a fresh reading).
     async fn tick(&self, hub: &Hub) {
         if !self.key_present() {
             return;
         }
-        let working: Vec<i64> = hub
-            .agents()
-            .list()
-            .into_iter()
-            .filter(|a| {
-                a.session_id.and_then(|s| hub.session(s)).is_some_and(|s| {
-                    s.provider == Provider::OpenRouter
-                        && matches!(s.state, AgentState::Working | AgentState::Starting | AgentState::Stuck)
-                })
+        let waiting = hub.agents().list().into_iter().any(|a| {
+            a.session_id.and_then(|s| hub.session(s)).is_some_and(|s| {
+                s.provider == Provider::OpenRouter
+                    && s.state != AgentState::Exited
+                    && (s.queued > 0 || matches!(s.state, AgentState::Working | AgentState::Starting | AgentState::Stuck))
             })
-            .map(|a| a.id)
-            .collect();
-        let due = {
-            let mut st = self.state.lock();
-            let was = st.working;
-            st.working = !working.is_empty();
-            st.active.extend(working.iter().copied());
-            let since = st.fetched_at.map_or(i64::MAX, |t| self.now() - t);
-            (st.working && since >= SAMPLE_MS) || (was && !st.working)
-        };
+        });
+        let due = waiting && self.state.lock().fetched_at.is_none_or(|t| self.now() - t >= SAMPLE_MS);
         if due {
             self.refresh(hub).await;
         }
     }
+}
+
+/// May the injector submit this prompt now? For a message on an unattended chain (any origin but
+/// the human's) to a session billing OpenRouter, the spend caps are checked again right before
+/// it is typed and before Enter: a prompt queued before the cap (or before the reading went stale)
+/// is taken back. `Some(reason)`: don't submit.
+pub fn submit_gate(hub: &Hub, session: SessionId, source: &crate::agents::Source) -> Option<String> {
+    let crate::agents::Source::Chain(p) = source else { return None };
+    if p.origin == Origin::Human {
+        return None;
+    }
+    let info = hub.session(session)?;
+    let agent = hub.agents().by_session(session)?;
+    if info.provider != Provider::OpenRouter && !bills_openrouter(hub, &agent) {
+        return None;
+    }
+    hub.spend.check(hub, &agent, &hub.schedules.settings()).err()
 }
 
 /// Does `agent` bill OpenRouter: its record, or its running process (a switch applies from the
@@ -337,15 +393,44 @@ pub fn applies(hub: &Hub, agent: &Agent, origin: Origin) -> bool {
     origin != Origin::Human && bills_openrouter(hub, agent)
 }
 
+/// The injector took back a prompt `submit_gate` refused: a schedule's or trigger's run ends
+/// refused (`budget: …`); any other message (an agent's ask on an unattended chain) is recorded as
+/// refused, so it counts toward no cap and its log entry says why.
+pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, why: String) {
+    let crate::agents::Source::Chain(p) = source else { return };
+    let Some(msg) = p.msg_id else { return };
+    let from = hub.store().agent_message(msg).ok().flatten().map(|m| m.from).unwrap_or_default();
+    if crate::schedules::is_run_sender(&from) {
+        crate::schedules::not_submitted(hub, source, crate::schedules::plan::Action::Refuse(why));
+        return;
+    }
+    match hub.store().set_agent_message_refused(msg, &why) {
+        Ok(()) => crate::agents::publish_message(hub, msg),
+        Err(e) => tracing::warn!(msg, "recording a budget refusal: {e:#}"),
+    }
+}
+
 /// The sampler (daemon start).
 pub fn spawn(hub: Arc<Hub>) {
     tokio::spawn(async move {
+        let mut rx = hub.subscribe();
+        let mut every = tokio::time::interval(TICK);
         loop {
-            tokio::time::sleep(TICK).await;
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Ok(crate::hub::ServerEvent::SessionUpserted(info)) => {
+                        if hub.spend.key_present() && hub.spend.observe(&hub, &info) {
+                            hub.spend.refresh(&hub).await;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return,
+                },
+                _ = every.tick() => hub.spend.tick(&hub).await,
+            }
             if hub.is_shutting_down() {
                 return;
             }
-            hub.spend.tick(&hub).await;
         }
     });
 }

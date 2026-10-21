@@ -4837,7 +4837,6 @@ body.dragging .panel-view { pointer-events: none; }
   flex: 0 1 300px;
 }
 
-.field .sch-trig-note,
 .field .sch-trig-repo,
 .field .sch-trig-gh {
   flex: 1 1 180px;
@@ -4914,6 +4913,25 @@ fieldset.sch-then > legend {
 
 .sch-chip.sch-watch {
   cursor: help;
+}
+
+.sch-watch-detail {
+  display: block;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--st-error);
+  white-space: normal;
+}
+
+.sch-spend-err {
+  display: block;
+  margin-top: 2px;
+  color: var(--st-attn);
+}
+
+.sch-trig-note-wrap {
+  flex: 1 1 200px;
+  min-width: 160px;
 }
 
 .sch-run.sch-run-step {

@@ -1146,9 +1146,12 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                         /// The schedule being edited (a URL trigger keeps its own name).
                         #[serde(default)]
                         id: Option<i64>,
+                        /// The "Then…" steps' agents (their rules show in the preview too).
+                        #[serde(default)]
+                        then_agents: Vec<String>,
                     }
                     let p: P = parse(params)?;
-                    Ok(crate::schedules::preview(hub, &p.when, p.tz.as_deref(), p.quiet_hours, p.agent.as_deref(), p.id)?)
+                    Ok(crate::schedules::preview(hub, &p.when, p.tz.as_deref(), p.quiet_hours, p.agent.as_deref(), p.id, &p.then_agents)?)
                 }
                 "trigger.fire" => {
                     #[derive(Deserialize)]

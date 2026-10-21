@@ -37,6 +37,8 @@ import {
   watchLabel,
   whenOfTrigger,
   withSteps,
+  nestedSteps,
+  noteOptions,
 } from "./schedules.ts";
 import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
 
@@ -348,9 +350,16 @@ Deno.test("Save sends only what changed", () => {
 
 Deno.test("trigger fields: each kind, checked", () => {
   const notes = [{ id: 4, title: "Ideas" }];
-  const t = { ...blankTrigger(), note: "ideas" };
-  eq(whenOfTrigger(t, notes), { when: { kind: "note", note_id: 4, quiet_min: 2 } }, "a note by its title, any case");
-  eq("error" in whenOfTrigger({ ...t, note: "Nope" }, notes), true);
+  const t = { ...blankTrigger(), note: 4 };
+  eq(whenOfTrigger(t, notes), { when: { kind: "note", note_id: 4, quiet_min: 2 } }, "a note by its id");
+  // Two notes of one name are told apart in the picker.
+  eq(noteOptions([{ id: 1, title: "Ideas", preview: "old list", updated_at: 1 }, { id: 2, title: "ideas", preview: "", updated_at: 2 },
+    { id: 3, title: "Plan", updated_at: 0 }]), [
+    { id: 2, label: "ideas (note 2)" },
+    { id: 1, label: "Ideas (note 1: old list)" },
+    { id: 3, label: "Plan" },
+  ]);
+  eq("error" in whenOfTrigger({ ...t, note: 99 }, notes), true);
   eq("error" in whenOfTrigger({ ...t, quiet: "0" }, notes), true);
   eq(whenOfTrigger({ ...t, kind: "git", repo: " ~/x ", branch: "master" }, notes), {
     when: { kind: "git", repo: "~/x", branch: "master" },
@@ -367,9 +376,9 @@ Deno.test("trigger fields: each kind, checked", () => {
   eq("error" in whenOfTrigger({ ...t, kind: "url", name: "has space" }, notes), true);
   eq(slug("Deploy finished!  (prod)"), "deploy-finished-prod");
   // A stored trigger fills the fields back.
-  const back = draftOfTrigger({ kind: "github", repo: "o/r", event: "ci_failed", branch: null, every_min: 7 }, blankTrigger(), () => "");
+  const back = draftOfTrigger({ kind: "github", repo: "o/r", event: "ci_failed", branch: null, every_min: 7 }, blankTrigger());
   eq([back.kind, back.ghRepo, back.ghBranch, back.every], ["ci_failed", "o/r", "", "7"]);
-  eq(draftOfTrigger({ kind: "note", note_id: 4, quiet_min: 3 }, blankTrigger(), () => "Ideas").note, "Ideas");
+  eq(draftOfTrigger({ kind: "note", note_id: 4, quiet_min: 3 }, blankTrigger()).note, 4);
   eq(isTrigger({ kind: "url", name: "x" }), true);
   eq(isTrigger({ kind: "cron", cron: "* * * * *" }), false);
 });
@@ -410,6 +419,19 @@ Deno.test("Then… steps: drafts and what is sent", () => {
     "the same steps send nothing",
   );
   eq(schedulePatch(before, { ...fields, then: null }), { then: null });
+  // A→B→C made with the API: editing B's prompt in the dialog keeps C.
+  const deep = {
+    on_success: {
+      notify: false, agent: "b", agent_id: 2, prompt: "B {reply}",
+      then: { on_success: { notify: false, agent: "c", agent_id: 3, prompt: "C {reply}", then: null }, on_failure: null },
+    },
+    on_failure: null,
+  };
+  eq(nestedSteps(deep), 1);
+  const edited = thenOfDraft({ ...draftOfThen(deep), okPrompt: "B again: {reply}" }, deep);
+  eq(edited, { then: { on_success: { agent: "b", prompt: "B again: {reply}", then: { on_success: { agent: "c", prompt: "C {reply}" } } } } });
+  eq(schedulePatch(sched({ then: deep }), { ...fields, then: (thenOfDraft(draftOfThen(deep), deep) as { then: any }).then }), {},
+    "unedited deep steps send nothing");
 });
 
 Deno.test("a trigger's row and its runs", () => {

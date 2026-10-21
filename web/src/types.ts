@@ -303,8 +303,8 @@ export interface Then {
 }
 /** What `schedule.create` / `.update` take as `then` (agents by name). */
 export interface ThenInput {
-  on_success?: { agent: string; prompt: string } | null;
-  on_failure?: { notify: true } | { agent: string; prompt: string } | null;
+  on_success?: { agent: string; prompt: string; then?: ThenInput } | null;
+  on_failure?: { notify: true } | { agent: string; prompt: string; then?: ThenInput } | null;
 }
 /** An event a trigger holds for its next run (or recorded with a triggered run). */
 export interface TriggerEvent {

@@ -1407,7 +1407,7 @@ cat '${BASE}/gh-body.json'
   ok(hAdd.ok && hAdd.out.includes("When a pull request is opened on octo/repo"), `muster schedule add --on gh: (${hAdd.out.trim()}${hAdd.err})`);
   const ghTrig = idOf(hAdd.out);
   await until("the first GitHub poll", async () => (await sched(ghTrig)).watch?.state === "ok");
-  ok((await Deno.readTextFile(`${BASE}/gh-args`)).includes("repos/octo/repo/pulls?state=open"), "polled with gh api");
+  ok((await Deno.readTextFile(`${BASE}/gh-args`)).includes("repos/octo/repo/pulls?state=all"), "polled with gh api");
   ok((await runs(ghTrig)).length === 0, "the first poll is a baseline");
   await Deno.writeTextFile(`${BASE}/gh-body.json`, JSON.stringify([
     { number: 2, title: "Add the thing", user: { login: "bob" }, html_url: "https://github.com/octo/repo/pull/2" },

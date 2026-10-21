@@ -200,6 +200,11 @@ pub struct WatchState {
     /// look only records it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_id: Option<u64>,
+    /// GitHub CI: the failed runs already seen, as `<run id>.<attempt>` (the latest
+    /// `triggers::SEEN_KEEP`), so a run that fails after a newer one did, or fails again on a
+    /// re-run, is still noticed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seen: Vec<String>,
 }
 
 /// "If missed": what a slot missed while Muster was off or asleep does.
@@ -882,13 +887,19 @@ impl WhenInput {
                 let id = match (note_id, note.as_deref().map(str::trim).filter(|t| !t.is_empty())) {
                     (Some(id), _) => *id,
                     (None, Some(t)) => {
-                        let found = crate::notes::list(hub)?.into_iter().find(|n| n.title.eq_ignore_ascii_case(t)).map(|n| n.id);
-                        match found {
-                            Some(id) => id,
-                            None => match t.parse::<NoteId>() {
+                        let found: Vec<NoteId> =
+                            crate::notes::list(hub)?.into_iter().filter(|n| n.title.eq_ignore_ascii_case(t)).map(|n| n.id).collect();
+                        match found.as_slice() {
+                            [id] => *id,
+                            [] => match t.parse::<NoteId>() {
                                 Ok(id) => id,
                                 Err(_) => anyhow::bail!("no note named “{t}” (a note trigger watches an existing note)"),
                             },
+                            many => anyhow::bail!(
+                                "{} notes are named “{t}” (ids {}): give the one to watch by its id (note_id)",
+                                many.len(),
+                                many.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                            ),
                         }
                     }
                     (None, None) => anyhow::bail!("a note trigger needs the note (note_id, or its title as note)"),
@@ -1124,8 +1135,15 @@ fn resolve_note(hub: &Hub, choice: &NoteChoice) -> anyhow::Result<NoteId> {
         NoteChoice::Title { title } => {
             let t = title.trim();
             ensure!(!t.is_empty(), "give the note a title");
-            if let Some(n) = crate::notes::list(hub)?.into_iter().find(|n| n.title.eq_ignore_ascii_case(t)) {
-                return Ok(n.id);
+            let found: Vec<NoteId> = crate::notes::list(hub)?.into_iter().filter(|n| n.title.eq_ignore_ascii_case(t)).map(|n| n.id).collect();
+            match found.as_slice() {
+                [id] => return Ok(*id),
+                [] => {}
+                many => anyhow::bail!(
+                    "{} notes are named “{t}” (ids {}): pick the one for the replies by its id",
+                    many.len(),
+                    many.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                ),
             }
             Ok(crate::notes::create(hub, Some(t), "", NoteAuthor::human(), None, None)?.id)
         }
@@ -1405,8 +1423,18 @@ pub fn runs(hub: &Hub, id: i64, before: Option<i64>, limit: Option<usize>) -> an
     Ok(json!({ "runs": rs.iter().map(|r| run_json(hub, r)).collect::<Vec<_>>(), "more": more }))
 }
 
+/// The preview's facts: its agent and its "Then…" steps' agents (a Claude subscription agent
+/// anywhere brings quiet hours by default and the 7-day expiry, as `facts_for` does once saved).
+fn preview_facts(hub: &Hub, agent: Option<&Agent>, then_agents: &[String]) -> Facts {
+    let mut f = agent.map(|a| facts(hub, a)).unwrap_or_default();
+    if !f.subscription_claude {
+        f.subscription_claude = then_agents.iter().filter_map(|n| hub.agents().get(n)).any(|a| facts(hub, &a).subscription_claude);
+    }
+    f
+}
+
 /// `schedule.preview`: the reading and the next runs of `when`, without saving anything.
-pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>, own: Option<i64>) -> anyhow::Result<Value> {
+pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Option<bool>, agent: Option<&str>, own: Option<i64>, then_agents: &[String]) -> anyhow::Result<Value> {
     let tz = tz.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(cron::local_zone_name);
     let when = &when.resolve_in(hub, &tz, own)?;
     if when.is_trigger() {
@@ -1414,7 +1442,7 @@ pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Optio
             Some(n) => Some(hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?),
             None => None,
         };
-        let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
+        let f = preview_facts(hub, agent.as_ref(), then_agents);
         let note_off = match when {
             When::Note { note_id, .. } => hub.store().load_note(*note_id).ok().flatten().is_some_and(|n| !n.triggers),
             _ => false,
@@ -1453,7 +1481,7 @@ pub fn preview(hub: &Hub, when: &WhenInput, tz: Option<&str>, quiet_hours: Optio
         Some(n) => Some(hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?),
         None => None,
     };
-    let f = agent.as_ref().map(|a| facts(hub, a)).unwrap_or_default();
+    let f = preview_facts(hub, agent.as_ref(), then_agents);
     let quiet_on = quiet_hours.unwrap_or(f.subscription_claude);
     let quiet = quiet_of(&hub.schedules.settings());
     let probe = Schedule { when: when.clone(), tz: tz.clone(), ..Default::default() };
@@ -1615,6 +1643,12 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
         if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts_for(hub, &agent, &s), today, since) {
             return Some(a);
         }
+        // A note trigger's prompt goes only while its note still allows triggers.
+        if r.kind == RunKind::Triggered
+            && let Some(a) = triggers::note_flag(hub, &s)
+        {
+            return Some(a);
+        }
     }
     // Recorded at the last check, right before Enter, for timed runs (Run now is the human's).
     if commit
@@ -1628,6 +1662,11 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
         tracing::warn!(schedule = s.id, "recording when its prompt went out: {e:#}");
     }
     None
+}
+
+/// Is `from` a schedule's, trigger's or "Then…" step's sender?
+pub fn is_run_sender(from: &str) -> bool {
+    run::parse_sender(from).is_some()
 }
 
 /// The injector took a schedule's prompt back without submitting it (`submit_gate` said no).

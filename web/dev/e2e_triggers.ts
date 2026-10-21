@@ -79,7 +79,7 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   const opts: string[] = await a.eval(`[...document.querySelectorAll('.sch-agent option')].map((o) => o.value + ':' + (o.disabled ? 'off' : 'on'))`);
   check(opts.includes("worker:on") && opts.includes("digest:off"), `agents need the webhook origin: ${opts}`);
   check(await a.eval(`!document.querySelector('.sch-dlg [aria-label="If missed (Muster was off or asleep)"]')`), "no If missed for a trigger");
-  await setValue(".sch-trig-note", "Ideas");
+  await setValue(".sch-trig-note", String(noteId), "change");
   await a.wait(`document.querySelector('.sch-reading')?.textContent.includes('“Ideas” changes (after 2 minutes of quiet)')`, 3000);
   await a.wait(`!!document.querySelector('.sch-trig-off')`, 2000);
   await a.click(".sch-prompt");

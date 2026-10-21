@@ -509,7 +509,8 @@ Store migration v19 adds `schedules` and `schedule_runs`.
 Code: `src/schedules/triggers.rs`, `src/schedules/run.rs` (steps), `src/spend.rs`.
 
 ```ts
-// More kinds of `When` (and of `WhenInput`, which may name a note by title: {kind:"note", note:"Ideas"}).
+// More kinds of `When` (and of `WhenInput`, which may name a note by title: {kind:"note", note:"Ideas"};
+// a title several notes share is refused: give note_id, as the dialog does).
 type TriggerWhen =
   | { kind: "note"; note_id: number; quiet_min: number /* 1..120, default 2 */ }
   | { kind: "git"; repo: string /* absolute, resolved */; branch: string }
@@ -530,7 +531,7 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 | Method | Params | Result |
 |---|---|---|
 | `schedule.create` / `.update` | also `when: TriggerWhen`, `then: {on_success?: {agent, prompt}, on_failure?: {notify: true} \| {agent, prompt}} \| null` (steps may nest `then`, at most 4 levels) | `Schedule`. A trigger needs an agent that accepts `webhook` (a step's agent the schedule's origin); `daily_cap` defaults to 10 for a trigger. A URL trigger gets a secret. |
-| `schedule.preview` | also `id` (the schedule being edited) | For a trigger: `{reading, trigger: true, next: [], note_triggers_off, daily_cap_default, expires, …}` |
+| `schedule.preview` | also `id` (the schedule being edited) and `then_agents` (the steps' agents) | For a trigger: `{reading, trigger: true, next: [], note_triggers_off, daily_cap_default, expires, …}` |
 | `schedule.settings.set` | also `spend_cap` (dollars, 0.01..1000; it can't be cleared) and `agent_spend_caps: {name: dollars \| null}` | `ScheduleSettings`. `schedule.settings.get` also reads the key again when the last reading is over a minute old (a `schedule_settings` event follows). |
 | `trigger.fire` | `{name, payload?}` | `{queued, trigger, runs_at}`. `muster trigger`: the human's client, no secret. |
 | `trigger.secret` | `{id} \| {name}, rotate?` | `{name, url, secret, curl}`. `rotate`: a new secret; the old one stops working. |
@@ -552,8 +553,9 @@ kind `triggered`, origin `webhook`, sender `trigger:<id>`, at hop 0. So pause, P
 7-day expiry (a trigger with a Claude subscription agent anywhere in it), quiet hours (checked
 when it runs), the daily caps, the busy rule, alerts, the reply note and cold-start recording all
 apply as for a timed run; a paused or expired trigger drops its events (recorded once). Never
-sooner than 15 minutes after its last run: an event in that time waits for it. An event while
-its previous run is still going waits a minute at a time. The prompt's `{event}` is what
+sooner than 15 minutes after its last run (its slot, and when its prompt was really submitted):
+an event in that time stays held until then, never spent on a run the floor would skip. An event
+while its previous run is still going waits a minute at a time. The prompt's `{event}` is what
 happened and `{payload}` the data sent, each quoted line by line under a label saying it comes
 from outside Muster and is data, not instructions (cut to 8 KiB and 16 KiB); a prompt that uses
 neither gets them added at its end. Placeholders are filled in one pass, so nothing put in is read
@@ -565,20 +567,31 @@ for placeholders again. Run now on a trigger runs it without an event. Skip next
   that never count: by the trigger's own agent, by any session whose provenance is a scheduled or
   triggered chain (every run a trigger started is one), and Muster's own append of a run's reply.
   Debounced: the run is `quiet_min` minutes after the last counting edit. At most 10 runs a day
-  across the triggers on one note (`refused: daily cap …`); switching "Allow triggers" off drops
-  any event waiting on it, and a due run of a note whose switch is off is skipped.
+  across the triggers on one note (`refused: daily cap …`), counted from runs claimed (going or
+  sent), under the lock every claim takes, so triggers due together can't pass it. Switching
+  "Allow triggers" off drops any event waiting on it and takes back its prompts still waiting in
+  an agent's queue; the switch is checked again when a run is claimed, before it is sent and right
+  before its prompt is typed and submitted (off: `skipped`).
 - **Git**: the branch's commit is read from the repository's ref files (`refs/heads/<branch>`,
   else `packed-refs`; git itself only for a reftable repository) every 15 s while the trigger is
   active; no hook is installed. The first look records it; a change holds an event with the
   subjects of up to 10 new commits (`git log old..new`), or says it was rewound. The commit last
   seen is kept with the schedule, so a move while Muster was off fires once after it starts.
-- **GitHub**: `gh api repos/<repo>/pulls?state=open…` (PR opened) or
-  `…/actions/runs?status=failure[&branch=…]` (CI failed) through the safe runner of src/pr.rs,
-  with the owner's own `gh` login (Muster never sees or stores a token), every `every_min`
-  minutes while active. The first poll records the newest PR number or run id; later ones hold
-  an event for each newer one (number, author, title, URL; workflow, branch, conclusion). A
+- **GitHub**: `gh api repos/<repo>/pulls?state=all&sort=created…` (PR opened: every state, so a
+  PR opened and closed or merged between polls, or while Muster was off, still counts; the newest
+  50) or `…/actions/runs?status=failure[&branch=…]` (CI failed) through the safe runner of
+  src/pr.rs, with the owner's own `gh` login (Muster never sees or stores a token), every
+  `every_min` minutes while active. The first poll records what is there. Then a PR number above
+  the highest seen is new, and a failed run (id and attempt, the latest 200 remembered) not seen
+  before is new, whatever its id: runs are listed by when they started, so one can fail after a
+  newer one did, and a re-run keeps its id
+  ([workflow runs](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository)).
+  An event names number, author, title and URL, or workflow, branch, conclusion and URL. A
   failure backs off (the interval doubling, at most an hour) and shows in `watch`:
   `gh_not_signed_in` (run `gh auth login`), `gh_missing`, or `error` with the detail.
+
+A git or GitHub watcher saves what it has seen and the event it found in one write, so a crash
+can't keep the one and lose the other.
 - **URL**: `trigger.fire` or the trigger URL hold an event at once.
 
 What it costs while idle: a note or URL trigger nothing at all; a git trigger a stat and a small
@@ -592,23 +605,35 @@ nothing. A notify step is a notice and a desktop notification. An ask step is a 
 run it follows (`reply_to` that run's message; sender `<schedule's sender>/then:<run id>`), so
 the 4-hop limit bounds a chain and every delivery rule applies to it; the schedule's own daily cap
 and 15-minute floor don't count steps. Its prompt may use `{reply}` (the previous reply, quoted as
-earlier output), `{outcome}` (`replied`, `blocked: …`) and `{event}`. A step's reply doesn't go to
-the schedule's note, and the row's `last_run` is the schedule's own run. Steps don't hold back the
-schedule's next run.
+earlier output), `{outcome}` (`replied`, `blocked`, …, followed by the reason quoted as data: it
+can come from the agent's screen) and `{event}`. A step's reply doesn't go to the schedule's note,
+and the row's `last_run` is the schedule's own run. Steps don't hold back the schedule's next run.
+A run's end and the step it starts are saved in one transaction (a restart in between can't lose
+the step; a run's step is recorded once), including a run refused as it is claimed (a daily cap),
+which takes its failure branch like any failure. A step's agent and prompt are read together from
+the schedule as it is when the step runs; a step changed or removed meanwhile fails with that
+reason. `schedule.preview` takes `then_agents` (names) so a step's Claude subscription agent shows
+its rules (quiet hours by default, the 7-day expiry) before saving.
 
 **Spend cap.** For agents on OpenRouter (their record, or their running process), an overall
 daily cap (`spend_cap`, default $5, always on) and optional per-agent caps. At a cap, every
 message to such an agent whose origin isn't the human's (scheduled, triggered, or an agent's ask on
 such a chain) is refused `budget: …` (checked in `agents::precheck` before anything is started,
-and again in `deliver`), with one alert per cap per day; a run already going finishes, and what the
-human types is never blocked. Spent is read from OpenRouter's `GET /api/v1/key` with the daemon's
-own key (passed to curl as a config on its stdin, never in an argument, the environment, a log or a
-reply): `usage_daily` (OpenRouter's UTC day) for the overall cap; per agent, each rise in `usage`
-between two readings goes to the OpenRouter agents seen working in between (split evenly), or to
-`other` when none was. The key is read while an OpenRouter agent works (at most every minute, and
-once when they all stop), before an unattended message when the last reading is over a minute old,
-and when the settings are read; never while they are idle. With no reading in the last 15 minutes
-(OpenRouter unreachable), unattended work on OpenRouter is refused too. Kept in `runtime_state`
+again in `deliver`, and by the injector right before such a prompt is typed and again before Enter,
+so one queued before the cap was reached is taken back: a schedule's run ends `refused`, any other
+message is recorded refused), with one alert per cap per day; a run already going finishes, and
+what the human types is never blocked. Spent is read from OpenRouter's `GET /api/v1/key` with the
+daemon's own key (passed to curl as a config on its stdin, never in an argument, the environment,
+a log or a reply): `usage_daily` (OpenRouter's UTC day) for the overall cap; per agent (an
+estimate), each rise in `usage` between two readings goes to the OpenRouter agents that were in a
+turn in between (from every session state change and every prompt submitted, so no turn is too
+short to see; split evenly when several were), or to `other` when none was. A rise across 00:00 UTC
+counts toward the new day only up to its `usage_daily`. The key is read while an OpenRouter agent
+works or has prompts waiting (at most every minute, and once when the last turn ends), before an
+unattended message when the last reading is over a minute old or from another UTC day, and when
+the settings are read; never while they are idle. With no reading of today in the last 15 minutes
+(OpenRouter unreachable), or no key in this backend at all (an OpenRouter agent from an earlier
+backend can still be running with its own), unattended work on OpenRouter is refused too. Kept in `runtime_state`
 `openrouter-spend`. Why this source: it is what OpenRouter bills (cache discounts, reasoning
 tokens and the provider it routed to included), for every request through the key; the CLIs don't
 report OpenRouter's price, and the per-generation stats endpoint

@@ -905,6 +905,12 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         crate::schedules::not_submitted(hub, &item.source, no);
         return Ok(true);
     }
+    // Unattended work for an OpenRouter session past a spend cap (or with today's spend
+    // unknown) is taken back too, whoever queued it (src/spend.rs).
+    if let Some(why) = crate::spend::submit_gate(hub, id, &item.source) {
+        crate::spend::not_submitted(hub, &item.source, why);
+        return Ok(true);
+    }
 
     // 1. Leftover text in the input box. Clear it if muster put it there (Claude restores an
     //    interrupted prompt) or on interrupt-mode sends; otherwise it's the human's draft:
@@ -980,6 +986,17 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
             crate::schedules::not_submitted(hub, &item.source, no);
             return Ok(true);
+        }
+        if let Some(why) = crate::spend::submit_gate(hub, id, &item.source) {
+            if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
+            crate::spend::not_submitted(hub, &item.source, why);
+            return Ok(true);
+        }
+        // Its turn is OpenRouter spend from now on, even before the screen shows it working.
+        if let Some(a) = hub.agents().by_session(id)
+            && hub.session(id).is_some_and(|s| s.provider == crate::openrouter::Provider::OpenRouter)
+        {
+            hub.spend.note_submitted(a.id);
         }
         // The prompt runs from here on: the session now handles a message from `source`.
         let now = crate::model::now_ms();

@@ -1186,6 +1186,13 @@ impl Store {
             params![id, idle_ms])? == 1)
     }
 
+    /// A message taken back before it was submitted (the spend caps): kept in the log with the
+    /// reason, counted toward no cap.
+    pub fn set_agent_message_refused(&self, id: i64, why: &str) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE agent_messages SET refused=?2 WHERE id=?1 AND reply IS NULL", params![id, why])?;
+        Ok(())
+    }
+
     pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agent_messages SET reply = ?2, replied_at = ?3 WHERE id = ?1",
@@ -1285,16 +1292,68 @@ impl Store {
     /// that slot already has a run (claimed before a crash or a clock change): nothing is
     /// recorded, only the schedule is saved.
     pub fn claim_run(&self, s: &crate::schedules::Schedule, run: &crate::schedules::Run) -> anyhow::Result<Option<i64>> {
+        Ok(self.claim_run_with_child(s, run, None)?.map(|(id, _)| id))
+    }
+
+    /// `claim_run`, and for a run that ends as it is claimed (a refusal), the "Then…" step it
+    /// starts (`child`, its `parent` set to the new run), in the same transaction. Returns the
+    /// run's id and the step's.
+    pub fn claim_run_with_child(&self, s: &crate::schedules::Schedule, run: &crate::schedules::Run,
+        child: Option<&crate::schedules::Run>) -> anyhow::Result<Option<(i64, Option<i64>)>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let n = Self::insert_run_on(&tx, run, "INSERT OR IGNORE")?;
         let id = (n == 1).then(|| tx.last_insert_rowid());
         Self::save_schedule_on(&tx, s)?;
-        if id.is_some() {
+        let mut child_id = None;
+        if let Some(id) = id {
+            if let Some(c) = child {
+                Self::insert_run_on(&tx, &crate::schedules::Run { parent: Some(id), ..c.clone() }, "INSERT")?;
+                child_id = Some(tx.last_insert_rowid());
+            }
             Self::prune_runs_on(&tx, run.schedule_id, crate::schedules::RUNS_KEEP)?;
         }
         tx.commit()?;
-        Ok(id)
+        Ok(id.map(|id| (id, child_id)))
+    }
+
+    /// Record how run `run` ended and the "Then…" step it starts, together (a restart in between
+    /// can't lose the step: a pending step is picked up like any pending run). A run's step is
+    /// recorded once, however often its end is. Returns the step's id.
+    pub fn finish_run_with_child(&self, run: &crate::schedules::Run, child: Option<&crate::schedules::Run>) -> anyhow::Result<Option<i64>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE schedule_runs SET msg_id = ?2, outcome = ?3, reason = ?4, finished_at = ?5, agent_id = ?6 WHERE id = ?1",
+            params![run.id, run.msg_id, run.outcome.as_str(), run.reason, run.finished_at, run.agent_id],
+        )?;
+        let mut child_id = None;
+        if let Some(c) = child {
+            let had: i64 = tx.query_row("SELECT COUNT(*) FROM schedule_runs WHERE parent_run = ?1", [run.id], |r| r.get(0))?;
+            if had == 0 {
+                Self::insert_run_on(&tx, &crate::schedules::Run { parent: Some(run.id), ..c.clone() }, "INSERT")?;
+                child_id = Some(tx.last_insert_rowid());
+                Self::prune_runs_on(&tx, run.schedule_id, crate::schedules::RUNS_KEEP)?;
+            }
+        }
+        tx.commit()?;
+        Ok(child_id)
+    }
+
+    /// Runs of the triggers `schedules` taken up since `since` (scheduler clock) that are going
+    /// or reached their agent: the per-note cap (Run now doesn't count).
+    pub fn count_trigger_runs_taken(&self, schedules: &[i64], since: i64) -> anyhow::Result<u32> {
+        let conn = self.conn.lock();
+        let mut total = 0i64;
+        for s in schedules {
+            total += conn.query_row(
+                "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id = ?1 AND kind = 'triggered' AND started_at >= ?2
+                 AND (outcome = 'pending' OR msg_id IS NOT NULL)",
+                params![s, since],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        Ok(total.max(0) as u32)
     }
 
     fn insert_run_on(conn: &Connection, run: &crate::schedules::Run, verb: &str) -> rusqlite::Result<usize> {
@@ -1316,20 +1375,10 @@ impl Store {
         Ok(id)
     }
 
-    /// Delivered runs (their message reached an agent, any kind but Run now) of any of
-    /// `schedules` since `since`: the per-note cap on trigger runs.
-    pub fn count_delivered_runs_of(&self, schedules: &[i64], since: i64) -> anyhow::Result<u32> {
-        let mut total = 0;
-        for s in schedules {
-            total += self.count_delivered_runs_since(*s, since, None)?;
-        }
-        Ok(total)
-    }
-
     pub fn update_run(&self, run: &crate::schedules::Run) -> anyhow::Result<()> {
         self.conn.lock().execute(
-            "UPDATE schedule_runs SET msg_id = ?2, outcome = ?3, reason = ?4, finished_at = ?5 WHERE id = ?1",
-            params![run.id, run.msg_id, run.outcome.as_str(), run.reason, run.finished_at],
+            "UPDATE schedule_runs SET msg_id = ?2, outcome = ?3, reason = ?4, finished_at = ?5, agent_id = ?6 WHERE id = ?1",
+            params![run.id, run.msg_id, run.outcome.as_str(), run.reason, run.finished_at, run.agent_id],
         )?;
         Ok(())
     }

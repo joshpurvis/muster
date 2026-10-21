@@ -205,6 +205,10 @@ pub struct WatchState {
     /// re-run, is still noticed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seen: Vec<String>,
+    /// Raised each time the trigger is changed to watch something else: a look started before
+    /// (a slow `gh` call) whose answer comes back after is thrown away, not saved.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// "If missed": what a slot missed while Muster was off or asleep does.
@@ -1279,7 +1283,7 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
             // A trigger that watches something else starts afresh: no held event, no memory.
             if s.when.is_trigger() || was_trigger {
                 s.event = None;
-                s.watch = WatchState::default();
+                s.watch = WatchState { generation: s.watch.generation + 1, ..WatchState::default() };
             }
             if matches!(s.when, When::Url { .. }) {
                 s.secret.get_or_insert_with(crate::paths::random_token);

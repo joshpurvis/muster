@@ -1498,6 +1498,28 @@ cat '${BASE}/gh-body.json'
   await c.call("schedule.settings.set", { spend_cap: 10 });
   ok(Math.abs((await c.call("schedule.settings.get")).spend.cap - 10) < 1e-9, "the cap can be raised");
   ok(!d.log.join("").includes(KEY), "the daemon log never shows the key");
+  // Raw keys from unattended work into the OpenRouter agent go through the caps too: back at $5,
+  // `muster keys` from the trig agent's session (its chain is scheduled work) is refused.
+  await c.call("schedule.settings.set", { spend_cap: 5 });
+  const orwSid: number = (await c.call("agent.list")).find((a: Json) => a.name === "orw").session_id;
+  const keys = await run(["keys", String(orwSid), "text:hello", "enter"], { MUSTER_SESSION_ID: String(sTrig) });
+  ok(!keys.ok && keys.err.includes("budget:"), `unattended raw keys to an OpenRouter session are refused at the cap (${keys.err.trim()})`);
+  await c.call("schedule.settings.set", { spend_cap: 10 });
+  // A reload with another key: orw still runs (billing the first key), so its spend can't be
+  // read and unattended work for it is refused until it restarts.
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({
+    MUSTER_TEST_TRIGGER_DELAY_MS: "1000",
+    MUSTER_TEST_WATCH_EVERY_MS: "700",
+    OPENROUTER_API_KEY: KEY + "-other",
+    MUSTER_TEST_OPENROUTER_KEY_URL: `http://127.0.0.1:${keyServer.addr.port}/key`,
+  });
+  c = new Client(d.token);
+  await c.open();
+  await c.call("schedule.run", { id: orSched });
+  await until("the other-key refusal", async () => (await runs(orSched))[0]?.reason?.includes("earlier OpenRouter key") ?? false);
+  ok((await runs(orSched))[0].outcome === "refused", `a run on a process launched with another key is refused: ${(await runs(orSched))[0].reason}`);
 
   for (const a of ["trig", "trig2", "orw"]) await c.call("agent.remove", { name: a });
   await keyServer.shutdown();

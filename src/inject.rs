@@ -907,7 +907,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     }
     // Unattended work for an OpenRouter session past a spend cap (or with today's spend
     // unknown) is taken back too, whoever queued it (src/spend.rs).
-    if let Some(why) = crate::spend::submit_gate(hub, id, &item.source) {
+    if let Some(why) = crate::spend::submit_gate_fresh(hub, id, &item.source).await {
         crate::spend::not_submitted(hub, &item.source, why);
         return Ok(true);
     }

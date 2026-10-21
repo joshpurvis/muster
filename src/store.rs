@@ -39,6 +39,10 @@ pub struct StoredTerminal {
     /// Where `spec` had the OpenRouter key, stored empty (src/openrouter.rs `redact_spec`).
     #[serde(default, skip_serializing_if = "crate::openrouter::KeyRefs::is_empty")]
     pub key_refs: crate::openrouter::KeyRefs,
+    /// The fingerprint of the OpenRouter key this run was launched with (never the key): the
+    /// spend caps refuse unattended work for a run whose key isn't the one the backend reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_fp: Option<String>,
     pub pending: bool,
     pub retired: bool,
 }
@@ -1494,12 +1498,16 @@ impl Store {
         Ok((last, reply))
     }
 
-    /// Keep the newest `keep` runs of `schedule` (and any still pending). Every insert does it.
+    /// Keep the newest `keep` runs of `schedule`, any still pending, and every run that reached
+    /// its agent in the last two days: the daily caps count those, so however many skips and
+    /// refusals fill the history, pruning never reopens a cap. Every insert does it.
     fn prune_runs_on(conn: &Connection, schedule: i64, keep: usize) -> rusqlite::Result<usize> {
+        let recent = now_ms() - 2 * 86_400_000;
         conn.execute(
-            "DELETE FROM schedule_runs WHERE schedule_id = ?1 AND outcome != 'pending' AND id NOT IN (
-                SELECT id FROM schedule_runs WHERE schedule_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![schedule, keep as i64],
+            "DELETE FROM schedule_runs WHERE schedule_id = ?1 AND outcome != 'pending'
+             AND NOT (msg_id IS NOT NULL AND (started_at >= ?3 OR msg_id IN (SELECT id FROM agent_messages WHERE created_at >= ?3)))
+             AND id NOT IN (SELECT id FROM schedule_runs WHERE schedule_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![schedule, keep as i64, recent],
         )
     }
 

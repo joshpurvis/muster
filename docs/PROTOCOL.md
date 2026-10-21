@@ -591,7 +591,14 @@ for placeholders again. Run now on a trigger runs it without an event. Skip next
   `gh_not_signed_in` (run `gh auth login`), `gh_missing`, or `error` with the detail.
 
 A git or GitHub watcher saves what it has seen and the event it found in one write, so a crash
-can't keep the one and lose the other.
+can't keep the one and lose the other; an answer for a trigger changed while it was being looked at
+(another repo or branch: `watch.generation` rises with each change) is thrown away. Every new PR or
+failed run is reported: the first 10 in full, the rest by number on one `+N more …` line, and a
+whole page of new ones says there may be more than one check lists.
+
+The daily caps count delivered runs, and history pruning (the newest 500 runs per schedule) never
+removes a run that reached its agent in the last two days, so skips and refusals can't push one out
+and reopen a cap.
 - **URL**: `trigger.fire` or the trigger URL hold an event at once.
 
 What it costs while idle: a note or URL trigger nothing at all; a git trigger a stat and a small
@@ -621,7 +628,10 @@ message to such an agent whose origin isn't the human's (scheduled, triggered, o
 such a chain) is refused `budget: …` (checked in `agents::precheck` before anything is started,
 again in `deliver`, and by the injector right before such a prompt is typed and again before Enter,
 so one queued before the cap was reached is taken back: a schedule's run ends `refused`, any other
-message is recorded refused), with one alert per cap per day; a run already going finishes, and
+message is recorded refused; before typing, a stale or missing reading is first renewed, so a
+prompt waiting from before a reload is judged on a real reading, never refused only because none
+was taken yet), and for raw keys (`session.input`, `muster keys`) sent on such a chain to an
+OpenRouter session, with one alert per cap per day; a run already going finishes, and
 what the human types is never blocked. Spent is read from OpenRouter's `GET /api/v1/key` with the
 daemon's own key (passed to curl as a config on its stdin, never in an argument, the environment,
 a log or a reply): `usage_daily` (OpenRouter's UTC day) for the overall cap; per agent (an
@@ -632,8 +642,12 @@ counts toward the new day only up to its `usage_daily`. The key is read while an
 works or has prompts waiting (at most every minute, and once when the last turn ends), before an
 unattended message when the last reading is over a minute old or from another UTC day, and when
 the settings are read; never while they are idle. With no reading of today in the last 15 minutes
-(OpenRouter unreachable), or no key in this backend at all (an OpenRouter agent from an earlier
-backend can still be running with its own), unattended work on OpenRouter is refused too. Kept in `runtime_state`
+(OpenRouter unreachable, or an answer without a usable `usage_daily`, which fails the reading),
+or no key in this backend at all (an OpenRouter agent from an earlier backend can still be running
+with its own), unattended work on OpenRouter is refused too. Each OpenRouter run's launch record
+keeps a one-way fingerprint of the key it was launched with (a salted SHA-256, 64 bits; never the
+key); a running agent whose fingerprint isn't that of the key this backend reads (a reload with
+another key) is refused unattended work until it restarts ("Start fresh"). Kept in `runtime_state`
 `openrouter-spend`. Why this source: it is what OpenRouter bills (cache discounts, reasoning
 tokens and the provider it routed to included), for every request through the key; the CLIs don't
 report OpenRouter's price, and the per-generation stats endpoint

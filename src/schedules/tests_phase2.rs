@@ -399,7 +399,7 @@ async fn a_reply_starts_the_next_step_one_hop_further() {
 fn fake_usage(values: Arc<parking_lot::Mutex<(f64, f64)>>) -> crate::spend::Fetcher {
     Arc::new(move || {
         let v = *values.lock();
-        Box::pin(async move { Ok(crate::spend::KeyUsage { usage: v.0, usage_daily: Some(v.1) }) })
+        Box::pin(async move { Ok(crate::spend::KeyUsage { usage: v.0, usage_daily: v.1 }) })
     })
 }
 
@@ -478,7 +478,7 @@ async fn spend_across_midnight_counts_only_todays_part_and_turns_are_seen_from_e
         Arc::new(move || {
             n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let v = *u.lock();
-            Box::pin(async move { Ok(crate::spend::KeyUsage { usage: v.0, usage_daily: Some(v.1) }) })
+            Box::pin(async move { Ok(crate::spend::KeyUsage { usage: v.0, usage_daily: v.1 }) })
         })
     };
     let clock = { let n = now.clone(); Arc::new(move || n.load(std::sync::atomic::Ordering::SeqCst)) };
@@ -549,6 +549,67 @@ fn a_held_event_waits_for_the_floor_from_the_last_submission() {
     let held = f.hub.schedules.get(s.id).unwrap();
     assert!(held.event.is_some() && held.next_run.unwrap() > t0 + 14 * MIN, "{:?}", held.next_run);
     assert!(f.runs(s.id).is_empty());
+}
+
+#[test]
+fn many_new_prs_are_all_reported_and_a_full_page_says_there_may_be_more() {
+    let prs = |ns: Vec<u64>| json!(ns.iter().map(|n| json!({"number": n, "title": format!("PR {n}"), "user": {"login": "a"}})).collect::<Vec<_>>());
+    let w = WatchState { max_id: Some(10), ..Default::default() };
+    let (lines, w2) = triggers::gh_new_items(GhEvent::PrOpened, "o/r", &prs((1..=23).rev().collect()), &w);
+    assert_eq!(w2.max_id, Some(23));
+    assert_eq!(lines.len(), 11, "{lines:?}");
+    assert_eq!(lines[10], "+3 more PRs opened on o/r: #21, #22, #23");
+    let (lines, _) = triggers::gh_new_items(GhEvent::PrOpened, "o/r", &prs((11..=60).rev().collect()), &w);
+    assert!(lines.last().unwrap().contains("there may be more"), "{lines:?}");
+}
+
+#[test]
+fn a_github_answer_for_a_trigger_changed_meanwhile_is_dropped() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    let s = f.create(json!({"agent": "worker", "prompt": "x", "when": {"kind": "github", "repo": "a/one", "event": "pr_opened"}})).unwrap();
+    // A gh that answers for repo a/one only once the test lets it.
+    let dir = std::env::temp_dir().join(format!("muster-slow-gh-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gate = dir.join("go");
+    let script = format!("#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\necho '[{{\"number\": 7}}]'\n", gate.display());
+    std::fs::write(dir.join("gh"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("gh"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hub = f.hub.clone();
+    let gh = dir.join("gh");
+    let poll = std::thread::spawn(move || {
+        let tools = crate::pr::Tools::new(gh.as_os_str(), "curl", false).parallel(1);
+        triggers::poll_github(&hub, s.id, &tools);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Edited to another repo while gh runs: the answer about a/one must not become b/two's cursor.
+    update(&f.hub, serde_json::from_value(json!({"id": s.id, "when": {"kind": "github", "repo": "b/two", "event": "pr_opened"}})).unwrap()).unwrap();
+    std::fs::write(&gate, "").unwrap();
+    poll.join().unwrap();
+    let after = f.hub.schedules.get(s.id).unwrap();
+    assert_eq!((after.watch.max_id, after.watch.generation), (None, 1), "the obsolete answer was dropped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pruning_the_history_never_reopens_a_daily_cap() {
+    let store = crate::store::Store::open_memory().unwrap();
+    let s = Schedule { agent_id: 1, ..Default::default() };
+    let id = store.insert_schedule(&s).unwrap();
+    let a = super::agent("w", SessionKind::Codex, crate::openrouter::Provider::Subscription, vec![Origin::Schedule]);
+    let m = crate::agents::message_record(&a, "schedule:1", None, crate::agents::Route { origin: Origin::Schedule, hop: 0, reply_to: None }, "x");
+    let mut sent = Run::new(id, 1, RunKind::Scheduled, crate::model::now_ms());
+    sent.msg_id = Some(store.insert_agent_message(&m).unwrap());
+    sent.outcome = Outcome::Replied;
+    store.insert_run(&sent).unwrap();
+    // Far more refusals than the history keeps, after it.
+    for i in 0..(RUNS_KEEP + 50) {
+        let mut r = Run::new(id, 100 + i as i64, RunKind::Manual, crate::model::now_ms());
+        r.outcome = Outcome::Refused;
+        store.insert_run(&r).unwrap();
+    }
+    assert_eq!(store.count_delivered_runs_since(id, crate::model::now_ms() - plan::DAY_MS, None).unwrap(), 1, "the delivered run is kept");
+    assert!(store.runs(id, None, 2000).unwrap().len() <= RUNS_KEEP + 1);
 }
 
 #[test]

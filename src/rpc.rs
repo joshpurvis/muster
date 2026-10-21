@@ -814,7 +814,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
-                    crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?
+                    crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?;
+                    // Keys can start a turn as well as a prompt can: an OpenRouter session's
+                    // spend caps apply to unattended keys too.
+                    if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {
+                        hub.spend.ensure_fresh(hub).await;
+                    }
+                    crate::spend::raw_input_gate(hub, p.id, r.origin).map_err(RpcError)?
                 }
                 // The human's keys (a paired phone, `muster keys` outside a session) take the
                 // same path as a client's: no session lookup under the hub lock, no SQLite.

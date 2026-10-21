@@ -63,6 +63,19 @@ fn test_ms(var: &str) -> Option<i64> {
     std::env::var(var).ok().and_then(|v| v.parse().ok()).filter(|v: &i64| *v > 0)
 }
 
+/// A watcher's answer for a trigger that was changed (or looked at by someone else) while it
+/// was working: thrown away.
+#[derive(Debug)]
+pub struct Obsolete;
+
+impl std::fmt::Display for Obsolete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the trigger changed while it was being looked at")
+    }
+}
+
+impl std::error::Error for Obsolete {}
+
 // ----- live watcher state (not stored) -----
 
 /// How a watcher is doing, for the panel (`schedule.watch`).
@@ -555,6 +568,9 @@ pub fn check_git(hub: &Hub) {
                 // and the event together.
                 let text = old.as_deref().map(|o| git_moved_text(Path::new(repo), branch, o, &sha));
                 let r = hub.schedules.edit(s.id, |x| {
+                    // Changed meanwhile (another repo or branch, or another look got there
+                    // first): this look is obsolete.
+                    ensure!(x.when == s.when && x.watch.generation == s.watch.generation && x.watch.sha == s.watch.sha, Obsolete);
                     x.watch.sha = Some(sha.clone());
                     match &text {
                         Some(t) => hold_on(x, t, None, now, false, now),
@@ -563,6 +579,7 @@ pub fn check_git(hub: &Hub) {
                 });
                 match r {
                     Ok(x) => super::publish(hub, &x),
+                    Err(e) if e.is::<Obsolete>() => tracing::debug!(schedule = s.id, "an obsolete git look was dropped"),
                     Err(e) => tracing::warn!(schedule = s.id, "holding a branch move: {e:#}"),
                 }
             }
@@ -668,9 +685,29 @@ pub fn gh_new_items(event: GhEvent, repo: &str, v: &Value, watch: &super::WatchS
                 s(x, "html_url")
             ),
         })
-        .collect();
+        .collect::<Vec<String>>();
+    let mut lines = lines;
+    // Every new one is reported: past the first few, by number in one line.
+    if fresh.len() > LIST_MAX {
+        let rest: Vec<String> = fresh[LIST_MAX..]
+            .iter()
+            .map(|x| match event {
+                GhEvent::PrOpened => format!("#{}", id_of(x).unwrap_or(0)),
+                GhEvent::CiFailed => format!("{} #{}", s(x, "name"), x.get("run_number").and_then(Value::as_u64).unwrap_or(0)),
+            })
+            .collect();
+        let what = if event == GhEvent::PrOpened { "PRs opened" } else { "failed runs" };
+        lines.push(format!("+{} more {what} on {repo}: {}", rest.len(), rest.join(", ")));
+    }
+    // A whole page of new ones: there may be more than one check lists.
+    if !fresh.is_empty() && fresh.len() == items.len() && items.len() >= GH_PAGE[event as usize] {
+        lines.push(format!("(GitHub lists only the newest {} at a time: there may be more on {repo})", items.len()));
+    }
     (lines, next)
 }
+
+/// How many PRs and failed runs one GitHub check lists (the `per_page` of `gh_path`).
+const GH_PAGE: [usize; 2] = [50, 20];
 
 /// The `gh api` path a GitHub trigger polls.
 pub fn gh_path(repo: &str, event: GhEvent, branch: Option<&str>) -> String {
@@ -712,16 +749,25 @@ pub fn poll_github(hub: &Hub, id: i64, tools: &crate::pr::Tools) {
             // What it has seen and the event it found are saved in one write (a crash can't
             // keep the one and lose the other).
             let r = hub.schedules.edit(id, |x| {
+                // Edited while `gh` ran (another repo or event): this answer is obsolete.
+                ensure!(x.when == s.when && x.watch.generation == s.watch.generation, Obsolete);
                 let (lines, watch) = gh_new_items(event, &repo, &v, &x.watch);
                 x.watch = watch;
                 if lines.is_empty() { Ok(()) } else { hold_on(x, &lines.join("\n"), None, now, false, now) }
             });
             match r {
                 Ok(x) => saved = Some(x),
+                Err(e) if e.is::<Obsolete>() => {
+                    tracing::debug!(schedule = id, "an obsolete GitHub poll was dropped");
+                    return;
+                }
                 Err(e) => tracing::warn!(schedule = id, "saving a GitHub poll: {e:#}"),
             }
         }
         Err(e) => {
+            if hub.schedules.get(id).is_none_or(|x| x.when != s.when || x.watch.generation != s.watch.generation) {
+                return; // Changed while gh ran: this answer is about something else.
+            }
             let (state, detail) = match e {
                 crate::pr::GhError::Missing => ("gh_missing", "gh (the GitHub CLI) isn't installed or not on PATH".to_string()),
                 crate::pr::GhError::NotSignedIn(d) => ("gh_not_signed_in", format!("gh isn't signed in to GitHub: run `gh auth login` ({})", crate::agents::truncate_bytes(&d, 200))),

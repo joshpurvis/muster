@@ -48,14 +48,17 @@ const LEDGER_KEY: &str = "openrouter-spend";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeyUsage {
     pub usage: f64,
-    pub usage_daily: Option<f64>,
+    pub usage_daily: f64,
 }
 
 pub fn parse_key_usage(body: &[u8]) -> anyhow::Result<KeyUsage> {
     let v: Value = serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("OpenRouter's answer isn't JSON: {e}"))?;
     let d = v.get("data").unwrap_or(&v);
     let usage = d.get("usage").and_then(Value::as_f64).ok_or_else(|| anyhow::anyhow!("OpenRouter's answer has no usage"))?;
-    Ok(KeyUsage { usage, usage_daily: d.get("usage_daily").and_then(Value::as_f64) })
+    let daily = d.get("usage_daily").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| anyhow::anyhow!("OpenRouter's answer has no usable usage_daily (today's spend), so it can't be checked"))?;
+    anyhow::ensure!(usage.is_finite() && usage >= 0.0, "OpenRouter's usage isn't a number");
+    Ok(KeyUsage { usage, usage_daily: daily })
 }
 
 pub type Fetcher = Arc<dyn Fn() -> BoxFuture<'static, anyhow::Result<KeyUsage>> + Send + Sync>;
@@ -96,6 +99,8 @@ struct State {
 pub struct Spend {
     store: Store,
     fetcher: parking_lot::RwLock<Option<Fetcher>>,
+    /// The fingerprint of the key the fetcher reads (`ApiKey::fingerprint`).
+    key_fp: parking_lot::RwLock<Option<String>>,
     clock: parking_lot::RwLock<Arc<dyn Fn() -> i64 + Send + Sync>>,
     state: Mutex<State>,
     fetching: tokio::sync::Mutex<()>,
@@ -124,6 +129,7 @@ impl Spend {
         Spend {
             store: store.clone(),
             fetcher: parking_lot::RwLock::new(key.map(|k| curl_fetcher(k.clone()))),
+            key_fp: parking_lot::RwLock::new(key.map(|k| k.fingerprint())),
             clock: parking_lot::RwLock::new(Arc::new(now_ms)),
             state: Mutex::new(State { ledger, ..Default::default() }),
             fetching: Default::default(),
@@ -133,6 +139,7 @@ impl Spend {
     /// Tests read the key through their own fetcher and clock.
     #[cfg(test)]
     pub fn set_fetcher(&self, f: Option<Fetcher>, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
+        *self.key_fp.write() = f.as_ref().map(|_| "test-key".to_string());
         *self.fetcher.write() = f;
         *self.clock.write() = clock;
     }
@@ -172,7 +179,7 @@ impl Spend {
                         // The previous reading was another day's: only what the key spent today
                         // (OpenRouter's `usage_daily`) can be today's; the rest was yesterday's.
                         if st.ledger.last_usage_day != day {
-                            delta = delta.min(u.usage_daily.unwrap_or(0.0).max(0.0));
+                            delta = delta.min(u.usage_daily);
                         }
                         if delta > 0.0 {
                             let active: Vec<i64> = std::mem::take(&mut st.active).into_iter().collect();
@@ -190,8 +197,7 @@ impl Spend {
                     st.active = st.working_now.clone();
                     st.ledger.last_usage = Some(u.usage);
                     st.ledger.last_usage_day = day.clone();
-                    let sum: f64 = st.ledger.agents.values().sum::<f64>() + st.ledger.other;
-                    st.today = Some(u.usage_daily.unwrap_or(sum));
+                    st.today = Some(u.usage_daily);
                     st.fetched_at = Some(now);
                     st.error = None;
                 }
@@ -244,6 +250,20 @@ impl Spend {
                  is refused until it has one (`env OPENROUTER_API_KEY=… muster reload`)"
                     .into(),
             );
+        }
+        // A running process bills the key it was launched with: when that isn't the key this
+        // backend reads (a reload with another key), its spend can't be measured.
+        if let Some(sid) = agent.session_id
+            && let Some(info) = hub.session(sid)
+            && info.state != AgentState::Exited
+            && info.provider == Provider::OpenRouter
+            && hub.run_key_fingerprint(sid) != self.key_fp.read().clone()
+        {
+            return Err(format!(
+                "budget: {} still runs with an earlier OpenRouter key than the one this backend reads, so its spend can't be \
+                 measured; Start fresh (or stop and start it) to run it on the current key",
+                agent.name
+            ));
         }
         let now = self.now();
         let mut st = self.state.lock();
@@ -393,12 +413,41 @@ pub fn applies(hub: &Hub, agent: &Agent, origin: Origin) -> bool {
     origin != Origin::Human && bills_openrouter(hub, agent)
 }
 
+/// `submit_gate` with a fresh reading first: when the gate applies and the last reading is over a
+/// minute old (or there is none yet: after a reload, before the sampler's first request), the key
+/// is read now, so a prompt is refused only on a real reading (or a real failure to get one).
+pub async fn submit_gate_fresh(hub: &Hub, session: SessionId, source: &crate::agents::Source) -> Option<String> {
+    submit_gate(hub, session, source)?;
+    hub.spend.ensure_fresh(hub).await;
+    submit_gate(hub, session, source)
+}
+
+/// Raw keys (`session.input`, `muster keys`) sent on a non-human chain to a session that bills
+/// OpenRouter go through the same caps as a prompt: they can start a turn just as well.
+pub fn raw_input_gate(hub: &Hub, session: SessionId, origin: Origin) -> Result<(), String> {
+    if origin == Origin::Human {
+        return Ok(());
+    }
+    let Some(info) = hub.session(session) else { return Ok(()) };
+    if info.state == AgentState::Exited || info.provider != Provider::OpenRouter {
+        return Ok(());
+    }
+    match hub.agents().by_session(session) {
+        Some(agent) => hub.spend.check(hub, &agent, &hub.schedules.settings()),
+        None => Err("budget: this session bills OpenRouter and isn't a named agent; unattended keys to it are refused".into()),
+    }
+}
+
 /// The injector took back a prompt `submit_gate` refused: a schedule's or trigger's run ends
 /// refused (`budget: …`); any other message (an agent's ask on an unattended chain) is recorded as
 /// refused, so it counts toward no cap and its log entry says why.
 pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, why: String) {
     let crate::agents::Source::Chain(p) = source else { return };
-    let Some(msg) = p.msg_id else { return };
+    let Some(msg) = p.msg_id else {
+        // A session's own send (send_message, `muster send`): no message record to mark.
+        hub.notice("warn", format!("A prompt on unattended work was not typed into an OpenRouter session: {why}"));
+        return;
+    };
     let from = hub.store().agent_message(msg).ok().flatten().map(|m| m.from).unwrap_or_default();
     if crate::schedules::is_run_sender(&from) {
         crate::schedules::not_submitted(hub, source, crate::schedules::plan::Action::Refuse(why));
@@ -493,9 +542,11 @@ mod tests {
     #[test]
     fn the_key_endpoint_is_read() {
         let u = parse_key_usage(br#"{"data":{"label":"x","usage":12.5,"usage_daily":1.25,"limit":null}}"#).unwrap();
-        assert_eq!(u, KeyUsage { usage: 12.5, usage_daily: Some(1.25) });
-        let u = parse_key_usage(br#"{"data":{"usage":3}}"#).unwrap();
-        assert_eq!(u.usage_daily, None);
+        assert_eq!(u, KeyUsage { usage: 12.5, usage_daily: 1.25 });
+        // No usable usage_daily: the reading fails (and unattended work is refused).
+        assert!(parse_key_usage(br#"{"data":{"usage":3}}"#).is_err());
+        assert!(parse_key_usage(br#"{"data":{"usage":3,"usage_daily":null}}"#).is_err());
+
         assert!(parse_key_usage(b"<html>").is_err());
         assert!(parse_key_usage(br#"{"data":{}}"#).is_err());
     }

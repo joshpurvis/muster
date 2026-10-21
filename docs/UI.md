@@ -375,17 +375,67 @@ terminal tab; there is no chat view.
 
 | Part | What |
 |---|---|
-| Header | "Agents", the count, `×` hides the panel. |
+| Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. |
 | Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
-| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays). |
+| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
+| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name, then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. |
+| Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). |
+| Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run`. |
 | + New agent | Under the list: the New agent dialog. |
 | Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet") and its route. |
 
 Live updates come from `agent_upserted`, `agent_removed` and `agent_message` (the agent list and
 the last 100 messages are loaded after each `hello`); states come from the agents' sessions.
 Daemons without agents (`agent.list` is an unknown method) show a one-line note instead.
+Schedules and their settings load after each `hello` too (`schedule.list`), then follow
+`schedule_upserted`, `schedule_removed`, `schedule_run` and `schedule_settings`; a backend without
+them (`schedule.list` is an unknown method) shows no schedule UI at all (no section, menu items,
+palette commands or banner). The palette has New schedule…, Pause all schedules / Resume all
+schedules (whichever applies) and Scheduling settings….
+
+**Scheduling settings** (header `⋯`, palette): Pause all schedules (a switch; each schedule skips
+its runs, recorded once, until resumed), quiet hours from / to (`HH:MM`, this computer's time zone,
+named in the hint; they apply to schedules with quiet hours on, the default for Claude
+subscription agents), and "Unattended messages per agent per day" (1–200, default 24: scheduled
+and triggered messages, not the human's, over any 24 hours; past it the message is refused with
+the reason). Save sends only what changed (`schedule.settings.set`).
+
+**New / Edit schedule dialog** (header `⋯`, an agent's menu, the palette, a schedule's Edit…):
+
+- Agent (New only; Edit shows it as fixed text): Codex and OpenRouter agents first ("Best for
+  scheduled work"), then Claude subscription agents that accept the Schedule origin, then the
+  rest, greyed out and never selectable, with a hint to tick Schedule in Edit agent. The agent
+  passed in (an agent's New schedule…) is preselected if it can take scheduled work, else the
+  first Codex or OpenRouter agent; a Claude subscription agent is never preselected for you. A
+  Claude subscription agent shows the amber unattended-use warning and one line: its recurring
+  schedules stop after 7 days unless renewed, and quiet hours are on by default. With no agent
+  that takes scheduled work, the field says so and offers **New agent…** (opens the New agent
+  dialog on the Background worker template).
+- Prompt (monospace), with a hint: `{date}`, `{last_run}` and `{last_reply}` are filled in each
+  run. Name (optional; blank: the prompt's first line).
+- When: Every 15 minutes, Every 30 minutes, Every hour (at minute :MM), Every day at HH:MM,
+  Weekdays at HH:MM (`MM HH * * 1-5`), Once a week on a day at HH:MM, Once at a date and time
+  (`datetime-local`, sent as `{kind:"once", at}`), Custom (a cron line). Each change asks
+  `schedule.preview` (debounced 250 ms; a newer answer always wins) and shows under it the
+  reading, the next 3 runs (each `quiet hours: skipped` where it falls in them), "Stops after 7
+  days unless you renew it" for a Claude subscription agent's recurring schedule, or the error
+  (e.g. faster than every 15 minutes) in red. Edit maps a stored cron line back to its preset
+  when it has one's shape, else Custom with the line as stored.
+- If missed (Automatic · Run once when Muster is back · Skip; Automatic says what it does for
+  this timing from the preview's `missed_default`), Conversation (Continue · Fresh each run:
+  a new conversation each run, never while you're in a turn with it), Notify me (On failure ·
+  Always · Never), Also put the reply in (Nothing · A note: an existing note's title from a list,
+  or a new title, which makes that note), and "Skip runs in quiet hours (23:00–07:00)" (follows
+  the agent's default until changed).
+- More options (open in Edit when either is set): at most N runs a day (empty: no cap; Run now
+  doesn't count) and the time zone (this browser's by default; 09:00 stays 09:00 across clock
+  changes).
+- Ctrl+Enter creates or saves; Esc closes. Create (`schedule.create`) opens the panel if it was
+  closed and toasts the next run; Save sends only changed fields (`schedule.update`). The
+  backend's refusals (an agent that doesn't take scheduled work, a bad cron line) show in the
+  dialog.
 
 **New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
 

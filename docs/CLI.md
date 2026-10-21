@@ -53,6 +53,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
 | `muster note ls/new/read/write/append/rename/open/close/rm` | Plain-text notes shared with agents. See "Notes" below. |
+| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history` | Recurring and one-off messages to a named agent. See "Schedules" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
@@ -127,6 +128,32 @@ title prefix; ambiguous or unknown ones exit 2.
 muster note new --title "Release checklist" "- [ ] changelog"
 echo "- [ ] tag v0.4" | muster note append release
 muster note read release --json | jq .rev     # then: muster note write release --rev 3 - < plan.txt
+```
+
+## Schedules
+
+Recurring or one-off messages to a named agent (docs/PROTOCOL.md "Schedules", docs/UI.md "Agents
+panel"). Each run is an ordinary message with origin `schedule` at hop 0, so the agent must accept
+scheduled work (`muster agent edit <name> --accepts human,schedule`; a Codex agent does by
+default) and its caps apply. Only you make or change schedules: these commands are refused from an
+agent's session (a shell tab counts as you). Times print in this machine's zone.
+
+| Command | What it does |
+|---|---|
+| `muster schedule add <agent> TIMING [options] [PROMPT...]` | Create one (`schedule.create`). TIMING is one of `--every 15m\|30m\|1h\|2h\|3h\|4h\|6h\|8h\|12h`, `--hourly` (or `--hourly=:MM`), `--daily HH:MM`, `--weekdays HH:MM`, `--weekly DAYS@HH:MM` (`mon@09:00`, `mon,thu@17:30`), `--cron "M H DOM MON DOW"` (at most every 15 minutes) or `--at WHEN` (once: `HH:MM` for the next one, `"YYYY-MM-DD HH:MM"`, or `+20m` / `+2h`). PROMPT as for `send` (none or `-`: stdin); it may use `{date}`, `{last_run}` and `{last_reply}`. Options: `--name`, `--tz ZONE` (default: this machine's), `--if-missed auto\|run\|skip`, `--fresh` (a new conversation each run), `--notify failure\|always\|never`, `--note <id\|title>` (append each reply there; a new title makes the note), `--quiet-hours on\|off` (default on for a Claude subscription agent), `--max-per-day N`, `--paused`. Prints `schedule ID: <reading> (<zone>); next <time>`, plus the 7-day expiry for a Claude subscription agent. |
+| `muster schedule ls [agent] [--json]` (alias `list`) | `ID  AGENT  STATUS  NEXT  LAST  NAME  (WHEN)`; says so first when all schedules are paused. `--json` prints `schedule.list`. |
+| `muster schedule rm <id>` | Remove it and its history. |
+| `muster schedule pause <id>` / `resume <id>` | Pause or resume one. `--all` instead: "Pause all schedules" on or off (each schedule's own pause stays). |
+| `muster schedule run <id>` | Run it now (origin `schedule`, outside its timing and quiet hours). Prints `run N: started`, or `skipped` when its previous run is still going. |
+| `muster schedule skip <id> [--undo]` | Skip its next run, or stop skipping it. |
+| `muster schedule renew <id>` | Renew a Claude subscription agent's recurring schedule for 7 days from now. |
+| `muster schedule history <id> [--limit N] [--json]` | Its runs, newest first: `RUN  TIME  KIND  OUTCOME  REASON` (with how long a run took). `--json` prints `schedule.runs`. |
+
+```sh
+muster schedule add worker --weekdays 09:00 --note "PR summaries" Summarise the PRs opened since {last_run}
+muster schedule add worker --at +20m Check whether the deploy finished
+muster schedule ls
+muster schedule history 3
 ```
 
 ## Agent skills

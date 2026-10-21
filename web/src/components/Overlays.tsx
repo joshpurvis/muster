@@ -954,9 +954,14 @@ function ShellDialog() {
 /** "Cache warning…": the cold prompt cache bar on or off, and how long each CLI/provider pair
  * keeps a conversation cached (`prefs.set {cache_warn, cache_ttl}`, src/cache.rs). */
 function CacheSettingsDialog() {
-  const cur = windowPrefs.value;
-  const ttl = cur?.cache_ttl ?? DEFAULT_CACHE_TTL;
-  const [on, setOn] = useState(cur?.cache_warn ?? true);
+  // What the dialog opened with: only fields edited here are sent, so a change another window
+  // saved meanwhile to a field left alone is never reverted.
+  const [opened] = useState(() => ({
+    warn: windowPrefs.value?.cache_warn ?? true,
+    ttl: { ...(windowPrefs.value?.cache_ttl ?? DEFAULT_CACHE_TTL) },
+  }));
+  const ttl = opened.ttl;
+  const [on, setOn] = useState(opened.warn);
   const [texts, setTexts] = useState<Record<keyof CacheTtl, string>>(
     Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key])])) as Record<keyof CacheTtl, string>,
   );
@@ -968,7 +973,7 @@ function CacheSettingsDialog() {
   const save = async () => {
     if (!ok) return;
     const change: { cache_warn?: boolean; cache_ttl?: Partial<CacheTtl> } = {};
-    if (on !== (cur?.cache_warn ?? true)) change.cache_warn = on;
+    if (on !== opened.warn) change.cache_warn = on;
     const t: Partial<CacheTtl> = {};
     for (const [k, v] of parsed) if (v !== ttl[k]) t[k] = v!;
     if (Object.keys(t).length) change.cache_ttl = t;
@@ -979,7 +984,7 @@ function CacheSettingsDialog() {
     } else setBusy(false);
   };
   return (
-    <Modal class="dialog cache-dlg" label="Cache warning">
+    <Modal class="dialog dialog-scroll cache-dlg" label="Cache warning">
       <form
         onSubmit={(e) => {
           e.preventDefault();

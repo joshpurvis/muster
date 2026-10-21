@@ -283,7 +283,7 @@ function RunEntry({ r, now }: { r: ScheduleRun; now: number }) {
           {cold !== null && (
             <span
               class="ap-chip ap-chip-cold"
-              data-tip={`Sent after ${idleText(cold)} idle: the agent re-read its whole conversation uncached`}
+              data-tip={`Sent after ${idleText(cold)} idle: the agent likely re-read its whole conversation uncached`}
             >
               cold start
             </span>

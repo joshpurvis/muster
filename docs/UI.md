@@ -294,23 +294,31 @@ a light blue tint):
   old context isn't needed.
 - **×** dismisses the bar for this idle period only (per viewer, kept in localStorage across
   reloads): once a later turn ends and goes cold too, it comes back.
-- It never takes the keyboard: its buttons don't take focus when pressed, the terminal keeps it,
-  and it is not a live region (`role="note"`), so nothing is announced when it appears.
-- The tab gets a small **cold** marker (after the OpenRouter badge) and a tooltip line; the
-  agent's row in the Agents panel gets one beside its state (also in its accessible name). The
-  markers stay while the bar is dismissed.
+- It never takes the keyboard: its buttons don't take focus when pressed and the terminal keeps
+  it. A polite live region inside it says once per idle period (not on each tab switch, and
+  without the ticking time) "<agent>: the prompt cache has likely expired, so the next message
+  re-reads the whole conversation at full cost." It sits above the terminal's canvases, which can
+  overhang it until xterm refits.
+- The tab gets a small **cold** marker (after the OpenRouter badge), a tooltip line and ", prompt
+  cache likely expired" in its accessible name; the agent's row in the Agents panel gets one
+  beside its state (also in its accessible name). The markers stay while the bar is dismissed.
 
 **Cache warning…** (`⋯` "Settings and more", with its state as the hint; palette "Cache warning
 settings…"; backends with `prefs.cache_warn` only): a switch "Warn when an agent's cache has likely
 expired" and the lifetime in minutes (1 to 1440) for Claude on a subscription (default 1 h),
-Claude on OpenRouter (5 min), Codex on a ChatGPT plan (30 min) and Codex on OpenRouter (10 min),
-each with its default and why under it. Save sends only what changed (`prefs.set`); every window
-follows at once. Off hides the bar and every marker.
+Claude on OpenRouter or an API key (5 min), Codex on a ChatGPT plan (30 min) and Codex on
+OpenRouter (10 min), each with its default and why under it. A Claude whose launch sets its own
+cache switch follows that instead (docs/PROTOCOL.md "Cold prompt cache"); the bar's tooltip names
+the lifetime that applies. Save sends only the fields edited in this dialog (compared with what
+it opened with, so another window's change to a field left alone stays); every window follows at
+once. Off hides the bar and every marker. Its body scrolls in a short window; Save stays on
+screen.
 
 Muster's own sends are noted too: an agent message, a scheduled run's message or panel events
 typed into a cold agent are still delivered, and recorded as a **cold start**: a `cold start`
 chip on the message in the Agents panel's message log, in its message overlay, and on the
-schedule run that sent it (tooltip: how long it had been idle).
+schedule run that sent it (tooltip: how long it had been idle, and that it likely re-read the
+conversation uncached: an estimate).
 
 ### Status line (optional, on by default, toggle in the palette)
 22px, muted: the focused tab's task name (only once it has a real name, not just its folder's;

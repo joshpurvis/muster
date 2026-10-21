@@ -161,6 +161,7 @@ interface Session {
   last_turn_at?: number | null;
   /** `last_turn_at` + the provider's cache lifetime (`prefs.cache_ttl`). */
   cache_cold_at?: number | null;
+  cache_ttl_min?: number | null;
 }
 
 const now = () => Date.now();
@@ -175,11 +176,12 @@ const windowPrefs = {
   revision: 0,
 };
 
-/** src/cache.rs `CacheRules::cold_at`. */
+/** src/cache.rs `CacheRules::cold_at` (and `refresh`'s `cache_ttl_min`). */
 function coldAt(s: Session): number | null {
-  if (!windowPrefs.cache_warn || s.kind === "shell" || s.last_turn_at == null) return null;
   const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : "");
-  return s.last_turn_at + windowPrefs.cache_ttl[key] * 60_000;
+  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] : null;
+  if (s.cache_ttl_min == null || s.last_turn_at == null) return null;
+  return s.last_turn_at + s.cache_ttl_min * 60_000;
 }
 const workspaces: any[] = [];
 const channels: any[] = [];
@@ -1410,8 +1412,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (typeof p.cache_warn === "boolean") windowPrefs.cache_warn = p.cache_warn;
       Object.assign(windowPrefs.cache_ttl, p.cache_ttl ?? {});
       for (const s of sessions.values()) {
+        const ttlBefore = s.cache_ttl_min ?? null;
         const at = coldAt(s);
-        if (at !== (s.cache_cold_at ?? null)) {
+        if (at !== (s.cache_cold_at ?? null) || ttlBefore !== s.cache_ttl_min) {
           s.cache_cold_at = at;
           upsert(s);
         }

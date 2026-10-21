@@ -277,6 +277,9 @@ struct SessEntry {
     /// Port block (`PORT`) the current process was started with; it stays reserved while that
     /// process runs, also after the session moved to another channel. 0: none yet.
     port_base: u16,
+    /// Its `Working` was put there by backend recovery, not seen: leaving it is no sign of a
+    /// model request (src/cache.rs). Cleared by the next state change.
+    unverified_working: bool,
 }
 
 struct WinEntry {
@@ -599,8 +602,18 @@ impl Hub {
     /// after it had been idle `idle_ms`, past its cache lifetime: the agent message gets
     /// `cold_idle_ms` (so do the schedule runs that sent it), and the timeline a notice.
     /// Never fails a delivery.
-    pub(crate) fn note_cold_send(&self, id: SessionId, prov: crate::agents::Prov, panel: bool, idle_ms: i64) {
+    /// `delivery`: what was typed (a message id, a panel batch, the text): a retry of the same
+    /// delivery is recorded once.
+    pub(crate) fn note_cold_send(&self, id: SessionId, prov: crate::agents::Prov, panel: bool, delivery: &str,
+        idle_ms: i64) {
         let Some(info) = self.session(id) else { return };
+        let key = format!("cold-send:{id}");
+        if self.store.load_runtime::<String>(&key).ok().flatten().as_deref() == Some(delivery) {
+            return;
+        }
+        if let Err(error) = self.store.save_runtime(&key, &delivery.to_string()) {
+            tracing::warn!(session = id, "recording a cold start: {error:#}");
+        }
         if let Some(msg) = prov.msg_id {
             match self.store.set_agent_message_cold(msg, idle_ms) {
                 Ok(true) => crate::agents::publish_message(self, msg),
@@ -628,6 +641,24 @@ impl Hub {
             "text": text, "level": "info",
             "cold_start": {"session_id": id, "idle_ms": idle_ms, "msg_id": prov.msg_id, "panel": panel},
         }));
+    }
+
+    /// A named agent's session is going away (its task closed): keep its conversation's cache
+    /// clock with the agent, for a later resume of the same conversation.
+    fn save_conversation_turn(&self, info: &SessionInfo) {
+        let Some(agent) = self.agents.by_session(info.id) else { return };
+        let (Some(resume), Some(at)) = (agent.resume_id, info.last_turn_at) else { return };
+        if let Err(error) = self.store.save_runtime(&format!("agent-turn:{}", agent.id), &(resume, at)) {
+            tracing::warn!(session = info.id, "keeping the conversation's cache clock: {error:#}");
+        }
+    }
+
+    /// The cache clock saved for the conversation session `id`'s agent resumes, if it is the same.
+    fn saved_conversation_turn(&self, id: SessionId) -> Option<i64> {
+        let agent = self.agents.by_session(id)?;
+        let resume = agent.resume_id?;
+        let saved: (String, i64) = self.store.load_runtime(&format!("agent-turn:{}", agent.id)).ok().flatten()?;
+        (saved.0 == resume).then_some(saved.1)
     }
 
     /// Session `id`'s next message would re-read its whole conversation uncached (src/cache.rs):
@@ -721,7 +752,11 @@ impl Hub {
             let generation = record.map_or(0, |r| r.spec.run.generation);
             let token = record.filter(|_| status.is_some_and(|s| s.alive)).map(|r| r.token.clone());
             let port_base = record.map_or(0, |r| r.port_base);
-            recover_session_state(&mut info, status, record.is_some(), now_ms());
+            let unverified_working = recover_session_state(&mut info, status, record.is_some(), now_ms());
+            // What the run's saved launch says about its cache (credentials: presence only).
+            info.cache_basis = record.map_or_else(Default::default, |r| {
+                crate::cache::basis_from_env(info.kind, |k| r.spec.env.get(k).map(String::as_str))
+            });
             let hook = store.load_hook_session(info.id, generation)?
                 .filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
@@ -745,6 +780,7 @@ impl Hub {
                     kill_requested: false,
                     usable_title,
                     port_base,
+                    unverified_working,
                 },
             );
         }
@@ -1466,7 +1502,15 @@ impl Hub {
             e.info.state_seq = next_seq;
             e.info.state = update.state;
             e.info.state_detail = update.detail.clone();
-            if crate::cache::note_state(&mut e.info, from, update.state, now) {
+            // Only what the screen really showed moves the cache clock, and only for a CLI that
+            // sends no hooks (they say when a request succeeded): never a timer's Stuck, a
+            // process exit, or leaving the Working that recovery put there.
+            let seen = source == StateSource::Screen && e.last_hook_at == 0
+                && !(from == AgentState::Working && e.unverified_working);
+            if from != update.state {
+                e.unverified_working = false;
+            }
+            if seen && crate::cache::note_screen(&mut e.info, from, update.state, now) {
                 self.cache_rules.lock().refresh(&mut e.info);
             }
             if let Err(err) = self.store.update_session(&e.info) {
@@ -2720,6 +2764,8 @@ impl Hub {
                 live_cwd: None,
                 last_turn_at: None,
                 cache_cold_at: None,
+                cache_ttl_min: None,
+                cache_basis: Default::default(),
                 state_seq: self.state_seq.next()?,
                 created_at: now,
                 window_id: Some(window_id),
@@ -2743,6 +2789,7 @@ impl Hub {
                     generation: 0,
                     early_exit: None,
                     last_hook_at: 0,
+                    unverified_working: false,
                     last_dequeue_at: 0,
                     busy: true,
                     kill_requested: false,
@@ -2932,6 +2979,9 @@ impl Hub {
         };
         let mut spec = adapter_for(info.kind).command(&ctx)?;
         let continues = crate::cache::continues_conversation(info.kind, &ctx.extra_args);
+        // A named agent resuming a conversation whose session row is gone (its task was
+        // closed) takes the clock that conversation had.
+        let resumed_turn = continues.then(|| self.saved_conversation_turn(id)).flatten();
         let provider = self.session_provider(id);
         let openrouter = match provider {
             crate::openrouter::Provider::OpenRouter => {
@@ -2977,6 +3027,7 @@ impl Hub {
                 paths::write_private(&session_dir.join(crate::hookcmd::TOKEN_FILE), token.as_bytes())?;
             }
         }
+        let cache_basis = crate::cache::basis_from_env(info.kind, |k| complete_env.get(k).map(String::as_str));
         let launch = SpawnSpec {
             run: RunId { id, generation }, program: spec.program.clone(), args: spec.args.clone(),
             env: complete_env, cwd: PathBuf::from(&info.cwd), cols: info.cols, rows: info.rows,
@@ -3003,7 +3054,12 @@ impl Hub {
             // What this run bills to (the badge follows the run, not the agent's saved setting).
             info.provider = provider;
             // A new conversation has nothing cached to lose; a resumed one keeps its clock.
-            if !continues { info.last_turn_at = None; }
+            if !continues {
+                info.last_turn_at = None;
+            } else if info.last_turn_at.is_none() {
+                info.last_turn_at = resumed_turn;
+            }
+            info.cache_basis = cache_basis;
             self.cache_rules.lock().refresh(&mut info);
             info.pid = None;
             info.exit_code = None;
@@ -3027,6 +3083,7 @@ impl Hub {
             records.insert(id, record.clone());
             e.info = info;
             e.last_hook_at = 0;
+            e.unverified_working = false;
             previous
         };
         // Clients first hear of the new run with its acknowledgement (pid included).
@@ -3315,6 +3372,7 @@ impl Hub {
         }
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
+        self.save_conversation_turn(&entry.info);
         self.agents.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;
@@ -3642,18 +3700,19 @@ impl Hub {
     /// marker only if some of that input came before it arrived, so a later keystroke can
     /// never lower the provenance of an earlier, agent-delivered turn.
     pub fn handle_hook_at(&self, token: &str, event: &str, payload: serde_json::Value, arrival: u64) -> anyhow::Result<()> {
-        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None, arrival))
+        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None, arrival, None))
     }
 
+    /// `captured_at`: when the helper saved it (unix ms; None from older helpers).
     pub(crate) fn handle_spooled_hook(&self, token: &str, event: &str, payload: serde_json::Value,
-        cursor: &crate::store::HookCursor) -> anyhow::Result<()> {
+        cursor: &crate::store::HookCursor, captured_at: Option<i64>) -> anyhow::Result<()> {
         // Spooled callbacks are ordered against markers by the inbox itself: a marker is
         // committed only after every earlier insert was drained, with inserts blocked.
-        self.handle_hook_checkpoint(token, event, payload, Some(cursor), u64::MAX)
+        self.handle_hook_checkpoint(token, event, payload, Some(cursor), u64::MAX, captured_at)
     }
 
     fn handle_hook_checkpoint(&self, token: &str, event: &str, payload: serde_json::Value,
-        cursor: Option<&crate::store::HookCursor>, arrival: u64) -> anyhow::Result<()> {
+        cursor: Option<&crate::store::HookCursor>, arrival: u64, captured_at: Option<i64>) -> anyhow::Result<()> {
         // Spool callbacks from a process that exited during an outage may still contain
         // its final reply. Accept only the recorded current run, never a previous generation.
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
@@ -3696,10 +3755,13 @@ impl Hub {
                 if let Some(delta) = subagent_delta(event, &payload) {
                     info.subagents = delta.map_or(0, |d| info.subagents.saturating_add_signed(d));
                 }
-                let to = info.state;
-                let turn = crate::cache::note_state(&mut info, from, to, now);
-                if crate::cache::note_hook(&mut info, event, &payload, now) || turn {
+                // When the callback was captured: one replayed after an outage happened then.
+                let at = captured_at.map_or(now, |t| t.min(now));
+                if crate::cache::note_hook(&mut info, event, &payload, at) {
                     self.cache_rules.lock().refresh(&mut info);
+                }
+                if from != info.state {
+                    entry.unverified_working = false;
                 }
             } else {
                 info.subagents = 0;
@@ -4127,8 +4189,9 @@ fn occupies(e: &SessEntry, records: &BTreeMap<SessionId, StoredTerminal>) -> boo
 }
 
 /// Reconcile a saved session with the host's facts for its run after a backend restart.
+/// Returns true when it put the session in a `Working` it didn't see (to re-read a dialog).
 fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal_protocol::TerminalStatus>,
-    has_record: bool, now: i64) {
+    has_record: bool, now: i64) -> bool {
     if let Some(status) = status {
         info.pid = status.alive.then_some(status.pid).flatten();
         info.exit_code = status.exit_code;
@@ -4152,6 +4215,7 @@ fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal
             info.state = AgentState::Working;
             info.state_detail = Some("Checking the terminal after a backend restart".into());
             info.state_since = now;
+            return true;
         }
     } else if info.state != AgentState::Exited {
         info.state = AgentState::Exited;
@@ -4159,6 +4223,7 @@ fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal
         info.pid = None;
         info.queued = 0;
     }
+    false
 }
 
 /// Only a host's explicit per-run rejection proves that a launch did not start.
@@ -4511,7 +4576,7 @@ mod tests {
         // the head of the inbox (that stalled every other session's callbacks and input).
         // start_process installed the initial state with the launch record and leaves it.
         hub.terminal_records.lock().get_mut(&2).unwrap().pending = true;
-        hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor).unwrap();
+        hub.handle_spooled_hook("callback-token", "PreToolUse", payload.clone(), &cursor, None).unwrap();
         hub.terminal_records.lock().get_mut(&2).unwrap().pending = false;
         let info = hub.session(2).unwrap();
         assert_eq!((info.state, info.subagents), (AgentState::Working, 1));
@@ -4520,11 +4585,11 @@ mod tests {
         assert!(checkpoint.last_hook_at > 0);
         assert_eq!(hub.inner.lock().sessions[&2].last_hook_at, checkpoint.last_hook_at);
         assert_eq!(hub.store.load_sessions().unwrap()[1].info.state, AgentState::Working);
-        hub.handle_spooled_hook("callback-token", "PreToolUse", payload, &cursor).unwrap();
+        hub.handle_spooled_hook("callback-token", "PreToolUse", payload, &cursor, None).unwrap();
         assert_eq!(hub.session(2).unwrap().subagents, 1);
         assert_eq!(hub.session(2).unwrap().state_seq, info.state_seq);
         cursor.sequence += 1;
-        hub.handle_spooled_hook("callback-token", "Stop", serde_json::json!({}), &cursor).unwrap();
+        hub.handle_spooled_hook("callback-token", "Stop", serde_json::json!({}), &cursor, None).unwrap();
         assert_eq!(hub.session(2).unwrap().subagents, 0);
         assert_eq!(hub.store.load_hook_session(2, 42).unwrap().unwrap().subagents, 0);
     }
@@ -4809,7 +4874,7 @@ mod tests {
             // A real callback reaches its checkpoint and waits for the database while it
             // holds the hub lock (as hook processing does across its commit).
             let callback = scope.spawn(|| hub.handle_spooled_hook("callback-token", "PreToolUse",
-                serde_json::json!({"tool_name": "Agent"}), &cursor));
+                serde_json::json!({"tool_name": "Agent"}), &cursor, None));
             wait_until("the callback to hold the hub lock", || hub.inner.is_locked());
             std::thread::sleep(Duration::from_millis(20));
             assert!(hub.inner.is_locked() && !callback.is_finished(), "the callback is waiting on SQLite");
@@ -5553,10 +5618,11 @@ mod tests {
             reply_to: None, created_at: 1, reply: None, replied_at: None, text: Some("digest".into()),
             refused: None, to_name: None, cold_idle_ms: None }).unwrap();
         let mut events = hub.subscribe();
-        hub.note_cold_send(2, Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) }, false, idle);
+        let prov = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) };
+        hub.note_cold_send(2, prov, false, &format!("msg:{msg}"), idle);
         assert_eq!(hub.store.agent_message(msg).unwrap().unwrap().cold_idle_ms, Some(idle));
         // A retry of the same prompt is recorded once.
-        hub.note_cold_send(2, Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) }, false, idle + 5);
+        hub.note_cold_send(2, prov, false, &format!("msg:{msg}"), idle + 5);
         assert_eq!(hub.store.agent_message(msg).unwrap().unwrap().cold_idle_ms, Some(idle));
         let mut published = false;
         while let Ok(e) = events.try_recv() {
@@ -5566,11 +5632,71 @@ mod tests {
         let channel = hub.session(2).unwrap().channel_id;
         let logged = hub.store.timeline(channel, None, 50).unwrap();
         assert_eq!(logged.iter().filter(|e| e.data.get("cold_start").is_some()).count(), 1, "one notice");
+        // Panel events carry no message: their batch is what a retry repeats.
+        let panel = Prov { origin: Origin::Human, hop: 0, msg_id: None };
+        hub.note_cold_send(2, panel, true, "panel:7", idle);
+        hub.note_cold_send(2, panel, true, "panel:7", idle);
+        hub.note_cold_send(2, panel, true, "panel:8", idle);
+        let logged = hub.store.timeline(channel, None, 50).unwrap();
+        assert_eq!(logged.iter().filter(|e| e.data.get("cold_start").is_some()).count(), 3, "one per delivery");
         let note = logged.iter().find(|e| e.data.get("cold_start").is_some()).expect("a timeline notice");
         assert!(note.data["text"].as_str().unwrap().contains("after 1 h 30 m idle"), "{}", note.data["text"]);
         // Warm, working or a shell: never cold.
         hub.set_state_for_test(2, AgentState::Working);
         assert_eq!(hub.cache_cold(2, now), None);
         assert_eq!(hub.cache_cold(1, i64::MAX), None);
+    }
+
+    #[test]
+    fn only_real_model_activity_moves_the_cache_clock() {
+        let hub = move_fixture();
+        hub.set_state_for_test(2, AgentState::Idle);
+        let last = |hub: &Hub| hub.session(2).unwrap().last_turn_at;
+        let set_last = |hub: &Hub, at: Option<i64>| hub.inner.lock().sessions.get_mut(&2).unwrap().info.last_turn_at = at;
+        // A CLI that sends no hooks: the screen's Working is all there is.
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Working), StateSource::Screen, None));
+        assert!(last(&hub).is_some());
+        // A timer's Stuck (and its way out) is no request.
+        set_last(&hub, Some(1));
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Stuck), StateSource::Timer, None));
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Working), StateSource::Timer, None));
+        assert_eq!(last(&hub), Some(1));
+        // Leaving the Working that backend recovery put there (to re-read a dialog) is none either.
+        hub.inner.lock().sessions.get_mut(&2).unwrap().unverified_working = true;
+        assert!(hub.set_state_checked(2, StateUpdate::with(AgentState::NeedsApproval, "Bash"), StateSource::Screen, None));
+        assert_eq!(last(&hub), Some(1));
+        assert!(!hub.inner.lock().sessions[&2].unverified_working, "cleared by the next state");
+        // Once hooks report, they alone move it: a failed turn doesn't, a Stop does.
+        hub.inner.lock().tokens.insert("cache-token".into(), 2);
+        hub.handle_hook("cache-token", "UserPromptSubmit", serde_json::json!({"prompt": "go"})).unwrap();
+        hub.handle_hook("cache-token", "StopFailure", serde_json::json!({"error_type": "rate_limit"})).unwrap();
+        assert_eq!(last(&hub), Some(1));
+        hub.inner.lock().sessions.get_mut(&2).unwrap().last_hook_at = 1; // past the hook grace
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Working), StateSource::Screen, None));
+        assert!(hub.set_state_checked(2, StateUpdate::new(AgentState::Idle), StateSource::Screen, None));
+        assert_eq!(last(&hub), Some(1), "the screen doesn't move a hooked session's clock");
+        // A callback replayed after an outage counts from when it was captured.
+        let captured = now_ms() - 90 * 60_000;
+        hub.handle_hook_checkpoint("cache-token", "Stop", serde_json::json!({}), None, u64::MAX, Some(captured)).unwrap();
+        assert_eq!(last(&hub), Some(captured));
+        assert!(hub.cache_cold(2, now_ms()).is_some(), "a turn that ended 90 min ago is cold");
+    }
+
+    #[test]
+    fn a_closed_agents_conversation_keeps_its_cache_clock() {
+        let hub = agent_fixture();
+        hub.set_state_for_test(2, AgentState::Idle);
+        hub.inner.lock().tokens.insert("cache-token".into(), 2);
+        hub.handle_hook("cache-token", "SessionStart", serde_json::json!({"session_id": "conv-1", "source": "startup"})).unwrap();
+        hub.handle_hook("cache-token", "Stop", serde_json::json!({})).unwrap();
+        let at = hub.session(2).unwrap().last_turn_at.expect("a turn");
+        let agent = hub.agents.by_session(2).unwrap();
+        assert_eq!(agent.resume_id.as_deref(), Some("conv-1"));
+        // What remove_session does as the session goes (not called here: it deletes the shared
+        // session folder other tests use).
+        hub.save_conversation_turn(&hub.session(2).unwrap());
+        // Its next session resumes conv-1 and takes the clock back.
+        hub.agents.link_session(&hub.store, agent.id, Some(1)).unwrap();
+        assert_eq!(hub.saved_conversation_turn(1), Some(at));
     }
 }

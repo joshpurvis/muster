@@ -1714,6 +1714,8 @@ impl Store {
                     last_turn_at: r.get(21)?,
                     // Derived from the shared preferences by the hub.
                     cache_cold_at: None,
+                    cache_ttl_min: None,
+                    cache_basis: Default::default(),
                     state_seq: 0,
                     created_at: r.get(16)?,
                     window_id: r.get(17)?,
@@ -1806,6 +1808,7 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
         tx.commit()?;
         Ok(())
     }
@@ -1825,6 +1828,7 @@ impl Store {
         }
         transaction.execute("DELETE FROM sessions WHERE id=?1", [id])?;
         transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
+        transaction.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
         transaction.execute("DELETE FROM events WHERE session_id=?1", [id])?;
         transaction.commit()?;
         Ok(())

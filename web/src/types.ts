@@ -134,6 +134,9 @@ export interface SessionInfo {
   /** When the prompt cache has likely expired (`last_turn_at` + the provider's lifetime);
    * null for shells, before the first turn, or with the warning off. */
   cache_cold_at?: number | null;
+  /** The cache lifetime that applies to this run, in minutes (its kind, provider, launch
+   * environment and the prefs); null like `cache_cold_at`. */
+  cache_ttl_min?: number | null;
 }
 
 export type EventKind =

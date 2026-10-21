@@ -337,7 +337,7 @@ export function ColdChip({ ms }: { ms: number }) {
   return (
     <span
       class="ap-chip ap-chip-cold"
-      data-tip={`Sent after ${idleText(ms)} idle: the agent re-read its whole conversation uncached`}
+      data-tip={`Sent after ${idleText(ms)} idle: the agent likely re-read its whole conversation uncached`}
     >
       cold start
     </span>

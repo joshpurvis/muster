@@ -310,6 +310,8 @@ mod tests {
             live_cwd: None,
             last_turn_at: None,
             cache_cold_at: None,
+            cache_ttl_min: None,
+            cache_basis: Default::default(),
             state_seq: 0,
             created_at: 0,
             window_id: None,

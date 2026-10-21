@@ -436,6 +436,13 @@ pub struct SessionInfo {
     /// warning off. Cold while waiting (not working, starting or exited) and now >= this.
     #[serde(default)]
     pub cache_cold_at: Option<i64>,
+    /// The prompt-cache lifetime that applies to this run, in minutes (from its kind, provider,
+    /// launch environment and the shared preferences); None like `cache_cold_at`.
+    #[serde(default)]
+    pub cache_ttl_min: Option<u32>,
+    /// What this run's launch environment says about its cache (src/cache.rs). Runtime only.
+    #[serde(skip)]
+    pub cache_basis: crate::cache::CacheBasis,
 }
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).

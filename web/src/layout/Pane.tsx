@@ -711,7 +711,7 @@ function GroupTab(
       )}
       role="tab"
       aria-selected={active}
-      aria-label={tabText(label)}
+      aria-label={cold ? `${tabText(label)}, prompt cache likely expired` : tabText(label)}
       tabIndex={active ? 0 : -1}
       data-tab-sid={s.id}
       data-tip={tip}
@@ -865,15 +865,34 @@ function InputPausedBar({ s }: { s: SessionInfo }) {
   );
 }
 
+/** Idle periods (`coldKey`) whose cold bar has been announced in this page. */
+const announcedCold = new Set<string>();
+const COLD_ANNOUNCEMENT =
+  "the prompt cache has likely expired, so the next message re-reads the whole conversation at full cost.";
+
 /** The agent idled past its prompt cache's lifetime (src/cache.ts). Never takes the keyboard:
  * its buttons don't take focus on press, and the terminal keeps it. Dismissed for this idle
  * period only: it comes back once a later turn goes cold too. */
 function CacheBar({ s }: { s: SessionInfo }) {
   const agent = agentBySession.value.get(s.id);
-  const ttl = ttlFor(s, windowPrefs.value?.cache_ttl ?? DEFAULT_CACHE_TTL);
+  const key = coldKey(s);
+  // Said politely once per idle period (not on every tab switch, never the ticking time),
+  // into a live region that exists before the words do, so screen readers hear it.
+  const [say, setSay] = useState("");
+  useEffect(() => {
+    if (announcedCold.has(key)) return;
+    const t = setTimeout(() => {
+      announcedCold.add(key);
+      setSay(`${agent?.name ?? s.name}: ${COLD_ANNOUNCEMENT}`);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [key]);
+  // The backend's (it knows the launch: an API key, a CLI cache setting); else from the prefs.
+  const ttl = s.cache_ttl_min ?? ttlFor(s, windowPrefs.value?.cache_ttl ?? DEFAULT_CACHE_TTL);
   const keepFocus = (e: MouseEvent) => e.preventDefault();
   return (
     <div class="cache-bar" role="note" aria-label="Prompt cache likely expired">
+      <span class="sr-only" role="status" aria-live="polite">{say}</span>
       <span class="cache-dot" aria-hidden="true" />
       <span
         class="cache-text"

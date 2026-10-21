@@ -10,7 +10,11 @@ export const CACHE_TTL_MAX = 24 * 60;
 /** The settings dialog's rows: which field, and what it covers. */
 export const CACHE_TTL_ROWS: { key: keyof CacheTtl; label: string; hint: string }[] = [
   { key: "claude", label: "Claude on a subscription", hint: "Claude Code asks for a 1-hour cache" },
-  { key: "claude_openrouter", label: "Claude on OpenRouter", hint: "Anthropic's default, unless Claude Code asks for 1 hour" },
+  {
+    key: "claude_openrouter",
+    label: "Claude on OpenRouter or an API key",
+    hint: "Anthropic's default, unless Claude Code asks for 1 hour",
+  },
   { key: "codex", label: "Codex on a ChatGPT plan", hint: "OpenAI's API default; ChatGPT plans don't say" },
   { key: "codex_openrouter", label: "Codex on OpenRouter", hint: "OpenRouter may switch provider after 10 idle minutes" },
 ];

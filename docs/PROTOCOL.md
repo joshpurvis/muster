@@ -569,17 +569,41 @@ callback recovered after a lost acknowledgement cannot increment the count twice
 Claude and Codex cache the conversation they send their model; a request after the cache has
 expired re-reads the whole conversation at full cost. Code: `src/cache.rs`.
 
-`SessionInfo.last_turn_at` (unix ms or null) is the last model request the daemon saw for a
-Claude or Codex session: set when its state enters or leaves `working` (hooks or the screen), and
-on a turn's end even when the state was already `idle` (Claude `Stop`/`StopFailure`, Codex
-`notify` `agent-turn-complete`). It is null before the conversation's first turn and for shells.
-Claude's `SessionStart` with `source: "clear"` (`/clear`) clears it, and so does any new run
-that doesn't continue its conversation (only Claude's `--resume`/`--continue` do: a named
-Claude agent's restart keeps it). Stored with the session (migration v20), so it survives a
-backend reload and restart.
+`SessionInfo.last_turn_at` (unix ms or null) is the last model request the daemon saw succeed
+for a Claude or Codex session. Only real model activity moves it, and never backwards:
 
-`SessionInfo.cache_cold_at` = `last_turn_at` + the lifetime for the session's kind and
-`provider` from the shared preferences, or null (shells, no turn yet, or `cache_warn` off).
+- Hooks, when the CLI sends them: the model answering (`PreToolUse`, `PermissionRequest`), a
+  turn's `Stop`, Codex's `notify` `agent-turn-complete` (not its title-generation turns). A
+  subagent's hooks (`agent_id`) don't count (its own cache), nor does `StopFailure` (a rate limit
+  or auth error may never have reached the model), `UserPromptSubmit` or `PostToolUse`. A callback
+  replayed from the hook inbox after an outage counts from when the helper captured it (the inbox's
+  `captured_at`; older helpers' rows count from when they are read).
+- The screen, only for a session that has sent no hook this run: entering or leaving `working`.
+  Never a timer's `stuck` (or its way out), a process exit, or leaving the `working` that backend
+  recovery sets to re-read a saved dialog.
+
+It is null before the conversation's first turn and for shells. Claude's `SessionStart` with
+`source: "clear"` (`/clear`) clears it, and so does any new run that doesn't continue its
+conversation: only Claude's `--resume`/`--continue`, in any spelling the argument check accepts
+(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), keep it. Stored with the session (migration v20),
+so it survives a backend reload and restart. When a named agent's session is removed (its task
+closed), its conversation's clock is kept with the agent (`runtime_state` `agent-turn:<agent>`,
+with its resume id) and given back to the session that resumes that same conversation.
+
+`SessionInfo.cache_ttl_min` is the lifetime that applies to the run, and
+`SessionInfo.cache_cold_at` = `last_turn_at` + it; both null for shells, before the first turn
+(`cache_cold_at` only), or with `cache_warn` off. Claude's lifetime also follows its launch
+environment (read at each start, and from the saved launch after a backend restart; credentials
+are only tested for being set, never read or stored):
+
+- `DISABLE_PROMPT_CACHING`: no cache, so no warning; else `FORCE_PROMPT_CACHING_5M`: 5 min; else
+  `CLAUDE_CODE_PROMPT_CACHE_TTL` (`5m`, `1h`); else `ENABLE_PROMPT_CACHING_1H`: 60 min.
+- Otherwise a Claude on its subscription launched with `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` / `_FOUNDRY` bills the API and
+  gets `cache_ttl.claude_openrouter` (the API's 5 min), like OpenRouter. guess: a key set only in
+  Claude Code's own settings (`apiKeyHelper`, `settings.json` `env`) is not seen and counts as the
+  subscription.
+
 Derived, not stored: every session follows a `prefs.set` at once (`session_upserted` for each
 that changed). A session is **cold** while it waits (any state but `working`, `starting` and
 `exited`) and now >= `cache_cold_at`.
@@ -594,7 +618,7 @@ Default lifetimes (`prefs.cache_ttl`, minutes; researched 2026-10):
 | Key | Default | Source |
 |---|---|---|
 | `claude` (Claude Code, subscription) | 60 | Claude Code asks for a 1-hour cache for the main conversation while within the plan's usage (5 min on usage credits); `promptCacheTtl` / `CLAUDE_CODE_PROMPT_CACHE_TTL` change it. code.claude.com/docs/en/prompt-caching |
-| `claude_openrouter` | 5 | Anthropic's API default is 5 min; 1 h only when Claude Code is set to ask for it (`ENABLE_PROMPT_CACHING_1H`, `promptCacheTtl: "1h"`). platform.claude.com/docs/en/build-with-claude/prompt-caching, openrouter.ai/docs/features/prompt-caching |
+| `claude_openrouter` (OpenRouter, or an API key) | 5 | Anthropic's API default is 5 min; 1 h only when Claude Code is set to ask for it (`ENABLE_PROMPT_CACHING_1H`, `promptCacheTtl: "1h"`). platform.claude.com/docs/en/build-with-claude/prompt-caching, openrouter.ai/docs/features/prompt-caching |
 | `codex` (ChatGPT plan) | 30 | guess: not documented for ChatGPT plans; OpenAI's API default for GPT-5.6 and later is 30 min (a 12 h option exists but Codex doesn't ask for it). developers.openai.com/api/docs/guides/prompt-caching |
 | `codex_openrouter` | 10 | guess: OpenRouter's sticky routing ends after 10 idle minutes, after which a request may reach another provider's (cold) cache. openrouter.ai/docs/features/prompt-caching |
 
@@ -605,10 +629,12 @@ an out-of-range value or unknown key refuses the whole call.
 
 **Cold sends.** When the injector submits a prompt Muster delivers (an agent message, a
 schedule run's message, panel events; not the human's own `session.send`) to a cold session, it
-is still delivered, and recorded: the agent message gets `cold_idle_ms` (how long the agent had
-been idle; also on the `agent_message` event and in a schedule run's `message`), and the
-channel's timeline a `system` event `{text, level: "info", cold_start: {session_id, idle_ms,
-msg_id, panel}}`.
+is still delivered, and recorded just before Enter is pressed (so a crash right after can't leave
+it unmarked): the agent message gets `cold_idle_ms` (how long the agent had been idle; also on
+the `agent_message` event and in a schedule run's `message`), and the channel's timeline a
+`system` event `{text, level: "info", cold_start: {session_id, idle_ms, msg_id, panel}}`. A retry
+of the same delivery (its message, else its panel batch, else its text) is recorded once
+(`runtime_state` `cold-send:<session>`).
 
 ## Groups layout (v2)
 

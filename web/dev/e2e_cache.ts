@@ -61,6 +61,17 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   check(await a.eval(`!!document.querySelector('[data-tab-sid="${sid}"] .tab-cold')`), "the tab says cold");
   check(await a.eval(`!!document.querySelector('[data-agent="digest"] .ap-cold')`), "the agents row says cold");
   check(await a.eval(`!!${bar}.querySelector('.link-btn')`), "a named agent's bar offers Start fresh");
+  // Said politely, once, without the ticking time; the tab's name says it too.
+  await a.wait(`(${bar}.querySelector('[aria-live=polite]')?.textContent ?? "").includes("likely expired")`, 2000);
+  check(
+    !/\d+ m/.test(await a.eval(`${bar}.querySelector('[aria-live=polite]').textContent`)),
+    "the announcement has no clock in it",
+  );
+  check(
+    (await a.eval(`document.querySelector('[data-tab-sid="${sid}"]').getAttribute('aria-label')`))
+      .endsWith("prompt cache likely expired"),
+    "the tab's accessible name says cold",
+  );
   await shot("bar-window");
   await shot("bar", `.pane:has(.cache-bar) .pane-body`, 0);
   await shot("agents-row", `[data-agent="digest"]`, 6);
@@ -104,6 +115,8 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   await a.key("Enter");
   await a.wait(`!!document.querySelector('.cache-dlg')`, 2000);
   check((await a.eval(`document.querySelector('.cache-ttl-claude').value`)) === "60", "Claude: 60 minutes");
+  // Another window changes a lifetime while this dialog is open: saving here keeps it.
+  await R("prefs.set", { cache_ttl: { codex: 45 } });
   check((await a.eval(`document.querySelector('.cache-ttl-codex_openrouter').value`)) === "10", "Codex on OpenRouter: 10");
   await shot("settings", `.cache-dlg`, 8);
   const setValue = (sel: string, v: string) =>
@@ -116,8 +129,27 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   await a.click(`.cache-dlg button[type=submit]`);
   await a.wait(`!document.querySelector('.cache-dlg')`, 3000);
   await a.wait(`!${bar} && !document.querySelector('[data-tab-sid="${sid}"] .tab-cold')`, 3000);
-  check((await R("prefs.get", {})).cache_ttl.claude === 120, "saved on the backend");
+  const saved = (await R("prefs.get", {})).cache_ttl;
+  check(saved.claude === 120, "saved on the backend");
+  check(saved.codex === 45, "a field left alone keeps the other window's change");
+  await R("prefs.set", { cache_ttl: { codex: 30 } });
   ok("a longer Claude cache lifetime (2 h) makes an agent idle 1 h 20 m warm again");
+
+  // A short window: the dialog's body scrolls, Save stays on screen.
+  await a.size(1440, 600);
+  await a.key("Ctrl+Shift+P");
+  await a.wait(`!!document.querySelector('.switcher')`);
+  await a.type("Cache warning");
+  await a.sleep(150);
+  await a.key("Enter");
+  await a.wait(`!!document.querySelector('.cache-dlg')`, 2000);
+  const save = await a.rect(`.cache-dlg button[type=submit]`);
+  check(save && save.y + save.h <= 600, `Save is on screen at 600 px (${JSON.stringify(save)})`);
+  await shot("settings-600", `.cache-dlg`, 8);
+  await a.key("Escape");
+  await a.wait(`!document.querySelector('.cache-dlg')`, 2000);
+  await a.size(1440, 900);
+  ok("the settings dialog scrolls in a short window; Save stays reachable");
 
   await R("prefs.set", { cache_ttl: { claude: 60 } });
   await a.wait(`!!${bar}`, 3000);

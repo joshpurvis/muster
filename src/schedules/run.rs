@@ -86,6 +86,7 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
         }
         if plan::expires_at(&s, &f).is_some_and(|e| now >= e) && hub.schedules.expired_seen.lock().insert(s.id) {
             publish(hub, &s);
+            cancel_unsent(hub, Some(s.id), plan::EXPIRED, false);
         }
         if s.next_run.is_none_or(|t| t > now) {
             continue;
@@ -102,7 +103,7 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
 /// Runs of `schedule` whose messages reached the agent in the last 24 hours (by the time each
 /// message was sent: the daemon's clock, which agent messages are stamped with).
 fn runs_today(hub: &Hub, schedule: i64) -> anyhow::Result<u32> {
-    hub.store().count_delivered_runs_since(schedule, now_ms() - plan::DAY_MS)
+    hub.store().count_delivered_runs_since(schedule, now_ms() - plan::DAY_MS, None)
 }
 
 /// Act on schedule `id`'s due slot: claim it (with its run row) and say whether to start it.
@@ -213,7 +214,8 @@ pub(super) fn previous_running(hub: &Hub, schedule: i64, before: i64) -> anyhow:
     if hub.store().pending_runs()?.iter().any(|r| r.schedule_id == schedule && r.id < before) {
         return Ok(true);
     }
-    let sent = hub.store().runs(schedule, Some(before), 20)?.into_iter().find(|r| r.msg_id.is_some());
+    // The newest run that sent a message, however many skips came after it.
+    let sent = hub.store().latest_sent_run(schedule, before)?;
     let Some(msg) = sent.and_then(|r| r.msg_id) else { return Ok(false) };
     let st = hub.agents().msg_status(hub.store(), msg);
     if st.reply.is_some() || !st.active {
@@ -283,7 +285,8 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         };
         if run.kind != RunKind::Manual {
             let settings = sched.settings();
-            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), runs_today(hub, s.id)?) {
+            let since = s.last_sent.map(|t| now_ms() - t);
+            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), runs_today(hub, s.id)?, since) {
                 Some(Action::Skip(why)) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
                 Some(Action::Refuse(why)) => return finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
                 _ => {}
@@ -337,6 +340,11 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
             }
         }
     };
+    // Its prompt may already have been taken back at the submission check (an idle agent takes
+    // it at once): then the run has ended, and stays as it was recorded.
+    if hub.store().run(run.id)?.is_none_or(|r| r.outcome != Outcome::Pending) {
+        return Ok(());
+    }
     run.msg_id = Some(d.msg_id);
     hub.store().update_run(&run)?;
     publish_run(hub, &run);
@@ -354,14 +362,32 @@ async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Resu
     // The hour for the reply counts from when the message was sent, across restarts.
     let left = (m.created_at + plan::RUN_TIMEOUT_MS - now_ms()).max(1000);
     let mut rx = hub.subscribe();
-    let waited = crate::agents::wait_for_reply(
-        &mut rx,
-        sid,
-        Duration::from_millis(left as u64),
-        || hub.session(sid),
-        || hub.agents().msg_status(hub.store(), msg),
-    )
-    .await;
+    // Woken when the prompt is taken back before it was submitted (`unsent`): that ends the run.
+    let woken = hub.schedules.waiters.lock().entry(run.id).or_default().clone();
+    let waited = tokio::select! {
+        w = crate::agents::wait_for_reply(
+            &mut rx,
+            sid,
+            Duration::from_millis(left as u64),
+            || hub.session(sid),
+            || hub.agents().msg_status(hub.store(), msg),
+        ) => w,
+        _ = woken.notified() => {
+            hub.schedules.waiters.lock().remove(&run.id);
+            return Ok(());
+        }
+    };
+    hub.schedules.waiters.lock().remove(&run.id);
+    // Never submitted within the hour (an unsent draft in the agent's input box kept it
+    // waiting): take it back, so clearing the draft later can't run it after all.
+    if matches!(waited, Ok((_, AskVerdict::Wait, _))) {
+        let st = hub.agents().msg_status(hub.store(), msg);
+        if st.delivered_at.is_none() && st.reply.is_none() && crate::inject::drop_message(hub, msg).unwrap_or(false) {
+            unsent(hub, msg, Action::Skip(format!("its prompt waited in the agent's queue for {} minutes without being submitted",
+                plan::RUN_TIMEOUT_MS / 60_000)));
+            return Ok(());
+        }
+    }
     let (outcome, reason) = match waited {
         Err(e) => (Outcome::Ended, Some(e)),
         Ok((info, v, _)) => match v {
@@ -379,23 +405,98 @@ async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Resu
 }
 
 /// Record the outcome, then alert and file the reply as the schedule says.
-fn finish(hub: &Arc<Hub>, s: &Schedule, run: &mut Run, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
+fn finish(hub: &Hub, s: &Schedule, run: &mut Run, outcome: Outcome, reason: Option<String>) -> anyhow::Result<()> {
     run.outcome = outcome;
     run.reason = reason;
     run.finished_at = Some(hub.schedules.now());
     hub.store().update_run(run)?;
     let agent = hub.agents().by_id(s.agent_id).map(|a| a.name).unwrap_or_else(|| "?".into());
-    if outcome == Outcome::Replied
-        && let Some(note) = s.note_id
-        && let Err(e) = reply_to_note(hub, s, &agent, run, note)
-    {
-        let why = format!("{e:#}");
-        tracing::warn!(schedule = s.id, "putting the reply in note {note}: {why}");
-        hub.notice("warn", format!("{agent}: couldn't add the reply of \"{}\" to its note: {why}", s.name));
+    if outcome == Outcome::Replied {
+        reply_to_note_once(hub, s, run);
     }
     publish_run(hub, run);
     notify_outcome(hub, s, &agent, run, false);
     Ok(())
+}
+
+/// Put run `run`'s reply in its schedule's note, at most once per run (the run waiting for its
+/// reply and a reply that arrives after it stopped waiting both come here).
+pub(super) fn reply_to_note_once(hub: &Hub, s: &Schedule, run: &Run) {
+    let Some(note) = s.note_id else { return };
+    let has_reply = run.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten()).is_some_and(|m| m.reply.is_some());
+    if !has_reply {
+        return;
+    }
+    match hub.store().mark_run_noted(run.id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => return tracing::warn!(run = run.id, "marking its reply noted: {e:#}"),
+    }
+    let agent = hub.agents().by_id(s.agent_id).map(|a| a.name).unwrap_or_else(|| "?".into());
+    if let Err(e) = reply_to_note(hub, s, &agent, run, note) {
+        let why = format!("{e:#}");
+        tracing::warn!(schedule = s.id, "putting the reply in note {note}: {why}");
+        hub.notice("warn", format!("{agent}: couldn't add the reply of \"{}\" to its note: {why}", s.name));
+    }
+}
+
+/// A run's prompt was taken back before it was submitted (the submission check said no, or it
+/// waited too long): the message is forgotten (it never reached the agent, so it counts toward
+/// no cap) and the run ends skipped or refused, waking its waiting task.
+pub(super) fn unsent(hub: &Hub, msg: i64, action: Action) {
+    let from = hub.store().agent_message(msg).ok().flatten().map(|m| m.from).unwrap_or_default();
+    let Some(mut run) = run_for_msg(hub, msg, &from) else {
+        let _ = hub.store().delete_agent_message(msg);
+        return;
+    };
+    let _ = hub.store().delete_agent_message(msg);
+    let _ = hub.store().clear_run_msg(run.id);
+    run.msg_id = None;
+    let (outcome, why) = match action {
+        Action::Refuse(w) => (Outcome::Refused, w),
+        Action::Skip(w) => (Outcome::Skipped, w),
+        Action::Fire(_) => (Outcome::Skipped, "it was taken back".to_string()),
+    };
+    if let Some(s) = hub.schedules.get(run.schedule_id) {
+        let _ = finish(hub, &s, &mut run, outcome, Some(format!("not sent: {why}")));
+    } else {
+        run.outcome = outcome;
+        run.reason = Some(format!("not sent: {why}"));
+        run.finished_at = Some(hub.schedules.now());
+        let _ = hub.store().update_run(&run);
+    }
+    if let Some(w) = hub.schedules.waiters.lock().remove(&run.id) {
+        w.notify_one();
+    }
+}
+
+/// The run that sent message `msg` (sender `from`). The prompt can reach the injector before
+/// the run row records the message id (an idle agent takes it at once): then it is that
+/// schedule's pending run that hasn't recorded a message yet (one run of a schedule sends at a
+/// time: `previous_running`).
+pub(super) fn run_for_msg(hub: &Hub, msg: i64, from: &str) -> Option<Run> {
+    if let Ok(Some(r)) = hub.store().run_by_msg(msg) {
+        return Some(r);
+    }
+    let schedule: i64 = from.strip_prefix("schedule:")?.parse().ok()?;
+    hub.store().pending_runs().ok()?.into_iter().filter(|r| r.schedule_id == schedule && r.msg_id.is_none()).max_by_key(|r| r.id)
+}
+
+/// Take back the prompts of pending runs (of `schedule`, else of every schedule) that are still
+/// waiting in an agent's prompt queue, unsubmitted: paused, removed or expired, they mustn't go
+/// out later. Run now's prompts are the human's and stay, unless the schedule is removed.
+pub(super) fn cancel_unsent(hub: &Hub, schedule: Option<i64>, why: &str, manual_too: bool) {
+    let Ok(pending) = hub.store().pending_runs() else { return };
+    for r in pending {
+        if schedule.is_some_and(|s| s != r.schedule_id) || (r.kind == RunKind::Manual && !manual_too) {
+            continue;
+        }
+        let Some(msg) = r.msg_id else { continue };
+        let st = hub.agents().msg_status(hub.store(), msg);
+        if st.delivered_at.is_none() && st.reply.is_none() && crate::inject::drop_message(hub, msg).unwrap_or(false) {
+            unsent(hub, msg, Action::Skip(why.to_string()));
+        }
+    }
 }
 
 fn reply_to_note(hub: &Hub, s: &Schedule, agent: &str, run: &Run, note: NoteId) -> anyhow::Result<()> {

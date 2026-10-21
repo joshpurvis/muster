@@ -385,9 +385,11 @@ const MIGRATIONS: &[&str] = &[
         msg_id INTEGER,
         outcome TEXT NOT NULL,
         reason TEXT,
-        finished_at INTEGER
+        finished_at INTEGER,
+        noted INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX schedule_runs_schedule ON schedule_runs(schedule_id, id);
+    CREATE INDEX schedule_runs_msg ON schedule_runs(msg_id);
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind != 'manual';
     "#,
 ];
@@ -1323,16 +1325,47 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Runs of `schedule` whose message was sent at or after `since` (unix ms on the daemon's
-    /// clock: the message's own time, not when the run was taken up).
-    pub fn count_delivered_runs_since(&self, schedule: i64, since: i64) -> anyhow::Result<u32> {
+    /// Timed runs of `schedule` (not Run now: the schedule's own cap is about its timing; the
+    /// agent's caps count every message) whose message was sent at or after `since` (unix ms on
+    /// the daemon's clock: the message's own time, not when the run was taken up), leaving out
+    /// message `except` (the one about to be submitted).
+    pub fn count_delivered_runs_since(&self, schedule: i64, since: i64, except: Option<i64>) -> anyhow::Result<u32> {
         let n: i64 = self.conn.lock().query_row(
             "SELECT COUNT(*) FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
-             WHERE r.schedule_id = ?1 AND m.created_at >= ?2",
-            params![schedule, since],
+             WHERE r.schedule_id = ?1 AND m.created_at >= ?2 AND r.kind != 'manual' AND (?3 IS NULL OR m.id != ?3)",
+            params![schedule, since, except],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as u32)
+    }
+
+    /// The run whose message is `msg`.
+    pub fn run_by_msg(&self, msg: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(&format!("SELECT {} FROM schedule_runs WHERE msg_id = ?1", Self::RUN_COLUMNS), [msg], Self::row_run)
+            .optional()?)
+    }
+
+    /// The newest run of `schedule` below run `before` that sent a message.
+    pub fn latest_sent_run(&self, schedule: i64, before: i64) -> anyhow::Result<Option<crate::schedules::Run>> {
+        let conn = self.conn.lock();
+        Ok(conn.query_row(
+            &format!("SELECT {} FROM schedule_runs WHERE schedule_id = ?1 AND id < ?2 AND msg_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                Self::RUN_COLUMNS),
+            params![schedule, before],
+            Self::row_run,
+        ).optional()?)
+    }
+
+    /// Mark run `id`'s reply as put in its note; true only for the first caller.
+    pub fn mark_run_noted(&self, id: i64) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute("UPDATE schedule_runs SET noted = 1 WHERE id = ?1 AND noted = 0", [id])? == 1)
+    }
+
+    /// Run `id` no longer has a message (it was never typed and was taken back).
+    pub fn clear_run_msg(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE schedule_runs SET msg_id = NULL WHERE id = ?1", [id])?;
+        Ok(())
     }
 
     /// The newest delivered run of `schedule` (for `{last_run}` / `{last_reply}`), and the newest

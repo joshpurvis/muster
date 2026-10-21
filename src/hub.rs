@@ -3627,7 +3627,10 @@ impl Hub {
             (info, from, fx)
         };
         let id = info.id;
-        if let Some(m) = fx.replied { crate::agents::publish_message(self, m); }
+        if let Some(m) = fx.replied {
+            crate::agents::publish_message(self, m);
+            crate::schedules::on_reply(self, m);
+        }
         if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
         self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
             serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));

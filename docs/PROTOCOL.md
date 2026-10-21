@@ -430,8 +430,10 @@ Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
 (sent, finished), and `schedule_settings` (`ScheduleSettings`).
 
-**Timing.** As in Vixie cron, when both day fields are restricted a day matches either; only a
-bare `*` leaves a day field open (`*/2` restricts it). A cron line is read in the schedule's time zone, so 09:00 stays 09:00 across daylight
+**Timing.** The day rule is Vixie cron's, as cronie has it: a day field written starting with
+`*` (`*`, `*/2`) is a wildcard, and then a day must match both fields (`*/2` with `*` is odd days,
+`*/1` with `mon` is Mondays); when neither is a wildcard a day matches either (`1-31` with `mon`
+is every day). A cron line is read in the schedule's time zone, so 09:00 stays 09:00 across daylight
 saving: a time skipped when the clocks go forward runs just after the change (02:30 becomes
 03:30), and a time that happens twice when they go back runs once, the first time. The
 scheduler sleeps on the monotonic clock until the next slot, at most a minute at a time, then
@@ -449,10 +451,12 @@ once per paused stretch); a slot more than 10 minutes late (Muster was off or as
 "If missed": `auto` runs once (the newest missed slot, as a `catch_up` run) for one-offs and
 schedules that run less often than hourly, and skips (`missed: … (N runs)`) for hourly-or-faster
 ones; Skip next skips that one occurrence (a later catch-up still runs); a slot less than 15
-minutes after the last one that ran is skipped (`too soon…`: daylight-saving changes can bunch a
+minutes after the last one that ran, or after this schedule's last prompt was actually
+submitted, is skipped (`too soon…`: daylight-saving changes can bunch a
 cron line's times); quiet hours skip it (`quiet hours (23:00–07:00)`, checked at the slot's
 time, or for a catch-up at the time it would run, in this machine's zone); the schedule's daily
-cap refuses it. Otherwise it runs.
+cap (timed runs only: Run now doesn't count toward it, only toward the agent's caps) refuses it.
+Otherwise it runs.
 
 **A run.** Skipped when the same schedule's previous run is still going: pending, or sent and its
 turn still running in the agent although the run stopped waiting for it (timed out, or blocked on
@@ -469,12 +473,19 @@ between turns and the human hasn't typed into it in the last two minutes; otherw
 back in line. The prompt's `{date}` (the slot's date in the schedule's zone), `{last_run}` (the
 previous run that reached the agent, `YYYY-MM-DD HH:MM`, or "never") and `{last_reply}` (the
 newest reply, up to 4000 bytes, quoted line by line under a label saying it is earlier output and
-data, not instructions) are filled in. Every message muster delivers to an agent is plain text
+data, not instructions) are filled in. A prompt can still wait in the agent's prompt queue (an
+unsent draft in its input box holds it): right before it is typed and again right before Enter,
+a schedule's prompt is checked once more (its run still pending, its schedule there, and for a
+timed run the same rules as above); one that may no longer go is taken back, never typed, and
+the run ends `skipped: not sent: …` (its message is forgotten and counts toward no cap). Pausing a
+schedule (or all), removing it or its expiry also take back its prompts still waiting, and so does
+the end of the hour for the reply. Every message muster delivers to an agent is plain text
 (control characters dropped), so stored text can't end a bracketed paste or press keys. The run
 then waits for the reply until an hour after the message was sent (across restarts) and ends `replied`, `blocked` (an approval prompt, a question
 or an error: never approved for you), `no_reply`, `ended`, `timed_out`, `refused` (with the
 agent's reason) or `failed`. A reply is also appended to the schedule's note, if it has one,
-under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent. "Notify me": an in-app
+under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent, exactly once per run, also
+when the reply comes after the run stopped waiting for it. "Notify me": an in-app
 notice and a desktop notification on failure (blocked, no reply, ended, timed out, refused,
 failed), on every outcome (`always`), or never. A backend restart picks up unfinished runs: one
 already sent waits for its reply again; one whose message was recorded but never typed and is in

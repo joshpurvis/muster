@@ -200,9 +200,11 @@ fn cap_reason(cap: u32) -> String {
     format!("daily cap: {cap} runs in the last 24 hours")
 }
 
-/// Just before an automatic run is sent (after waiting in line or for its catch-up turn): the
-/// rules that may have changed meanwhile. `Some(Action::Skip | Action::Refuse)`: don't send.
-pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32) -> Option<Action> {
+/// Just before an automatic run is sent, and again right before its prompt is submitted (it may
+/// wait in the agent's prompt queue behind an unsent draft): the rules that may have changed
+/// meanwhile. `since_sent`: how long ago this schedule's previous message was submitted.
+/// `Some(Action::Skip | Action::Refuse)`: don't send.
+pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32, since_sent: Option<i64>) -> Option<Action> {
     if expires_at(s, f).is_some_and(|e| now >= e) {
         return Some(Action::Skip(EXPIRED.into()));
     }
@@ -219,6 +221,14 @@ pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &
         && runs_today >= cap
     {
         return Some(Action::Refuse(cap_reason(cap)));
+    }
+    // The floor by when messages were actually submitted: a run that went out late doesn't
+    // let the next slot follow it within the 15 minutes.
+    if since_sent.is_some_and(|d| d < MIN_GAP_MS) {
+        return Some(Action::Skip(format!(
+            "too soon after the previous run was sent (schedules run at most every {} minutes)",
+            MIN_GAP_MS / MINUTE_MS
+        )));
     }
     None
 }

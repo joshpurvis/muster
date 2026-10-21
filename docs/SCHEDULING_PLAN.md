@@ -25,8 +25,13 @@ panel". Choices made while building it:
   each schedule chooses whether it respects them. Run now ignores quiet hours and the
   schedule's own daily cap, but not the agent's caps.
 - "Fresh each run" never restarts within two minutes of the human typing into the agent.
-- A slot less than 15 minutes after the last run is skipped when it comes, even where a
-  daylight-saving change bunches a cron line's times.
+- A slot less than 15 minutes after the last run (its slot, or when its prompt was really
+  submitted) is skipped when it comes, even where a daylight-saving change bunches a cron line's
+  times.
+- Cron's day rule is cronie's: a day field starting with `*` is a wildcard, and then both day
+  fields must match.
+- A schedule's prompt that waits in the agent's queue is checked again right before it is typed
+  and before Enter; paused, removed, expired or out of time, it is taken back, never typed.
 - `{last_reply}` is quoted and labelled as earlier output (data, not instructions).
 - Each run is one row in a small runs table (time, outcome, reason) pointing at its agent
   message, which keeps the text and the reply.

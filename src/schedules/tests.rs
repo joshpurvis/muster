@@ -207,7 +207,7 @@ fn a_catch_up_after_the_seven_days_is_expired() {
     let s = Schedule { renewed_at: made, ..cron_at("0 9 * * *", at(LONDON, "2026-10-18T09:00")) };
     let d = plan::due(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0, None).unwrap();
     assert_eq!(d.action, Action::Skip(plan::EXPIRED.into()));
-    assert_eq!(plan::still_ok(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0),
+    assert_eq!(plan::still_ok(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0, None),
         Some(Action::Skip(plan::EXPIRED.into())), "and a run still waiting when it expires");
 }
 
@@ -215,16 +215,61 @@ fn a_catch_up_after_the_seven_days_is_expired() {
 fn rules_are_checked_again_before_sending() {
     let s = cron_at("0 9 * * *", 0);
     let now = at(LONDON, "2026-10-19T09:30");
-    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0), None);
+    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, None), None);
     let paused_all = Settings { paused: true, ..Settings::default() };
-    assert_eq!(plan::still_ok(&s, now, &paused_all, &quiet_london(), &Facts::default(), 0), Some(Action::Skip(plan::PAUSED_ALL.into())));
+    assert_eq!(plan::still_ok(&s, now, &paused_all, &quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(plan::PAUSED_ALL.into())));
     let paused = Schedule { paused: true, ..s.clone() };
-    assert_eq!(plan::still_ok(&paused, now, &Settings::default(), &quiet_london(), &Facts::default(), 0), Some(Action::Skip(plan::PAUSED.into())));
+    assert_eq!(plan::still_ok(&paused, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(plan::PAUSED.into())));
     let quiet = Schedule { quiet_hours: true, ..s.clone() };
-    assert!(matches!(plan::still_ok(&quiet, at(LONDON, "2026-10-19T23:30"), &Settings::default(), &quiet_london(), &Facts::default(), 0),
+    assert!(matches!(plan::still_ok(&quiet, at(LONDON, "2026-10-19T23:30"), &Settings::default(), &quiet_london(), &Facts::default(), 0, None),
         Some(Action::Skip(ref r)) if r.starts_with("quiet")));
     let capped = Schedule { daily_cap: Some(1), ..s };
-    assert!(matches!(plan::still_ok(&capped, now, &Settings::default(), &quiet_london(), &Facts::default(), 1), Some(Action::Refuse(_))));
+    assert!(matches!(plan::still_ok(&capped, now, &Settings::default(), &quiet_london(), &Facts::default(), 1, None), Some(Action::Refuse(_))));
+}
+
+#[test]
+fn the_floor_counts_from_when_the_last_prompt_went_out() {
+    // The 09:00 run went out at 09:14:30; the 09:15 run would follow 30 s later.
+    let s = cron_at("*/15 * * * *", 0);
+    let now = at(LONDON, "2026-10-19T09:15");
+    assert!(matches!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, Some(30_000)),
+        Some(Action::Skip(ref r)) if r.starts_with("too soon after the previous run was sent")));
+    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, Some(15 * plan::MINUTE_MS)), None);
+}
+
+#[test]
+fn run_history_queries() {
+    let store = crate::store::Store::open_memory().unwrap();
+    let a = agent("w", SessionKind::Codex, Provider::Subscription, vec![Origin::Human, Origin::Schedule]);
+    let aid = store.insert_agent(&a).unwrap();
+    let a = Agent { id: aid, ..a };
+    let s = Schedule { agent_id: aid, ..cron_at("0 9 * * *", 1) };
+    let id = store.insert_schedule(&s).unwrap();
+    let s = Schedule { id, ..s };
+    let route = crate::agents::Route { origin: Origin::Schedule, hop: 0, reply_to: None };
+    let mut msg = |kind: RunKind, slot: i64| {
+        let m = store.insert_agent_message(&crate::agents::message_record(&a, "schedule:1", None, route, "x")).unwrap();
+        let r = Run { id: 0, schedule_id: id, slot, kind, started_at: 1, msg_id: Some(m), outcome: Outcome::Replied, reason: None, finished_at: Some(2) };
+        (store.insert_run(&r).unwrap(), m)
+    };
+    let (first, first_msg) = msg(RunKind::Scheduled, 10);
+    msg(RunKind::Manual, 11);
+    // Run now doesn't count toward the schedule's own daily cap.
+    assert_eq!(store.count_delivered_runs_since(id, 0, None).unwrap(), 1);
+    assert_eq!(store.count_delivered_runs_since(id, 0, Some(first_msg)).unwrap(), 0);
+    // 30 skips later, the newest run that sent a message is still found.
+    for n in 0..30 {
+        let skip = Run { id: 0, schedule_id: id, slot: 100 + n, kind: RunKind::Scheduled, started_at: 1, msg_id: None,
+            outcome: Outcome::Skipped, reason: Some("busy".into()), finished_at: Some(1) };
+        store.claim_run(&s, &skip).unwrap();
+    }
+    let latest = store.latest_sent_run(id, i64::MAX).unwrap().unwrap();
+    assert_eq!(latest.kind, RunKind::Manual);
+    assert_eq!(store.latest_sent_run(id, latest.id).unwrap().unwrap().id, first);
+    assert_eq!(store.run_by_msg(first_msg).unwrap().unwrap().id, first);
+    // A reply goes to the note once, whoever asks first.
+    assert!(store.mark_run_noted(first).unwrap());
+    assert!(!store.mark_run_noted(first).unwrap());
 }
 
 #[test]

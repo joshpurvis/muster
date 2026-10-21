@@ -156,6 +156,9 @@ pub struct Schedule {
     pub last_slot: Option<i64>,
     /// The newest slot that ran (the 15-minute floor counts from it).
     pub last_fired: Option<i64>,
+    /// When this schedule's newest message was submitted to the agent (unix ms, daemon clock):
+    /// the floor also counts from it, so a late run doesn't let the next slot follow at once.
+    pub last_sent: Option<i64>,
     /// Start of the 7-day window of a Claude subscription agent's recurring schedule.
     pub renewed_at: i64,
     /// The "expires tomorrow" notice was given for this window.
@@ -184,6 +187,7 @@ impl Default for Schedule {
             next_run: None,
             last_slot: None,
             last_fired: None,
+            last_sent: None,
             renewed_at: 0,
             expiry_warned: false,
             created_at: 0,
@@ -372,6 +376,9 @@ pub struct Schedules {
     started_at: std::sync::atomic::AtomicI64,
     /// Schedules already announced as expired (`run::tick`), so clients hear of it once.
     pub(crate) expired_seen: Mutex<std::collections::HashSet<i64>>,
+    /// Runs waiting for their reply, woken when the run is ended elsewhere (its prompt was
+    /// taken back before it was submitted).
+    pub(crate) waiters: Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>,
 }
 
 impl Schedules {
@@ -388,6 +395,7 @@ impl Schedules {
             catchup: Default::default(),
             started_at: started_at.into(),
             expired_seen: Default::default(),
+            waiters: Default::default(),
         })
     }
 
@@ -772,6 +780,7 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         next_run: next,
         last_slot: None,
         last_fired: None,
+        last_sent: None,
         renewed_at: now,
         expiry_warned: false,
         created_at: now,
@@ -855,6 +864,7 @@ pub fn remove(hub: &Hub, id: i64) -> anyhow::Result<Value> {
         s
     };
     hub.emit(ServerEvent::ScheduleRemoved { id, agent_id: s.agent_id });
+    run::cancel_unsent(hub, Some(id), "its schedule was removed", true);
     Ok(json!({ "removed": id }))
 }
 
@@ -881,6 +891,9 @@ pub fn set_paused(hub: &Hub, id: i64, paused: bool) -> anyhow::Result<Value> {
         s.paused = paused;
         Ok(())
     })?;
+    if paused {
+        run::cancel_unsent(hub, Some(id), plan::PAUSED, false);
+    }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
@@ -1024,6 +1037,9 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
         next
     };
     hub.schedules.wake.notify_one();
+    if next.paused {
+        run::cancel_unsent(hub, None, plan::PAUSED_ALL, false);
+    }
     let v = settings_json(&next);
     hub.emit(ServerEvent::ScheduleSettings(v.clone()));
     // Every schedule's status may read differently (paused for all).
@@ -1065,6 +1081,68 @@ pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
         run::spawn_execute(hub.clone(), r.clone());
     }
     Ok(run_json(hub, &r))
+}
+
+/// The injector is about to submit a prompt from `source` (and checks again right before
+/// Enter). For a schedule's message: may it still go? `Some(action)`: no, and why. The run must
+/// still be pending (not timed out, its schedule not removed) and, for a timed run, its rules
+/// must still hold now (`plan::still_ok`), as when it was taken up. Allowed: the time is kept
+/// for the 15-minute floor. Any other prompt: `None`.
+pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> Option<plan::Action> {
+    let crate::agents::Source::Chain(p) = source else { return None };
+    let msg = p.msg_id?;
+    if p.origin != Origin::Schedule || p.hop != 0 {
+        return None;
+    }
+    let m = hub.store().agent_message(msg).ok().flatten()?;
+    if !m.from.starts_with("schedule:") {
+        return None;
+    }
+    let deny = |why: &str| Some(plan::Action::Skip(why.to_string()));
+    let Some(r) = run::run_for_msg(hub, msg, &m.from) else { return deny("its schedule was removed") };
+    if r.outcome != Outcome::Pending {
+        return deny("its run had already ended before the prompt could be submitted");
+    }
+    let Some(s) = hub.schedules.get(r.schedule_id) else { return deny("its schedule was removed") };
+    let Some(agent) = hub.agents().by_id(s.agent_id) else { return deny("its agent was removed") };
+    if r.kind != RunKind::Manual {
+        let settings = hub.schedules.settings();
+        let today = hub.store().count_delivered_runs_since(s.id, now_ms() - plan::DAY_MS, Some(msg)).unwrap_or(0);
+        let since = s.last_sent.map(|t| now_ms() - t);
+        if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts(hub, &agent), today, since) {
+            return Some(a);
+        }
+    }
+    // Recorded at the last check, right before Enter, for timed runs (Run now is the human's).
+    if commit
+        && r.kind != RunKind::Manual
+        && let Err(e) = hub.schedules.edit(s.id, |x| {
+            x.last_sent = Some(now_ms());
+            Ok(())
+        })
+    {
+        tracing::warn!(schedule = s.id, "recording when its prompt went out: {e:#}");
+    }
+    None
+}
+
+/// The injector took a schedule's prompt back without submitting it (`submit_gate` said no).
+pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, action: plan::Action) {
+    let crate::agents::Source::Chain(p) = source else { return };
+    let Some(msg) = p.msg_id else { return };
+    run::unsent(hub, msg, action);
+}
+
+/// A reply arrived for agent message `msg` (the hook handler): a schedule run's reply goes to
+/// its note even when the run had stopped waiting for it, once.
+pub fn on_reply(hub: &Hub, msg: i64) {
+    let Ok(Some(r)) = hub.store().run_by_msg(msg) else { return };
+    let Some(s) = hub.schedules.get(r.schedule_id) else { return };
+    run::reply_to_note_once(hub, &s, &r);
+    if r.outcome != Outcome::Pending {
+        // Its history line now reads "replied" (late).
+        publish_run(hub, &r);
+    }
 }
 
 /// Start the scheduler (once, at daemon start, after agents autostart is under way).

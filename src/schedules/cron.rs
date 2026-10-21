@@ -5,9 +5,10 @@
 //!
 //! Syntax: `*`, numbers, ranges `a-b`, steps `*/n` and `a-b/n`, lists `a,b`, month names
 //! (`jan`…`dec`) and day names (`sun`…`sat`; 0 and 7 are Sunday), and the macros `@hourly`,
-//! `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. As in Vixie cron, when
-//! both day fields are restricted a day matches either of them; only a bare `*` leaves a day
-//! field unrestricted (a step such as `*/2` restricts it).
+//! `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. The day rule is
+//! Vixie cron's (as cronie has it): a day field written starting with `*` (`*`, `*/2`) is a
+//! wildcard, and then a day must match both fields (`*/2` still selects odd days); when neither
+//! is a wildcard, a day matches either (`1-31` with `mon` is every day).
 //!
 //! Daylight saving: a time that doesn't exist that day (the clocks went forward) fires at the
 //! same wall-clock offset after the change (02:30 becomes 03:30); a time that happens twice (the
@@ -131,10 +132,10 @@ impl Cron {
             dom,
             months,
             dow: dow as u8,
-            // Only a bare `*` leaves a day field open: `*/2` is a restriction like any other
-            // (so `0 9 */2 * 1` is every other day of the month, or a Monday).
-            dom_star: parts[2] == "*",
-            dow_star: parts[4] == "*",
+            // As cronie (entry.c, cron.c): a day field written starting with `*` (`*`, `*/2`)
+            // is a wildcard for the day rule, kept apart from the values it selects.
+            dom_star: parts[2].starts_with('*'),
+            dow_star: parts[4].starts_with('*'),
         };
         // `0 0 31 2 *` never happens: say so now rather than never firing.
         if !c.dom_star && c.dow_star {
@@ -159,12 +160,9 @@ impl Cron {
         }
         let dom = self.dom & (1 << d.day() as u32) != 0;
         let dow = self.dow & (1 << d.weekday().to_sunday_zero_offset() as u32) != 0;
-        match (self.dom_star, self.dow_star) {
-            (true, true) => true,
-            (true, false) => dow,
-            (false, true) => dom,
-            (false, false) => dom || dow,
-        }
+        // cronie: if either day field is a wildcard, both must match (a `*/2` still selects its
+        // days); if both are restricted, either may.
+        if self.dom_star || self.dow_star { dom && dow } else { dom || dow }
     }
 
     /// Matching wall-clock times from `start` (inclusive), in order, for `HORIZON_DAYS`.
@@ -265,11 +263,18 @@ impl Cron {
         let days = {
             let dow = self.dow_phrase();
             let dom = self.dom_phrase();
-            match (self.dom_star, self.dow_star) {
-                (true, true) => "every day".to_string(),
-                (true, false) => dow,
-                (false, true) => dom,
-                (false, false) => format!("{dom} or {dow}"),
+            let all_dom = bits_list(self.dom as u64, 1, 31).len() == 31;
+            let all_dow = self.dow & 0x7f == 0x7f;
+            if self.dom_star || self.dow_star {
+                // Both must match: name the fields that restrict anything.
+                match (all_dom, all_dow) {
+                    (true, true) => "every day".to_string(),
+                    (true, false) => dow,
+                    (false, true) => dom,
+                    (false, false) => format!("{dom}, if it is {}", dow.trim_start_matches("on ")),
+                }
+            } else {
+                format!("{dom} or {dow}")
             }
         };
         let months = bits_list(self.months as u64, 1, 12);
@@ -405,6 +410,9 @@ mod tests {
         assert_eq!(r("0 9 1 * *"), "At 09:00, on day 1 of the month");
         assert_eq!(r("0 9 1,15 1,7 *"), "At 09:00, on days 1 and 15 of the month, in January and July");
         assert_eq!(r("0 9 1 * 1"), "At 09:00, on day 1 of the month or on Monday");
+        assert_eq!(r("0 9 */1 * 1"), "At 09:00, on Monday");
+        assert_eq!(r("0 9 */10 * *"), "At 09:00, on days 1, 11, 21 and 31 of the month");
+        assert_eq!(r("0 9 */2 * 1"), "At 09:00, on days 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29 and 31 of the month, if it is Monday");
         assert_eq!(r("0-10 9 * * *"), "At minute 0-10 past hour 9, every day");
     }
 
@@ -473,17 +481,24 @@ mod tests {
     }
 
     #[test]
-    fn a_stepped_day_field_restricts_the_days() {
+    fn the_day_rule_follows_cronie() {
         let tz = zone("UTC").unwrap();
-        // Every other day of the month (odd days), not every day.
-        let c = Cron::parse("0 9 */2 * *").unwrap();
-        let a = c.next_after(&tz, ms(&tz, "2026-10-20T10:00")).unwrap();
-        assert_eq!(fmt(&tz, a), "2026-10-21 09:00 UTC");
-        assert_eq!(fmt(&tz, c.next_after(&tz, a).unwrap()), "2026-10-23 09:00 UTC");
-        // Both restricted: either matches (a Monday, or an odd day).
-        let c = Cron::parse("0 9 */2 * 1").unwrap();
-        assert_eq!(fmt(&tz, c.next_after(&tz, ms(&tz, "2026-10-23T10:00")).unwrap()), "2026-10-25 09:00 UTC");
-        assert_eq!(fmt(&tz, c.next_after(&tz, ms(&tz, "2026-10-25T10:00")).unwrap()), "2026-10-26 09:00 UTC");
+        let next = |line: &str, from: &str| fmt(&tz, Cron::parse(line).unwrap().next_after(&tz, ms(&tz, from)).unwrap());
+        // `*/2` with `*`: odd days of the month (2026-10-20 is a Tuesday).
+        assert_eq!(next("0 9 */2 * *", "2026-10-20T10:00"), "2026-10-21 09:00 UTC");
+        assert_eq!(next("0 9 */2 * *", "2026-10-21T10:00"), "2026-10-23 09:00 UTC");
+        // `*/1` (a wildcard) with Monday: Mondays only, never daily.
+        assert_eq!(next("0 9 */1 * MON", "2026-10-20T10:00"), "2026-10-26 09:00 UTC");
+        // `*/2` with Monday: both must match, an odd day that is a Monday (the 9th).
+        assert_eq!(next("0 9 */2 * 1", "2026-10-20T10:00"), "2026-11-09 09:00 UTC");
+        // `1-31` isn't a wildcard: with Monday it is every day (either matches), as in cronie.
+        assert_eq!(next("0 9 1-31 * 1", "2026-10-20T10:00"), "2026-10-21 09:00 UTC");
+        // Day-of-week only: Mondays; and with a stepped weekday wildcard: every other weekday
+        // from Sunday (Sun, Tue, Thu, Sat).
+        assert_eq!(next("0 9 * * 1", "2026-10-20T10:00"), "2026-10-26 09:00 UTC");
+        assert_eq!(next("0 9 * * */2", "2026-10-20T10:00"), "2026-10-22 09:00 UTC");
+        // Day-of-month only.
+        assert_eq!(next("0 9 15 * *", "2026-10-20T10:00"), "2026-11-15 09:00 UTC");
     }
 
     #[test]

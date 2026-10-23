@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::broadcast;
 
+use crate::replay::{self, LogMarks, Mark};
 use crate::{ScreenSnapshot, SessionId, TerminalEvent, EventSink, now_ms};
 
 /// Raw output kept for replay (and persisted as output.log).
@@ -30,22 +31,24 @@ const OUTPUT_BROADCAST_CAP: usize = 1024;
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// An immutable replay checkpoint. The owner stores the body separately from
-/// the small mode/offset metadata, avoiding JSON expansion of terminal bytes.
+/// the small size/offset metadata, avoiding JSON expansion of terminal bytes.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ReplaySnapshot {
     #[serde(skip)]
     pub body: Vec<u8>,
-    input_modes: Vec<u8>,
-    alternate_screen: bool,
+    /// Raw output offset of the body's first byte.
+    start: u64,
+    marks: Vec<Mark>,
+    cols: u16,
+    rows: u16,
     pub offset: u64,
 }
 
 impl ReplaySnapshot {
-    pub fn replay(mut self, max_body: Option<usize>) -> Vec<u8> {
-        if let Some(max) = max_body { tail_from_line(&mut self.body, max); }
-        let mut replay = replay_prefix_parts(self.alternate_screen, &self.input_modes, &self.body);
-        replay.extend_from_slice(&self.body);
-        replay
+    /// Replay of the ended terminal (see `replay::render_ended`).
+    pub fn replay(self, max_body: Option<usize>) -> Vec<u8> {
+        replay::render_ended(&self.body, self.start, &self.marks, (self.cols, self.rows), max_body)
+            .unwrap_or(self.body)
     }
 }
 /// Input queued for a program that isn't reading its terminal is capped at this.
@@ -59,9 +62,13 @@ pub fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
 }
 
 #[derive(Default)]
-struct TitleCb {
+pub(crate) struct TitleCb {
     title: Option<String>,
     changed: bool,
+    /// Modes vt100 doesn't track, for replays: focus reporting (`CSI ? 1004 h`) and the
+    /// cursor style (DECSCUSR).
+    pub(crate) focus_reporting: bool,
+    pub(crate) cursor_style: Option<u16>,
     /// Answers to terminal queries seen in the output. The daemon is the only responder for
     /// these: the web UI's xterm.js is told not to answer them (see web/src/terms.ts), so a
     /// program gets exactly one reply however many clients watch, and none from replays.
@@ -91,6 +98,13 @@ impl vt100::Callbacks for TitleCb {
         c: char,
     ) {
         let p0 = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        match (i1, c) {
+            (Some(b'?'), 'h' | 'l') if params.iter().any(|p| p.first() == Some(&1004)) => {
+                self.focus_reporting = c == 'h';
+            }
+            (Some(b' '), 'q') => self.cursor_style = (p0 > 0).then_some(p0),
+            _ => {}
+        }
         // Same answers xterm.js would give (TERM=xterm-256color).
         match (i1, c) {
             // DA1. Programs such as fish block until it is answered.
@@ -121,6 +135,32 @@ struct OutBuf {
     wrapped: bool,
     /// Bytes ever ingested (the ring holds the last `ring.len()` of them).
     total: u64,
+    /// Size and screen changes, oldest first; the first is the state at or before the ring's
+    /// first byte (see `replay`).
+    marks: VecDeque<Mark>,
+    /// Bumped on every change to `marks` (output.log's marks file is rewritten after one).
+    marks_version: u64,
+}
+
+impl OutBuf {
+    /// The terminal is `cols`x`rows` on the alternate screen or not from the next byte on.
+    fn mark(&mut self, cols: u16, rows: u16, alternate_screen: bool) {
+        let m = Mark { offset: self.total, cols, rows, alternate_screen };
+        match self.marks.back_mut() {
+            Some(last) if (last.cols, last.rows, last.alternate_screen) == (cols, rows, alternate_screen) => return,
+            Some(last) if last.offset == m.offset => *last = m,
+            _ => self.marks.push_back(m),
+        }
+        while self.marks.len() > replay::MAX_MARKS {
+            self.marks.pop_front();
+        }
+        self.marks_version += 1;
+    }
+
+    /// Raw output offset of the ring's first byte.
+    fn ring_start(&self) -> u64 {
+        self.total - self.ring.len() as u64
+    }
 }
 
 /// output.log bookkeeping. The file is append-only between compactions.
@@ -133,6 +173,35 @@ struct LogState {
     rewrite: bool,
     /// Appended since the last fsync.
     unsynced: bool,
+    /// Raw output offset of output.log's first byte.
+    start: u64,
+    /// `OutBuf::marks_version` the marks file was last written for.
+    marks_version: u64,
+    /// output.log's first bytes (the marks file names them, see `LogMarks`).
+    head: Vec<u8>,
+}
+
+/// A client replay, possibly still to be finished outside the terminal's locks.
+enum Replay {
+    Done(Vec<u8>),
+    Ended(ReplaySnapshot, Option<usize>),
+    /// On the alternate screen: `view` is that screen; the normal screen behind it comes from
+    /// re-running the ring.
+    Behind { body: Vec<u8>, start: u64, marks: Vec<Mark>, size: (u16, u16), max_body: Option<usize>, view: Vec<u8> },
+}
+
+impl Replay {
+    fn finish(self) -> Vec<u8> {
+        match self {
+            Replay::Done(v) => v,
+            Replay::Ended(snapshot, max_body) => snapshot.replay(max_body),
+            Replay::Behind { body, start, marks, size, max_body, view } => {
+                let mut v = replay::behind(&body, start, &marks, size, max_body);
+                v.extend_from_slice(&view);
+                v
+            }
+        }
+    }
 }
 
 pub struct SpawnParams {
@@ -267,6 +336,8 @@ pub fn spawn(p: SpawnParams, events: EventSink) -> anyhow::Result<Arc<PtySession
             ring: VecDeque::new(),
             wrapped: false,
             total: 0,
+            marks: VecDeque::from([Mark { offset: 0, cols, rows, alternate_screen: false }]),
+            marks_version: 0,
         }),
         out_tx,
         parser: Mutex::new(vt100::Parser::new_with_callbacks(
@@ -289,6 +360,9 @@ pub fn spawn(p: SpawnParams, events: EventSink) -> anyhow::Result<Arc<PtySession
             // A new process always starts a new output.log.
             rewrite: true,
             unsynced: false,
+            start: 0,
+            marks_version: 0,
+            head: Vec::new(),
         }),
         log_path: p.log_path,
         markers,
@@ -388,14 +462,23 @@ impl PtySession {
         }
         let replies = std::mem::take(&mut cb.replies);
         let chunk = Bytes::copy_from_slice(data);
+        let screen = parser.screen();
+        let ((rows, cols), alt) = (screen.size(), screen.alternate_screen());
         {
             let mut out = self.out.lock();
             out.ring.extend(data.iter().copied());
             out.total += data.len() as u64;
+            // A switch inside this chunk is marked at its end: a replay starting inside the
+            // chunk re-runs the switch itself.
+            out.mark(cols, rows, alt);
             let over = out.ring.len().saturating_sub(RING_CAP);
             if over > 0 {
                 out.ring.drain(..over);
                 out.wrapped = true;
+                let start = out.ring_start();
+                while out.marks.len() > 1 && out.marks[1].offset <= start {
+                    out.marks.pop_front();
+                }
             }
             self.seq.fetch_add(1, Ordering::SeqCst);
             self.last_output_at.store(now_ms(), Ordering::SeqCst);
@@ -419,30 +502,36 @@ impl PtySession {
         v
     }
 
-    /// The ring's bytes for a client replay: once it wrapped, starting after the first
-    /// newline so the replay doesn't begin inside an escape sequence or UTF-8 character.
-    fn snapshot_locked(out: &OutBuf) -> Vec<u8> {
+    /// The ring's bytes for a client replay and the raw output offset of the first one: once
+    /// it wrapped, starting at a boundary (`cut_to_boundary`).
+    fn snapshot_locked(out: &OutBuf) -> (Vec<u8>, u64) {
         let mut v = Self::raw_locked(out);
+        let mut start = out.ring_start();
         if out.wrapped {
-            // Don't start the replay in the middle of an escape sequence / UTF-8 char.
-            if let Some(pos) = v.iter().take(64 * 1024).position(|&c| c == b'\n') {
-                v.drain(..=pos);
-            }
+            start += cut_to_boundary(&mut v) as u64;
         }
-        v
+        (v, start)
     }
 
-    /// Replay for a client: the terminal modes that the ring may no longer contain, then the
-    /// ring (its last `max_body` bytes when set). Callers hold the parser lock and then the out
-    /// lock.
-    fn client_replay(parser: &vt100::Parser<TitleCb>, out: &OutBuf, max_body: Option<usize>) -> Vec<u8> {
-        let mut body = Self::snapshot_locked(out);
-        if let Some(max) = max_body {
-            tail_from_line(&mut body, max);
+    /// Replay for a client (see `replay`): the ring itself while that is faithful, otherwise
+    /// the screen from the emulator. Callers hold the parser lock and then the out lock; the
+    /// slow part of an alternate-screen replay waits until they let go (`Replay::finish`).
+    fn client_replay(parser: &mut vt100::Parser<TitleCb>, out: &OutBuf, max_body: Option<usize>, ended: bool) -> Replay {
+        let marks: Vec<Mark> = out.marks.iter().copied().collect();
+        let (rows, cols) = parser.screen().size();
+        if ended {
+            // Exactly what the archive will show (`ReplaySnapshot::replay`).
+            let (body, start) = Self::snapshot_locked(out);
+            return Replay::Ended(ReplaySnapshot { body, start, marks, cols, rows, offset: out.total }, max_body);
         }
-        let mut v = replay_prefix(parser.screen(), &body);
-        v.extend_from_slice(&body);
-        v
+        if replay::raw_is_faithful(out.ring_start(), &marks) && max_body.is_none_or(|m| out.ring.len() <= m) {
+            return Replay::Done(Self::raw_locked(out));
+        }
+        if !parser.screen().alternate_screen() {
+            return Replay::Done(replay::live_normal(parser, max_body));
+        }
+        let (body, start) = Self::snapshot_locked(out);
+        Replay::Behind { body, start, marks, size: (cols, rows), max_body, view: replay::live_alt(parser) }
     }
 
     /// Replay bytes + a live receiver, taken atomically (no lost or duplicated bytes).
@@ -452,22 +541,31 @@ impl PtySession {
     }
 
     /// The offset is the first live byte after this replay, captured under the
-    /// same locks as the snapshot and subscription. Synthetic mode prefixes do
-    /// not advance the raw output offset.
+    /// same locks as the snapshot and subscription. A rendered replay is the state at
+    /// exactly that offset.
     pub fn attach_sequenced(&self, max_body: Option<usize>) -> (Vec<u8>, broadcast::Receiver<Bytes>, u64) {
-        let parser = self.parser.lock();
-        let out = self.out.lock();
-        (Self::client_replay(&parser, &out, max_body), self.out_tx.subscribe(), out.total)
+        // No more output can come: the program ended and nothing holds the terminal open.
+        let ended = !self.is_alive() && self.is_drained();
+        let (replay, receiver, offset) = {
+            let mut parser = self.parser.lock();
+            let out = self.out.lock();
+            (Self::client_replay(&mut parser, &out, max_body, ended), self.out_tx.subscribe(), out.total)
+        };
+        (replay.finish(), receiver, offset)
     }
 
     /// Capture replay state without retaining a PTY, parser, or output channel.
     pub fn replay_snapshot(&self) -> ReplaySnapshot {
         let parser = self.parser.lock();
         let out = self.out.lock();
+        let (body, start) = Self::snapshot_locked(&out);
+        let (rows, cols) = parser.screen().size();
         ReplaySnapshot {
-            body: Self::snapshot_locked(&out),
-            input_modes: parser.screen().input_mode_formatted(),
-            alternate_screen: parser.screen().alternate_screen(),
+            body,
+            start,
+            marks: out.marks.iter().copied().collect(),
+            cols,
+            rows,
             offset: out.total,
         }
     }
@@ -521,7 +619,14 @@ impl PtySession {
 
     pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
         let (cols, rows) = clamp_size(cols, rows);
-        self.parser.lock().screen_mut().set_size(rows, cols);
+        {
+            let mut parser = self.parser.lock();
+            parser.screen_mut().set_size(rows, cols);
+            let alt = parser.screen().alternate_screen();
+            self.out.lock().mark(cols, rows, alt);
+        }
+        // output.log's marks file needs the new size.
+        self.dirty.store(true, Ordering::SeqCst);
         if self.is_alive()
             && let Some(m) = self.master.lock().as_ref()
         {
@@ -603,7 +708,7 @@ impl PtySession {
             }
             return;
         }
-        let (data, rewrite, total) = {
+        let (data, rewrite, total, ring_start, marks) = {
             let out = self.out.lock();
             let pending = out.total - st.persisted;
             let rewrite = st.rewrite || pending > out.ring.len() as u64 || st.size + pending > 2 * RING_CAP as u64;
@@ -615,7 +720,9 @@ impl PtySession {
                 let skip = out.ring.len() - pending as usize;
                 out.ring.range(skip..).copied().collect()
             };
-            (data, rewrite, out.total)
+            let marks = (rewrite || out.marks_version != st.marks_version)
+                .then(|| (out.marks_version, out.marks.iter().copied().collect::<Vec<_>>()));
+            (data, rewrite, out.total, out.ring_start(), marks)
         };
         let r = if rewrite {
             write_file(&self.log_path, &data, sync)
@@ -632,6 +739,19 @@ impl PtySession {
                 };
                 st.rewrite = false;
                 st.unsynced = !sync;
+                if rewrite {
+                    st.start = ring_start;
+                    st.head = data[..data.len().min(replay::HEAD_LEN)].to_vec();
+                }
+                if let Some((version, marks)) = marks {
+                    let file = LogMarks::new(st.start, &st.head, marks);
+                    match serde_json::to_vec(&file).map_err(std::io::Error::other)
+                        .and_then(|b| crate::private_fs::write_private(&replay::marks_path(&self.log_path), &b))
+                    {
+                        Ok(()) => st.marks_version = version,
+                        Err(e) => tracing::warn!(session = self.id, "saving output marks: {e}"),
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(session = self.id, "flushing output.log: {e}");
@@ -934,63 +1054,6 @@ fn sync_file(p: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new().append(true).open(p)?.sync_all()
 }
 
-/// Escape codes a client needs before the ring's bytes to end up in the daemon's terminal
-/// state even when the ring wrapped past the sequences that set it up: the input modes
-/// (bracketed paste, application cursor/keypad, mouse reporting) and, if the ring starts
-/// inside the alternate screen, a switch to it. Setting a mode the replay sets again later
-/// is harmless, so this is also correct for an unwrapped ring.
-fn replay_prefix(screen: &vt100::Screen, body: &[u8]) -> Vec<u8> {
-    replay_prefix_parts(screen.alternate_screen(), &screen.input_mode_formatted(), body)
-}
-
-fn replay_prefix_parts(alternate_screen: bool, input_modes: &[u8], body: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    let starts_in_alt = match first_alt_switch(body) {
-        // The first switch leaves the alternate screen: everything before it was drawn there.
-        Some(enter) => !enter,
-        None => alternate_screen,
-    };
-    if starts_in_alt {
-        v.extend_from_slice(b"\x1b[?1049h");
-    }
-    v.extend_from_slice(input_modes);
-    v
-}
-
-/// Direction of the first alternate-screen switch (`CSI ? 47/1047/1049 h|l`) in `data`:
-/// Some(true) = enter, Some(false) = leave.
-fn first_alt_switch(data: &[u8]) -> Option<bool> {
-    let mut i = 0;
-    while i + 3 < data.len() {
-        if data[i] != 0x1b || data[i + 1] != b'[' || data[i + 2] != b'?' {
-            i += 1;
-            continue;
-        }
-        let mut j = i + 3;
-        let mut params: Vec<u32> = Vec::new();
-        let mut cur: Option<u32> = None;
-        while j < data.len() {
-            match data[j] {
-                d @ b'0'..=b'9' => cur = Some(cur.unwrap_or(0).saturating_mul(10).saturating_add((d - b'0') as u32)),
-                b';' => params.push(cur.take().unwrap_or(0)),
-                _ => break,
-            }
-            j += 1;
-        }
-        if let Some(c) = cur {
-            params.push(c);
-        }
-        if let Some(&f) = data.get(j)
-            && (f == b'h' || f == b'l')
-            && params.iter().any(|p| matches!(p, 47 | 1047 | 1049))
-        {
-            return Some(f == b'h');
-        }
-        i = j.max(i + 1);
-    }
-    None
-}
-
 /// Map portable-pty's exit status to a shell-style code (128 + signal when killed).
 fn exit_code_of(st: &portable_pty::ExitStatus) -> i32 {
     let Some(name) = st.signal() else {
@@ -1057,86 +1120,87 @@ fn tail_text(parser: &mut vt100::Parser<TitleCb>, n: usize) -> String {
 /// Replay bytes from a persisted output.log (last `RING_CAP` bytes; the file itself may be
 /// up to twice that between compactions).
 pub fn read_log(path: &Path) -> Vec<u8> {
+    read_log_from(path).0
+}
+
+/// `read_log`, and the file offset its bytes start at.
+fn read_log_from(path: &Path) -> (Vec<u8>, u64) {
     use std::io::{Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     // A log rewritten from a wrapped ring is exactly RING_CAP bytes and starts mid-line; longer
-    // ones are read from the middle. Either way, start after the first newline.
+    // ones are read from the middle. Either way, start at a boundary.
     let cut = len >= RING_CAP as u64;
-    if len > RING_CAP as u64 && f.seek(SeekFrom::Start(len - RING_CAP as u64)).is_err() {
-        return Vec::new();
+    let mut skipped = len.saturating_sub(RING_CAP as u64);
+    if skipped > 0 && f.seek(SeekFrom::Start(skipped)).is_err() {
+        return (Vec::new(), 0);
     }
     let mut data = Vec::with_capacity(len.min(RING_CAP as u64) as usize);
     if f.take(RING_CAP as u64).read_to_end(&mut data).is_err() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
-    if cut && let Some(pos) = data.iter().take(64 * 1024).position(|&c| c == b'\n') {
-        data.drain(..=pos);
+    if cut {
+        skipped += cut_to_boundary(&mut data) as u64;
     }
-    data
+    (data, skipped)
 }
 
-/// Client replay of a persisted output.log: its last `RING_CAP` bytes (or `max_body`),
-/// prefixed like a live replay with the terminal modes and alternate-screen state they leave
-/// behind.
+/// Drop bytes from the front up to a place a parser can start: after the first newline or
+/// before the first escape, whichever comes first, so a replay doesn't begin inside an escape
+/// sequence or a UTF-8 character. Looks only at the first 64 KiB; with neither there, nothing
+/// is dropped. Returns how many bytes went.
+fn cut_to_boundary(v: &mut Vec<u8>) -> usize {
+    let n = match v.iter().take(64 * 1024).position(|&c| c == b'\n' || c == 0x1b) {
+        Some(pos) if v[pos] == b'\n' => pos + 1,
+        Some(pos) => pos,
+        None => 0,
+    };
+    v.drain(..n);
+    n
+}
+
+/// A persisted output.log's replay bytes, their raw output offset and the marks for them, from
+/// its marks file when there is one that matches it (none for logs saved before marks).
+fn log_body(path: &Path) -> (Vec<u8>, u64, Vec<Mark>) {
+    let (data, skipped) = read_log_from(path);
+    match LogMarks::read(path) {
+        Some(m) => (data, m.start + skipped, m.marks),
+        None => (data, skipped, Vec::new()),
+    }
+}
+
+/// A persisted output.log re-run through an emulator (`cols`x`rows` without marks).
+fn log_rerun(path: &Path, cols: u16, rows: u16) -> Option<replay::Rerun> {
+    if !path.exists() {
+        return None;
+    }
+    let (data, start, marks) = log_body(path);
+    replay::rerun(&data, start, &marks, (cols, rows))
+}
+
+/// Client replay of a persisted output.log: its program has ended (see
+/// `replay::render_ended`). `max_body` bounds the replay's size.
 pub fn log_replay(path: &Path, cols: u16, rows: u16, max_body: Option<usize>) -> Vec<u8> {
-    let mut data = read_log(path);
+    let (data, start, marks) = log_body(path);
     if data.is_empty() {
         return data;
     }
-    let (cols, rows) = clamp_size(cols, rows);
-    let mut parser = vt100::Parser::new(rows, cols, 0);
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&data))).is_ok();
-    if let Some(max) = max_body {
-        tail_from_line(&mut data, max);
-    }
-    if !parsed {
-        return data;
-    }
-    // A compacted log may start inside the alternate screen; `replay_prefix` detects that from
-    // the first switch in the bytes.
-    let mut v = replay_prefix(parser.screen(), &data);
-    v.extend_from_slice(&data);
-    v
-}
-
-/// Keep at most the last `max` bytes, starting after a newline so the cut doesn't land inside
-/// an escape sequence or a UTF-8 character (if there is none in the first 64 KiB of the tail,
-/// the cut stays where it is).
-fn tail_from_line(v: &mut Vec<u8>, max: usize) {
-    if v.len() <= max {
-        return;
-    }
-    v.drain(..v.len() - max);
-    if let Some(pos) = v.iter().take(64 * 1024).position(|&c| c == b'\n') {
-        v.drain(..=pos);
-    }
+    replay::render_ended(&data, start, &marks, (cols, rows), max_body).unwrap_or(data)
 }
 
 /// Plain-text tail of a persisted output.log (for exited sessions from a previous daemon).
 pub fn log_tail_text(path: &Path, cols: u16, rows: u16, n: usize) -> Option<String> {
-    if !path.exists() {
-        return None;
-    }
-    let data = read_log(path);
-    let (cols, rows) = clamp_size(cols, rows);
-    let mut parser = vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, TitleCb::default());
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&data))).ok()?;
-    Some(tail_text(&mut parser, n))
+    let mut run = log_rerun(path, cols, rows)?;
+    Some(tail_text(&mut run.parser, n))
 }
 
 /// Screen snapshot rebuilt from a persisted output.log.
 pub fn log_screen(path: &Path, cols: u16, rows: u16) -> Option<ScreenSnapshot> {
-    if !path.exists() {
-        return None;
-    }
-    let data = read_log(path);
-    let (cols, rows) = clamp_size(cols, rows);
-    let mut parser = vt100::Parser::new(rows, cols, 0);
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&data))).ok()?;
-    let screen = parser.screen();
+    let run = log_rerun(path, cols, rows)?;
+    let screen = run.parser.screen();
+    let (rows, cols) = screen.size();
     let (cursor_row, cursor_col) = screen.cursor_position();
     Some(ScreenSnapshot {
         lines: screen.rows(0, cols).map(|l| l.trim_end().to_string()).collect(),
@@ -1432,39 +1496,25 @@ mod tests {
     }
 
     #[test]
-    fn tail_from_line_cuts_at_a_newline() {
-        let mut v = b"aaaa\nbbbb\ncccc".to_vec();
-        tail_from_line(&mut v, 100);
-        assert_eq!(v, b"aaaa\nbbbb\ncccc");
-        tail_from_line(&mut v, 7);
-        assert_eq!(v, b"cccc");
-        let mut v = b"no newline here".to_vec();
-        tail_from_line(&mut v, 4);
-        assert_eq!(v, b"here");
+    fn cut_to_boundary_starts_at_a_line_or_an_escape() {
+        let mut v = b"ab\ncd".to_vec();
+        assert_eq!(cut_to_boundary(&mut v), 3);
+        assert_eq!(v, b"cd");
+        let mut v = b"5;3Hx\x1b[1mbold\n".to_vec();
+        assert_eq!(cut_to_boundary(&mut v), 5);
+        assert!(v.starts_with(b"\x1b[1m"));
+        let mut v = b"no boundary".to_vec();
+        assert_eq!(cut_to_boundary(&mut v), 0);
     }
 
     #[test]
-    fn replay_prefix_restores_modes_and_alt_screen() {
-        // Modes set long ago (not in the replayed bytes) come back via the prefix.
-        let p = parser_with(b"\x1b[?2004h\x1b[?1h\x1b[?1000h", 5);
-        let pre = replay_prefix(p.screen(), b"plain output\r\n");
-        let s = String::from_utf8_lossy(&pre);
-        assert!(
-            s.contains("\x1b[?2004h") && s.contains("\x1b[?1h") && s.contains("\x1b[?1000h"),
-            "{s:?}"
-        );
-        assert!(!s.contains("1049"));
-        // Ring starts inside the alternate screen (its switch was cut off).
-        let p = parser_with(b"\x1b[?1049hfull screen app", 5);
-        assert!(replay_prefix(p.screen(), b"more app output").starts_with(b"\x1b[?1049h"));
-        // Ring holds the switch itself (not wrapped): no extra switch.
-        assert!(!replay_prefix(p.screen(), b"shell\r\n\x1b[?1049happ").starts_with(b"\x1b[?1049h"));
-        // Ring starts in the alt screen and leaves it later.
-        let p = parser_with(b"\x1b[?1049happ\x1b[?1049lback", 5);
-        assert!(replay_prefix(p.screen(), b"app\x1b[?1049lback").starts_with(b"\x1b[?1049h"));
-        assert_eq!(first_alt_switch(b"x\x1b[?25;1049hy"), Some(true));
-        assert_eq!(first_alt_switch(b"x\x1b[?25h\x1b[?47l"), Some(false));
-        assert_eq!(first_alt_switch(b"\x1b[?2004h"), None);
+    fn tracks_modes_vt100_does_not() {
+        let mut p = parser_with(b"\x1b[?1004h\x1b[5 q", 5);
+        assert!(p.callbacks().focus_reporting);
+        assert_eq!(p.callbacks().cursor_style, Some(5));
+        p.process(b"\x1b[?1004l\x1b[0 q");
+        assert!(!p.callbacks().focus_reporting);
+        assert_eq!(p.callbacks().cursor_style, None);
     }
 
     #[test]

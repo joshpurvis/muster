@@ -2010,6 +2010,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "vt100",

@@ -6,13 +6,16 @@
 //! `stat` calls and hashes a file only once its size and mtime have held still for one tick, so
 //! a build still being written is never hashed. Changes go to clients as `updates_changed`.
 //!
-//! `daemon.reload` and `daemon.shutdown` run the CLI's own `reload` / `stop`, detached, so the
-//! safety checks stay in one place.
+//! `daemon.reload`, `daemon.restart` and `daemon.shutdown` run the CLI's own `reload` /
+//! `restart-all` / `stop`, detached, so the safety checks stay in one place. One of them at a
+//! time: while one this backend started may still happen, the others are refused (`BUSY`).
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use parking_lot::Mutex;
@@ -50,6 +53,10 @@ pub struct Updates {
     status: Mutex<Status>,
     /// The launch path and the running build's SHA-256, for `daemon.reload`.
     launch: Mutex<Option<(PathBuf, String)>>,
+    /// The running terminal host's pid, for `daemon.restart`'s look at what it would start.
+    host_pid: Mutex<Option<u32>>,
+    /// A reload, restart or shutdown this backend started may still happen (see [`Claim`]).
+    busy: AtomicBool,
 }
 
 impl Updates {
@@ -65,6 +72,35 @@ impl Updates {
         }
         *cur = next;
         true
+    }
+}
+
+/// What a reload, restart or shutdown is refused with while another one this backend started
+/// may still happen (a second window's click, or `muster reload` meanwhile).
+pub const BUSY: &str = "Muster is already restarting or shutting down";
+
+/// `Updates::busy`, claimed for one lifecycle command. Dropped before the command has started,
+/// it frees the next one; once started ([`Claim::keep`]) only the command's failure frees it
+/// ([`watch`]): on success this backend stops.
+struct Claim<'a>(Option<&'a Updates>);
+
+impl<'a> Claim<'a> {
+    fn new(updates: &'a Updates) -> anyhow::Result<Self> {
+        updates.busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| anyhow::anyhow!("{BUSY}"))?;
+        Ok(Self(Some(updates)))
+    }
+
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if let Some(updates) = self.0 {
+            updates.busy.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -130,6 +166,7 @@ pub fn spawn(hub: &Arc<Hub>, launch: Launch) {
     let data = crate::paths::data_dir();
     let exe = launch_path(launch.exe);
     *hub.updates().launch.lock() = Some((exe.clone(), launch.app_hash.clone()));
+    *hub.updates().host_pid.lock() = launch.host_pid;
     hub.updates().set(Status { ui_release: crate::assets::active_release(&data), ..Status::default() });
     let weak = Arc::downgrade(hub);
     tokio::spawn(async move {
@@ -170,7 +207,12 @@ pub fn spawn(hub: &Arc<Hub>, launch: Launch) {
 }
 
 /// A detached `muster <args>` from `exe` in its own session, its output in the daemon log.
-fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter::ApiKey>) -> anyhow::Result<std::process::Child> {
+fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter::ApiKey>) -> anyhow::Result<Child> {
+    cli_command(exe, args, openrouter_key)?.spawn().with_context(|| format!("starting {}", exe.display()))
+}
+
+/// The command [`run_cli`] spawns.
+fn cli_command(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter::ApiKey>) -> anyhow::Result<Command> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -191,7 +233,22 @@ fn run_cli(exe: &Path, args: &[&str], openrouter_key: Option<&crate::openrouter:
             Ok(())
         });
     }
-    cmd.spawn().with_context(|| format!("starting {}", exe.display()))
+    Ok(cmd)
+}
+
+/// Wait for a detached lifecycle command. Only a failure reports (on success this backend is
+/// stopped before the command ends): an error notice, and the next lifecycle command is free.
+fn watch(hub: &Arc<Hub>, mut child: Child, failed: &'static str) {
+    let weak = Arc::downgrade(hub);
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait()
+            && !status.success()
+            && let Some(hub) = weak.upgrade()
+        {
+            hub.updates().busy.store(false, Ordering::SeqCst);
+            hub.notice("error", format!("{failed} ({status}). Details: {}", crate::paths::log_path().display()));
+        }
+    });
 }
 
 /// What a refused `daemon.reload_handoff` error starts with: the CLI then reloads the usual way.
@@ -212,19 +269,10 @@ pub fn reload_handoff(hub: &Arc<Hub>, exe: &Path) -> anyhow::Result<PathBuf> {
         _ => false,
     };
     anyhow::ensure!(same, "{HANDOFF_REFUSED} this backend was started from {}, not {}", launch.display(), exe.display());
-    let mut child = run_cli(&launch, &["reload"], hub.openrouter_key())?;
-    let weak = Arc::downgrade(hub);
-    std::thread::spawn(move || {
-        if let Ok(status) = child.wait()
-            && !status.success()
-            && let Some(hub) = weak.upgrade()
-        {
-            hub.notice("error", format!(
-                "The backend was not restarted ({status}). Details: {}",
-                crate::paths::log_path().display()
-            ));
-        }
-    });
+    let claim = Claim::new(hub.updates())?;
+    let child = run_cli(&launch, &["reload"], hub.openrouter_key())?;
+    claim.keep();
+    watch(hub, child, "The backend was not restarted");
     Ok(launch)
 }
 
@@ -248,27 +296,167 @@ fn check_reload(current: &str, running: &str, expect: &str, exe: &Path) -> anyho
 /// this backend running and says so in a notice. This binds the click to the offered build; it
 /// is no defence against a process of this user swapping the file in between.
 pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
+    let claim = Claim::new(hub.updates())?;
     let (exe, running) = hub.updates().launch.lock().clone()
         .context("this backend does not know where it was launched from")?;
     anyhow::ensure!(exe.is_file(), "no muster build at {}", exe.display());
     let path = exe.clone();
     let current = tokio::task::spawn_blocking(move || crate::executables::hash_file(&path)).await??;
     check_reload(&current, &running, expect, &exe)?;
-    let mut child = run_cli(&exe, &["reload"], hub.openrouter_key())?;
-    let weak = Arc::downgrade(hub);
-    // On success this backend is stopped before the command ends, so only a failure reports.
-    std::thread::spawn(move || {
-        if let Ok(status) = child.wait()
-            && !status.success()
-            && let Some(hub) = weak.upgrade()
-        {
-            hub.notice("error", format!(
-                "The backend was not restarted ({status}). Details: {}",
-                crate::paths::log_path().display()
-            ));
-        }
-    });
+    let child = run_cli(&exe, &["reload"], hub.openrouter_key())?;
+    claim.keep();
+    watch(hub, child, "The backend was not restarted");
     Ok(exe)
+}
+
+/// `daemon.restart {backend, host}`: the `updates.backend` and `updates.host` ids the window
+/// showed (null: none of that kind waiting), so what starts is what the human was shown.
+#[derive(Debug, Default, Deserialize)]
+pub struct Expect {
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// Are the builds a restart would start (`now`: what [`compare`] says of the launch path and
+/// the host beside it, read again) the ones the window showed?
+fn check_restart(now: &(Option<String>, Option<String>), expect: &Expect, exe: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        now.0 == expect.backend,
+        "the Muster build at {} changed since this window last looked (it may still be being written); \
+         nothing was stopped. Wait for the window to show it, then try again",
+        exe.display()
+    );
+    anyhow::ensure!(
+        now.1 == expect.host,
+        "the terminal host beside {} changed since this window last looked (it may still be being written); \
+         nothing was stopped. Wait for the window to show it, then try again",
+        exe.display()
+    );
+    Ok(())
+}
+
+/// The descriptor the restart command reports on (`restart-all --report-fd 3`).
+const REPORT_FD: i32 = 3;
+/// How long the restart command may take over its checks before it reports.
+const REPORT_WAIT: Duration = Duration::from_secs(30);
+
+/// `daemon.restart`: what `muster stop` then `muster` do (every session ends; then a new backend
+/// and terminal host start from the launch path, as a normal start picks them), as one command:
+/// `<launch path> restart-all`, detached, with this backend's environment and OpenRouter key, as
+/// `daemon.reload` runs `reload`. Refused before anything stops: while another lifecycle command
+/// may still happen, without a known launch path, when the builds there are not the ones the
+/// window showed (`expect`), or when the command's own checks refuse (it reports on a socket
+/// before it stops anything, and stops nothing until this backend answers). Windows hear
+/// `daemon_stopping {reason: "restart"}` before the command goes ahead.
+pub async fn restart(hub: &Arc<Hub>, expect: Expect) -> anyhow::Result<PathBuf> {
+    let claim = Claim::new(hub.updates())?;
+    let (exe, running) = hub.updates().launch.lock().clone()
+        .context("this backend does not know where it was launched from, so it can't start Muster again; nothing was stopped")?;
+    anyhow::ensure!(exe.is_file(), "no muster build at {}; nothing was stopped", exe.display());
+    let host_pid = *hub.updates().host_pid.lock();
+    let path = exe.clone();
+    let now = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let launch = crate::executables::hash_file(&path)?;
+        let sibling = crate::executables::hash_file(&path.with_file_name(crate::executables::HOST)).ok();
+        let running_host = host_pid
+            .and_then(|pid| crate::executables::hash_file(Path::new(&format!("/proc/{pid}/exe"))).ok());
+        Ok(compare(&running, running_host.as_deref(), Some(&launch), sibling.as_deref()))
+    })
+    .await??;
+    check_restart(&now, &expect, &exe)?;
+    let cmd = cli_command(&exe, &["restart-all", "--report-fd", &REPORT_FD.to_string()], hub.openrouter_key())?;
+    let (child, report) = spawn_reporting(cmd).with_context(|| format!("starting {}", exe.display()))?;
+    let announce = Arc::downgrade(hub);
+    let shown = exe.clone();
+    let child = tokio::task::spawn_blocking(move || {
+        handshake(child, report, REPORT_WAIT, &shown, || {
+            if let Some(hub) = announce.upgrade() {
+                hub.emit(ServerEvent::DaemonStopping { reason: "restart".into() });
+            }
+        })
+    })
+    .await??;
+    claim.keep();
+    watch(hub, child, "Muster was not restarted");
+    Ok(exe)
+}
+
+/// Spawn `cmd` with one end of a socket pair as its descriptor [`REPORT_FD`]; the other end is
+/// returned.
+fn spawn_reporting(mut cmd: Command) -> anyhow::Result<(Child, UnixStream)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let (ours, theirs) = UnixStream::pair()?;
+    let fd = theirs.as_raw_fd();
+    // SAFETY: dup2 and fcntl are async-signal-safe. Both ends are close-on-exec; dup2 clears
+    // that on the copy, and an end that already is the descriptor gets it cleared by hand.
+    unsafe {
+        cmd.pre_exec(move || {
+            if fd == REPORT_FD {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(fd, REPORT_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    drop(theirs);
+    Ok((child, ours))
+}
+
+/// The restart command's verdict on `report`: "ready" (its checks passed; it stops nothing until
+/// it reads "go"), "refused: <why>", or nothing within `wait` (it exited: an older build without
+/// `restart-all`, say). On "ready", `announce` runs before the "go", so windows hear of the
+/// restart before it begins; the command is returned to be watched. Otherwise it is ended, if
+/// it hasn't ended itself, and the error says why; nothing was stopped.
+fn handshake(mut child: Child, report: UnixStream, wait: Duration, exe: &Path, announce: impl FnOnce())
+    -> anyhow::Result<Child> {
+    use std::io::{BufRead, BufReader, Write};
+    report.set_read_timeout(Some(wait))?;
+    let mut line = String::new();
+    let read = BufReader::new(&report).read_line(&mut line);
+    if read.is_ok() && line.trim_end() == "ready" {
+        announce();
+        // A command that can't hear this stops nothing; the windows' wait for the new backend
+        // runs out and says so.
+        (&report).write_all(b"go\n").context("telling the restart command to go ahead")?;
+        return Ok(child);
+    }
+    drop(report);
+    // Let it finish writing its reason to the log; one that hangs is ended.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+        }
+    };
+    if let Some(why) = line.trim_end().strip_prefix("refused: ") {
+        anyhow::bail!("{why}");
+    }
+    let log = crate::paths::log_path();
+    if let Err(error) = read
+        && matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    {
+        anyhow::bail!("the restart command did not answer within {} s; nothing was stopped. Details: {}", wait.as_secs(), log.display());
+    }
+    let status = status.map_or_else(|| "it was ended".to_string(), |s| s.to_string());
+    anyhow::bail!(
+        "the muster build at {} did not start the restart ({status}); nothing was stopped. It may be older than \
+         the running one: run `muster stop`, then `muster`. Details: {}",
+        exe.display(),
+        log.display()
+    )
 }
 
 /// `daemon.shutdown`: what `muster stop` does (stop this backend, then the terminal host,
@@ -276,22 +464,13 @@ pub async fn reload(hub: &Arc<Hub>, expect: &str) -> anyhow::Result<PathBuf> {
 /// `daemon_stopping` once the stop command has started (it signals this backend only after it
 /// has read the discovery file); a command that can't start leaves them connected.
 pub fn shutdown(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    let claim = Claim::new(hub.updates())?;
     let exe = hub.muster_bin().to_path_buf();
     anyhow::ensure!(exe.exists(), "the muster command {} is missing", exe.display());
-    let mut child = run_cli(&exe, &["stop"], None)?;
+    let child = run_cli(&exe, &["stop"], None)?;
     hub.emit(ServerEvent::DaemonStopping { reason: "shutdown".into() });
-    let weak = Arc::downgrade(hub);
-    std::thread::spawn(move || {
-        if let Ok(status) = child.wait()
-            && !status.success()
-            && let Some(hub) = weak.upgrade()
-        {
-            hub.notice("error", format!(
-                "Muster did not shut down ({status}). Details: {}",
-                crate::paths::log_path().display()
-            ));
-        }
-    });
+    claim.keep();
+    watch(hub, child, "Muster did not shut down");
     Ok(())
 }
 
@@ -322,6 +501,76 @@ mod tests {
         assert!(e.contains("changed since the update was offered"), "{e}");
         assert!(check_reload(&b, &a, "", exe).is_err(), "no expected build");
         assert!(check_reload(&b, &a, "bbb", exe).is_err(), "too short to identify a build");
+    }
+
+    #[test]
+    fn restart_starts_only_the_builds_the_window_showed() {
+        let exe = Path::new("/p/muster");
+        let none = Expect::default();
+        check_restart(&(None, None), &none, exe).unwrap();
+        let both = Expect { backend: Some("b".repeat(12)), host: Some("h".repeat(12)) };
+        check_restart(&(Some("b".repeat(12)), Some("h".repeat(12))), &both, exe).unwrap();
+        // A build that appeared, changed or went away since the window looked: refused.
+        let e = check_restart(&(Some("b".repeat(12)), None), &none, exe).unwrap_err().to_string();
+        assert!(e.contains("Muster build at /p/muster changed") && e.contains("nothing was stopped"), "{e}");
+        let e = check_restart(&(None, Some("g".repeat(12))), &none, exe).unwrap_err().to_string();
+        assert!(e.contains("terminal host beside /p/muster changed"), "{e}");
+        let e = check_restart(&(Some("b".repeat(12)), Some("g".repeat(12))), &both, exe).unwrap_err().to_string();
+        assert!(e.contains("terminal host"), "{e}");
+        assert!(check_restart(&(None, None), &both, exe).is_err());
+    }
+
+    #[test]
+    fn one_lifecycle_command_at_a_time() {
+        let u = Updates::default();
+        let first = Claim::new(&u).unwrap();
+        assert_eq!(Claim::new(&u).err().unwrap().to_string(), BUSY);
+        // Refused before it started: the next one may go.
+        drop(first);
+        let started = Claim::new(&u).unwrap();
+        started.keep();
+        assert!(Claim::new(&u).is_err(), "a started command keeps it until it fails");
+        u.busy.store(false, Ordering::SeqCst);
+        assert!(Claim::new(&u).is_ok());
+    }
+
+    /// `sh -c <script>` with the report socket on fd 3, as `daemon.restart` runs `restart-all`.
+    fn reporting(script: &str) -> (Child, UnixStream) {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        spawn_reporting(cmd).unwrap()
+    }
+
+    #[test]
+    fn restart_goes_ahead_only_after_the_command_is_ready_and_told_to() {
+        let dir = std::env::temp_dir().join(format!("muster-restart-{}", crate::paths::random_token()));
+        std::fs::create_dir(&dir).unwrap();
+        let heard = dir.join("heard");
+        let exe = Path::new("/p/muster");
+        // Ready: windows are told first, then the command hears "go".
+        let (child, report) = reporting(&format!("echo ready >&3; read x <&3; echo \"$x\" > '{}'", heard.display()));
+        let mut announced = false;
+        let mut child = handshake(child, report, Duration::from_secs(10), exe, || announced = true).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(announced);
+        assert_eq!(std::fs::read_to_string(&heard).unwrap().trim(), "go");
+        // Its own checks refused: their reason, nothing announced.
+        let (child, report) = reporting("echo 'refused: the terminal host belongs to another data directory' >&3; exit 1");
+        let e = handshake(child, report, Duration::from_secs(10), exe, || panic!("announced")).unwrap_err().to_string();
+        assert_eq!(e, "the terminal host belongs to another data directory");
+        // Exited without a word (an older build without `restart-all`: a usage error).
+        let (child, report) = reporting("exit 2");
+        let e = handshake(child, report, Duration::from_secs(10), exe, || panic!("announced")).unwrap_err().to_string();
+        assert!(e.contains("/p/muster did not start the restart") && e.contains("nothing was stopped"), "{e}");
+        assert!(e.contains("muster stop"), "{e}");
+        // Says nothing in time: ended, never told to go.
+        let (child, report) = reporting(&format!("sleep 30; echo late > '{}'", heard.display()));
+        let started = Instant::now();
+        let e = handshake(child, report, Duration::from_millis(300), exe, || panic!("announced")).unwrap_err().to_string();
+        assert!(e.contains("did not answer within"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the silent command was ended");
+        assert_eq!(std::fs::read_to_string(&heard).unwrap().trim(), "go", "it never ran on");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

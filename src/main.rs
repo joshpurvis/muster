@@ -120,6 +120,15 @@ enum Cmd {
     Stop,
     /// Restart only the application backend; host-owned terminal processes continue.
     Reload,
+    /// Stop Muster, ending every session, then start it again from this build, as `muster stop`
+    /// then `muster` would. A window's "Restart Muster…" runs it (`daemon.restart`).
+    #[command(hide = true)]
+    RestartAll {
+        /// Report the checks' verdict on this descriptor and stop nothing until the backend
+        /// answers "go" there.
+        #[arg(long, value_name = "FD")]
+        report_fd: Option<i32>,
+    },
     /// Activate a built UI directory without restarting backend or terminals.
     UiInstall {
         /// Built UI directory (for example web/dist).
@@ -526,7 +535,9 @@ fn main() -> ExitCode {
     // Printing commands die quietly on a closed pipe (`muster ls | head`) instead of panicking.
     // Not the daemon or a window: they write to sockets and must keep ignoring SIGPIPE (a Rust
     // binary starts with it ignored, so processes they spawn are unaffected either way).
-    if !matches!(cli.cmd, None | Some(Cmd::Daemon { foreground: true }) | Some(Cmd::NativeWindow { .. })) {
+    // Nor `restart-all`: it writes to the backend's report socket, which may close first.
+    if !matches!(cli.cmd, None | Some(Cmd::Daemon { foreground: true }) | Some(Cmd::NativeWindow { .. })
+        | Some(Cmd::RestartAll { .. })) {
         // SAFETY: setting a signal disposition before any threads exist.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -540,6 +551,7 @@ fn main() -> ExitCode {
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Reload) => reload(),
+        Some(Cmd::RestartAll { report_fd }) => restart_all(report_fd),
         Some(Cmd::UiInstall { path }) => {
             if std::env::var_os("MUSTER_WEB_DIR").is_some() {
                 Err(anyhow::anyhow!("MUSTER_WEB_DIR overrides installed UI releases; update that directory or unset the override on the backend"))
@@ -850,26 +862,103 @@ fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long `stop` waits for the backend to exit.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+/// How long `restart-all` waits: longer, since it starts Muster again only once the backend has
+/// finished saving its state.
+const RESTART_STOP_WAIT: Duration = Duration::from_secs(30);
+
 fn stop() -> anyhow::Result<()> {
-    stop_backend(None)?;
+    stop_all(STOP_WAIT)
+}
+
+/// Stop the backend (waiting up to `wait`), then the terminal host, ending every session.
+fn stop_all(wait: Duration) -> anyhow::Result<()> {
+    stop_backend_within(None, wait)?;
+    if let Some(host) = stoppable_host()? {
+        let socket = paths::runtime_dir().join("terminal.sock");
+        host.call(muster_terminal_protocol::Command::Shutdown)?;
+        let end = Instant::now() + Duration::from_secs(10);
+        while socket.exists() {
+            anyhow::ensure!(Instant::now() < end, "terminal host did not stop within 10s");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("muster terminal host stopped");
+    }
+    Ok(())
+}
+
+/// The running terminal host, checked to be this data directory's: the one `stop` shuts down.
+/// None when no host runs.
+fn stoppable_host() -> anyhow::Result<Option<muster_terminal_protocol::client::Client>> {
     let socket = paths::runtime_dir().join("terminal.sock");
     match muster_terminal_protocol::client::Client::connect(&socket) {
         Ok(host) => {
             anyhow::ensure!(host.hello.data_dir == std::fs::canonicalize(paths::data_dir().join("terminal"))?,
                 "terminal host belongs to another data directory");
-            host.call(muster_terminal_protocol::Command::Shutdown)?;
-            let end = Instant::now() + Duration::from_secs(10);
-            while socket.exists() {
-                anyhow::ensure!(Instant::now() < end, "terminal host did not stop within 10s");
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            println!("muster terminal host stopped");
+            Ok(Some(host))
         }
         Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|
-            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => {},
-        Err(error) => return Err(error),
+            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => Ok(None),
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+/// `muster restart-all`: `stop`, then start the daemon from this binary as `muster` does (the
+/// newest terminal host beside it included), without opening a window: the open ones reconnect.
+/// Everything that can refuse is checked before anything stops. With `report_fd` (the backend's
+/// `daemon.restart`), the verdict goes there ("ready" or "refused: <why>") and nothing stops
+/// until the backend answers "go", so windows hear of the restart first. A stop that fails
+/// still starts Muster again, so the user is never left without it unknowingly.
+fn restart_all(report_fd: Option<i32>) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::fd::FromRawFd;
+    // SAFETY: the backend hands this process its end of a socket pair at this descriptor, which
+    // nothing else here uses.
+    let report = report_fd.map(|fd| unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+    let old = match restart_checks() {
+        Ok(old) => old,
+        Err(error) => {
+            if let Some(mut r) = report {
+                let _ = writeln!(r, "refused: {}", format!("{error:#}").replace('\n', " "));
+            }
+            return Err(error);
+        }
+    };
+    if let Some(mut r) = report {
+        r.write_all(b"ready\n").context("reporting to the backend; nothing was stopped")?;
+        r.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(&r).read_line(&mut line);
+        anyhow::ensure!(line.trim_end() == "go", "the backend did not confirm the restart; nothing was stopped");
+    }
+    println!("muster: restarting; every session ends");
+    let stopped = stop_all(RESTART_STOP_WAIT);
+    if let Err(error) = &stopped {
+        eprintln!("muster: stopping Muster for the restart failed ({error:#}); starting it again anyway");
+    }
+    match (stopped, start_daemon_detached()) {
+        (Ok(()), Ok(d)) => {
+            anyhow::ensure!(old.as_ref().is_none_or(|o| o.pid != d.pid), "the old backend (pid {}) still runs", d.pid);
+            println!("muster restarted (pid {}); every session ended, open windows reconnect", d.pid);
+            Ok(())
+        }
+        (Err(error), Ok(d)) => Err(error.context(format!("Muster runs again (pid {}), but stopping it first failed", d.pid))),
+        (_, Err(error)) => Err(error.context("Muster was stopped but did not start again; start it with `muster`")),
+    }
+}
+
+/// What `restart-all` checks before anything stops: this command can signal the backend, and
+/// the terminal host is one `stop` shuts down (one it refused would keep every session running
+/// beside a stopped backend).
+fn restart_checks() -> anyhow::Result<Option<Discovery>> {
+    let d = paths::read_discovery().filter(backend_alive);
+    if let Some(d) = &d {
+        anyhow::ensure!(!backend_hidden(d),
+            "Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); restart it from outside", d.pid);
+    }
+    stoppable_host().context("the terminal host can't be stopped from here; nothing was stopped")?;
+    Ok(d)
 }
 
 /// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
@@ -926,8 +1015,9 @@ fn reload() -> anyhow::Result<()> {
 fn reload_handoff(d: &Discovery) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locating the muster binary")?;
     let sent = client::rpc(d, "daemon.reload_handoff", serde_json::json!({ "exe": exe }));
+    // Refused, or another restart or shutdown is under way (nothing to wait for here).
     if let Err(error) = &sent
-        && error.to_string().contains(crate::updates::HANDOFF_REFUSED)
+        && [crate::updates::HANDOFF_REFUSED, crate::updates::BUSY].iter().any(|m| error.to_string().contains(m))
     {
         return sent.map(|_| ());
     }
@@ -980,6 +1070,10 @@ fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_prot
 }
 
 fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
+    stop_backend_within(expected, STOP_WAIT)
+}
+
+fn stop_backend_within(expected: Option<&Discovery>, wait: Duration) -> anyhow::Result<()> {
     if let Some(d) = paths::read_discovery().filter(backend_hidden) {
         anyhow::bail!("Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); stop it from outside", d.pid);
     }
@@ -1001,10 +1095,10 @@ fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
     unsafe {
         libc::kill(d.pid as libc::pid_t, libc::SIGTERM);
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + wait;
     while paths::pid_alive(d.pid) && is_muster_process(d.pid) {
         if Instant::now() > deadline {
-            anyhow::bail!("daemon (pid {}) did not stop within 10s", d.pid);
+            anyhow::bail!("daemon (pid {}) did not stop within {}s", d.pid, wait.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

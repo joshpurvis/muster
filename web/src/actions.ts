@@ -2,7 +2,7 @@
 // update local state (the window's layout of groups, prefs, windows).
 
 import { signal } from "@preact/signals";
-import { rpc } from "./rpc.ts";
+import { connStatus, rpc } from "./rpc.ts";
 import {
   agentBySession,
   agentMessages,
@@ -45,7 +45,11 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
+  backendPid,
+  daemonRestarting,
   daemonStopped,
+  stoppedReason,
+  updateStatus,
   dismissToastKey,
   saveLayoutNow,
   toast,
@@ -65,6 +69,7 @@ import type { Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
+import { restartAnswered, restartExpect } from "./updates.ts";
 import type {
   Agent,
   Schedule,
@@ -1278,6 +1283,52 @@ export async function shutDown() {
         : `Couldn't shut down Muster: ${errText(e)}`,
     );
   }
+}
+
+/** "Restart Muster": stop the backend and the terminal host, ending every session, then start
+ * them again from the installed build (`daemon.restart`, with the builds this window was shown).
+ * Every window hears `daemon_stopping {reason: "restart"}` before anything stops, shows
+ * "Restarting Muster…" and reconnects to the new backend by itself. A refusal comes back before
+ * anything stopped. */
+export async function restartMuster() {
+  if (!connectedFor("restart Muster")) return;
+  const pid = backendPid.value;
+  try {
+    await rpc.call("daemon.restart", restartExpect(updateStatus.value));
+    // The event comes first, unless this connection missed it.
+    if (!daemonRestarting.value) daemonRestarting.value = { pid };
+  } catch (e) {
+    // The old backend may go away before it answers: that is the restart working.
+    if (daemonRestarting.value) return;
+    toast(
+      "error",
+      /connection lost/i.test(errText(e))
+        ? "The connection dropped before Muster answered; it may be restarting."
+        : `Couldn't restart Muster: ${errText(e)}`,
+    );
+  }
+}
+
+/** A hello arrived while restarting: from the new backend, the restart is done. */
+export function restartHello(helloPid: number | undefined) {
+  if (!restartAnswered(daemonRestarting.value, helloPid)) return;
+  daemonRestarting.value = null;
+  toast("success", "Muster restarted. Restart a Claude tab to reopen its conversation.", 8000);
+}
+
+/** No new backend answered in time. Still connected (the old one never stopped): say so and
+ * carry on. Otherwise the stopped screen says to start it with `muster`. */
+export function restartTimedOut() {
+  if (!daemonRestarting.value) return;
+  daemonRestarting.value = null;
+  // A new backend answered but speaks another UI protocol: its own screen says so.
+  if (connStatus.value === "incompatible") return;
+  if (rpc.isOpen) {
+    toast("error", "Muster didn't restart. To restart it by hand, run muster stop, then muster.");
+    return;
+  }
+  stoppedReason.value = "restart_failed";
+  daemonStopped.value = true;
 }
 
 // ---------- named agents (docs/UI.md "Agents panel") ----------

@@ -1,4 +1,4 @@
-import { pickUpdate, releaseOfScript, type UpdateStatus, waitingUpdates } from "./updates.ts";
+import { pickUpdate, releaseOfScript, restartAnswered, restartExpect, runningText, type UpdateStatus, waitingUpdates } from "./updates.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual);
@@ -42,4 +42,29 @@ Deno.test("dismissing hides that update until a different one arrives", () => {
   // A dismissed update lets the next one through.
   assertEquals(pickUpdate({ ...s, host: "h1" }, null, { backend: "abc" }), { kind: "host", key: "h1" });
   assertEquals(pickUpdate({ ...s, ui_release: "2-b" }, "1-a", { backend: "abc", ui: "2-b" }), null);
+});
+
+Deno.test("a restart expects the builds the window was shown", () => {
+  assertEquals(restartExpect(null), { backend: null, host: null });
+  assertEquals(restartExpect(none), { backend: null, host: null });
+  assertEquals(restartExpect({ ui_release: "1-a", backend: "abc", host: "def" }), { backend: "abc", host: "def" });
+});
+
+Deno.test("only a hello from another backend ends the restart wait", () => {
+  assertEquals(restartAnswered(null, 5), false, "not restarting");
+  assertEquals(restartAnswered({ pid: 5 }, 5), false, "the old backend, still stopping");
+  assertEquals(restartAnswered({ pid: 5 }, 6), true);
+  assertEquals(restartAnswered({ pid: null }, 6), true, "the old backend didn't say its pid");
+  assertEquals(restartAnswered({ pid: 5 }, undefined), true, "the new backend doesn't say its pid");
+});
+
+Deno.test("the dialogs count running sessions and agents", () => {
+  const sh = { kind: "shell" };
+  const cl = { kind: "claude" };
+  assertEquals(runningText([]), "No sessions are running.");
+  assertEquals(runningText([sh]), "1 session is running.");
+  assertEquals(runningText([cl]), "1 session is running (an agent).");
+  assertEquals(runningText([cl, cl]), "2 sessions are running (all agents).");
+  assertEquals(runningText([cl, sh, sh]), "3 sessions are running (1 agent).");
+  assertEquals(runningText([cl, cl, sh]), "3 sessions are running (2 agents).");
 });

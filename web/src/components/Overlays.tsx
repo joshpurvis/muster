@@ -39,6 +39,7 @@ import { AgentDialog, MessageDialog } from "./Agents.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfileSelect } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
+import { runningText } from "../updates.ts";
 import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
 import { labelOf } from "../layout/Pane.tsx";
@@ -153,7 +154,9 @@ export function Overlays() {
     case "cache_settings":
       return <CacheSettingsDialog />;
     case "shutdown":
-      return <Shutdown />;
+      return <Lifecycle restart={false} />;
+    case "restart":
+      return <Lifecycle restart />;
     case "shortcuts":
       return <Shortcuts />;
     case "confirm":
@@ -1193,39 +1196,33 @@ function Confirm(
   );
 }
 
-// ---------------- shut down ----------------
+// ---------------- shut down, restart ----------------
 
-/** "Shut down Muster…": what `muster stop` does, from the window. Cancel is the default. */
-function Shutdown() {
+/** "Shut down Muster…" (what `muster stop` does) and "Restart Muster…" (that, then `muster`
+ * again by itself), from the window. Both end every session; Cancel is the default. */
+function Lifecycle({ restart }: { restart: boolean }) {
   const cancel = useRef<HTMLButtonElement>(null);
   const [busy, setBusy] = useState(false);
   useLayoutEffect(() => cancel.current?.focus(), []);
   const running = [...sessions.value.values()].filter((s) => s.state !== "exited");
-  const agentCount = running.filter((s) => s.kind !== "shell").length;
-  const n = running.length;
+  const label = restart ? "Restart Muster" : "Shut down Muster";
   return (
-    <Modal class="dialog confirm-dlg" label="Shut down Muster" describedBy="shutdown-body">
+    <Modal class="dialog confirm-dlg" label={label} describedBy="lifecycle-body">
       <div class="dlg-head">
-        <h2>Shut down Muster?</h2>
+        <h2>{label}?</h2>
       </div>
-      <div class="dlg-body" id="shutdown-body">
+      <div class="dlg-body" id="lifecycle-body">
         <p>
-          This stops the Muster backend and its terminal host, in every window. Every terminal closes and every
-          agent in them stops.
+          {restart
+            ? "This stops the Muster backend and its terminal host, in every window, then starts them again. Every terminal closes and every agent in them stops."
+            : "This stops the Muster backend and its terminal host, in every window. Every terminal closes and every agent in them stops."}
         </p>
-        <p>
-          {n === 0 ? "No sessions are running." : (
-            <>
-              <strong>{n === 1 ? "1 session is running" : `${n} sessions are running`}</strong>
-              {agentCount === 0
-                ? "."
-                : agentCount === n
-                ? (n === 1 ? " (an agent)." : " (all agents).")
-                : ` (${agentCount} ${agentCount === 1 ? "agent" : "agents"}).`}
-            </>
-          )}
+        <p>{running.length ? <strong>{runningText(running)}</strong> : runningText(running)}</p>
+        <p class="muted">
+          {restart
+            ? "Windows reconnect by themselves. Claude tabs can be restarted afterwards and reopen their conversation."
+            : <>Run <code>muster</code> to start it again.</>}
         </p>
-        <p class="muted">Run <code>muster</code> to start it again.</p>
       </div>
       <div class="dlg-foot">
         <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
@@ -1235,11 +1232,11 @@ function Shutdown() {
           disabled={busy}
           onClick={() => {
             setBusy(true);
-            A.shutDown().finally(() => (overlay.value = null));
+            (restart ? A.restartMuster() : A.shutDown()).finally(() => (overlay.value = null));
           }}
         >
           {busy && <Spinner size={12} />}
-          Shut down
+          {restart ? "Restart" : "Shut down"}
         </button>
       </div>
     </Modal>

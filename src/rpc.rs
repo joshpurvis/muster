@@ -333,6 +333,12 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             crate::updates::shutdown(hub)?;
             Ok(json!({}))
         }
+        "daemon.restart" => {
+            human_only(who, method, &params)?;
+            let expect: crate::updates::Expect = parse(params)?;
+            let exe = crate::updates::restart(hub, expect).await?;
+            Ok(json!({ "exe": exe.to_string_lossy() }))
+        }
         "prefs.get" => to_value(hub.ui_prefs()),
         "prefs.set" => {
             if params.get("shell").is_some() {
@@ -2178,7 +2184,7 @@ mod tests {
     async fn restart_and_shutdown_are_human_only() {
         let (hub, _st) = fixture();
         let device = Principal::Device { id: 1 };
-        for method in ["daemon.reload", "daemon.shutdown", "daemon.reload_handoff"] {
+        for method in ["daemon.reload", "daemon.shutdown", "daemon.reload_handoff", "daemon.restart"] {
             assert!(crate::devices::method_scope(method).is_none(), "{method}");
             let e = dispatch(&hub, &device, method, json!({})).await.unwrap_err();
             assert!(e.0.contains("only available on this computer"), "{}", e.0);
@@ -2190,6 +2196,15 @@ mod tests {
         assert!(e.contains("invalid params"), "{e}");
         let e = call(&hub, "daemon.reload", json!({"expect": "abcdefabcdef"})).await.unwrap_err();
         assert!(e.contains("where it was launched from"), "{e}");
+        // A restart refuses before anything stops, and tells windows nothing; a refused one
+        // leaves the next try free (not "already restarting").
+        let mut rx = hub.subscribe();
+        for _ in 0..2 {
+            let e = call(&hub, "daemon.restart", json!({"backend": null, "host": null})).await.unwrap_err();
+            assert!(e.contains("where it was launched from") && e.contains("nothing was stopped"), "{e}");
+        }
+        assert!(call(&hub, "daemon.restart", json!({"host": 7})).await.unwrap_err().contains("invalid params"));
+        assert!(drain(&mut rx, "daemon_stopping").is_empty(), "no daemon_stopping without a restart");
         let h = call(&hub, "hello", json!({})).await.unwrap();
         assert_eq!(h["updates"], json!({"ui_release": null, "backend": null, "host": null}));
         // The key handoff: refused (so the CLI reloads the usual way) without a key, without a

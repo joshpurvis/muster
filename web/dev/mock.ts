@@ -1459,6 +1459,20 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       broadcast("daemon_stopping", { reason: "shutdown" });
       for (const s of sessions.values()) if (s.state !== "exited") kill(s.id);
       return {};
+    case "daemon.restart":
+      // Only the builds the window was shown, as the backend checks.
+      if ((p.backend ?? null) !== updates.backend || (p.host ?? null) !== updates.host) {
+        throw new Error("the Muster build at /mock/target/release/muster changed since this window last looked; nothing was stopped");
+      }
+      // Every session ends; a new backend (with the current builds) answers the reconnects.
+      broadcast("daemon_stopping", { reason: "restart" });
+      for (const s of sessions.values()) if (s.state !== "exited") kill(s.id);
+      updates.backend = null;
+      updates.host = null;
+      setTimeout(() => {
+        for (const c of clients) c.close();
+      }, 300);
+      return { exe: "/mock/target/release/muster" };
     case "window.claim": {
       if (!ws) throw new Error("window.claim is WebSocket only");
       return claim(ws, typeof p.id === "number" ? p.id : undefined);

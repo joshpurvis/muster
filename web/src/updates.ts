@@ -50,3 +50,33 @@ export function waitingUpdates(s: UpdateStatus | null, loaded: string | null): P
 export function pickUpdate(s: UpdateStatus | null, loaded: string | null, dismissed: Dismissed): PendingUpdate | null {
   return waitingUpdates(s, loaded).find((u) => dismissed[u.kind] !== u.key) ?? null;
 }
+
+/** `daemon.restart`'s params: the backend and terminal host builds this window was shown (null:
+ * none of that kind waiting). The backend refuses if what it would start differs, so a build
+ * still being written, or replaced since, is never started. */
+export function restartExpect(s: UpdateStatus | null): { backend: string | null; host: string | null } {
+  return { backend: s?.backend ?? null, host: s?.host ?? null };
+}
+
+/** How long a window waits for the new backend after a restart before it says to run `muster`.
+ * Stopping can take up to about 30 s (saving state, ending every session), starting about 15 s. */
+export const RESTART_WAIT_MS = 90_000;
+
+/** Did a hello on reconnect come from the new backend? Not when the old one (`restarting.pid`)
+ * answered while it was still stopping. A backend that didn't say its pid: any reconnect is. */
+export function restartAnswered(restarting: { pid: number | null } | null, helloPid: number | undefined): boolean {
+  if (!restarting) return false;
+  return restarting.pid === null || helloPid === undefined || helloPid !== restarting.pid;
+}
+
+/** "3 sessions are running (2 agents)." for the shutdown and restart dialogs: `running` are the
+ * sessions that haven't exited; shells aren't agents. */
+export function runningText(running: { kind: string }[]): string {
+  const n = running.length;
+  if (n === 0) return "No sessions are running.";
+  const agents = running.filter((s) => s.kind !== "shell").length;
+  const head = n === 1 ? "1 session is running" : `${n} sessions are running`;
+  if (agents === 0) return `${head}.`;
+  if (agents === n) return `${head} ${n === 1 ? "(an agent)" : "(all agents)"}.`;
+  return `${head} (${agents} ${agents === 1 ? "agent" : "agents"}).`;
+}

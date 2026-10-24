@@ -528,6 +528,8 @@ export interface HelloResult {
   prefs?: WindowPrefs;
   /** Whether the backend has an OpenRouter key (never the key). Missing: no OpenRouter support. */
   openrouter?: { key_present: boolean };
+  /** The backend's own pid (missing from older backends): tells a restarted backend apart. */
+  pid?: number;
 }
 
 export interface PanelCsp {

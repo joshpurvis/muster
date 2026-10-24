@@ -401,6 +401,12 @@ export const commands: Command[] = [
     run: () => (overlay.value = { kind: "shell" }),
   },
   {
+    id: "restart-muster",
+    title: "Restart Muster…",
+    group: "Window",
+    run: () => (overlay.value = { kind: "restart" }),
+  },
+  {
     id: "shutdown",
     title: "Shut down Muster…",
     group: "Window",

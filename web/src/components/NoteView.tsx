@@ -1,15 +1,16 @@
 // A note's editor (docs/UI.md "Notes"): a plain <textarea> that saves itself, plus a status line
-// with who edited it last, the save state and the caret position. The text and caret live in the
-// note's draft (notes.ts), so moving the tab between groups keeps them.
+// with who edited it last, the save state and the caret position. The text, caret and undo history
+// live in the note's draft (notes.ts), so moving the tab between groups keeps them.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, isDirty, notes } from "../notes.ts";
+import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, isDirty, notes, undoDraft } from "../notes.ts";
 import { mapOffset } from "../note_merge.ts";
+import { kindOf } from "../note_undo.ts";
 import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
 import { schedules } from "../state.ts";
 import { setNoteTriggers } from "../actions.ts";
 import { IconZap } from "../icons.tsx";
-import { cx } from "../util.ts";
+import { cx, isMac } from "../util.ts";
 
 /** "Allow triggers" in a note's status line: off by default, and only you switch it (agents
  * can't). With it off, a schedule's note trigger never fires on this note's changes. */
@@ -62,12 +63,14 @@ function size(bytes: number): string {
 const utf8 = new TextEncoder();
 
 /** Note `id`'s editor. Every note tab of a group keeps its editor mounted (`hidden` while it isn't
- * the visible tab), so switching tabs keeps the textarea and its undo history. */
+ * the visible tab), so switching tabs keeps the textarea and its scroll. */
 export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean }) {
   const n = notes.value.get(id);
   void draftsChanged.value;
   const now = useNow();
   const ref = useRef<HTMLTextAreaElement>(null);
+  /** Where the selection started before the edit on its way (for undo; `beforeinput`). */
+  const from = useRef<number | null>(null);
   const [pos, setPos] = useState({ line: 1, col: 1 });
   const d = n ? draftOf(n) : undefined;
   // Only its summary is known yet (hello carries no text): fetch the text.
@@ -82,6 +85,17 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
   const track = () => {
     const el = ref.current;
     if (el) setPos(caret(el.value, el.selectionStart));
+  };
+
+  // Ctrl+Z / Ctrl+Shift+Z: the note's own history (note_undo.ts), never the browser's, which
+  // WebKitGTK has no key for and which an agent's change wipes.
+  const undo = (again: boolean) => {
+    const el = ref.current;
+    const c = undoDraft(id, again);
+    if (!el || !c) return;
+    el.setRangeText(c.insert, c.at, c.end);
+    el.setSelectionRange(c.sel[0], c.sel[1]);
+    track();
   };
 
   useLayoutEffect(() => {
@@ -99,7 +113,16 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       el.scrollTop = top;
       track();
     };
+    const onBefore = (e: InputEvent) => {
+      // Undo and Redo from the context menu (or a platform's Edit menu) come as input events.
+      if (e.inputType === "historyUndo" || e.inputType === "historyRedo") {
+        e.preventDefault();
+        undo(e.inputType === "historyRedo");
+      } else from.current = el.selectionStart;
+    };
+    el.addEventListener("beforeinput", onBefore);
     return () => {
+      el.removeEventListener("beforeinput", onBefore);
       d.sel = [el.selectionStart, el.selectionEnd];
       d.onRemote = null;
       if (isDirty(d)) flushDraft(id);
@@ -127,7 +150,14 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
         placeholder="Type here. Agents read and add to this note too (note_read, note_append)."
         disabled={connStatus.value === "incompatible"}
         onInput={(e) => {
-          editDraft(id, (e.target as HTMLTextAreaElement).value);
+          const el = e.target as HTMLTextAreaElement;
+          const ie = e as InputEvent;
+          editDraft(id, el.value, {
+            from: from.current ?? Infinity,
+            caret: el.selectionEnd,
+            kind: kindOf(ie.inputType, ie.isComposing),
+          });
+          from.current = null;
           track();
         }}
         onKeyUp={track}
@@ -142,6 +172,15 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "s") {
             e.preventDefault();
             flushDraft(id);
+          }
+          // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z and ⇧⌘Z on a Mac). Kept from the browser's
+          // own undo and from every other key handler.
+          const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+          const k = e.key.toLowerCase();
+          if (mod && !e.altKey && !e.isComposing && (k === "z" || (k === "y" && !isMac && !e.shiftKey))) {
+            e.preventDefault();
+            e.stopPropagation();
+            undo(k === "y" || e.shiftKey);
           }
         }}
       />

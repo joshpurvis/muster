@@ -102,6 +102,24 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   await a.wait(`!document.querySelector('${editor}').value.includes('UNDO-ME')`, 2000);
   await a.wait(`!${M}.notes.value.get(${id}).body.includes('UNDO-ME')`, 4000);
   ok("switching away and back kept the editor mounted: Ctrl+Z still undid the typing");
+
+  // ---- Ctrl+Z takes back only the human's typing: an agent's append meanwhile stays
+  const value = `document.querySelector('${editor}').value`;
+  await a.type(" MINE");
+  await R("note.append", { id, text: "- agent: while you typed", from_session: agent });
+  await a.wait(`${value}.includes('while you typed')`, 3000);
+  await a.key("Ctrl+z");
+  await a.wait(`!${value}.includes(' MINE') && ${value}.includes('while you typed')`, 2000);
+  await a.wait(`!${M}.notes.value.get(${id}).body.includes(' MINE') && ${M}.notes.value.get(${id}).body.includes('while you typed')`, 4000);
+  check(await a.eval(`document.activeElement?.matches('${editor}')`), "the keyboard stayed in the editor");
+  await a.key("Ctrl+Shift+z");
+  await a.wait(`${value}.includes(' MINE\\n- agent: while you typed')`, 2000);
+  await a.key("Ctrl+z");
+  await a.wait(`!${value}.includes(' MINE')`, 2000);
+  await a.key("Ctrl+y");
+  await a.wait(`${value}.includes(' MINE')`, 2000);
+  await a.wait(`${M}.notes.value.get(${id}).body.includes(' MINE\\n- agent: while you typed')`, 4000);
+  ok("Ctrl+Z undid the typing but kept an agent's append made meanwhile; Ctrl+Shift+Z and Ctrl+Y redid it, saved");
   await a.key("Alt+Shift+Z");
   await a.wait(`${M}.fullscreen.value !== null && !!document.querySelector('.fs-exit')`, 2000);
   await a.click(".fs-exit");

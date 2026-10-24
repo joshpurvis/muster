@@ -45,7 +45,7 @@ import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
 import { labelOf } from "../layout/Pane.tsx";
 import { basename, type JumpCandidate, jumpOrder, rankJump, tabText, windowLabel } from "../model.ts";
-import { cx, fuzzy, tildify } from "../util.ts";
+import { cx, fuzzy, isMac, tildify } from "../util.ts";
 
 const FOCUSABLE =
   'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
@@ -1066,6 +1066,8 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Reorder, move to a group, split or window", keys: ["Drag tab"], group: "Tab" },
   { title: "Group menu", keys: ["Right-click"], group: "Groups" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },
+  { title: "Undo in a note", keys: [isMac ? "Cmd+Z" : "Ctrl+Z"], group: "Notes" },
+  { title: "Redo in a note", keys: isMac ? ["Cmd+Shift+Z"] : ["Ctrl+Shift+Z", "Ctrl+Y"], group: "Notes" },
 ];
 
 type ScGroup = [string, { title: string; keys: string[] }[]];

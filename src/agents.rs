@@ -614,10 +614,11 @@ pub fn agent_args(
 }
 
 /// `args` with any conversation flag (`--resume`/`--continue`, in every spelling the argument
-/// check accepts) replaced by `--resume <id>`: how a Claude tab that isn't a named agent's
-/// restarts into the conversation it last started. Its other arguments are kept.
-pub fn with_resume(kind: SessionKind, args: &[String], id: &str) -> anyhow::Result<Vec<String>> {
-    anyhow::ensure!(kind == SessionKind::Claude && valid_resume_id(id), "not a Claude conversation id: {id}");
+/// check accepts) replaced by `--resume <id>`, or dropped for None: how a Claude tab that isn't
+/// a named agent's restarts into the conversation it last used. Its other arguments are kept.
+pub fn with_resume(kind: SessionKind, args: &[String], id: Option<&str>) -> anyhow::Result<Vec<String>> {
+    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume a conversation");
+    anyhow::ensure!(id.is_none_or(valid_resume_id), "not a Claude conversation id: {id:?}");
     let mut out = Vec::new();
     for (long, values) in crate::adapters::parse_extra_args(kind, args)? {
         match (long, values.as_slice()) {
@@ -629,7 +630,9 @@ pub fn with_resume(kind: SessionKind, args: &[String], id: &str) -> anyhow::Resu
             }
         }
     }
-    out.extend(["--resume".to_string(), id.to_string()]);
+    if let Some(id) = id {
+        out.extend(["--resume".to_string(), id.to_string()]);
+    }
     crate::adapters::check_extra_args(kind, &out)?;
     Ok(out)
 }
@@ -2766,16 +2769,17 @@ mod tests {
     fn with_resume_replaces_any_conversation_flag_and_keeps_the_rest() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let c = SessionKind::Claude;
-        assert_eq!(with_resume(c, &[], "x").unwrap(), a(&["--resume", "x"]));
+        assert_eq!(with_resume(c, &[], Some("x")).unwrap(), a(&["--resume", "x"]));
         for old in [&["--resume", "old"][..], &["-r", "old"], &["-rold"], &["--resume=old"], &["--resume"], &["-c"], &["--continue"]] {
-            assert_eq!(with_resume(c, &a(old), "x").unwrap(), a(&["--resume", "x"]), "{old:?}");
+            assert_eq!(with_resume(c, &a(old), Some("x")).unwrap(), a(&["--resume", "x"]), "{old:?}");
+            assert!(with_resume(c, &a(old), None).unwrap().is_empty(), "{old:?}");
         }
         assert_eq!(
-            with_resume(c, &a(&["--model", "opus", "-r", "old", "--verbose", "--debug"]), "x").unwrap(),
+            with_resume(c, &a(&["--model", "opus", "-r", "old", "--verbose", "--debug"]), Some("x")).unwrap(),
             a(&["--model=opus", "--verbose", "--debug", "--resume", "x"])
         );
-        assert!(with_resume(c, &[], "--evil").is_err());
-        assert!(with_resume(SessionKind::Codex, &[], "x").is_err());
+        assert!(with_resume(c, &[], Some("--evil")).is_err());
+        assert!(with_resume(SessionKind::Codex, &[], Some("x")).is_err());
     }
 
     #[test]

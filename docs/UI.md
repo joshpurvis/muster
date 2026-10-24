@@ -99,8 +99,10 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   current turn is lost; it reopens the same conversation." (Codex: "…and the program starts
   fresh."), with Cancel focused. Shells and idle agents don't ask, nor do the palette commands
   and shortcuts. Restarting a Claude tab, also one that ended when Muster shut down, reopens the
-  conversation it last started (`--resume`; a `/clear` counts as a new one); for an empty one,
-  open a new Claude tab.
+  conversation it last used (`--resume`), once a prompt was sent in it; after a `/clear` it
+  starts empty until the new conversation has a prompt. If Claude can't open that conversation
+  any more ("No conversation found"), the next restart starts empty. For an empty conversation
+  any time, open a new Claude tab.
 
 ### Agent panel tabs
 

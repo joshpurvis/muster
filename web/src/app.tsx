@@ -16,6 +16,7 @@ import {
   fullscreen,
   applyEvent,
   applyHello,
+  daemonRestarting,
   daemonStopped,
   focusedSession,
   focusedTabId,
@@ -28,6 +29,7 @@ import {
   removedSessionListeners,
   sessions,
   panels,
+  stoppedReason,
   toast,
   updateLayout,
   windowId,
@@ -55,6 +57,7 @@ import { DragOverlay } from "./layout/dnd.tsx";
 import { LaunchButtons } from "./layout/Pane.tsx";
 import { focusPane, paneOfSession } from "./layout/tree.ts";
 import { windowParam } from "./model.ts";
+import { RESTART_WAIT_MS } from "./updates.ts";
 import type { SessionKind } from "./types.ts";
 import { tildify } from "./util.ts";
 
@@ -92,7 +95,10 @@ terms.onClipboardFailed((text) => toast("error", text));
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
   A.deliveriesNeedReview(h.paused_deliveries ?? []);
-  if (reconnect) A.backendRestarted();
+  if (reconnect) {
+    A.backendRestarted();
+    A.restartHello(h);
+  }
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
   if (reconnect) terms.reattachAll();
@@ -103,6 +109,14 @@ rpc.onEvent = applyEvent;
 // the stopped screen says how to start it again.
 effect(() => {
   if (daemonStopped.value) rpc.suspend();
+});
+
+// Muster is restarting: the window keeps reconnecting; a new backend that never answers ends in
+// the stopped screen's guidance.
+effect(() => {
+  if (!daemonRestarting.value) return;
+  const t = setTimeout(() => A.restartTimedOut(), RESTART_WAIT_MS);
+  return () => clearTimeout(t);
 });
 
 // The system title bar follows the shared preference in every native window (new windows are
@@ -275,10 +289,29 @@ function Stopped() {
         aria-describedby="stopped-text"
         tabIndex={-1}
       >
-        <h1 id="stopped-title">Muster is shut down</h1>
-        <p id="stopped-text">
-          Every session has ended. Run <code>muster</code> to start it again, then reconnect.
-        </p>
+        {stoppedReason.value === "restart_failed"
+          ? (
+            <>
+              <h1 id="stopped-title">Muster didn't come back</h1>
+              <p id="stopped-text">
+                The restart didn't finish: no new Muster has answered for 3 minutes. Sessions may have ended, or some
+                may still be running. In a terminal, run <code>muster stop</code>, then <code>muster</code> (it says
+                what went wrong, when it knows). Then reconnect.
+              </p>
+              <p class="muted">
+                If <code>muster stop</code> says the backend didn't stop, or that a restart is under way, wait a
+                minute and run it again.
+              </p>
+            </>
+          )
+          : (
+            <>
+              <h1 id="stopped-title">Muster is shut down</h1>
+              <p id="stopped-text">
+                Every session has ended. Run <code>muster</code> to start it again, then reconnect.
+              </p>
+            </>
+          )}
         <p class="muted" role="status">
           {notYet && "Muster isn't running yet. Start it with muster in a terminal, then try again."}
         </p>
@@ -291,14 +324,58 @@ function Stopped() {
   );
 }
 
+/** After `daemon_stopping {reason: "restart"}`, until the new backend answers: like the stopped
+ * screen it takes the focus (a terminal may have had it), but nothing needs doing. */
+function Restarting() {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => ref.current?.focus(), []);
+  return (
+    <div class="splash">
+      <div
+        ref={ref}
+        class="welcome-card"
+        role="alertdialog"
+        aria-labelledby="restarting-title"
+        aria-describedby="restarting-text"
+        tabIndex={-1}
+      >
+        <div class="welcome-mark pulse">m</div>
+        <h1 id="restarting-title">Restarting Muster…</h1>
+        <p id="restarting-text">
+          Every session is ending. Muster starts again by itself and this window reconnects. Claude tabs can then
+          be restarted to reopen their conversations.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function Splash() {
   const s = connStatus.value;
   if (daemonStopped.value) return <Stopped />;
   if (s === "incompatible") {
+    // After a restart the sessions have ended and the new Muster brings its own interface.
+    if (daemonRestarting.value) {
+      return (
+        <div class="splash">
+          <div class="welcome-card" role="alertdialog" aria-labelledby="restarted-ui-title" aria-describedby="restarted-ui-text">
+            <h1 id="restarted-ui-title">Muster restarted with a new interface</h1>
+            <p id="restarted-ui-text">
+              Every session ended with the restart. Reload this window to use the new interface; Claude tabs can then
+              be restarted to reopen their conversations.
+            </p>
+            <div class="splash-actions">
+              <button type="button" class="btn btn-primary" onClick={() => location.reload()}>Reload window</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return <div class="splash"><div class="welcome-card"><h1>UI update required</h1>
       <p>Install a UI compatible with this backend, then refresh. Your terminals remain running.</p>
     </div></div>;
   }
+  if (daemonRestarting.value) return <Restarting />;
   if (s === "no_token") {
     return (
       <div class="splash">
@@ -326,7 +403,7 @@ function Splash() {
 
 function App() {
   const ready = helloDone.value && (!windowsSupported.value || windowId.value !== null);
-  if (!ready || connStatus.value === "incompatible" || daemonStopped.value) {
+  if (!ready || connStatus.value === "incompatible" || daemonStopped.value || daemonRestarting.value) {
     return (
       <>
         <Splash />

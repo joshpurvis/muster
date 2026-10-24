@@ -1745,6 +1745,75 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
     "openrouter: still in no file after the reloads (the detached backend's log included)",
   );
+
+  // "Restart Muster" (`daemon.restart`): every session ends, then a new backend and a new
+  // terminal host start by themselves from the launch path, and the API answers again.
+  c = await connect();
+  const h0 = await c.call("hello");
+  const live = await c.call("channel.create", { workspace_id: h0.workspaces[0].id, agent: "shell" });
+  let liveSess: Json | undefined;
+  for (let n = 0; n < 100 && !(liveSess?.pid > 0); n++) {
+    liveSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === live.id);
+    if (!(liveSess?.pid > 0)) await sleep(50);
+  }
+  ok(liveSess?.pid > 0 && liveSess.state !== "exited", "restart: a shell runs before it");
+  const stale = await c.call("daemon.restart", { backend: "0123456789ab", host: h0.updates.host })
+    .then(() => "", (e: Error) => e.message);
+  ok(stale.includes("nothing was stopped"), `restart: builds other than the ones shown are refused: ${stale}`);
+  const still = await c.call("hello");
+  ok(still.pid === h0.pid && still.sessions.find((s: Json) => s.id === liveSess!.id)?.state !== "exited",
+    "restart: ...and nothing stopped");
+  const restarted = await c.call("daemon.restart", { backend: h0.updates.backend, host: h0.updates.host });
+  ok(String(restarted.exe).endsWith("/muster"), `restart: started from the launch path (${restarted.exe})`);
+  for (let n = 0; n < 100 && !c.closed && !c.events.some((e) => e.event === "daemon_stopping"); n++) await sleep(20);
+  ok(c.events.some((e) => e.event === "daemon_stopping" && e.data.reason === "restart"),
+    "restart: windows hear daemon_stopping {reason: restart}");
+  let h1: Json | null = null;
+  for (const end = Date.now() + 60000; !h1 && Date.now() < end; await sleep(200)) {
+    try {
+      const disc = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`));
+      if (disc.pid === h0.pid) continue;
+      const k = new Client(disc.token);
+      await k.open();
+      h1 = await k.call("hello");
+      c.close();
+      c = k;
+    } catch { /* not up yet */ }
+  }
+  ok(h1 && h1.pid !== h0.pid, `restart: a new backend answers (pid ${h0.pid} -> ${h1?.pid})`);
+  ok(
+    h1!.terminal_host.instance !== h0.terminal_host.instance && h1!.terminal_host.pid !== h0.terminal_host.pid,
+    `restart: ...with a new terminal host (pid ${h0.terminal_host.pid} -> ${h1!.terminal_host.pid})`,
+  );
+  ok(h1!.sessions.find((s: Json) => s.id === liveSess!.id)?.state === "exited", "restart: the running shell ended");
+  ok(typeof h1!.build === "string" && h1!.build === (h0.updates.backend ?? h0.build),
+    `restart: the new backend runs the build the restart was for (${h0.build} -> ${h1!.build})`);
+  ok(!(await Deno.stat(`${RUNTIME}/restart-failed`).then(() => true, () => false)), "restart: no failure is recorded");
+  ok(h1!.updates.host === null && h1!.updates.backend === null, "restart: no update is left waiting at the launch path");
+  // It runs the release checked before anything stopped (its read-only snapshot), not the build output.
+  // (python3 reads the link: the smoke has no read permission for /proc.)
+  const exeOf = async (pid: number) =>
+    dec.decode((await new Deno.Command("python3", {
+      args: ["-I", "-c", "import os, sys; print(os.readlink(sys.argv[1]))", `/proc/${pid}/exe`],
+      stdout: "piped", stderr: "null",
+    }).output()).stdout).trim();
+  const [appExe, hostExe] = [await exeOf(h1!.pid), await exeOf(h1!.terminal_host.pid)];
+  ok(appExe.includes("/application-releases/") && hostExe.includes("/application-releases/") &&
+    appExe.split("/").slice(0, -1).join("/") === hostExe.split("/").slice(0, -1).join("/"),
+    `restart: the new backend and host run from one checked release (${appExe}, ${hostExe})`);
+  ok(h1!.openrouter.key_present === true, "restart: the restarted backend keeps the OpenRouter key");
+  const after = await c.call("channel.create", { workspace_id: h1!.workspaces[0].id, agent: "shell" });
+  let afterSess: Json | undefined;
+  for (let n = 0; n < 100 && !(afterSess?.pid > 0); n++) {
+    afterSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === after.id);
+    if (!(afterSess?.pid > 0)) await sleep(50);
+  }
+  ok(afterSess?.pid > 0, "restart: the API answers again and a new shell starts on the new host");
+  ok(
+    (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
+    "restart: the key is still in no file",
+  );
+  c.close();
   const stop = await cli(["stop"], ENV);
   ok(stop.success, "openrouter: the reloaded backend stops");
   // `current` (the first backend) has exited; the cleanup below finds nothing left to stop.

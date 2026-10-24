@@ -2,7 +2,7 @@
 // update local state (the window's layout of groups, prefs, windows).
 
 import { signal } from "@preact/signals";
-import { rpc } from "./rpc.ts";
+import { connStatus, rpc } from "./rpc.ts";
 import {
   agentBySession,
   agentMessages,
@@ -45,7 +45,12 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
+  lastBackend,
+  daemonRestarting,
   daemonStopped,
+  lifecycleChecking,
+  stoppedReason,
+  updateStatus,
   dismissToastKey,
   saveLayoutNow,
   toast,
@@ -61,10 +66,11 @@ import {
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
-import type { Note } from "./types.ts";
+import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
+import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
   Schedule,
@@ -1265,6 +1271,7 @@ export function backendRestarted() {
  * taken as a shutdown (the window keeps reconnecting). */
 export async function shutDown() {
   if (!connectedFor("shut down")) return;
+  lifecycleChecking.value = "shutdown";
   try {
     await rpc.call("daemon.shutdown");
     daemonStopped.value = true;
@@ -1277,7 +1284,67 @@ export async function shutDown() {
         ? "The connection dropped before Muster answered; it may not have shut down."
         : `Couldn't shut down Muster: ${errText(e)}`,
     );
+  } finally {
+    lifecycleChecking.value = null;
   }
+}
+
+/** "Restart Muster": stop the backend and the terminal host, ending every session, then start
+ * them again from the installed build (`daemon.restart`, with the builds this window was shown).
+ * Every window hears `daemon_stopping {reason: "restart"}` before anything stops, shows
+ * "Restarting Muster…" and reconnects to the new backend by itself. A refusal comes back before
+ * anything stopped. */
+export async function restartMuster() {
+  if (!connectedFor("restart Muster")) return;
+  const wait = restartWait(lastBackend.value, updateStatus.value);
+  lifecycleChecking.value = "restart";
+  try {
+    await rpc.call("daemon.restart", restartExpect(updateStatus.value));
+    // The event comes first, unless this connection missed it.
+    if (!daemonRestarting.value) daemonRestarting.value = wait;
+  } catch (e) {
+    // The old backend may go away before it answers: that is the restart working.
+    if (daemonRestarting.value) return;
+    const why = errText(e);
+    // Lost or slow: the restart may still go ahead (this window then shows it).
+    if (/connection lost/i.test(why)) toast("warn", "The connection dropped before Muster answered; it may be restarting.");
+    else if (/timed out/i.test(why)) toast("warn", "Muster hasn't answered yet; it may still restart.");
+    else toast("error", `Couldn't restart Muster: ${why}`);
+  } finally {
+    lifecycleChecking.value = null;
+  }
+}
+
+/** A hello arrived while restarting: from the new backend on a new host, the restart is done. */
+export function restartHello(hello: HelloResult) {
+  const outcome = restartOutcome(daemonRestarting.value, hello);
+  if (outcome === "waiting") return;
+  daemonRestarting.value = null;
+  if (outcome === "other_build") {
+    toast(
+      "warn",
+      "Muster started again, but from another build than the one this restart was for: something else started it meanwhile. Every session ended.",
+      12000,
+    );
+    return;
+  }
+  toast("success", "Muster restarted. Restart a Claude tab to reopen its conversation.", 8000);
+}
+
+/** No new backend answered in time. Still connected (the old one never stopped): say so and
+ * carry on. Otherwise the stopped screen says to start it with `muster`. */
+export function restartTimedOut() {
+  if (!daemonRestarting.value) return;
+  // A new backend answered but speaks another UI protocol: the restart happened, and that
+  // screen says so (it keeps the restart's context).
+  if (connStatus.value === "incompatible") return;
+  daemonRestarting.value = null;
+  if (rpc.isOpen) {
+    toast("error", "Muster didn't restart. To restart it by hand, run muster stop, then muster.");
+    return;
+  }
+  stoppedReason.value = "restart_failed";
+  daemonStopped.value = true;
 }
 
 // ---------- named agents (docs/UI.md "Agents panel") ----------

@@ -83,7 +83,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
   Alt keys, Jump focuses the other window, System title bar (native window only), Command
-  palette, Keyboard shortcuts, then Reload window, Close window, Shut down Muster…), plus a
+  palette, Keyboard shortcuts, then Reload window, Close window, Restart Muster…, Shut down Muster…), plus a
   "Reconnecting…" pill when disconnected. The top-right group is the one touching the window's
   right edge highest up; a zoomed group carries the controls; narrow strips keep only Jump and
   `⋯`.
@@ -350,9 +350,10 @@ docs/PROTOCOL.md "Updates and window preferences"), in this order:
    reconnects.
 2. **UI update ready**: the installed UI release differs from the one this page loaded (after
    `muster ui-install`). "Reload" (Ctrl+Shift+R).
-3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. No button:
-   installing it needs a full restart, which ends all sessions; a "Shut down Muster…" link opens
-   the shutdown dialog.
+3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. Installing
+   it needs a restart of Muster, which ends all sessions: "Restart Muster…" (disabled while
+   disconnected) opens the restart dialog (see "Window and shutdown"), so the update is one
+   confirmed click.
 
 When the backend and the UI both changed, the backend banner comes first and the UI banner shows
 after the restart. The banner is hidden while a dialog is open, and has its own polite live
@@ -369,9 +370,34 @@ of the same kind arrives; the next waiting update shows meanwhile.
 - **System title bar** (`⋯`, palette; native windows only): shows or hides the window
   decorations of every native window. Kept by the backend (`prefs.set`), so new windows are built
   with it; open windows switch at once. Windows opened by an older build don't have the switch.
-- **Shut down Muster…** (`⋯`, palette, the terminal host banner): a dialog warning that it stops
+- **Restart Muster…** (`⋯`, palette, the terminal host banner): what `muster stop` then `muster`
+  do, without a terminal. A dialog warning that it stops the backend and the terminal host and
+  starts them again, ending every session and agent, with how many sessions are running, and that
+  windows reconnect by themselves and Claude tabs can be restarted afterwards to reopen their
+  conversation. Cancel is focused; "Restart" (red) calls `daemon.restart` with the builds this
+  window was shown (never queued). The dialog then says "Checking that Muster can restart…" and
+  that nothing has stopped yet, with no Cancel; Escape, the backdrop and shortcuts (the command
+  palette, Jump) no longer close or replace it, and nothing else takes the screen from it (the
+  request can't be withdrawn). A refusal (a build still being written or changed since, another
+  restart, reload or shutdown under way, a check of the restart command) comes back as a toast
+  before anything stopped. Otherwise every window shows "Restarting Muster…" (an alert dialog
+  that takes the focus; no shortcut works meanwhile, nor on the shut-down screen) and keeps
+  reconnecting; when a new backend on a new terminal host answers, the window carries on (the
+  terminal host banner is gone) and a toast says Muster restarted (or, when the backend that
+  answers runs another build than the restart was for, that something else started Muster
+  meanwhile and every session ended). If that backend needs another
+  UI, the screen says Muster restarted with a new interface, every session ended, and offers
+  Reload window. If none answers within 3 minutes, the window shows the stopped screen, "Muster
+  didn't come back": the restart didn't finish, sessions may have ended or some may still run, and
+  to run `muster stop`, then `muster` (which prints why the restart didn't finish when the restart
+  command recorded it), again after a minute if `muster stop` says the backend didn't stop or a
+  restart is under way. If the old backend still answers then (the restart never went ahead), a
+  toast says so instead. Native windows stay open and reconnect; no
+  new window opens.
+- **Shut down Muster…** (`⋯`, palette): a dialog warning that it stops
   the backend and the terminal host and ends every session and agent, with how many sessions are
-  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
+  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown` (the dialog then says
+  "Shutting down Muster…", with no Cancel, and holds the screen as a confirmed restart's does). Every window then shows
   "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
   `daemon_stopping` or the call's reply does that; a dropped connection just reconnects. Its
   Reconnect reloads the window only once Muster answers again; until then it says "Muster isn't

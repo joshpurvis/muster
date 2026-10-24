@@ -44,3 +44,8 @@ webkit2gtk = { version = "=2.0.1", optional = true }
 
 [profile.release]
 lto = "thin"
+
+# Every backend start, `daemon.restart` and `restart-all` hash and snapshot the (debug: ~240 MB)
+# executables; unoptimized SHA-256 made that take ~15 s per start in tests and smoke runs.
+[profile.dev.package.sha2]
+opt-level = 3

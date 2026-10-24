@@ -96,8 +96,11 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
   the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
   "Claude is working" / "Codex is working", "Stop its current turn?" or "Restart it? Its
-  current turn is lost and the program starts fresh.", with Cancel focused. Shells and idle
-  agents don't ask, nor do the palette commands and shortcuts.
+  current turn is lost; it reopens the same conversation." (Codex: "…and the program starts
+  fresh."), with Cancel focused. Shells and idle agents don't ask, nor do the palette commands
+  and shortcuts. Restarting a Claude tab, also one that ended when Muster shut down, reopens the
+  conversation it last started (`--resume`; a `/clear` counts as a new one); for an empty one,
+  open a new Claude tab.
 
 ### Agent panel tabs
 

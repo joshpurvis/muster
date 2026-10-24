@@ -3207,6 +3207,23 @@ impl Hub {
         })
     }
 
+    /// A Claude tab that isn't a named agent's keeps the conversation its run started (or a
+    /// `/clear` began) as `--resume <id>` among its stored arguments, so a restart, also after
+    /// a full restart of Muster, reopens that conversation instead of an empty one. Named
+    /// agents keep theirs on their record (`agents::restart_args`).
+    fn remember_conversation(&self, id: SessionId, kind: SessionKind, event: &str, payload: &serde_json::Value) {
+        if kind != SessionKind::Claude || self.agents.by_session(id).is_some() {
+            return;
+        }
+        let Some(conversation) = crate::agents::resume_id_from_hook(kind, event, payload) else { return };
+        let Some(args) = self.inner.lock().sessions.get(&id).map(|e| e.extra_args.clone()) else { return };
+        let saved = crate::agents::with_resume(kind, &args, &conversation)
+            .and_then(|next| if next == args { Ok(()) } else { self.set_session_extra_args(id, next) });
+        if let Err(error) = saved {
+            tracing::warn!(session = id, "remembering the conversation to resume: {error:#}");
+        }
+    }
+
     /// Replace a session's agent arguments for its next (re)start (an agent's `--resume`). Checked
     /// against the allowlist like any extra args.
     pub fn set_session_extra_args(&self, id: SessionId, args: Vec<String>) -> anyhow::Result<()> {
@@ -3814,6 +3831,7 @@ impl Hub {
             (info, from, fx)
         };
         let id = info.id;
+        self.remember_conversation(id, info.kind, event, &payload);
         if let Some(m) = fx.replied {
             crate::agents::publish_message(self, m);
             crate::schedules::on_reply(self, m);
@@ -5589,6 +5607,34 @@ mod tests {
         assert_eq!((v.channel_ids, v.open, v.name.as_str()), (vec![13], false, "2"));
         assert_eq!(clean_window_name(Some("  a\u{1b}b ".into())).as_deref(), Some("ab"));
         assert_eq!(clean_window_name(Some(" ".into())), None);
+    }
+
+    #[test]
+    fn a_plain_claude_tab_restarts_into_its_last_conversation() {
+        let hub = move_fixture();
+        hub.inner.lock().tokens.insert("plain-token".into(), 2);
+        hub.set_state_for_test(2, AgentState::Idle);
+        let args = |hub: &Hub| hub.inner.lock().sessions.get(&2).unwrap().extra_args.clone();
+        let start = |hub: &Hub, id: &str| {
+            hub.handle_hook("plain-token", "SessionStart", serde_json::json!({"session_id": id})).unwrap();
+        };
+        start(&hub, "conv-1");
+        assert_eq!(args(&hub), ["--resume", "conv-1"]);
+        // A `/clear` starts another conversation: that one is resumed.
+        start(&hub, "conv-2");
+        assert_eq!(args(&hub), ["--resume", "conv-2"]);
+        assert_eq!(hub.store.load_sessions().unwrap().into_iter().find(|s| s.info.id == 2).unwrap().extra_args,
+            ["--resume", "conv-2"], "kept across a backend restart");
+        start(&hub, "--evil");
+        assert_eq!(args(&hub), ["--resume", "conv-2"], "never a flag");
+
+        // A named agent's session keeps its conversation on the agent's record instead.
+        let hub = agent_fixture();
+        hub.inner.lock().tokens.insert("agent-token".into(), 2);
+        hub.set_state_for_test(2, AgentState::Idle);
+        hub.handle_hook("agent-token", "SessionStart", serde_json::json!({"session_id": "conv-1"})).unwrap();
+        assert!(args(&hub).is_empty());
+        assert_eq!(hub.agents.by_session(2).unwrap().resume_id.as_deref(), Some("conv-1"));
     }
 
     #[test]

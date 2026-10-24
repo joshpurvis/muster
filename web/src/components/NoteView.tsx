@@ -4,7 +4,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, isDirty, notes, undoDraft } from "../notes.ts";
 import { mapOffset } from "../note_merge.ts";
-import { kindOf } from "../note_undo.ts";
+import { clean, endGroup, kindOf } from "../note_undo.ts";
 import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
 import { schedules } from "../state.ts";
@@ -62,6 +62,32 @@ function size(bytes: number): string {
 
 const utf8 = new TextEncoder();
 
+/** The letter of a shortcut's key, by its place on the keyboard when the layout isn't Latin
+ * (Ctrl+я on a Russian layout is Ctrl+Z), as Muster's own shortcuts match. */
+function letter(e: KeyboardEvent): string {
+  const k = e.key.toLowerCase();
+  if (/^[a-z]$/.test(k)) return k;
+  return /^Key[A-Z]$/.test(e.code) ? e.code.slice(3).toLowerCase() : k;
+}
+
+/** Scroll `el` so offset `at` shows: WebKit doesn't when the selection is set from script. A
+ * hidden copy of the textarea, as wide and holding the text up to `at`, says how far down it is. */
+function reveal(el: HTMLTextAreaElement, at: number) {
+  const m = el.cloneNode() as HTMLTextAreaElement;
+  m.removeAttribute("data-note-id");
+  m.setAttribute("aria-hidden", "true");
+  m.style.cssText = `position:absolute;visibility:hidden;flex:none;height:0;width:${el.offsetWidth}px`;
+  el.after(m);
+  m.value = el.value.slice(0, at);
+  const cs = getComputedStyle(el);
+  const bottom = m.scrollHeight - (parseFloat(cs.paddingBottom) || 0);
+  m.remove();
+  const top = bottom - (parseFloat(cs.lineHeight) || 18);
+  if (top < el.scrollTop || bottom > el.scrollTop + el.clientHeight) {
+    el.scrollTop = Math.max(0, top - el.clientHeight / 3);
+  }
+}
+
 /** Note `id`'s editor. Every note tab of a group keeps its editor mounted (`hidden` while it isn't
  * the visible tab), so switching tabs keeps the textarea and its scroll. */
 export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean }) {
@@ -95,6 +121,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
     if (!el || !c) return;
     el.setRangeText(c.insert, c.at, c.end);
     el.setSelectionRange(c.sel[0], c.sel[1]);
+    reveal(el, c.sel[0]);
     track();
   };
 
@@ -114,15 +141,20 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       track();
     };
     const onBefore = (e: InputEvent) => {
-      // Undo and Redo from the context menu (or a platform's Edit menu) come as input events.
+      // The browser's own Undo and Redo (its context menu, when it offers them there, which it
+      // decides by its own history) use the note's instead of replaying a stale one.
       if (e.inputType === "historyUndo" || e.inputType === "historyRedo") {
         e.preventDefault();
         undo(e.inputType === "historyRedo");
       } else from.current = el.selectionStart;
     };
+    // Each input method composition is a step of its own.
+    const onCompose = () => endGroup(d.history);
     el.addEventListener("beforeinput", onBefore);
+    el.addEventListener("compositionstart", onCompose);
     return () => {
       el.removeEventListener("beforeinput", onBefore);
+      el.removeEventListener("compositionstart", onCompose);
       d.sel = [el.selectionStart, el.selectionEnd];
       d.onRemote = null;
       if (isDirty(d)) flushDraft(id);
@@ -152,6 +184,13 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
         onInput={(e) => {
           const el = e.target as HTMLTextAreaElement;
           const ie = e as InputEvent;
+          // Control characters (a pasted ESC) go at once, as saving would drop them anyway, so
+          // what is recorded for undo is what the daemon keeps.
+          if (!ie.isComposing && clean(el.value) !== el.value) {
+            const at = clean(el.value.slice(0, el.selectionEnd)).length;
+            el.value = clean(el.value);
+            el.setSelectionRange(at, at);
+          }
           editDraft(id, el.value, {
             from: from.current ?? Infinity,
             caret: el.selectionEnd,
@@ -169,15 +208,15 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
         }}
         onKeyDown={(e) => {
           // Ctrl+S saves now (it saves by itself anyway); never the browser's "Save page".
-          if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "s") {
+          const k = letter(e);
+          if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && k === "s") {
             e.preventDefault();
             flushDraft(id);
           }
-          // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z and ⇧⌘Z on a Mac). Kept from the browser's
-          // own undo and from every other key handler.
+          // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z, ⇧⌘Z and ⌘Y on a Mac). Kept from the
+          // browser's own undo and from every other key handler.
           const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
-          const k = e.key.toLowerCase();
-          if (mod && !e.altKey && !e.isComposing && (k === "z" || (k === "y" && !isMac && !e.shiftKey))) {
+          if (mod && !e.altKey && !e.isComposing && (k === "z" || (k === "y" && !e.shiftKey))) {
             e.preventDefault();
             e.stopPropagation();
             undo(k === "y" || e.shiftKey);

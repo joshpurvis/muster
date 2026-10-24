@@ -1067,7 +1067,7 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Group menu", keys: ["Right-click"], group: "Groups" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },
   { title: "Undo in a note", keys: [isMac ? "Cmd+Z" : "Ctrl+Z"], group: "Notes" },
-  { title: "Redo in a note", keys: isMac ? ["Cmd+Shift+Z"] : ["Ctrl+Shift+Z", "Ctrl+Y"], group: "Notes" },
+  { title: "Redo in a note", keys: isMac ? ["Cmd+Shift+Z", "Cmd+Y"] : ["Ctrl+Shift+Z", "Ctrl+Y"], group: "Notes" },
 ];
 
 type ScGroup = [string, { title: string; keys: string[] }[]];

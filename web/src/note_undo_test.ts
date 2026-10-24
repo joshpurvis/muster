@@ -1,4 +1,7 @@
-import { applyChange, editOf, type EditKind, GROUP_MS, kindOf, newHistory, rebaseHistory, record, redo, undo } from "./note_undo.ts";
+import {
+  applyChange, clean, editOf, type EditKind, endGroup, GROUP_MS, kindOf, newHistory, reach, rebaseHistory, record, redo,
+  sameChange, undo,
+} from "./note_undo.ts";
 
 function eq<T>(actual: T, expected: T, msg = "") {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -236,6 +239,45 @@ Deno.test("an input method's text is one step; the input type decides the kind",
   record(h, "かn", "かな", { from: 1, caret: 2, kind: "compose" }, 5200);
   eq(h.undo.length, 1);
   eq(h.undo[0].inserted, "かな");
+  // WebKit's commit after compositionend joins it; the next composition is a step of its own.
+  eq(kindOf("deleteCompositionText"), "compose");
+  eq(kindOf("insertFromComposition"), "compose");
+  record(h, "かな", "", { from: 0, caret: 0, kind: "compose" }, 5300);
+  record(h, "", "かな", { from: 0, caret: 2, kind: "compose" }, 5300);
+  eq(h.undo.length, 1);
+  endGroup(h);
+  record(h, "かな", "かなk", { from: 2, caret: 3, kind: "compose" }, 5400);
+  eq(h.undo.length, 2);
+});
+
+Deno.test("removing one of two identical lines may have been either: the paste is not undone", () => {
+  // The owner pastes a second "todo" line above the first; an agent then removes one of them.
+  const e = editor("todo\n");
+  e.select(0);
+  e.paste("todo\n");
+  e.remote("todo\n");
+  eq(e.undo(), false, "undoing the paste could remove the line that is left");
+  eq(e.text, "todo\n");
+  eq(reach("todo\ntodo\n", "todo\n"), { lo: 0, hi: 10 }, "the whole run counts");
+  eq(reach("a\nmine", "a\nmine and theirs"), { lo: 6, hi: 6 }, "an append is where it is");
+  eq(reach("x😀😀", "x😀"), { lo: 1, hi: 5 }, "never inside an emoji");
+});
+
+Deno.test("the same change made by someone else is theirs too: it is not undone", () => {
+  const h = newHistory();
+  record(h, "Plan\n", "Plan\n- agree\n", { from: 5, caret: 13, kind: "other" }, 0);
+  sameChange(h, "Plan\n", "Plan\n- agree\n");
+  eq(undo(h, "Plan\n- agree\n"), null);
+  // Older typing elsewhere, before the change, still undoes.
+  const g = newHistory();
+  record(g, "Plan\n", "My Plan\n", { from: 0, caret: 3, kind: "other" }, 0);
+  record(g, "My Plan\n", "My Plan\n- agree\n", { from: 8, caret: 16, kind: "other" }, 10);
+  sameChange(g, "My Plan\n", "My Plan\n- agree\n");
+  eq(g.undo.length, 0, "steps older than one it touched go too");
+});
+
+Deno.test("text is cleaned as the daemon cleans it", () => {
+  eq(clean("a\r\nb\rc\x1b[31md\x00\te\u0085f\n"), "a\nb\nc[31md\tef\n");
 });
 
 Deno.test("a history out of step with the text is dropped, not applied blind", () => {

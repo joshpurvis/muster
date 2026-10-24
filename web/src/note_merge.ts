@@ -17,7 +17,7 @@ interface Span {
 const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
 const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
 
-export function span(base: string, next: string): Span {
+function span(base: string, next: string): Span {
   const max = Math.min(base.length, next.length);
   let p = 0;
   while (p < max && base.charCodeAt(p) === next.charCodeAt(p)) p++;

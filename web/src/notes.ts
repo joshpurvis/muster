@@ -17,7 +17,9 @@ import { signal } from "@preact/signals";
 import type { Note, NoteAuthor, NoteInfo, NoteSummary } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { merge3 } from "./note_merge.ts";
-import { applyChange, type Change, type History, type How, newHistory, rebaseHistory, record, redo, undo } from "./note_undo.ts";
+import {
+  applyChange, type Change, type History, type How, newHistory, rebaseHistory, record, redo, sameChange, undo,
+} from "./note_undo.ts";
 
 /** Every note, by id (`hello.notes`, then `note_upserted` / `note_removed`). */
 export const notes = signal<Map<number, NoteInfo>>(new Map());
@@ -258,6 +260,8 @@ function rebase(d: Draft, n: Note) {
     return;
   }
   const m = merge3(d.base, d.text, n.body, authorName(n.updated_by));
+  // They made the human's change too (the merge is the draft as it was): it is theirs as well.
+  if (m.text === d.text && n.body !== d.base) sameChange(d.history, d.base, d.text);
   d.base = n.body;
   d.baseRev = n.rev;
   if (m.conflict) d.conflictWith = authorName(n.updated_by);

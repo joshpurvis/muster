@@ -8,11 +8,11 @@
 //
 // Each step is one span: at `at`, `removed` became `inserted`. Typing groups into one step per
 // word or burst (a pause ends it); deleting groups the same way; a paste, a cut, a drop or an
-// autocorrection is a step of its own. Someone else's change moves the steps it doesn't touch,
-// so Ctrl+Z only ever takes back the human's own text. A step the change touched can't be taken
-// back without rewriting theirs: it and every older step are dropped, and Ctrl+Z stops there.
-
-import { span } from "./note_merge.ts";
+// autocorrection is a step of its own, and so is each input method's text. Someone else's
+// change moves the steps it doesn't touch, so Ctrl+Z only ever takes back the human's own text.
+// A step the change touched (or, where repeated text makes it ambiguous where the change was,
+// could have touched) can't be taken back without rewriting theirs: it and every older step are
+// dropped, and Ctrl+Z stops there.
 
 /** How an edit was made: typing and deleting group into words and bursts, the rest never. */
 export type EditKind = "type" | "delete" | "compose" | "other";
@@ -44,9 +44,16 @@ const MAX_CHARS = 4_000_000;
 
 export const newHistory = (): History => ({ undo: [], redo: [], open: false });
 
+/** The next edit starts a new step (an input method starts composing). */
+export const endGroup = (h: History) => {
+  h.open = false;
+};
+
 /** What an `input` event's `inputType` did. */
 export function kindOf(inputType: string | undefined, composing = false): EditKind {
-  if (composing || inputType === "insertCompositionText") return "compose";
+  // WebKit commits an input method's text after `compositionend`, as these two.
+  if (composing || inputType === "insertCompositionText" || inputType === "deleteCompositionText" ||
+    inputType === "insertFromComposition") return "compose";
   if (inputType === "insertText" || inputType === "insertLineBreak" || inputType === "insertParagraph") return "type";
   if (inputType === "deleteByCut" || inputType === "deleteByDrag") return "other";
   if (inputType?.startsWith("delete")) return "delete";
@@ -55,6 +62,12 @@ export function kindOf(inputType: string | undefined, composing = false): EditKi
 
 const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
 const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+
+/** Plain text, as the daemon keeps it (src/notes.rs `clean`): CRLF and CR become LF; control
+ * characters other than tab and newline are dropped. The editor cleans what is typed or pasted
+ * before it is recorded, so the save never changes the human's own text under the history. */
+// deno-lint-ignore no-control-regex
+export const clean = (s: string) => s.replace(/\r\n?/g, "\n").replace(/[\0-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 
 /** How the human made an edit: where the selection started before it, where it left the caret,
  * and its kind. */
@@ -125,15 +138,33 @@ export function record(h: History, before: string, after: string, { from, caret,
 }
 
 /**
- * Carry the steps of `list` (newest last; `undo` says which stack) across someone else's change
- * of the text from `before` to `after`. The newest step applies to the text as it is, each older
- * one to what the newer left, so the change is carried down the list step by step. The first
- * step it overlaps, and every older one, is dropped.
+ * The part of `before` that changing it into `after` may have touched, under every placement of
+ * the change. Repeated text makes the place ambiguous: removing one of two "todo\n" lines may
+ * be the first or the second, so the whole run counts.
  */
-function carry(list: Step[], undo: boolean, before: string, after: string): Step[] {
-  const c = span(before, after);
-  let { start, end } = c;
-  const delta = c.text.length - (end - start);
+export function reach(before: string, after: string): { lo: number; hi: number } {
+  const max = Math.min(before.length, after.length);
+  let p = 0;
+  while (p < max && before.charCodeAt(p) === after.charCodeAt(p)) p++;
+  let s = 0;
+  while (s < max && before.charCodeAt(before.length - 1 - s) === after.charCodeAt(after.length - 1 - s)) s++;
+  // Placed as late as it goes (the longest common start), then as early (the longest common end).
+  let lo = Math.min(p, max - s);
+  let hi = before.length - Math.min(s, max - p);
+  // Never between the two halves of a surrogate pair.
+  if (lo > 0 && isLow(before.charCodeAt(lo))) lo--;
+  if (hi < before.length && isLow(before.charCodeAt(hi))) hi++;
+  return { lo, hi };
+}
+
+/**
+ * Carry the steps of `list` (newest last; `undo` says which stack) across someone else's change,
+ * which may have touched [start, end) of the text and changed its length by `delta`. The newest
+ * step applies to the text as it is, each older one to what the newer left, so the change is
+ * carried down the list step by step. The first step it may overlap, and every older one, is
+ * dropped.
+ */
+function carry(list: Step[], undo: boolean, start: number, end: number, delta: number): Step[] {
   for (let i = list.length - 1; i >= 0; i--) {
     const s = list[i];
     const here = undo ? s.inserted : s.removed;
@@ -148,12 +179,28 @@ function carry(list: Step[], undo: boolean, before: string, after: string): Step
   return list;
 }
 
-/** Someone else's change (an agent, a merge, the daemon's cleanup) turned `before` into `after`. */
+/** Someone else's change (an agent, a merge) turned `before` into `after`. */
 export function rebaseHistory(h: History, before: string, after: string) {
   h.open = false;
   if (before === after) return;
-  h.undo = carry(h.undo, true, before, after);
-  h.redo = carry(h.redo, false, before, after);
+  const { lo, hi } = reach(before, after);
+  const delta = after.length - before.length;
+  h.undo = carry(h.undo, true, lo, hi, delta);
+  h.redo = carry(h.redo, false, lo, hi, delta);
+}
+
+/**
+ * Someone else made the same change as the human's unsaved one (`text`, made from `base`), so
+ * merging left `text` as it was: what the human typed there is theirs too, and its steps (with
+ * every older one) are dropped, as for any change that touches them.
+ */
+export function sameChange(h: History, base: string, text: string) {
+  h.open = false;
+  if (base === text) return;
+  const { lo, hi } = reach(base, text);
+  const end = hi + text.length - base.length;
+  h.undo = carry(h.undo, true, lo, end, 0);
+  h.redo = carry(h.redo, false, lo, end, 0);
 }
 
 /** An undo or redo to make: text[at, end) becomes `insert`, then the selection is `sel`. */

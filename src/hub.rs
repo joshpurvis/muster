@@ -4021,24 +4021,22 @@ impl Hub {
 
 /// What a hook means for the conversation a Claude tab that isn't a named agent's restarts
 /// into (named agents keep theirs on their record, `agents::restart_args`): the run's latest
-/// conversation id, and the session's new stored arguments when they change. A conversation
-/// becomes `--resume <id>` only once a prompt was sent in it (Claude can't resume one without
-/// messages); a `/clear` drops the old one until the new one has a prompt. Known gap: a
-/// restart that overtakes a hook still waiting in the inbox (an outage) misses that hook.
+/// conversation id (every Claude hook carries it), and the session's new stored arguments when
+/// they change. A conversation becomes `--resume <id>` only once a prompt was sent in it or a
+/// turn ended (Claude can't resume one without messages), so a tab already running when this
+/// shipped picks its conversation up at its next turn; a `/clear` drops the old one until then.
+/// Known gap: a restart that overtakes a hook still waiting in the inbox (an outage) misses it.
 fn resume_after_hook(conversation: Option<&str>, args: &[String], event: &str, payload: &serde_json::Value)
     -> (Option<String>, Option<Vec<String>>) {
     let kind = SessionKind::Claude;
-    let (conversation, next) = match event {
-        "SessionStart" => match crate::agents::resume_id_from_hook(kind, event, payload) {
-            Some(id) => {
-                let cleared = payload.get("source").and_then(|v| v.as_str()) == Some("clear");
-                (Some(id), cleared.then(|| crate::agents::with_resume(kind, args, None)))
-            }
-            None => (conversation.map(str::to_string), None),
-        },
-        "UserPromptSubmit" => (conversation.map(str::to_string),
-            conversation.map(|c| crate::agents::with_resume(kind, args, Some(c)))),
-        _ => (conversation.map(str::to_string), None),
+    let reported = payload.get("session_id").and_then(|v| v.as_str()).map(str::trim)
+        .filter(|id| crate::agents::valid_resume_id(id));
+    let conversation = reported.or(conversation).map(str::to_string);
+    let next = match event {
+        "SessionStart" if reported.is_some() && payload.get("source").and_then(|v| v.as_str()) == Some("clear") =>
+            Some(crate::agents::with_resume(kind, args, None)),
+        "UserPromptSubmit" | "Stop" => conversation.as_deref().map(|c| crate::agents::with_resume(kind, args, Some(c))),
+        _ => None,
     };
     let next = match next {
         Some(Ok(next)) => (next != args).then_some(next),
@@ -5684,6 +5682,10 @@ mod tests {
         start(&hub, "--evil", "startup");
         prompt(&hub);
         assert_eq!(args(&hub), ["--resume", "conv-2"], "never a flag");
+        // A run whose SessionStart came before this backend learns it from its next turn.
+        hub.inner.lock().sessions.get_mut(&2).unwrap().conversation = None;
+        hook(&hub, "plain-token", "Stop", serde_json::json!({"session_id": "conv-3"}));
+        assert_eq!(args(&hub), ["--resume", "conv-3"]);
 
         // A run that can't open its conversation ends before reporting one: the next starts empty.
         let (c, resume) = (SessionKind::Claude, ["--resume".to_string(), "conv-2".to_string()]);

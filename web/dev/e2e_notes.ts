@@ -102,6 +102,24 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   await a.wait(`!document.querySelector('${editor}').value.includes('UNDO-ME')`, 2000);
   await a.wait(`!${M}.notes.value.get(${id}).body.includes('UNDO-ME')`, 4000);
   ok("switching away and back kept the editor mounted: Ctrl+Z still undid the typing");
+
+  // ---- Ctrl+Z takes back only the human's typing: an agent's append meanwhile stays
+  const value = `document.querySelector('${editor}').value`;
+  await a.type(" MINE");
+  await R("note.append", { id, text: "- agent: while you typed", from_session: agent });
+  await a.wait(`${value}.includes('while you typed')`, 3000);
+  await a.key("Ctrl+z");
+  await a.wait(`!${value}.includes(' MINE') && ${value}.includes('while you typed')`, 2000);
+  await a.wait(`!${M}.notes.value.get(${id}).body.includes(' MINE') && ${M}.notes.value.get(${id}).body.includes('while you typed')`, 4000);
+  check(await a.eval(`document.activeElement?.matches('${editor}')`), "the keyboard stayed in the editor");
+  await a.key("Ctrl+Shift+z");
+  await a.wait(`${value}.includes(' MINE\\n- agent: while you typed')`, 2000);
+  await a.key("Ctrl+z");
+  await a.wait(`!${value}.includes(' MINE')`, 2000);
+  await a.key("Ctrl+y");
+  await a.wait(`${value}.includes(' MINE')`, 2000);
+  await a.wait(`${M}.notes.value.get(${id}).body.includes(' MINE\\n- agent: while you typed')`, 4000);
+  ok("Ctrl+Z undid the typing but kept an agent's append made meanwhile; Ctrl+Shift+Z and Ctrl+Y redid it, saved");
   await a.key("Alt+Shift+Z");
   await a.wait(`${M}.fullscreen.value !== null && !!document.querySelector('.fs-exit')`, 2000);
   await a.click(".fs-exit");
@@ -129,6 +147,13 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   ok("typing not saved before a reload came back and was saved");
 
   // ---- drag the note's tab into the other group: a note beside a terminal, text kept
+  // Typing just before the drag stays undoable after it, though the editor is a new one there.
+  const toEnd = `(() => { const t = document.querySelector('${editor}'); t.focus();
+    t.setSelectionRange(t.value.length, t.value.length); })()`;
+  await a.eval(toEnd);
+  await a.type(" BEFORE-DRAG");
+  await a.wait(`${M}.notes.value.get(${id}).body.endsWith(' BEFORE-DRAG')`, 4000);
+  await a.eval(`document.querySelector('${editor}').__beforeDrag = true`);
   const from = paneOfSession(await root(), tab)!;
   const other = allPanes(await root()).find((p) => p.id !== from.id)!;
   const otherTab = other.tabs.find((t) => t > 0) ?? other.tabs[0];
@@ -144,6 +169,20 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   ok("dragging the note's tab into another group moved it there with its text");
   await a.click(`[data-tab-sid="${tab}"]`);
   await a.wait(`!!document.querySelector('.note-tab.active.focused')`, 2000);
+  check(!(await a.eval(`!!document.querySelector('${editor}').__beforeDrag`)), "the drag remounted the editor");
+  await a.eval(`document.querySelector('${editor}').focus()`);
+  await a.key("Ctrl+z");
+  await a.wait(`!${value}.includes('BEFORE-DRAG')`, 2000);
+  const sel = `(() => { const t = document.querySelector('${editor}'); return [t.selectionStart, t.selectionEnd, t.value.length]; })()`;
+  const [s0, s1, len] = await a.eval(sel);
+  check(s0 === len && s1 === len, `the caret is where the undone typing began: ${s0}-${s1} of ${len}`);
+  await a.wait(`!${M}.notes.value.get(${id}).body.includes('BEFORE-DRAG')`, 4000);
+  await a.key("Ctrl+Shift+z");
+  await a.wait(`${value}.endsWith(' BEFORE-DRAG')`, 2000);
+  const [r0, r1, rlen] = await a.eval(sel);
+  check(r0 === rlen && r1 === rlen, `redo leaves the caret after the text: ${r0}-${r1} of ${rlen}`);
+  await a.wait(`${M}.notes.value.get(${id}).body.endsWith(' BEFORE-DRAG')`, 4000);
+  ok("typing from before the drag was undone and redone in the moved (remounted) editor, and saved");
   await shot("notes-1-beside-terminal");
 
   // ---- close keeps the note; the notes list reopens it

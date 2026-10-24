@@ -194,8 +194,24 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   the window save first. A status line under it: Saved / Edited / Saving… / the reason a save
   failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
   with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
-  its editor (hidden behind the visible tab), so switching tabs keeps the undo history (Ctrl+Z);
-  moving the tab to another group or window, or someone else's change, starts it afresh.
+  its editor (hidden behind the visible tab), so switching tabs keeps its scroll.
+- **Undo**: Ctrl+Z undoes the human's own edits in the note, Ctrl+Shift+Z or Ctrl+Y redoes them
+  (⌘Z, ⇧⌘Z or ⌘Y on a Mac; on other keyboard layouts the keys in those places). Undo and redo
+  are keyboard only: the browser's context menu greys its Undo and Redo by its own history, so
+  they may be unavailable; when it does offer them they act on the note's history. It is the
+  editor's own history (`web/src/note_undo.ts`), not the browser's: WebKitGTK, the native
+  window's engine, has no key for its own, and a browser drops its own whenever an agent's
+  change replaces the text. Typing undoes a word or a burst at a time (a pause of a second ends
+  one), runs of Backspace or Delete likewise; a paste, a cut, a drop or each input method
+  composition is one step. Control characters typed or pasted (an ESC) are dropped at once, as
+  the daemon would drop them. An undo saves like typing, so the daemon and other windows get it,
+  and scrolls what it changed into view. Someone else's change never gets undone: Ctrl+Z steps
+  over it, taking back only the human's text around it. A step the change touched can't be
+  taken back without rewriting theirs, so the history ends there (Ctrl+Z then does nothing).
+  That includes a step the change may have touched where repeated text makes its place
+  ambiguous (removing one of two identical lines), and a step where an agent made the very
+  same change before it was saved. The history lives with the note in this window: moving the
+  tab to another group keeps it; another window, or a reload, starts afresh.
 - **Never lost**: typing not yet saved is kept in this browser until the daemon has it. After a
   reload, a closed window or a crash, the window's next page brings it back (a bar says so),
   merged onto the note as it is by then, and saves it. Reload window and Close window first wait
@@ -213,7 +229,8 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
 - **Keys**: in the editor, Muster's shortcuts that work in text fields still do (Ctrl+Space,
   Ctrl+K, Ctrl+Shift+P, Ctrl+Tab, Alt+Shift+…); Alt+letters and Alt+arrows stay with the text, as
   in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
-  the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
+  the corner, as for a terminal). Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y stay with the note ("Undo"),
+  never reaching a terminal or another shortcut. The notes list is a combobox: the field keeps focus and the
   arrow keys move the selected row, which screen readers announce.
 - **Allow triggers**: a small switch in the status line (a lightning icon, `triggers off` /
   `triggers on · N` with the number of triggers watching the note; role switch; the tooltip says
@@ -687,6 +704,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
+| Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y (in a note) | Undo / redo the human's own edits in the note (see "Notes") |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Terminal font size |
 | Alt+/ or F1 | Shortcuts sheet |

@@ -841,7 +841,9 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
     kind: "confirm",
     title: `${KIND_LABEL[s.kind]} is working`,
     body: what === "restart"
-      ? "Restart it? Its current turn is lost and the program starts fresh."
+      ? s.kind === "claude"
+        ? "Restart it? Its current turn is lost; it reopens the same conversation."
+        : "Restart it? Its current turn is lost and the program starts fresh."
       : "Stop its current turn?",
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,

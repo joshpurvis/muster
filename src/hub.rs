@@ -280,6 +280,9 @@ struct SessEntry {
     /// Its `Working` was put there by backend recovery, not seen: leaving it is no sign of a
     /// model request (src/cache.rs). Cleared by the next state change.
     unverified_working: bool,
+    /// The run's latest Claude conversation id (SessionStart) for a tab that isn't a named
+    /// agent's; None until this run reports one (`resume_after_hook`).
+    conversation: Option<String>,
 }
 
 struct WinEntry {
@@ -786,7 +789,8 @@ impl Hub {
             let hook = store.load_hook_session(info.id, generation)?
                 .filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
-            let last_hook_at = hook.map_or(0, |saved| saved.last_hook_at);
+            let last_hook_at = hook.as_ref().map_or(0, |saved| saved.last_hook_at);
+            let conversation = hook.and_then(|saved| saved.conversation);
             cache_rules.refresh(&mut info);
             store.update_session(&info)?;
             if let Some(token) = &token { inner.tokens.insert(token.clone(), info.id); }
@@ -807,6 +811,7 @@ impl Hub {
                     usable_title,
                     port_base,
                     unverified_working,
+                    conversation,
                 },
             );
         }
@@ -1716,6 +1721,16 @@ impl Hub {
             e.info.pid = None;
             e.info.queued = 0;
             e.info.subagents = 0;
+            // Not for a kill (a restart or shutdown), nor a named agent's tab.
+            if !e.busy && !e.kill_requested && !self.shutting_down.load(Ordering::SeqCst)
+                && let Some(next) = without_failed_resume(e.info.kind, &e.extra_args, e.conversation.as_deref(), code)
+                && self.agents.by_session(id).is_none()
+            {
+                match self.store.set_session_extra_args(id, &next) {
+                    Ok(()) => e.extra_args = next,
+                    Err(error) => tracing::warn!(session = id, "dropping a conversation Claude couldn't resume: {error:#}"),
+                }
+            }
             let token = e.token.take();
             let ch = e.info.channel_id;
             if let Some(t) = token {
@@ -2820,6 +2835,7 @@ impl Hub {
                     kill_requested: false,
                     usable_title: None,
                     port_base: 0,
+                    conversation: None,
                 },
             );
             id
@@ -2977,6 +2993,7 @@ impl Hub {
             let e = g.sessions.get_mut(&id).expect("looked up above");
             e.generation = generation;
             e.early_exit = None;
+            e.conversation = None;
             let (info, extra) = (e.info.clone(), e.extra_args.clone());
             // Also on restarts: args stored before the allowlist existed are replayed here.
             crate::adapters::check_extra_args(info.kind, &extra)?;
@@ -3793,8 +3810,13 @@ impl Hub {
             } else {
                 info.subagents = 0;
             }
-            let runtime = crate::store::HookSession { generation: entry.generation,
-                subagents: info.subagents, last_hook_at };
+            let mut runtime = crate::store::HookSession { generation: entry.generation,
+                subagents: info.subagents, last_hook_at, conversation: entry.conversation.clone(), extra_args: None };
+            if info.kind == SessionKind::Claude && self.agents.by_session(entry.info.id).is_none() {
+                let (conversation, args) = resume_after_hook(entry.conversation.as_deref(), &entry.extra_args, event, &payload);
+                runtime.conversation = conversation;
+                runtime.extra_args = args;
+            }
             // State/count/grace and reply attribution all commit with the cursor.
             // A crash before publishing memory can recover state and attribution.
             let fx = self.agents.on_hook_session_checkpoint(&self.store, &entry.info, event, &payload,
@@ -3804,6 +3826,8 @@ impl Hub {
                 || info.cache_cold_at != entry.info.cache_cold_at;
             entry.info = info.clone();
             entry.last_hook_at = last_hook_at;
+            entry.conversation = runtime.conversation;
+            if let Some(args) = runtime.extra_args { entry.extra_args = args; }
             if changed {
                 self.publish_session(&info);
             }
@@ -3989,6 +4013,45 @@ impl Hub {
         self.save_input_interrupted();
     }
 
+}
+
+/// What a hook means for the conversation a Claude tab that isn't a named agent's restarts
+/// into (named agents keep theirs on their record, `agents::restart_args`): the run's latest
+/// conversation id (every Claude hook carries it), and the session's new stored arguments when
+/// they change. A conversation becomes `--resume <id>` only once a prompt was sent in it or a
+/// turn ended (Claude can't resume one without messages), so a tab already running when this
+/// shipped picks its conversation up at its next turn; a `/clear` drops the old one until then.
+/// Known gap: a restart that overtakes a hook still waiting in the inbox (an outage) misses it.
+fn resume_after_hook(conversation: Option<&str>, args: &[String], event: &str, payload: &serde_json::Value)
+    -> (Option<String>, Option<Vec<String>>) {
+    let kind = SessionKind::Claude;
+    let reported = payload.get("session_id").and_then(|v| v.as_str()).map(str::trim)
+        .filter(|id| crate::agents::valid_resume_id(id));
+    let conversation = reported.or(conversation).map(str::to_string);
+    let next = match event {
+        "SessionStart" if reported.is_some() && payload.get("source").and_then(|v| v.as_str()) == Some("clear") =>
+            Some(crate::agents::with_resume(kind, args, None)),
+        "UserPromptSubmit" | "Stop" => conversation.as_deref().map(|c| crate::agents::with_resume(kind, args, Some(c))),
+        _ => None,
+    };
+    let next = match next {
+        Some(Ok(next)) => (next != args).then_some(next),
+        Some(Err(error)) => {
+            tracing::warn!("keeping the conversation to resume: {error:#}");
+            None
+        }
+        None => None,
+    };
+    (conversation, next)
+}
+
+/// A Claude tab's arguments without the `--resume` its run ended on, when it ended the way a
+/// conversation Claude can't open does ("No conversation found": exit 1 before any
+/// SessionStart), so the next restart starts empty instead of failing the same way.
+fn without_failed_resume(kind: SessionKind, args: &[String], conversation: Option<&str>, code: i32) -> Option<Vec<String>> {
+    (code == 1 && conversation.is_none() && crate::cache::continues_conversation(kind, args))
+        .then(|| crate::agents::with_resume(kind, args, None).ok())
+        .flatten()
 }
 
 /// What the event log keeps of a hook payload: the event's identifying fields only (the full
@@ -5585,6 +5648,56 @@ mod tests {
         assert_eq!((v.channel_ids, v.open, v.name.as_str()), (vec![13], false, "2"));
         assert_eq!(clean_window_name(Some("  a\u{1b}b ".into())).as_deref(), Some("ab"));
         assert_eq!(clean_window_name(Some(" ".into())), None);
+    }
+
+    #[test]
+    fn a_plain_claude_tab_restarts_into_its_last_conversation() {
+        let hub = move_fixture();
+        hub.inner.lock().tokens.insert("plain-token".into(), 2);
+        hub.set_state_for_test(2, AgentState::Idle);
+        let args = |hub: &Hub| hub.inner.lock().sessions.get(&2).unwrap().extra_args.clone();
+        let hook = |hub: &Hub, token: &str, event: &str, payload: serde_json::Value| {
+            hub.handle_hook(token, event, payload).unwrap();
+        };
+        let start = |hub: &Hub, id: &str, source: &str| {
+            hook(hub, "plain-token", "SessionStart", serde_json::json!({"session_id": id, "source": source}));
+        };
+        let prompt = |hub: &Hub| hook(hub, "plain-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"}));
+        start(&hub, "conv-1", "startup");
+        assert!(args(&hub).is_empty(), "nothing to resume before a prompt");
+        prompt(&hub);
+        assert_eq!(args(&hub), ["--resume", "conv-1"]);
+        // A `/clear` starts an empty conversation: a restart starts empty until it has a prompt.
+        start(&hub, "conv-2", "clear");
+        assert!(args(&hub).is_empty());
+        prompt(&hub);
+        assert_eq!(args(&hub), ["--resume", "conv-2"]);
+        assert_eq!(hub.store.load_sessions().unwrap().into_iter().find(|s| s.info.id == 2).unwrap().extra_args,
+            ["--resume", "conv-2"], "kept across a backend restart");
+        assert_eq!(hub.store.load_hook_session(2, 0).unwrap().unwrap().conversation.as_deref(), Some("conv-2"));
+        start(&hub, "--evil", "startup");
+        prompt(&hub);
+        assert_eq!(args(&hub), ["--resume", "conv-2"], "never a flag");
+        // A run whose SessionStart came before this backend learns it from its next turn.
+        hub.inner.lock().sessions.get_mut(&2).unwrap().conversation = None;
+        hook(&hub, "plain-token", "Stop", serde_json::json!({"session_id": "conv-3"}));
+        assert_eq!(args(&hub), ["--resume", "conv-3"]);
+
+        // A run that can't open its conversation ends before reporting one: the next starts empty.
+        let (c, resume) = (SessionKind::Claude, ["--resume".to_string(), "conv-2".to_string()]);
+        assert_eq!(without_failed_resume(c, &resume, None, 1), Some(vec![]));
+        assert_eq!(without_failed_resume(c, &resume, Some("conv-2"), 1), None, "it opened");
+        assert_eq!(without_failed_resume(c, &resume, None, 0), None);
+        assert_eq!(without_failed_resume(c, &[], None, 1), None);
+
+        // A named agent's session keeps its conversation on the agent's record instead.
+        let hub = agent_fixture();
+        hub.inner.lock().tokens.insert("agent-token".into(), 2);
+        hub.set_state_for_test(2, AgentState::Idle);
+        hook(&hub, "agent-token", "SessionStart", serde_json::json!({"session_id": "conv-1"}));
+        hook(&hub, "agent-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"}));
+        assert!(args(&hub).is_empty());
+        assert_eq!(hub.agents.by_session(2).unwrap().resume_id.as_deref(), Some("conv-1"));
     }
 
     #[test]

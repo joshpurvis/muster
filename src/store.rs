@@ -59,6 +59,14 @@ pub struct HookSession {
     pub generation: u64,
     pub subagents: u32,
     pub last_hook_at: i64,
+    /// The run's latest Claude conversation id (SessionStart), for a tab that isn't a named
+    /// agent's (`Hub::resume_after_hook`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+    /// Not part of the record: the session's new stored arguments, saved in the same
+    /// transaction as the hook that changed them.
+    #[serde(skip)]
+    pub extra_args: Option<Vec<String>>,
 }
 
 /// Which daily cap refused a message (`insert_agent_message_capped`), with the count.
@@ -1173,6 +1181,10 @@ impl Store {
             tx.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
                 ON CONFLICT(key) DO UPDATE SET record=excluded.record",
                 params![format!("hook-session:{}", info.id), serde_json::to_string(runtime)?])?;
+            if let Some(args) = &runtime.extra_args {
+                tx.execute("UPDATE sessions SET extra_args = ?2 WHERE id = ?1",
+                    params![info.id, serde_json::to_string(args)?])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -2223,7 +2235,7 @@ mod tests {
         info.state = AgentState::Idle;
         info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
         let cursor = HookCursor { instance: "fixture".into(), sequence: 4 };
-        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234 };
+        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234, conversation: None, extra_args: None };
         info.state = AgentState::Working;
         info.state_detail = Some("Agent".into());
         info.state_since = 1234;

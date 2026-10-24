@@ -256,7 +256,15 @@ function EmptyWindow() {
  * focus and is announced as an alert dialog. */
 function Stopped() {
   const ref = useRef<HTMLDivElement>(null);
+  const [notYet, setNotYet] = useState(false);
   useEffect(() => ref.current?.focus(), []);
+  // Reloading while nothing answers would replace this page with the browser's own
+  // "can't reach 127.0.0.1" error, which has no way back. Check first.
+  // Cleared first, so a repeated failure is announced again.
+  const reconnect = () => {
+    setNotYet(false);
+    fetch(location.href, { cache: "no-store" }).then(() => location.reload(), () => setNotYet(true));
+  };
   return (
     <div class="splash">
       <div
@@ -271,9 +279,12 @@ function Stopped() {
         <p id="stopped-text">
           Every session has ended. Run <code>muster</code> to start it again, then reconnect.
         </p>
+        <p class="muted" role="status">
+          {notYet && "Muster isn't running yet. Start it with muster in a terminal, then try again."}
+        </p>
         <div class="splash-actions">
           {canCloseWindow() && <button type="button" class="btn" onClick={() => A.closeWindow()}>Close window</button>}
-          <button type="button" class="btn btn-primary" onClick={() => location.reload()}>Reconnect</button>
+          <button type="button" class="btn btn-primary" onClick={reconnect}>Reconnect</button>
         </div>
       </div>
     </div>

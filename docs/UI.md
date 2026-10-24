@@ -373,7 +373,9 @@ of the same kind arrives; the next waiting update shows meanwhile.
   the backend and the terminal host and ends every session and agent, with how many sessions are
   running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
   "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
-  `daemon_stopping` or the call's reply does that; a dropped connection just reconnects.
+  `daemon_stopping` or the call's reply does that; a dropped connection just reconnects. Its
+  Reconnect reloads the window only once Muster answers again; until then it says "Muster isn't
+  running yet" (a reload would show the browser's own "can't reach 127.0.0.1" page instead).
 
 ### Overlays
 - **Jump** (Ctrl+Space or Ctrl+Shift+K anywhere, Ctrl+K outside terminals; Ctrl+Space again closes it): fuzzy search over every tab and

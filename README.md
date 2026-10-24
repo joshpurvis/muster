@@ -264,19 +264,21 @@ and each window logs its choice and any fallback to the daemon log.
 
 ### Native window watchdog (Linux)
 
-Every 2 seconds the native window runs a one-line script in its page. The answer comes back
-only when the page's main thread is free, so a page stuck in a script stops answering, while a
-hidden, minimised or backgrounded window, a page on the shut-down or reconnect screen, and a
-page that is loading do not count (and a suspended laptop's sleep isn't counted as silence).
-After 10 seconds without an answer the window writes a line to the daemon log (when it
-stopped, for how long, and the WebKit web process's pid) and asks in a small native dialog:
-**Reload window** or **Keep waiting**. Reload ends the stuck web process and loads the UI again
-with the same tabs; sessions keep running, as they live in the daemon. If the page answers
-again first, the dialog goes away and the log says how long it was stuck. Each freeze is
-offered once.
+Every 2 seconds the native window asks WebKit whether its page could run an editing command
+(no script runs in the page). WebKit answers that on the page's main thread, so a page stuck in
+a script stops answering, while a hidden, minimised or backgrounded window, a page on the
+shut-down or reconnect screen, and a page that is loading do not count (and a suspended
+laptop's sleep isn't counted as silence). After 10 seconds without an answer the window writes
+a line to the daemon log (when it stopped, for how long, and the WebKit web process's pid) and
+asks in a small native dialog: **Keep waiting** (the default, so Enter typed into the frozen
+window doesn't reload it) or **Reload window**. Reload ends the stuck web process and loads the
+UI again with the same tabs; sessions keep running, as they live in the daemon. If the page
+answers again first, the dialog goes away and the log says how long it was stuck. Each freeze
+is offered once.
 
 When the window process exits (closed, or killed with SIGTERM, SIGHUP or SIGINT), it ends its
-web process too, which a page stuck in a script would otherwise keep running.
+web process too, which a page stuck in a script would otherwise keep running. A window process
+killed with SIGKILL (`kill -9`) can't: kill its `WebKitWebProcess` too.
 
 To find out what froze a page, open the window with WebKit's inspector allowed (release builds
 have it off): `env MUSTER_WEB_INSPECTOR=1 muster`. Right-click the page (somewhere without its

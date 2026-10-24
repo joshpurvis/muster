@@ -185,6 +185,7 @@ async function doClaim(): Promise<void> {
     knowWindow(w);
     windowId.value = w.id;
     rememberWindow(w.id);
+    native.tellNativeWindow(w.id);
     if (document.hasFocus()) windowFocused();
   } catch (e) {
     // The socket dropped: the next hello claims again.

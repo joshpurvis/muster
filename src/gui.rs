@@ -98,6 +98,9 @@ pub enum IpcMessage {
     Decorations(bool),
     /// Close this window (`{"close": true}`).
     Close,
+    /// The page claimed Muster window `.0` (`{"window": id}`); a reload of a frozen page asks
+    /// for it again.
+    Window(i64),
 }
 
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
@@ -109,6 +112,9 @@ pub fn parse_ipc(body: &str, secret: &str) -> Option<IpcMessage> {
     }
     if let Some(d) = v.get("decorations").and_then(|d| d.as_bool()) {
         return Some(IpcMessage::Decorations(d));
+    }
+    if let Some(w) = v.get("window").and_then(|w| w.as_i64()).filter(|w| *w > 0) {
+        return Some(IpcMessage::Window(w));
     }
     (v.get("close") == Some(&serde_json::Value::Bool(true))).then_some(IpcMessage::Close)
 }
@@ -143,7 +149,7 @@ pub fn init_script(origin: &str, token: &str, window: Option<i64>, secret: &str)
         format!("sessionStorage.setItem(\"muster.window\",{});", q(&w.to_string()))
     });
     format!(
-        "(function(){{try{{if(window===window.top&&location.origin==={o}){{window.__musterNative={{ipc:2,secret:{s}}};sessionStorage.setItem(\"muster.token\",{t});{win}}}}}catch(e){{}}}})();",
+        "(function(){{try{{if(window===window.top&&location.origin==={o}){{window.__musterNative={{ipc:3,secret:{s}}};sessionStorage.setItem(\"muster.token\",{t});{win}}}}}catch(e){{}}}})();",
         o = q(origin),
         s = q(secret),
         t = q(token)
@@ -164,49 +170,32 @@ pub const PING_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub const FREEZE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The script the native window evaluates in its page. The answer comes back only once the
-/// page's main thread runs it, so a page stuck in a script never answers, while a hidden or
-/// backgrounded page (whose timers and animation frames are throttled) still does at once. It
-/// returns the window the page shows (`sessionStorage["muster.window"]`), which a reload of a
-/// frozen page asks for again.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
-pub fn ping_script(origin: &str) -> String {
-    let o = serde_json::to_string(origin).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        "(function(){{try{{return location.origin==={o}?String(sessionStorage.getItem(\"muster.window\")||\"\"):\"\"}}catch(e){{return \"\"}}}})()"
-    )
-}
-
-/// The window id in a `ping_script` answer (JSON, as the webview returns it), if any.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
-pub fn ping_window(answer: &str) -> Option<i64> {
-    let s: String = serde_json::from_str(answer).ok()?;
-    s.parse::<i64>().ok().filter(|w| *w > 0)
-}
-
 /// What the watchdog wants done on a tick.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 pub enum Check {
     Idle,
-    /// Ask the page (`ping_script`); its answer goes to `answered` with this number.
+    /// Ask the page; its answer goes to `answered` with this number.
     Ping(u64),
-    /// The page has not answered for this long: report it and offer a reload, once per freeze.
-    Froze(std::time::Duration),
+    /// The page has been silent this long, since `since` (wall clock): report it and offer a
+    /// reload, once per freeze.
+    Froze { silent: std::time::Duration, since: jiff::Timestamp },
 }
 
 /// Whether the native window's page still answers. Pure: the window feeds it ticks (every
-/// `PING_EVERY`) and answers, with the time on a monotonic clock, which stands still while the
-/// machine is suspended. Only one question is open at a time, and only while armed (a page
-/// committed in a live web process), so a page that is loading or a web process that is gone
-/// raises nothing.
+/// `PING_EVERY`) and answers, timed on a monotonic clock, which stands still while the machine
+/// is suspended; the wall clock only names times in the log. One question is open at a time,
+/// and only while armed (a page committed in a live web process), so a page that is loading or
+/// a web process that is gone raises nothing.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 #[derive(Debug, Default)]
 pub struct Watchdog {
     armed: bool,
     last: u64,
-    /// The open question and when it was asked.
-    waiting: Option<(u64, std::time::Instant)>,
+    /// The open question.
+    waiting: Option<u64>,
+    /// When the page went quiet: the first question since its last answer was asked.
+    quiet_since: Option<(std::time::Instant, jiff::Timestamp)>,
     last_tick: Option<std::time::Instant>,
     /// This freeze has been reported (until the page answers again).
     frozen: bool,
@@ -214,11 +203,12 @@ pub struct Watchdog {
 
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 impl Watchdog {
-    /// A page committed: start (or keep) asking. A question the old page may never answer (a
-    /// navigation can drop it) is asked again of the new one.
+    /// A page committed: start (or keep) asking. The open question (a navigation can drop it)
+    /// is asked again of the new page; a reported freeze stays reported until that page answers.
     pub fn arm(&mut self) {
+        self.waiting = None;
         if !self.frozen {
-            self.waiting = None;
+            self.quiet_since = None;
         }
         self.armed = true;
     }
@@ -229,45 +219,49 @@ impl Watchdog {
         *self = Watchdog { armed, last: self.last, last_tick: self.last_tick, ..Default::default() };
     }
 
-    pub fn tick(&mut self, now: std::time::Instant) -> Check {
+    pub fn tick(&mut self, now: std::time::Instant, wall: jiff::Timestamp) -> Check {
         // Ticks that come far apart mean this process (or the whole machine) was stopped, not
-        // the page: give the open question a fresh start.
+        // the page: the silence starts over.
         let stalled = self.last_tick.is_some_and(|t| now.saturating_duration_since(t) > PING_EVERY * 3);
         self.last_tick = Some(now);
         if !self.armed {
             return Check::Idle;
         }
-        match &mut self.waiting {
-            None => {
-                self.last += 1;
-                self.waiting = Some((self.last, now));
-                Check::Ping(self.last)
-            }
-            Some((_, asked)) => {
-                if stalled && !self.frozen {
-                    *asked = now;
-                }
-                let silent = now.saturating_duration_since(*asked);
-                if self.frozen || silent < FREEZE_AFTER {
-                    return Check::Idle;
-                }
-                self.frozen = true;
-                Check::Froze(silent)
-            }
+        if stalled && !self.frozen && self.quiet_since.is_some() {
+            self.quiet_since = Some((now, wall));
         }
+        let (asked, since) = *self.quiet_since.get_or_insert((now, wall));
+        if self.waiting.is_none() {
+            self.last += 1;
+            self.waiting = Some(self.last);
+            return Check::Ping(self.last);
+        }
+        let silent = now.saturating_duration_since(asked);
+        if self.frozen || silent < FREEZE_AFTER {
+            return Check::Idle;
+        }
+        self.frozen = true;
+        Check::Froze { silent, since }
     }
 
-    /// The page answered question `seq` (any reply from the webview, even an error, means its
-    /// main thread is not stuck). After a reported freeze: how long the page was silent.
-    pub fn answered(&mut self, seq: u64, now: std::time::Instant) -> Option<std::time::Duration> {
-        let (_, asked) = self.waiting.filter(|(s, _)| *s == seq)?;
+    /// The page answered question `seq` (any reply from the web process, even an error, means
+    /// its main thread is not stuck). After a reported freeze: how long the page was silent,
+    /// and since when.
+    pub fn answered(&mut self, seq: u64, now: std::time::Instant) -> Option<(std::time::Duration, jiff::Timestamp)> {
+        if self.waiting != Some(seq) {
+            return None;
+        }
         self.waiting = None;
-        std::mem::take(&mut self.frozen).then(|| now.saturating_duration_since(asked))
+        let quiet = self.quiet_since.take();
+        if !std::mem::take(&mut self.frozen) {
+            return None;
+        }
+        quiet.map(|(asked, since)| (now.saturating_duration_since(asked), since))
     }
 
-    /// How long the open question has gone unanswered.
+    /// How long the page has been silent.
     pub fn silent(&self, now: std::time::Instant) -> Option<std::time::Duration> {
-        self.waiting.map(|(_, asked)| now.saturating_duration_since(asked))
+        self.quiet_since.map(|(asked, _)| now.saturating_duration_since(asked))
     }
 }
 
@@ -279,6 +273,29 @@ pub fn parse_proc_stat(stat: &str) -> Option<(&str, u32)> {
     let (comm, rest) = rest.rsplit_once(") ")?;
     let ppid = rest.split_whitespace().nth(1)?.parse().ok()?;
     Some((comm, ppid))
+}
+
+/// The WebKit web processes among `root`'s descendants, from `(pid, comm, ppid)` of every
+/// process. Descendants, not only children: with WebKit's sandbox on (`WEBKIT_FORCE_SANDBOX=1`)
+/// a web process runs under bubblewrap helpers.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn web_process_pids(root: u32, procs: &[(u32, String, u32)]) -> Vec<u32> {
+    let mut family = vec![root];
+    let mut found = Vec::new();
+    let mut i = 0;
+    while let Some(&parent) = family.get(i) {
+        for (pid, comm, ppid) in procs {
+            if *ppid == parent && *pid != root && !family.contains(pid) {
+                family.push(*pid);
+                if comm.starts_with("WebKitWebProces") {
+                    found.push(*pid);
+                }
+            }
+        }
+        i += 1;
+    }
+    found.sort_unstable();
+    found
 }
 
 fn find_in_path(prog: &str) -> Option<PathBuf> {
@@ -551,22 +568,21 @@ pub mod linux {
         path.map(|p| std::fs::remove_file(p).is_ok()).unwrap_or(false)
     }
 
-    /// This window's WebKit web processes (WebKitGTK says no pid; they are our children), for
-    /// the log: "1234", "1234, 5678", or "unknown".
+    /// This window's WebKit web processes (WebKitGTK says no pid; they are our descendants),
+    /// for the log: "1234", "1234, 5678", or "unknown".
     pub fn web_processes() -> String {
-        let me = std::process::id();
-        let mut pids: Vec<u32> = std::fs::read_dir("/proc")
+        let procs: Vec<(u32, String, u32)> = std::fs::read_dir("/proc")
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| {
-                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
-                    super::parse_proc_stat(&s).is_some_and(|(comm, ppid)| ppid == me && comm.starts_with("WebKitWebProces"))
-                })
+            .filter_map(|e| {
+                let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let (comm, ppid) = super::parse_proc_stat(&stat)?;
+                Some((pid, comm.to_string(), ppid))
             })
             .collect();
-        pids.sort_unstable();
+        let pids = super::web_process_pids(std::process::id(), &procs);
         if pids.is_empty() {
             return "unknown".into();
         }
@@ -591,34 +607,35 @@ mod native {
         /// The watchdog's clock (every `PING_EVERY`).
         #[cfg(target_os = "linux")]
         Tick,
-        /// The page answered watchdog question `.0` (`ping_script`'s result as JSON).
+        /// The web process answered watchdog question `.0`.
         #[cfg(target_os = "linux")]
-        Pong(u64, String),
+        Pong(u64),
         /// A page committed in the webview (its web process runs).
         #[cfg(target_os = "linux")]
         PageCommitted,
         /// The web process crashed or was killed by someone else.
         #[cfg(target_os = "linux")]
         WebProcessGone,
-        /// The answer to the "stopped responding" offer: true for Reload window.
+        /// The answer to "stopped responding" offer `.0`: true for Reload window.
         #[cfg(target_os = "linux")]
-        Offer(bool),
+        Offer(u64, bool),
         /// SIGTERM, SIGHUP or SIGINT: close like the user would.
         #[cfg(target_os = "linux")]
         Quit,
     }
 
-    /// When `ago` was, on the local clock, for the log.
+    /// A wall-clock time for the log, on the local clock.
     #[cfg(target_os = "linux")]
-    fn at(ago: std::time::Duration) -> String {
-        jiff::Zoned::now().checked_sub(ago).map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default()
+    fn at(t: jiff::Timestamp) -> String {
+        t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string()
     }
 
     /// The page stopped answering: ask, from the native side (the page can't), whether to
     /// reload it. Not modal, so the window can still be closed; the answer comes back as
-    /// `UserEvent::Offer`.
+    /// `UserEvent::Offer(id, ..)`. Keep waiting is the default, so Enter typed at the frozen
+    /// terminal as the dialog appears never reloads.
     #[cfg(target_os = "linux")]
-    fn offer_reload(window: &tao::window::Window, proxy: tao::event_loop::EventLoopProxy<UserEvent>) -> gtk::MessageDialog {
+    fn offer_reload(window: &tao::window::Window, proxy: tao::event_loop::EventLoopProxy<UserEvent>, id: u64) -> gtk::MessageDialog {
         use gtk::prelude::*;
         use tao::platform::unix::WindowExtUnix;
         let d = gtk::MessageDialog::new(
@@ -634,11 +651,14 @@ mod native {
         )));
         d.add_button("Keep waiting", gtk::ResponseType::Cancel);
         d.add_button("Reload window", gtk::ResponseType::Accept);
-        d.set_default_response(gtk::ResponseType::Accept);
+        d.set_default_response(gtk::ResponseType::Cancel);
         d.connect_response(move |_, r| {
-            let _ = proxy.send_event(UserEvent::Offer(r == gtk::ResponseType::Accept));
+            let _ = proxy.send_event(UserEvent::Offer(id, r == gtk::ResponseType::Accept));
         });
         d.present();
+        if let Some(wait) = d.widget_for_response(gtk::ResponseType::Cancel) {
+            wait.grab_focus();
+        }
         d
     }
 
@@ -689,7 +709,7 @@ mod native {
         #[cfg(target_os = "linux")]
         let watch_proxy = event_loop.create_proxy();
         #[cfg(target_os = "linux")]
-        let (ping, reload_origin) = (super::ping_script(&origin), origin.clone());
+        let reload_origin = origin.clone();
         let ipc_origin = origin.clone();
         let ipc_secret = rand::random::<[u8; 32]>().iter().map(|b| format!("{b:02x}")).collect::<String>();
         let load_origin = origin.clone();
@@ -821,7 +841,17 @@ mod native {
             }
         }
         #[cfg(target_os = "linux")]
-        let (mut watchdog, mut offer, mut page_window) = (super::Watchdog::default(), None::<gtk::MessageDialog>, None::<i64>);
+        let (mut watchdog, mut page_window) = (super::Watchdog::default(), None::<i64>);
+        // The open "stopped responding" dialog, and the id of the last one offered.
+        #[cfg(target_os = "linux")]
+        let (mut offer, mut offers) = (None::<(u64, gtk::MessageDialog)>, 0u64);
+        // Close the open dialog, if any (the freeze ended, or its page is gone). True if there was one.
+        #[cfg(target_os = "linux")]
+        fn withdraw(offer: &mut Option<(u64, gtk::MessageDialog)>) -> bool {
+            use gtk::prelude::WidgetExtManual;
+            // SAFETY: our own dialog, not used after this; its response handler only sends an event.
+            offer.take().map(|(_, d)| unsafe { d.destroy() }).is_some()
+        }
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -835,16 +865,25 @@ mod native {
                 Event::UserEvent(UserEvent::Ipc(IpcMessage::Decorations(on))) => window.set_decorations(on),
                 Event::UserEvent(UserEvent::Ipc(IpcMessage::Close)) => *control_flow = ControlFlow::Exit,
                 #[cfg(target_os = "linux")]
+                Event::UserEvent(UserEvent::Ipc(IpcMessage::Window(w))) => page_window = Some(w),
+                #[cfg(target_os = "linux")]
                 Event::UserEvent(UserEvent::Quit) => *control_flow = ControlFlow::Exit,
                 #[cfg(target_os = "linux")]
-                Event::UserEvent(UserEvent::Tick) => match watchdog.tick(std::time::Instant::now()) {
+                Event::UserEvent(UserEvent::Tick) => match watchdog.tick(std::time::Instant::now(), jiff::Timestamp::now()) {
+                    // The question: can the page run an editing command? WebKit answers it on the
+                    // web process's main thread, so a page stuck in a script never answers, while
+                    // a hidden or backgrounded page (throttled timers and animation frames) does
+                    // at once. No script runs: an evaluated one would count as a user gesture and
+                    // consume the page's transient activation, which a panel's click needs.
                     super::Check::Ping(seq) => {
+                        use webkit2gtk::WebViewExt;
+                        use wry::WebViewExtUnix;
                         let answer = watch_proxy.clone();
-                        let _ = webview.evaluate_script_with_callback(&ping, move |r| {
-                            let _ = answer.send_event(UserEvent::Pong(seq, r));
+                        webview.webview().can_execute_editing_command("Copy", None::<&webkit2gtk::gio::Cancellable>, move |_| {
+                            let _ = answer.send_event(UserEvent::Pong(seq));
                         });
                     }
-                    super::Check::Froze(silent) => {
+                    super::Check::Froze { silent, since } => {
                         let hint = if inspector {
                             ""
                         } else {
@@ -852,27 +891,24 @@ mod native {
                         };
                         eprintln!(
                             "muster: native window: the page stopped responding at {} (no answer for {} s; web process {}); offering Reload window{hint}",
-                            at(silent),
+                            at(since),
                             silent.as_secs(),
                             super::linux::web_processes()
                         );
-                        offer = Some(offer_reload(&window, watch_proxy.clone()));
+                        withdraw(&mut offer);
+                        offers += 1;
+                        offer = Some((offers, offer_reload(&window, watch_proxy.clone(), offers)));
                     }
                     super::Check::Idle => {}
                 },
                 #[cfg(target_os = "linux")]
-                Event::UserEvent(UserEvent::Pong(seq, answer)) => {
-                    if let Some(w) = super::ping_window(&answer) {
-                        page_window = Some(w);
-                    }
-                    if let Some(after) = watchdog.answered(seq, std::time::Instant::now()) {
-                        use gtk::prelude::WidgetExtManual;
-                        // SAFETY: our own dialog, not used after this; its response handler only sends an event.
-                        let withdrawn = offer.take().map(|d| unsafe { d.destroy() }).is_some();
+                Event::UserEvent(UserEvent::Pong(seq)) => {
+                    if let Some((after, since)) = watchdog.answered(seq, std::time::Instant::now()) {
+                        let withdrawn = withdraw(&mut offer);
                         eprintln!(
                             "muster: native window: the page is responding again after {} s (it stopped at {}){}",
                             after.as_secs(),
-                            at(after),
+                            at(since),
                             if withdrawn { "; Reload window offer withdrawn" } else { "" }
                         );
                     }
@@ -880,16 +916,21 @@ mod native {
                 #[cfg(target_os = "linux")]
                 Event::UserEvent(UserEvent::PageCommitted) => watchdog.arm(),
                 #[cfg(target_os = "linux")]
-                Event::UserEvent(UserEvent::WebProcessGone) => watchdog.reset(false),
+                Event::UserEvent(UserEvent::WebProcessGone) => {
+                    watchdog.reset(false);
+                    if withdraw(&mut offer) {
+                        eprintln!("muster: native window: the web process ended (crashed or killed); Reload window offer withdrawn");
+                    }
+                }
                 #[cfg(target_os = "linux")]
-                Event::UserEvent(UserEvent::Offer(reload)) => {
-                    use gtk::prelude::WidgetExtManual;
+                Event::UserEvent(UserEvent::Offer(id, reload)) => {
                     use webkit2gtk::WebViewExt;
                     use wry::WebViewExtUnix;
-                    // Already withdrawn (the page recovered): nothing to do.
-                    let Some(d) = offer.take() else { return };
-                    // SAFETY: as above.
-                    unsafe { d.destroy() };
+                    // An answer to a dialog already withdrawn (the page recovered or went): nothing to do.
+                    if offer.as_ref().is_none_or(|(open, _)| *open != id) {
+                        return;
+                    }
+                    withdraw(&mut offer);
                     let silent = watchdog.silent(std::time::Instant::now()).map_or(0, |s| s.as_secs());
                     if !reload {
                         eprintln!("muster: native window: kept waiting for the page (no answer for {silent} s)");
@@ -910,7 +951,9 @@ mod native {
                 }
                 // A normal exit (closed by the user or the page, or a signal): not a renderer
                 // crash. Its web process goes too, even one stuck in a script, which would never
-                // notice this process is gone.
+                // notice this process is gone. A window process killed with SIGKILL (or one that
+                // crashes) can't do this: WebKit starts the web process, so nothing here can
+                // make the kernel end it with its parent.
                 #[cfg(target_os = "linux")]
                 Event::LoopDestroyed => {
                     use webkit2gtk::WebViewExt;
@@ -933,7 +976,7 @@ mod tests {
         assert!(s.contains(r#"sessionStorage.setItem("muster.token","ab\"c")"#), "{s}");
         assert!(!s.contains("muster.window"), "{s}");
         assert!(s.contains("window===window.top"), "{s}");
-        assert!(s.contains(r#"window.__musterNative={ipc:2,secret:"secret"};"#), "{s}");
+        assert!(s.contains(r#"window.__musterNative={ipc:3,secret:"secret"};"#), "{s}");
         let s = super::init_script("http://127.0.0.1:7433", "t", Some(3), "secret");
         assert!(s.contains(r#"sessionStorage.setItem("muster.window","3");"#), "{s}");
     }
@@ -972,27 +1015,34 @@ mod tests {
         assert!(allow(ui, "http://127.0.0.1:7433/x", || { asked = true; None }) && !asked, "UI loads never read discovery");
     }
 
+    /// Times `s` seconds in, on the monotonic clock and (`wall`) on the wall clock.
+    fn clocks() -> (impl Fn(u64) -> std::time::Instant, impl Fn(i64) -> jiff::Timestamp) {
+        let t0 = std::time::Instant::now();
+        (move |s| t0 + std::time::Duration::from_secs(s), |s| jiff::Timestamp::from_second(1_800_000_000 + s).unwrap())
+    }
+
     #[test]
     fn watchdog_reports_a_freeze_once_and_its_recovery() {
         use super::{Check, FREEZE_AFTER, PING_EVERY, Watchdog};
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
+        use std::time::Duration;
+        let (at, wall) = clocks();
         let mut w = Watchdog::default();
-        assert_eq!(w.tick(at(0)), Check::Idle, "nothing asked before a page commits");
+        assert_eq!(w.tick(at(0), wall(0)), Check::Idle, "nothing asked before a page commits");
         w.arm();
         // An answering page: one question per tick, each answered.
-        assert_eq!(w.tick(at(2)), Check::Ping(1));
+        assert_eq!(w.tick(at(2), wall(2)), Check::Ping(1));
         assert_eq!(w.answered(1, at(2)), None);
-        assert_eq!(w.tick(at(4)), Check::Ping(2));
-        // It stops answering: no second question while one is open, a report after FREEZE_AFTER.
+        assert_eq!(w.tick(at(4), wall(4)), Check::Ping(2));
+        // It stops answering: no second question while one is open, a report after FREEZE_AFTER,
+        // naming when the unanswered question was asked even though the wall clock jumped since.
         let mut froze = None;
         for s in (6..=30).step_by(2) {
-            match w.tick(at(s)) {
+            match w.tick(at(s), wall(s as i64 + 3600)) {
                 Check::Idle => {}
-                Check::Froze(d) => {
+                Check::Froze { silent, since } => {
                     assert!(froze.is_none(), "reported twice");
-                    assert!(d >= FREEZE_AFTER && d < FREEZE_AFTER + PING_EVERY, "{d:?}");
+                    assert!(silent >= FREEZE_AFTER && silent < FREEZE_AFTER + PING_EVERY, "{silent:?}");
+                    assert_eq!(since, wall(4));
                     froze = Some(s);
                 }
                 c => panic!("{c:?} at {s}"),
@@ -1001,64 +1051,60 @@ mod tests {
         assert_eq!(froze, Some(14));
         assert_eq!(w.silent(at(30)), Some(Duration::from_secs(26)));
         assert_eq!(w.answered(1, at(31)), None, "a stale answer changes nothing");
-        assert_eq!(w.answered(2, at(31)), Some(Duration::from_secs(27)), "recovered, with how long it was silent");
-        assert_eq!(w.tick(at(32)), Check::Ping(3));
+        assert_eq!(w.answered(2, at(31)), Some((Duration::from_secs(27), wall(4))), "recovered: how long, since when");
+        assert_eq!(w.tick(at(32), wall(32)), Check::Ping(3));
         assert_eq!(w.answered(3, at(32)), None, "an ordinary answer after a recovery");
         // A second freeze is reported again.
-        assert_eq!(w.tick(at(34)), Check::Ping(4));
+        assert_eq!(w.tick(at(34), wall(34)), Check::Ping(4));
         for s in (36..=42).step_by(2) {
-            assert_eq!(w.tick(at(s)), Check::Idle, "{s}");
+            assert_eq!(w.tick(at(s), wall(s as i64)), Check::Idle, "{s}");
         }
-        assert_eq!(w.tick(at(44)), Check::Froze(Duration::from_secs(10)));
+        assert_eq!(w.tick(at(44), wall(44)), Check::Froze { silent: Duration::from_secs(10), since: wall(34) });
     }
 
     #[test]
     fn watchdog_ignores_stalls_gone_processes_and_navigations() {
         use super::{Check, Watchdog};
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let at = |s: u64| t0 + Duration::from_secs(s);
+        use std::time::Duration;
+        let (at, wall) = clocks();
+        let tick = |w: &mut Watchdog, s: u64| w.tick(at(s), wall(s as i64));
         let mut w = Watchdog::default();
         w.arm();
-        assert_eq!(w.tick(at(0)), Check::Ping(1));
-        // This process was stopped for a minute (ticks far apart): the question starts over.
+        assert_eq!(tick(&mut w, 0), Check::Ping(1));
+        // This process was stopped for a minute (ticks far apart): the silence starts over.
         for s in (60..=68).step_by(2) {
-            assert_eq!(w.tick(at(s)), Check::Idle, "{s}");
+            assert_eq!(tick(&mut w, s), Check::Idle, "{s}");
         }
-        assert_eq!(w.tick(at(70)), Check::Froze(Duration::from_secs(10)));
+        assert_eq!(tick(&mut w, 70), Check::Froze { silent: Duration::from_secs(10), since: wall(60) });
         // The web process went (crash, or our reload): nothing is asked or reported, and the
         // late answer of the dead page is ignored.
         w.reset(false);
         assert_eq!(w.answered(1, at(71)), None);
         for s in (72..=100).step_by(2) {
-            assert_eq!(w.tick(at(s)), Check::Idle, "{s}");
+            assert_eq!(tick(&mut w, s), Check::Idle, "{s}");
         }
         // A new page commits: asked again, with fresh numbers.
         w.arm();
-        assert_eq!(w.tick(at(102)), Check::Ping(2));
-        // A navigation commits before the answer: the question is asked of the new page.
+        assert_eq!(tick(&mut w, 102), Check::Ping(2));
+        // A navigation commits before the answer: the question is asked of the new page, and
+        // the silence starts with it.
         w.arm();
-        assert_eq!(w.tick(at(104)), Check::Ping(3));
+        assert_eq!(tick(&mut w, 104), Check::Ping(3));
         assert_eq!(w.answered(2, at(104)), None);
         for s in (106..=112).step_by(2) {
-            assert_eq!(w.tick(at(s)), Check::Idle, "{s}");
+            assert_eq!(tick(&mut w, s), Check::Idle, "{s}");
         }
-        assert_eq!(w.tick(at(114)), Check::Froze(Duration::from_secs(10)), "the open question is still 3");
-        // A commit during a reported freeze keeps it (it is reported once).
+        assert_eq!(tick(&mut w, 114), Check::Froze { silent: Duration::from_secs(10), since: wall(104) });
+        // A commit during a reported freeze: the new page is asked (the old page's question may
+        // never be answered), but the freeze is not reported again and lasts until it answers.
         w.arm();
-        assert_eq!(w.tick(at(116)), Check::Idle);
-        assert_eq!(w.answered(3, at(117)), Some(Duration::from_secs(13)));
-    }
-
-    #[test]
-    fn ping_script_and_answer() {
-        let s = super::ping_script("http://127.0.0.1:7433");
-        assert!(s.contains(r#"location.origin==="http://127.0.0.1:7433""#), "{s}");
-        assert!(s.contains(r#"sessionStorage.getItem("muster.window")"#), "{s}");
-        assert_eq!(super::ping_window(r#""3""#), Some(3));
-        for none in [r#""""#, r#""0""#, r#""-2""#, r#""x""#, "3", "", "null"] {
-            assert_eq!(super::ping_window(none), None, "{none}");
+        assert_eq!(tick(&mut w, 116), Check::Ping(4));
+        for s in (118..=140).step_by(2) {
+            assert_eq!(tick(&mut w, s), Check::Idle, "{s}");
         }
+        assert_eq!(w.answered(3, at(141)), None, "the old page's question is no longer open");
+        assert_eq!(w.answered(4, at(141)), Some((Duration::from_secs(37), wall(104))));
+        assert_eq!(tick(&mut w, 142), Check::Ping(5));
     }
 
     #[test]
@@ -1070,12 +1116,34 @@ mod tests {
     }
 
     #[test]
+    fn web_processes_are_found_among_descendants() {
+        let procs: Vec<(u32, String, u32)> = [
+            (100, "muster", 1),
+            (101, "WebKitNetworkPr", 100),
+            (102, "WebKitWebProces", 100),
+            // Sandboxed: bubblewrap between us and the web process.
+            (103, "bwrap", 100),
+            (104, "bwrap", 103),
+            (105, "WebKitWebProces", 104),
+            // Another window's.
+            (200, "muster", 1),
+            (201, "WebKitWebProces", 200),
+        ]
+        .into_iter()
+        .map(|(p, c, pp)| (p, c.to_string(), pp))
+        .collect();
+        assert_eq!(super::web_process_pids(100, &procs), vec![102, 105]);
+        assert_eq!(super::web_process_pids(300, &procs), Vec::<u32>::new());
+    }
+
+    #[test]
     fn ipc_messages() {
         use super::{IpcMessage, parse_ipc};
         assert_eq!(parse_ipc(r#"{"decorations":false,"secret":"s"}"#, "s"), Some(IpcMessage::Decorations(false)));
         assert_eq!(parse_ipc(r#"{"decorations":true,"secret":"s"}"#, "s"), Some(IpcMessage::Decorations(true)));
         assert_eq!(parse_ipc(r#"{"close":true,"secret":"s"}"#, "s"), Some(IpcMessage::Close));
-        for junk in [r#"{"close":true}"#, r#"{"close":true,"secret":"wrong"}"#, r#"{"secret":"s","close":1}"#, r#"{"decorations":"no"}"#, "close", "{}", ""] {
+        assert_eq!(parse_ipc(r#"{"window":3,"secret":"s"}"#, "s"), Some(IpcMessage::Window(3)));
+        for junk in [r#"{"close":true}"#, r#"{"close":true,"secret":"wrong"}"#, r#"{"secret":"s","close":1}"#, r#"{"decorations":"no"}"#, r#"{"window":0,"secret":"s"}"#, r#"{"window":"3","secret":"s"}"#, r#"{"window":3}"#, "close", "{}", ""] {
             assert_eq!(parse_ipc(junk, "s"), None, "{junk}");
         }
     }

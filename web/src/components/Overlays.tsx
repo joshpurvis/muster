@@ -1199,46 +1199,71 @@ function Confirm(
 // ---------------- shut down, restart ----------------
 
 /** "Shut down Muster…" (what `muster stop` does) and "Restart Muster…" (that, then `muster`
- * again by itself), from the window. Both end every session; Cancel is the default. */
+ * again by itself), from the window. Both end every session; Cancel is the default. Once
+ * confirmed there is no way back (the request can't be withdrawn, and a restart's checks may
+ * take a while before every session ends), so the dialog then only says it is under way, with
+ * no Cancel, and Escape and the backdrop no longer close it. */
 function Lifecycle({ restart }: { restart: boolean }) {
   const cancel = useRef<HTMLButtonElement>(null);
+  const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   useLayoutEffect(() => cancel.current?.focus(), []);
   const running = [...sessions.value.values()].filter((s) => s.state !== "exited");
   const label = restart ? "Restart Muster" : "Shut down Muster";
+  const go = () => {
+    busyRef.current = true;
+    setBusy(true);
+    (restart ? A.restartMuster() : A.shutDown()).finally(() => (overlay.value = null));
+  };
   return (
-    <Modal class="dialog confirm-dlg" label={label} describedBy="lifecycle-body">
+    <Modal
+      class="dialog confirm-dlg"
+      label={label}
+      describedBy="lifecycle-body"
+      onClose={() => {
+        if (!busyRef.current) close();
+      }}
+    >
       <div class="dlg-head">
-        <h2>{label}?</h2>
+        <h2>{busy ? label : `${label}?`}</h2>
       </div>
-      <div class="dlg-body" id="lifecycle-body">
-        <p>
-          {restart
-            ? "This stops the Muster backend and its terminal host, in every window, then starts them again. Every terminal closes and every agent in them stops."
-            : "This stops the Muster backend and its terminal host, in every window. Every terminal closes and every agent in them stops."}
-        </p>
-        <p>{running.length ? <strong>{runningText(running)}</strong> : runningText(running)}</p>
-        <p class="muted">
-          {restart
-            ? "Windows reconnect by themselves. Claude tabs can be restarted afterwards and reopen their conversation."
-            : <>Run <code>muster</code> to start it again.</>}
-        </p>
-      </div>
-      <div class="dlg-foot">
-        <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
-        <button
-          type="button"
-          class="btn btn-danger"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            (restart ? A.restartMuster() : A.shutDown()).finally(() => (overlay.value = null));
-          }}
-        >
-          {busy && <Spinner size={12} />}
-          {restart ? "Restart" : "Shut down"}
-        </button>
-      </div>
+      {busy
+        ? (
+          <div class="dlg-body" id="lifecycle-body">
+            <p role="status">
+              <Spinner size={12} />{" "}
+              {restart ? "Checking that Muster can restart…" : "Shutting down Muster…"}
+            </p>
+            <p class="muted">
+              {restart
+                ? "Nothing has stopped yet. If the check passes, every session ends and Muster starts again; if not, this window says why."
+                : "Every session is ending."}
+            </p>
+          </div>
+        )
+        : (
+          <>
+            <div class="dlg-body" id="lifecycle-body">
+              <p>
+                {restart
+                  ? "This stops the Muster backend and its terminal host, in every window, then starts them again. Every terminal closes and every agent in them stops."
+                  : "This stops the Muster backend and its terminal host, in every window. Every terminal closes and every agent in them stops."}
+              </p>
+              <p>{running.length ? <strong>{runningText(running)}</strong> : runningText(running)}</p>
+              <p class="muted">
+                {restart
+                  ? "Windows reconnect by themselves. Claude tabs can be restarted afterwards and reopen their conversation."
+                  : <>Run <code>muster</code> to start it again.</>}
+              </p>
+            </div>
+            <div class="dlg-foot">
+              <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
+              <button type="button" class="btn btn-danger" onClick={go}>
+                {restart ? "Restart" : "Shut down"}
+              </button>
+            </div>
+          </>
+        )}
     </Modal>
   );
 }

@@ -339,12 +339,13 @@ fn check_restart(now: &(Option<String>, Option<String>), expect: &Expect, exe: &
 
 /// The descriptor the restart command reports on (`restart-all --report-fd 3`).
 const REPORT_FD: i32 = 3;
-/// How long the restart command may take over its checks before it reports.
-const REPORT_WAIT: Duration = Duration::from_secs(30);
+/// How long the restart command may take over its checks (snapshotting the release) before it
+/// reports: short enough that the call still answers within a window's 30 s request timeout.
+const REPORT_WAIT: Duration = Duration::from_secs(20);
 
 /// `daemon.restart`: what `muster stop` then `muster` do (every session ends; then a new backend
 /// and terminal host start from the launch path, as a normal start picks them), as one command:
-/// `<launch path> restart-all`, detached, with this backend's environment and OpenRouter key, as
+/// `<launch path> restart-all --launch <it> --app <its SHA-256> [--host <the host's>]`, detached, with this backend's environment and OpenRouter key, as
 /// `daemon.reload` runs `reload`. Refused before anything stops: while another lifecycle command
 /// may still happen, without a known launch path, when the builds there are not the ones the
 /// window showed (`expect`), or when the command's own checks refuse (it reports on a socket
@@ -357,16 +358,24 @@ pub async fn restart(hub: &Arc<Hub>, expect: Expect) -> anyhow::Result<PathBuf> 
     anyhow::ensure!(exe.is_file(), "no muster build at {}; nothing was stopped", exe.display());
     let host_pid = *hub.updates().host_pid.lock();
     let path = exe.clone();
-    let now = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let (launch, sibling, now) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let launch = crate::executables::hash_file(&path)?;
         let sibling = crate::executables::hash_file(&path.with_file_name(crate::executables::HOST)).ok();
         let running_host = host_pid
             .and_then(|pid| crate::executables::hash_file(Path::new(&format!("/proc/{pid}/exe"))).ok());
-        Ok(compare(&running, running_host.as_deref(), Some(&launch), sibling.as_deref()))
+        let now = compare(&running, running_host.as_deref(), Some(&launch), sibling.as_deref());
+        Ok((launch, sibling, now))
     })
     .await??;
     check_restart(&now, &expect, &exe)?;
-    let cmd = cli_command(&exe, &["restart-all", "--report-fd", &REPORT_FD.to_string()], hub.openrouter_key())?;
+    // The command refuses unless the release it prepares (and starts) is exactly these files.
+    let fd = REPORT_FD.to_string();
+    let exe_arg = exe.to_string_lossy();
+    let mut args = vec!["restart-all", "--report-fd", &fd, "--launch", &exe_arg, "--app", &launch];
+    if let Some(host) = &sibling {
+        args.extend(["--host", host.as_str()]);
+    }
+    let cmd = cli_command(&exe, &args, hub.openrouter_key())?;
     let (child, report) = spawn_reporting(cmd).with_context(|| format!("starting {}", exe.display()))?;
     let announce = Arc::downgrade(hub);
     let shown = exe.clone();

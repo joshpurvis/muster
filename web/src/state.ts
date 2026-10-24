@@ -31,7 +31,7 @@ import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupport
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { newerRun, upsertRun } from "./schedules.ts";
-import { type Dismissed, releaseOfScript, type UpdateStatus } from "./updates.ts";
+import { type Dismissed, releaseOfScript, type RestartWait, type UpdateStatus } from "./updates.ts";
 import {
   allSessions,
   emptyLayout,
@@ -158,11 +158,12 @@ export const daemonStopped = signal(false);
 /** Why the stopped screen shows: a shutdown, or a restart whose new backend never answered. */
 export const stoppedReason = signal<"shutdown" | "restart_failed">("shutdown");
 /** The backend announced a restart (`daemon_stopping {reason: "restart"}`): every session ends
- * and a new backend starts by itself; this page keeps reconnecting until one that isn't `pid`
- * answers (null: the old backend didn't say its pid, so any new connection is the new one). */
-export const daemonRestarting = signal<{ pid: number | null } | null>(null);
-/** The pid of the backend this page last said hello to (`hello.pid`; null from older backends). */
-export const backendPid = signal<number | null>(null);
+ * and a new backend starts by itself; this page keeps reconnecting until a backend that isn't
+ * `pid`, on a terminal host that isn't `host`, answers (`restartAnswered`). */
+export const daemonRestarting = signal<RestartWait | null>(null);
+/** The backend this page last said hello to: its pid and its terminal host's instance (null
+ * when the hello didn't say). */
+export const lastBackend = signal<RestartWait>({ pid: null, host: null });
 
 // ---------------- named agents (docs/UI.md "Agents panel") ----------------
 
@@ -778,7 +779,7 @@ export function applyHello(h: HelloResult) {
       login_shell: h.login_shell ?? h.default_shell,
     };
     updateStatus.value = h.updates ?? null;
-    backendPid.value = h.pid ?? null;
+    lastBackend.value = { pid: h.pid ?? null, host: h.terminal_host?.instance ?? null };
     windowPrefs.value = h.prefs ?? null;
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     accountProfiles.value = h.account_profiles ?? [];
@@ -933,7 +934,7 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "daemon_stopping":
       // A restart keeps the connection retrying; anything else (a shutdown) stops it.
-      if (ev.data.reason === "restart") daemonRestarting.value = { pid: backendPid.peek() };
+      if (ev.data.reason === "restart") daemonRestarting.value = lastBackend.peek();
       else daemonStopped.value = true;
       break;
   }

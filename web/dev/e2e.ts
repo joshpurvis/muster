@@ -1355,11 +1355,26 @@ try {
     await a.wait(`!!document.querySelector('.update-banner.update-host')`, 4000);
     await a.click(".update-host .update-actions .btn");
     await a.wait(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`, 2000);
+    // Its checks take a while: once confirmed, the dialog says so and can't be dismissed.
+    await R(a, "mock.restart_delay", { ms: 2500 });
     await a.click(".modal .dlg-foot .btn-danger");
-    await a.wait(`!!document.querySelector('#restarting-title')`, 3000);
+    await a.wait(`/Checking that Muster can restart/.test(document.querySelector('.modal .dlg-body')?.textContent ?? "")`, 2000);
+    check(await a.eval(`!document.querySelector('.modal .dlg-foot')`), "no Cancel once confirmed");
+    await shot(a, "13b-restart-checking");
+    await a.key("Escape");
+    await a.sleep(200);
+    check(await a.eval(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`), "Escape doesn't dismiss a confirmed restart");
+    await a.wait(`!!document.querySelector('#restarting-title')`, 5000);
     check(await a.eval(`document.activeElement?.getAttribute('aria-labelledby') === 'restarting-title'`), "the restarting screen takes the focus");
     await shot(a, "15-restarting");
+    // Shortcuts do nothing while restarting (Alt+T would open a tab on the new backend).
+    const tabsBefore = await a.eval(`${M}.sessions.value.size`);
+    check(await a.eval(`!!document.querySelector('#restarting-title')`), "still restarting when the shortcut is pressed");
+    await a.key("Alt+T");
     await a.wait(`!!document.querySelector('.app') && !document.querySelector('#restarting-title')`, 10000);
+    await a.sleep(500);
+    check((await a.eval(`${M}.sessions.value.size`)) === tabsBefore && (await a.eval(`!document.querySelector('.modal')`)),
+      "a shortcut pressed while restarting did nothing, also after the reconnect");
     check(await a.eval(`!document.querySelector('.update-host')`), "no terminal host banner after the restart");
     check(
       await a.eval(`[...document.querySelectorAll('.toast-text')].some((t) => /Muster restarted/.test(t.textContent))`),

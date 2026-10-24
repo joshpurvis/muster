@@ -50,12 +50,18 @@ Deno.test("a restart expects the builds the window was shown", () => {
   assertEquals(restartExpect({ ui_release: "1-a", backend: "abc", host: "def" }), { backend: "abc", host: "def" });
 });
 
-Deno.test("only a hello from another backend ends the restart wait", () => {
-  assertEquals(restartAnswered(null, 5), false, "not restarting");
-  assertEquals(restartAnswered({ pid: 5 }, 5), false, "the old backend, still stopping");
-  assertEquals(restartAnswered({ pid: 5 }, 6), true);
-  assertEquals(restartAnswered({ pid: null }, 6), true, "the old backend didn't say its pid");
-  assertEquals(restartAnswered({ pid: 5 }, undefined), true, "the new backend doesn't say its pid");
+Deno.test("only another backend on a new terminal host ends the restart wait", () => {
+  const old = { pid: 5, host: "h1" };
+  const on = (pid: number | undefined, host: string | null) => ({ pid, terminal_host: host ? { instance: host } : null });
+  assertEquals(restartAnswered(null, on(6, "h2")), false, "not restarting");
+  assertEquals(restartAnswered(old, on(5, "h1")), false, "the old backend, still stopping");
+  assertEquals(restartAnswered(old, on(6, "h2")), true);
+  // A shell's `muster reload` meanwhile: a new backend on the old host is not the restart.
+  assertEquals(restartAnswered(old, on(6, "h1")), false, "a new backend on the old host");
+  assertEquals(restartAnswered(old, on(6, null)), false, "a backend without a host");
+  assertEquals(restartAnswered(old, { pid: 6 }), false, "a hello that names no host");
+  assertEquals(restartAnswered({ pid: null, host: null }, on(6, "h2")), true, "the old backend said neither");
+  assertEquals(restartAnswered(old, on(undefined, "h2")), true, "the new backend doesn't say its pid");
 });
 
 Deno.test("the dialogs count running sessions and agents", () => {

@@ -59,14 +59,29 @@ export function restartExpect(s: UpdateStatus | null): { backend: string | null;
 }
 
 /** How long a window waits for the new backend after a restart before it says to run `muster`.
- * Stopping can take up to about 30 s (saving state, ending every session), starting about 15 s. */
-export const RESTART_WAIT_MS = 90_000;
+ * The restart command waits up to 120 s for the old backend to exit (saving state, ending every
+ * session), 30 s for the terminal host, and about 15 s for the new backend to answer. */
+export const RESTART_WAIT_MS = 180_000;
 
-/** Did a hello on reconnect come from the new backend? Not when the old one (`restarting.pid`)
- * answered while it was still stopping. A backend that didn't say its pid: any reconnect is. */
-export function restartAnswered(restarting: { pid: number | null } | null, helloPid: number | undefined): boolean {
+/** The backend a window last talked to: its pid and its terminal host's instance (null: the
+ * hello didn't say). */
+export interface RestartWait {
+  pid: number | null;
+  host: string | null;
+}
+
+/** Did a hello on reconnect come from the restarted Muster? It must run on a terminal host, a
+ * new one (the restart replaces it), and be another backend than the old one (which may answer
+ * while it is still stopping, and a shell's `muster reload` meanwhile would start a backend on
+ * the old host). What the old backend didn't say isn't compared. */
+export function restartAnswered(
+  restarting: RestartWait | null,
+  hello: { pid?: number; terminal_host?: { instance: string } | null },
+): boolean {
   if (!restarting) return false;
-  return restarting.pid === null || helloPid === undefined || helloPid !== restarting.pid;
+  const host = hello.terminal_host?.instance;
+  if (!host || (restarting.host !== null && host === restarting.host)) return false;
+  return restarting.pid === null || hello.pid === undefined || hello.pid !== restarting.pid;
 }
 
 /** "3 sessions are running (2 agents)." for the shutdown and restart dialogs: `running` are the

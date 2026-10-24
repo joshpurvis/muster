@@ -45,7 +45,7 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
-  backendPid,
+  lastBackend,
   daemonRestarting,
   daemonStopped,
   stoppedReason,
@@ -65,7 +65,7 @@ import {
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
-import type { Note } from "./types.ts";
+import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
@@ -1292,26 +1292,25 @@ export async function shutDown() {
  * anything stopped. */
 export async function restartMuster() {
   if (!connectedFor("restart Muster")) return;
-  const pid = backendPid.value;
+  const before = lastBackend.value;
   try {
     await rpc.call("daemon.restart", restartExpect(updateStatus.value));
     // The event comes first, unless this connection missed it.
-    if (!daemonRestarting.value) daemonRestarting.value = { pid };
+    if (!daemonRestarting.value) daemonRestarting.value = before;
   } catch (e) {
     // The old backend may go away before it answers: that is the restart working.
     if (daemonRestarting.value) return;
-    toast(
-      "error",
-      /connection lost/i.test(errText(e))
-        ? "The connection dropped before Muster answered; it may be restarting."
-        : `Couldn't restart Muster: ${errText(e)}`,
-    );
+    const why = errText(e);
+    // Lost or slow: the restart may still go ahead (this window then shows it).
+    if (/connection lost/i.test(why)) toast("warn", "The connection dropped before Muster answered; it may be restarting.");
+    else if (/timed out/i.test(why)) toast("warn", "Muster hasn't answered yet; it may still restart.");
+    else toast("error", `Couldn't restart Muster: ${why}`);
   }
 }
 
-/** A hello arrived while restarting: from the new backend, the restart is done. */
-export function restartHello(helloPid: number | undefined) {
-  if (!restartAnswered(daemonRestarting.value, helloPid)) return;
+/** A hello arrived while restarting: from the new backend on a new host, the restart is done. */
+export function restartHello(hello: HelloResult) {
+  if (!restartAnswered(daemonRestarting.value, hello)) return;
   daemonRestarting.value = null;
   toast("success", "Muster restarted. Restart a Claude tab to reopen its conversation.", 8000);
 }
@@ -1320,9 +1319,10 @@ export function restartHello(helloPid: number | undefined) {
  * carry on. Otherwise the stopped screen says to start it with `muster`. */
 export function restartTimedOut() {
   if (!daemonRestarting.value) return;
-  daemonRestarting.value = null;
-  // A new backend answered but speaks another UI protocol: its own screen says so.
+  // A new backend answered but speaks another UI protocol: the restart happened, and that
+  // screen says so (it keeps the restart's context).
   if (connStatus.value === "incompatible") return;
+  daemonRestarting.value = null;
   if (rpc.isOpen) {
     toast("error", "Muster didn't restart. To restart it by hand, run muster stop, then muster.");
     return;

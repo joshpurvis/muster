@@ -1786,7 +1786,18 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     `restart: ...with a new terminal host (pid ${h0.terminal_host.pid} -> ${h1!.terminal_host.pid})`,
   );
   ok(h1!.sessions.find((s: Json) => s.id === liveSess!.id)?.state === "exited", "restart: the running shell ended");
-  ok(h1!.updates.host === null, "restart: no terminal host update is left waiting");
+  ok(h1!.updates.host === null && h1!.updates.backend === null, "restart: no update is left waiting at the launch path");
+  // It runs the release checked before anything stopped (its read-only snapshot), not the build output.
+  // (python3 reads the link: the smoke has no read permission for /proc.)
+  const exeOf = async (pid: number) =>
+    dec.decode((await new Deno.Command("python3", {
+      args: ["-I", "-c", "import os, sys; print(os.readlink(sys.argv[1]))", `/proc/${pid}/exe`],
+      stdout: "piped", stderr: "null",
+    }).output()).stdout).trim();
+  const [appExe, hostExe] = [await exeOf(h1!.pid), await exeOf(h1!.terminal_host.pid)];
+  ok(appExe.includes("/application-releases/") && hostExe.includes("/application-releases/") &&
+    appExe.split("/").slice(0, -1).join("/") === hostExe.split("/").slice(0, -1).join("/"),
+    `restart: the new backend and host run from one checked release (${appExe}, ${hostExe})`);
   ok(h1!.openrouter.key_present === true, "restart: the restarted backend keeps the OpenRouter key");
   const after = await c.call("channel.create", { workspace_id: h1!.workspaces[0].id, agent: "shell" });
   let afterSess: Json | undefined;

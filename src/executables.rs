@@ -18,6 +18,7 @@ pub struct Release {
     directory: PathBuf,
     command: PathBuf,
     app_hash: String,
+    host_hash: String,
 }
 
 impl Release {
@@ -32,6 +33,17 @@ impl Release {
     /// SHA-256 of the application executable this release holds (the running backend's).
     pub fn app_hash(&self) -> &str {
         &self.app_hash
+    }
+
+    /// SHA-256 of the terminal host this release holds.
+    pub fn host_hash(&self) -> &str {
+        &self.host_hash
+    }
+
+    /// The release's own copy of the application: checked, read-only, and never replaced by a
+    /// rebuild. A backend started from it runs this release (its host is the copy beside it).
+    pub fn app(&self) -> PathBuf {
+        self.directory.join(APP)
     }
 
     pub fn activate(&self) -> anyhow::Result<()> {
@@ -90,7 +102,7 @@ pub fn prepare_running(data: &Path, launch: &Path, running: &Path) -> anyhow::Re
         fs::rename(&stage.0, &directory)?;
         File::open(&releases)?.sync_all()?;
     }
-    Ok(Release { directory, command, app_hash })
+    Ok(Release { directory, command, app_hash, host_hash })
 }
 
 /// SHA-256 of a file's content, as release names use it.

@@ -375,17 +375,23 @@ of the same kind arrives; the next waiting update shows meanwhile.
   starts them again, ending every session and agent, with how many sessions are running, and that
   windows reconnect by themselves and Claude tabs can be restarted afterwards to reopen their
   conversation. Cancel is focused; "Restart" (red) calls `daemon.restart` with the builds this
-  window was shown (never queued). A refusal (a build still being written or changed since,
-  another restart or shutdown under way, a check of the restart command) comes back as a toast
+  window was shown (never queued). The dialog then says "Checking that Muster can restart…" and
+  that nothing has stopped yet, with no Cancel; Escape and the backdrop no longer close it (the
+  request can't be withdrawn). A refusal (a build still being written or changed since, another
+  restart, reload or shutdown under way, a check of the restart command) comes back as a toast
   before anything stopped. Otherwise every window shows "Restarting Muster…" (an alert dialog
-  that takes the focus) and keeps reconnecting; when a new backend answers, the window carries
-  on (the terminal host banner is gone) and a toast says Muster restarted. If none answers within
-  90 s, the window shows the stopped screen, saying Muster didn't start again and to run `muster`;
-  if the old backend still answers then (the restart never went ahead), a toast says so instead.
-  Native windows stay open and reconnect; no new window opens.
+  that takes the focus; no shortcut works meanwhile, nor on the shut-down screen) and keeps
+  reconnecting; when a new backend on a new terminal host answers, the window carries on (the
+  terminal host banner is gone) and a toast says Muster restarted. If that backend needs another
+  UI, the screen says Muster restarted with a new interface, every session ended, and offers
+  Reload window. If none answers within 3 minutes, the window shows the stopped screen, saying
+  Muster didn't start again and to run `muster`; if the old backend still answers then (the
+  restart never went ahead), a toast says so instead. Native windows stay open and reconnect; no
+  new window opens.
 - **Shut down Muster…** (`⋯`, palette): a dialog warning that it stops
   the backend and the terminal host and ends every session and agent, with how many sessions are
-  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
+  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown` (the dialog then says
+  "Shutting down Muster…", with no Cancel). Every window then shows
   "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
   `daemon_stopping` or the call's reply does that; a dropped connection just reconnects. Its
   Reconnect reloads the window only once Muster answers again; until then it says "Muster isn't

@@ -168,6 +168,10 @@ const now = () => Date.now();
 let seq = 1;
 /** `hello.updates` (docs/PROTOCOL.md "Updates"); `mock.updates` changes it. */
 const updates = { ui_release: null as string | null, backend: null as string | null, host: null as string | null };
+/** The pretend backend and terminal host (`hello.pid`, `hello.terminal_host`); a restart replaces both. */
+const mockBackend = { pid: 4242, host: "mock-host-1", hostPid: 4243 };
+/** `mock.restart_delay`: how long `daemon.restart`'s checks pretend to take (ms). */
+let restartDelay = 0;
 /** Shared window preferences (`prefs.get` / `prefs.set`). */
 const windowPrefs = {
   decorations: true,
@@ -1277,6 +1281,10 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     setTimeout(() => { for (const c of clients) c.close(); }, 150);
     return {};
   }
+  if (method === "mock.restart_delay") {
+    restartDelay = Number(p.ms) || 0;
+    return {};
+  }
   if (method === "mock.updates") {
     // Pretend a build or UI release is waiting: {ui_release?, backend?, host?}.
     Object.assign(updates, p);
@@ -1421,6 +1429,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         updates,
         prefs: windowPrefs,
         openrouter: { key_present: orKey },
+        pid: mockBackend.pid,
+        terminal_host: { protocol: 1, instance: mockBackend.host, pid: mockBackend.hostPid },
       };
     case "prefs.get":
       return windowPrefs;
@@ -1464,14 +1474,20 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if ((p.backend ?? null) !== updates.backend || (p.host ?? null) !== updates.host) {
         throw new Error("the Muster build at /mock/target/release/muster changed since this window last looked; nothing was stopped");
       }
-      // Every session ends; a new backend (with the current builds) answers the reconnects.
+      // The restart command's checks, before anything stops.
+      if (restartDelay) await new Promise((r) => setTimeout(r, restartDelay));
+      // Every session ends; a new backend on a new host (with the current builds) answers the reconnects.
       broadcast("daemon_stopping", { reason: "restart" });
+      mockBackend.pid++;
+      mockBackend.host = `mock-host-${mockBackend.pid}`;
+      mockBackend.hostPid = mockBackend.pid + 1000;
       for (const s of sessions.values()) if (s.state !== "exited") kill(s.id);
       updates.backend = null;
       updates.host = null;
+      // The old backend takes a moment to go (a real one saves state and ends every session).
       setTimeout(() => {
         for (const c of clients) c.close();
-      }, 300);
+      }, 1500);
       return { exe: "/mock/target/release/muster" };
     case "window.claim": {
       if (!ws) throw new Error("window.claim is WebSocket only");

@@ -97,7 +97,7 @@ rpc.onHello = async (h, reconnect) => {
   A.deliveriesNeedReview(h.paused_deliveries ?? []);
   if (reconnect) {
     A.backendRestarted();
-    A.restartHello(h.pid);
+    A.restartHello(h);
   }
   // Re-claim on every hello: after a reconnect the daemon released our window.
   await A.claimWindow();
@@ -349,6 +349,23 @@ function Splash() {
   const s = connStatus.value;
   if (daemonStopped.value) return <Stopped />;
   if (s === "incompatible") {
+    // After a restart the sessions have ended and the new Muster brings its own interface.
+    if (daemonRestarting.value) {
+      return (
+        <div class="splash">
+          <div class="welcome-card" role="alertdialog" aria-labelledby="restarted-ui-title" aria-describedby="restarted-ui-text">
+            <h1 id="restarted-ui-title">Muster restarted with a new interface</h1>
+            <p id="restarted-ui-text">
+              Every session ended with the restart. Reload this window to use the new interface; Claude tabs can then
+              be restarted to reopen their conversations.
+            </p>
+            <div class="splash-actions">
+              <button type="button" class="btn btn-primary" onClick={() => location.reload()}>Reload window</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return <div class="splash"><div class="welcome-card"><h1>UI update required</h1>
       <p>Install a UI compatible with this backend, then refresh. Your terminals remain running.</p>
     </div></div>;

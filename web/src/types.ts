@@ -530,6 +530,8 @@ export interface HelloResult {
   openrouter?: { key_present: boolean };
   /** The backend's own pid (missing from older backends): tells a restarted backend apart. */
   pid?: number;
+  /** The terminal host this backend runs on (null or missing: none, or an older backend). */
+  terminal_host?: { instance: string; pid: number } | null;
 }
 
 export interface PanelCsp {

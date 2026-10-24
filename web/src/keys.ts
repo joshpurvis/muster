@@ -6,6 +6,8 @@ import {
   agentsSupported,
   altHeld,
   confirmClose,
+  daemonRestarting,
+  daemonStopped,
   focusedSession,
   focusedTabId,
   focusedTask,
@@ -631,6 +633,9 @@ export function findBinding(e: KeyboardEvent, ctx: KeyCtx = ctxOf(e)): Binding |
 
 /** Keys the app claims while an overlay is open (the overlay handles its own keys). */
 function overlayAllows(b: Binding): boolean {
+  // Muster is restarting or shut down: no shortcut may act (one would reach a later backend, or
+  // none). The screen shown then has nothing a shortcut drives.
+  if (daemonRestarting.value || daemonStopped.value) return false;
   const o = overlay.value;
   if (!o) return true;
   // Toggle-style commands still work from inside overlays.
@@ -694,6 +699,8 @@ export function installKeys() {
   addEventListener(
     "keydown",
     (e) => {
+      // Restarting or shut down: no key acts on the app (see `overlayAllows`).
+      if (daemonRestarting.value || daemonStopped.value) return;
       // Inline "Close? ⏎ / Esc". Enter/Esc must not reach the terminal (Enter would submit the
       // agent's prompt), so terminal focus counts here.
       const pending = confirmClose.value;

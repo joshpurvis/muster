@@ -107,6 +107,10 @@ enum Cmd {
     Daemon {
         #[arg(long)]
         foreground: bool,
+        /// Where this build was installed, when it runs from a release snapshot (`restart-all`
+        /// starts the checked snapshot): updates are looked for there.
+        #[arg(long, hide = true, value_name = "PATH", requires = "foreground")]
+        launch: Option<PathBuf>,
     },
     /// Forward an agent hook callback to the daemon (used inside agent CLIs).
     Hook {
@@ -128,6 +132,15 @@ enum Cmd {
         /// answers "go" there.
         #[arg(long, value_name = "FD")]
         report_fd: Option<i32>,
+        /// The path this build was installed at (default: this binary's).
+        #[arg(long, value_name = "PATH")]
+        launch: Option<PathBuf>,
+        /// Refuse unless this build is the one with this SHA-256.
+        #[arg(long, value_name = "SHA256")]
+        app: Option<String>,
+        /// Refuse unless the terminal host beside the launch path has this SHA-256.
+        #[arg(long, value_name = "SHA256")]
+        host: Option<String>,
     },
     /// Activate a built UI directory without restarting backend or terminals.
     UiInstall {
@@ -536,7 +549,7 @@ fn main() -> ExitCode {
     // Not the daemon or a window: they write to sockets and must keep ignoring SIGPIPE (a Rust
     // binary starts with it ignored, so processes they spawn are unaffected either way).
     // Nor `restart-all`: it writes to the backend's report socket, which may close first.
-    if !matches!(cli.cmd, None | Some(Cmd::Daemon { foreground: true }) | Some(Cmd::NativeWindow { .. })
+    if !matches!(cli.cmd, None | Some(Cmd::Daemon { foreground: true, .. }) | Some(Cmd::NativeWindow { .. })
         | Some(Cmd::RestartAll { .. })) {
         // SAFETY: setting a signal disposition before any threads exist.
         unsafe {
@@ -545,13 +558,13 @@ fn main() -> ExitCode {
     }
     let r = match cli.cmd {
         None => ensure_daemon().and_then(|d| open_ui(&d, None)),
-        Some(Cmd::Daemon { foreground: true }) => run_daemon(),
-        Some(Cmd::Daemon { foreground: false }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
+        Some(Cmd::Daemon { foreground: true, launch }) => run_daemon(launch),
+        Some(Cmd::Daemon { foreground: false, .. }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Reload) => reload(),
-        Some(Cmd::RestartAll { report_fd }) => restart_all(report_fd),
+        Some(Cmd::RestartAll { report_fd, launch, app, host }) => restart_all(RestartOpts { report_fd, launch, app, host }),
         Some(Cmd::UiInstall { path }) => {
             if std::env::var_os("MUSTER_WEB_DIR").is_some() {
                 Err(anyhow::anyhow!("MUSTER_WEB_DIR overrides installed UI releases; update that directory or unset the override on the backend"))
@@ -782,6 +795,12 @@ fn ensure_daemon() -> anyhow::Result<Discovery> {
 /// Re-exec `muster daemon --foreground` in its own session, logging to the runtime dir,
 /// and wait until it answers.
 fn start_daemon_detached() -> anyhow::Result<Discovery> {
+    let exe = std::env::current_exe().context("locating the muster binary")?;
+    start_daemon_from(&exe, None)
+}
+
+/// [`start_daemon_detached`] from `exe` (`launch`: see `daemon --launch`).
+fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>) -> anyhow::Result<Discovery> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     if let Some(d) = find_daemon() {
@@ -797,9 +816,12 @@ fn start_daemon_detached() -> anyhow::Result<Discovery> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     paths::make_private_file(&log_path);
-    let exe = std::env::current_exe().context("locating the muster binary")?;
     let mut cmd = Command::new(exe);
-    cmd.args(["daemon", "--foreground"])
+    cmd.args(["daemon", "--foreground"]);
+    if let Some(launch) = launch {
+        cmd.arg("--launch").arg(launch);
+    }
+    cmd
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -864,60 +886,199 @@ fn status() -> anyhow::Result<()> {
 
 /// How long `stop` waits for the backend to exit.
 const STOP_WAIT: Duration = Duration::from_secs(10);
-/// How long `restart-all` waits: longer, since it starts Muster again only once the backend has
-/// finished saving its state.
-const RESTART_STOP_WAIT: Duration = Duration::from_secs(30);
+/// How long `restart-all` waits for the old backend to exit: it goes on (stopping the host,
+/// starting Muster) only once the backend has really gone, so it waits long.
+const RESTART_STOP_WAIT: Duration = Duration::from_secs(120);
+/// How long a terminal host may take to stop.
+const HOST_STOP_WAIT: Duration = Duration::from_secs(30);
+
+/// What a `stop`, `reload` or `restart-all` is refused with while another holds the lifecycle
+/// lock.
+const LIFECYCLE_BUSY: &str = "another Muster restart, reload or stop is under way (a window's Restart Muster, say)";
+
+/// `<runtime>/lifecycle.lock`, held by `restart-all`, `stop` and `reload` while they stop or
+/// replace Muster, so one started from another shell refuses instead of racing it (a reload
+/// starting a backend on a host the restart is about to stop). Close-on-exec, so a daemon
+/// started meanwhile never holds it.
+struct LifecycleLock(#[allow(dead_code)] std::fs::File);
+
+fn lifecycle_lock(what: &str) -> anyhow::Result<LifecycleLock> {
+    use std::os::fd::AsRawFd;
+    let rt = paths::runtime_dir();
+    paths::ensure_private_dir(&rt)?;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(rt.join("lifecycle.lock"))?;
+    // SAFETY: flock on an fd we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!("{LIFECYCLE_BUSY}, so {what} was refused and nothing was changed; try again once it has finished");
+    }
+    Ok(LifecycleLock(f))
+}
 
 fn stop() -> anyhow::Result<()> {
+    let _lock = lifecycle_lock("`muster stop`")?;
     stop_all(STOP_WAIT)
 }
 
 /// Stop the backend (waiting up to `wait`), then the terminal host, ending every session.
 fn stop_all(wait: Duration) -> anyhow::Result<()> {
     stop_backend_within(None, wait)?;
-    if let Some(host) = stoppable_host()? {
-        let socket = paths::runtime_dir().join("terminal.sock");
-        host.call(muster_terminal_protocol::Command::Shutdown)?;
-        let end = Instant::now() + Duration::from_secs(10);
-        while socket.exists() {
-            anyhow::ensure!(Instant::now() < end, "terminal host did not stop within 10s");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    if let Some(host) = running_host(&HostPaths::current())? {
+        host.stop()?;
         println!("muster terminal host stopped");
     }
     Ok(())
 }
 
-/// The running terminal host, checked to be this data directory's: the one `stop` shuts down.
-/// None when no host runs.
-fn stoppable_host() -> anyhow::Result<Option<muster_terminal_protocol::client::Client>> {
-    let socket = paths::runtime_dir().join("terminal.sock");
-    match muster_terminal_protocol::client::Client::connect(&socket) {
-        Ok(host) => {
-            anyhow::ensure!(host.hello.data_dir == std::fs::canonicalize(paths::data_dir().join("terminal"))?,
-                "terminal host belongs to another data directory");
-            Ok(Some(host))
-        }
-        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|
-            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => Ok(None),
-        Err(error) => Err(error),
+/// Where the terminal host of this runtime and data directory answers and describes itself.
+#[derive(Clone)]
+struct HostPaths {
+    socket: PathBuf,
+    /// `terminal.json`: the host's `Hello`, written when it starts.
+    discovery: PathBuf,
+    /// The host's data directory (`<data>/terminal`).
+    data: PathBuf,
+}
+
+impl HostPaths {
+    fn current() -> Self {
+        let rt = paths::runtime_dir();
+        Self { socket: rt.join("terminal.sock"), discovery: rt.join("terminal.json"), data: paths::data_dir().join("terminal") }
     }
 }
 
-/// `muster restart-all`: `stop`, then start the daemon from this binary as `muster` does (the
-/// newest terminal host beside it included), without opening a window: the open ones reconnect.
-/// Everything that can refuse is checked before anything stops. With `report_fd` (the backend's
+/// The running terminal host of [`HostPaths`], checked to be this data directory's: the one
+/// `stop` shuts down.
+struct RunningHost {
+    instance: String,
+    pid: u32,
+    how: HostStop,
+    paths: HostPaths,
+}
+
+enum HostStop {
+    /// It speaks this build's protocol: asked to shut down.
+    Protocol(muster_terminal_protocol::client::Client),
+    /// Another protocol version (a build that raised `VERSION`, stopping the host an older one
+    /// started): sent SIGTERM, which it handles as a shutdown. Only after its identity is
+    /// confirmed without the protocol (see [`identify_host`]).
+    Signal,
+}
+
+/// The host answering at `paths.socket`, if one does (None: no socket, or nothing listening).
+fn running_host(paths: &HostPaths) -> anyhow::Result<Option<RunningHost>> {
+    let data = std::fs::canonicalize(&paths.data);
+    match muster_terminal_protocol::client::Client::connect(&paths.socket) {
+        Ok(host) => {
+            anyhow::ensure!(data.is_ok_and(|d| host.hello.data_dir == d), "terminal host belongs to another data directory");
+            let (instance, pid) = (host.hello.instance.clone(), host.hello.pid);
+            Ok(Some(RunningHost { instance, pid, how: HostStop::Protocol(host), paths: paths.clone() }))
+        }
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e|
+            matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)) => Ok(None),
+        // Something answers but not in this protocol (or not at all): find out who, without it.
+        Err(error) => match identify_host(paths) {
+            Ok((instance, pid)) => Ok(Some(RunningHost { instance, pid, how: HostStop::Signal, paths: paths.clone() })),
+            Err(why) => Err(error.context(format!("the terminal host can't be identified ({why:#})"))),
+        },
+    }
+}
+
+/// Who the host at `paths.socket` is, without its protocol: the process listening on the socket
+/// (by its peer credentials, this user's) must be the pid its `terminal.json` names, for this
+/// data directory. Read as plain JSON, so any version's file does.
+fn identify_host(paths: &HostPaths) -> anyhow::Result<(String, u32)> {
+    let raw = std::fs::read(&paths.discovery).with_context(|| format!("reading {}", paths.discovery.display()))?;
+    let hello: serde_json::Value = serde_json::from_slice(&raw).context("terminal.json is not JSON")?;
+    let pid = hello["pid"].as_u64().and_then(|p| u32::try_from(p).ok()).context("terminal.json names no pid")?;
+    let instance = hello["instance"].as_str().unwrap_or_default().to_string();
+    let data = std::fs::canonicalize(&paths.data)?;
+    anyhow::ensure!(hello["data_dir"].as_str().map(PathBuf::from) == Some(data), "terminal host belongs to another data directory");
+    let stream = std::os::unix::net::UnixStream::connect(&paths.socket)?;
+    let (peer, uid) = peer_cred(&stream)?;
+    // SAFETY: geteuid has no preconditions.
+    anyhow::ensure!(uid == unsafe { libc::geteuid() }, "the terminal host socket belongs to another user");
+    anyhow::ensure!(peer == pid, "the process on the terminal host socket (pid {peer}) isn't the one terminal.json names (pid {pid})");
+    Ok((instance, pid))
+}
+
+/// The pid and uid of the process at the other end of `stream`.
+#[cfg(target_os = "linux")]
+fn peer_cred(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `cred`.
+    let r = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len)
+    };
+    anyhow::ensure!(r == 0, "reading the terminal host's credentials: {}", std::io::Error::last_os_error());
+    Ok((cred.pid as u32, cred.uid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_cred(_: &std::os::unix::net::UnixStream) -> anyhow::Result<(u32, u32)> {
+    anyhow::bail!("a terminal host of another protocol version can only be identified on Linux")
+}
+
+impl RunningHost {
+    /// Shut it down (every session ends) and wait until it has gone.
+    fn stop(self) -> anyhow::Result<()> {
+        self.stop_with(|pid| {
+            // SAFETY: plain kill(2), to the pid just confirmed to own the host socket.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }, paths::pid_alive)
+    }
+
+    /// [`RunningHost::stop`] with how to signal it and how to tell it still runs.
+    fn stop_with(self, signal: impl FnOnce(u32), alive: impl Fn(u32) -> bool) -> anyhow::Result<()> {
+        match &self.how {
+            HostStop::Protocol(host) => {
+                host.call(muster_terminal_protocol::Command::Shutdown)?;
+            }
+            HostStop::Signal => {
+                // Confirmed again right before the signal, so a pid freed since isn't hit.
+                let (_, pid) = identify_host(&self.paths)?;
+                anyhow::ensure!(pid == self.pid, "the terminal host changed while it was being stopped");
+                signal(pid);
+            }
+        }
+        let end = Instant::now() + HOST_STOP_WAIT;
+        while self.paths.socket.exists() || (matches!(self.how, HostStop::Signal) && alive(self.pid)) {
+            anyhow::ensure!(Instant::now() < end, "terminal host did not stop within {}s", HOST_STOP_WAIT.as_secs());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+}
+
+/// `muster restart-all`'s options (see `Cmd::RestartAll`).
+struct RestartOpts {
+    report_fd: Option<i32>,
+    launch: Option<PathBuf>,
+    app: Option<String>,
+    host: Option<String>,
+}
+
+/// `muster restart-all`: `stop`, then start Muster again as `muster` does, without opening a
+/// window (the open ones reconnect). Everything that can refuse is checked before anything
+/// stops, including the release the new daemon will run: this build and the terminal host
+/// beside its launch path are snapshotted and checked first (`executables::prepare_running`,
+/// as a daemon start does), and the daemon is then started from that snapshot, so a rebuild
+/// meanwhile can neither fail nor change the start. With `report_fd` (the backend's
 /// `daemon.restart`), the verdict goes there ("ready" or "refused: <why>") and nothing stops
-/// until the backend answers "go", so windows hear of the restart first. A stop that fails
-/// still starts Muster again, so the user is never left without it unknowingly.
-fn restart_all(report_fd: Option<i32>) -> anyhow::Result<()> {
+/// until the backend answers "go", so windows hear of the restart first. Holds the lifecycle
+/// lock throughout. Once anything has stopped, it goes on only when each step has really
+/// finished (the backend exited, the host gone); if one doesn't, it stops there and says so,
+/// and the windows' wait ends in "run muster".
+fn restart_all(opts: RestartOpts) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
     use std::os::fd::FromRawFd;
     // SAFETY: the backend hands this process its end of a socket pair at this descriptor, which
     // nothing else here uses.
-    let report = report_fd.map(|fd| unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
-    let old = match restart_checks() {
-        Ok(old) => old,
+    let report = opts.report_fd.map(|fd| unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+    let checked = lifecycle_lock("the restart").and_then(|lock| restart_checks(&opts).map(|c| (lock, c)));
+    let (_lock, (old, old_host, release, launch)) = match checked {
+        Ok(c) => c,
         Err(error) => {
             if let Some(mut r) = report {
                 let _ = writeln!(r, "refused: {}", format!("{error:#}").replace('\n', " "));
@@ -933,37 +1094,63 @@ fn restart_all(report_fd: Option<i32>) -> anyhow::Result<()> {
         anyhow::ensure!(line.trim_end() == "go", "the backend did not confirm the restart; nothing was stopped");
     }
     println!("muster: restarting; every session ends");
-    let stopped = stop_all(RESTART_STOP_WAIT);
-    if let Err(error) = &stopped {
-        eprintln!("muster: stopping Muster for the restart failed ({error:#}); starting it again anyway");
+    stop_backend_within(old.as_ref(), RESTART_STOP_WAIT).context(
+        "the old backend did not stop, so the terminal host was left running and Muster was not started again; \
+         once it has stopped, run `muster stop`, then `muster`")?;
+    let old_instance = old_host.as_ref().map(|h| h.instance.clone());
+    if let Some(host) = old_host {
+        host.stop().context("the terminal host did not stop, so Muster was not started again; run `muster stop`, then `muster`")?;
+        println!("muster terminal host stopped");
     }
-    match (stopped, start_daemon_detached()) {
-        (Ok(()), Ok(d)) => {
-            anyhow::ensure!(old.as_ref().is_none_or(|o| o.pid != d.pid), "the old backend (pid {}) still runs", d.pid);
-            println!("muster restarted (pid {}); every session ended, open windows reconnect", d.pid);
-            Ok(())
-        }
-        (Err(error), Ok(d)) => Err(error.context(format!("Muster runs again (pid {}), but stopping it first failed", d.pid))),
-        (_, Err(error)) => Err(error.context("Muster was stopped but did not start again; start it with `muster`")),
-    }
+    let d = start_daemon_from(&release.app(), Some(&launch))
+        .context("Muster was stopped but did not start again; start it with `muster`")?;
+    let hello = client::rpc(&d, "hello", serde_json::json!({})).context("the new backend does not answer")?;
+    anyhow::ensure!(old.as_ref().is_none_or(|o| o.pid != d.pid), "the old backend (pid {}) still runs", d.pid);
+    let instance = hello["terminal_host"]["instance"].as_str().unwrap_or_default();
+    anyhow::ensure!(!instance.is_empty() && old_instance.as_deref() != Some(instance), "the new backend has no new terminal host");
+    println!("muster restarted (pid {}); every session ended, open windows reconnect", d.pid);
+    Ok(())
 }
-
-/// What `restart-all` checks before anything stops: this command can signal the backend, and
-/// the terminal host is one `stop` shuts down (one it refused would keep every session running
-/// beside a stopped backend).
-fn restart_checks() -> anyhow::Result<Option<Discovery>> {
+/// What `restart-all` checks before anything stops: this command can signal the backend; the
+/// terminal host is one it can stop (in this protocol or not); and the release the new daemon
+/// will run is prepared and checked, and is the build the backend offered (`opts.app`,
+/// `opts.host`). Returns the running backend, the host, that release and the launch path.
+fn restart_checks(opts: &RestartOpts)
+    -> anyhow::Result<(Option<Discovery>, Option<RunningHost>, executables::Release, PathBuf)> {
     let d = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &d {
         anyhow::ensure!(!backend_hidden(d),
             "Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); restart it from outside", d.pid);
     }
-    stoppable_host().context("the terminal host can't be stopped from here; nothing was stopped")?;
-    Ok(d)
+    let host = running_host(&HostPaths::current()).context("the terminal host can't be stopped from here; nothing was stopped")?;
+    let launch = match &opts.launch {
+        Some(launch) => launch.clone(),
+        None => std::env::current_exe().context("locating the muster binary")?,
+    };
+    // What executes is this build; the host comes from beside the launch path, as at a start.
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    let running = if proc_exe.exists() { proc_exe.to_path_buf() } else { launch.clone() };
+    let release = executables::prepare_running(&paths::data_dir(), &launch, &running)
+        .context("the new Muster build can't be started (nothing was stopped)")?;
+    check_restart_release(&release, opts.app.as_deref(), opts.host.as_deref(), &launch)?;
+    Ok((d, host, release, launch))
+}
+
+/// Is the prepared `release` the build the backend offered?
+fn check_restart_release(release: &executables::Release, app: Option<&str>, host: Option<&str>, launch: &std::path::Path)
+    -> anyhow::Result<()> {
+    anyhow::ensure!(app.is_none_or(|a| a == release.app_hash()),
+        "the Muster build at {} changed after the restart was asked for; nothing was stopped", launch.display());
+    anyhow::ensure!(host.is_none_or(|h| h == release.host_hash()),
+        "the terminal host beside {} changed after the restart was asked for; nothing was stopped", launch.display());
+    Ok(())
 }
 
 /// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
 /// compatible host and the same backend identity immediately before signalling.
 fn reload() -> anyhow::Result<()> {
+    // Released before a handoff: the backend's own `reload` takes it then.
+    let mut lock = Some(lifecycle_lock("`muster reload`")?);
     let discovery = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &discovery {
         let hello = client::rpc(d, "hello", serde_json::json!({}))
@@ -981,6 +1168,7 @@ fn reload() -> anyhow::Result<()> {
                  has to restart itself with its own environment; {} set here can't be applied. Run it outside the sandbox",
                 openrouter::ENV_KEY
             );
+            drop(lock.take());
             reload_handoff(d)?;
             println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
             return Ok(());
@@ -989,6 +1177,7 @@ fn reload() -> anyhow::Result<()> {
         // the backend has one (only in its memory), the backend restarts itself instead, so the
         // key carries over. OPENROUTER_API_KEY set here, even empty, replaces (or clears) it.
         if std::env::var_os(openrouter::ENV_KEY).is_none() && hello["openrouter"]["key_present"] == true {
+            drop(lock.take());
             match reload_handoff(d) {
                 Ok(()) => {
                     println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
@@ -996,6 +1185,7 @@ fn reload() -> anyhow::Result<()> {
                 }
                 Err(error) if error.to_string().contains(crate::updates::HANDOFF_REFUSED) => {
                     eprintln!("note: the backend can't restart itself here ({error:#}); reloading from this shell instead");
+                    lock = Some(lifecycle_lock("`muster reload`")?);
                 }
                 Err(error) => return Err(error),
             }
@@ -1004,6 +1194,7 @@ fn reload() -> anyhow::Result<()> {
         stop_backend(Some(d))?;
     }
     start_daemon_detached()?;
+    drop(lock);
     println!("muster backend restarted; terminals preserved");
     Ok(())
 }
@@ -1073,21 +1264,40 @@ fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
     stop_backend_within(expected, STOP_WAIT)
 }
 
+/// Stop the backend: `expected` (the one a reload or restart checked), else the one the discovery
+/// file names. The expected one is stopped even when its discovery file has gone meanwhile (it is
+/// removed only at the end of a backend's teardown, or by something else): reading the file again
+/// would say "not running" while it still runs, and the next backend would fail to start beside it.
 fn stop_backend_within(expected: Option<&Discovery>, wait: Duration) -> anyhow::Result<()> {
-    if let Some(d) = paths::read_discovery().filter(backend_hidden) {
+    let current = paths::read_discovery();
+    if let Some(d) = current.as_ref().filter(|d| backend_hidden(d)) {
         anyhow::bail!("Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); stop it from outside", d.pid);
     }
-    let Some(d) = paths::read_discovery().filter(|d| paths::pid_alive(d.pid)) else {
+    let d = match expected {
+        Some(expected) => {
+            if let Some(d) = &current {
+                anyhow::ensure!(d.pid == expected.pid && d.token == expected.token && d.port == expected.port,
+                    "backend changed while preparing the reload or restart; nothing was stopped");
+            }
+            expected.clone()
+        }
+        None => match current {
+            Some(d) => d,
+            None => {
+                println!("muster daemon: not running");
+                return Ok(());
+            }
+        },
+    };
+    if !paths::pid_alive(d.pid) {
         println!("muster daemon: not running");
         return Ok(());
-    };
-    if let Some(expected) = expected {
-        anyhow::ensure!(d.pid == expected.pid && d.token == expected.token && d.port == expected.port,
-            "backend changed while preparing reload; nothing was stopped");
     }
     // Guard against a stale daemon.json whose pid now belongs to an unrelated process.
     if !is_muster_process(d.pid) {
-        let _ = std::fs::remove_file(paths::discovery_path());
+        if expected.is_none() {
+            let _ = std::fs::remove_file(paths::discovery_path());
+        }
         println!("muster daemon: not running (removed stale daemon.json)");
         return Ok(());
     }
@@ -1238,7 +1448,7 @@ async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
     Ok(listener)
 }
 
-fn run_daemon() -> anyhow::Result<()> {
+fn run_daemon(launch: Option<PathBuf>) -> anyhow::Result<()> {
     // First, while this is the only thread: the key leaves the process environment.
     let openrouter_key = openrouter::take_key_from_env();
     tracing_subscriber::fmt()
@@ -1256,13 +1466,13 @@ fn run_daemon() -> anyhow::Result<()> {
     let _lock = acquire_lock()?;
     paths::ensure_private_dir(&paths::data_dir())?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let r = rt.block_on(daemon_main(openrouter_key));
+    let r = rt.block_on(daemon_main(openrouter_key, launch));
     rt.shutdown_timeout(Duration::from_secs(2));
     paths::remove_discovery_if_ours();
     r
 }
 
-async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Result<()> {
+async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<PathBuf>) -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
     // The terminal host and its rollback fence first: an older, monolithic daemon holding
@@ -1272,7 +1482,10 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>) -> anyhow::Resu
     // by now: a rebuild in between must still show as an update.
     let proc_exe = std::path::Path::new("/proc/self/exe");
     let running = if proc_exe.exists() { proc_exe } else { launch_exe.as_path() };
+    // Started from a release snapshot (`restart-all`, `--launch`), its host is the snapshot's
+    // copy beside it, checked before anything stopped; updates are looked for at `launch`.
     let release = executables::prepare_running(&paths::data_dir(), &launch_exe, running)?;
+    let launch_exe = launch.unwrap_or(launch_exe);
     let terminal_host = terminal::ensure_host(&release.host())?;
     let host_pid = terminal_host.client.hello.pid;
     let listener = bind().await?;
@@ -1505,6 +1718,127 @@ mod tests {
             parse(&["events"]).unwrap(),
             Cmd::Events { json: false, session: None, tab: None }
         ));
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use muster_terminal_protocol::wire;
+
+    /// A terminal host of an older protocol version at `dir`: it answers every request with the
+    /// error such a host gives a newer client, and its `terminal.json` names this test process.
+    fn old_host(dir: &std::path::Path, pid: u32) -> HostPaths {
+        let data = dir.join("terminal");
+        std::fs::create_dir_all(&data).unwrap();
+        let paths = HostPaths { socket: dir.join("terminal.sock"), discovery: dir.join("terminal.json"), data: data.clone() };
+        let hello = serde_json::json!({"protocol": 0, "instance": "old-host", "pid": pid,
+            "data_dir": std::fs::canonicalize(&data).unwrap()});
+        std::fs::write(&paths.discovery, serde_json::to_vec(&hello).unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let Ok(frame) = wire::read(&mut stream) else { continue };
+                let request: muster_terminal_protocol::Request = frame.decode().unwrap();
+                assert_ne!(request.version, 0, "a newer client");
+                let error = muster_terminal_protocol::Response::Error {
+                    code: "protocol".into(), message: "unsupported terminal protocol".into() };
+                let _ = wire::write(&mut stream, &wire::Frame::json(&error).unwrap());
+            }
+        });
+        paths
+    }
+
+    fn temp() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("muster-restart-host-{}", paths::random_token()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_host_of_an_older_protocol_is_stopped_by_signal_after_its_identity_is_confirmed() {
+        let dir = temp();
+        let paths = old_host(&dir, std::process::id());
+        let host = running_host(&paths).unwrap().expect("a host answers");
+        assert!(matches!(host.how, HostStop::Signal), "not through the protocol it doesn't speak");
+        assert_eq!((host.instance.as_str(), host.pid), ("old-host", std::process::id()));
+        let socket = paths.socket.clone();
+        let signalled = std::cell::Cell::new(None);
+        host.stop_with(|pid| {
+            signalled.set(Some(pid));
+            // The host exits on SIGTERM: its socket goes.
+            std::fs::remove_file(&socket).unwrap();
+        }, |_| signalled.get().is_none()).unwrap();
+        assert_eq!(signalled.get(), Some(std::process::id()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_host_whose_identity_doesnt_match_is_never_signalled() {
+        // terminal.json names another process than the one on the socket.
+        let dir = temp();
+        let paths = old_host(&dir, std::process::id() + 1);
+        let e = running_host(&paths).err().expect("refused").to_string();
+        assert!(e.contains("can't be identified"), "{e}");
+        let e = format!("{:#}", running_host(&paths).err().unwrap());
+        assert!(e.contains("isn't the one terminal.json names"), "{e}");
+        // Another data directory.
+        let other = temp();
+        let mut wrong = old_host(&other, std::process::id());
+        wrong.data = dir.join("terminal");
+        let e = format!("{:#}", running_host(&wrong).err().unwrap());
+        assert!(e.contains("another data directory"), "{e}");
+        // No host at all: nothing to stop.
+        let none = temp();
+        let paths = HostPaths { socket: none.join("terminal.sock"), discovery: none.join("terminal.json"), data: none.clone() };
+        assert!(running_host(&paths).unwrap().is_none());
+        for d in [dir, other, none] {
+            std::fs::remove_dir_all(&d).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_release_must_be_the_offered_build() {
+        let dir = temp();
+        let bin = dir.join("build");
+        std::fs::create_dir(&bin).unwrap();
+        for (name, body) in [("muster", "app"), (executables::HOST, "host")] {
+            std::fs::write(bin.join(name), body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let launch = bin.join("muster");
+        let release = executables::prepare_running(&dir.join("data"), &launch, &launch).unwrap();
+        let (app, host) = (release.app_hash().to_string(), release.host_hash().to_string());
+        check_restart_release(&release, Some(&app), Some(&host), &launch).unwrap();
+        check_restart_release(&release, None, None, &launch).unwrap();
+        let e = check_restart_release(&release, Some("other"), Some(&host), &launch).unwrap_err().to_string();
+        assert!(e.contains("Muster build at") && e.contains("nothing was stopped"), "{e}");
+        let e = check_restart_release(&release, Some(&app), Some("other"), &launch).unwrap_err().to_string();
+        assert!(e.contains("terminal host beside"), "{e}");
+        // The new daemon starts from the release's own read-only copy, not the build output.
+        assert_eq!(std::fs::read(release.app()).unwrap(), b"app");
+        std::fs::write(&launch, b"rebuilt").unwrap();
+        assert_eq!(std::fs::read(release.app()).unwrap(), b"app");
+        // A host the start would refuse (not executable) fails the preparation, before anything stops.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join(executables::HOST), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(bin.join(executables::HOST), b"new host").unwrap();
+        assert!(executables::prepare_running(&dir.join("data"), &launch, &launch).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_lifecycle_command_across_processes() {
+        // Runtime dir is the isolated one in `deno task test`.
+        if std::env::var_os("MUSTER_RUNTIME_DIR").is_none() {
+            return;
+        }
+        let first = lifecycle_lock("the restart").unwrap();
+        let e = lifecycle_lock("`muster stop`").err().unwrap().to_string();
+        assert!(e.contains(LIFECYCLE_BUSY) && e.contains("`muster stop` was refused"), "{e}");
+        drop(first);
+        lifecycle_lock("`muster stop`").unwrap();
     }
 }
 

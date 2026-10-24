@@ -396,8 +396,8 @@ fn exited_terminals_archive_without_losing_replay_or_disconnecting_existing_stre
         Frame::Replay { next_offset, data } => {
             assert_eq!(next_offset, offset);
             assert!(String::from_utf8_lossy(&data).contains("before-exit"));
-            assert!(data.ends_with(b"last-output\r\n"));
-            assert!(data.windows(8).any(|s| s == b"\x1b[?2004h"));
+            // An ended terminal replays as plain lines (see `replay::render_ended`).
+            assert!(data.ends_with(b"last-output\x1b[m"));
         }
         other => panic!("{other:?}"),
     }

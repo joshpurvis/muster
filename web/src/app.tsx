@@ -292,10 +292,15 @@ function Stopped() {
         {stoppedReason.value === "restart_failed"
           ? (
             <>
-              <h1 id="stopped-title">Muster didn't start again</h1>
+              <h1 id="stopped-title">Muster didn't come back</h1>
               <p id="stopped-text">
-                The restart ended every session, but Muster hasn't answered since. Run <code>muster</code>{" "}
-                to start it, then reconnect.
+                The restart didn't finish: no new Muster has answered for 3 minutes. Sessions may have ended, or some
+                may still be running. In a terminal, run <code>muster stop</code>, then <code>muster</code> (it says
+                what went wrong, when it knows). Then reconnect.
+              </p>
+              <p class="muted">
+                If <code>muster stop</code> says the backend didn't stop, or that a restart is under way, wait a
+                minute and run it again.
               </p>
             </>
           )

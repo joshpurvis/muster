@@ -169,7 +169,7 @@ let seq = 1;
 /** `hello.updates` (docs/PROTOCOL.md "Updates"); `mock.updates` changes it. */
 const updates = { ui_release: null as string | null, backend: null as string | null, host: null as string | null };
 /** The pretend backend and terminal host (`hello.pid`, `hello.terminal_host`); a restart replaces both. */
-const mockBackend = { pid: 4242, host: "mock-host-1", hostPid: 4243 };
+const mockBackend = { pid: 4242, host: "mock-host-1", hostPid: 4243, build: "0000000000a1" };
 /** `mock.restart_delay`: how long `daemon.restart`'s checks pretend to take (ms). */
 let restartDelay = 0;
 /** Shared window preferences (`prefs.get` / `prefs.set`). */
@@ -1430,6 +1430,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         prefs: windowPrefs,
         openrouter: { key_present: orKey },
         pid: mockBackend.pid,
+        build: mockBackend.build,
         terminal_host: { protocol: 1, instance: mockBackend.host, pid: mockBackend.hostPid },
       };
     case "prefs.get":
@@ -1481,6 +1482,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       mockBackend.pid++;
       mockBackend.host = `mock-host-${mockBackend.pid}`;
       mockBackend.hostPid = mockBackend.pid + 1000;
+      mockBackend.build = updates.backend ?? mockBackend.build;
       for (const s of sessions.values()) if (s.state !== "exited") kill(s.id);
       updates.backend = null;
       updates.host = null;

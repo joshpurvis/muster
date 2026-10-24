@@ -25,6 +25,7 @@ mod spend;
 mod notify;
 mod openrouter;
 mod paths;
+mod pidfd;
 mod pr;
 mod renderer;
 mod pty;
@@ -111,6 +112,10 @@ enum Cmd {
         /// starts the checked snapshot): updates are looked for there.
         #[arg(long, hide = true, value_name = "PATH", requires = "foreground")]
         launch: Option<PathBuf>,
+        /// Started by a command that holds the lifecycle lock for it (see `start_daemon_from`),
+        /// so this start doesn't wait for that lock itself.
+        #[arg(long, hide = true, requires = "foreground")]
+        lifecycle_locked: bool,
     },
     /// Forward an agent hook callback to the daemon (used inside agent CLIs).
     Hook {
@@ -558,7 +563,7 @@ fn main() -> ExitCode {
     }
     let r = match cli.cmd {
         None => ensure_daemon().and_then(|d| open_ui(&d, None)),
-        Some(Cmd::Daemon { foreground: true, launch }) => run_daemon(launch),
+        Some(Cmd::Daemon { foreground: true, launch, lifecycle_locked }) => run_daemon(launch, lifecycle_locked),
         Some(Cmd::Daemon { foreground: false, .. }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Hook { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
@@ -765,7 +770,7 @@ fn find_daemon() -> Option<Discovery> {
 /// that pid, which a stale discovery file or a recycled pid can't fake.
 fn backend_alive(d: &Discovery) -> bool {
     if paths::pid_alive(d.pid) {
-        return is_muster_process(d.pid);
+        return is_our_backend(d.pid);
     }
     backend_answers_as(d)
 }
@@ -793,18 +798,29 @@ fn ensure_daemon() -> anyhow::Result<Discovery> {
 }
 
 /// Re-exec `muster daemon --foreground` in its own session, logging to the runtime dir,
-/// and wait until it answers.
+/// and wait until it answers. While a restart, reload or stop holds the lifecycle lock, it
+/// waits for that to finish first (a restart's own new backend is then the one found). A
+/// restart that didn't finish is reported here (see [`take_restart_failure`]).
 fn start_daemon_detached() -> anyhow::Result<Discovery> {
+    let lock = wait_lifecycle_lock()?;
     let exe = std::env::current_exe().context("locating the muster binary")?;
-    start_daemon_from(&exe, None)
+    let failure = take_restart_failure();
+    let (d, _) = start_daemon_from(&exe, None, &lock)?;
+    if let Some(failure) = failure {
+        eprintln!("muster: note: {failure}");
+    }
+    Ok(d)
 }
 
-/// [`start_daemon_detached`] from `exe` (`launch`: see `daemon --launch`).
-fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>) -> anyhow::Result<Discovery> {
+/// [`start_daemon_detached`] from `exe` (`launch`: see `daemon --launch`), for a caller that
+/// holds the lifecycle lock (`_held`). Also says whether the backend that answers is the one
+/// this started (false: one was already running, or another won the start).
+fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>, _held: &LifecycleLock)
+    -> anyhow::Result<(Discovery, bool)> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     if let Some(d) = find_daemon() {
-        return Ok(d);
+        return Ok((d, false));
     }
     let rt = paths::runtime_dir();
     paths::ensure_private_dir(&rt)?;
@@ -817,7 +833,7 @@ fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>) ->
         .with_context(|| format!("opening {}", log_path.display()))?;
     paths::make_private_file(&log_path);
     let mut cmd = Command::new(exe);
-    cmd.args(["daemon", "--foreground"]);
+    cmd.args(["daemon", "--foreground", "--lifecycle-locked"]);
     if let Some(launch) = launch {
         cmd.arg("--launch").arg(launch);
     }
@@ -838,7 +854,8 @@ fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>) ->
     loop {
         if let Some(d) = find_daemon() {
             // No need to reap: the daemon outlives us and is reparented to init.
-            return Ok(d);
+            let ours = d.pid == child.id();
+            return Ok((d, ours));
         }
         if exited.is_none()
             && let Ok(Some(st)) = child.try_wait()
@@ -877,6 +894,9 @@ fn status() -> anyhow::Result<()> {
         );
     }
     println!("data: {}", paths::data_dir().display());
+    if let Some(failure) = restart_failure() {
+        println!("{failure}");
+    }
     #[cfg(all(feature = "gui", target_os = "linux"))]
     if std::env::var_os("MUSTER_BROWSER").is_none() {
         println!("next native window: {}", gui::linux::status_line());
@@ -902,16 +922,82 @@ const LIFECYCLE_BUSY: &str = "another Muster restart, reload or stop is under wa
 /// started meanwhile never holds it.
 struct LifecycleLock(#[allow(dead_code)] std::fs::File);
 
-fn lifecycle_lock(what: &str) -> anyhow::Result<LifecycleLock> {
+/// The lifecycle lock, or None while another command holds it.
+fn try_lifecycle_lock() -> anyhow::Result<Option<LifecycleLock>> {
     use std::os::fd::AsRawFd;
     let rt = paths::runtime_dir();
     paths::ensure_private_dir(&rt)?;
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(rt.join("lifecycle.lock"))?;
     // SAFETY: flock on an fd we own.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::bail!("{LIFECYCLE_BUSY}, so {what} was refused and nothing was changed; try again once it has finished");
+        return Ok(None);
     }
-    Ok(LifecycleLock(f))
+    Ok(Some(LifecycleLock(f)))
+}
+
+fn lifecycle_lock(what: &str) -> anyhow::Result<LifecycleLock> {
+    try_lifecycle_lock()?.with_context(||
+        format!("{LIFECYCLE_BUSY}, so {what} was refused and nothing was changed; try again once it has finished"))
+}
+
+/// How long an ordinary start waits for a restart, reload or stop under way: longer than a
+/// restart can take (its checks, the old backend's 120 s, the host's 30 s, the new start).
+const LIFECYCLE_WAIT: Duration = Duration::from_secs(240);
+
+/// The lifecycle lock for an ordinary start (`muster`, `muster daemon`, a command that starts
+/// the daemon): while a restart, reload or stop holds it, wait for that to finish instead of
+/// starting a backend in the middle of it (on a terminal host about to be stopped, or beside
+/// the one a restart starts).
+fn wait_lifecycle_lock() -> anyhow::Result<LifecycleLock> {
+    let end = Instant::now() + LIFECYCLE_WAIT;
+    let mut said = false;
+    loop {
+        if let Some(lock) = try_lifecycle_lock()? {
+            return Ok(lock);
+        }
+        if !said {
+            eprintln!("muster: a Muster restart, reload or stop is under way; waiting for it to finish…");
+            said = true;
+        }
+        anyhow::ensure!(Instant::now() < end,
+            "{LIFECYCLE_BUSY} and hasn't finished within {} s, so Muster wasn't started; see {}",
+            LIFECYCLE_WAIT.as_secs(), paths::log_path().display());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Where a restart that went ahead but didn't finish says why (`<runtime>/restart-failed`):
+/// the windows waiting for it can't hear it, so the next `muster` (and `muster status`) do.
+fn restart_failure_path() -> PathBuf {
+    paths::runtime_dir().join("restart-failed")
+}
+
+fn record_restart_failure(error: &anyhow::Error) {
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let why = format!("{error:#}").replace('\n', " ");
+    let _ = paths::write_private(&restart_failure_path(), format!("{at}\n{why}\n").as_bytes());
+}
+
+/// The last restart's failure, as a sentence, if one is recorded.
+fn restart_failure() -> Option<String> {
+    let raw = std::fs::read_to_string(restart_failure_path()).ok()?;
+    let (at, why) = raw.split_once('\n')?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let minutes = now.saturating_sub(at.trim().parse().unwrap_or(now)) / 60;
+    let ago = match minutes {
+        0 => "less than a minute ago".to_string(),
+        1 => "1 minute ago".to_string(),
+        m if m < 120 => format!("{m} minutes ago"),
+        m => format!("{} hours ago", m / 60),
+    };
+    Some(format!("the last Restart Muster ({ago}) didn't finish: {}", why.trim()))
+}
+
+/// [`restart_failure`], removed once told.
+fn take_restart_failure() -> Option<String> {
+    let failure = restart_failure();
+    let _ = std::fs::remove_file(restart_failure_path());
+    failure
 }
 
 fn stop() -> anyhow::Result<()> {
@@ -1023,10 +1109,21 @@ fn peer_cred(_: &std::os::unix::net::UnixStream) -> anyhow::Result<(u32, u32)> {
 impl RunningHost {
     /// Shut it down (every session ends) and wait until it has gone.
     fn stop(self) -> anyhow::Result<()> {
-        self.stop_with(|pid| {
-            // SAFETY: plain kill(2), to the pid just confirmed to own the host socket.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        }, paths::pid_alive)
+        // Without the protocol it is signalled through a handle opened before its identity is
+        // confirmed again (in `stop_with`), so the signal reaches the process just confirmed to
+        // own the socket, never one that took its pid since.
+        let process = match self.how {
+            HostStop::Signal => pidfd::Process::open(self.pid).ok(),
+            HostStop::Protocol(_) => None,
+        };
+        self.stop_with(
+            |_| {
+                if let Some(process) = &process {
+                    let _ = process.signal(libc::SIGTERM);
+                }
+            },
+            |_| process.as_ref().is_some_and(|p| !p.exited()),
+        )
     }
 
     /// [`RunningHost::stop`] with how to signal it and how to tell it still runs.
@@ -1036,14 +1133,21 @@ impl RunningHost {
                 host.call(muster_terminal_protocol::Command::Shutdown)?;
             }
             HostStop::Signal => {
+                // Nothing listens any more: it has gone by itself.
+                if let Err(e) = std::os::unix::net::UnixStream::connect(&self.paths.socket)
+                    && matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+                {
+                    return Ok(());
+                }
                 // Confirmed again right before the signal, so a pid freed since isn't hit.
-                let (_, pid) = identify_host(&self.paths)?;
-                anyhow::ensure!(pid == self.pid, "the terminal host changed while it was being stopped");
+                let (instance, pid) = identify_host(&self.paths)?;
+                anyhow::ensure!(pid == self.pid && instance == self.instance, "the terminal host changed while it was being stopped");
                 signal(pid);
             }
         }
         let end = Instant::now() + HOST_STOP_WAIT;
-        while self.paths.socket.exists() || (matches!(self.how, HostStop::Signal) && alive(self.pid)) {
+        // Asked through the protocol, it is gone once its socket is; signalled, once it exited.
+        while match self.how { HostStop::Protocol(_) => self.paths.socket.exists(), HostStop::Signal => alive(self.pid) } {
             anyhow::ensure!(Instant::now() < end, "terminal host did not stop within {}s", HOST_STOP_WAIT.as_secs());
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1063,13 +1167,15 @@ struct RestartOpts {
 /// window (the open ones reconnect). Everything that can refuse is checked before anything
 /// stops, including the release the new daemon will run: this build and the terminal host
 /// beside its launch path are snapshotted and checked first (`executables::prepare_running`,
-/// as a daemon start does), and the daemon is then started from that snapshot, so a rebuild
+/// as a daemon start does), both copies are run once (the host on scratch directories, answering
+/// this build's protocol), and the daemon is then started from that snapshot, so a rebuild
 /// meanwhile can neither fail nor change the start. With `report_fd` (the backend's
 /// `daemon.restart`), the verdict goes there ("ready" or "refused: <why>") and nothing stops
 /// until the backend answers "go", so windows hear of the restart first. Holds the lifecycle
-/// lock throughout. Once anything has stopped, it goes on only when each step has really
-/// finished (the backend exited, the host gone); if one doesn't, it stops there and says so,
-/// and the windows' wait ends in "run muster".
+/// lock throughout (ordinary starts wait for it). Once anything has stopped, it goes on only
+/// when each step has really finished (the backend exited, the host gone); if one doesn't, it
+/// stops there and says so, and the windows' wait ends in "run muster". A failure after "go"
+/// is also recorded for the next `muster` to tell ([`record_restart_failure`]).
 fn restart_all(opts: RestartOpts) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
     use std::os::fd::FromRawFd;
@@ -1077,7 +1183,7 @@ fn restart_all(opts: RestartOpts) -> anyhow::Result<()> {
     // nothing else here uses.
     let report = opts.report_fd.map(|fd| unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
     let checked = lifecycle_lock("the restart").and_then(|lock| restart_checks(&opts).map(|c| (lock, c)));
-    let (_lock, (old, old_host, release, launch)) = match checked {
+    let (lock, plan) = match checked {
         Ok(c) => c,
         Err(error) => {
             if let Some(mut r) = report {
@@ -1093,35 +1199,85 @@ fn restart_all(opts: RestartOpts) -> anyhow::Result<()> {
         let _ = std::io::BufReader::new(&r).read_line(&mut line);
         anyhow::ensure!(line.trim_end() == "go", "the backend did not confirm the restart; nothing was stopped");
     }
+    let _ = std::fs::remove_file(restart_failure_path());
+    let restarted = restart_go(&lock, plan);
+    if let Err(error) = &restarted {
+        record_restart_failure(error);
+    }
+    restarted
+}
+
+/// What `restart-all` stops and starts, once checked ([`restart_checks`]).
+struct RestartPlan {
+    backend: Option<Backend>,
+    host: Option<RunningHost>,
+    release: executables::Release,
+    launch: PathBuf,
+}
+
+/// `restart-all` past the point of no return: stop the backend, then the host, then start the
+/// checked release and confirm it is what answers.
+fn restart_go(lock: &LifecycleLock, plan: RestartPlan) -> anyhow::Result<()> {
     println!("muster: restarting; every session ends");
-    stop_backend_within(old.as_ref(), RESTART_STOP_WAIT).context(
-        "the old backend did not stop, so the terminal host was left running and Muster was not started again; \
-         once it has stopped, run `muster stop`, then `muster`")?;
-    let old_instance = old_host.as_ref().map(|h| h.instance.clone());
-    if let Some(host) = old_host {
+    stop_backend_within(plan.backend.as_ref(), RESTART_STOP_WAIT).context(
+        "the old backend did not stop, so the terminal host was left running (sessions may still run) and Muster \
+         was not started again; once it has stopped, run `muster stop`, then `muster`")?;
+    let old_instance = plan.host.as_ref().map(|h| h.instance.clone());
+    if let Some(host) = plan.host {
         host.stop().context("the terminal host did not stop, so Muster was not started again; run `muster stop`, then `muster`")?;
         println!("muster terminal host stopped");
     }
-    let d = start_daemon_from(&release.app(), Some(&launch))
+    let (d, started) = start_daemon_from(&plan.release.app(), Some(&plan.launch), lock)
         .context("Muster was stopped but did not start again; start it with `muster`")?;
+    anyhow::ensure!(started && plan.backend.as_ref().is_none_or(|o| o.d.pid != d.pid),
+        "Muster was stopped, but the backend that answers (pid {}) isn't the one this restart started; \
+         run `muster stop`, then `muster`", d.pid);
     let hello = client::rpc(&d, "hello", serde_json::json!({})).context("the new backend does not answer")?;
-    anyhow::ensure!(old.as_ref().is_none_or(|o| o.pid != d.pid), "the old backend (pid {}) still runs", d.pid);
-    let instance = hello["terminal_host"]["instance"].as_str().unwrap_or_default();
-    anyhow::ensure!(!instance.is_empty() && old_instance.as_deref() != Some(instance), "the new backend has no new terminal host");
+    check_restarted(&hello, &plan.release, old_instance.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e:#}; run `muster stop`, then `muster`"))?;
     println!("muster restarted (pid {}); every session ended, open windows reconnect", d.pid);
     Ok(())
 }
-/// What `restart-all` checks before anything stops: this command can signal the backend; the
-/// terminal host is one it can stop (in this protocol or not); and the release the new daemon
-/// will run is prepared and checked, and is the build the backend offered (`opts.app`,
-/// `opts.host`). Returns the running backend, the host, that release and the launch path.
-fn restart_checks(opts: &RestartOpts)
-    -> anyhow::Result<(Option<Discovery>, Option<RunningHost>, executables::Release, PathBuf)> {
+
+/// Is the backend that answers (`hello`) the release this restart checked and started, on a new
+/// terminal host started from that release's host?
+fn check_restarted(hello: &serde_json::Value, release: &executables::Release, old_instance: Option<&str>)
+    -> anyhow::Result<()> {
+    let build = hello["build"].as_str().unwrap_or_default();
+    anyhow::ensure!(!build.is_empty() && release.app_hash().starts_with(build),
+        "the new backend runs another build ({}) than the one this restart checked", if build.is_empty() { "unknown" } else { build });
+    let instance = hello["terminal_host"]["instance"].as_str().unwrap_or_default();
+    anyhow::ensure!(!instance.is_empty() && old_instance != Some(instance), "the new backend has no new terminal host");
+    // By content, where /proc shows it (it keeps the executable even if its file is replaced).
+    if let Some(pid) = hello["terminal_host"]["pid"].as_u64()
+        && let Ok(hash) = executables::hash_file(std::path::Path::new(&format!("/proc/{pid}/exe")))
+    {
+        anyhow::ensure!(hash == release.host_hash(), "the new terminal host (pid {pid}) isn't the one this restart checked");
+    }
+    Ok(())
+}
+
+/// The least free space the data directory's file system must have left once the release is
+/// prepared, for the new backend's database, logs and state.
+const RESTART_MIN_FREE: u64 = 64 * 1024 * 1024;
+
+/// What `restart-all` checks before anything stops: this command can signal the backend (a
+/// handle on its process is taken now, see [`open_backend`]); the terminal host is one it can
+/// stop (in this protocol or not); and the release the new daemon will run is prepared, is the
+/// build the backend offered (`opts.app`, `opts.host`), and runs: its backend answers
+/// `--version` as this build, its host starts on scratch directories and answers this build's
+/// protocol ([`terminal::probe_host`]). There must also be room left to start.
+fn restart_checks(opts: &RestartOpts) -> anyhow::Result<RestartPlan> {
     let d = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &d {
         anyhow::ensure!(!backend_hidden(d),
             "Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); restart it from outside", d.pid);
     }
+    let backend = match &d {
+        Some(d) => Some(open_backend(d)
+            .with_context(|| format!("Muster's backend (pid {}) stopped while the restart was being checked; nothing was stopped", d.pid))?),
+        None => None,
+    };
     let host = running_host(&HostPaths::current()).context("the terminal host can't be stopped from here; nothing was stopped")?;
     let launch = match &opts.launch {
         Some(launch) => launch.clone(),
@@ -1133,7 +1289,53 @@ fn restart_checks(opts: &RestartOpts)
     let release = executables::prepare_running(&paths::data_dir(), &launch, &running)
         .context("the new Muster build can't be started (nothing was stopped)")?;
     check_restart_release(&release, opts.app.as_deref(), opts.host.as_deref(), &launch)?;
-    Ok((d, host, release, launch))
+    check_release_runs(&release).map_err(|e| anyhow::anyhow!("{e:#}; nothing was stopped"))?;
+    let free = free_space(&paths::data_dir()).unwrap_or(u64::MAX);
+    anyhow::ensure!(free >= RESTART_MIN_FREE,
+        "only {} MB are free where Muster keeps its data ({}), too little to start it again; nothing was stopped. Free some space, then try again",
+        free / (1024 * 1024), paths::data_dir().display());
+    Ok(RestartPlan { backend, host, release, launch })
+}
+
+/// Run the prepared release once, as the new daemon will: its backend copy answers
+/// `--version` as this build (the copy executes where it lies: no `noexec` mount, nothing
+/// missing), and its terminal host copy starts and speaks this build's protocol.
+fn check_release_runs(release: &executables::Release) -> anyhow::Result<()> {
+    let app = release.app();
+    // The OpenRouter key this command was handed is for the new daemon only.
+    let mut child = Command::new(&app).arg("--version").env_remove(openrouter::ENV_KEY)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().with_context(|| format!("the new Muster build {} can't be run", app.display()))?;
+    let end = Instant::now() + Duration::from_secs(10);
+    while child.try_wait()?.is_none() {
+        if Instant::now() > end {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("the new Muster build {} did not answer `--version` within 10 s", app.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output()?;
+    let said = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let want = format!("muster {}", env!("CARGO_PKG_VERSION"));
+    anyhow::ensure!(output.status.success() && said == want,
+        "the new Muster build {} doesn't run as this build (it says {said:?})", app.display());
+    // Beside the real host's socket, unless a socket there would be too long a path for one.
+    let name = format!(".restart-check-{}", &paths::random_token()[..12]);
+    let mut scratch = paths::runtime_dir().join(&name);
+    if scratch.join("run/terminal.sock").as_os_str().len() > 100 {
+        scratch = std::env::temp_dir().join(name);
+    }
+    terminal::probe_host(&release.host(), &scratch)
+}
+
+/// Bytes free to this user on the file system holding `path`.
+fn free_space(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs writes into the zeroed struct; the path is NUL-terminated.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0).then(|| stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 /// Is the prepared `release` the build the backend offered?
@@ -1152,6 +1354,8 @@ fn reload() -> anyhow::Result<()> {
     // Released before a handoff: the backend's own `reload` takes it then.
     let mut lock = Some(lifecycle_lock("`muster reload`")?);
     let discovery = paths::read_discovery().filter(backend_alive);
+    // A handle on its process now, so the one checked is the one stopped (see `open_backend`).
+    let backend = discovery.as_ref().and_then(open_backend);
     if let Some(d) = &discovery {
         let hello = client::rpc(d, "hello", serde_json::json!({}))
             .context("cannot verify restart safety; backend left running")?;
@@ -1191,9 +1395,13 @@ fn reload() -> anyhow::Result<()> {
             }
         }
         warn_openrouter_key_lost(&hello);
-        stop_backend(Some(d))?;
+        // Gone meanwhile (nothing to stop): the start below finds whatever runs now.
+        if let Some(backend) = &backend {
+            stop_backend(Some(backend))?;
+        }
     }
-    start_daemon_detached()?;
+    let held = lock.as_ref().context("the lifecycle lock is held across the reload")?;
+    start_daemon_from(&std::env::current_exe().context("locating the muster binary")?, None, held)?;
     drop(lock);
     println!("muster backend restarted; terminals preserved");
     Ok(())
@@ -1260,60 +1468,94 @@ fn validate_reload_host(backend: &serde_json::Value, host: &muster_terminal_prot
     Ok(())
 }
 
-fn stop_backend(expected: Option<&Discovery>) -> anyhow::Result<()> {
+fn stop_backend(expected: Option<&Backend>) -> anyhow::Result<()> {
     stop_backend_within(expected, STOP_WAIT)
+}
+
+/// A running backend: its discovery file, and a handle on its process ([`open_backend`]).
+struct Backend {
+    d: Discovery,
+    process: pidfd::Process,
+}
+
+/// The backend `d` names, if it runs. The handle on its process is opened first, then the
+/// process is confirmed to be this runtime directory's backend ([`is_our_backend`]), so a pid
+/// that was freed and reused (by anything, or by another runtime directory's daemon) is never
+/// taken for it, and everything later signalled or waited for through the handle is that one.
+fn open_backend(d: &Discovery) -> Option<Backend> {
+    let process = pidfd::Process::open(d.pid).ok()?;
+    is_our_backend(d.pid).then(|| Backend { d: d.clone(), process })
 }
 
 /// Stop the backend: `expected` (the one a reload or restart checked), else the one the discovery
 /// file names. The expected one is stopped even when its discovery file has gone meanwhile (it is
 /// removed only at the end of a backend's teardown, or by something else): reading the file again
 /// would say "not running" while it still runs, and the next backend would fail to start beside it.
-fn stop_backend_within(expected: Option<&Discovery>, wait: Duration) -> anyhow::Result<()> {
+/// Signalled and waited for through its process handle.
+fn stop_backend_within(expected: Option<&Backend>, wait: Duration) -> anyhow::Result<()> {
     let current = paths::read_discovery();
     if let Some(d) = current.as_ref().filter(|d| backend_hidden(d)) {
         anyhow::bail!("Muster's backend (pid {}) runs where this command can't signal it (a sandboxed command); stop it from outside", d.pid);
     }
-    let d = match expected {
+    let opened;
+    let backend = match expected {
         Some(expected) => {
             if let Some(d) = &current {
-                anyhow::ensure!(d.pid == expected.pid && d.token == expected.token && d.port == expected.port,
+                let e = &expected.d;
+                anyhow::ensure!(d.pid == e.pid && d.token == e.token && d.port == e.port,
                     "backend changed while preparing the reload or restart; nothing was stopped");
             }
-            expected.clone()
+            expected
         }
-        None => match current {
-            Some(d) => d,
-            None => {
+        None => {
+            let Some(d) = current else {
                 println!("muster daemon: not running");
                 return Ok(());
+            };
+            match open_backend(&d) {
+                Some(backend) => {
+                    opened = backend;
+                    &opened
+                }
+                // Guard against a stale daemon.json whose pid now belongs to another process.
+                None if paths::pid_alive(d.pid) => {
+                    let _ = std::fs::remove_file(paths::discovery_path());
+                    println!("muster daemon: not running (removed stale daemon.json)");
+                    return Ok(());
+                }
+                None => {
+                    println!("muster daemon: not running");
+                    return Ok(());
+                }
             }
-        },
+        }
     };
-    if !paths::pid_alive(d.pid) {
+    if backend.process.exited() {
         println!("muster daemon: not running");
         return Ok(());
     }
-    // Guard against a stale daemon.json whose pid now belongs to an unrelated process.
-    if !is_muster_process(d.pid) {
-        if expected.is_none() {
-            let _ = std::fs::remove_file(paths::discovery_path());
-        }
-        println!("muster daemon: not running (removed stale daemon.json)");
-        return Ok(());
-    }
-    // SAFETY: plain kill(2).
-    unsafe {
-        libc::kill(d.pid as libc::pid_t, libc::SIGTERM);
-    }
+    backend.process.signal(libc::SIGTERM).with_context(|| format!("signalling the backend (pid {})", backend.d.pid))?;
     let deadline = Instant::now() + wait;
-    while paths::pid_alive(d.pid) && is_muster_process(d.pid) {
+    while !backend.process.exited() {
         if Instant::now() > deadline {
-            anyhow::bail!("daemon (pid {}) did not stop within {}s", d.pid, wait.as_secs());
+            anyhow::bail!("daemon (pid {}) did not stop within {}s", backend.d.pid, wait.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     println!("muster daemon stopped");
     Ok(())
+}
+
+/// Is `pid` this runtime directory's backend: a `muster daemon` ([`is_muster_process`]) that
+/// holds its `backend.lock` open (or `daemon.lock`, an older monolithic daemon's)? A daemon of
+/// another runtime directory holds other files. Where its open files can't be read (no procfs,
+/// or not allowed), the cmdline check's answer.
+fn is_our_backend(pid: u32) -> bool {
+    if !is_muster_process(pid) {
+        return false;
+    }
+    let held = [paths::backend_lock_path(), paths::lock_path()].map(|lock| pidfd::holds_open(pid, &lock));
+    held.contains(&Some(true)) || held.iter().all(Option::is_none)
 }
 
 /// Best effort: does `pid` look like a `muster daemon` process?
@@ -1448,7 +1690,7 @@ async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
     Ok(listener)
 }
 
-fn run_daemon(launch: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_daemon(launch: Option<PathBuf>, lifecycle_locked: bool) -> anyhow::Result<()> {
     // First, while this is the only thread: the key leaves the process environment.
     let openrouter_key = openrouter::take_key_from_env();
     tracing_subscriber::fmt()
@@ -1459,6 +1701,11 @@ fn run_daemon(launch: Option<PathBuf>) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
+    // Run by hand (not by a command holding the lifecycle lock for it): wait out a restart,
+    // reload or stop under way first, as `muster` does.
+    if !lifecycle_locked {
+        drop(wait_lifecycle_lock()?);
+    }
     if let Some(d) = find_daemon() {
         println!("muster daemon already running (pid {}): {}", d.pid, d.base_url());
         return Ok(());
@@ -1750,7 +1997,8 @@ mod restart_tests {
     }
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("muster-restart-host-{}", paths::random_token()));
+        // Short: the host checks put a socket in here.
+        let dir = std::env::temp_dir().join(format!("muster-restart-host-{}", &paths::random_token()[..12]));
         std::fs::create_dir(&dir).unwrap();
         dir
     }
@@ -1837,8 +2085,93 @@ mod restart_tests {
         let first = lifecycle_lock("the restart").unwrap();
         let e = lifecycle_lock("`muster stop`").err().unwrap().to_string();
         assert!(e.contains(LIFECYCLE_BUSY) && e.contains("`muster stop` was refused"), "{e}");
+        // An ordinary start waits for it instead (`wait_lifecycle_lock`): it sees it held.
+        assert!(try_lifecycle_lock().unwrap().is_none());
+        let waiter = std::thread::spawn(|| {
+            let started = Instant::now();
+            let lock = wait_lifecycle_lock().unwrap();
+            (started.elapsed(), lock)
+        });
+        std::thread::sleep(Duration::from_millis(500));
         drop(first);
+        let (waited, lock) = waiter.join().unwrap();
+        assert!(waited >= Duration::from_millis(400), "it waited for the restart: {waited:?}");
+        drop(lock);
         lifecycle_lock("`muster stop`").unwrap();
+    }
+
+    #[test]
+    fn a_restart_that_went_ahead_and_failed_is_told_by_the_next_start() {
+        if std::env::var_os("MUSTER_RUNTIME_DIR").is_none() {
+            return;
+        }
+        record_restart_failure(&anyhow::anyhow!("daemon (pid 7) did not stop within 120s")
+            .context("the old backend did not stop"));
+        let told = restart_failure().unwrap();
+        assert!(told.starts_with("the last Restart Muster (less than a minute ago) didn't finish: the old backend did not stop: daemon (pid 7)"), "{told}");
+        assert_eq!(take_restart_failure().as_deref(), Some(told.as_str()));
+        assert!(restart_failure().is_none(), "told once");
+    }
+
+    /// A release of stand-in executables, as `prepare_running` publishes it.
+    fn release(dir: &std::path::Path, host: &[u8]) -> executables::Release {
+        let bin = dir.join("build");
+        std::fs::create_dir_all(&bin).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for (name, body) in [("muster", &b"app"[..]), (executables::HOST, host)] {
+            std::fs::write(bin.join(name), body).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        executables::prepare_running(&dir.join("data"), &bin.join("muster"), &bin.join("muster")).unwrap()
+    }
+
+    #[test]
+    fn a_host_that_doesnt_run_or_speak_this_protocol_fails_the_check() {
+        let dir = temp();
+        // Truncated, but still executable: it can't even start.
+        let truncated = release(&dir.join("a"), b"\x7fELF\x02\x01\x01");
+        let e = format!("{:#}", terminal::probe_host(&truncated.host(), &dir.join("probe-a")).unwrap_err());
+        // (Or run by the shell fallback for an unknown executable format, which then fails.)
+        assert!(e.contains("running the terminal host") || e.contains("exited when started"), "{e}");
+        // Starts, then exits without answering.
+        let exits = release(&dir.join("b"), b"#!/bin/sh\necho 'muster-terminal-host: broken' >&2\nexit 3\n");
+        let e = format!("{:#}", terminal::probe_host(&exits.host(), &dir.join("probe-b")).unwrap_err());
+        assert!(e.contains("exited when started") && e.contains("broken"), "{e}");
+        assert!(!dir.join("probe-b").exists(), "its scratch directories are removed");
+        // Answers, but in another protocol version (a backend rebuilt after a protocol bump).
+        let older = release(&dir.join("c"), b"#!/bin/sh\nsleep 20\n");
+        let probe = dir.join("probe-c");
+        old_host(&probe.join("run"), std::process::id());
+        let e = format!("{:#}", terminal::probe_host(&older.host(), &probe).unwrap_err());
+        assert!(e.contains("doesn't speak this build's protocol"), "{e}");
+        // This build's own host passes (when the workspace build left it beside the tests).
+        let built = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join(executables::HOST);
+        if built.exists() {
+            terminal::probe_host(&built, &dir.join("probe-d")).unwrap();
+            assert!(!dir.join("probe-d").exists());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_restart_is_done_only_when_its_own_release_answers_on_a_new_host() {
+        let dir = temp();
+        let release = release(&dir, b"host");
+        let build: String = release.app_hash().chars().take(12).collect();
+        let hello = |build: &str, instance: &str| serde_json::json!({"build": build, "terminal_host": {"instance": instance}});
+        check_restarted(&hello(&build, "new"), &release, Some("old")).unwrap();
+        let e = check_restarted(&hello("0123456789ab", "new"), &release, Some("old")).unwrap_err().to_string();
+        assert!(e.contains("another build (0123456789ab)"), "{e}");
+        let e = check_restarted(&serde_json::json!({"terminal_host": {"instance": "new"}}), &release, None).unwrap_err().to_string();
+        assert!(e.contains("another build (unknown)"), "{e}");
+        let e = check_restarted(&hello(&build, "old"), &release, Some("old")).unwrap_err().to_string();
+        assert!(e.contains("no new terminal host"), "{e}");
+        // The host it runs on is checked by content: this test process is no such host.
+        let mut wrong = hello(&build, "new");
+        wrong["terminal_host"]["pid"] = std::process::id().into();
+        let e = check_restarted(&wrong, &release, Some("old")).unwrap_err().to_string();
+        assert!(e.contains("isn't the one this restart checked"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

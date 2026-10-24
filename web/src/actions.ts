@@ -48,6 +48,7 @@ import {
   lastBackend,
   daemonRestarting,
   daemonStopped,
+  lifecycleChecking,
   stoppedReason,
   updateStatus,
   dismissToastKey,
@@ -69,7 +70,7 @@ import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
-import { restartAnswered, restartExpect } from "./updates.ts";
+import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
   Schedule,
@@ -1270,6 +1271,7 @@ export function backendRestarted() {
  * taken as a shutdown (the window keeps reconnecting). */
 export async function shutDown() {
   if (!connectedFor("shut down")) return;
+  lifecycleChecking.value = "shutdown";
   try {
     await rpc.call("daemon.shutdown");
     daemonStopped.value = true;
@@ -1282,6 +1284,8 @@ export async function shutDown() {
         ? "The connection dropped before Muster answered; it may not have shut down."
         : `Couldn't shut down Muster: ${errText(e)}`,
     );
+  } finally {
+    lifecycleChecking.value = null;
   }
 }
 
@@ -1292,11 +1296,12 @@ export async function shutDown() {
  * anything stopped. */
 export async function restartMuster() {
   if (!connectedFor("restart Muster")) return;
-  const before = lastBackend.value;
+  const wait = restartWait(lastBackend.value, updateStatus.value);
+  lifecycleChecking.value = "restart";
   try {
     await rpc.call("daemon.restart", restartExpect(updateStatus.value));
     // The event comes first, unless this connection missed it.
-    if (!daemonRestarting.value) daemonRestarting.value = before;
+    if (!daemonRestarting.value) daemonRestarting.value = wait;
   } catch (e) {
     // The old backend may go away before it answers: that is the restart working.
     if (daemonRestarting.value) return;
@@ -1305,13 +1310,24 @@ export async function restartMuster() {
     if (/connection lost/i.test(why)) toast("warn", "The connection dropped before Muster answered; it may be restarting.");
     else if (/timed out/i.test(why)) toast("warn", "Muster hasn't answered yet; it may still restart.");
     else toast("error", `Couldn't restart Muster: ${why}`);
+  } finally {
+    lifecycleChecking.value = null;
   }
 }
 
 /** A hello arrived while restarting: from the new backend on a new host, the restart is done. */
 export function restartHello(hello: HelloResult) {
-  if (!restartAnswered(daemonRestarting.value, hello)) return;
+  const outcome = restartOutcome(daemonRestarting.value, hello);
+  if (outcome === "waiting") return;
   daemonRestarting.value = null;
+  if (outcome === "other_build") {
+    toast(
+      "warn",
+      "Muster started again, but from another build than the one this restart was for: something else started it meanwhile. Every session ended.",
+      12000,
+    );
+    return;
+  }
   toast("success", "Muster restarted. Restart a Claude tab to reopen its conversation.", 8000);
 }
 

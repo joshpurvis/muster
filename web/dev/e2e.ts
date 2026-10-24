@@ -1364,6 +1364,13 @@ try {
     await a.key("Escape");
     await a.sleep(200);
     check(await a.eval(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`), "Escape doesn't dismiss a confirmed restart");
+    // Nor does a shortcut that opens another overlay (Escape would then return to normal work).
+    await a.key("Ctrl+Shift+P");
+    await a.sleep(200);
+    check(
+      await a.eval(`!!document.querySelector('.modal[aria-label="Restart Muster"]') && !document.querySelector('.switcher')`),
+      "the command palette shortcut doesn't replace a confirmed restart's dialog",
+    );
     await a.wait(`!!document.querySelector('#restarting-title')`, 5000);
     check(await a.eval(`document.activeElement?.getAttribute('aria-labelledby') === 'restarting-title'`), "the restarting screen takes the focus");
     await shot(a, "15-restarting");

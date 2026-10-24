@@ -1786,6 +1786,9 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     `restart: ...with a new terminal host (pid ${h0.terminal_host.pid} -> ${h1!.terminal_host.pid})`,
   );
   ok(h1!.sessions.find((s: Json) => s.id === liveSess!.id)?.state === "exited", "restart: the running shell ended");
+  ok(typeof h1!.build === "string" && h1!.build === (h0.updates.backend ?? h0.build),
+    `restart: the new backend runs the build the restart was for (${h0.build} -> ${h1!.build})`);
+  ok(!(await Deno.stat(`${RUNTIME}/restart-failed`).then(() => true, () => false)), "restart: no failure is recorded");
   ok(h1!.updates.host === null && h1!.updates.backend === null, "restart: no update is left waiting at the launch path");
   // It runs the release checked before anything stopped (its read-only snapshot), not the build output.
   // (python3 reads the link: the smoke has no read permission for /proc.)

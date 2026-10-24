@@ -31,7 +31,7 @@ import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupport
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { newerRun, upsertRun } from "./schedules.ts";
-import { type Dismissed, releaseOfScript, type RestartWait, type UpdateStatus } from "./updates.ts";
+import { type Dismissed, releaseOfScript, type RestartWait, restartWait, type UpdateStatus } from "./updates.ts";
 import {
   allSessions,
   emptyLayout,
@@ -163,7 +163,11 @@ export const stoppedReason = signal<"shutdown" | "restart_failed">("shutdown");
 export const daemonRestarting = signal<RestartWait | null>(null);
 /** The backend this page last said hello to: its pid and its terminal host's instance (null
  * when the hello didn't say). */
-export const lastBackend = signal<RestartWait>({ pid: null, host: null });
+export const lastBackend = signal<RestartWait>({ pid: null, host: null, build: null });
+/** A confirmed Restart or Shut down whose request is still out (the restart's checks may take a
+ * while): its dialog stays up whatever else asks for the screen, and no shortcut acts, until it is
+ * refused or Muster is restarting or stopped. */
+export const lifecycleChecking = signal<"restart" | "shutdown" | null>(null);
 
 // ---------------- named agents (docs/UI.md "Agents panel") ----------------
 
@@ -779,7 +783,7 @@ export function applyHello(h: HelloResult) {
       login_shell: h.login_shell ?? h.default_shell,
     };
     updateStatus.value = h.updates ?? null;
-    lastBackend.value = { pid: h.pid ?? null, host: h.terminal_host?.instance ?? null };
+    lastBackend.value = { pid: h.pid ?? null, host: h.terminal_host?.instance ?? null, build: h.build ?? null };
     windowPrefs.value = h.prefs ?? null;
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     accountProfiles.value = h.account_profiles ?? [];
@@ -934,7 +938,7 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "daemon_stopping":
       // A restart keeps the connection retrying; anything else (a shutdown) stops it.
-      if (ev.data.reason === "restart") daemonRestarting.value = lastBackend.peek();
+      if (ev.data.reason === "restart") daemonRestarting.value = restartWait(lastBackend.peek(), updateStatus.peek());
       else daemonStopped.value = true;
       break;
   }

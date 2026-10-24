@@ -64,6 +64,12 @@ impl Updates {
         self.status.lock().clone()
     }
 
+    /// The running build's content id (`hello.build`: its SHA-256's first 12 hex digits, as
+    /// `Status::backend` names a waiting one), once known.
+    pub fn build(&self) -> Option<String> {
+        self.launch.lock().as_ref().map(|(_, hash)| hash.chars().take(12).collect())
+    }
+
     /// Store `next`; true when it changed.
     fn set(&self, next: Status) -> bool {
         let mut cur = self.status.lock();

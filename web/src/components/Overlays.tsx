@@ -12,6 +12,7 @@ import {
   layoutOrder,
   meta,
   myWindow,
+  lifecycleChecking,
   overlay,
   panels,
   prefs,
@@ -136,6 +137,10 @@ function Modal(
 }
 
 export function Overlays() {
+  // A confirmed Restart or Shut down keeps its dialog until it is refused or under way, whatever
+  // else asked for the screen meanwhile.
+  const checking = lifecycleChecking.value;
+  if (checking) return <Lifecycle restart={checking === "restart"} />;
   const o = overlay.value;
   if (!o) return null;
   switch (o.kind) {
@@ -1202,17 +1207,15 @@ function Confirm(
  * again by itself), from the window. Both end every session; Cancel is the default. Once
  * confirmed there is no way back (the request can't be withdrawn, and a restart's checks may
  * take a while before every session ends), so the dialog then only says it is under way, with
- * no Cancel, and Escape and the backdrop no longer close it. */
+ * no Cancel; Escape, the backdrop and shortcuts no longer close or replace it
+ * (`lifecycleChecking`, shared with the keys). */
 function Lifecycle({ restart }: { restart: boolean }) {
   const cancel = useRef<HTMLButtonElement>(null);
-  const busyRef = useRef(false);
-  const [busy, setBusy] = useState(false);
+  const busy = lifecycleChecking.value !== null;
   useLayoutEffect(() => cancel.current?.focus(), []);
   const running = [...sessions.value.values()].filter((s) => s.state !== "exited");
   const label = restart ? "Restart Muster" : "Shut down Muster";
   const go = () => {
-    busyRef.current = true;
-    setBusy(true);
     (restart ? A.restartMuster() : A.shutDown()).finally(() => (overlay.value = null));
   };
   return (
@@ -1221,7 +1224,7 @@ function Lifecycle({ restart }: { restart: boolean }) {
       label={label}
       describedBy="lifecycle-body"
       onClose={() => {
-        if (!busyRef.current) close();
+        if (!lifecycleChecking.peek()) close();
       }}
     >
       <div class="dlg-head">

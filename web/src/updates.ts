@@ -63,11 +63,20 @@ export function restartExpect(s: UpdateStatus | null): { backend: string | null;
  * session), 30 s for the terminal host, and about 15 s for the new backend to answer. */
 export const RESTART_WAIT_MS = 180_000;
 
-/** The backend a window last talked to: its pid and its terminal host's instance (null: the
- * hello didn't say). */
+/** The backend a window last talked to: its pid, its terminal host's instance and its build
+ * (`hello.build`) (null: the hello didn't say). While restarting, `build` is the build the
+ * restart starts instead (see `restartWait`). */
 export interface RestartWait {
   pid: number | null;
   host: string | null;
+  build: string | null;
+}
+
+/** What a window waits for once a restart begins: another backend than `last`, on another
+ * terminal host, running the backend build the window was shown (`status.backend`), or else the
+ * same build as before. */
+export function restartWait(last: RestartWait, status: UpdateStatus | null): RestartWait {
+  return { ...last, build: status?.backend ?? last.build };
 }
 
 /** Did a hello on reconnect come from the restarted Muster? It must run on a terminal host, a
@@ -82,6 +91,18 @@ export function restartAnswered(
   const host = hello.terminal_host?.instance;
   if (!host || (restarting.host !== null && host === restarting.host)) return false;
   return restarting.pid === null || hello.pid === undefined || hello.pid !== restarting.pid;
+}
+
+/** What a hello on reconnect says of a restart: not done yet ("waiting"), done ("restarted"),
+ * or done but by a backend of another build than the restart started ("other_build":
+ * something else started Muster meanwhile). */
+export function restartOutcome(
+  restarting: RestartWait | null,
+  hello: { pid?: number; build?: string | null; terminal_host?: { instance: string } | null },
+): "waiting" | "restarted" | "other_build" {
+  if (!restartAnswered(restarting, hello)) return "waiting";
+  const build = hello.build ?? null;
+  return restarting?.build && build && build !== restarting.build ? "other_build" : "restarted";
 }
 
 /** "3 sessions are running (2 agents)." for the shutdown and restart dialogs: `running` are the

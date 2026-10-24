@@ -84,25 +84,56 @@ pub fn prepare_running(data: &Path, launch: &Path, running: &Path) -> anyhow::Re
     };
     let releases = data.join("application-releases");
     crate::paths::ensure_private_dir(&releases)?;
+    // A release already published (a restart's checked snapshot, which the new backend starts
+    // from, or an earlier start of the same builds) is reused without copying anything: a start
+    // that finds its release never needs disk space, so it can't fail for want of it.
+    let app_hash = hash_executable(running)?;
+    let host_hash = hash_executable(&host)?;
+    if let Some(release) = published(&releases, command.clone(), &app_hash, &host_hash, running, &host)? {
+        return Ok(release);
+    }
     let stage = RemoveOnDrop(releases.join(format!(".stage-{}", crate::paths::random_token())));
     fs::create_dir(&stage.0)?;
     fs::set_permissions(&stage.0, fs::Permissions::from_mode(0o700))?;
+    // Hashed again as copied: a host rebuilt in between is named by what was copied.
     let app_hash = snapshot(running, &stage.0.join(APP))?;
     let host_hash = snapshot(&host, &stage.0.join(HOST))?;
     File::open(&stage.0)?.sync_all()?;
-    let directory = releases.join(format!("{app_hash}-{host_hash}"));
-    if directory.exists() {
-        // A previous startup may have published the same release. Do not trust
-        // its name alone, and never silently overwrite a corrupted executable.
-        let meta = fs::symlink_metadata(&directory)?;
-        anyhow::ensure!(meta.is_dir(), "executable release is not a directory");
-        verify(&directory.join(APP), &app_hash)?;
-        verify(&directory.join(HOST), &host_hash)?;
-    } else {
-        fs::rename(&stage.0, &directory)?;
-        File::open(&releases)?.sync_all()?;
+    if let Some(release) = published(&releases, command.clone(), &app_hash, &host_hash, running, &host)? {
+        return Ok(release);
     }
+    let directory = releases.join(format!("{app_hash}-{host_hash}"));
+    fs::rename(&stage.0, &directory)?;
+    File::open(&releases)?.sync_all()?;
     Ok(Release { directory, command, app_hash, host_hash })
+}
+
+/// The release of these hashes, if one is published: its name alone is not trusted, and a
+/// corrupted executable is never silently overwritten. Files that are the sources themselves
+/// (a backend started from that release) were just hashed, so they aren't read again.
+fn published(releases: &Path, command: PathBuf, app_hash: &str, host_hash: &str, app: &Path, host: &Path)
+    -> anyhow::Result<Option<Release>> {
+    let directory = releases.join(format!("{app_hash}-{host_hash}"));
+    let meta = match fs::symlink_metadata(&directory) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    anyhow::ensure!(meta.is_dir(), "executable release is not a directory");
+    for (name, source, hash) in [(APP, app, app_hash), (HOST, host, host_hash)] {
+        let file = directory.join(name);
+        let same = fs::canonicalize(source).ok().zip(fs::canonicalize(&file).ok()).is_some_and(|(a, b)| a == b)
+            && fs::symlink_metadata(&file).is_ok_and(|m| m.is_file());
+        if !same {
+            verify(&file, hash)?;
+        }
+    }
+    Ok(Some(Release { directory, command, app_hash: app_hash.to_string(), host_hash: host_hash.to_string() }))
+}
+
+/// SHA-256 of an executable file (refused unless it is one).
+fn hash_executable(path: &Path) -> anyhow::Result<String> {
+    hash_and_copy(&mut executable_file(path)?, &mut std::io::sink())
 }
 
 /// SHA-256 of a file's content, as release names use it.
@@ -264,6 +295,32 @@ mod tests {
         assert_eq!(fs::read(release.directory.join(APP)).unwrap(), b"what executes");
         assert_eq!(release.app_hash(), hash_file(&root.0.join("running")).unwrap());
         assert_eq!(fs::read(release.host()).unwrap(), b"host", "the host comes from beside the launch path");
+    }
+
+    #[test]
+    fn a_published_release_is_reused_without_copying() {
+        let root = RemoveOnDrop(std::env::temp_dir().join(format!(
+            "muster-executables-{}",
+            crate::paths::random_token()
+        )));
+        fs::create_dir(&root.0).unwrap();
+        binary(&root.0.join(APP), b"application");
+        binary(&root.0.join(HOST), b"host");
+        let data = root.0.join("data");
+        let first = prepare(&data, &root.0.join(APP)).unwrap();
+        // Nothing more can be written there (as on a full disk): a start of the same builds,
+        // and one from the release itself (a restart's new backend), still prepares.
+        let releases = data.join("application-releases");
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o500)).unwrap();
+        let again = prepare(&data, &root.0.join(APP));
+        let own = prepare_running(&data, &first.directory.join(APP), &first.directory.join(APP));
+        fs::set_permissions(&releases, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(again.unwrap().directory, first.directory);
+        let own = own.unwrap();
+        assert_eq!((own.directory.clone(), own.app_hash(), own.host_hash()), (first.directory.clone(), first.app_hash(), first.host_hash()));
+        // A different build still needs (and gets) its own copy.
+        binary(&root.0.join(APP), b"rebuilt");
+        assert_ne!(prepare(&data, &root.0.join(APP)).unwrap().directory, first.directory);
     }
 
     #[test]

@@ -101,6 +101,8 @@ pub fn hello(hub: &Hub) -> Value {
         "paused_deliveries": inject::paused(hub),
         "terminal_host": hub.terminal_host_info(),
         "updates": hub.updates().status(),
+        // The running build's content id, so a restart can tell the build it started answers.
+        "build": hub.updates().build(),
         "prefs": hub.ui_prefs(),
         // The backend's own pid, so a CLI that can't see it (a sandboxed command in its own PID
         // namespace) can still tell the discovery file names this backend.

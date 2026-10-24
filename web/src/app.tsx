@@ -260,8 +260,11 @@ function Stopped() {
   useEffect(() => ref.current?.focus(), []);
   // Reloading while nothing answers would replace this page with the browser's own
   // "can't reach 127.0.0.1" error, which has no way back. Check first.
-  const reconnect = () =>
+  // Cleared first, so a repeated failure is announced again.
+  const reconnect = () => {
+    setNotYet(false);
     fetch(location.href, { cache: "no-store" }).then(() => location.reload(), () => setNotYet(true));
+  };
   return (
     <div class="splash">
       <div

@@ -2,10 +2,7 @@
 //! replay bytes, screen rows and plain-text scrollback are loaded on demand.
 use std::path::PathBuf;
 
-use muster_terminal_core::{
-    ScreenSnapshot, private_fs,
-    pty::{PtySession, ReplaySnapshot},
-};
+use muster_terminal_core::{ScreenSnapshot, private_fs, pty::PtySession, replay};
 use muster_terminal_protocol::TerminalStatus;
 
 pub struct Archive {
@@ -26,11 +23,12 @@ impl Archive {
         pty.flush_log_final();
         anyhow::ensure!(pty.log_durable(), "terminal log is not durably saved");
         status.log_persisted = true;
-        let replay = pty.replay_snapshot();
-        private_fs::write_private(&directory.join("replay.bin"), &replay.body)?;
+        // Rendered once here; attaches only cut it to their limit.
+        let (replay, offset) = pty.ended_replay();
+        private_fs::write_private(&directory.join("replay.bin"), &replay)?;
         private_fs::write_private(
             &directory.join("replay.json"),
-            &serde_json::to_vec(&replay)?,
+            &serde_json::to_vec(&serde_json::json!({ "offset": offset }))?,
         )?;
         private_fs::write_private(
             &directory.join("screen.json"),
@@ -49,11 +47,11 @@ impl Archive {
     }
 
     pub fn replay(&self, limit: Option<usize>) -> anyhow::Result<(Vec<u8>, u64)> {
-        let mut snapshot: ReplaySnapshot =
+        let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(self.directory.join("replay.json"))?)?;
-        snapshot.body = std::fs::read(self.directory.join("replay.bin"))?;
-        let offset = snapshot.offset;
-        Ok((snapshot.replay(limit), offset))
+        let offset = meta["offset"].as_u64().ok_or_else(|| anyhow::anyhow!("replay.json has no offset"))?;
+        let replay = std::fs::read(self.directory.join("replay.bin"))?;
+        Ok((replay::trim_replay(&replay, limit), offset))
     }
 
     pub fn screen(&self) -> anyhow::Result<ScreenSnapshot> {

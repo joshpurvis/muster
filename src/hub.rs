@@ -1451,21 +1451,17 @@ impl Hub {
         let stamp = std::fs::metadata(&path)
             .ok()
             .map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
+        // The whole replay is cached; a client with a limit gets its last lines.
         if let Some((len, mtime)) = stamp
-            && max_body.is_none()
             && let Some((l, m, b)) = self.replay_cache.lock().get(&id)
             && *l == len
             && *m == mtime
         {
-            return Ok(Attach::Replay(b.to_vec()));
+            return Ok(Attach::Replay(pty::trim_replay(b, max_body)));
         }
         let (cols, rows) = (info.cols, info.rows);
         let p2 = path.clone();
-        let data = tokio::task::spawn_blocking(move || pty::log_replay(&p2, cols, rows, max_body)).await?;
-        if max_body.is_some() {
-            // Only whole replays are cached.
-            return Ok(Attach::Replay(data));
-        }
+        let data = tokio::task::spawn_blocking(move || pty::log_replay(&p2, cols, rows)).await?;
         if let Some((len, mtime)) = stamp {
             let mut c = self.replay_cache.lock();
             if c.len() >= REPLAY_CACHE_MAX && !c.contains_key(&id) {
@@ -1475,7 +1471,7 @@ impl Hub {
             }
             c.insert(id, (len, mtime, Bytes::from(data.clone())));
         }
-        Ok(Attach::Replay(data))
+        Ok(Attach::Replay(pty::trim_replay(&data, max_body)))
     }
 
     /// Apply a state change with precedence rules:

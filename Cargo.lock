@@ -1978,6 +1978,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
+ "gtk",
  "jiff",
  "libc",
  "mime_guess",

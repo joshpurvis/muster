@@ -262,6 +262,29 @@ Setting either variable yourself always wins (`env WEBKIT_DISABLE_DMABUF_RENDERE
 forces the fast renderer on, `=1` off). `muster status` shows what the next window would use,
 and each window logs its choice and any fallback to the daemon log.
 
+### Native window watchdog (Linux)
+
+Every 2 seconds the native window runs a one-line script in its page. The answer comes back
+only when the page's main thread is free, so a page stuck in a script stops answering, while a
+hidden, minimised or backgrounded window, a page on the shut-down or reconnect screen, and a
+page that is loading do not count (and a suspended laptop's sleep isn't counted as silence).
+After 10 seconds without an answer the window writes a line to the daemon log (when it
+stopped, for how long, and the WebKit web process's pid) and asks in a small native dialog:
+**Reload window** or **Keep waiting**. Reload ends the stuck web process and loads the UI again
+with the same tabs; sessions keep running, as they live in the daemon. If the page answers
+again first, the dialog goes away and the log says how long it was stuck. Each freeze is
+offered once.
+
+When the window process exits (closed, or killed with SIGTERM, SIGHUP or SIGINT), it ends its
+web process too, which a page stuck in a script would otherwise keep running.
+
+To find out what froze a page, open the window with WebKit's inspector allowed (release builds
+have it off): `env MUSTER_WEB_INSPECTOR=1 muster`. Right-click the page (somewhere without its
+own menu, such as the sidebar) and choose Inspect Element, then leave the inspector open; a
+frozen page can't open it. When the page freezes, the pause button in its Sources tab stops the
+running script and shows where it was. Windows the daemon opens itself (`window.show`) use the
+daemon's environment.
+
 ### Downgrading
 
 Downgrading to a monolithic build (one without `muster-terminal-host`) is an offline step:

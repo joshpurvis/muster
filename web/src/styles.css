@@ -1073,15 +1073,9 @@ button.sl-item:hover {
   min-width: 0;
 }
 
-/* Crowded strips: drop the kind icon and idle close buttons so names stay readable. */
-.tabstrip.overflowing .tab > .icon {
-  display: none;
-}
-
-.tabstrip.overflowing .tab:not(.active):not(:hover) .tab-close {
-  display: none;
-}
-
+/* Overflow controls may take space, but must not shrink the tabs being measured.
+   Hiding their icons/buttons here made overflow alternate on every layout effect,
+   starving the event loop when a moved tab or resized window crossed that boundary. */
 .tab-more {
   display: flex;
   align-items: center;

@@ -141,27 +141,57 @@ fn hooks_review(s: &ScreenSnapshot) -> bool {
     s.contains("Hooks need review") && s.lines.iter().any(|l| tui::parse_option(l).is_some())
 }
 
-/// Approval dialog: (question row, options).
+/// Question row of an approval: a known opening whose text ends in `?`, on this row or on the
+/// next two (a narrow pane wraps the title).
+fn is_question_at(lines: &[String], i: usize) -> bool {
+    let t = lines[i].trim();
+    if !(t.starts_with("Would you like to")
+        || t.starts_with("Do you want to")
+        || t.starts_with("Allow "))
+    {
+        return false;
+    }
+    lines[i..(i + 3).min(lines.len())]
+        .iter()
+        .map(|l| l.trim())
+        .take_while(|t| !t.is_empty())
+        .any(|t| t.ends_with('?'))
+}
+
+/// Approval dialog: (question row, options). Found from the bottom, since the command shown
+/// between the question and the options can be any length: the footer, then the block of
+/// options right above it (wrapped labels included), then the question above that. This is
+/// the only signal that Codex is asking the human (see `PermissionRequest` in `on_hook`).
 fn approval_dialog(s: &ScreenSnapshot) -> Option<(usize, Vec<tui::MenuOption>)> {
     let lines = &s.lines;
-    let q = tui::rfind(lines, |l| {
-        let t = l.trim();
-        (t.starts_with("Would you like to")
-            || t.starts_with("Do you want to")
-            || t.starts_with("Allow "))
-            && t.ends_with('?')
+    let footer = tui::rfind(lines, |l| {
+        l.contains("Press enter to confirm") || l.contains("esc to cancel")
     })?;
-    let opts = tui::options_in(lines, q + 1, q + 16);
-    let has_footer = lines
-        .iter()
-        .skip(q + 1)
-        .take(18)
-        .any(|l| l.contains("Press enter to confirm") || l.contains("esc to cancel"));
-    if has_footer && opts.len() >= 2 && opts.iter().any(|o| tui::is_yes_label(&o.label)) {
-        Some((q, opts))
-    } else {
-        None
+    let mut opts = Vec::new();
+    let mut top = footer;
+    for i in (0..footer).rev() {
+        let blank = lines[i].trim().is_empty();
+        // Options sit right above the footer, under at most a wrapped label or two.
+        if (blank && !opts.is_empty()) || (opts.is_empty() && footer - i > 6) {
+            break;
+        }
+        if let Some(o) = tui::parse_option(&lines[i]) {
+            opts.push(o);
+            top = i;
+        }
     }
+    opts.reverse();
+    if opts.len() < 2 || !opts.iter().any(|o| tui::is_yes_label(&o.label)) {
+        return None;
+    }
+    if let Some(q) = (0..top).rev().find(|&i| is_question_at(lines, i)) {
+        return Some((q, opts));
+    }
+    // A command taller than the pane can push the question off the top; Codex's "No" option
+    // is specific enough to stand in for it.
+    opts.iter()
+        .any(|o| o.label.contains("tell Codex what to do differently"))
+        .then(|| (top, opts))
 }
 
 fn approval_detail(lines: &[String], q: usize) -> String {
@@ -179,6 +209,9 @@ fn approval_detail(lines: &[String], q: usize) -> String {
         .find_map(|l| l.strip_prefix("Reason: "))
     {
         return clip(r, 160);
+    }
+    if tui::parse_option(&lines[q]).is_some() {
+        return "Codex is asking for approval".to_string();
     }
     clip(lines[q].trim(), 160)
 }
@@ -274,10 +307,11 @@ impl Adapter for CodexAdapter {
                 state: Working,
                 detail: tool_detail(payload),
             }),
-            "PermissionRequest" => Some(StateUpdate {
-                state: NeedsApproval,
-                detail: tool_detail(payload).or(Some("Permission requested".into())),
-            }),
+            // Fires before `approvals_reviewer="auto_review"` decides, and the payload doesn't
+            // say whether the reviewer or the human will answer, so it can't mean NeedsApproval:
+            // a request the reviewer approves would flash the approval banner. The screen parser
+            // reports a real dialog the moment it renders (it overrides hook state at once).
+            "PermissionRequest" => None,
             "PostToolUse" => Some(StateUpdate::new(Working)),
             "PreCompact" => Some(StateUpdate::with(Working, "Compacting conversation")),
             "Stop" => Some(
@@ -456,6 +490,59 @@ mod tests {
         assert_eq!(CodexAdapter.composer_text(&s), None);
     }
 
+    fn row_of(s: &ScreenSnapshot, prefix: &str) -> usize {
+        s.lines.iter().position(|l| l.trim().starts_with(prefix)).unwrap()
+    }
+
+    #[test]
+    fn wrapped_question_and_long_command_approvals() {
+        // A narrow pane wraps the question title.
+        let mut s = fx!("codex_approval_exec");
+        let q = row_of(&s, "Would you like to");
+        s.lines[q] = "  Would you like to run the".into();
+        s.lines.insert(q + 1, "  following command?".into());
+        let u = detect(&s, AgentState::Working).unwrap();
+        assert_eq!(u.state, AgentState::NeedsApproval);
+        assert_eq!(CodexAdapter.approve_bytes(Decision::Approve, &s), Some(b"y".to_vec()));
+
+        // A long heredoc puts the options far below the question.
+        let mut s = fx!("codex_approval_exec");
+        let cmd = row_of(&s, "$ touch");
+        s.lines[cmd] = "  $ python3 - <<'PY'".into();
+        for i in 0..30 {
+            s.lines.insert(cmd + 1 + i, format!("  print({i})"));
+        }
+        let u = detect(&s, AgentState::Working).unwrap();
+        assert_eq!(u.state, AgentState::NeedsApproval);
+        assert_eq!(u.detail.as_deref(), Some("Run: python3 - <<'PY'"));
+        assert_eq!(CodexAdapter.approve_bytes(Decision::ApproveAlways, &s), Some(b"p".to_vec()));
+
+        // Taller than the pane: the question scrolled off the top.
+        let q = row_of(&s, "Would you like to");
+        s.lines.drain(..=cmd + 5);
+        assert!(!s.lines[..q.min(s.lines.len())].iter().any(|l| l.contains("Would you like")));
+        let u = detect(&s, AgentState::Working).unwrap();
+        assert_eq!(u.state, AgentState::NeedsApproval);
+        assert_eq!(u.detail.as_deref(), Some("Codex is asking for approval"));
+        assert_eq!(CodexAdapter.approve_bytes(Decision::Deny, &s), Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn options_far_above_the_footer_are_not_an_approval() {
+        // An old Yes/No list in the transcript, then an unrelated "esc to cancel" footer.
+        let mut s = fx!("codex_idle_done");
+        let row = composer_row(&s.lines).unwrap();
+        let old = ["  Would you like to run it?", "  1. Yes, proceed (y)", "  2. No (esc)"];
+        for (i, l) in old.iter().enumerate() {
+            s.lines.insert(row - 2 + i, l.to_string());
+        }
+        for i in 0..8 {
+            s.lines.push(format!("  line {i}"));
+        }
+        s.lines.push("  esc to cancel".into());
+        assert_eq!(approval_dialog(&s), None);
+    }
+
     #[test]
     fn no_prompt_no_bytes() {
         assert_eq!(
@@ -499,10 +586,8 @@ mod tests {
                 "Bash: touch zzz.txt"
             ))
         );
-        assert_eq!(
-            a.on_hook("PermissionRequest", &pre).unwrap().state,
-            AgentState::NeedsApproval
-        );
+        // The auto-reviewer may answer it; only the on-screen dialog means NeedsApproval.
+        assert_eq!(a.on_hook("PermissionRequest", &pre), None);
         assert_eq!(
             a.on_hook("Interrupt", &json!({})).unwrap().state,
             AgentState::Idle

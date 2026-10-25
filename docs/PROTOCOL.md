@@ -888,7 +888,9 @@ New and restarted Codex sessions also receive `-c approval_policy="on-request"` 
 `--approve-for-me`, while preserving the channel's sandbox and network settings. The shorthand
 itself conflicts with `--sandbox`, so Muster passes the equivalent settings separately.
 These are per-process overrides; the user's Codex config is not changed, and already-running
-sessions keep their current approval settings. See the
+sessions keep their current approval settings. Because Codex fires its `PermissionRequest` hook
+before the automatic reviewer decides, a Codex session reports `needs_approval` only when the
+approval dialog is on its screen, never from that hook. See the
 [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and
 [sandbox configuration](https://learn.chatgpt.com/docs/sandboxing).
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,

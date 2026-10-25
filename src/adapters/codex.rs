@@ -1,4 +1,4 @@
-//! Codex CLI adapter (verified against `codex` v0.155.1).
+//! Codex CLI adapter (launch flags verified against `codex` v0.164.0).
 //!
 //! Launch: `codex -c notify=[...] -c mcp_servers.muster.url=... -c
 //! mcp_servers.muster.bearer_token_env_var="MUSTER_TOKEN" [-c hooks.<Event>=[...]]...
@@ -6,6 +6,9 @@
 //! [-- <initial prompt>]`. The sandbox flags come from the channel's permission profile
 //! (`sandbox_args`). All settings are `-c` overrides for this process only;
 //! `~/.codex/config.toml` is never touched.
+//! - approvals: `approval_policy="on-request"` and `approvals_reviewer="auto_review"` give
+//!   new sessions the approval behavior of `--approve-for-me`. That shorthand conflicts with
+//!   `--sandbox`, so use its settings directly to preserve the channel's selected sandbox.
 //! - notify: Codex runs `<muster_bin> hook codex notify <json>` with the JSON payload as the last
 //!   argv item (`{"type":"agent-turn-complete","thread-id",...,"input-messages",
 //!   "last-assistant-message"}`). Codex also fires it for its internal title-generation
@@ -58,7 +61,7 @@ fn hooks_enabled() -> bool {
 
 /// Sandbox flags for the channel's profile: always an explicit `--sandbox`, plus the
 /// workspace-write network switch (set either way, so a `network_access = true` in the user's
-/// config.toml can't widen a no-network profile). Approval policy is left alone.
+/// config.toml can't widen a no-network profile). Approval review is set in `config_overrides`.
 pub fn sandbox_args(sandbox: CodexSandbox) -> Vec<String> {
     let (mode, network) = match sandbox {
         CodexSandbox::ReadOnly => ("read-only", None),
@@ -91,6 +94,10 @@ pub fn config_overrides(muster_bin: &str, daemon_url: &str, with_hooks: bool) ->
         "mcp_servers.muster.bearer_token_env_var=\"MUSTER_TOKEN\"".to_string(),
         // Codex's default tool timeout (~60s) would cut off wait_for_state (max 1800s).
         "mcp_servers.muster.tool_timeout_sec=1900".to_string(),
+        // `--approve-for-me` conflicts with our explicit --sandbox. Set its approval behavior
+        // separately so read-only, workspace/network and full-access profiles keep their bounds.
+        "approval_policy=\"on-request\"".to_string(),
+        "approvals_reviewer=\"auto_review\"".to_string(),
     ];
     if with_hooks {
         let bin = sh_quote(muster_bin);
@@ -561,16 +568,19 @@ mod tests {
             let spec = CodexAdapter.command(&ctx(sb, Some("hi"))).unwrap();
             assert_eq!(spec.program, "codex");
             let a = &spec.args;
-            // Profile flags come before the user's extra args and the prompt, and nothing
-            // muster adds touches the approval policy or bypasses the sandbox wholesale.
+            // Every profile gets automatic review while keeping its explicit sandbox; never
+            // combine --sandbox with the conflicting --approve-for-me shorthand.
             let i = a.iter().position(|x| x == "--sandbox").unwrap();
             let e = a.iter().position(|x| x == "--model").unwrap();
             assert!(i < e);
             assert_eq!(&a[a.len() - 2..], &["--", "hi"]);
+            for setting in ["approval_policy=\"on-request\"", "approvals_reviewer=\"auto_review\""] {
+                assert_eq!(a.windows(2).filter(|w| w[0] == "-c" && w[1] == setting).count(), 1);
+            }
             assert!(!a.iter().any(|x| x.starts_with("--ask-for-approval")
                 || x == "-a"
                 || x.starts_with("--dangerously")
-                || x.contains("approval_policy")));
+                || x == "--approve-for-me"));
         }
         let spec = CodexAdapter
             .command(&ctx(CodexSandbox::WorkspaceWriteNetwork, None))
@@ -601,6 +611,9 @@ mod tests {
         assert!(o.iter().any(|x| x
             == r#"hooks.Stop=[{hooks=[{type="command",command="'/opt/my apps/muster' hook codex Stop",timeout=10}]}]"#));
         assert_eq!(o[3], "mcp_servers.muster.tool_timeout_sec=1900");
-        assert_eq!(config_overrides("/m", "http://x", false).len(), 4);
+        let without_hooks = config_overrides("/m", "http://x", false);
+        assert_eq!(without_hooks.len(), 6);
+        assert_eq!(without_hooks[4], "approval_policy=\"on-request\"");
+        assert_eq!(without_hooks[5], "approvals_reviewer=\"auto_review\"");
     }
 }

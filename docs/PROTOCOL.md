@@ -882,7 +882,15 @@ restart), for every agent in the channel, including agents spawned through MCP:
 Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
 `network_access` in the user's own config) decides how a Codex session starts. Claude's
 `default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
-there; the other Claude profiles pass `--permission-mode`. Approval policies are not touched.
+there; the other Claude profiles pass `--permission-mode`.
+New and restarted Codex sessions also receive `-c approval_policy="on-request"` and
+`-c approvals_reviewer="auto_review"`: the automatic approval-review behavior of
+`--approve-for-me`, while preserving the channel's sandbox and network settings. The shorthand
+itself conflicts with `--sandbox`, so Muster passes the equivalent settings separately.
+These are per-process overrides; the user's Codex config is not changed, and already-running
+sessions keep their current approval settings. See the
+[Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and
+[sandbox configuration](https://learn.chatgpt.com/docs/sandboxing).
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
 MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
 later flag win they are checked against an **allowlist** (also again on every restart):
@@ -907,7 +915,7 @@ the discovery file with the client token, so with network access (`workspace_wri
 and in any unsandboxed mode (`full_access`, `bypass`, or commands the human approves), an agent
 can call this API as the user, e.g. `channel.set_permissions` on its own channel. Pick those
 modes only for work you would let run with your own access. Sources: `codex
---help` (0.155.1), the Codex config reference and "agent approvals & security" docs
+--help` (0.164.0), the Codex config reference and "agent approvals & security" docs
 (`sandbox_workspace_write.network_access`, off by default), `claude --help` (2.1.280) and
 code.claude.com/docs/en/permissions (`default` is labelled "Manual", `manual` is an alias).
 

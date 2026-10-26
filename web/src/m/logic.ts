@@ -39,6 +39,43 @@ export function scrollPosition(position: number, base: number, height: number, o
   return { row, pan, remainder: y - row * height - pan };
 }
 
+/** A full-screen program keeps its own history (Claude Code's fullscreen view): the alternate
+ * screen has no scrollback, so the phone can only show it by asking the program to scroll, with
+ * the mouse wheel, as a desktop terminal does. xterm.js sends no wheel reports in X10 mode. */
+export function programScrolls(buffer: "normal" | "alternate", mouseTrackingMode: string): boolean {
+  return buffer === "alternate" && mouseTrackingMode !== "none" && mouseTrackingMode !== "x10";
+}
+
+/** A vertical drag over a full-screen program: pan the phone's view of the screen first, then
+ * the part the pan can't take scrolls the program (negative = toward older output). */
+export function splitPan(delta: number, pan: number, overflow: number) {
+  const next = Math.max(0, Math.min(overflow, pan + delta));
+  return { pan: next, rest: delta - (next - pan) };
+}
+
+/** Turn drag pixels into whole wheel notches, one per text row, carrying the rest. */
+export function wheelSteps(px: number, remainder: number, step: number) {
+  const total = remainder + px;
+  const count = Math.trunc(total / Math.max(1, step));
+  return { count, remainder: total - count * Math.max(1, step) };
+}
+
+/** One mouse-wheel report as xterm.js sends it to a program tracking the mouse, at 1-based
+ * cell `col`, `row` in the program's active encoding (`DEFAULT`, `SGR` or `SGR_PIXELS`). */
+export function wheelReport(up: boolean, col: number, row: number, encoding: string, cell: Cell): string {
+  const button = up ? 64 : 65;
+  if (encoding === "DEFAULT") {
+    const byte = (n: number) => String.fromCharCode(32 + Math.min(223, n));
+    return `\x1b[M${byte(button)}${byte(col)}${byte(row)}`;
+  }
+  if (encoding === "SGR_PIXELS") {
+    const x = Math.floor((col - 0.5) * cell.width);
+    const y = Math.floor((row - 0.5) * cell.height);
+    return `\x1b[<${button};${x};${y}M`;
+  }
+  return `\x1b[<${button};${col};${row}M`;
+}
+
 export interface BufferLine {
   isWrapped: boolean;
   translateToString(trimRight?: boolean): string;

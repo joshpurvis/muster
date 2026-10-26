@@ -1,4 +1,15 @@
-import { bufferText, normalizeCode, phoneGrid, relativeTime, scrollPosition, sessionOrder } from "./logic.ts";
+import {
+  bufferText,
+  normalizeCode,
+  phoneGrid,
+  programScrolls,
+  relativeTime,
+  scrollPosition,
+  sessionOrder,
+  splitPan,
+  wheelReport,
+  wheelSteps,
+} from "./logic.ts";
 import type { SessionInfo } from "../types.ts";
 
 function equal(actual: unknown, expected: unknown) {
@@ -62,4 +73,46 @@ Deno.test("relative times tolerate future timestamps and use daemon milliseconds
   equal(relativeTime(2000, 1000), "just now");
   equal(relativeTime(0, 120000), "2m");
   equal(relativeTime(0, 7200000), "2h");
+});
+
+// Claude Code's fullscreen view draws on the alternate screen, which has no scrollback: the phone
+// could only ever show one screen of it. It scrolls by asking the program, as a mouse wheel does.
+Deno.test("only a full-screen program that tracks the mouse scrolls its own history", () => {
+  equal(programScrolls("alternate", "any"), true);
+  equal(programScrolls("alternate", "vt200"), true);
+  equal(programScrolls("alternate", "drag"), true);
+  equal(programScrolls("alternate", "none"), false);
+  equal(programScrolls("alternate", "x10"), false);
+  equal(programScrolls("normal", "any"), false);
+});
+
+Deno.test("a drag pans the phone's view of the screen first, the rest scrolls the program", () => {
+  equal(splitPan(-50, 30, 100), { pan: 0, rest: -20 });
+  equal(splitPan(-50, 0, 0), { pan: 0, rest: -50 });
+  equal(splitPan(40, 80, 100), { pan: 100, rest: 20 });
+  equal(splitPan(10, 20, 100), { pan: 30, rest: 0 });
+});
+
+Deno.test("drag pixels become one wheel notch per row, carrying the rest either way", () => {
+  equal(wheelSteps(-35, 0, 16), { count: -2, remainder: -3 });
+  equal(wheelSteps(-13, -3, 16), { count: -1, remainder: 0 });
+  equal(wheelSteps(10, 0, 16), { count: 0, remainder: 10 });
+  equal(wheelSteps(7, 10, 16), { count: 1, remainder: 1 });
+  // Many small moves (a slow drag) add up to the same notches as one long one.
+  let count = 0, remainder = 0;
+  for (let i = 0; i < 100; i++) {
+    const step = wheelSteps(-3.2, remainder, 16);
+    count += step.count;
+    remainder = step.remainder;
+  }
+  equal(count, -20);
+});
+
+Deno.test("wheel reports match what xterm.js sends in each mouse encoding", () => {
+  const cell = { width: 8, height: 16 };
+  equal(wheelReport(true, 10, 5, "SGR", cell), "\x1b[<64;10;5M");
+  equal(wheelReport(false, 10, 5, "SGR", cell), "\x1b[<65;10;5M");
+  equal(wheelReport(true, 1, 2, "DEFAULT", cell), '\x1b[M`!"');
+  equal(wheelReport(false, 300, 2, "DEFAULT", cell), '\x1b[Ma\xff"');
+  equal(wheelReport(true, 2, 3, "SGR_PIXELS", cell), "\x1b[<64;12;40M");
 });

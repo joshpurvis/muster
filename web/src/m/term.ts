@@ -4,7 +4,17 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
 import type { SessionInfo } from "../types.ts";
-import { bufferText, type Cell, FONT_FAMILY, phoneGrid, scrollPosition } from "./logic.ts";
+import {
+  bufferText,
+  type Cell,
+  FONT_FAMILY,
+  phoneGrid,
+  programScrolls,
+  scrollPosition,
+  splitPan,
+  wheelReport,
+  wheelSteps,
+} from "./logic.ts";
 
 export function cellSize(fontSize: number, term?: Terminal): Cell {
   const cell = (term as any)?._core?._renderService?.dimensions?.css?.cell;
@@ -56,6 +66,10 @@ export class PhoneTerminal {
   private disposed = false;
   private selecting = false;
   private pinned = true;
+  /** Wheel notches this view sent up into a full-screen program, net of the ones sent down. */
+  private programBack = 0;
+  private wheelRemainder = 0;
+  private replaying = false;
   private observer: ResizeObserver;
   private media = matchMedia("(prefers-color-scheme: light)");
   private events = new AbortController();
@@ -70,6 +84,8 @@ export class PhoneTerminal {
     private closedHeight: () => number,
     private onBottom: (bottom: boolean) => void,
     private onFont: (size: number) => void,
+    /** Sends input bytes to the session; false when this device may not. */
+    private scrollProgram: (data: string) => boolean,
   ) {
     this.term = new Terminal({
       cols: info.cols,
@@ -102,7 +118,7 @@ export class PhoneTerminal {
     this.observer = new ResizeObserver(() => {
       if (this.selecting) return;
       if (this.pinned) {
-        this.bottom();
+        this.end();
         return;
       }
       this.panY = Math.min(this.panY, this.maxPan());
@@ -122,7 +138,41 @@ export class PhoneTerminal {
   }
   private atBottom() {
     const b = this.term.buffer.active;
-    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1;
+    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1 && this.programBack === 0;
+  }
+  private programScrolls() {
+    return programScrolls(this.term.buffer.active.type, this.term.modes.mouseTrackingMode);
+  }
+  /** Scroll by `delta` px (negative = older). The normal screen scrolls its own scrollback; a
+   * full-screen program that tracks the mouse (Claude Code) has none, so past the edge of the
+   * screen the drag becomes mouse-wheel reports at `at`, and the program scrolls its history. */
+  private scrollBy(delta: number, at: { x: number; y: number }) {
+    if (!this.programScrolls()) {
+      this.scrollTo(this.position() + delta);
+      return;
+    }
+    const split = splitPan(delta, this.panY, this.maxPan());
+    this.panY = split.pan;
+    this.scrollRemainder = 0;
+    const steps = wheelSteps(split.rest, this.wheelRemainder, this.cell().height);
+    this.wheelRemainder = steps.remainder;
+    if (steps.count) this.wheel(steps.count, at);
+    this.render();
+  }
+  /** Send |count| wheel notches, up when negative, at the cell under client point `at`. */
+  private wheel(count: number, at: { x: number; y: number }) {
+    const cell = this.cell();
+    const rect = this.surface.getBoundingClientRect();
+    const clamp = (n: number, max: number) => Math.max(1, Math.min(max, n));
+    const col = clamp(Math.floor((at.x - rect.left + this.panX) / cell.width) + 1, this.term.cols);
+    const row = clamp(Math.floor((at.y - rect.top + this.panY) / cell.height) + 1, this.term.rows);
+    const encoding = (this.term as any)._core?.coreMouseService?.activeEncoding ?? "SGR";
+    const report = wheelReport(count < 0, col, row, encoding, cell);
+    if (this.scrollProgram(report.repeat(Math.abs(count)))) {
+      this.programBack = Math.max(0, this.programBack - count);
+    } else {
+      this.wheelRemainder = 0;
+    }
   }
   private position() {
     return this.term.buffer.active.viewportY * this.cell().height + this.panY + this.scrollRemainder;
@@ -142,10 +192,21 @@ export class PhoneTerminal {
     this.panX = Math.max(0, Math.min(this.panX, this.term.cols * cell.width - this.surface.clientWidth));
     this.host.style.width = `${Math.ceil(this.term.cols * cell.width)}px`;
     this.host.style.transform = `translate(${-this.panX}px, ${-this.panY}px)`;
+    if (!this.replaying && !this.programScrolls()) this.programBack = this.wheelRemainder = 0;
     this.pinned = this.atBottom();
     this.onBottom(this.pinned);
   }
+  /** "Latest output": also scrolls a full-screen program back down as far as this view took it
+   * up (more notches than needed are harmless; the program stops at its newest line). */
   bottom() {
+    if (this.programBack && this.programScrolls()) {
+      const rect = this.surface.getBoundingClientRect();
+      this.wheel(this.programBack, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+    }
+    this.programBack = this.wheelRemainder = 0;
+    this.end();
+  }
+  private end() {
     this.scrollTo(Infinity);
   }
   grid() {
@@ -155,14 +216,14 @@ export class PhoneTerminal {
     if (info.cols === this.term.cols && info.rows === this.term.rows) return;
     const pinned = this.atBottom();
     this.term.resize(info.cols, info.rows);
-    if (pinned) this.bottom();
+    if (pinned) this.end();
     else this.render();
   }
   fontSize(size: number) {
     if (size === this.term.options.fontSize) return;
     const pinned = this.atBottom();
     this.term.options.fontSize = size;
-    if (pinned) this.bottom();
+    if (pinned) this.end();
     else this.render();
   }
   select(active: boolean) {
@@ -186,9 +247,12 @@ export class PhoneTerminal {
       cancelAnimationFrame(this.raf);
       this.raf = 0;
       this.queue = [];
+      // A program scrolled up stays scrolled across a reattach: keep the count of notches.
+      this.replaying = true;
       this.term.write("\x1bc");
       this.term.write(payload.slice(), () => {
-        if (!this.disposed) this.bottom();
+        this.replaying = false;
+        if (!this.disposed) this.end();
       });
     } else if (type === FRAME_OUTPUT) {
       this.queue.push(payload.slice());
@@ -248,7 +312,7 @@ export class PhoneTerminal {
           this.panX += dx;
           this.render();
         } else if (axis === "y") {
-          this.scrollTo(this.position() + dy);
+          this.scrollBy(dy, point);
           velocity = dy / Math.max(8, e.timeStamp - time);
         }
       }
@@ -268,7 +332,7 @@ export class PhoneTerminal {
       const step = (now: number) => {
         const dt = Math.min(32, now - previous);
         previous = now;
-        this.scrollTo(this.position() + velocity * dt);
+        this.scrollBy(velocity * dt, last);
         velocity *= Math.pow(0.94, dt / 16);
         if (Math.abs(velocity) > 0.02) this.momentum = requestAnimationFrame(step);
       };
@@ -278,7 +342,7 @@ export class PhoneTerminal {
     this.surface.addEventListener("pointercancel", end, options);
     this.surface.addEventListener("wheel", (e) => {
       e.preventDefault();
-      this.scrollTo(this.position() + e.deltaY);
+      this.scrollBy(e.deltaY, { x: e.clientX, y: e.clientY });
     }, { ...options, passive: false });
   }
   dispose() {

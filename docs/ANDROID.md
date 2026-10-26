@@ -212,6 +212,20 @@ maths do not double-offset):
    "queued (n)" from `SendOutcome` (src/inject.rs:39-45). Long-press Send offers "Interrupt
    and send". A settings sheet holds `termSize` and notification opt-in.
 
+   **Scrolling back** (web/src/m/term.ts `scrollBy`): on the normal screen a drag scrolls the
+   phone's own xterm scrollback (10000 lines, filled by the replay and live output); while
+   scrolled up, new output does not move the view. A full-screen program on the alternate
+   screen has no scrollback there: Claude Code's fullscreen view (`"tui": "fullscreen"`) keeps
+   its conversation itself, so the phone showed only its one screen. When the alternate screen
+   is active and the program tracks the mouse (any mode but X10), a vertical drag first pans the
+   phone's view of the screen and the rest becomes mouse-wheel reports (one notch per text row,
+   in the program's mouse encoding, at the cell under the finger), sent as `0x02` input frames
+   like a desktop terminal's wheel. The program scrolls its own history (Claude Code keeps its
+   place while new output arrives and shows "N new messages"). This needs the `interact` scope
+   (a view-only phone gets a one-time notice) and is not resized to the phone in `follow`.
+   The scroll is the program's, so a desktop window showing the same session scrolls with it.
+   "Latest output" sends back the wheel-down notches the phone sent up, then pans to the bottom.
+
 ## Terminal width
 
 The daemon's resize is "last resizer wins" (src/rpc.rs:197-207 → src/pty.rs:460), and the

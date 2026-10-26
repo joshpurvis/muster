@@ -202,6 +202,24 @@ export function closeSession() {
   }
 }
 
+let viewOnlyScrollNoted = false;
+/** Wheel reports that scroll a full-screen program (Claude Code) back through its own history,
+ * sent like a desktop terminal's mouse wheel: raw input, without the resize `act` does in
+ * `follow`. False when this device can't send input (view access only, or disconnected). */
+export function scrollProgram(sid: number, data: string): boolean {
+  if (!canInteract.peek()) {
+    if (ready.peek() && !viewOnlyScrollNoted) {
+      viewOnlyScrollNoted = true;
+      notify("This device has view access only, so it can't scroll back in a full-screen agent");
+    }
+    return false;
+  }
+  const s = sessions.peek().get(sid);
+  if (!s || s.state === "exited") return false;
+  rpc.sendInput(sid, data);
+  return rpc.isOpen;
+}
+
 /** Resize only on an explicit action; approval uses the version rendered by its caller. */
 export async function act<T = unknown>(s: SessionInfo, method: string, params: object = {}, grid?: Grid) {
   if (!canInteract.peek()) {

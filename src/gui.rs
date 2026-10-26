@@ -324,7 +324,12 @@ fn spawn_detached(mut cmd: Command, stderr: Option<Stdio>) -> anyhow::Result<()>
             Ok(())
         });
     }
-    cmd.spawn().context("launching the UI")?;
+    let mut child = cmd.spawn().context("launching the UI")?;
+    // setsid detaches the session, not the parent: without a wait, every child that exits
+    // (each xdg-open, a closed window) stays a zombie until this process does.
+    let _ = std::thread::Builder::new().name("reap-child".into()).spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 

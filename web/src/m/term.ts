@@ -5,6 +5,7 @@ import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
 import type { SessionInfo } from "../types.ts";
 import {
+  type AttachInfo,
   bufferText,
   type Cell,
   FONT_FAMILY,
@@ -16,9 +17,11 @@ import {
   programScrollFor,
   programScrolls,
   repeatBytes,
+  ReplayCursor,
   returnNotches,
   scrollPosition,
   sessionBusy,
+  type Since,
   splitPan,
   wheelReport,
   wheelSteps,
@@ -67,6 +70,7 @@ function theme() {
 export class PhoneTerminal {
   readonly term: Terminal;
   private queue: Uint8Array[] = [];
+  private cursor = new ReplayCursor();
   private raf = 0;
   private momentum = 0;
   private panX = 0;
@@ -274,8 +278,27 @@ export class PhoneTerminal {
       cell: this.cell(),
     };
   }
+  /** `attach_info` for this session: says what the next replay frame is. */
+  attachInfo(info: AttachInfo) {
+    this.cursor.info(info);
+  }
+  /** The connection ended (see `ReplayCursor.disconnected`). */
+  disconnected() {
+    this.cursor.disconnected();
+  }
+  /** Where this terminal stands, for reattaching with only the bytes it missed. */
+  since(): Since | null {
+    return this.cursor.since();
+  }
   receive(type: number, payload: Uint8Array) {
-    if (type === FRAME_REPLAY) {
+    // Live output, or a delta replay: the live output this terminal missed while detached,
+    // appended so the terminal (and a normal screen's scrollback) stays as it was.
+    const append = type === FRAME_OUTPUT || (type === FRAME_REPLAY && this.cursor.replay());
+    if (type === FRAME_OUTPUT) this.cursor.output(payload.length);
+    if (append) {
+      this.queue.push(payload.slice());
+      if (!this.raf) this.raf = requestAnimationFrame(() => this.flush());
+    } else if (type === FRAME_REPLAY) {
       cancelAnimationFrame(this.raf);
       this.raf = 0;
       this.queue = [];
@@ -286,9 +309,6 @@ export class PhoneTerminal {
         this.replaying = false;
         if (!this.disposed) this.end();
       });
-    } else if (type === FRAME_OUTPUT) {
-      this.queue.push(payload.slice());
-      if (!this.raf) this.raf = requestAnimationFrame(() => this.flush());
     }
   }
   private flush() {

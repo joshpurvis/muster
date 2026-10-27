@@ -24,8 +24,11 @@ impl std::error::Error for SpawnUncertain {}
 
 #[derive(Clone, Debug)]
 pub enum Output {
+    /// Live bytes, in order and without gaps since the last replay.
     Bytes(Bytes),
-    Replay(Bytes),
+    /// A fresh replay after the host stream was reset (the renderer starts over), and the
+    /// raw output offset it ends at: the next live bytes start there.
+    Replay(Bytes, u64),
 }
 
 #[derive(Debug)]
@@ -546,6 +549,11 @@ impl Terminal {
             _ => None,
         }
     }
+    /// The host's own answer whether the run is still running (not the cached status). False
+    /// when the host can't be asked.
+    pub fn alive_now(&self) -> bool {
+        matches!(self.client.call(Command::Status { run: self.run() }), Ok(Response::Status(status)) if status.alive)
+    }
     pub fn has_processes(&self) -> bool {
         match self.client.call(Command::Status { run: self.run() }) {
             Ok(Response::Status(status)) => status.has_processes,
@@ -568,12 +576,15 @@ impl Terminal {
         Ok(())
     }
 
-    pub fn attach(&self, max_body: Option<usize>) -> anyhow::Result<(Vec<u8>, broadcast::Receiver<Output>)> {
+    /// The replay, the raw output offset it ends at (the host's count of bytes the run has
+    /// written: the live bytes that follow start there), and the live output.
+    pub fn attach(&self, max_body: Option<usize>) -> anyhow::Result<(Vec<u8>, u64, broadcast::Receiver<Output>)> {
         let mut stream = self.client.subscribe(Command::Attach { run: self.run(), replay_bytes: max_body })?;
         let (replay, mut offset) = match wire::read(&mut stream)? {
             Frame::Replay { next_offset, data } => (data, next_offset),
             _ => anyhow::bail!("terminal host omitted initial replay"),
         };
+        let start = offset;
         let (tx, rx) = broadcast::channel(1024);
         let client = self.client.clone();
         let run = self.run();
@@ -586,7 +597,7 @@ impl Terminal {
                     }
                     Ok(Frame::Replay { next_offset, data }) => {
                         offset = next_offset;
-                        Output::Replay(Bytes::from(data))
+                        Output::Replay(Bytes::from(data), next_offset)
                     }
                     Ok(Frame::Ping) => continue,
                     _ => {
@@ -602,7 +613,7 @@ impl Terminal {
                                 if let Ok(Frame::Replay { next_offset, data }) = wire::read(&mut next) {
                                     stream = next;
                                     offset = next_offset;
-                                    break Output::Replay(Bytes::from(data));
+                                    break Output::Replay(Bytes::from(data), next_offset);
                                 }
                             }
                             delay = (delay * 2).min(Duration::from_secs(2));
@@ -612,7 +623,7 @@ impl Terminal {
                 if tx.send(output).is_err() { break }
             }
         })?;
-        Ok((replay, rx))
+        Ok((replay, start, rx))
     }
 }
 
@@ -1152,11 +1163,14 @@ mod tests {
                 pid: Some(1), alive: true, drained: false, has_processes: true, exit_code: None,
                 title: None, cols: 80, rows: 24, output_seq: 0, last_output_at: 0,
                 application_cursor: false, log_persisted: true, cwd: directory.clone() });
-            let (replay, mut rx) = terminal.attach(None).unwrap();
-            assert_eq!(replay, b"A");
+            let (replay, start, mut rx) = terminal.attach(None).unwrap();
+            assert_eq!((&replay[..], start), (&b"A"[..], 1));
             for (reset, expected) in [(false, "B"), (true, "AB"), (false, "C")] {
                 let output = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
-                let (actual_reset, bytes) = match output { Output::Bytes(bytes) => (false, bytes), Output::Replay(bytes) => (true, bytes) };
+                let (actual_reset, bytes) = match output {
+                    Output::Bytes(bytes) => (false, bytes),
+                    Output::Replay(bytes, next) => { assert_eq!(next, 2, "a reset replay says where it ends"); (true, bytes) }
+                };
                 assert_eq!(actual_reset, reset);
                 assert_eq!(&bytes[..], expected.as_bytes());
             }

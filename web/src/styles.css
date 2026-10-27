@@ -3333,6 +3333,10 @@ textarea {
   color: var(--cold);
 }
 
+.ap-chip-warn {
+  color: var(--st-error);
+}
+
 .ap-msg-refused {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -3790,6 +3794,12 @@ textarea {
 
 .msg-refused .icon {
   margin-top: 2px;
+}
+
+.msg-late-status {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
 }
 
 .msg-pre {

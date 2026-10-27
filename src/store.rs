@@ -426,6 +426,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind IN ('scheduled', 'catch_up');
     ALTER TABLE notes ADD COLUMN triggers INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v22, v23: reserved for two unmerged branches (their migrations replace these when they
+    // merge; this branch's own is v24).
+    "-- v22 reserved",
+    "-- v23 reserved",
+    // v24: late replies (src/agent_reply.rs). `delivered_at`: when Muster typed the message into
+    // the agent (an agent may reply only to a message it received). `answer`: the agent's later
+    // reply as JSON (`agent_reply::Answer`: text, time, route, how it reached the asker), stored
+    // before it is delivered so a backend restart can't lose it.
+    r#"
+    ALTER TABLE agent_messages ADD COLUMN delivered_at INTEGER;
+    ALTER TABLE agent_messages ADD COLUMN answer TEXT;
+    CREATE INDEX agent_messages_answered ON agent_messages(id) WHERE answer IS NOT NULL;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -476,7 +489,8 @@ fn enum_to_str<T: serde::Serialize>(v: &T) -> String {
 
 /// `row_agent_message`'s columns (the recipient's name, while the agent exists).
 const AGENT_MESSAGE_SELECT: &str = "SELECT m.id, m.from_label, m.from_session, m.to_agent, m.to_session, m.origin,
-    m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name, m.cold_idle_ms
+    m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name, m.cold_idle_ms,
+    m.answer
     FROM agent_messages m LEFT JOIN agents a ON a.id = m.to_agent";
 
 fn perms_json(p: &Permissions) -> String {
@@ -1034,6 +1048,8 @@ impl Store {
             refused: r.get(12)?,
             to_name: r.get(13)?,
             cold_idle_ms: r.get(14)?,
+            // Unreadable JSON reads as no answer rather than failing the whole log.
+            answer: r.get::<_, Option<String>>(15)?.and_then(|s| serde_json::from_str(&s).ok()),
         })
     }
 
@@ -1215,6 +1231,84 @@ impl Store {
             params![id, reply, at],
         )?;
         Ok(())
+    }
+
+    /// Message `id` was typed into its agent at `at` (the first time counts).
+    pub fn set_agent_message_delivered(&self, id: i64, at: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE agent_messages SET delivered_at = ?2 WHERE id = ?1 AND delivered_at IS NULL",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn agent_message_delivered_at(&self, id: i64) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.lock()
+            .query_row("SELECT delivered_at FROM agent_messages WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Keep the late reply to message `id` (src/agent_reply.rs), once: false when it has one
+    /// already, was refused, or is gone.
+    pub fn set_agent_answer(&self, id: i64, answer: &crate::agent_reply::Answer) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE agent_messages SET answer = ?2 WHERE id = ?1 AND answer IS NULL AND refused IS NULL",
+            params![id, serde_json::to_string(answer)?],
+        )? == 1)
+    }
+
+    /// Change message `id`'s late reply with `edit`, only while its status is one of `from`
+    /// (read and written in one transaction, so two callers can't both take it). Returns it
+    /// before and after the change; None when it has no reply or its status is another.
+    pub fn update_agent_answer(
+        &self,
+        id: i64,
+        from: &[crate::agent_reply::AnswerStatus],
+        edit: impl FnOnce(&mut crate::agent_reply::Answer),
+    ) -> anyhow::Result<Option<(crate::agent_reply::Answer, crate::agent_reply::Answer)>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx
+            .query_row("SELECT answer FROM agent_messages WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let Some(before) = raw.and_then(|s| serde_json::from_str::<crate::agent_reply::Answer>(&s).ok()) else {
+            return Ok(None);
+        };
+        if !from.contains(&before.status) {
+            return Ok(None);
+        }
+        let mut after = before.clone();
+        edit(&mut after);
+        if after != before {
+            tx.execute("UPDATE agent_messages SET answer = ?2 WHERE id = ?1", params![id, serde_json::to_string(&after)?])?;
+            tx.commit()?;
+        }
+        Ok(Some((before, after)))
+    }
+
+    /// Messages whose late reply hasn't reached its asker yet (a restart came between storing it
+    /// and delivering it), oldest first.
+    pub fn unfinished_agent_answers(&self) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT id FROM agent_messages WHERE answer IS NOT NULL
+             AND json_extract(answer, '$.status') IN ('pending', 'delivering') ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The message that carried a late reply to an agent: to `to_agent`, answering `reply_to`,
+    /// from `from`, at or after `since`, with exactly `text`.
+    pub fn find_answer_delivery(&self, to_agent: i64, reply_to: i64, from: &str, since: i64, text: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.lock().query_row(
+            "SELECT id FROM agent_messages WHERE to_agent = ?1 AND reply_to = ?2 AND from_label = ?3
+             AND created_at >= ?4 AND text = ?5 AND refused IS NULL ORDER BY id DESC LIMIT 1",
+            params![to_agent, reply_to, from, since, text],
+            |r| r.get(0),
+        ).optional()?)
     }
 
     /// Messages delivered to agent `agent_id` at or after `since` (unix ms): the daily cap.
@@ -2456,6 +2550,7 @@ mod tests {
             refused: None,
             to_name: None,
             cold_idle_ms: None,
+            answer: None,
         };
         let id = s.insert_agent_message(&m).unwrap();
         s.insert_agent_message(&AgentMessage { created_at: 10, ..m.clone() }).unwrap();
@@ -2563,6 +2658,7 @@ mod tests {
             refused: None,
             to_name: None,
             cold_idle_ms: None,
+            answer: None,
         };
         let delivered = s.insert_agent_message(&m).unwrap();
         for at in [100, 200, 300, 400, 500] {
@@ -2594,6 +2690,7 @@ mod tests {
             refused: None,
             to_name: None,
             cold_idle_ms: None,
+            answer: None,
         };
         let ok = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {

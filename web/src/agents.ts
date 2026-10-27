@@ -6,6 +6,7 @@ import type {
   Agent,
   AgentMessage,
   AgentState,
+  LateAnswer,
   ModelCatalog,
   OpenRouterModel,
   Origin,
@@ -311,4 +312,22 @@ export function listedModels(
 /** Codex on OpenRouter has no usable default (its own model names lack the vendor prefix). */
 export function needsModel(provider: Provider, kind: Agent["kind"], model: string): boolean {
   return provider === "openrouter" && kind === "codex" && !model.trim();
+}
+
+/** How an agent's late reply (`reply`) reached whoever asked, in a sentence. */
+export function lateText(a: LateAnswer): string {
+  switch (a.status) {
+    case "pending":
+    case "delivering":
+      return "Sending it to whoever asked…";
+    case "returned":
+      return "The ask that was still waiting got it as its reply.";
+    case "delivered":
+      return a.note ? `Delivered: ${a.note}.` : "Delivered to whoever asked.";
+    case "shown":
+      return "Shown here: the human (or a schedule) asked.";
+    case "refused":
+    case "undelivered":
+      return `Kept here, not delivered${a.note ? `: ${a.note.replace(/^not delivered:? ?/, "")}` : ""}.`;
+  }
 }

@@ -159,6 +159,7 @@ panel".
 | Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
 | Asking | MCP `ask_agent` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
 | Messages | Each delivery gets an `agent_messages` row (from, to, origin, hop, reply_to, text, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. A message the agent's policy refuses is kept too, with the reason (never delivered, not counted toward the cap). |
+| Late replies | MCP `reply {msg_id, text}` / `muster reply` in the agent's session: the agent a message was typed into answers it after that turn (a long job), once. Stored on the message's row first (`answer`, store migration v24), then: a waiting ask returns it; an asking agent gets it as a new message (`reply_to` = the message, every delivery guard); another Claude or Codex session gets it typed in (`[muster reply to msg <id> …]`, the Claude origin rule); the human or a schedule sees it in the agents panel's log. Route: the stricter of the message's chain and the replier's, one hop on. `src/agent_reply.rs`, docs/MCP.md "Late replies". |
 | Editing | `agent.update` / `muster agent edit` / the panel's Edit dialog: persona (rewrites the persona file), provider, model, effort, accepted origins, autostart, permissions (also set on its tab). Provider, model, effort and permissions apply from the next start. |
 | Provider | `subscription` (the CLI's own login) or `openrouter`: pay per token with the owner's `OPENROUTER_API_KEY` from the backend's environment, held in memory only and passed only into that agent's sessions (§3: it is the owner's key, not a CLI credential; still never stored, logged or sent to clients). `src/openrouter.rs`, docs/PROTOCOL.md "OpenRouter". |
 
@@ -229,4 +230,3 @@ triggers) and Phase 3 (agents proposing schedules) are not built.
   its policy exist; nothing fires it yet. Webhook triggers are never exposed to anyone but the
   user. (Schedules are built: above.)
 - Codex resume (`codex resume <id>`; the thread id is already captured).
-- An async `reply(msg_id)` tool, so an agent can answer later instead of in the same turn.

@@ -20,6 +20,7 @@
 //! Messages to agents also get a one-line envelope
 //! (`[muster msg <id> from <sender> origin=<origin> hop=<n>]`) and an `agent_messages` row; the
 //! agent's final message for the turn that ran it (Stop hook, Codex notify) is that row's reply.
+//! An answer given later with the `reply` tool is src/agent_reply.rs.
 //! Delivery is refused when the agent doesn't accept the origin, past `guard::MAX_AGENT_HOPS`, or
 //! past the agent's daily cap (`guard::check_agent_delivery`; the cap is re-checked atomically
 //! with the insert).
@@ -148,6 +149,8 @@ pub struct AgentMessage {
     /// Typed into the agent after its prompt cache had likely expired: how long it had been
     /// idle (ms). None: warm, not delivered yet, or from before this was kept (src/cache.rs).
     pub cold_idle_ms: Option<i64>,
+    /// The agent's later answer through `reply`, and how it reached the asker (src/agent_reply.rs).
+    pub answer: Option<crate::agent_reply::Answer>,
 }
 
 /// A session's provenance: origin and hop of the message it is handling, and that message's
@@ -241,8 +244,10 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
-         your final message for that turn goes back to the sender. To ask other agents, use the muster \
-         MCP tools `list_agents` and `ask_agent`.\n",
+         your final message for that turn goes back to the sender. If the answer needs longer (a long \
+         job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
+         (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
+         agents, use the muster MCP tools `list_agents` and `ask_agent`.\n",
         kind = kind.as_str(),
         resume = if kind == SessionKind::Claude { " and resumes your conversation when you restart" } else { "" },
         persona = if persona.is_empty() { "(none given)" } else { persona },
@@ -1561,6 +1566,7 @@ pub fn message_record(agent: &Agent, from: &str, from_session: Option<SessionId>
         refused: None,
         to_name: None,
         cold_idle_ms: None,
+        answer: None,
     }
 }
 
@@ -1778,14 +1784,19 @@ pub async fn ask(
         Some(s) => format!("session:{s}"),
         None => proposed_route(prov, forced).origin.as_str().to_string(),
     };
+    // While it delivers and then waits, the agent's `reply` to this message ends it
+    // (src/agent_reply.rs).
+    let asking = hub.replies.asking(agent.id, from_session);
     let (d, route) = send_checked(hub, &agent, text, from, from_session, prov, forced).await?;
     let mut rx = hub.subscribe();
+    let _waiting = hub.replies.wait(d.msg_id);
+    drop(asking);
     let (info, verdict, waited_ms) = wait_for_reply(
         &mut rx,
         d.session_id,
         timeout,
         || hub.session(d.session_id),
-        || hub.agents().msg_status(hub.store(), d.msg_id),
+        || crate::agent_reply::status(hub, d.msg_id),
     )
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -1846,6 +1857,9 @@ pub fn ask_result(
                 d.session_id
             ));
         }
+        AskVerdict::Wait => {
+            out["note"] = json!(crate::agent_reply::TIMED_OUT_NOTE);
+        }
         _ => {}
     }
     out
@@ -1894,6 +1908,7 @@ pub fn message_json(m: &AgentMessage) -> Value {
         "replied_at": m.replied_at,
         "refused": m.refused,
         "cold_idle_ms": m.cold_idle_ms,
+        "answer": m.answer,
     })
 }
 
@@ -2566,6 +2581,7 @@ mod tests {
                 refused: None,
                 to_name: None,
                 cold_idle_ms: None,
+                answer: None,
             })
             .unwrap()
     }

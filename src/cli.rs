@@ -2060,15 +2060,19 @@ impl EventTracker {
     }
 }
 
-/// `msg 12  human -> ada  origin=human hop=0  first line` (with `refused: why` or `replied`).
+/// `msg 12  human -> ada  origin=human hop=0  first line` (with `refused: why` or `replied`,
+/// then `late reply: STATUS` once the agent answered it later).
 pub fn agent_message_line(m: &Value) -> String {
     let first = m["text"].as_str().and_then(|t| t.lines().find(|l| !l.trim().is_empty())).unwrap_or("");
     let first: String = first.chars().take(80).collect();
-    let status = match (m["refused"].as_str(), m["reply"].is_string()) {
+    let mut status = match (m["refused"].as_str(), m["reply"].is_string()) {
         (Some(why), _) => format!("  refused: {why}"),
         (None, true) => "  replied".to_string(),
         _ => String::new(),
     };
+    if let Some(s) = m["answer"]["status"].as_str() {
+        status.push_str(&format!("  late reply: {s}"));
+    }
     format!(
         "msg {}  {} -> {}  origin={} hop={}  {first}{status}",
         m["id"],
@@ -2430,6 +2434,29 @@ pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: 
                 r["detail"].as_str().map(|d| format!(" ({d})")).unwrap_or_default()
             ),
         ));
+    }
+    Ok(())
+}
+
+/// `muster reply`: inside an agent's session, `agent.reply` (its MCP `reply`): answer message
+/// `msg_id` later. Prints how it reached the asker; exit 1 when the delivery was refused.
+pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> anyhow::Result<()> {
+    let Some(session) = env_session() else {
+        anyhow::bail!("muster reply runs inside an agent's session (it answers a message Muster delivered to that agent)");
+    };
+    let text = send_text(words, || {
+        let mut s = String::new();
+        std::io::stdin().lock().read_to_string(&mut s)?;
+        Ok(s)
+    })?;
+    let r = client::rpc(d, "agent.reply", json!({"msg_id": msg_id, "text": text, "from_session": session}))?;
+    if as_json {
+        print_json(&r)?;
+    } else {
+        println!("{}", r["note"].as_str().unwrap_or("replied"));
+    }
+    if !r["delivered"].as_bool().unwrap_or(false) && r["status"] != "pending" {
+        return Err(exit(1, format!("message {msg_id}: reply kept, not delivered ({})", r["status"].as_str().unwrap_or("?"))));
     }
     Ok(())
 }

@@ -1061,6 +1061,27 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 }
             }
         }
+        // `muster reply` inside an agent's session: its MCP `reply` (src/agent_reply.rs). Only the
+        // agent a message was delivered to answers it; the human and shells never do.
+        "agent.reply" => {
+            #[derive(Deserialize)]
+            struct P {
+                msg_id: i64,
+                text: String,
+                #[serde(default)]
+                from_session: Option<SessionId>,
+            }
+            let p: P = parse(params)?;
+            match caller(hub, p.from_session)? {
+                Caller::Agent(s) => {
+                    let args = json!({"msg_id": p.msg_id, "text": p.text});
+                    mcp_json(crate::mcp::call_as(hub, s, "reply", args).await)
+                }
+                Caller::Shell(_) | Caller::Human => Err(RpcError(
+                    "only the agent a message was delivered to can reply to it: run `muster reply` in that agent's session".into(),
+                )),
+            }
+        }
 
         // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes or changes them: a call
         // on an agent session's behalf is refused (agents proposing schedules is a later phase).
@@ -2085,6 +2106,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_reply_is_the_agents_own_mcp_reply() {
+        let (hub, st) = fixture();
+        agent(&hub, "rpc-rex");
+        let rex = hub.agents().get("rpc-rex").unwrap();
+        hub.agents().link_session(hub.store(), rex.id, Some(3)).unwrap();
+        let route = crate::agents::Route { origin: Origin::Human, hop: 0, reply_to: None };
+        let m = hub.store().insert_agent_message(&crate::agents::message_record(&rex, "human", None, route, "how long?")).unwrap();
+        hub.store().set_agent_message_delivered(m, now_ms() - 60_000).unwrap();
+        // The human and shells never reply; a session that isn't the agent can't either.
+        for from in [Value::Null, json!(1), json!(2)] {
+            let e = call(&hub, "agent.reply", json!({"msg_id": m, "text": "x", "from_session": from})).await.unwrap_err();
+            assert!(e.contains("only the agent") || e.contains("isn't one"), "{e}");
+        }
+        // `!` would run as a command where it is typed.
+        let e = call(&hub, "agent.reply", json!({"msg_id": m, "text": "!rm -rf x", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("shell command"), "{e}");
+        let r = call(&hub, "agent.reply", json!({"msg_id": m, "text": "two hours", "from_session": 3})).await.unwrap();
+        assert_eq!((r["status"].as_str(), r["delivered"].as_bool()), (Some("shown"), Some(true)), "{r}");
+        let logged = crate::agents::messages(&hub, Some("rpc-rex"), None, None).unwrap();
+        assert_eq!(logged["messages"][0]["answer"]["text"], "two hours");
+        // Once per message; refusals don't use up the send rate limit, deliveries do.
+        let e = call(&hub, "agent.reply", json!({"msg_id": m, "text": "again", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("already replied"), "{e}");
+        assert!(st.guard.lock().sends.check_and_record(3, now_ms(), 1, 60_000).is_err(), "the reply used a slot");
+        assert!(st.guard.lock().sends.check_and_record(3, now_ms(), 2, 60_000).is_ok(), "and only it did");
+        // Audited like any MCP call.
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["tool"] == "reply" && e.data["args"]["via"] == "cli"));
+    }
+
+    #[tokio::test]
     async fn refused_asks_are_logged_and_listed() {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-ivy");
@@ -2152,7 +2204,7 @@ mod tests {
         assert!(serde_json::from_str::<Value>(raw).is_err());
         // No agent method is ever a device's, and writes need the desktop client token.
         for m in [
-            "agent.create", "agent.update", "agent.list", "agent.remove", "agent.start", "agent.ask",
+            "agent.create", "agent.update", "agent.list", "agent.remove", "agent.start", "agent.ask", "agent.reply",
             "agent.templates", "agent.models", "agent.messages", "agent.memory.list", "agent.memory.read",
             "agent.memory.write", "agent.memory.add", "agent.memory.delete",
         ] {

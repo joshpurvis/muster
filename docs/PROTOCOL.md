@@ -176,6 +176,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
 | `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, provider_pending}` (`provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
 | `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedule runs go through the same daemon-internal path with origin `schedule` (see "Schedules"). Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
+| `agent.reply` | `{msg_id, text, from_session}` | The MCP `reply` result (docs/MCP.md "Late replies"). `from_session` (`muster reply` passes `$MUSTER_SESSION_ID`) must be an agent session: the call runs MCP `reply` as that session (same checks, rate limit, audit). Without it, or from a shell session, it is refused: only the agent a message was delivered to answers it. |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 ```ts
@@ -190,7 +191,13 @@ type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "h
              to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
              origin: Origin; hop: number; reply_to: number | null; created_at: number;
              text: string | null /* null: sent before text was kept */; reply: string | null; replied_at: number | null;
-             refused: string | null /* why the policy refused it: never delivered */ };
+             refused: string | null /* why the policy refused it: never delivered */;
+             cold_idle_ms: number | null;
+             answer: LateAnswer | null /* the agent's later `reply`, docs/MCP.md "Late replies" */ };
+type LateAnswer = { text: string; at: number; from_session: number; origin: Origin; hop: number /* its route */;
+             status: "pending" | "delivering" | "returned" | "delivered" | "shown" | "refused" | "undelivered";
+             note?: string /* how it went, in words */; msg?: number /* the message that carried it to an agent */;
+             session?: number /* the session it was typed into */ };
 type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
              model: string | null; effort: string | null; persona: string; permissions: Permissions;
              accepts: Origin[]; autostart: boolean };
@@ -206,8 +213,8 @@ type OpenRouterModel = { id: string /* --model / -m, e.g. "anthropic/claude-sonn
 Agent events (also on `GET /api/events`; never sent to paired devices):
 `{"event":"agent_upserted","data":Agent}` when an agent is created or its record changes (edit,
 start, its tab, its conversation id), `{"event":"agent_removed","data":{"id","name"}}`, and
-`{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused or gets its
-reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
+`{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused, gets its
+reply, or gets or delivers a late reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.

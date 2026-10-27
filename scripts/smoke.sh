@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build muster and run the end-to-end smoke test against a throwaway daemon
-# (temp data/runtime dirs, port 17433). Deno permissions are scoped to exactly what it needs.
+# (temp data/runtime dirs, port 17433, or MUSTER_SMOKE_PORT so parallel runs don't collide).
+# Deno permissions are scoped to exactly what it needs.
 set -euo pipefail
 # Never the owner's real credentials: an OpenRouter key, OpenRouter's own Claude Code setup (the
 # same key as ANTHROPIC_AUTH_TOKEN), any other Claude credential, or settings inherited from an
@@ -21,6 +22,7 @@ cleanup() {
 trap cleanup EXIT
 deno run \
   --allow-net=127.0.0.1 \
+  --allow-env=MUSTER_SMOKE_PORT \
   --allow-read="$TMP,$BIN" \
   --allow-write="$TMP" \
   --allow-run="$BIN,git,python3,unshare" \

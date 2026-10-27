@@ -35,6 +35,7 @@ import {
   feedFor,
   firstLine,
   keepForKind,
+  lateText,
   listedModels,
   memoryPathError,
   nameError,
@@ -52,6 +53,7 @@ import type {
   Agent,
   AgentMessage,
   AgentTemplate,
+  LateAnswer,
   ModelCatalog,
   OpenRouterModel,
   OpenRouterModels,
@@ -348,6 +350,16 @@ export function ColdChip({ ms }: { ms: number }) {
   );
 }
 
+/** The agent answered this message later (`reply`): green once it reached the asker. */
+function LateChip({ a }: { a: LateAnswer }) {
+  const failed = a.status === "refused" || a.status === "undelivered";
+  return (
+    <span class={cx("ap-chip", failed ? "ap-chip-warn" : "ap-chip-ok")} data-tip={lateText(a)}>
+      {failed ? "late reply not delivered" : "late reply"}
+    </span>
+  );
+}
+
 function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
   return (
     <button
@@ -367,6 +379,7 @@ function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
         <OriginChip origin={m.origin} />
         <span class="ap-chip">hop {m.hop}</span>
         {m.reply !== null && <span class="ap-chip ap-chip-ok">replied</span>}
+        {m.answer && <LateChip a={m.answer} />}
         {m.cold_idle_ms != null && <ColdChip ms={m.cold_idle_ms} />}
       </span>
       {m.refused && (
@@ -1621,6 +1634,8 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   const m = agentMessages.value.find((x) => x.id === id);
   if (!m) return null;
   const when = new Date(m.created_at).toLocaleString();
+  // This message carried another one's late reply.
+  const answers = agentMessages.value.find((x) => x.answer?.msg === m.id);
   return (
     <Modal class="dialog msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
@@ -1629,7 +1644,9 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
         </h2>
         <span class="muted msg-meta">
           Message {m.id} · {when} · <OriginChip origin={m.origin} /> <span class="ap-chip">hop {m.hop}</span>
-          {m.reply_to !== null && ` · while handling message ${m.reply_to}`}
+          {m.reply_to !== null && (answers !== undefined
+            ? ` · late reply to message ${m.reply_to}`
+            : ` · while handling message ${m.reply_to}`)}
           {m.cold_idle_ms != null && <>{" · "}<ColdChip ms={m.cold_idle_ms} /></>}
         </span>
       </div>
@@ -1654,6 +1671,22 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             {m.reply !== null
               ? <pre class="msg-pre">{m.reply}</pre>
               : <span class="muted">No reply yet. Replies arrive when the agent's turn ends.</span>}
+          </div>
+        )}
+        {m.answer && (
+          <div class="field">
+            <span class="field-label">
+              Later reply <span class="muted">({new Date(m.answer.at).toLocaleTimeString()})</span>
+            </span>
+            <pre class="msg-pre">{m.answer.text}</pre>
+            <span
+              class={cx(
+                "msg-late-status",
+                m.answer.status === "refused" || m.answer.status === "undelivered" ? "form-error" : "muted",
+              )}
+            >
+              {lateText(m.answer)}
+            </span>
           </div>
         )}
       </div>

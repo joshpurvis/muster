@@ -369,7 +369,7 @@ Deno.test("OpenRouter: the badge follows the run, not only the saved setting", (
 Deno.test("a late reply says how it reached the asker", () => {
   const a = { text: "42", at: 1, from_session: 3, origin: "human" as const, hop: 2 };
   check(lateText({ ...a, status: "returned" }).includes("still waiting"), "returned");
-  assertEquals(lateText({ ...a, status: "delivered", note: "delivered to ada as message 9" }), "Delivered: delivered to ada as message 9.");
+  assertEquals(lateText({ ...a, status: "delivered", note: "delivered to ada as message 9" }), "Delivered to ada as message 9.");
   check(lateText({ ...a, status: "shown" }).startsWith("Shown here"), "shown");
   assertEquals(
     lateText({ ...a, status: "refused", note: "not delivered to ada: agent ada accepts only human messages" }),

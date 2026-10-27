@@ -367,7 +367,7 @@ export function lateText(a: LateAnswer): string {
     case "returned":
       return "The ask that was still waiting got it as its reply.";
     case "delivered":
-      return a.note ? `Delivered: ${a.note}.` : "Delivered to whoever asked.";
+      return a.note ? `${a.note[0].toUpperCase()}${a.note.slice(1)}.` : "Delivered to whoever asked.";
     case "shown":
       return "Shown here: the human (or a schedule) asked.";
     case "refused":

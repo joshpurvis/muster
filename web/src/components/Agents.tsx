@@ -1746,6 +1746,8 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             </span>
             {m.reply !== null
               ? <pre class="msg-pre">{m.reply}</pre>
+              : m.answer
+              ? <span class="muted">None in that turn; the agent answered later (below).</span>
               : <span class="muted">No reply yet. Replies arrive when the agent's turn ends.</span>}
           </div>
         )}

@@ -1163,6 +1163,8 @@ exec cat > /dev/null
   ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");
   await c.call("agent.remove", { name: "bg" });
 
+  ({ c, d } = await sleepAndWake(c, d, { mcp }));
+
   ({ c, d } = await schedules(c, d));
   ({ c, d } = await triggers(c, d));
   await openRouter(c, d);
@@ -1206,6 +1208,162 @@ const cli = (args: string[], env: Record<string, string>) =>
  * origin schedule, refusals, pause and skip, the busy rule, the reply in a note, and the missed-run
  * rule across a backend restart (a debug-build clock offset stands in for two days off). Returns
  * the client and backend it ends with. */
+/** Sleep and wake (src/sleep.rs), with the fake Codex standing in for the agent: an idle agent's
+ * process stops while its tab and conversation stay; whatever would deliver to it wakes it once,
+ * into the same conversation; looking at it never does; it stays asleep across a backend restart;
+ * and with a short idle time it falls asleep on its own. */
+async function sleepAndWake(
+  c: Client,
+  d: Daemon,
+  t: {
+    mcp: (token: string, name: string, args?: Json) => Promise<any>;
+  },
+): Promise<{ c: Client; d: Daemon }> {
+  const input = () => Deno.readTextFile(`${BASE}/fake-input`).catch(() => "");
+  // Through this section's client (it is replaced at the backend restart below).
+  const sessOf = async (id: number) => (await c.call("hello")).sessions.find((x: Json) => x.id === id);
+  const inputHas = async (...parts: string[]) => {
+    let got = "";
+    for (let n = 0; n < 150; n++) {
+      got = await input();
+      if (parts.every((p) => got.includes(p))) break;
+      await sleep(100);
+    }
+    return got;
+  };
+  const times = (s: string, part: string) => s.split(part).length - 1;
+  const dozy = async () => (await c.call("agent.list")).find((a: Json) => a.name === "dozy");
+  /** How many times session `id` began starting since event `mark`. */
+  const starts = (id: number, mark: number) => {
+    let last = "", n = 0;
+    for (const e of c.events.slice(mark)) {
+      if (e.event !== "session_upserted" || e.data.id !== id) continue;
+      if (e.data.state === "starting" && last !== "starting") n++;
+      last = e.data.state;
+    }
+    return n;
+  };
+  const refused = (p: Promise<unknown>, part: string, what: string) =>
+    p.then(() => ok(false, what), (e) => ok(String(e).includes(part), `${what}: ${e}`));
+  /** Sleep once Muster has finished typing (a prompt is checked for a few seconds after Enter,
+   * and nothing sleeps while one is: "it has prompts waiting to be typed"). */
+  const sleepSoon = async () => {
+    for (let n = 0; ; n++) {
+      try {
+        return await c.call("agent.sleep", { name: "dozy" });
+      } catch (e) {
+        if (n > 100 || !String(e).includes("can't sleep now")) throw e;
+        await sleep(100);
+      }
+    }
+  };
+  /** Its turn ends (Codex's notify, always the same thread): the reply, and the agent at rest. */
+  const turnEnd = async (id: number, token: string) => {
+    const mark = c.events.length;
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ type: "agent-turn-complete", "thread-id": "thread-dozy", "input-messages": ["hi"], "last-assistant-message": "done thread-dozy" }),
+    });
+    await r.body?.cancel();
+    await c.waitFor("dozy's turn end", () =>
+      c.events.slice(mark).some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state_detail === "done thread-dozy"));
+  };
+
+  const made = await c.call("agent.create", { name: "dozy", kind: "codex", sleep_after_min: 5 });
+  ok(made.sleep_after_min === 5 && made.asleep === false, "sleep: agent.create takes an idle time, off unless given");
+  await refused(c.call("agent.update", { name: "dozy", sleep_after_min: 2 }), "5 to", "sleep: less than 5 minutes is refused");
+  await refused(c.call("agent.sleep", { name: "dozy" }), "isn't running", "sleep: a stopped agent has nothing to stop");
+  const zid: number = (await c.call("agent.start", { name: "dozy" })).session.id;
+  await c.waitFor("dozy idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === zid && e.data.state === "idle"));
+  let token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await refused(c.call("agent.sleep", { name: "dozy" }), "couldn't pick it up again", "sleep: never before its conversation is saved");
+  // Two panels of its own: one the human closes while it sleeps, one they click in.
+  const closing = (await t.mcp(token, "panel_open", { title: "Dozy closing", app: "markdown" })).panel_id;
+  const clicking = (await t.mcp(token, "panel_open", { title: "Dozy clicking", app: "markdown" })).panel_id;
+  await turnEnd(zid, token);
+
+  let mark = c.events.length;
+  const slept = await c.call("agent.sleep", { name: "dozy" });
+  let z = await sessOf(zid);
+  ok(slept.asleep && slept.asleep_at > 0 && z.state === "exited" && z.state_detail === "asleep",
+    `sleep: its process stopped, its tab kept and shown asleep (${z.state}, ${z.state_detail})`);
+  ok((await c.call("agent.sleep", { name: "dozy" })).asleep, "sleep: asleep already is nothing to do");
+  // Looking never wakes it: lists (agent.list is list_agents' JSON), its output, its panel
+  // closing, the terminal's own reports (focus, a mouse click) from its tab.
+  await c.call("hello");
+  await c.call("session.output", { id: zid, lines: 20 });
+  const listed = await dozy();
+  ok(listed?.asleep === true && listed?.state === "exited" && listed?.asleep_at === slept.asleep_at, "sleep: the agent list says asleep");
+  await c.call("panel.dismiss", { id: closing });
+  c.input(zid, "\x1b[I\x1b[O\x1b[<0;3;4M\x1b[<0;3;4m");
+  await sleep(1500);
+  ok((await dozy()).asleep && starts(zid, mark) === 0,
+    "sleep: listing, reading its screen, closing its panel and focus or mouse reports never wake it");
+
+  // Typing into its tab wakes it: the keys are held, then typed once into the resumed run.
+  mark = c.events.length;
+  await Deno.remove(`${BASE}/launch-codex-${zid}`).catch(() => {});
+  c.input(zid, "hello from the keyboard");
+  c.input(zid, "\r");
+  // (The fake's terminal turns Enter's \r into \n.)
+  let got = await inputHas("hello from the keyboard\n");
+  ok(times(got, "hello from the keyboard") === 1 && got.includes("keyboard\n"),
+    `wake: typing into an asleep tab wakes it and is typed once it is ready: ${JSON.stringify(got.slice(0, 60))}`);
+  ok((await launchOf("codex", zid)).args.endsWith(" -- thread-dozy"), "wake: it resumes the same conversation");
+  ok(!(await dozy()).asleep && starts(zid, mark) === 1, "wake: awake, started once");
+
+  // Two messages at once wake it once; each is typed in exactly once.
+  await sleepSoon();
+  mark = c.events.length;
+  const asks = await Promise.all([1, 2].map((n) =>
+    c.call("agent.ask", { agent: "dozy", text: `together ${n}`, timeout_ms: 1000 })
+  ));
+  got = await inputHas("together 1", "together 2");
+  ok(asks.filter((r) => r.woke).length === 1 && asks.every((r) => r.session_id === zid) && starts(zid, mark) === 1,
+    `wake: two messages at once wake it once (woke: ${asks.map((r) => r.woke)})`);
+  ok(times(got, "together 1") === 1 && times(got, "together 2") === 1, "wake: neither message lost or typed twice");
+  // Both submitted (and checked) before the turn ends: until then it is mid-turn.
+  for (let n = 0; n < 100 && (await sessOf(zid)).queued > 0; n++) await sleep(100);
+  token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await turnEnd(zid, token);
+
+  // Asleep stays asleep across a backend restart (autostart too), not exited or crashed.
+  await c.call("agent.update", { name: "dozy", autostart: true });
+  await sleepSoon();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  // One "minute" of idle time is 100 ms from here on (debug builds only).
+  d = await startDaemon({ MUSTER_TEST_SLEEP_MINUTE_MS: "100" });
+  c = new Client(d.token);
+  await c.open();
+  await sleep(1500);
+  z = await sessOf(zid);
+  ok((await dozy()).asleep && z.state === "exited" && z.state_detail === "asleep",
+    `restart: still asleep after a backend restart, and autostart left it asleep (${z.state}, ${z.state_detail})`);
+
+  // A message wakes it (woke: true), and once idle for its 5 "minutes" it falls asleep on its own.
+  mark = c.events.length;
+  const woke = await c.call("agent.ask", { agent: "dozy", text: "after the restart", timeout_ms: 1000 });
+  ok(woke.woke === true && String(woke.woke_note).includes("was asleep"), "wake: the ask's result says it woke the agent");
+  // Never asleep mid-turn: only once its turn ends after the message was typed in.
+  for (let n = 0; n < 100 && (await sessOf(zid)).queued > 0; n++) await sleep(100);
+  await sleep(1000);
+  ok(!(await dozy()).asleep, "auto: never asleep while the message it woke for is its turn");
+  token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await turnEnd(zid, token);
+  await c.waitFor("dozy asleep on its own", () =>
+    c.events.slice(mark).some((e) => e.event === "agent_upserted" && e.data.name === "dozy" && e.data.asleep), 15000);
+  ok((await sessOf(zid)).state_detail === "asleep", "auto: it falls asleep on its own after its idle time");
+
+  // A real click in its panel wakes it; the earlier close notice comes along with it.
+  c.input(zid, "\x1b[I");
+  await c.call("panel.event", { panel_id: clicking, kind: "approve", payload: { message: "clicked while asleep" } });
+  got = await inputHas("clicked while asleep");
+  ok(got.includes("clicked while asleep") && got.includes('"kind":"closed"'), "wake: a click in its panel wakes it, with the close notice");
+  await c.call("agent.remove", { name: "dozy" });
+  return { c, d };
+}
+
 async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
   const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
   const sch = async (...args: string[]) => {

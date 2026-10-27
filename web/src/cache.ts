@@ -27,6 +27,12 @@ export function isCold(s: SessionInfo, now: number): boolean {
   return s.kind !== "shell" && !WAITING_NOT.has(s.state) && s.cache_cold_at != null && now >= s.cache_cold_at;
 }
 
+/** Waking it now would re-read the conversation uncached: its cache has likely expired, whatever
+ * its state (an asleep agent's session is exited; src/sleep.rs `wake_cost`). */
+export function wakeCold(s: SessionInfo | undefined, now: number): boolean {
+  return !!s && s.kind !== "shell" && s.cache_cold_at != null && now >= s.cache_cold_at;
+}
+
 /** How long since its last model request, or null. */
 export function idleFor(s: SessionInfo, now: number): number | null {
   return s.last_turn_at == null ? null : Math.max(0, now - s.last_turn_at);

@@ -19,6 +19,10 @@ panel". Choices made while building it:
   hourly-or-faster schedules. A slot up to 10 minutes late (a reload, a short sleep) still counts as
   on time.
 - The busy rule waits at most an hour in line; a sent run waits at most an hour for its reply.
+- A run to an asleep agent (its process stopped while idle, PROTOCOL.md "Sleep and wake") wakes it
+  only after every rule above and the delivery checks (origin, hop, daily and unattended caps,
+  spend caps) let it through: a skipped or refused run leaves it asleep. An asleep agent is never
+  "busy". "Fresh each run" starts its new conversation instead of waking the old one.
 - The per-agent unattended cap defaults to 24 messages a day and counts every message whose
   origin isn't the human's, at any hop.
 - Quiet hours are one window for the whole machine (default 23:00 to 07:00, its local time), and

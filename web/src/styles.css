@@ -1485,6 +1485,93 @@ button.sl-item:hover {
   color: var(--text-faint);
 }
 
+/* A named agent asleep (see AsleepBar): resting, not ended. In the exited bar's family; tinted
+   like the cold-cache bar when waking would re-read the conversation at full cost. */
+.asleep-bar {
+  flex: none;
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+}
+
+.asleep-bar.cold {
+  background: color-mix(in srgb, var(--cold) 9%, var(--bg-1));
+  border-top-color: color-mix(in srgb, var(--cold) 30%, var(--border));
+}
+
+.asleep-bar .asleep-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.asleep-bar .link-btn {
+  flex: none;
+}
+
+.asleep-dot,
+.dot.dot-asleep {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--st-exited) 35%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--st-exited);
+}
+
+.asleep-bar.cold .asleep-dot {
+  box-shadow: inset 0 0 0 1.5px var(--cold);
+  background: color-mix(in srgb, var(--cold) 30%, transparent);
+}
+
+.tab-asleep {
+  flex: none;
+  align-self: center;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+/* The agent dialog's "Sleep when idle" and its minutes. */
+.sleep-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sleep-after {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 40px;
+}
+
+.sleep-after-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.sleep-after-input .sleep-min {
+  width: 72px;
+  height: 28px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
 .link-btn {
   display: inline-flex;
   align-items: center;

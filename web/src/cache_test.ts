@@ -1,4 +1,4 @@
-import { addDismissal, coldKey, coldText, idleText, isCold, parseTtl, ttlFor, ttlText } from "./cache.ts";
+import { addDismissal, coldKey, coldText, idleText, isCold, parseTtl, ttlFor, ttlText, wakeCold } from "./cache.ts";
 import { DEFAULT_CACHE_TTL } from "./cache.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -16,6 +16,14 @@ function sess(over: Partial<SessionInfo> = {}): SessionInfo {
     queued: 0, created_at: 0, last_turn_at: 0, cache_cold_at: 60 * MIN, ...over,
   };
 }
+
+Deno.test("waking an asleep (exited) agent is cold past cache_cold_at too", () => {
+  assertEquals(wakeCold(sess({ state: "exited" }), 60 * MIN), true);
+  assertEquals(wakeCold(sess({ state: "exited" }), 60 * MIN - 1), false);
+  assertEquals(wakeCold(sess({ state: "exited", cache_cold_at: null }), 999 * MIN), false);
+  assertEquals(wakeCold(sess({ state: "exited", kind: "shell" }), 999 * MIN), false);
+  assertEquals(wakeCold(undefined, 999 * MIN), false);
+});
 
 Deno.test("cold only past cache_cold_at, while waiting, never for shells", () => {
   assertEquals(isCold(sess(), 60 * MIN - 1), false);

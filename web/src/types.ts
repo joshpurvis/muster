@@ -188,6 +188,12 @@ export interface Agent {
   session_id: SessionId | null;
   resumable: boolean;
   created_at: number;
+  /** Sleeps after this many idle minutes (null: never; older daemons: absent). */
+  sleep_after_min?: number | null;
+  /** Its process was stopped while idle; the next message wakes it (src/sleep.rs). */
+  asleep?: boolean;
+  /** Asleep since (Unix ms). */
+  asleep_at?: number | null;
 }
 
 /** A message muster delivered to an agent, or refused to (`agent.messages`, `agent_message`). */

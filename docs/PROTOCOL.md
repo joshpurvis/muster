@@ -161,8 +161,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
-| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
+| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?}` | `Agent`. `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -174,7 +174,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.memory.delete` | `{name, path}` | `{path}`. Removes one regular file under `memory/` (same path rules and walk as a read); a folder or a link is refused. |
 | `agent.list` | `{}` | `Agent[]` |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
-| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, provider_pending}` (`provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, woke, provider_pending}` (`woke`: the agent was asleep and this start woke it; `provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.sleep` | `{name}` | `Agent`. Puts an idle agent to sleep now (see "Sleep and wake"): refused, with the reason, while it isn't running, is working, waiting for approval or a question, in a turn, has prompts waiting or a message on its way, has text in its input box, or before its conversation id is known. Already asleep: returns it unchanged. Client token only. Emits `agent_upserted`. |
 | `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedule runs go through the same daemon-internal path with origin `schedule` (see "Schedules"). Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
@@ -185,7 +186,9 @@ type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "su
              persona: string; permissions: Permissions /* its tab's, when muster creates it */;
              accepts_origins: Origin[]; autostart: boolean; home_dir: string; session_id: number | null;
              channel_id: number | null /* its own tab */; state: AgentState | null /* its session's */; detail: string | null;
-             resumable: boolean; created_at: number };
+             resumable: boolean; created_at: number;
+             sleep_after_min: number | null /* sleeps after this many idle minutes; null: never */;
+             asleep: boolean; asleep_at: number | null /* unix ms */ };
 type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "human" */; from_session: number | null;
              to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
              origin: Origin; hop: number; reply_to: number | null; created_at: number;
@@ -211,6 +214,45 @@ reply (the same id again). An agent's state changes arrive as its session's `ses
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.
+
+### Sleep and wake
+
+An asleep agent's CLI process was stopped while it sat idle; its record, tab, scrollback and
+conversation stay (`src/sleep.rs`). Its session is `exited` with detail `asleep`, and its record
+says `asleep: true` with `asleep_at`; both are saved, so it stays asleep across a backend reload
+and a full restart (recovery keeps the `asleep` detail, and autostart leaves it asleep). A
+per-agent setting, off by default: `sleep_after_min` (5 to 10080) puts it to sleep once it has
+been idle that long, measured from the latest of: when it came to rest, its last model request
+(`last_turn_at`), and the human's last keystroke in its tab (never within 2 minutes of one). The
+check runs every 30 s. `agent.sleep` (`muster agent sleep`, Sleep in the agents panel) does it
+now. Never while it is working, starting, waiting for approval or a question, shows an error or
+looks stuck, has running sub-agents, has prompts queued or being typed, has a message on its way
+(`agents::deliver` from before the start until the prompt is queued), is waking, is in a turn
+(an agent message was typed in since it last came to rest), has text in its input box, or before
+its conversation id is known (it couldn't be resumed). The check and the stop run under the agent
+start lock, which every wake takes too, and the sleep waits for the process to exit before
+releasing it.
+
+What wakes it, through `agent.start` (so two messages arriving together wake it once, and each
+keeps its one durable path through the prompt queue): `agent.ask` / MCP `ask_agent` (its result
+has `woke: true` and a `woke_note`), a schedule run (after every schedule guard rail and the
+delivery checks: a skipped or refused run never wakes it), the human's `session.send`
+(`muster send`), `agent.start` (Start / Wake in the panel), `session.restart`, a real action in
+one of its panels (not a notice: a panel closing never wakes it; see docs/AGENT_PANELS.md), and
+the human typing into its tab: keys from a client or phone (`FRAME_INPUT`, `session.input`
+without `from_session`) for an asleep agent's session are held by the daemon (at most 64 KB) and
+typed once into the resumed run when it is ready and no prompt is being typed (given up after 10
+minutes, with a notice). The terminal's own reports (focus, mouse, cursor position, OSC
+answers), cursor and function keys never wake it and are dropped; bracketed-paste markers are
+kept. Nothing else wakes it: `hello`, `agent.list`, `session.output`, list and read tools,
+`wait_for_state`, showing its tab.
+
+The wake re-reads the whole conversation; once its prompt cache has likely expired
+(`cache_cold_at`, which an exited session keeps), uncached at full cost. The tab's asleep bar says
+so before a wake, a wake is logged on the agent's timeline (`system` event with `woke: {agent,
+asleep_ms, cold_idle_ms, cause}`), and a message Muster types into the woken agent gets the
+cold-start mark (`cold_idle_ms`) as any message to a cold agent does. A sleep is logged too
+(`asleep: {agent, idle_ms, manual}`).
 Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`,
 `agent.memory.add`, `agent.memory.delete`) need the client token; no `agent.*` method has a
 device scope.

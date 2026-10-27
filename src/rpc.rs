@@ -596,11 +596,14 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                             return Err(RpcError(format!("session {} is the agent {}: use `muster ask {}`", p.id, b.name, b.name)));
                         }
                     }
-                    to_value(inject::send(hub, p.id, p.text, mode, format!("session:{s}"), source).await?)
+                    // An asleep agent wakes for it (src/sleep.rs).
+                    let (id, _delivering) = crate::sleep::for_send(hub, p.id).await?;
+                    to_value(inject::send(hub, id, p.text, mode, format!("session:{s}"), source).await?)
                 }
-                Caller::Human => to_value(
-                    inject::send(hub, p.id, p.text, mode, who.label(), crate::agents::Source::Human).await?,
-                ),
+                Caller::Human => {
+                    let (id, _delivering) = crate::sleep::for_send(hub, p.id).await?;
+                    to_value(inject::send(hub, id, p.text, mode, who.label(), crate::agents::Source::Human).await?)
+                }
             }
         }
         "session.approve" => {
@@ -832,7 +835,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 }
                 // The human's keys (a paired phone, `muster keys` outside a session) take the
                 // same path as a client's: no session lookup under the hub lock, no SQLite.
-                None => hub.note_human_input(p.id),
+                None => {
+                    hub.note_human_input(p.id);
+                    // An asleep agent's tab: held until it has woken (src/sleep.rs).
+                    if crate::sleep::keys(hub, p.id, p.data.as_bytes()) {
+                        return Ok(json!({}));
+                    }
+                }
             }
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
@@ -987,6 +996,9 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
             let p: P = parse(params)?;
             let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
+            if let Some(at) = bs.woke {
+                crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, "you chose Wake", true);
+            }
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
                 // The running process keeps the provider it started with: a change shows here
@@ -994,7 +1006,18 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 "provider_pending": !bs.started && bs.session.provider != bs.agent.provider,
                 "session": bs.session,
                 "started": bs.started,
+                "woke": bs.woke.is_some(),
             }))
+        }
+        "agent.sleep" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+            }
+            let p: P = parse(params)?;
+            let a = crate::sleep::sleep(hub, &p.name, crate::sleep::Why::Manual).await?;
+            Ok(crate::agents::agent_json(&a, a.session_id.and_then(|s| hub.session(s)).as_ref()))
         }
         "agent.messages" => {
             #[derive(Deserialize)]
@@ -1637,6 +1660,10 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     // The marker is recorded in memory and committed off this path, so a
                     // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
                     hub.note_human_input(id);
+                    // An asleep agent's tab: held until it has woken (src/sleep.rs).
+                    if crate::sleep::keys(&hub, id, &data[5..]) {
+                        continue;
+                    }
                     if let Err(e) = hub.send_keys(id, &data[5..]) {
                         // Lost or refused keystrokes interrupt their run, which the user sees
                         // on the session (`input_interrupted`) and in a notice.
@@ -1897,6 +1924,7 @@ mod tests {
                 accepts: None,
                 permissions: None,
                 autostart: false,
+                sleep_after_min: None,
             },
         )
         .unwrap();

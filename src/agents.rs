@@ -121,6 +121,11 @@ pub struct Agent {
     pub created_at: i64,
     /// Started when the daemon starts.
     pub autostart: bool,
+    /// Put to sleep after this many idle minutes (src/sleep.rs). None: never (the default).
+    pub sleep_after_min: Option<u32>,
+    /// Asleep since (Unix ms): its process was stopped while idle, its tab and conversation
+    /// kept; the next message wakes it. None: awake (running or stopped).
+    pub asleep_at: Option<i64>,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -795,8 +800,11 @@ pub const REFUSED_KEEP: usize = 1000;
 pub struct Registry {
     store: Store,
     inner: Mutex<RegInner>,
-    /// Serializes agent starts, so two asks can't start one agent twice.
-    start_lock: tokio::sync::Mutex<()>,
+    /// Serializes agent starts, so two asks can't start one agent twice (and a sleep with them:
+    /// src/sleep.rs).
+    pub(crate) start_lock: tokio::sync::Mutex<()>,
+    /// Sleep and wake bookkeeping that the keystroke path reads (src/sleep.rs).
+    pub(crate) sleep: crate::sleep::State,
 }
 
 impl Registry {
@@ -819,10 +827,15 @@ impl Registry {
             }
             inner.agents.insert(b.id, b);
         }
+        let sleep = crate::sleep::State::default();
+        for a in inner.agents.values() {
+            sleep.set_asleep(a.session_id, a.id, a.asleep_at.is_some());
+        }
         Ok(Registry {
             store: store.clone(),
             inner: Mutex::new(inner),
             start_lock: Default::default(),
+            sleep,
         })
     }
 
@@ -893,6 +906,7 @@ impl Registry {
         a.accepts_origins = next.accepts_origins.clone();
         a.autostart = next.autostart;
         a.provider = next.provider;
+        a.sleep_after_min = next.sleep_after_min;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -906,6 +920,31 @@ impl Registry {
         store.update_agent_runtime(next.id, next.channel_id, next.session_id, next.resume_id.as_deref())?;
         *b = next;
         Ok(())
+    }
+
+    /// Agent `id` fell asleep at `at`, or woke (None). Saved first; the keystroke path's set
+    /// follows. Returns the record as it was.
+    pub(crate) fn set_asleep(&self, store: &Store, id: i64, at: Option<i64>) -> anyhow::Result<Agent> {
+        let (before, session) = {
+            let mut g = self.inner.lock();
+            let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+            let before = b.clone();
+            if b.asleep_at != at {
+                store.set_agent_asleep(id, at)?;
+                b.asleep_at = at;
+            }
+            (before, b.session_id)
+        };
+        self.sleep.set_asleep(session, id, at.is_some());
+        Ok(before)
+    }
+
+    /// When the message session `id` is running now was typed into it (None: no agent message
+    /// is active there).
+    pub(crate) fn active_delivered_at(&self, id: SessionId) -> Option<i64> {
+        let g = self.inner.lock();
+        let msg = g.runtime.active.get(&id)?;
+        g.runtime.delivered.get(msg).filter(|(s, _)| *s == id).map(|(_, at)| *at)
     }
 
     /// Link a named agent to the session being started for it. spawn_session saves this
@@ -1209,6 +1248,9 @@ pub struct NewAgent {
     pub permissions: Option<PermissionsInput>,
     #[serde(default)]
     pub autostart: bool,
+    /// Sleep after this many idle minutes (src/sleep.rs). Absent or 0: never.
+    #[serde(default)]
+    pub sleep_after_min: Option<u32>,
 }
 
 pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
@@ -1230,6 +1272,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     if hub.agents().get(&name).is_some() {
         anyhow::bail!("an agent named {name} already exists");
     }
+    let sleep_after_min = crate::sleep::check_after(req.sleep_after_min)?;
     let persona = req.persona.unwrap_or_default();
     let home = home_dir_for(&name);
     ensure_home(&home)?;
@@ -1254,6 +1297,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             resume_id: None,
             created_at: now_ms(),
             autostart: req.autostart,
+            sleep_after_min,
+            asleep_at: None,
         },
     )?;
     publish(hub, &a);
@@ -1280,6 +1325,9 @@ pub struct AgentUpdate {
     pub autostart: Option<bool>,
     #[serde(default)]
     pub permissions: Option<PermissionsInput>,
+    /// Sleep after this many idle minutes; 0 turns sleeping off (src/sleep.rs).
+    #[serde(default)]
+    pub sleep_after_min: Option<u32>,
 }
 
 /// Model, effort and permissions apply from the agent's next start; the persona file is
@@ -1312,6 +1360,9 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
     if let Some(p) = req.permissions {
         next.permissions = p.into();
     }
+    if let Some(m) = req.sleep_after_min {
+        next.sleep_after_min = crate::sleep::check_after(Some(m))?;
+    }
     if next.persona != cur.persona {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
@@ -1341,6 +1392,7 @@ pub fn remove(hub: &Hub, name: &str) -> anyhow::Result<Agent> {
         tracing::warn!(agent = agent.name, "removing its session: {e:#}");
     }
     hub.agents().remove(hub.store(), agent.id)?;
+    hub.agents().sleep.set_asleep(agent.session_id, agent.id, false);
     crate::schedules::remove_for_agent(hub, agent.id);
     hub.emit(ServerEvent::AgentRemoved { id: agent.id, name: agent.name.clone() });
     Ok(agent)
@@ -1379,6 +1431,8 @@ pub struct AgentSession {
     pub session: SessionInfo,
     /// A process was started (or restarted) for this call.
     pub started: bool,
+    /// The agent was asleep since then (Unix ms), and this call woke it (src/sleep.rs).
+    pub woke: Option<i64>,
 }
 
 /// `agent.start`: the agent's live session, else restart its exited one, else a new session in
@@ -1440,7 +1494,7 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         && session.state != AgentState::Exited
         && hub.live_session_ids().contains(&sid)
     {
-        return Ok(AgentSession { agent, session, started: false });
+        return Ok(AgentSession { agent, session, started: false, woke: None });
     }
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
@@ -1464,17 +1518,20 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         Ok(Some(_)) => refuse_symlink(&persona)?,
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
+    // Awake from here on, whatever the start below makes of it (a failed one shows as stopped).
+    let woke = crate::sleep::on_start(hub, &agent)?;
+    agent.asleep_at = None;
     if let Some(sid) = agent.session_id
         && let Some(info) = hub.session(sid)
         && hub.channel(info.channel_id).is_some_and(|c| !c.archived)
     {
         let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&sid);
         if live && !fresh {
-            return Ok(AgentSession { agent, session: info, started: false });
+            return Ok(AgentSession { agent, session: info, started: false, woke });
         }
         hub.set_session_extra_args(sid, args)?;
         let session = hub.restart_session(sid).await?;
-        return Ok(AgentSession { agent, session, started: true });
+        return Ok(AgentSession { agent, session, started: true, woke });
     }
     let window = window.filter(|w| hub.window(*w).is_some());
     // The agent's own tab, never one found by name (it could have wider permissions).
@@ -1528,7 +1585,7 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         })
         .await?;
     agent.session_id = Some(session.id);
-    Ok(AgentSession { agent, session, started: true })
+    Ok(AgentSession { agent, session, started: true, woke })
 }
 
 /// The CLI arguments a restart of session `sid` must use when it is a named agent's: rebuilt
@@ -1558,7 +1615,8 @@ pub fn forget_conversation(hub: &Hub, sid: SessionId, failed: Option<&str>) -> a
 
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
 pub async fn autostart(hub: &Arc<Hub>) {
-    for a in hub.agents().list().into_iter().filter(|a| a.autostart) {
+    // An asleep agent stays asleep across restarts: its next message wakes it (src/sleep.rs).
+    for a in hub.agents().list().into_iter().filter(|a| a.autostart && a.asleep_at.is_none()) {
         match start(hub, &a.name, false, None).await {
             Ok(s) => tracing::info!(agent = a.name, "autostarted (session {})", s.session.id),
             Err(e) => {
@@ -1588,6 +1646,8 @@ pub struct Delivery {
     pub delivered: bool,
     pub queued: u32,
     pub started: bool,
+    /// The agent was asleep and this message woke it (src/sleep.rs).
+    pub woke: bool,
 }
 
 /// The record of a message to `agent` (not yet stored).
@@ -1682,7 +1742,12 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
             return Err(Refused(why).into());
         }
     }
+    // A sleep waits for this delivery to reach the queue (src/sleep.rs).
+    let _delivering = hub.agents().get(&out.agent).map(|a| crate::sleep::delivering(hub, a.id));
     let bs = start(hub, &out.agent, false, None).await?;
+    if let Some(at) = bs.woke {
+        crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, &format!("a message from {} arrived", out.from), false);
+    }
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);
     msg.to_session = Some(sid);
@@ -1724,6 +1789,7 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
                 delivered: o.delivered,
                 queued: o.queued,
                 started: bs.started,
+                woke: bs.woke.is_some(),
             })
         }
         Err(e) => {
@@ -1877,8 +1943,14 @@ pub fn ask_result(
         "hop": route.hop,
         "sent_at_ms": d.sent_at_ms,
         "started": d.started,
+        "woke": d.woke,
         "waited_ms": waited_ms,
     });
+    if d.woke {
+        out["woke_note"] = json!(format!(
+            "{agent} was asleep: this message woke it, so it re-read its conversation before answering"
+        ));
+    }
     match verdict {
         AskVerdict::Unattributed => {
             out["unattributed_output"] = json!(unattributed_tail);
@@ -1920,6 +1992,9 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "detail": session.and_then(|s| s.state_detail.clone()),
         "resumable": b.resume_id.is_some(),
         "created_at": b.created_at,
+        "sleep_after_min": b.sleep_after_min,
+        "asleep": b.asleep_at.is_some(),
+        "asleep_at": b.asleep_at,
     })
 }
 
@@ -2591,7 +2666,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         }
     }
 

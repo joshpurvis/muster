@@ -1778,6 +1778,9 @@ impl Hub {
         } else if failed_resume {
             // Said in the tab: the CLI printed why (e.g. "No conversation found") above.
             failed_resume_detail(code)
+        } else if self.agents.sleep.is_asleep(id) {
+            // Stopped to sleep (src/sleep.rs): the next message wakes it.
+            crate::sleep::ASLEEP_DETAIL.to_string()
         } else {
             format!("exit code {code}")
         };
@@ -3421,6 +3424,8 @@ impl Hub {
         if let Some(args) = crate::agents::restart_args(&self.agents, id) {
             self.set_session_extra_args(id, args?)?;
         }
+        // An asleep agent restarted from its tab is awake from here on (src/sleep.rs).
+        crate::sleep::on_session_start(self, id)?;
         self.restart_inner(id).await
     }
 
@@ -3541,6 +3546,17 @@ impl Hub {
             None if self.session(id).is_some() => Ok(()),
             None => anyhow::bail!("no such session: {id}"),
         }
+    }
+
+    /// Stop session `id`'s run for its agent to sleep (src/sleep.rs): like Stop, and never read
+    /// as a run that failed to reopen its conversation. Err: no run to stop.
+    pub(crate) fn stop_for_sleep(&self, id: SessionId) -> anyhow::Result<u64> {
+        let p = self.pty(id).filter(|p| p.is_alive()).ok_or_else(|| self.not_running(id))?;
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
+            e.killed_generation = Some(p.generation);
+        }
+        p.terminate(false)?;
+        Ok(p.generation)
     }
 
     /// Kill (if alive) and forget a session, including its scrollback.
@@ -4560,8 +4576,12 @@ fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal
         info.rows = status.rows;
         info.title = status.title.clone();
         if !status.alive {
+            // An agent asleep before the restart stays asleep (src/sleep.rs), never "exit code".
+            let asleep = info.state == AgentState::Exited && info.state_detail.as_deref() == Some(crate::sleep::ASLEEP_DETAIL);
             info.state = AgentState::Exited;
-            info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+            if !asleep {
+                info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+            }
             info.queued = 0;
         } else if info.state == AgentState::Exited {
             // The saved Exited belongs to an earlier run (a restart that crashed before
@@ -4756,7 +4776,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false,
+                    autostart: false, sleep_after_min: None, asleep_at: None,
                 })
                 .unwrap();
         })
@@ -5175,7 +5195,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(),
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -6005,7 +6025,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
                 }).unwrap();
             }
         });
@@ -6297,7 +6317,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();

@@ -635,6 +635,24 @@ const NOTICE_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub fn deliver_pending(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let _op = hub.panels.operations.lock();
     for (session, panels) in due(hub)? { crate::inject::enqueue_panels(hub, session, &panels)?; }
+    wake_asleep_openers(hub)
+}
+
+/// An asleep agent (src/sleep.rs) wakes for a real action in one of its panels, never for a
+/// notice ([`wakes`]: a panel closing). Its events wait queued and come with the panel prompt
+/// once it is ready, as for any idle opener.
+fn wake_asleep_openers(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    if !hub.agents().sleep.any_asleep() { return Ok(()) }
+    for p in list(hub)? {
+        if !hub.agents().sleep.is_asleep(p.session_id) { continue }
+        let Some(s) = hub.session(p.session_id) else { continue };
+        if s.channel_id != p.channel_id || hub.channel(p.channel_id).is_none_or(|c| c.archived) { continue }
+        if hub.store().panel_events(&p)?.iter().any(|e| wakes(&p, e))
+            && let Some(a) = hub.agents().by_session(s.id)
+        {
+            crate::sleep::wake_soon(hub, a.id, None, "you clicked in one of its panels", false);
+        }
+    }
     Ok(())
 }
 

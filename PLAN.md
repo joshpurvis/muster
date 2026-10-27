@@ -220,11 +220,24 @@ before), quiet hours on by default; Claude on OpenRouter doesn't expire. `muster
 `schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (spend caps, chaining,
 triggers) and Phase 3 (agents proposing schedules) are not built.
 
+**Sleep and wake (built; src/sleep.rs, docs/PROTOCOL.md "Sleep and wake").** A per-agent
+setting, off by default (`sleep_after_min`, 5 minutes to a week), plus a manual Sleep: an idle
+agent's process stops, its record, tab and conversation stay, shown as asleep (saved: it stays
+asleep across a reload and a restart, and autostart leaves it). Never while it works, waits for
+approval or a question, is in a turn, has prompts queued or a message on its way, has text in
+its input box, or before its conversation id is known. Whatever would deliver to it wakes it
+through `agent.start` under the start lock (so two messages wake it once, and each keeps its
+durable queue path): `ask_agent` / `muster ask`, schedule runs (after every guard rail),
+`muster send`, Start / Wake, a real panel action, and the human typing into its tab (keys held and
+typed once it is ready). Panel notices (a panel closing), list and read tools, status checks and
+showing its tab never wake it. The wake's cost is shown as the cold-cache warning's is: the
+asleep bar, a `cold` marker, a timeline note, and the cold-start mark on the message. Store
+migration v22 (`agents.sleep_after_min`, `agents.asleep_at`).
+
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
   `agent.*` method and no agent events).
-- Sleep and wake: stop an idle agent's process, resume it on the next message.
 - Webhooks and other triggers (docs/SCHEDULING_PLAN.md Phases 2 and 3): the `webhook` origin and
   its policy exist; nothing fires it yet. Webhook triggers are never exposed to anyone but the
   user. (Schedules are built: above.)

@@ -312,7 +312,7 @@ fn agent(name: &str, kind: SessionKind, provider: Provider, accepts: Vec<Origin>
         session_id: None,
         resume_id: None,
         created_at: 0,
-        autostart: false,
+        autostart: false, sleep_after_min: None, asleep_at: None,
     }
 }
 

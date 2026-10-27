@@ -484,6 +484,13 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind IN ('scheduled', 'catch_up');
     ALTER TABLE notes ADD COLUMN triggers INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v22: sleep and wake for named agents (src/sleep.rs): how long an agent may sit idle before
+    // Muster stops its process (NULL: never), and since when it is asleep (NULL: awake). An
+    // asleep agent keeps its tab and record; the next message resumes its conversation.
+    r#"
+    ALTER TABLE agents ADD COLUMN sleep_after_min INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_at INTEGER;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -915,7 +922,8 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart, account_profile_id, provider FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at
+             FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -939,6 +947,9 @@ impl Store {
                 autostart: r.get::<_, i64>(13)? != 0,
                 account_profile_id: r.get(14)?,
                 provider: crate::openrouter::Provider::parse(&r.get::<_, String>(15)?),
+                // Out of range (written by hand): the nearest allowed value.
+                sleep_after_min: r.get::<_, Option<i64>>(16)?.map(crate::sleep::clamp_after),
+                asleep_at: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -950,8 +961,9 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
+                               sleep_after_min, asleep_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -967,7 +979,9 @@ impl Store {
                 b.channel_id,
                 b.autostart as i64,
                 b.account_profile_id,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min,
+                b.asleep_at
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1007,7 +1021,7 @@ impl Store {
     pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
-                    autostart = ?7, provider = ?8 WHERE id = ?1",
+                    autostart = ?7, provider = ?8, sleep_after_min = ?9 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1016,9 +1030,16 @@ impl Store {
                 perms_json(&b.permissions),
                 serde_json::to_string(&b.accepts_origins)?,
                 b.autostart as i64,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min
             ],
         )?;
+        Ok(())
+    }
+
+    /// Agent `id` fell asleep at `at` (src/sleep.rs), or woke (None).
+    pub fn set_agent_asleep(&self, id: i64, at: Option<i64>) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE agents SET asleep_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
     }
 
@@ -2511,7 +2532,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.
@@ -2531,6 +2552,16 @@ mod tests {
         // Rows from before v17 (and anything unreadable) are the subscription.
         s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
         assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
+        // Sleep (v22): off by default; the setting is config, asleep is its own write.
+        assert_eq!((back.sleep_after_min, back.asleep_at), (None, None));
+        s.update_agent_config(&crate::agents::Agent { sleep_after_min: Some(45), ..sub.clone() }).unwrap();
+        s.set_agent_asleep(b.id, Some(7_000)).unwrap();
+        let slept = &s.load_agents().unwrap()[0];
+        assert_eq!((slept.sleep_after_min, slept.asleep_at), (Some(45), Some(7_000)));
+        s.set_agent_asleep(b.id, None).unwrap();
+        s.conn.lock().execute("UPDATE agents SET sleep_after_min = 1", []).unwrap();
+        let back2 = &s.load_agents().unwrap()[0];
+        assert_eq!((back2.sleep_after_min, back2.asleep_at), (Some(crate::sleep::AFTER_MIN), None));
 
         let m = AgentMessage {
             id: 0,

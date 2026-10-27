@@ -5,9 +5,14 @@
 // The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
 // Never uses port 7433 or the default data dirs.
 
-const [BASE, BIN] = Deno.args;
-if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary>");
-const PORT = 17433;
+const [BASE, BIN, PORT_ARG] = Deno.args;
+if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary> [port]");
+// A port of its own lets two worktrees run the smoke test at once (scripts/smoke.sh passes
+// MUSTER_SMOKE_PORT).
+const PORT = Number(PORT_ARG || 17433);
+if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 7433) {
+  throw new Error(`bad smoke port ${PORT_ARG}: use 1024-65535, never 7433`);
+}
 const DATA = `${BASE}/data`;
 const RUNTIME = `${BASE}/run`;
 const REPO = `${BASE}/repo`;

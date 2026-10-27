@@ -60,7 +60,7 @@ type View =
  * Stop, Close and Archive say different things for them, so they wait for it. */
 type Known =
   | { state: "loading" }
-  | { state: "ok"; agents: Agents }
+  | { state: "ok"; agents: Agents; seen: Set<number> }
   | { state: "error"; message: string }
   | { state: "old" };
 
@@ -78,7 +78,8 @@ function ActionSheet({ session: s, onClose }: { session: SessionInfo; onClose: (
     if (!online) return;
     let current = true;
     loadInfo().then(
-      (i) => current && setKnown(i.agents ? { state: "ok", agents: i.agents } : { state: "old" }),
+      (i) =>
+        current && setKnown(i.agents ? { state: "ok", agents: i.agents, seen: i.seen } : { state: "old" }),
       (e) => current && setKnown({ state: "error", message: errorText(e) }),
     );
     return () => current = false;
@@ -101,18 +102,27 @@ function ActionSheet({ session: s, onClose }: { session: SessionInfo; onClose: (
   const agent = agentName(s, agents);
   const exited = s.state === "exited";
   const canAct = online && !busy;
-  const canDestroy = canAct && known.state === "ok";
+  // A tab that appeared after the agent list was read (one that started or moved in since) may be
+  // an agent: read the list again, and wait for it.
+  const unseen = known.state === "ok"
+    ? [s, ...inTask].filter((x) => !known.seen.has(x.id)).map((x) => x.id).sort().join(",")
+    : "";
+  useEffect(() => {
+    if (unseen) setAttempt((n) => n + 1);
+  }, [unseen]);
+  const canDestroy = canAct && known.state === "ok" && !unseen;
+  const targets = JSON.stringify({ session: s.id, task: s.channel_id, tabs: inTask.map((x) => x.id).sort() });
   const build = (which: Which): Confirm | null => {
-    switch (which) {
-      case "restart":
-        return restartConfirm(s);
-      case "stop":
-        return stopConfirm(s, agent);
-      case "close":
-        return closeConfirm(s, agent, task, inTask.length === 1);
-      case "archive":
-        return task ? archiveConfirm(task, inTask, agents) : null;
-    }
+    const words = which === "restart"
+      ? restartConfirm(s)
+      : which === "stop"
+      ? stopConfirm(s, agent)
+      : which === "close"
+      ? closeConfirm(s, agent, task, inTask.length === 1)
+      : task
+      ? archiveConfirm(task, inTask, agents)
+      : null;
+    return words && { ...words, targets };
   };
   const works: Record<Which, () => Promise<void>> = {
     restart: async () => {
@@ -149,7 +159,7 @@ function ActionSheet({ session: s, onClose }: { session: SessionInfo; onClose: (
     }
   };
   const ask = (which: Which) => {
-    if (which !== "restart" && known.state !== "ok") return;
+    if (which !== "restart" && !canDestroy) return;
     const confirm = build(which);
     if (confirm) setView({ kind: "confirm", which, shown: confirm, changed: false });
     else if (which === "restart") run(works.restart);

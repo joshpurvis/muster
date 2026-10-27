@@ -3,13 +3,16 @@ import type { Channel, SessionInfo, SessionKind, Workspace } from "../types.ts";
 
 export const KIND_LABEL: Record<SessionKind, string> = { claude: "Claude", codex: "Codex", shell: "Shell" };
 
-/** Named agents' sessions: session id → the agent's name (`hello.agent_sessions`). */
-export type Agents = Map<number, string>;
+/** Named agents' sessions (`hello.agent_sessions`): session id → the agent's name
+ * (`hello.agent_names`), or null when the backend doesn't send names. */
+export type Agents = Map<number, string | null>;
 
 /** The named agent session `s` belongs to, or null. `hidden` is only ever set on an agent's
- * session, so a hidden one counts even before the list is known (its tab name stands in). */
+ * session, so a hidden one counts even before the list is known. The tab's name stands in when
+ * the agent's isn't known. */
 export function agentName(s: SessionInfo, agents: Agents | null): string | null {
-  return agents?.get(s.id) ?? (s.hidden ? s.name : null);
+  if (agents?.has(s.id)) return agents.get(s.id) || s.name;
+  return s.hidden ? s.name : null;
 }
 
 export function tildify(path: string, home: string): string {
@@ -57,9 +60,12 @@ export interface Confirm {
   body: string[];
   action: string;
   danger: boolean;
+  /** What it acts on (ids), so the same words about another task or tab don't count as the same. */
+  targets?: string;
 }
 
-/** Two confirmations say the same thing (so one already read still describes what happens). */
+/** Two confirmations say the same thing about the same targets (so one already read still
+ * describes what happens). */
 export const sameConfirm = (a: Confirm, b: Confirm) => JSON.stringify(a) === JSON.stringify(b);
 
 const MID_TURN = new Set(["working", "stuck", "needs_approval", "asking_question"]);

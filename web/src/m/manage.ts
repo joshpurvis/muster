@@ -21,16 +21,24 @@ export interface ManageInfo {
   channels: Channel[];
   home: string;
   agents: Agents | null;
+  /** The sessions that existed when `agents` was read: about any other, it says nothing. */
+  seen: Set<number>;
 }
 export const info = signal<ManageInfo | null>(null);
 
 export async function loadInfo(): Promise<ManageInfo> {
-  const h = await rpc.call<HelloResult & { agent_sessions?: { id: number; name: string }[] }>("hello");
+  const h = await rpc.call<
+    HelloResult & { agent_sessions?: number[]; agent_names?: Record<string, string> }
+  >("hello");
+  const names = h.agent_names ?? {};
   const next = {
     workspaces: h.workspaces,
     channels: h.channels,
     home: h.home,
-    agents: Array.isArray(h.agent_sessions) ? new Map(h.agent_sessions.map((a) => [a.id, a.name])) : null,
+    agents: Array.isArray(h.agent_sessions)
+      ? new Map(h.agent_sessions.map((id) => [id, names[String(id)] ?? null]))
+      : null,
+    seen: new Set(h.sessions.map((s) => s.id)),
   };
   info.value = next;
   return next;

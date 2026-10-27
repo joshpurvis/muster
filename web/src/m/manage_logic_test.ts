@@ -54,6 +54,8 @@ Deno.test("a named agent is known from the daemon's list (by its own name), or f
   equal(agentName(session({}), null), null);
   equal(agentName(session({}), new Map([[1, "scout"]])), "scout");
   equal(agentName(session({ hidden: true }), null), "ada");
+  // A backend without agent_names: still an agent, under its tab's name.
+  equal(agentName(session({}), new Map([[1, null]])), "ada");
 });
 
 Deno.test("closing a named agent's tab says it keeps running; any other tab says it stops", () => {
@@ -104,6 +106,8 @@ Deno.test("archiving names the running terminals, any named agent, and what stay
   // A tab that starts, ends or turns out to be an agent changes the confirmation.
   equal(sameConfirm(c, archiveConfirm(channel({}), tabs, null)), true);
   equal(sameConfirm(c, withAgent), false);
+  // The same words about another task (same name, same tabs) are not the same confirmation.
+  equal(sameConfirm({ ...c, targets: '{"task":10}' }, { ...c, targets: '{"task":11}' }), false);
   equal(
     sameConfirm(c, archiveConfirm(channel({}), [...tabs, session({ id: 3, state: "idle" })], null)),
     false,

@@ -5215,6 +5215,7 @@ fieldset.sch-then > legend {
 }
 
 .sch-prop-use-line .icon {
+  display: inline-block;
   margin-right: 3px;
   vertical-align: -1px;
 }

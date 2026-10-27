@@ -1806,6 +1806,9 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
     panels::spawn(hub.clone());
     detect::spawn(hub.clone());
     notify::spawn(hub.clone());
+    // Runs that couldn't reopen their conversation while no backend watched: forget it before
+    // anything (autostart, a restart) would try it again.
+    hub.reconcile_failed_resumes();
     // Agents with autostart on (their homes were moved above, before anything could start).
     {
         let hub = hub.clone();

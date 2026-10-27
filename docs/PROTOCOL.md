@@ -748,7 +748,8 @@ for a Claude or Codex session. Only real model activity moves it, and never back
 It is null before the conversation's first turn and for shells. Claude's `SessionStart` with
 `source: "clear"` (`/clear`) clears it, and so does any new run that doesn't continue its
 conversation: only Claude's `--resume`/`--continue`, in any spelling the argument check accepts
-(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), keep it. Stored with the session (migration v20),
+(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), and a Codex run that reopens its saved thread
+(`codex resume … -- <id>`), keep it. Stored with the session (migration v20),
 so it survives a backend reload and restart. A session saved before v20 has none; at the next
 backend start, one that is resting (not `working`, `starting` or `exited`) and has had a turn (its
 CLI has set a task title, which Claude Code and Codex do after the first prompt) gets its
@@ -900,7 +901,11 @@ later flag win they are checked against an **allowlist** (also again on every re
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
 with the keys `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
-`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. Values
+`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. (A Codex
+run that reopens its conversation launches as `codex resume <the same flags> -- <thread id>`;
+the thread is kept outside `extra_args`, so the stored arguments stay valid for older
+backends: `runtime_state` `codex-thread:<session>` for a tab, the agent's record for an
+agent.) Values
 may be attached (`--model=x`, `-mx`, `-cmodel=x`). Anything else (sandbox, approval policy,
 allowed tools, extra dirs, settings, profiles, positional arguments) is refused. Shells are
 not affected.

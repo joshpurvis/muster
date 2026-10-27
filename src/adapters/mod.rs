@@ -31,6 +31,61 @@ pub struct SpawnCtx {
     pub initial_prompt: Option<String>,
     /// The channel's permission profile (chosen by the human), mapped to CLI flags.
     pub permissions: Permissions,
+    /// Codex: the thread this run reopens (`codex resume … -- <id>`), chosen by the hub from
+    /// what it saved (never from `extra_args`, which older backends must keep accepting).
+    /// Claude resumes through its own `--resume` in `extra_args`; ignored there.
+    pub resume: Option<String>,
+}
+
+/// Whether a launch's argv reopens a saved conversation, and which one if it names it:
+/// `codex resume … -- <id>`, or Claude's `--resume <id>` / `-r <id>` / `--resume=<id>` (Some(None)
+/// for a bare `--resume` picker or `--continue`). Read from the argv actually launched, so a
+/// backend that recovers a run another backend started reads it the same way.
+pub fn resumed_in_launch(kind: SessionKind, args: &[String]) -> Option<Option<String>> {
+    match kind {
+        SessionKind::Codex => (args.first().map(String::as_str) == Some(codex::RESUME)).then(|| {
+            args.iter().position(|a| a == "--").and_then(|i| args.get(i + 1)).cloned()
+        }),
+        SessionKind::Claude => {
+            let mut found = None;
+            for (i, a) in args.iter().enumerate() {
+                let value = match a.as_str() {
+                    "--resume" | "-r" => Some(args.get(i + 1).filter(|v| !v.starts_with('-')).cloned()),
+                    "--continue" | "-c" => Some(None),
+                    _ => a.strip_prefix("--resume=").or_else(|| a.strip_prefix("-r").filter(|v| !v.is_empty()))
+                        .map(|v| Some(v.to_string())),
+                };
+                if value.is_some() { found = value; }
+            }
+            found
+        }
+        SessionKind::Shell => None,
+    }
+}
+
+/// The CLI said it has no conversation `id` (the evidence a failed resume needs before Muster
+/// forgets it; any other failure keeps it). Claude Code (verified against 2.1.306): "No
+/// conversation found with session ID: <id>". Codex (the message in codex-cli 0.164.0's binary,
+/// printed when `codex resume <id>` finds no saved thread): "No saved session found with ID
+/// <id>. Run `codex resume` without an ID to choose from existing sessions." With `id`, the
+/// message must name that id.
+///
+/// `output` is terminal rows (`Hub::recent_output_text`): a narrow pane wraps the message, also
+/// through the id, so it is matched with all whitespace removed.
+pub fn says_conversation_missing(kind: SessionKind, output: &str, id: Option<&str>) -> bool {
+    let phrase = match kind {
+        SessionKind::Claude => "No conversation found",
+        SessionKind::Codex => "No saved session found with ID",
+        SessionKind::Shell => return false,
+    };
+    let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let (text, phrase) = (squeeze(output), squeeze(phrase));
+    let Some(id) = id.map(squeeze) else { return text.contains(&phrase) };
+    let id_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    text.match_indices(&phrase).any(|(at, _)| {
+        let rest = text[at + phrase.len()..].trim_start_matches(['"', '\'', '`', ':']);
+        rest.strip_prefix(id.as_str()).is_some_and(|after| !after.starts_with(id_char))
+    })
 }
 
 /// How an allowed extra-arg flag takes its value.
@@ -301,5 +356,49 @@ mod tests {
             assert!(!check(Claude, bad), "{bad:?}");
         }
         assert!(check(Shell, &["--sandbox", "-c", "sandbox"]), "shells take anything");
+        // Muster resumes a Codex thread outside the stored arguments: never a Codex flag there.
+        for bad in [&["--resume", "t-1"][..], &["--resume=t-1"]] {
+            assert!(!check(Codex, bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn launches_say_which_conversation_they_reopen() {
+        use SessionKind::*;
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(resumed_in_launch(Codex, &a(&["resume", "-c", "x=1", "--sandbox", "read-only", "--", "t-1", "go"])), Some(Some("t-1".into())));
+        assert_eq!(resumed_in_launch(Codex, &a(&["-c", "x=1", "--", "resume"])), None, "a prompt, not the subcommand");
+        assert_eq!(resumed_in_launch(Claude, &a(&["--settings", "s.json", "--resume", "c-1"])), Some(Some("c-1".into())));
+        assert_eq!(resumed_in_launch(Claude, &a(&["--resume=c-2"])), Some(Some("c-2".into())));
+        assert_eq!(resumed_in_launch(Claude, &a(&["-rc-3"])), Some(Some("c-3".into())));
+        assert_eq!(resumed_in_launch(Claude, &a(&["--continue"])), Some(None));
+        assert_eq!(resumed_in_launch(Claude, &a(&["--model", "opus"])), None);
+        assert_eq!(resumed_in_launch(Shell, &a(&["--resume", "x"])), None);
+        let codex = "Error: No saved session found with ID t-1. Run `codex resume` without an ID to choose from existing sessions.";
+        assert!(says_conversation_missing(Codex, codex, Some("t-1")));
+        assert!(!says_conversation_missing(Codex, codex, Some("t-2")), "another thread's message");
+        assert!(!says_conversation_missing(Codex, "Error: failed to open state db: database is locked", Some("t-1")));
+        assert!(says_conversation_missing(Claude, "No conversation found with session ID: c-1", None));
+        assert!(!says_conversation_missing(Claude, "Error: something else", None));
+        assert!(!says_conversation_missing(Shell, codex, None));
+    }
+
+    #[test]
+    fn a_missing_conversation_message_is_found_when_a_narrow_pane_wraps_it() {
+        use SessionKind::*;
+        let id = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b";
+        let message = format!("Error: No saved session found with ID {id}. Run `codex resume` without an ID to choose from existing sessions.");
+        // Terminal rows of a 17-column pane: the message wraps mid-word and through the id,
+        // and rows keep their trailing padding.
+        let chars: Vec<char> = message.chars().collect();
+        let rows: Vec<String> = chars.chunks(17).map(|row| format!("{:<17}", row.iter().collect::<String>())).collect();
+        let wrapped = format!("$ codex resume -- {id}\n{}\n$ ", rows.join("\n"));
+        assert!(!rows.iter().any(|l| l.contains(id)), "the fixture wraps the id");
+        assert!(says_conversation_missing(Codex, &wrapped, Some(id)));
+        assert!(!says_conversation_missing(Codex, &wrapped, Some("019a2b3c")), "a prefix of the id isn't it");
+        assert!(!says_conversation_missing(Codex, &wrapped, Some("019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5c")));
+        assert!(!says_conversation_missing(Codex, &format!("$ codex resume -- {id}\nError: database is locked"), Some(id)),
+            "the id alone isn't the message");
+        assert!(says_conversation_missing(Claude, "No conver\nsation found with session ID: c-1", None));
     }
 }

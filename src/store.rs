@@ -54,19 +54,77 @@ pub struct HookCursor {
 }
 
 /// Hook-derived runtime facts, committed with the inbox cursor and session state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookSession {
     pub generation: u64,
     pub subagents: u32,
     pub last_hook_at: i64,
-    /// The run's latest Claude conversation id (SessionStart), for a tab that isn't a named
-    /// agent's (`Hub::resume_after_hook`).
+    /// The run's conversation (Claude: the latest reported id; Codex: its top-level thread),
+    /// `Hub::conversation_after_hook`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Codex: `conversation` is known to be the top-level thread (the run resumed it, or its
+    /// SessionStart hook named it), not only the first thread that finished a turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_sure: bool,
     /// Not part of the record: the session's new stored arguments, saved in the same
     /// transaction as the hook that changed them.
     #[serde(skip)]
     pub extra_args: Option<Vec<String>>,
+    /// Not part of the record: a Codex tab's new saved thread (Some(None): forget it), saved
+    /// in the same transaction (`CodexThread`).
+    #[serde(skip)]
+    pub tab_thread: Option<Option<CodexThread>>,
+    /// Not part of the record: a Codex agent's new conversation (Some(None): forget it).
+    #[serde(skip)]
+    pub thread: Option<Option<String>>,
+    /// Not part of the record: the hook came from a run Start fresh is replacing, so it changes
+    /// no conversation an agent resumes.
+    #[serde(skip)]
+    pub fenced: bool,
+    /// Not part of the record: a Codex notify from a thread that isn't the run's top-level
+    /// one (a sub-agent's turn): no reply, no state.
+    #[serde(skip)]
+    pub child: bool,
+}
+
+/// The Codex thread a tab's next start reopens (`runtime_state` key `codex-thread:<session>`),
+/// kept out of `sessions.extra_args` so older backends, whose argument check has no such flag,
+/// can still restart the tab. `generation`: the run that last carried it; a start resumes it
+/// only from that run, so a run an older backend started in between (a new conversation) wins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodexThread {
+    pub thread: String,
+    pub generation: u64,
+}
+
+fn save_codex_thread(conn: &Connection, session: SessionId, thread: Option<&CodexThread>) -> anyhow::Result<()> {
+    match thread {
+        Some(t) => conn.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", params![codex_thread_key(session), serde_json::to_string(t)?])?,
+        None => conn.execute("DELETE FROM runtime_state WHERE key=?1", [codex_thread_key(session)])?,
+    };
+    Ok(())
+}
+
+fn confirm_codex_agent_thread(conn: &Connection, agent: i64, thread: Option<&str>) -> anyhow::Result<()> {
+    match thread {
+        Some(t) => conn.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", params![codex_agent_thread_key(agent), serde_json::to_string(t)?])?,
+        None => conn.execute("DELETE FROM runtime_state WHERE key=?1", [codex_agent_thread_key(agent)])?,
+    };
+    Ok(())
+}
+
+pub fn codex_thread_key(session: SessionId) -> String {
+    format!("codex-thread:{session}")
+}
+
+/// A Codex agent's `resume_id` as this backend saved it (`runtime_state` key
+/// `codex-agent-thread:<agent>`). Older backends saved every notify's thread (Codex's title
+/// requests and sub-agents' included) without it: a record that doesn't match is not resumed.
+pub fn codex_agent_thread_key(agent: i64) -> String {
+    format!("codex-agent-thread:{agent}")
 }
 
 /// Which daily cap refused a message (`insert_agent_message_capped`), with the count.
@@ -940,11 +998,26 @@ impl Store {
         session_id: Option<SessionId>,
         resume_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn.lock().execute(
+        let conn = self.conn.lock();
+        conn.execute(
             "UPDATE agents SET channel_id = ?2, session_id = ?3, resume_id = ?4 WHERE id = ?1",
             params![id, channel_id, session_id, resume_id],
         )?;
+        // Only a hook (`commit_hook`) sets a Codex agent's thread; anything else forgets it.
+        if resume_id.is_none() {
+            confirm_codex_agent_thread(&conn, id, None)?;
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn confirm_codex_agent_thread_for_test(&self, agent: i64, thread: &str) {
+        confirm_codex_agent_thread(&self.conn.lock(), agent, Some(thread)).unwrap();
+    }
+
+    /// The Codex agent thread this backend confirmed (`codex_agent_thread_key`).
+    pub fn confirmed_codex_agent_thread(&self, agent: i64) -> anyhow::Result<Option<String>> {
+        self.load_runtime(&codex_agent_thread_key(agent))
     }
 
     /// The fields `agent.update` changes (`agents::update`).
@@ -1028,7 +1101,9 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        confirm_codex_agent_thread(&conn, id, None)?;
         Ok(())
     }
 
@@ -1185,6 +1260,9 @@ impl Store {
         if let Some(agent) = agent {
             tx.execute("UPDATE agents SET channel_id=?2, session_id=?3, resume_id=?4 WHERE id=?1",
                 params![agent.id, agent.channel_id, agent.session_id, agent.resume_id])?;
+            if agent.kind == SessionKind::Codex {
+                confirm_codex_agent_thread(&tx, agent.id, agent.resume_id.as_deref())?;
+            }
         }
         tx.execute("INSERT INTO runtime_state(key,record) VALUES ('agent-attribution',?1)
             ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(attribution)?])?;
@@ -1202,9 +1280,22 @@ impl Store {
                 tx.execute("UPDATE sessions SET extra_args = ?2 WHERE id = ?1",
                     params![info.id, serde_json::to_string(args)?])?;
             }
+            if let Some(thread) = &runtime.tab_thread {
+                save_codex_thread(&tx, info.id, thread.as_ref())?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// A Codex tab's saved thread (`CodexThread`), if any.
+    pub fn codex_thread(&self, session: SessionId) -> anyhow::Result<Option<CodexThread>> {
+        self.load_runtime(&codex_thread_key(session))
+    }
+
+    /// Save (None: forget) a Codex tab's thread.
+    pub fn set_codex_thread(&self, session: SessionId, thread: Option<&CodexThread>) -> anyhow::Result<()> {
+        save_codex_thread(&self.conn.lock(), session, thread)
     }
 
     pub fn load_hook_session(&self, id: SessionId, generation: u64) -> anyhow::Result<Option<HookSession>> {
@@ -2035,6 +2126,7 @@ impl Store {
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [codex_thread_key(id)])?;
         tx.commit()?;
         Ok(())
     }
@@ -2354,7 +2446,7 @@ mod tests {
         info.state = AgentState::Idle;
         info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
         let cursor = HookCursor { instance: "fixture".into(), sequence: 4 };
-        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234, conversation: None, extra_args: None };
+        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234, ..Default::default() };
         info.state = AgentState::Working;
         info.state_detail = Some("Agent".into());
         info.state_since = 1234;

@@ -719,6 +719,7 @@ mod tests {
             extra_args: vec!["--model".into(), "haiku".into()],
             initial_prompt: Some("-do it".into()),
             permissions: Permissions::default(),
+            resume: None,
         };
         let spec = ClaudeAdapter.command(&ctx).unwrap();
         assert!(spec.consumed_initial_prompt);

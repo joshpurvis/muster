@@ -454,7 +454,13 @@ pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, why: String
         return;
     }
     match hub.store().set_agent_message_refused(msg, &why) {
-        Ok(()) => crate::agents::publish_message(hub, msg),
+        Ok(answered) => {
+            crate::agents::publish_message(hub, msg);
+            // It carried a late reply: that one wasn't delivered either.
+            if let Some(orig) = answered {
+                crate::agents::publish_message(hub, orig);
+            }
+        }
         Err(e) => tracing::warn!(msg, "recording a budget refusal: {e:#}"),
     }
 }

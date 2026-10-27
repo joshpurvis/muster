@@ -273,6 +273,34 @@ export interface AgentMessage {
   /** Typed in after the agent's prompt cache had likely expired: how long it had been idle
    * (ms). Null or missing: warm, not delivered yet, or an older daemon. */
   cold_idle_ms?: number | null;
+  /** The agent's later answer (MCP `reply`), and how it reached the asker. Missing: an older
+   * daemon. */
+  answer?: LateAnswer | null;
+}
+
+/** How a late reply stands: `pending`/`delivering` until it reaches the asker. */
+export type LateAnswerStatus =
+  | "pending"
+  | "delivering"
+  | "returned"
+  | "delivered"
+  | "shown"
+  | "refused"
+  | "undelivered";
+
+export interface LateAnswer {
+  text: string;
+  /** When the agent replied (unix ms). */
+  at: number;
+  from_session: SessionId;
+  origin: Origin;
+  hop: number;
+  status: LateAnswerStatus;
+  note?: string | null;
+  /** The message that carried it to an asking agent. */
+  msg?: number | null;
+  /** The session it was typed into. */
+  session?: SessionId | null;
 }
 
 /** A New agent template (`agent.templates`). */

@@ -1,5 +1,6 @@
 mod account_profiles;
 mod adapters;
+mod agent_reply;
 mod agents;
 mod assets;
 mod cache;
@@ -404,6 +405,19 @@ carries that session's origin (docs/MCP.md, \"Agents\").")]
         #[arg(long)]
         json: bool,
     },
+    /// Inside an agent's session: answer a message it received, after the turn that received it.
+    #[command(after_help = "Examples:\n  muster reply 42 the benchmarks finished: all green\n  cat report.md | muster reply 42 -\n\n\
+Runs the session's MCP `reply` tool: once per message, only for messages Muster delivered to this\n\
+agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").")]
+    Reply {
+        /// The message's id, from its `[muster msg <id> ...]` line.
+        msg_id: i64,
+        /// Words, joined by spaces. None or `-`: read stdin.
+        text: Vec<String>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
     NativeWindow {
@@ -799,6 +813,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::ask(d, &agent, &text, timeout, json),
+        Cmd::Reply { msg_id, text, json } => cli::reply(d, msg_id, &text, json),
         _ => unreachable!("dispatched in main"),
     }
 }
@@ -1834,7 +1849,13 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
     // Agents with autostart on (their homes were moved above, before anything could start).
     {
         let hub = hub.clone();
-        tokio::spawn(async move { agents::autostart(&hub).await });
+        // Late replies a previous backend stored but didn't deliver (src/agent_reply.rs), read
+        // now, before the server takes requests: this backend's own deliveries are never among them.
+        let unfinished = agent_reply::unfinished(&hub);
+        tokio::spawn(async move {
+            agents::autostart(&hub).await;
+            agent_reply::resume(&hub, unfinished).await;
+        });
     }
     // Schedules: finish runs a previous backend left, then fire on time (src/schedules/); the
     // trigger watchers (git refs, GitHub through gh) and the OpenRouter spend sampler.
@@ -1945,6 +1966,8 @@ mod tests {
         assert!(parse(&["ask", "ada", "hi"]).is_ok());
         // Provenance comes from the calling session, never from a flag.
         assert!(parse(&["ask", "ada", "hi", "--origin", "human"]).is_err());
+        assert!(parse(&["reply", "42", "all", "green"]).is_ok());
+        assert!(parse(&["reply", "x", "hi"]).is_err());
         assert!(matches!(parse(&["agent", "start", "ada", "--fresh"]), Ok(Cmd::Agent { .. })));
     }
 

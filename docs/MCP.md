@@ -96,7 +96,8 @@ and targets in them are refused.
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
 | `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
-| `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. See "Agents" below. |
+| `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message. See "Agents" below. |
+| `reply` | `msg_id`, `text` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, or starts with `!` (unless shell commands are allowed). |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
 
@@ -737,6 +738,51 @@ agent session, `muster ask` runs this server's `ask_agent` and `muster send` its
 that session (same guards, rate limits and audit event, with `via: "cli"` in the args); `muster
 keys` and `muster new` carry its provenance and the Claude origin rule. A shell session is a human
 typing in a shell tab, with that shell's provenance if an agent ever typed into it.
+
+**Late replies.** An agent can answer a message after the turn that received it, e.g. once a
+long job finishes: it says so in that turn's reply, then calls `reply {msg_id, text}` (or runs
+`muster reply <msg_id> TEXT` in its terminal, which calls this tool with its session's own token). Code:
+`src/agent_reply.rs`.
+
+- *Who:* only the named agent the message was addressed to (its current session, also after a
+  restart), only for a message Muster typed into it (`delivered_at`, set when the injector
+  presses Enter; never a refused or still-queued one), and once per message: a second `reply`
+  is an error. To say more, it asks the sender with `ask_agent`.
+- *Stored first:* the answer goes on the message's row (`agent_messages.answer`, JSON: text,
+  time, route, status, note) before any delivery, so a backend reload never loses it; one a
+  restart interrupted is delivered at the next start (an interrupted delivery to an agent is
+  matched to the message that already carried it, never sent twice; one being typed into a
+  plain session is marked "may not have arrived" rather than typed again).
+- *Route:* the stricter of the message's chain and the replier's current provenance (a
+  non-human origin wins, then the higher hop), one hop on. So a reply written while handling a
+  scheduled job is unattended work, and a reply chain ends at hop 4 like any other. The reply
+  also keeps every non-human origin it is rooted in (`origins`: a webhook-rooted question
+  answered during scheduled work is both), and an asking agent must accept each of them; a
+  Claude session takes none. A waiting ask takes the reply only when it brings no origin the
+  question's chain didn't have; otherwise it goes the guarded way, as a new message.
+- *The asker* is the agent that sent the message: if it was removed and a new agent took its
+  name, the reply is kept in the log (`undelivered`), never sent to the newcomer.
+- *Recovery:* the late replies left unfinished are read at daemon start, before the server takes
+  requests. A carrying message that was recorded but never queued (the restart came in between)
+  is dropped and sent again; one the spend cap refuses later in the asker's queue marks the
+  reply `refused`. A delivery cut off by the backend shutting down stays `pending` for the next
+  start.
+- *How the asker gets it:*
+
+  | Asker | What happens | Status |
+  |---|---|---|
+  | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 3 s untaken, e.g. the ask was cancelled, the next row applies). | `returned` |
+  | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
+  | Another Claude or Codex session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
+  | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the agents panel's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
+  | An agent since removed, a session that ended | Kept in the log only. | `undelivered` |
+
+  A reply to an asker is a reply to that asker's own question, so two rules for starting work
+  don't apply: the workspace rule (an agent may answer a project session that asked it) and
+  the permission-widening check (a plan-mode researcher may answer a wider orchestrator). All
+  the others do, and `reply` shares `send_message`'s rate limit (20 per minute).
+- *Seen in:* `agent.messages` and `agent_message` events (`answer` on the message answered;
+  the carrying message's `reply_to` points back), `muster events` (`late reply: STATUS`).
 
 **Refusals are logged.** A message refused by the agent's policy (`ask_agent`'s permission
 check, origin rule, hop limit, daily cap or unattended cap, and the same checks behind `muster ask`) is kept in

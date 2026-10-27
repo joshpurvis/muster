@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 28] = [
+pub const TOOL_NAMES: [&str; 29] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -34,6 +34,7 @@ pub const TOOL_NAMES: [&str; 28] = [
     "get_diff",
     "list_agents",
     "ask_agent",
+    "reply",
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
     "note_list", "note_read", "note_write", "note_append", "note_open",
     "list_schedules", "propose_schedule", "set_reminder", "pause_schedule", "delete_schedule",
@@ -238,6 +239,21 @@ pub fn tool_definitions() -> Vec<Value> {
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 600, "description": "How long to wait for the reply."}
                 },
                 "required": ["agent", "text"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "reply",
+            "Reply to a message later",
+            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text; otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "integer", "description": "The id from the message's [muster msg <id> ...] line."},
+                    "text": {"type": "string", "description": "Your answer; multi-line is fine."}
+                },
+                "required": ["msg_id", "text"],
                 "additionalProperties": false
             }),
             false,
@@ -498,6 +514,7 @@ pub async fn call_tool<B: Backend>(
         // accepted (same guards), not listed.
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
+        "reply" => reply(st, caller, &a).await,
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
         "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
         "list_schedules" | "propose_schedule" | "set_reminder" | "pause_schedule" | "delete_schedule" => schedule_tool(st, caller, name, map),
@@ -1327,6 +1344,8 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         from_session: Some(caller),
         route,
     };
+    // A reply that comes before this ask starts waiting below still goes to it.
+    let asking = st.backend.agent_asking(agent.id, caller);
     let d = match st.backend.agent_deliver(out).await {
         Ok(d) => d,
         Err(e) => {
@@ -1340,8 +1359,11 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         g.last_send.insert(d.session_id, d.sent_at_ms);
         if !d.delivered { g.note_queued(d.session_id, d.queued); }
     }) { tracing::warn!("{error}"); }
-    // Wait for this message's own turn (not whatever runs before it in the queue).
+    // Wait for this message's own turn (not whatever runs before it in the queue); the agent's
+    // `reply` to it meanwhile ends the wait too.
     let mut rx = st.backend.subscribe();
+    let _waiting = st.backend.agent_wait(d.msg_id);
+    drop(asking);
     let (info, verdict, waited_ms) = crate::agents::wait_for_reply(
         &mut rx,
         d.session_id,
@@ -1354,6 +1376,43 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         .then(|| st.backend.recent_output(d.session_id, AGENT_FALLBACK_LINES))
         .flatten();
     Ok(pretty(&crate::agents::ask_result(&agent.name, &d, route, &info, &verdict, waited_ms, tail)))
+}
+
+/// The caller (a named agent) answers a message it received, after the turn that received it
+/// (src/agent_reply.rs). Same size limit, text cleaning, `!` rule and rate limit as ask_agent.
+async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let msg_id = a.req_int("msg_id")?;
+    let text = a.req_str("text")?;
+    caller_session(st, caller)?;
+    if text.chars().count() > st.limits.max_message_chars {
+        return Err(format!("text too long (max {} characters)", st.limits.max_message_chars));
+    }
+    let text = clean_text(text);
+    if text.trim().is_empty() {
+        return Err("text must not be empty".into());
+    }
+    // Where it is typed (an agent or session), a leading `!` would run as a shell command.
+    if !st.limits.allow_shell && text.trim_start().starts_with('!') {
+        return Err(format!(
+            "a reply starting with `!` would run as a shell command where it is typed, which agents may not do. Rephrase it. {HOW_SHELL}"
+        ));
+    }
+    if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
+        caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
+    ))? {
+        return Err(format!(
+            "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
+            st.limits.send_per_window
+        ));
+    }
+    match st.backend.agent_reply(caller, msg_id, text).await {
+        Ok(v) => Ok(pretty(&v)),
+        Err(e) => {
+            // Refused before anything was stored or sent: the slot isn't used.
+            if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+            Err(format!("{e:#}"))
+        }
+    }
 }
 
 /// ask_agent's default wait, and how much terminal output stands in for a reply no hook

@@ -195,7 +195,14 @@ type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "h
              to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
              origin: Origin; hop: number; reply_to: number | null; created_at: number;
              text: string | null /* null: sent before text was kept */; reply: string | null; replied_at: number | null;
-             refused: string | null /* why the policy refused it: never delivered */ };
+             refused: string | null /* why the policy refused it: never delivered */;
+             cold_idle_ms: number | null;
+             answer: LateAnswer | null /* the agent's later `reply`, docs/MCP.md "Late replies" */ };
+type LateAnswer = { text: string; at: number; from_session: number; origin: Origin; hop: number /* its route */;
+             origins?: Origin[] /* every non-human origin it is rooted in: the question's chain and the replier's work */;
+             status: "pending" | "delivering" | "returned" | "delivered" | "shown" | "refused" | "undelivered";
+             note?: string /* how it went, in words */; msg?: number /* the message that carried it to an agent */;
+             session?: number /* the session it was typed into */ };
 type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
              model: string | null; effort: string | null; persona: string; permissions: Permissions;
              accepts: Origin[]; autostart: boolean };
@@ -211,8 +218,8 @@ type OpenRouterModel = { id: string /* --model / -m, e.g. "anthropic/claude-sonn
 Agent events (also on `GET /api/events`; never sent to paired devices):
 `{"event":"agent_upserted","data":Agent}` when an agent is created or its record changes (edit,
 start, its tab, its conversation id), `{"event":"agent_removed","data":{"id","name"}}`, and
-`{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused or gets its
-reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
+`{"event":"agent_message","data":AgentMessage}` when a message is recorded, refused, gets its
+reply, or gets or delivers a late reply (the same id again). An agent's state changes arrive as its session's `session_upserted`.
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.

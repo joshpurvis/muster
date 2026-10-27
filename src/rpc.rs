@@ -1174,6 +1174,8 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                 }
             }
         }
+        // No `agent.reply`: `muster reply` calls the session's MCP `reply` with that session's own
+        // token (src/agent_reply.rs), so no client-token holder can answer as an agent.
 
         // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes, approves or changes them:
         // a call on an agent session's behalf is refused, except what an agent may do through its
@@ -2665,6 +2667,40 @@ mod tests {
         assert!(!format!("{:?}", hub.store().load_agents().unwrap()).contains(KEY));
         // A device never learns about OpenRouter's models.
         assert!(crate::devices::method_scope("openrouter.models").is_none());
+    }
+
+    #[tokio::test]
+    async fn reply_is_only_the_agents_own_mcp_tool() {
+        let (hub, st) = fixture();
+        agent(&hub, "rpc-rex");
+        let rex = hub.agents().get("rpc-rex").unwrap();
+        hub.agents().link_session(hub.store(), rex.id, Some(3)).unwrap();
+        let route = crate::agents::Route { origin: Origin::Human, hop: 0, reply_to: None };
+        let m = hub.store().insert_agent_message(&crate::agents::message_record(&rex, "human", None, route, "how long?")).unwrap();
+        hub.store().set_agent_message_delivered(m, now_ms() - 60_000).unwrap();
+        // No RPC answers on an agent's behalf (a client-token holder could name its session):
+        // `muster reply` calls MCP with the session's own token.
+        let e = call(&hub, "agent.reply", json!({"msg_id": m, "text": "x", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("unknown method"), "{e}");
+        let reply = |from, text: &str| crate::mcp::call_as(&hub, from, "reply", json!({"msg_id": m, "text": text}));
+        // A session that isn't the agent can't reply.
+        for from in [1, 2] {
+            let e = reply(from, "x").await.unwrap_err();
+            assert!(e.contains("isn't one") || e.contains("no message"), "{e}");
+        }
+        // `!` would run as a command where it is typed.
+        assert!(reply(3, "!rm -rf x").await.unwrap_err().contains("shell command"));
+        let r: Value = serde_json::from_str(&reply(3, "two hours").await.unwrap()).unwrap();
+        assert_eq!((r["status"].as_str(), r["delivered"].as_bool()), (Some("shown"), Some(true)), "{r}");
+        let logged = crate::agents::messages(&hub, Some("rpc-rex"), None, None).unwrap();
+        assert_eq!(logged["messages"][0]["answer"]["text"], "two hours");
+        // Once per message; refusals don't use up the send rate limit, deliveries do.
+        assert!(reply(3, "again").await.unwrap_err().contains("already replied"));
+        assert!(st.guard.lock().sends.check_and_record(3, now_ms(), 1, 60_000).is_err(), "the reply used a slot");
+        assert!(st.guard.lock().sends.check_and_record(3, now_ms(), 2, 60_000).is_ok(), "and only it did");
+        // Audited like any MCP call.
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["tool"] == "reply"));
     }
 
     #[tokio::test]

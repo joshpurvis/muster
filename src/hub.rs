@@ -498,6 +498,8 @@ pub struct Hub {
     devices: crate::devices::Registry,
     /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
     agents: crate::agents::Registry,
+    /// The agent messages an ask is waiting for (a late `reply` goes to it; src/agent_reply.rs).
+    pub(crate) replies: crate::agent_reply::Waiters,
     pub(crate) injection: crate::inject::Queues,
     /// The MCP server (weak: it holds the hub), set by `mcp::router`.
     #[allow(clippy::type_complexity)]
@@ -920,6 +922,7 @@ impl Hub {
             cfg,
             devices,
             agents,
+            replies: Default::default(),
             injection,
             mcp: Mutex::new(None),
             state_seq,
@@ -1433,7 +1436,14 @@ impl Hub {
             anyhow::ensure!(g.sessions.get(&id).is_some_and(|entry| Some(entry.generation) == generation),
                 "terminal generation changed before prompt attribution");
             self.agents.on_delivered(id, source, now)
-        })
+        })?;
+        // Evidence that the agent received it, so it may `reply` to it later (src/agent_reply.rs).
+        if let crate::agents::Source::Chain(crate::agents::Prov { msg_id: Some(msg), .. }) = source
+            && let Err(error) = self.store.set_agent_message_delivered(msg, now)
+        {
+            tracing::warn!(session = id, msg, "recording a delivery: {error:#}");
+        }
+        Ok(())
     }
 
     /// The session's current terminal handle for input. Never takes `inner` (held across
@@ -5385,7 +5395,7 @@ mod tests {
         hub.inner.lock().sessions.get_mut(&2).unwrap().generation = 42;
         let message = || hub.store.insert_agent_message(&AgentMessage { id: 0, from: "fixture".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 1,
-            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None }).unwrap();
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
         let first = message();
         let next = message();
         let source = |msg| Source::Chain(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(msg) });
@@ -6802,7 +6812,7 @@ mod tests {
         let msg = hub.store.insert_agent_message(&AgentMessage { id: 0, from: "schedule:1".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 0,
             reply_to: None, created_at: 1, reply: None, replied_at: None, text: Some("digest".into()),
-            refused: None, to_name: None, cold_idle_ms: None }).unwrap();
+            refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
         let mut events = hub.subscribe();
         let prov = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) };
         hub.note_cold_send(2, prov, false, &format!("msg:{msg}"), idle);

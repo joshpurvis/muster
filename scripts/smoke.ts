@@ -221,12 +221,13 @@ async function main() {
   await Deno.mkdir(`${BASE}/bin`, { recursive: true });
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
+printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token-'"$MUSTER_SESSION_ID"
 ${LAUNCH_DUMP("codex")}
 if [ "$1" = resume ] && [ "\${@: -1}" = stale-thread ]; then echo 'Error: No saved session found with ID stale-thread. Run \`codex resume\` without an ID to choose from existing sessions.'; exit 1; fi
 if [ "$1" = resume ] && [ -e '${BASE}/codex-broken' ]; then echo 'Error: failed to initialize state runtime: database is locked'; exit 1; fi
 stty -echo -icanon min 1 time 0
 printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
-exec cat > '${BASE}/fake-input'
+exec tee '${BASE}/fake-input-'"$MUSTER_SESSION_ID" > '${BASE}/fake-input'
 `);
   await Deno.chmod(`${BASE}/bin/codex`, 0o700);
   // Stand-in Claude: records how it was launched, then idles (never starts a real agent).
@@ -1257,6 +1258,7 @@ exec cat > /dev/null
   ok(!!(await sessOf(agentSid)), "Stop (session.kill) stops it; its tab stays");
   await c.call("agent.remove", { name: "bg" });
 
+  await lateReplies(c, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
   ({ c, d } = await schedules(c, d));
@@ -1265,6 +1267,126 @@ exec cat > /dev/null
   ({ c, d } = await phoneAlerts(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
+}
+
+/** Late replies (docs/MCP.md "Late replies"): two fake Codex agents stand in for an asker and a
+ * helper that answers after its turn. */
+async function lateReplies(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+  await c.call("agent.create", { name: "asker", kind: "codex" });
+  await c.call("agent.create", { name: "helper", kind: "codex" });
+  const askerStart = (await c.call("agent.start", { name: "asker" })).session;
+  const askerS: number = askerStart.id;
+  const helperS: number = (await c.call("agent.start", { name: "helper" })).session.id;
+  // A plain Codex session (not a named agent) beside it.
+  const plainS: number = (await c.call("session.spawn", { channel_id: askerStart.channel_id, kind: "codex" })).id;
+  for (const id of [askerS, helperS, plainS]) {
+    await c.waitFor(`agent ${id} idle`, () => c.events.some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state === "idle"));
+  }
+  const tokenOf = async (id: number) => {
+    const path = `${BASE}/fake-token-${id}`;
+    for (let n = 0; n < 100 && !(await exists(path)); n++) await sleep(100);
+    return await Deno.readTextFile(path);
+  };
+  /** Session `id`'s fake terminal got `needle` (waits up to 10 s). */
+  const got = async (id: number, needle: string) => {
+    for (let n = 0; n < 100; n++) {
+      const text = await Deno.readTextFile(`${BASE}/fake-input-${id}`).catch(() => "");
+      if (text.includes(needle)) return true;
+      await sleep(100);
+    }
+    return false;
+  };
+  const refused = (p: Promise<unknown>, needle: string) => p.then(() => "", (e) => String(e)).then((e) => e.includes(needle) ? true : e);
+  /** `reply` once the message's Enter was pressed (its paste shows up a moment before). */
+  const reply = async (token: string, msg_id: number, text: string) => {
+    for (let n = 0; ; n++) {
+      try {
+        return await mcp(token, "reply", { msg_id, text });
+      } catch (e) {
+        if (n > 50 || !String(e).includes("hasn't reached you")) throw e;
+        await sleep(100);
+      }
+    }
+  };
+  const askerT = await tokenOf(askerS);
+  const helperT = await tokenOf(helperS);
+  const plainToken = await tokenOf(plainS);
+  const msgOf = async (agent: string, id: number) =>
+    (await c.call("agent.messages", { agent, limit: 50 })).messages.find((m: Json) => m.id === id);
+
+  // The human asks; the fake never answers, so the ask times out and says a late reply will come.
+  const asked = await c.call("agent.ask", { agent: "helper", text: "how long will the build take?", timeout_ms: 1000 });
+  ok(asked.timed_out === true && String(asked.note).includes("new message"), `a timed-out ask says a late reply comes later (${asked.note})`);
+  ok(await got(helperS, `[muster msg ${asked.msg_id} from human origin=human hop=0]`), "the helper got the message");
+  // Only the agent it was delivered to replies.
+  ok(await refused(mcp(askerT, "reply", { msg_id: asked.msg_id, text: "not mine" }), "no message") === true, "another agent can't reply to it");
+  const plain = await refused(mcp(plainToken, "reply", { msg_id: asked.msg_id, text: "not an agent" }), "isn't one");
+  ok(plain === true, `a session that isn't an agent can't reply (${plain})`);
+  const r1 = await reply(helperT, asked.msg_id, "about ten minutes");
+  ok(r1.status === "shown" && r1.delivered === true, `the human's late reply is shown in the log (${JSON.stringify(r1)})`);
+  const m1 = await msgOf("helper", asked.msg_id);
+  ok(m1.answer?.text === "about ten minutes" && m1.answer.status === "shown", "agent.messages carries the late reply");
+  ok(await refused(mcp(helperT, "reply", { msg_id: asked.msg_id, text: "again" }), "already replied") === true, "a message takes one reply");
+  ok(c.events.some((e) => e.event === "agent_message" && e.data.id === asked.msg_id && e.data.answer?.status === "shown"), "clients get the late reply as agent_message");
+
+  // An agent asked and stopped waiting: the answer comes to it as a new message.
+  const a2 = await mcp(askerT, "ask_agent", { agent: "helper", text: "run the benchmarks\nand report", timeout_seconds: 1 });
+  ok(a2.timed_out === true, "the asking agent's ask timed out");
+  const r2 = await reply(helperT, a2.msg_id, "benchmarks: all green");
+  ok(r2.status === "delivered" && typeof r2.delivered_as === "number" && r2.hop === a2.hop + 1,
+    `a late reply to an agent is a new message one hop on (${JSON.stringify(r2)})`);
+  ok(await got(askerS, `[muster msg ${r2.delivered_as} from helper origin=human hop=${r2.hop}]`) &&
+    await got(askerS, `Late reply to your message ${a2.msg_id} ("run the benchmarks"):`) &&
+    await got(askerS, "benchmarks: all green"), "the asker gets it typed in after an envelope");
+  const carried = await msgOf("asker", r2.delivered_as);
+  ok(carried.reply_to === a2.msg_id && carried.from === "helper", "the carrying message points at the message it answers");
+  ok((await msgOf("helper", a2.msg_id)).answer.msg === r2.delivered_as, "the answered message names the message that carried it");
+
+  // An ask still waiting ends with the reply instead.
+  const waiting = mcp(askerT, "ask_agent", { agent: "helper", text: "quick one", timeout_seconds: 30 });
+  let id3 = 0;
+  for (let n = 0; n < 100 && !id3; n++) {
+    id3 = (await c.call("agent.messages", { agent: "helper", limit: 10 })).messages.find((m: Json) => m.text === "quick one")?.id ?? 0;
+    if (!id3) await sleep(100);
+  }
+  const r3 = await reply(helperT, id3, "done already");
+  const w = await waiting;
+  ok(r3.status === "returned" && w.reply === "done already" && w.timed_out === false,
+    `a waiting ask ends with the late reply (${JSON.stringify(r3)}, ${JSON.stringify(w).slice(0, 200)})`);
+
+  // A plain Codex session asked and stopped waiting: the answer is typed into it after a header
+  // that is no agent envelope.
+  const a4 = await mcp(plainToken, "ask_agent", { agent: "helper", text: "which port?", timeout_seconds: 1 });
+  ok(a4.timed_out === true, "the plain session's ask timed out");
+  const r4 = await reply(helperT, a4.msg_id, "port 8080");
+  ok(r4.status === "delivered" && r4.session_id === plainS, `a late reply to a plain session is typed into it (${JSON.stringify(r4)})`);
+  ok(await got(plainS, `[muster reply to msg ${a4.msg_id} from helper origin=human hop=${r4.hop}]`) &&
+    await got(plainS, "port 8080"), "the plain session gets it after a reply header");
+
+  // `muster reply` is the agent's own tool; outside an agent's session it is refused.
+  const outside = await new Deno.Command(BIN, { args: ["reply", String(id3), "hi"], env: ENV, stdout: "piped", stderr: "piped" }).output();
+  ok(!outside.success && dec.decode(outside.stderr).includes("inside an agent's session"), "muster reply outside an agent's session is refused");
+  // The session's own token decides who replies: naming the helper's session id with the
+  // asker's token is the asker replying (refused), never the helper.
+  const cli = (env: Record<string, string>, ...args: string[]) =>
+    new Deno.Command(BIN, { args: ["reply", ...args], env: { ...ENV, ...env }, stdout: "piped", stderr: "piped" }).output();
+  const plainCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: askerT }, String(id3), "hi");
+  ok(!plainCli.success && dec.decode(plainCli.stderr).includes("no message"), "muster reply can't answer as another agent");
+  const noToken = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: "" }, String(id3), "hi");
+  ok(!noToken.success && dec.decode(noToken.stderr).includes("MCP tool `reply`"), "muster reply without the session's token points to the MCP tool");
+  // The helper's own `muster reply` works.
+  const a5 = await mcp(askerT, "ask_agent", { agent: "helper", text: "and the docs?", timeout_seconds: 1 });
+  for (let n = 0; n < 50 && !(await got(helperS, `[muster msg ${a5.msg_id} `)); n++) await sleep(100);
+  let viaCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: helperT }, String(a5.msg_id), "docs", "built");
+  for (let n = 0; n < 50 && !viaCli.success && dec.decode(viaCli.stderr).includes("hasn't reached you"); n++) {
+    await sleep(100);
+    viaCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: helperT }, String(a5.msg_id), "docs", "built");
+  }
+  ok(viaCli.success && dec.decode(viaCli.stdout).includes("delivered to asker"), `the agent's own muster reply delivers (${dec.decode(viaCli.stdout)}${dec.decode(viaCli.stderr)})`);
+  ok(await got(askerS, "docs built"), "and the asker gets it");
+  await c.call("session.remove", { id: plainS });
+  await c.call("agent.remove", { name: "asker" });
+  await c.call("agent.remove", { name: "helper" });
 }
 
 /** The fake CLI's launch record for session `id` (waits until it is written). */

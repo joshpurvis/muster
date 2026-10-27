@@ -24,6 +24,7 @@ cleanup() {
 trap cleanup EXIT
 deno run \
   --allow-net=127.0.0.1 \
+  --allow-env=MUSTER_SMOKE_PORT \
   --allow-read="$TMP,$BIN" \
   --allow-write="$TMP" \
   --allow-run="$BIN,git,python3,unshare,openssl" \

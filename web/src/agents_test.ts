@@ -1,5 +1,6 @@
 import {
   agentStatus,
+  carriesLateReply,
   ago,
   asleepText,
   isAsleep,
@@ -12,6 +13,7 @@ import {
   effortsFor,
   feedFor,
   firstLine,
+  lateText,
   keepForKind,
   listedModels,
   MEMORY_FILE_MAX,
@@ -363,4 +365,23 @@ Deno.test("OpenRouter: the badge follows the run, not only the saved setting", (
   assertEquals(agentBilling(agent({ provider: "subscription", session_id: 7 }), run(undefined)).badge, false);
   assertEquals(providerPendingNote(agent({ provider: "openrouter", session_id: 7 }), run("openrouter")), null);
   assertEquals(providerPendingNote(onOr, run("openrouter", "exited")), null);
+});
+
+Deno.test("a late reply says how it reached the asker", () => {
+  const a = { text: "42", at: 1, from_session: 3, origin: "human" as const, hop: 2 };
+  check(lateText({ ...a, status: "returned" }).includes("still waiting"), "returned");
+  assertEquals(lateText({ ...a, status: "delivered", note: "delivered to ada as message 9" }), "Delivered to ada as message 9.");
+  check(lateText({ ...a, status: "shown" }).startsWith("Shown here"), "shown");
+  assertEquals(
+    lateText({ ...a, status: "refused", note: "not delivered to ada: agent ada accepts only human messages" }),
+    "Kept here, not delivered: to ada: agent ada accepts only human messages.",
+  );
+  assertEquals(lateText({ ...a, status: "undelivered", note: "not delivered: session 4, which asked, has ended" }),
+    "Kept here, not delivered: session 4, which asked, has ended.");
+});
+
+Deno.test("a message that carried a late reply is told by its own text", () => {
+  check(carriesLateReply(msg(9, 1, { reply_to: 4, text: 'Late reply to your message 4 ("x"):\nok' })), "carrier");
+  check(!carriesLateReply(msg(9, 1, { reply_to: 4, text: "while handling 4" })), "ordinary chained message");
+  check(!carriesLateReply(msg(9, 1, { reply_to: 5, text: "Late reply to your message 4:\nok" })), "another message's");
 });

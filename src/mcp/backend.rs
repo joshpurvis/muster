@@ -79,10 +79,21 @@ pub trait Backend: Send + Sync + 'static {
     fn agent_messages_since(&self, agent_id: i64, since: i64) -> usize;
     /// Start the agent if needed, record and send the message (`agents::deliver`).
     fn agent_deliver(&self, out: Outgoing) -> impl Future<Output = anyhow::Result<Delivery>> + Send;
-    /// Where an agent message stands: delivered, running, its reply.
+    /// Where an agent message stands: delivered, running, its reply (a late `reply` left for a
+    /// waiting ask included).
     fn agent_message_status(&self, msg_id: i64) -> MsgStatus;
     /// Keep a message the agent's policy refused, for the log (`agents::record_refused`).
     fn agent_refused(&self, m: AgentMessage, why: &str);
+    /// An ask waits for message `msg_id` until the guard drops: a late `reply` to it goes to
+    /// that ask (src/agent_reply.rs).
+    fn agent_wait(&self, _msg_id: i64) -> Option<crate::agent_reply::WaitGuard> { None }
+    /// The caller is delivering an ask to `agent_id` (its message id comes after): until the
+    /// guard drops, a reply waits for that ask too.
+    fn agent_asking(&self, _agent_id: i64, _caller: SessionId) -> Option<crate::agent_reply::WaitGuard> { None }
+    /// The caller (an agent) answers a message it received, after its turn (`agent_reply::reply`).
+    fn agent_reply(&self, _caller: SessionId, _msg_id: i64, _text: String) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
+        async { anyhow::bail!("replies unavailable in this backend") }
+    }
 }
 
 #[derive(Clone)]
@@ -181,10 +192,19 @@ impl Backend for HubBackend {
         crate::agents::deliver(&self.0, out).await
     }
     fn agent_message_status(&self, msg_id: i64) -> MsgStatus {
-        self.0.agents().msg_status(self.0.store(), msg_id)
+        crate::agent_reply::status(&self.0, msg_id)
     }
     fn agent_refused(&self, m: AgentMessage, why: &str) {
         crate::agents::record_refused(&self.0, &m, why)
+    }
+    fn agent_wait(&self, msg_id: i64) -> Option<crate::agent_reply::WaitGuard> {
+        Some(self.0.replies.wait(msg_id))
+    }
+    fn agent_asking(&self, agent_id: i64, caller: SessionId) -> Option<crate::agent_reply::WaitGuard> {
+        Some(self.0.replies.asking(agent_id, Some(caller)))
+    }
+    async fn agent_reply(&self, caller: SessionId, msg_id: i64, text: String) -> anyhow::Result<serde_json::Value> {
+        crate::agent_reply::reply(&self.0, caller, msg_id, text).await
     }
 }
 

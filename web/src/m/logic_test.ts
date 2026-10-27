@@ -11,6 +11,7 @@ import {
   programScrolls,
   relativeTime,
   repeatBytes,
+  ReplayCursor,
   returnNotches,
   scrollPosition,
   sessionOrder,
@@ -183,4 +184,27 @@ Deno.test("saved scroll state follows the session's run and its unseen activity"
   const fresh = programScrollFor(saved, { ...claude, pid: 101 });
   equal(fresh, { run: 101, back: 0, behind: false, at: null });
   equal(programScrollFor(saved, { ...claude, pid: 102 }) === fresh, false);
+});
+
+Deno.test("the replay cursor counts live bytes on from the replay and appends only deltas", () => {
+  const c = new ReplayCursor();
+  equal(c.since(), null);
+  c.info({ id: 1, kind: "screen", offset: 100, generation: 2, epoch: "e" });
+  equal(c.replay(), false);
+  c.output(5);
+  c.output(7);
+  equal(c.since(), { offset: 112, generation: 2, epoch: "e" });
+  c.info({ id: 1, kind: "delta", offset: 150, generation: 2, epoch: "e" });
+  equal(c.replay(), true);
+  c.output(1);
+  equal(c.since()?.offset, 151);
+  // A replay without attach_info (an older daemon) replaces and leaves the offset unknown.
+  equal(c.replay(), false);
+  equal(c.since(), null);
+  c.output(3);
+  equal(c.since(), null);
+  // A session from an earlier daemon run can't be resumed.
+  c.info({ id: 1, kind: "full", offset: 0, generation: null, epoch: "e" });
+  c.replay();
+  equal(c.since(), null);
 });

@@ -191,3 +191,46 @@ export function relativeTime(since: number, now = Date.now()): string {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
 }
+
+/** `attach_info` (docs/PROTOCOL.md "Remote devices"): what the next replay frame is and the raw
+ * output offset it ends at. `generation` is null for a session from an earlier daemon run. */
+export interface AttachInfo {
+  id: number;
+  kind: "full" | "screen" | "delta";
+  offset: number;
+  generation: number | null;
+  epoch: string;
+}
+export interface Since {
+  offset: number;
+  generation: number;
+  epoch: string;
+}
+
+/** Where the phone's terminal stands in its session's raw output, so a reattach can ask for
+ * only what it missed (`replay: {since}`): the offset of the last replay plus every live byte
+ * received after it. A `delta` replay appends; any other replay replaces the terminal. */
+export class ReplayCursor {
+  private at: Since | null = null;
+  private next: AttachInfo["kind"] | null = null;
+  info(info: AttachInfo) {
+    this.at = info.generation === null
+      ? null
+      : { offset: info.offset, generation: info.generation, epoch: info.epoch };
+    this.next = info.kind;
+  }
+  /** A replay frame arrived. True: it is a delta, to append to the terminal as it is. A replay
+   * without `attach_info` (an older daemon) leaves the offset unknown. */
+  replay(): boolean {
+    const delta = this.next === "delta";
+    if (this.next === null) this.at = null;
+    this.next = null;
+    return delta;
+  }
+  output(bytes: number) {
+    if (this.at) this.at.offset += bytes;
+  }
+  since(): Since | null {
+    return this.at && { ...this.at };
+  }
+}

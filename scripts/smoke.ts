@@ -710,6 +710,38 @@ exec cat > /dev/null
   await c2.call("session.detach", { id: sid });
   c2.close();
 
+  // Phone replays (docs/PROTOCOL.md `attach_info`): a screen, then only the bytes it missed.
+  const infos = (cl: Client) => cl.events.filter((e) => e.event === "attach_info").map((e) => e.data);
+  const phone = new Client(d.token);
+  await phone.open();
+  await phone.call("session.attach", { id: sid, replay: "screen", replay_bytes: 65536 });
+  await phone.waitFor("screen replay", () => phone.frames.some((f) => f.id === sid && f.type === 0x03));
+  const shown = infos(phone)[0];
+  ok(shown?.id === sid && shown.kind === "screen" && Number.isInteger(shown.offset) &&
+    Number.isInteger(shown.generation) && typeof shown.epoch === "string", "a screen attach is announced by attach_info");
+  c.input(sid, "echo third$((1+2))\r");
+  await phone.waitFor("live output on the phone", () => phone.terminal(sid).includes("third3"));
+  const reached = shown.offset +
+    phone.frames.filter((f) => f.id === sid && f.type === 0x01).reduce((n, f) => n + f.data.length, 0);
+  phone.close();
+  c.input(sid, "echo missed$((2+2))\r");
+  await c.waitFor("output while the phone is away", () => c.terminal(sid).includes("missed4"));
+  await sleep(300);
+  const back = new Client(d.token);
+  await back.open();
+  const since = { offset: reached, generation: shown.generation, epoch: shown.epoch };
+  await back.call("session.attach", { id: sid, replay: { since } });
+  await back.waitFor("delta replay", () => back.frames.some((f) => f.id === sid && f.type === 0x03));
+  const delta = back.frames.find((f) => f.id === sid && f.type === 0x03)!.data;
+  const resumed = infos(back)[0];
+  ok(resumed?.kind === "delta" && dec.decode(delta).includes("missed4") && !dec.decode(delta).includes("third3") &&
+    resumed.offset === reached + delta.length, "a returning phone gets only the bytes it missed (delta)");
+  await back.call("session.attach", { id: sid, replay: { since: { ...since, epoch: "another-daemon-run" } } });
+  await back.waitFor("second attach_info", () => infos(back).length === 2);
+  ok(infos(back)[1].kind === "screen", "an offset from another daemon run gets a screen");
+  ok(JSON.stringify(await back.call("ping")) === "{}", "ping answers");
+  back.close();
+
   // ----- windows, tabs, auto naming -----
   const httpRpc = async (method: string, params: Json = {}) =>
     await (

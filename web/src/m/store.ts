@@ -2,7 +2,14 @@ import { batch, computed, signal } from "@preact/signals";
 import { connStatus, rpc } from "../rpc.ts";
 import type { Channel, Decision, SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
-import { type Grid, normalizeCode, noteSession, type ProgramScroll } from "./logic.ts";
+import {
+  type AttachInfo,
+  type Grid,
+  normalizeCode,
+  noteSession,
+  type ProgramScroll,
+  type Since,
+} from "./logic.ts";
 
 export interface Device {
   id: number;
@@ -19,9 +26,21 @@ interface Prefs {
 interface Viewer {
   sid: number;
   receive(type: number, payload: Uint8Array): void;
+  attachInfo(info: AttachInfo): void;
+  since(): Since | null;
   update(info: SessionInfo): void;
   grid(): Grid;
 }
+/** Replay sizes (docs/ANDROID.md "Reconnect and battery"). Opening a session brings up to 256 KiB
+ * of its history; coming back to it (the app was in the background, or the connection dropped)
+ * brings only the output it missed when that is at most 64 KiB, else a 64 KiB screen with as
+ * much recent history as fits. */
+const OPEN_REPLAY_BYTES = 262144;
+const RESUME_REPLAY_BYTES = 65536;
+/** While visible, the phone checks every so often that its connection still answers; a dead one
+ * (a network change can leave it looking open) is replaced at once. */
+const PING_EVERY_MS = 25000;
+const PING_TIMEOUT_MS = 10000;
 
 const stored = load<Prefs>("m.prefs", { fontSize: 11, termSize: "follow" });
 export const prefs = signal<Prefs>({
@@ -174,19 +193,52 @@ export async function logout() {
   }
 }
 
+/** Whether the current viewer was attached before (a reattach after a reconnect). */
+let viewerAttached = false;
 function attach() {
   if (!viewer || !ready.peek() || attached === viewer.sid) return;
   const current = viewer;
   attached = current.sid;
-  rpc.call("session.attach", { id: current.sid, replay_bytes: 262144 }).catch((e) => {
+  const since = current.since();
+  const params = since ? { id: current.sid, replay: { since }, replay_bytes: RESUME_REPLAY_BYTES } : {
+    id: current.sid,
+    replay: "screen",
+    replay_bytes: viewerAttached ? RESUME_REPLAY_BYTES : OPEN_REPLAY_BYTES,
+  };
+  viewerAttached = true;
+  rpc.call("session.attach", params).catch((e) => {
     if (viewer === current && rpc.isOpen) notify(errorText(e));
   });
+}
+
+let helloCount = 0;
+let pinging = false;
+/** A connection that doesn't answer a ping within PING_TIMEOUT_MS is dropped and replaced. */
+async function heartbeat() {
+  if (pinging || document.visibilityState !== "visible" || !rpc.isOpen) return;
+  pinging = true;
+  const connection = helloCount;
+  let timer = 0;
+  const timedOut = new Promise<"timeout">((resolve) =>
+    timer = setTimeout(() => resolve("timeout"), PING_TIMEOUT_MS)
+  );
+  try {
+    const answer = await Promise.race([rpc.call("ping").then(() => "ok", () => "error"), timedOut]);
+    if (answer === "timeout" && connection === helloCount && rpc.isOpen) {
+      rpc.suspend();
+      reconnect();
+    }
+  } finally {
+    clearTimeout(timer);
+    pinging = false;
+  }
 }
 
 export function bindTerminal(next: Viewer | null) {
   if (attached !== null && rpc.isOpen) rpc.call("session.detach", { id: attached }).catch(() => {});
   attached = null;
   viewer = next;
+  viewerAttached = false;
   attach();
 }
 
@@ -269,6 +321,7 @@ export function start() {
     else readLocation();
   });
   rpc.onHello = (hello) => {
+    helloCount++;
     batch(() => {
       sessions.value = new Map(hello.sessions.map((s) => [s.id, s]));
       channels.value = new Map(hello.channels.map((c) => [c.id, c]));
@@ -306,6 +359,9 @@ export function start() {
       case "notice":
         notify(event.data.text);
         break;
+      case "attach_info":
+        if (viewer?.sid === event.data.id) viewer.attachInfo(event.data);
+        break;
     }
   };
   rpc.onBinary = (type, sid, payload) => {
@@ -320,6 +376,9 @@ export function start() {
     else reconnect();
   });
   document.addEventListener("freeze", () => rpc.suspend());
+  // Chrome's page lifecycle: a frozen page that comes back fires `resume`.
+  document.addEventListener("resume", () => reconnect());
+  setInterval(heartbeat, PING_EVERY_MS);
   addEventListener("offline", () => {
     online.value = false;
     rpc.suspend();

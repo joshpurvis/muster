@@ -113,7 +113,7 @@ impl Principal {
 /// callable by a device.
 pub fn method_scope(method: &str) -> Option<Scope> {
     Some(match method {
-        "hello" | "session.attach" | "session.detach" | "session.screen" | "session.output" | "session.wait"
+        "ping" | "hello" | "session.attach" | "session.detach" | "session.screen" | "session.output" | "session.wait"
         | "channel.timeline" | "channel.diff" | "session.queue" => Scope::View,
         "session.send" | "session.input" | "session.approve" | "session.interrupt" | "session.clear_queue"
         | "session.resume_queue" | "session.continue_input"
@@ -550,6 +550,7 @@ mod tests {
 
     #[test]
     fn scopes_table() {
+        assert_eq!(method_scope("ping"), Some(Scope::View));
         assert_eq!(method_scope("hello"), Some(Scope::View));
         assert_eq!(method_scope("session.attach"), Some(Scope::View));
         assert_eq!(method_scope("session.approve"), Some(Scope::Interact));

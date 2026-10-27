@@ -28,6 +28,7 @@ mod paths;
 mod pidfd;
 mod pr;
 mod renderer;
+mod replay_tail;
 mod pty;
 mod rpc;
 mod schedules;

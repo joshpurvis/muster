@@ -219,8 +219,9 @@ pub struct HubConfig {
 pub enum Attach {
     /// Running (or exited-this-run) session: replay bytes + live output receiver + the
     /// generation of the process they belong to (taken together, so a restart can't
-    /// mismatch them; see `pty_generation`).
-    Live(Vec<u8>, broadcast::Receiver<Output>, u64),
+    /// mismatch them; see `pty_generation`) + the raw output offset the replay ends at (the
+    /// first live byte's; docs/PROTOCOL.md `attach_info`).
+    Live { replay: Vec<u8>, rx: broadcast::Receiver<Output>, generation: u64, offset: u64 },
     /// Session from a previous daemon run: replay only.
     Replay(Vec<u8>),
 }
@@ -460,6 +461,8 @@ pub struct Hub {
     /// Client replays of exited sessions rebuilt from output.log (a vt100 pass over up to
     /// 2 MiB), keyed by session and the log's (length, mtime).
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
+    /// Raw output tails for phones' `delta` replays (src/replay_tail.rs).
+    tails: Arc<crate::replay_tail::Tails>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
     /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
@@ -882,6 +885,7 @@ impl Hub {
             workers: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
+            tails: Arc::default(),
             branch_lock: tokio::sync::Mutex::new(()),
             rt: tokio::runtime::Handle::try_current().ok(),
             updates: Default::default(),
@@ -1446,8 +1450,8 @@ impl Hub {
     /// `session.attach`'s `replay_bytes`); None = the whole ring.
     pub async fn attach(&self, id: SessionId, max_body: Option<usize>) -> anyhow::Result<Attach> {
         if let Some(p) = self.pty(id) {
-            let (replay, rx) = p.attach(max_body)?;
-            return Ok(Attach::Live(replay, rx, p.generation));
+            let (replay, offset, rx) = p.attach(max_body)?;
+            return Ok(Attach::Live { replay, rx, generation: p.generation, offset });
         }
         let info = self
             .session(id)
@@ -1477,6 +1481,23 @@ impl Hub {
             c.insert(id, (len, mtime, Bytes::from(data.clone())));
         }
         Ok(Attach::Replay(pty::trim_replay(&data, max_body)))
+    }
+
+    /// This daemon run's replay epoch (docs/PROTOCOL.md `attach_info`).
+    pub fn replay_epoch(&self) -> &str {
+        self.tails.epoch()
+    }
+
+    /// Keep a raw output tail of session `id`'s current run for a `delta` replay later, and
+    /// count a client as attached through it until the returned use is dropped (src/replay_tail.rs).
+    /// Call before taking the client's replay. None without a live run or a free tail.
+    pub fn join_tail(&self, id: SessionId) -> Option<crate::replay_tail::TailUse> {
+        let p = self.pty(id)?;
+        self.tails.join(id, p.generation, 0, move || {
+            // The host's smallest replay: the tail only needs the stream and its offset.
+            let (_, offset, rx) = p.attach(Some(4096))?;
+            Ok((offset, rx))
+        })
     }
 
     /// Apply a state change with precedence rules:
@@ -3715,6 +3736,9 @@ impl Hub {
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         if let Some(p) = self.pty(id) {
             p.resize(cols, rows)?;
+        }
+        if cur.cols != cols || cur.rows != rows {
+            self.tails.resized(id);
         }
         if cur.cols != cols || cur.rows != rows || cur.size_owner.as_deref() != Some(owner) {
             self.update_session_info(id, |i| {

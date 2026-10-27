@@ -97,7 +97,8 @@ waits for a `wait_for_panel_event` or the next panel prompt instead of waking an
 cache). A panel opened with `notify_on_close: true` keeps the old behaviour: closing it prompts
 the idle agent ([MCP.md](MCP.md#panels)). The same rule wakes an asleep named agent (its
 process stopped while idle; PROTOCOL.md "Sleep and wake"): a user action in one of its panels
-wakes it and is delivered once it is ready; a notice never does, and rides with that prompt.
+wakes it and is delivered once it is ready; a notice never does, not even a close notice the
+agent asked for with `notify_on_close`, and rides with that prompt.
 
 An app can only send an event in direct response to the user (a click or key in the panel). A
 panel that renders a stranger's PR must not be able to type instructions to the agent on its own.

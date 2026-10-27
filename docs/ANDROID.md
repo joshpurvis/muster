@@ -217,6 +217,14 @@ maths do not double-offset):
    "queued (n)" from `SendOutcome` (src/inject.rs:39-45). Long-press Send offers "Interrupt
    and send". A settings sheet holds `termSize` and notification opt-in.
 
+   **An asleep named agent** (its run stopped while idle, detail `asleep`; docs/PROTOCOL.md
+   "Sleep and wake") is listed with the live sessions, not under "Exited". Its composer stays
+   open: Send (`session.send`) wakes it into its conversation and delivers the message, and a
+   line under the textarea says so ("scout is asleep. Sending a message wakes it into the same
+   conversation.", or that it re-reads the whole conversation at full cost once its prompt
+   cache has likely expired). The key chips, Stop and "Interrupt and send" stay off until it is
+   awake: there is no run for them to reach.
+
    **Scrolling back** (web/src/m/term.ts `scrollBy`): on the normal screen a drag scrolls the
    phone's own xterm scrollback (10000 lines, filled by the replay and live output); while
    scrolled up, new output does not move the view. A full-screen program on the alternate

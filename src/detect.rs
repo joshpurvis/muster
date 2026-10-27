@@ -305,6 +305,7 @@ mod tests {
             rows: 32,
             queued: 0,
             subagents: 0,
+            background: 0,
             size_owner: None,
             input_interrupted: false,
             live_cwd: None,

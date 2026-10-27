@@ -548,7 +548,8 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         "session.restart" => {
             let p: IdParam<SessionId> = parse(params)?;
-            to_value(hub.restart_session(p.id).await?)
+            // A named agent's tab under the start lock, like every start of it (src/sleep.rs).
+            to_value(crate::agents::restart_session(hub, p.id).await?)
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;
@@ -863,7 +864,8 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
-            match chain {
+            // Admitted until written, so a sleep can't stop the run they are typed into (src/sleep.rs).
+            let _admitted = match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
                     crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?;
@@ -872,18 +874,21 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {
                         hub.spend.ensure_fresh(hub).await;
                     }
-                    crate::spend::raw_input_gate(hub, p.id, r.origin).map_err(RpcError)?
+                    crate::spend::raw_input_gate(hub, p.id, r.origin).map_err(RpcError)?;
+                    // Keys can't wake an asleep agent: only a message does (its guard rails apply).
+                    crate::sleep::admit(hub, p.id)?
                 }
                 // The human's keys (a paired phone, `muster keys` outside a session) take the
                 // same path as a client's: no session lookup under the hub lock, no SQLite.
                 None => {
                     hub.note_human_input(p.id);
                     // An asleep agent's tab: held until it has woken (src/sleep.rs).
-                    if crate::sleep::keys(hub, p.id, p.data.as_bytes()) {
-                        return Ok(json!({}));
+                    match crate::sleep::keys(hub, p.id, p.data.as_bytes()) {
+                        crate::sleep::Keys::Held => return Ok(json!({})),
+                        crate::sleep::Keys::Pass(admitted) => admitted,
                     }
                 }
-            }
+            };
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
             } else {
@@ -1016,14 +1021,14 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             require_local(who, method)?;
             let p: crate::agents::AgentUpdate = parse(params)?;
             let b = crate::agents::update(hub, p)?;
-            Ok(crate::agents::agent_json(&b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+            Ok(crate::agents::agent_view(hub, &b))
         }
         "agent.list" => {
             let out: Vec<Value> = hub
                 .agents()
                 .list()
                 .iter()
-                .map(|b| crate::agents::agent_json(b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+                .map(|b| crate::agents::agent_view(hub, b))
                 .collect();
             Ok(Value::Array(out))
         }
@@ -1073,7 +1078,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
             let p: P = parse(params)?;
             let a = crate::sleep::sleep(hub, &p.name, crate::sleep::Why::Manual).await?;
-            Ok(crate::agents::agent_json(&a, a.session_id.and_then(|s| hub.session(s)).as_ref()))
+            Ok(crate::agents::agent_view(hub, &a))
         }
         "agent.messages" => {
             #[derive(Deserialize)]
@@ -1836,10 +1841,12 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     // The marker is recorded in memory and committed off this path, so a
                     // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
                     hub.note_human_input(id);
-                    // An asleep agent's tab: held until it has woken (src/sleep.rs).
-                    if crate::sleep::keys(&hub, id, &data[5..]) {
-                        continue;
-                    }
+                    // An asleep agent's tab: held until it has woken (src/sleep.rs). Admitted
+                    // until handed to the terminal, so a sleep can't stop the run meanwhile.
+                    let _admitted = match crate::sleep::keys(&hub, id, &data[5..]) {
+                        crate::sleep::Keys::Held => continue,
+                        crate::sleep::Keys::Pass(admitted) => admitted,
+                    };
                     if let Err(e) = hub.send_keys(id, &data[5..]) {
                         // Lost or refused keystrokes interrupt their run, which the user sees
                         // on the session (`input_interrupted`) and in a notice.

@@ -1,5 +1,6 @@
 import {
   alertsFailure,
+  asleepNote,
   alertState,
   bufferText,
   fromB64url,
@@ -20,6 +21,7 @@ import {
   ReplayCursor,
   returnNotches,
   sameBytes,
+  sessionAsleep,
   subscriptionRefused,
   scrollPosition,
   sessionOrder,
@@ -35,6 +37,15 @@ function equal(actual: unknown, expected: unknown, what = "") {
     throw new Error(`${what ? what + ": " : ""}Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
 }
+
+Deno.test("an asleep agent's tab is no exited session: a message wakes it", () => {
+  equal(sessionAsleep({ state: "exited", state_detail: "asleep" }), true);
+  equal(sessionAsleep({ state: "exited", state_detail: "exit code 0" }), false, "stopped");
+  equal(sessionAsleep({ state: "idle", state_detail: "asleep" }), false, "a run is going");
+  equal(sessionAsleep(undefined), false);
+  equal(asleepNote({ name: "scout", cache_cold_at: null }, 0), "scout is asleep. Sending a message wakes it into the same conversation.");
+  equal(asleepNote({ name: "scout", cache_cold_at: 10 }, 20).includes("full cost"), true, "the cost once its cache expired");
+});
 
 Deno.test("pairing codes accept mixed case, spaces and dashes without changing QR tokens", () => {
   equal(normalizeCode(" abc-def ghJ "), "ABCDEFGHJ");

@@ -924,13 +924,14 @@ impl Registry {
 
     /// Agent `id` fell asleep at `at`, or woke (None). Saved first; the keystroke path's set
     /// follows. Returns the record as it was.
-    pub(crate) fn set_asleep(&self, store: &Store, id: i64, at: Option<i64>) -> anyhow::Result<Agent> {
+    /// `generation`: the run a sleep is stopping (a restart that cuts the stop off finishes it).
+    pub(crate) fn set_asleep(&self, store: &Store, id: i64, at: Option<i64>, generation: Option<u64>) -> anyhow::Result<Agent> {
         let (before, session) = {
             let mut g = self.inner.lock();
             let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
             let before = b.clone();
             if b.asleep_at != at {
-                store.set_agent_asleep(id, at)?;
+                store.set_agent_asleep(id, at, generation)?;
                 b.asleep_at = at;
             }
             (before, b.session_id)
@@ -1174,8 +1175,18 @@ impl Registry {
 
 /// Tell clients an agent's record changed (`agent_upserted`).
 pub fn publish(hub: &Hub, a: &Agent) {
+    hub.emit(ServerEvent::AgentUpserted(agent_view(hub, a)));
+}
+
+/// `agent_json` with its session, and why its last wake failed while that still applies
+/// (`wake_error`, src/sleep.rs).
+pub fn agent_view(hub: &Hub, a: &Agent) -> Value {
     let s = a.session_id.and_then(|s| hub.session(s));
-    hub.emit(ServerEvent::AgentUpserted(agent_json(a, s.as_ref())));
+    let mut v = agent_json(a, s.as_ref());
+    if let Some(e) = hub.agents().sleep.wake_failed(a.id).filter(|_| a.asleep_at.is_some()) {
+        v["wake_error"] = json!(e);
+    }
+    v
 }
 
 /// Tell clients about a message to an agent: new, refused, or just replied to (`agent_message`).
@@ -1476,6 +1487,23 @@ pub async fn start_fresh_if(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInf
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
     fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
     let _one = hub.agents().start_lock.lock().await;
+    start_locked(hub, name, fresh, window, fresh_if).await
+}
+
+/// `start_guarded` with the start lock held. A start of an asleep agent that fails, at any
+/// step, leaves it asleep and records why (src/sleep.rs `wake_failed`), for its asleep bar.
+async fn start_locked(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
+    fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
+    let asleep = hub.agents().get(name).filter(|a| a.asleep_at.is_some()).map(|a| a.id);
+    let r = start_once(hub, name, fresh, window, fresh_if).await;
+    if let (Err(e), Some(id)) = (&r, asleep) {
+        crate::sleep::wake_failed(hub, id, e);
+    }
+    r
+}
+
+async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
+    fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
     let mut agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
     if let Some(ok) = fresh_if
         && let Some(sid) = agent.session_id
@@ -1518,9 +1546,24 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         Ok(Some(_)) => refuse_symlink(&persona)?,
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
-    // Awake from here on, whatever the start below makes of it (a failed one shows as stopped).
+    // Awake from here on; a start below that fails puts an agent it was waking back to sleep
+    // (src/sleep.rs `start_failed`), so its next message tries again.
     let woke = crate::sleep::on_start(hub, &agent)?;
     agent.asleep_at = None;
+    let id = agent.id;
+    let r = run_agent(hub, agent, fresh, window, args, woke).await;
+    if let Some(at) = woke {
+        match &r {
+            Ok(_) => crate::sleep::launched(hub, id),
+            Err(e) => crate::sleep::start_failed(hub, id, at, e),
+        }
+    }
+    r
+}
+
+/// The run part of `start_locked`: restart the agent's exited session, else a new one in its tab.
+async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option<WindowId>, args: Vec<String>,
+    woke: Option<i64>) -> anyhow::Result<AgentSession> {
     if let Some(sid) = agent.session_id
         && let Some(info) = hub.session(sid)
         && hub.channel(info.channel_id).is_some_and(|c| !c.archived)
@@ -1613,12 +1656,49 @@ pub fn forget_conversation(hub: &Hub, sid: SessionId, failed: Option<&str>) -> a
     Ok(true)
 }
 
+/// Agent `id` if it is asleep: woken under the start lock (`for_send`), so a sleep can't slip
+/// between this check and the send. None: awake (running or not), or removed.
+pub async fn wake_if_asleep(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Option<AgentSession>> {
+    let _one = hub.agents().start_lock.lock().await;
+    let Some(a) = hub.agents().by_id(id).filter(|a| a.asleep_at.is_some()) else { return Ok(None) };
+    let s = start_locked(hub, &a.name, false, None, None).await?;
+    publish(hub, &s.agent);
+    Ok(Some(s))
+}
+
+/// `session.restart` of session `id`: a named agent's tab restarts under the start lock, like
+/// any start of it, so a sleep that checked the old run can't stop the new one (src/sleep.rs).
+pub async fn restart_session(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<SessionInfo> {
+    if hub.agents().by_session(id).is_none() {
+        return hub.restart_session(id).await;
+    }
+    let _one = hub.agents().start_lock.lock().await;
+    let asleep = hub.agents().by_session(id).filter(|a| a.asleep_at.is_some()).map(|a| a.id);
+    let r = hub.restart_session(id).await;
+    if let (Err(e), Some(agent)) = (&r, asleep) {
+        crate::sleep::wake_failed(hub, agent, e);
+    }
+    r
+}
+
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
 pub async fn autostart(hub: &Arc<Hub>) {
-    // An asleep agent stays asleep across restarts: its next message wakes it (src/sleep.rs).
     for a in hub.agents().list().into_iter().filter(|a| a.autostart && a.asleep_at.is_none()) {
-        match start(hub, &a.name, false, None).await {
-            Ok(s) => tracing::info!(agent = a.name, "autostarted (session {})", s.session.id),
+        // Checked again under the start lock: a sleep since the list was read (the idle sweep
+        // runs from daemon start too) keeps it asleep; its next message wakes it (src/sleep.rs).
+        let r = {
+            let _one = hub.agents().start_lock.lock().await;
+            match hub.agents().by_id(a.id).filter(|b| b.autostart && b.asleep_at.is_none()) {
+                Some(b) => start_locked(hub, &b.name, false, None, None).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        match r {
+            Ok(None) => tracing::info!(agent = a.name, "not autostarted: it is asleep (or autostart was turned off)"),
+            Ok(Some(s)) => {
+                publish(hub, &s.agent);
+                tracing::info!(agent = a.name, "autostarted (session {})", s.session.id)
+            }
             Err(e) => {
                 tracing::warn!(agent = a.name, "autostart failed: {e:#}");
                 hub.notice("warn", format!("Agent {} didn't start: {e:#}", a.name));

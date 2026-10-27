@@ -29,7 +29,7 @@ import {
 import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText, wakeCold } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
-import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter } from "../agents.ts";
+import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter, wakeFailedText } from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -938,7 +938,8 @@ function CacheBar({ s }: { s: SessionInfo }) {
   );
 }
 
-/** Announced once per sleep in this page (the agent and since when). */
+/** Announced once per sleep in this page (the agent and since when), again when its prompt cache
+ * expires while it sleeps (the wake then costs more), and once per failed wake. */
 const announcedAsleep = new Set<string>();
 
 /** A named agent asleep (src/sleep.rs): not exited for good. Typing here or a message wakes it;
@@ -949,13 +950,15 @@ function AsleepBar({ s }: { s: SessionInfo }) {
   const agent = agentBySession.value.get(s.id);
   const now = cacheNow();
   const cold = wakeCold(s, now);
-  const key = `${agent?.id}:${agent?.asleep_at ?? 0}`;
+  const name = agent?.name ?? s.name;
+  const failed = agent?.wake_error;
+  const key = `${agent?.id}:${agent?.asleep_at ?? 0}:${cold ? "cold" : "warm"}:${failed ?? ""}`;
   const [say, setSay] = useState("");
   useEffect(() => {
     if (announcedAsleep.has(key)) return;
     const t = setTimeout(() => {
       announcedAsleep.add(key);
-      setSay(asleepText(agent?.name ?? s.name, null, cold, now));
+      setSay(failed ? wakeFailedText(name, failed, cold) : asleepText(name, null, cold, now));
     }, 150);
     return () => clearTimeout(t);
   }, [key]);
@@ -964,7 +967,9 @@ function AsleepBar({ s }: { s: SessionInfo }) {
     <div class={cx("asleep-bar", cold && "cold")} role="note" aria-label="Agent asleep">
       <span class="sr-only" role="status" aria-live="polite">{say}</span>
       <span class="asleep-dot" aria-hidden="true" />
-      <span class="asleep-text">{asleepText(agent?.name ?? s.name, agent?.asleep_at, cold, now)}</span>
+      <span class="asleep-text">
+        {failed ? wakeFailedText(name, failed, cold) : asleepText(name, agent?.asleep_at, cold, now)}
+      </span>
       {agent && (
         <button
           type="button"

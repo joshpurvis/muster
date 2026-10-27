@@ -228,12 +228,26 @@ been idle that long, measured from the latest of: when it came to rest, its last
 (`last_turn_at`), and the human's last keystroke in its tab (never within 2 minutes of one). The
 check runs every 30 s. `agent.sleep` (`muster agent sleep`, Sleep in the agents panel) does it
 now. Never while it is working, starting, waiting for approval or a question, shows an error or
-looks stuck, has running sub-agents, has prompts queued or being typed, has a message on its way
-(`agents::deliver` from before the start until the prompt is queued), is waking, is in a turn
-(an agent message was typed in since it last came to rest), has text in its input box, or before
-its conversation id is known (it couldn't be resumed). The check and the stop run under the agent
-start lock, which every wake takes too, and the sleep waits for the process to exit before
-releasing it.
+looks stuck, has running sub-agents, has background work running (`SessionInfo.background`: a
+sub-agent or command started with `run_in_background` that hasn't reported back, from its hooks
+and its notices in the run's transcript; the CLI's exit would end it), has prompts queued or
+being typed, has a message on its way (`agents::deliver` and the human's `session.send` from
+before the start lock until the prompt is queued), is waking, is in a turn (an agent message was
+typed in since it last came to rest), has text in its input box, or before its conversation id
+is known (it couldn't be resumed). The check and the stop run under the agent start lock, which
+every wake, `session.send` to an agent's session, `session.restart` of one and autostart take
+too. The last check and the switch to asleep are one step against raw input (keys admitted
+since the check, or still on their way, refuse it; from then on the human's keys are held), and
+the stop is fenced to the run that was checked (a restart's new run is never stopped). The sleep
+waits for the process to exit before releasing the lock; if it doesn't exit, the agent is awake
+and keys held meanwhile go to it. Keys from an agent or a shell (`session.input` with
+`from_session`) to an asleep or waking agent are refused: a message wakes it, keys don't.
+
+The saved record keeps an older backend from undoing a sleep: while asleep, the `agents.autostart`
+column reads 0 (the setting is kept in `asleep_autostart`, migration v24), so a backend from
+before sleep never starts it at its own start. `asleep_generation` is the run the sleep was
+stopping: a backend that starts while that very run still runs (a reload cut the stop off)
+finishes the stop; another run means it was woken meanwhile, so it is awake.
 
 What wakes it, through `agent.start` (so two messages arriving together wake it once, and each
 keeps its one durable path through the prompt queue): `agent.ask` / MCP `ask_agent` (its result
@@ -244,10 +258,21 @@ one of its panels (not a notice: a panel closing never wakes it; see docs/AGENT_
 the human typing into its tab: keys from a client or phone (`FRAME_INPUT`, `session.input`
 without `from_session`) for an asleep agent's session are held by the daemon (at most 64 KB) and
 typed once into the resumed run when it is ready and no prompt is being typed (given up after 10
-minutes, with a notice). The terminal's own reports (focus, mouse, cursor position, OSC
-answers), cursor and function keys never wake it and are dropped; bracketed-paste markers are
-kept. Nothing else wakes it: `hello`, `agent.list`, `session.output`, list and read tools,
-`wait_for_state`, showing its tab.
+minutes, with a notice). Typing held for it is the human's input (the turn it starts is the
+human's, whatever woke the agent). Over 64 KB none of it is kept, with a notice (a paste cut
+short is worse than none). While the resumed CLI shows a question or an approval of its own (a
+startup dialog), keys go straight to it. A backend that stops while typing is held says in the
+tab's timeline how much was lost (the size only, never the text). The terminal's own reports
+(focus, mouse, cursor position, OSC answers), cursor and function keys never wake it and are
+dropped; bracketed-paste markers are kept. Nothing else wakes it: `hello`, `agent.list`,
+`session.output`, list and read tools, `wait_for_state`, showing its tab. A paired phone with
+`interact` scope sends a message to an asleep agent like any other (`session.send`), which wakes
+it; its key buttons stay off until it is awake.
+
+A wake that fails (its account profile is disabled, the CLI can't start) leaves it asleep, not
+stopped: its record has `wake_error` (why) until it wakes or sleeps again, the asleep bar says
+so, keys held for it are dropped (with a notice), and the next message, Wake, or typing into its
+tab tries again at once (a panel click at most once a minute).
 
 The wake re-reads the whole conversation; once its prompt cache has likely expired
 (`cache_cold_at`, which an exited session keeps), uncached at full cost. The tab's asleep bar says

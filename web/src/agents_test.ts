@@ -3,6 +3,7 @@ import {
   ago,
   asleepText,
   isAsleep,
+  wakeFailedText,
   parseSleepAfter,
   choiceOf,
   contextLabel,
@@ -145,6 +146,12 @@ Deno.test("sleep: the idle time field and the asleep bar's words", () => {
   );
   const cold = asleepText("ada", null, true, 0);
   check(cold.startsWith("ada is asleep. The next message") && cold.includes("full cost"), cold);
+  // A wake that failed: still asleep, says why and how to try again.
+  assertEquals(
+    wakeFailedText("ada", "account profile Work is disabled.", false),
+    "Waking ada failed: account profile Work is disabled. It is still asleep: the next message, or typing here, tries again.",
+  );
+  check(wakeFailedText("ada", "x", true).endsWith("at full cost."), "the cost still said");
 });
 
 Deno.test("ago and firstLine", () => {

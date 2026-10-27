@@ -68,6 +68,13 @@ export function asleepText(name: string, asleepAt: number | null | undefined, co
       : " into the same conversation.");
 }
 
+/** The asleep bar's line after a wake that failed (`wake_error`): still asleep, how to try again,
+ * and what a wake costs once its prompt cache has likely expired (`cold`). */
+export function wakeFailedText(name: string, error: string, cold: boolean): string {
+  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message, or typing here, tries again` +
+    (cold ? ", and re-reads the whole conversation at full cost." : ".");
+}
+
 /** "now", "45s", "12m", "3h", "2d". */
 export function ago(ms: number, now: number): string {
   const s = Math.max(0, Math.round((now - ms) / 1000));

@@ -27,7 +27,7 @@ fn err(r: anyhow::Result<Value>) -> String {
 }
 
 fn no_quiet_hours(f: &Fixture) {
-    set_settings(&f.hub, serde_json::from_value(json!({"quiet_start": "00:00", "quiet_end": "00:00"})).unwrap()).unwrap();
+    set_settings(&f.hub, serde_json::from_value(json!({"quiet_start": "00:00", "quiet_end": "00:00"})).unwrap(), true).unwrap();
 }
 
 // ----- proposals -----
@@ -56,17 +56,17 @@ fn a_proposal_never_runs_until_the_human_approves_it() {
     assert!(f.tick().is_empty());
     assert!(plan::due(&Schedule { next_run: Some(0), ..s.clone() }, f.hub.schedules.now(), &Settings::default(), &super::quiet_london(), &Facts::default(), 0, None).is_none());
     assert!(run_now(&f.hub, id).unwrap_err().to_string().contains("approve it"));
-    assert!(set_skip(&f.hub, id, true).is_err());
+    assert!(set_skip(&f.hub, id, true, None).is_err());
     update(&f.hub, serde_json::from_value(json!({"id": id, "when": {"kind": "cron", "cron": "0 17 * * 5"}})).unwrap()).unwrap();
     assert!(f.hub.schedules.get(id).unwrap().next_run.is_none(), "the human's edit keeps it waiting");
     assert!(matches!(plan::still_ok(&s, 0, &Settings::default(), &super::quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(_))));
     // Approved: it runs like any schedule, from now on.
-    let j = approve(&f.hub, id).unwrap();
+    let j = approve(&f.hub, id, None).unwrap();
     assert_eq!(j["status"], "active");
     let s = f.hub.schedules.get(id).unwrap();
     assert_eq!(s.next_run, Some(at(LONDON, "2026-10-23T17:00")));
     assert!(s.made_by.as_ref().unwrap().approved_at.is_some());
-    assert!(approve(&f.hub, id).is_err(), "only once");
+    assert!(approve(&f.hub, id, None).is_err(), "only once");
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn approving_checks_the_proposal_again() {
     let id = r["schedule_id"].as_i64().unwrap();
     // Its time passed before the human looked: it can't be approved as it is.
     f.set(at(LONDON, "2026-10-19T11:00"));
-    let e = approve(&f.hub, id).unwrap_err().to_string();
+    let e = approve(&f.hub, id, None).unwrap_err().to_string();
     assert!(e.contains("passed") && e.contains("dismiss"), "{e}");
     // A proposal for cleo (a Claude subscription agent that opted in), then the human takes the
     // opt-in back: approving is refused.
@@ -88,7 +88,7 @@ fn approving_checks_the_proposal_again() {
     assert!(j["estimate"]["text"].as_str().unwrap().contains("Claude subscription"), "{}", j["estimate"]["text"]);
     let edit: crate::agents::AgentUpdate = serde_json::from_value(json!({"name": "cleo", "accepts": ["human"]})).unwrap();
     crate::agents::update(&f.hub, edit).unwrap();
-    assert!(approve(&f.hub, id).unwrap_err().to_string().contains("doesn't take scheduled work"));
+    assert!(approve(&f.hub, id, None).unwrap_err().to_string().contains("doesn't take scheduled work"));
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn proposal_limits_count_waiting_live_and_daily() {
     assert!(err(tool(&f, 41, "propose_schedule", p(3))).contains("already waiting"));
     // Approved ones still count toward the 5 live schedules it made.
     for id in &ids {
-        approve(&f.hub, *id).unwrap();
+        approve(&f.hub, *id, None).unwrap();
     }
     tool(&f, 41, "propose_schedule", p(4)).unwrap();
     tool(&f, 41, "propose_schedule", p(5)).unwrap();
@@ -142,7 +142,7 @@ fn proposal_limits_count_waiting_live_and_daily() {
         let id = f.hub.schedules.list().into_iter().find(|s| s.made_by.is_some()).unwrap().id;
         tool(&f, 41, "delete_schedule", json!({"schedule_id": id})).unwrap();
         let new = tool(&f, 41, "propose_schedule", p(10 + n)).unwrap()["schedule_id"].as_i64().unwrap();
-        approve(&f.hub, new).unwrap();
+        approve(&f.hub, new, None).unwrap();
     }
     let id = f.hub.schedules.list().into_iter().find(|s| s.made_by.is_some()).unwrap().id;
     tool(&f, 41, "delete_schedule", json!({"schedule_id": id})).unwrap();
@@ -223,7 +223,7 @@ fn a_claude_reminder_keeps_quiet_hours() {
     let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
     as_agent(&f, "cleo", 43);
     // Quiet hours nearly all day: a reminder that would only be skipped is refused.
-    set_settings(&f.hub, serde_json::from_value(json!({"quiet_start": "00:00", "quiet_end": "23:59"})).unwrap()).unwrap();
+    set_settings(&f.hub, serde_json::from_value(json!({"quiet_start": "00:00", "quiet_end": "23:59"})).unwrap(), true).unwrap();
     let e = err(tool(&f, 43, "set_reminder", json!({"prompt": "p", "in_minutes": 20})));
     assert!(e.contains("quiet hours"), "{e}");
     no_quiet_hours(&f);
@@ -288,7 +288,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 fn allow(f: &Fixture, dirs: &[&std::path::Path]) {
     let v: Vec<String> = dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect();
-    set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": v})).unwrap()).unwrap();
+    set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": v})).unwrap(), true).unwrap();
 }
 
 #[test]
@@ -314,9 +314,9 @@ fn file_triggers_are_off_until_the_human_chooses_a_folder() {
     allow(&f, &[&other]);
     assert!(matches!(triggers::event_flag(&f.hub, &s), Some(Action::Skip(w)) if w.contains("no longer")));
     // The settings check their folders.
-    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": ["/"]})).unwrap()).is_err());
-    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": ["relative/x"]})).unwrap()).is_err());
-    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": [root.join("missing")]})).unwrap()).is_err());
+    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": ["/"]})).unwrap(), true).is_err());
+    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": ["relative/x"]})).unwrap(), true).is_err());
+    assert!(set_settings(&f.hub, serde_json::from_value(json!({"watch_folders": [root.join("missing")]})).unwrap(), true).is_err());
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&other);
 }
@@ -513,10 +513,16 @@ fn a_held_event_stops_when_its_folder_is_swapped_for_a_link() {
 /// `worker` is session 41; a span of its work, or of unattended work, from `start` to `end`
 /// (unix ms, real clock).
 fn worked(f: &Fixture, sid: SessionId, start: i64, end: Option<i64>) {
-    f.hub.triggers.observe(sid, true, start);
+    obs(f, sid, true, start);
     if let Some(e) = end {
-        f.hub.triggers.observe(sid, false, e);
+        obs(f, sid, false, e);
     }
+}
+
+/// A session event for `sid`, as `Hub::emit` passes it on: working or not since `at`, with
+/// whether its provenance is unattended work now.
+fn obs(f: &Fixture, sid: SessionId, working: bool, at: i64) {
+    f.hub.triggers.observe(sid, working, at, f.hub.agents().unattended_now(sid));
 }
 
 #[test]
@@ -547,9 +553,9 @@ fn file_changes_are_debounced_and_an_agents_own_are_ignored() {
     // Its agent's turn started, wrote and ended between two looks: still its own (the turn is
     // recorded from the session's state changes, not seen at a look).
     let real = now_ms();
-    f.hub.triggers.observe(41, true, real - 2_000);
+    obs(&f, 41, true, real - 2_000);
     std::fs::write(d.join("written-by-agent.pdf"), "3").unwrap();
-    f.hub.triggers.observe(41, false, now_ms());
+    obs(&f, 41, false, now_ms());
     triggers::check_files(&f.hub);
     let after = f.hub.schedules.get(s.id).unwrap();
     assert!(after.event.is_none(), "an agent's own change doesn't count");
@@ -560,7 +566,7 @@ fn file_changes_are_debounced_and_an_agents_own_are_ignored() {
     std::fs::write(d.join("by-a-schedule.pdf"), "4").unwrap();
     triggers::check_files(&f.hub);
     assert!(f.hub.schedules.get(s.id).unwrap().event.is_none(), "unattended work's change doesn't count");
-    f.hub.triggers.observe(77, false, now_ms());
+    obs(&f, 77, false, now_ms());
     // Turns that ended well over 30 s ago don't make a change now anyone's own.
     f.hub.triggers.forget_activity_for_test();
     worked(&f, 41, now_ms() - 120_000, Some(now_ms() - 60_000));
@@ -602,7 +608,7 @@ fn who_was_working_is_kept_across_a_reload() {
     // Session 42's span was open at the save and the session isn't working now (it is gone):
     // it is closed, at the save at the latest.
     assert!(after[1].session == 42 && after[1].end.is_some_and(|e| e >= after[1].start), "{after:?}");
-    assert!(triggers::own_change(&after, -1, Some(42), real, now_ms()), "a change then is still its own");
+    assert!(triggers::own_change(&after, 0, -1, Some(42), real, now_ms()), "a change then is still its own");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -683,4 +689,249 @@ fn a_proposals_timing_says_its_time_zone_when_it_isnt_this_computers() {
     let r = tool(&f, 41, "propose_schedule", json!({"prompt": "p", "in_minutes": 120, "tz": tz, "reason": "r"})).unwrap();
     let e = r["estimate"].as_str().unwrap();
     assert!(e.contains(&format!("{zone} time")) && e.contains("here)"), "{e}");
+}
+
+// ----- made or widened outside Muster's window: held for the owner's click (fix round 2) -----
+
+const WHY: &str = HELD_WHY;
+
+fn held_what(f: &Fixture, id: i64) -> Option<Vec<HeldWhat>> {
+    f.hub.schedules.get(id).unwrap().held.map(|h| h.what)
+}
+
+#[test]
+fn a_schedule_made_outside_the_window_waits_for_the_owners_click() {
+    let t0 = at(LONDON, "2026-10-19T08:00");
+    let f = Fixture::new(t0);
+    let j = create_held(&f.hub, serde_json::from_value(json!({"agent": "worker", "prompt": "p", "tz": LONDON, "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap(), WHY).unwrap();
+    let id = j["id"].as_i64().unwrap();
+    assert_eq!((j["status"].as_str(), j["next_run"].as_i64()), (Some("held"), None));
+    assert_eq!(j["held"]["what"], json!(["made"]));
+    assert!(j["held"]["why"].as_str().unwrap().contains("command line"));
+    assert!(j["estimate"]["text"].as_str().unwrap().contains("run"), "the card says what it would use");
+    // Nothing runs it: not its time, not Run now, not Skip next.
+    f.set(at(LONDON, "2026-10-19T09:00"));
+    assert!(f.tick().is_empty());
+    assert!(run_now(&f.hub, id).unwrap_err().to_string().contains("approve it"));
+    assert!(set_skip(&f.hub, id, true, None).is_err());
+    // The owner's own edit in the window keeps it held (only Approve lets it run).
+    update(&f.hub, serde_json::from_value(json!({"id": id, "name": "renamed"})).unwrap()).unwrap();
+    assert_eq!(held_what(&f, id), Some(vec![HeldWhat::Made]));
+    // Approving what was looked at: a schedule changed since is refused.
+    let seen = f.hub.schedules.get(id).unwrap().updated_at;
+    f.set(at(LONDON, "2026-10-19T09:30"));
+    update_held(&f.hub, serde_json::from_value(json!({"id": id, "prompt": "wider"})).unwrap(), WHY).unwrap();
+    let e = approve(&f.hub, id, Some(seen)).unwrap_err().to_string();
+    assert!(e.contains("changed since you looked"), "{e}");
+    let seen = f.hub.schedules.get(id).unwrap().updated_at;
+    let j = approve(&f.hub, id, Some(seen)).unwrap();
+    assert_eq!(j["status"], "active");
+    let s = f.hub.schedules.get(id).unwrap();
+    assert!(s.held.is_none() && s.next_run == Some(at(LONDON, "2026-10-20T09:00")) && s.renewed_at == at(LONDON, "2026-10-19T09:30"));
+    // At most HELD_NEW_MAX new ones wait at once; nobody approving them for 7 days removes them.
+    for i in 0..HELD_NEW_MAX {
+        create_held(&f.hub, serde_json::from_value(json!({"agent": "worker", "prompt": format!("p{i}"), "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap(), WHY).unwrap();
+    }
+    let e = create_held(&f.hub, serde_json::from_value(json!({"agent": "worker", "prompt": "one more", "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap(), WHY).unwrap_err().to_string();
+    assert!(e.contains("already wait for your approval"), "{e}");
+    f.set(at(LONDON, "2026-10-26T09:31"));
+    f.tick();
+    let left: Vec<Schedule> = f.hub.schedules.list();
+    assert_eq!(left.len(), 1, "only the approved one stays");
+    assert_eq!(left[0].id, id);
+}
+
+#[test]
+fn outside_the_window_widening_holds_and_narrowing_applies() {
+    let t0 = at(LONDON, "2026-10-19T08:00");
+    let f = Fixture::new(t0);
+    let s = f.create(json!({"agent": "worker", "prompt": "p", "tz": LONDON, "daily_cap": 5, "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap();
+    let narrow = |v: Value| update_held(&f.hub, serde_json::from_value(v).unwrap(), WHY).unwrap();
+    // A rename, its alerts, quiet hours on, a lower cap, pausing: applied at once.
+    narrow(json!({"id": s.id, "name": "new name", "notify": "always", "quiet_hours": true, "daily_cap": 3}));
+    assert_eq!(held_what(&f, s.id), None);
+    set_paused(&f.hub, s.id, true, Some(WHY)).unwrap();
+    assert_eq!(held_what(&f, s.id), None);
+    // Resuming from outside: held, with no time to run until approved.
+    let j = set_paused(&f.hub, s.id, false, Some(WHY)).unwrap();
+    assert_eq!((j["status"].as_str(), j["next_run"].as_i64()), (Some("held"), None));
+    assert_eq!(held_what(&f, s.id), Some(vec![HeldWhat::Resumed]));
+    approve(&f.hub, s.id, None).unwrap();
+    let a = f.hub.schedules.get(s.id).unwrap();
+    assert!(a.held.is_none() && !a.paused && a.next_run == Some(at(LONDON, "2026-10-19T09:00")));
+    assert_eq!(a.renewed_at, t0, "a change keeps its 7 days as they were");
+    // A higher cap, no cap, quiet hours off, a new prompt or timing: held.
+    for v in [
+        json!({"id": s.id, "daily_cap": 4}),
+        json!({"id": s.id, "daily_cap": null}),
+        json!({"id": s.id, "quiet_hours": false}),
+        json!({"id": s.id, "prompt": "do more"}),
+        json!({"id": s.id, "when": {"kind": "cron", "cron": "0 10 * * *"}}),
+    ] {
+        let j = narrow(v.clone());
+        assert_eq!(j["status"], "held", "{v}");
+        approve(&f.hub, s.id, None).unwrap();
+    }
+    // Undoing Skip next from outside: held.
+    set_skip(&f.hub, s.id, true, None).unwrap();
+    set_skip(&f.hub, s.id, false, Some(WHY)).unwrap();
+    assert_eq!(held_what(&f, s.id), Some(vec![HeldWhat::Unskipped]));
+    approve(&f.hub, s.id, None).unwrap();
+    // Renewing a Claude subscription agent's schedule from outside: held, and the approval
+    // renews it; one that doesn't expire has nothing to renew.
+    let c = f.create(json!({"agent": "cleo", "prompt": "p", "tz": LONDON, "when": {"kind": "cron", "cron": "0 12 * * *"}})).unwrap();
+    f.set(t0 + 3 * plan::DAY_MS);
+    renew(&f.hub, c.id, Some(WHY)).unwrap();
+    assert_eq!(held_what(&f, c.id), Some(vec![HeldWhat::Renewed]));
+    assert_eq!(f.hub.schedules.get(c.id).unwrap().renewed_at, t0, "not renewed before the click");
+    approve(&f.hub, c.id, None).unwrap();
+    assert_eq!(f.hub.schedules.get(c.id).unwrap().renewed_at, t0 + 3 * plan::DAY_MS);
+    renew(&f.hub, s.id, Some(WHY)).unwrap();
+    assert_eq!(held_what(&f, s.id), None);
+    // Removing is narrowing: it applies.
+    remove(&f.hub, c.id).unwrap();
+}
+
+#[test]
+fn outside_the_window_settings_only_tighten() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+    let d = temp_dir("settings");
+    let set = |v: Value| set_settings(&f.hub, serde_json::from_value(v).unwrap(), false).map_err(|e| e.to_string());
+    let worker = f.hub.agents().get("worker").unwrap().id;
+    // Tightening applies: pause all, lower caps, a cap for an agent, fewer folders.
+    allow(&f, &[&d]);
+    set(json!({"paused": true, "unattended_cap": 10, "spend_cap": 2.0, "agent_spend_caps": {"worker": 1.0}, "watch_folders": []})).unwrap();
+    let st = f.hub.schedules.settings();
+    assert!(st.paused && st.unattended_cap == 10 && st.spend_cap_cents == 200 && st.agent_spend_caps.get(&worker) == Some(&100) && st.watch_folders.is_empty());
+    // Loosening is refused, and nothing changes.
+    for (v, what) in [
+        (json!({"paused": false}), "Resuming all schedules"),
+        (json!({"unattended_cap": 11}), "higher unattended cap"),
+        (json!({"spend_cap": 3.0}), "higher spend cap"),
+        (json!({"agent_spend_caps": {"worker": null}}), "cleared agent spend cap"),
+        (json!({"quiet_start": "01:00"}), "quiet hours"),
+        (json!({"watch_folders": [d]}), "another watched folder"),
+    ] {
+        let e = set(v.clone()).unwrap_err();
+        assert!(e.to_lowercase().contains(&what.to_lowercase()) && e.contains("Muster's window"), "{v}: {e}");
+    }
+    assert_eq!(f.hub.schedules.settings(), st);
+    // From the window: anything.
+    set_settings(&f.hub, serde_json::from_value(json!({"paused": false, "watch_folders": [d]})).unwrap(), true).unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ----- file triggers: who worked when (fix round 2) -----
+
+#[test]
+fn an_earlier_unattended_turn_stays_unattended_when_a_later_one_begins() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    let d = temp_dir("turns");
+    allow(&f, &[&d]);
+    let s = f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d}})).unwrap();
+    triggers::check_files(&f.hub);
+    // Session 77 does a scheduled turn that writes, then (well over the start slack later) a
+    // turn of the human's begins, all between two looks.
+    f.hub.agents().set_prov(77, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) })).unwrap();
+    assert!(f.hub.agents().unattended_now(77));
+    obs(&f, 77, true, now_ms() - 1_000);
+    std::fs::write(d.join("by-a-schedule.pdf"), "1").unwrap();
+    obs(&f, 77, false, now_ms());
+    f.hub.agents().set_prov(77, None).unwrap();
+    assert!(!f.hub.agents().unattended_now(77));
+    obs(&f, 77, true, now_ms() + 10_000);
+    triggers::check_files(&f.hub);
+    assert!(f.hub.schedules.get(s.id).unwrap().event.is_none(), "the scheduled turn's change is still an agent's own");
+    let spans = f.hub.triggers.spans_for_test();
+    assert!(spans[0].unattended && !spans[1].unattended, "{spans:?}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn work_that_starts_while_a_folder_is_read_still_counts() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    let d = temp_dir("during");
+    allow(&f, &[&d]);
+    let s = f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d}})).unwrap();
+    triggers::check_files(&f.hub);
+    // A scheduled turn starts and writes; its start is recorded only while the folder is read.
+    f.hub.agents().set_prov(77, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) })).unwrap();
+    let start = now_ms() - 500;
+    std::fs::write(d.join("written-meanwhile.pdf"), "1").unwrap();
+    let hub = f.hub.clone();
+    triggers::AFTER_LOOK.with(|h| *h.borrow_mut() = Some(Box::new(move || hub.triggers.observe(77, true, start, true))));
+    triggers::check_files(&f.hub);
+    triggers::AFTER_LOOK.with(|h| *h.borrow_mut() = None);
+    let after = f.hub.schedules.get(s.id).unwrap();
+    assert!(after.event.is_none(), "judged with the work seen during the look");
+    assert!(after.watch.recent.iter().any(|(r, _)| r == "written-meanwhile.pdf"), "recorded as seen");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn who_worked_when_is_kept_until_every_file_trigger_has_looked_past_it() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    let worker = f.hub.agents().get("worker").unwrap().id;
+    f.hub.agents().set_prov(77, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) })).unwrap();
+    let real = now_ms();
+    let (start, end) = (real - 2 * 3_600_000, real - 2 * 3_600_000 + 60_000);
+    worked(&f, 77, start, Some(end));
+    // A file trigger (a paused one) last looked three hours ago: the span two hours old stays.
+    let (spans, complete) = f.hub.triggers.settled_for_test(&f.hub, real, Some(real - 3 * 3_600_000));
+    assert_eq!((spans.len(), complete), (1, 0));
+    assert!(triggers::own_change(&spans, complete, worker, None, start + 30_000, real));
+    // Once every trigger has looked past it, it goes after the hour, and what happened up to its
+    // end is no longer known: a change then counts as an agent's own; a later one doesn't.
+    let (spans, complete) = f.hub.triggers.settled_for_test(&f.hub, real, Some(real - 60_000));
+    assert!(spans.is_empty() && complete >= end, "{complete} vs {end}");
+    assert!(triggers::own_change(&spans, complete, worker, None, start + 30_000, real), "unknown: not a run");
+    assert!(!triggers::own_change(&spans, complete, worker, None, real - 600_000, real));
+    // check_files keeps them for a paused trigger whose boundary is old.
+    let d = temp_dir("keep");
+    allow(&f, &[&d]);
+    let s = f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d}})).unwrap();
+    triggers::check_files(&f.hub);
+    set_paused(&f.hub, s.id, true, None).unwrap();
+    f.hub.schedules.edit(s.id, |x| {
+        x.watch.stamp = Some(((real - 3 * 3_600_000) as u64) * 1_000_000);
+        Ok(())
+    }).unwrap();
+    worked(&f, 77, start, Some(end));
+    triggers::check_files(&f.hub);
+    assert!(f.hub.triggers.spans_for_test().iter().any(|x| x.start == start), "kept for the paused trigger");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_folder_with_too_many_entries_is_never_read_whole() {
+    let d = temp_dir("many");
+    for i in 0..5 {
+        std::fs::write(d.join(format!("{i}.txt")), "x").unwrap();
+    }
+    assert_eq!(triggers::names_for_test(&d, 5), Ok(5));
+    assert_eq!(triggers::names_for_test(&d, 3), Err(()), "stops at the first entry over the budget");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_reminder_being_claimed_is_never_missed_by_the_limits() {
+    // Three reminders due at once; while the scheduler claims them, a fourth is asked for
+    // again and again: it is refused every time (the reads share the claim lock).
+    for _ in 0..20 {
+        let t0 = at(LONDON, "2026-10-19T10:00");
+        let f = Fixture::new(t0);
+        as_agent(&f, "worker", 41);
+        for m in [20, 40, 60] {
+            tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": m})).unwrap();
+        }
+        f.set(t0 + 60 * MIN);
+        let admitted = std::thread::scope(|sc| {
+            let ask = sc.spawn(|| (0..200).filter(|_| tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 200})).is_ok()).count());
+            f.tick();
+            ask.join().unwrap()
+        });
+        assert_eq!(admitted, 0, "a fourth reminder slipped in while the others were claimed");
+    }
 }

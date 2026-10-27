@@ -791,10 +791,12 @@ Rules (every one is checked in the tool, whatever the client):
   schedule directly; `schedule.update`, `schedule.create`, resuming and the settings are refused
   from an agent's session and from a shell an agent has typed into, and `schedule.approve` is
   taken only from a click in Muster's window (a WebSocket of the UI's that holds a window, whose
-  process isn't inside any session: never the CLI, `/api/rpc` or a script; docs/PROTOCOL.md
-  "Schedules"). To change an approved schedule an agent proposes a new one. (Agents run as the
-  owner's user, so this raises the bar rather than closing it: docs/SCHEDULING_PLAN.md "Approval
-  and its limits".)
+  program is known and isn't inside any session: never the CLI, `/api/rpc` or a script;
+  docs/PROTOCOL.md "Schedules"). A schedule made or widened anywhere else (the CLI without a
+  session id, `/api/rpc`, a script) is held for that click like a proposal, and settings that
+  loosen a limit are refused there. To change an approved schedule an agent proposes a new one.
+  (Agents run as the owner's user, so this raises the bar rather than closing it:
+  docs/SCHEDULING_PLAN.md "Approval and its limits".)
 - **Not from unattended work.** A session handling scheduled or triggered work (any chain a
   schedule or trigger started: its provenance's origin isn't `human`) can't propose or set a
   reminder. So a reminder can't set the next one, and a schedule can't breed more schedules; the

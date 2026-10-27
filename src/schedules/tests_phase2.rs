@@ -195,7 +195,7 @@ fn a_branch_moving_in_a_local_repo_fires_once_with_its_commits() {
     triggers::check_git(&f.hub);
     assert_eq!(held(&f, s.id).unwrap().count, 1);
     // Paused: not even read.
-    set_paused(&f.hub, s.id, true).unwrap();
+    set_paused(&f.hub, s.id, true, None).unwrap();
     git(&dir, &["commit", "-q", "--allow-empty", "-m", "while paused"]);
     triggers::check_git(&f.hub);
     assert_eq!(held(&f, s.id).unwrap().count, 1);
@@ -434,12 +434,12 @@ async fn the_spend_caps_refuse_unattended_work_on_openrouter_only() {
     let e = crate::agents::precheck(&f.hub, &orla, "x", "schedule:1", None, None, Some(Origin::Schedule)).unwrap_err();
     assert!(e.to_string().starts_with("budget:"));
     // Raising the cap lets it through; a per-agent cap applies to that agent's share.
-    set_settings(&f.hub, SettingsChange { spend_cap: Some(20.0), ..Default::default() }).unwrap();
+    set_settings(&f.hub, SettingsChange { spend_cap: Some(20.0), ..Default::default() }, true).unwrap();
     assert!(f.hub.spend.check(&f.hub, &orla, &settings(&f)).is_ok());
-    let e = set_settings(&f.hub, SettingsChange { spend_cap: Some(0.0), ..Default::default() }).unwrap_err();
+    let e = set_settings(&f.hub, SettingsChange { spend_cap: Some(0.0), ..Default::default() }, true).unwrap_err();
     assert!(e.to_string().contains("$0.01 to $1000"), "always on: it can't be cleared");
     let caps = [("orla".to_string(), Some(0.5))].into_iter().collect();
-    set_settings(&f.hub, SettingsChange { agent_spend_caps: Some(caps), ..Default::default() }).unwrap();
+    set_settings(&f.hub, SettingsChange { agent_spend_caps: Some(caps), ..Default::default() }, true).unwrap();
     // orla works while the key goes up $0.60: its share.
     f.hub.spend.mark_active_for_test(orla.id);
     *usage.lock() = (104.7, 5.7);

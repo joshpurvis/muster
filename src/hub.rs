@@ -1046,12 +1046,16 @@ impl Hub {
     }
 
     pub fn emit(&self, ev: ServerEvent) {
-        // Every session state change passes here: file triggers record who worked when from it
-        // (a leaf lock that calls nothing, so it is safe with `inner` held).
+        // Every session state change passes here: file triggers record who worked when from it,
+        // and whether that turn is unattended work (two leaf locks that call nothing, so it is
+        // safe with `inner` held).
         match &ev {
-            ServerEvent::SessionUpserted(i) => {
-                self.triggers.observe(i.id, crate::schedules::triggers::working_state(i.state), i.state_since)
-            }
+            ServerEvent::SessionUpserted(i) => self.triggers.observe(
+                i.id,
+                crate::schedules::triggers::working_state(i.state),
+                i.state_since,
+                self.agents.unattended_now(i.id),
+            ),
             ServerEvent::SessionRemoved { id } => self.triggers.session_gone(*id),
             _ => {}
         }

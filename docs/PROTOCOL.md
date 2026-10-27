@@ -335,7 +335,7 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
 | `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
 | `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
-| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. |
+| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. `on: true` only from a click in Muster's window (see "Schedules", Phase 3, "Held"); `off` from anywhere. |
 
 `from_session` (the CLI passes `$MUSTER_SESSION_ID`) says who wrote: a shell tab, or no
 `from_session`, is the human. An agent's session (Claude or Codex) makes `updated_by` that agent
@@ -430,7 +430,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
 | `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
-| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. |
+| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. A change that loosens a limit is taken only from a click in Muster's window (Phase 3, "Held"). |
 
 Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next run moves,
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
@@ -543,6 +543,8 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 `trigger.*`, `note.set_triggers` and every schedule change are the human's: refused from an
 agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
 an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
+Since Phase 3's second fix round, what makes or widens unattended work also needs a click in
+Muster's window; elsewhere it is held or refused (Phase 3, "Held").
 
 **Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
 daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
@@ -679,6 +681,10 @@ Code: `src/schedules/agent.rs` (the agent tools and the estimate), `src/schedule
 //               billing: "claude_subscription" | "openrouter" | "codex" | "other",
 //               recent_unattended_7d: number, lines: string[], text: string } | null   // agent-made only
 //   status: also "proposed" (waiting for approval: it has no next_run and never runs)
+//           and "held" (made or widened outside Muster's window: waits the same way)
+//   held: { what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[], at: number,
+//           why: string } | null   // what was done outside the window, waiting for the owner's click
+//   estimate is also set on a held schedule
 // Another kind of When / WhenInput (origin webhook, like every trigger):
 type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */; pattern: string | null /* "*.pdf": * and ? on file names */;
                    recursive: boolean /* up to 3 levels down */; quiet_min: number /* 1..120, default 2 */ };
@@ -688,11 +694,36 @@ type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */;
 
 | Method | Params | Result |
 |---|---|---|
-| `schedule.approve` | `{id}` | `Schedule`. The human approves an agent's proposal: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule, and a Claude subscription agent's 7 days start now. **Only over a WebSocket of the UI's own**: the client token, an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`, `wry://`), a window claimed on that connection (`window.claim`), and the connection's process (found from the socket in `/proc`) not descended from any session's process. Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove`. |
+| `schedule.approve` | `{id, seen?}` | `Schedule`. The owner approves an agent's proposal or a held schedule: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule from its next time. A Claude subscription agent's 7 days start now for a proposal, a held new schedule or a held renewal, and stay as they were for a held change. `seen`: the `updated_at` the owner looked at (the UI sends it); a schedule changed since is refused. **Only a click in Muster's window** (below). Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session, a connection whose program can't be told. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove`. |
 | `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
 | `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
 | `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
 | `schedule.settings.set` | also `watch_folders: string[]` (the whole list; existing folders, `~/` allowed, made absolute with links resolved; not `/`; at most 20) | `ScheduleSettings`. Removing a folder stops the file triggers inside it: their waiting events go, their prompts still in an agent's queue are taken back, and a run due is `skipped`. |
+
+**Held** (fix round 2). A click in Muster's window is a call over a WebSocket that came in with the
+client token and an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`,
+`wry://`), that holds a window (`window.claim`), names no `from_session`, and whose program is
+known and outside every session: the socket's holders found in `/proc` (a process of the owner's
+whose descriptors can't be read counts as a possible holder, judged by its parents), none of them
+descended from a session's process. A program that can't be told (no `/proc`, as on macOS; the
+connection not listed; no holder found; a lookup error) is not the window. Anything else is
+outside the window, and there:
+
+| Call | From outside the window |
+|---|---|
+| `schedule.create` | Made, but held: `status: "held"`, `held.what: ["made"]`, no `next_run`. At most 10 new held schedules wait at once; one nobody approves is removed after 7 days. |
+| `schedule.update` | A change that only narrows (name, notify, quiet hours on, a lower or new daily cap, pausing) applies; any other (prompt, timing, time zone, steps, note, missed rule, conversation, quiet hours off, a higher or no cap) is made but held (`changed`), and its prompts still in an agent's queue are taken back. |
+| `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
+| `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
+| `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
+| `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
+| `note.set_triggers` | `on: true` refused; `off` applies. |
+| `agent.update` | Adding `schedule` or `webhook` to `accepts` refused; anything else applies. |
+
+A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
+or fired) until `schedule.approve`. Edits from the window keep it held; `schedule.remove` drops it.
+`schedule.run` and `trigger.fire` stay as they were: they run work already approved, once, under
+the agent's caps.
 
 A proposal is stored like any schedule with `made_by` and no `next_run`; every write to it keeps
 `next_run` empty while it waits (the human may edit it before approving), and the scheduler,

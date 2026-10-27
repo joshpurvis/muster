@@ -27,7 +27,8 @@
 //!
 //! Limit (as for every agent rule, docs/PROTOCOL.md "Limits"): an agent that calls the client API
 //! with the client token directly, not through MCP or `muster`, is the human as far as the daemon
-//! can tell.
+//! can tell. What it makes or widens that way is still held for the owner's click in Muster's
+//! window (`super::Held`, `rpc::from_window`; docs/SCHEDULING_PLAN.md "Approval and its limits").
 
 use std::collections::HashMap;
 
@@ -125,11 +126,13 @@ fn attended(hub: &Hub, caller: SessionId) -> anyhow::Result<()> {
 /// run still to happen (a one-off whose run was claimed keeps no next run, but may still wait
 /// behind a turn of the human's). Not done or expired. Each with the time it runs at, for a
 /// one-off: its next run, or the slot of its run still pending.
-fn live_made(hub: &Hub, agent: i64) -> Vec<(Schedule, Option<i64>)> {
+/// The schedules and the pending runs are read together, under the scheduler's claim lock
+/// (`Schedules::with_pending`): a reminder whose run is being claimed can't slip between them.
+fn live_made(hub: &Hub, agent: i64) -> anyhow::Result<Vec<(Schedule, Option<i64>)>> {
     let now = hub.schedules.now();
-    let pending: HashMap<i64, i64> = hub.store().pending_runs().unwrap_or_default().into_iter().map(|r| (r.schedule_id, r.slot)).collect();
-    hub.schedules
-        .list()
+    let (list, pending) = hub.schedules.with_pending().context("reading the schedules")?;
+    let pending: HashMap<i64, i64> = pending.into_iter().map(|r| (r.schedule_id, r.slot)).collect();
+    Ok(list
         .into_iter()
         .filter(|s| s.made_by.as_ref().is_some_and(|m| m.agent_id == agent))
         .filter_map(|s| {
@@ -141,7 +144,7 @@ fn live_made(hub: &Hub, agent: i64) -> Vec<(Schedule, Option<i64>)> {
             let expired = plan::expires_at(&s, &super::facts_for(hub, &a, &s)).is_some_and(|e| now >= e);
             (!expired && (runs_at.is_some() || s.when.is_trigger())).then_some((s, runs_at))
         })
-        .collect()
+        .collect())
 }
 
 /// When, as an agent gives it: exactly one of a cron line, a one-off time (`YYYY-MM-DDTHH:MM`
@@ -249,7 +252,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
             );
             // From the first check to the record of it: one call at a time.
             let _making = hub.schedules.made.making.lock();
-            let mine = live_made(hub, me.id);
+            let mine = live_made(hub, me.id)?;
             let waiting: Vec<i64> = mine
                 .iter()
                 .filter(|(s, _)| s.made_by.as_ref().is_some_and(|m| m.kind == MadeKind::Reminder))
@@ -288,7 +291,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 ..Default::default()
             };
             let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Reminder, reason: String::new(), at: now, approved_at: None };
-            let s = super::create_as(hub, req, Some(made)).map_err(reword)?;
+            let s = super::create_as(hub, req, Some(made), None).map_err(reword)?;
             hub.schedules.made.add(me.id, MadeKind::Reminder, now);
             Ok(json!({
                 "schedule_id": s.id,
@@ -334,8 +337,8 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 None => me.clone(),
             };
             let _making = hub.schedules.made.making.lock();
-            let mine = live_made(hub, me.id);
-            let waiting = mine.iter().filter(|(s, _)| s.waiting_approval()).count();
+            let mine = live_made(hub, me.id)?;
+            let waiting = mine.iter().filter(|(s, _)| s.made_by.as_ref().is_some_and(MadeBy::waiting)).count();
             ensure!(waiting < PROPOSALS_WAITING_MAX, "{waiting} of your proposals are already waiting for the human (at most {PROPOSALS_WAITING_MAX})");
             ensure!(mine.len() < AGENT_MADE_MAX, "you already have {AGENT_MADE_MAX} schedules you made: delete one first");
             let today = made_today(hub, me.id, MadeKind::Proposal, now);
@@ -356,7 +359,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 ..Default::default()
             };
             let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Proposal, reason, at: now, approved_at: None };
-            let s = super::create_as(hub, req, Some(made)).map_err(reword)?;
+            let s = super::create_as(hub, req, Some(made), None).map_err(reword)?;
             hub.schedules.made.add(me.id, MadeKind::Proposal, now);
             drop(_making);
             let j = super::schedule_json(hub, &s);
@@ -391,7 +394,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 "schedule {} neither runs on you nor was made by you: only the human can pause it",
                 s.id
             );
-            let j = super::set_paused(hub, s.id, true)?;
+            let j = super::set_paused(hub, s.id, true, None)?;
             Ok(json!({"schedule_id": s.id, "status": j["status"], "note": "Only the human can resume it."}))
         }
         "delete_schedule" => {
@@ -527,11 +530,23 @@ pub fn estimate(hub: &Hub, agent: &Agent, s: &Schedule, now: i64) -> Value {
 }
 
 /// The scheduler's tidying (`run::tick`): proposals nobody approved within 7 days go, and so do
+/// schedules made outside Muster's window that nobody approved within 7 days (`Held`), and
 /// reminders a day after they ran.
 pub fn tidy(hub: &Hub, now: i64) {
     for s in hub.schedules.list() {
+        if s.made_by.is_none()
+            && let Some(h) = &s.held
+            && h.what.contains(&super::HeldWhat::Made)
+            && now - h.at >= super::HELD_KEEP_MS
+        {
+            hub.notice("info", format!("The schedule \"{}\", made outside Muster's window, waited 7 days without approval and was removed.", s.name));
+            if let Err(e) = super::remove(hub, s.id) {
+                tracing::warn!(schedule = s.id, "tidying a held schedule: {e:#}");
+            }
+            continue;
+        }
         let Some(m) = &s.made_by else { continue };
-        let stale = if s.waiting_approval() {
+        let stale = if m.waiting() {
             now - m.at >= PROPOSAL_KEEP_MS
         } else {
             m.kind == MadeKind::Reminder
@@ -542,7 +557,7 @@ pub fn tidy(hub: &Hub, now: i64) {
         if !stale {
             continue;
         }
-        if s.waiting_approval() {
+        if m.waiting() {
             hub.notice("info", format!("{}'s proposal \"{}\" waited 7 days without approval and was removed.", m.agent, s.name));
         }
         if let Err(e) = super::remove(hub, s.id) {

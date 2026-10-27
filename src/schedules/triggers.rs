@@ -141,12 +141,26 @@ struct Activity {
     /// When they were last saved (unix ms).
     #[serde(default)]
     saved_at: i64,
+    /// The spans are complete from this time on (unix ms): every span that ended after it is
+    /// kept. Before it some were dropped (too many, or from before Muster kept them), so who
+    /// made a change then is unknown, and such a change counts as an agent's own (`own_change`).
+    #[serde(default)]
+    complete_since: i64,
     #[serde(skip)]
     dirty: bool,
 }
 
+impl Activity {
+    /// Span `s` is dropped: what happened up to its end is no longer known.
+    fn forget(&mut self, s: &Span, now: i64) {
+        self.complete_since = self.complete_since.max(s.end.unwrap_or(now));
+        self.dirty = true;
+    }
+}
+
 const ACTIVITY_KEY: &str = "schedules.file_trigger_activity";
-/// Spans are kept this long after they end (a change is judged within a look or two of it).
+/// Spans are kept at least this long after they end, and longer while a file trigger has not
+/// looked past them yet (a paused one, say: `Watchers::settled`'s `keep_from`).
 const SPAN_KEEP_MS: i64 = 60 * plan::MINUTE_MS;
 const SPANS_MAX: usize = 1000;
 /// A change this long before a span's recorded start still counts as during it: the state is
@@ -169,10 +183,14 @@ pub fn working_state(s: AgentState) -> bool {
 }
 
 impl Watchers {
-    /// A session's state is now `working` (or not) since `at`: opens or closes its span. Called
-    /// from `Hub::emit` for every session event (often with the hub's lock held): it takes only
-    /// its own lock and calls nothing.
-    pub fn observe(&self, session: SessionId, working: bool, at: i64) {
+    /// A session's state is now `working` (or not) since `at`, and whether its provenance is
+    /// unattended work now (`unattended`, `agents::Registry::unattended_now`): opens or closes
+    /// its span. The span is marked unattended when its turn is seen to be (at its start, while
+    /// it runs or when it ends: the provenance stays the turn's until the next prompt), so a
+    /// later turn of the same session can't hide what an earlier one was. Called from
+    /// `Hub::emit` for every session event (often with the hub's lock held): it takes only its
+    /// own lock and calls nothing.
+    pub fn observe(&self, session: SessionId, working: bool, at: i64, unattended: bool) {
         let at = if at <= 0 { now_ms() } else { at };
         let mut g = self.activity.lock();
         let open = g.spans.iter().rposition(|s| s.session == session && s.end.is_none());
@@ -182,14 +200,20 @@ impl Watchers {
                 if g.spans.len() >= 2 * SPANS_MAX
                     && let Some(i) = g.spans.iter().position(|s| s.end.is_some())
                 {
-                    g.spans.remove(i);
+                    let dropped = g.spans.remove(i);
+                    g.forget(&dropped, at);
                 }
-                g.spans.push(Span { session, agent: None, unattended: false, start: at, end: None });
+                g.spans.push(Span { session, agent: None, unattended, start: at, end: None });
+                g.dirty = true;
+            }
+            (true, Some(i)) if unattended && !g.spans[i].unattended => {
+                g.spans[i].unattended = true;
                 g.dirty = true;
             }
             (false, Some(i)) => {
                 let start = g.spans[i].start;
                 g.spans[i].end = Some(at.max(start));
+                g.spans[i].unattended |= unattended;
                 g.dirty = true;
             }
             _ => {}
@@ -198,13 +222,17 @@ impl Watchers {
 
     /// A session went away: its span ends now.
     pub fn session_gone(&self, session: SessionId) {
-        self.observe(session, false, now_ms());
+        self.observe(session, false, now_ms(), false);
     }
 
-    /// The spans, with each one's agent and whether it was unattended filled in (from the
-    /// session's provenance while the turn is open or just ended, before a later turn begins),
-    /// old ones dropped. Lookups run without the lock held (they take other locks).
-    fn settled(&self, hub: &Hub, now: i64) -> Vec<Span> {
+    /// The spans, with each one's agent filled in, and whether it was unattended for one not
+    /// marked when seen (from the session's provenance while the turn is open or just ended,
+    /// before a later turn begins: spans restored after a reload), and the time they are
+    /// complete from (`Activity::complete_since`). A finished span is kept `SPAN_KEEP_MS`, and
+    /// longer while a file trigger hasn't looked past it (`keep_from`: the oldest file trigger
+    /// boundary, unix ms); past `SPANS_MAX` the oldest go. Lookups run without the lock held
+    /// (they take other locks).
+    fn settled(&self, hub: &Hub, now: i64, keep_from: Option<i64>) -> (Vec<Span>, i64) {
         let snapshot = self.activity.lock().spans.clone();
         let mut updates: Vec<(SessionId, i64, Option<i64>, bool)> = Vec::new();
         for (i, s) in snapshot.iter().enumerate() {
@@ -225,14 +253,15 @@ impl Watchers {
                 g.dirty = true;
             }
         }
-        let before = g.spans.len();
-        g.spans.retain(|s| s.end.is_none_or(|e| now - e < SPAN_KEEP_MS));
+        let keep = keep_from.map_or(now - SPAN_KEEP_MS, |k| k.min(now - SPAN_KEEP_MS));
+        let (kept, dropped): (Vec<Span>, Vec<Span>) = std::mem::take(&mut g.spans).into_iter().partition(|s| s.end.is_none_or(|e| e >= keep));
+        g.spans = kept;
         let over = g.spans.len().saturating_sub(SPANS_MAX);
-        g.spans.drain(..over);
-        if g.spans.len() != before {
-            g.dirty = true;
+        let dropped: Vec<Span> = dropped.into_iter().chain(g.spans.drain(..over)).collect();
+        for s in &dropped {
+            g.forget(s, now);
         }
-        g.spans.clone()
+        (g.spans.clone(), g.complete_since)
     }
 
     /// Save the spans if they changed since the last save.
@@ -261,6 +290,11 @@ impl Watchers {
     pub(super) fn spans_for_test(&self) -> Vec<Span> {
         self.activity.lock().spans.clone()
     }
+
+    #[cfg(test)]
+    pub(super) fn settled_for_test(&self, hub: &Hub, now: i64, keep_from: Option<i64>) -> (Vec<Span>, i64) {
+        self.settled(hub, now, keep_from)
+    }
 }
 
 /// At start (a reload keeps sessions running): the spans saved before, plus what the sessions
@@ -268,15 +302,22 @@ impl Watchers {
 /// ended after the save has a span to then (its start is unknown: from the save on), and a span
 /// left open at the save that is no longer working ends at its last turn (or the save).
 pub(super) fn restore_activity(hub: &Hub) {
-    let saved: Activity = match hub.store().load_runtime(ACTIVITY_KEY) {
+    // Nothing saved (or unreadable): nothing is known from before now. A record from before
+    // `complete_since` was kept had spans only for the hour before its save.
+    let fresh = Activity { complete_since: now_ms(), ..Default::default() };
+    let mut saved: Activity = match hub.store().load_runtime(ACTIVITY_KEY) {
         Ok(Some(a)) => a,
-        Ok(None) => Activity::default(),
+        Ok(None) => fresh,
         Err(e) => {
             tracing::warn!("reading who was working (file triggers): {e:#}");
-            Activity::default()
+            fresh
         }
     };
+    if saved.complete_since == 0 {
+        saved.complete_since = saved.saved_at - SPAN_KEEP_MS;
+    }
     let sessions = hub.sessions();
+    let unattended: std::collections::HashSet<SessionId> = sessions.iter().map(|i| i.id).filter(|id| hub.agents().unattended_now(*id)).collect();
     let mut g = hub.triggers.activity.lock();
     let mut spans = saved.spans;
     for sp in spans.iter_mut().filter(|s| s.end.is_none()) {
@@ -289,14 +330,15 @@ pub(super) fn restore_activity(hub: &Hub) {
     }
     for i in &sessions {
         let open = spans.iter().any(|s| s.session == i.id && s.end.is_none());
+        let u = unattended.contains(&i.id);
         if working_state(i.state) && !open {
-            spans.push(Span { session: i.id, agent: None, unattended: false, start: i.state_since.min(now_ms()), end: None });
+            spans.push(Span { session: i.id, agent: None, unattended: u, start: i.state_since.min(now_ms()), end: None });
         } else if !working_state(i.state)
             && let Some(t) = i.last_turn_at
             && t > saved.saved_at
             && !spans.iter().any(|s| s.session == i.id && s.end.is_some_and(|e| e >= t))
         {
-            spans.push(Span { session: i.id, agent: None, unattended: false, start: saved.saved_at.min(t), end: Some(t) });
+            spans.push(Span { session: i.id, agent: None, unattended: u, start: saved.saved_at.min(t), end: Some(t) });
         }
     }
     // Spans recorded since start (session events before this ran) stay, after the saved ones.
@@ -307,14 +349,19 @@ pub(super) fn restore_activity(hub: &Hub) {
     }
     g.spans = spans;
     g.saved_at = saved.saved_at;
+    g.complete_since = g.complete_since.max(saved.complete_since);
     g.dirty = true;
 }
 
 /// Is a change made at `at` (unix ms) an agent's own, for a file trigger on agent `agent`
 /// (its session `own`)? Yes during, or `ABSORB_GRACE_MS` after, a span of that agent's or of
-/// unattended work.
-pub fn own_change(spans: &[Span], agent: i64, own: Option<SessionId>, at: i64, now: i64) -> bool {
+/// unattended work; and yes when who worked then is no longer known (before `complete_since`,
+/// plus the grace): a change nobody can vouch for doesn't start a run.
+pub fn own_change(spans: &[Span], complete_since: i64, agent: i64, own: Option<SessionId>, at: i64, now: i64) -> bool {
     let grace = test_ms("MUSTER_TEST_ABSORB_GRACE_MS").unwrap_or(ABSORB_GRACE_MS);
+    if at <= complete_since + grace {
+        return true;
+    }
     spans.iter().any(|s| {
         (s.agent == Some(agent) || Some(s.session) == own || s.unattended)
             && at >= s.start - SPAN_START_SLACK_MS
@@ -864,7 +911,7 @@ fn gh_bin() -> String {
 /// Is this trigger worth watching now (not paused, not expired)? A paused or expired trigger
 /// costs nothing: no reads, no `gh`.
 fn watching(hub: &Hub, s: &Schedule, settings: &super::Settings) -> bool {
-    if s.paused || settings.paused {
+    if s.paused || settings.paused || s.waiting_approval() {
         return false;
     }
     let Some(agent) = hub.agents().by_id(s.agent_id) else { return false };
@@ -1123,8 +1170,9 @@ mod pinned {
             Ok(stat_of(&st))
         }
 
-        /// The entries' names (not `.` and `..`).
-        pub fn names(&mut self) -> Vec<CString> {
+        /// The entries' names (not `.` and `..`), at most `max`: Err as soon as there is one
+        /// more, so a folder with millions of entries is never read (nor held in memory) whole.
+        pub fn names(&mut self, max: usize) -> Result<Vec<CString>, ()> {
             let mut out = Vec::new();
             loop {
                 // SAFETY: self.0 is an open DIR; the entry is read before the next readdir.
@@ -1135,10 +1183,13 @@ mod pinned {
                 // SAFETY: d_name is NUL-terminated within the entry.
                 let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) };
                 if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                    if out.len() >= max {
+                        return Err(());
+                    }
                     out.push(name.to_owned());
                 }
             }
-            out
+            Ok(out)
         }
 
         /// Where the open handle is (None where the system can't say).
@@ -1202,13 +1253,11 @@ pub fn look_at_folder(folder: &Path, pattern: Option<&str>, recursive: bool, kno
         seen: &mut usize,
         out: &mut FolderLook,
     ) -> Result<(), ()> {
-        let names = dir.names();
+        // The entries this look may still read: one more and the folder is refused.
+        let names = dir.names(FILES_SCAN_MAX.saturating_sub(*seen))?;
         let mut subdirs = Vec::new();
         for c in names {
             *seen += 1;
-            if *seen > FILES_SCAN_MAX {
-                return Err(());
-            }
             let name = String::from_utf8_lossy(c.to_bytes()).into_owned();
             let Ok(st) = dir.stat_at(&c) else { continue };
             if !(st.dir || st.file) || skipped_name(&name, st.dir) {
@@ -1307,9 +1356,9 @@ pub fn check_files(hub: &Hub) {
     let settings = hub.schedules.settings();
     let files: Vec<Schedule> = hub.schedules.list().into_iter().filter(|s| matches!(s.when, When::Files { .. })).collect();
     let any = !files.is_empty();
-    // Who worked when, on the real clock (change times are real), saved if it changed.
-    let real_now = now_ms();
-    let spans = hub.triggers.settled(hub, real_now);
+    // Who worked when is kept until every file trigger (paused and held ones too) has looked
+    // past it, so one that looks again after a long pause still knows.
+    let keep_from = files.iter().filter_map(|s| s.watch.stamp).min().map(|ns| (ns / 1_000_000) as i64);
     for s in files {
         let When::Files { folder, pattern, recursive, quiet_min } = &s.when else { continue };
         if !watching(hub, &s, &settings) {
@@ -1337,6 +1386,8 @@ pub fn check_files(hub: &Hub) {
                 }
             }
         });
+        #[cfg(test)]
+        AFTER_LOOK.with(|h| h.borrow().as_ref().map(|f| f()));
         let look = match got {
             Ok(look) => look,
             Err(e) => {
@@ -1357,10 +1408,17 @@ pub fn check_files(hub: &Hub) {
             continue;
         };
         // Changes made while its agent, or any unattended work, was working (or just after) are
-        // an agent's own: recorded as seen, never an event.
+        // an agent's own: recorded as seen, never an event. Who worked when is read after the
+        // look, on the real clock (change times are real), so work that began while the folder
+        // was being read counts too.
+        let real_now = now_ms();
+        let (spans, complete_since) = hub.triggers.settled(hub, real_now, keep_from);
         let own = hub.agents().by_id(s.agent_id).and_then(|a| a.session_id);
-        let theirs: Vec<String> =
-            fresh.iter().filter(|f| !own_change(&spans, s.agent_id, own, f.changed_at_ms(), real_now)).map(|f| f.rel.clone()).collect();
+        let theirs: Vec<String> = fresh
+            .iter()
+            .filter(|f| !own_change(&spans, complete_since, s.agent_id, own, f.changed_at_ms(), real_now))
+            .map(|f| f.rel.clone())
+            .collect();
         let first = s.watch.stamp.is_none();
         let text = (!first && !theirs.is_empty()).then(|| files_text(folder, &theirs));
         let at = now + test_ms("MUSTER_TEST_TRIGGER_DELAY_MS").unwrap_or(*quiet_min as i64 * plan::MINUTE_MS);
@@ -1380,7 +1438,8 @@ pub fn check_files(hub: &Hub) {
     }
     // Saved only while there is a file trigger to use it (it is still recorded meanwhile).
     if any {
-        hub.triggers.save_activity(hub, real_now);
+        hub.triggers.settled(hub, now_ms(), keep_from);
+        hub.triggers.save_activity(hub, now_ms());
     }
 }
 
@@ -1623,6 +1682,19 @@ pub fn spawn(hub: Arc<Hub>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: runs right after a folder is read and before its changes are judged (work that
+    /// starts while a look runs).
+    pub(super) static AFTER_LOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: how many entries `names` reads from `dir` with a budget of `max` (Err: more).
+#[cfg(test)]
+pub(super) fn names_for_test(dir: &Path, max: usize) -> Result<usize, ()> {
+    pinned::Dir::open_root(dir).map_err(|_| ())?.names(max).map(|n| n.len())
 }
 
 #[cfg(test)]

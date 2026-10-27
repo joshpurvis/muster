@@ -802,9 +802,30 @@ pub struct Registry {
     inner: Mutex<RegInner>,
     /// Serializes agent starts, so two asks can't start one agent twice.
     start_lock: tokio::sync::Mutex<()>,
+    /// The sessions whose provenance is now unattended work (a schedule's or trigger's chain),
+    /// kept beside `inner.runtime.prov` behind a lock of its own that calls nothing: file
+    /// triggers read it on every session event (`Hub::emit`, sometimes with the hub's lock
+    /// held), so each turn is marked when it is seen, not at a later look.
+    unattended: Mutex<HashSet<SessionId>>,
+}
+
+/// The sessions `rt` says are doing unattended work.
+fn unattended_of(rt: &Attributions) -> HashSet<SessionId> {
+    rt.prov.iter().filter(|(_, p)| p.origin != Origin::Human).map(|(id, _)| *id).collect()
 }
 
 impl Registry {
+    /// Is session `id` doing unattended work now (its provenance a schedule's or a trigger's)?
+    /// A leaf lock: safe from anywhere.
+    pub fn unattended_now(&self, id: SessionId) -> bool {
+        self.unattended.lock().contains(&id)
+    }
+
+    /// Keep `unattended` in step with the provenance just saved (with `inner` held).
+    fn mark(&self, rt: &Attributions) {
+        *self.unattended.lock() = unattended_of(rt);
+    }
+
     pub fn load(store: &Store) -> anyhow::Result<Self> {
         let mut inner = RegInner {
             runtime: store.load_runtime("agent-attribution")?.unwrap_or_default(),
@@ -824,10 +845,12 @@ impl Registry {
             }
             inner.agents.insert(b.id, b);
         }
+        let unattended = Mutex::new(unattended_of(&inner.runtime));
         Ok(Registry {
             store: store.clone(),
             inner: Mutex::new(inner),
             start_lock: Default::default(),
+            unattended,
         })
     }
 
@@ -839,6 +862,7 @@ impl Registry {
         let result = edit(&mut next);
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         // Stamps describe only sessions still marked.
@@ -1000,6 +1024,7 @@ impl Registry {
         }
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         for (id, (first, last)) in marks {
@@ -1123,6 +1148,7 @@ impl Registry {
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
         if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some() {
             store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
+            self.mark(&next);
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
         }

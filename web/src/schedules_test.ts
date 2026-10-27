@@ -40,6 +40,9 @@ import {
   nestedSteps,
   noteOptions,
   isProposal,
+  isHeld,
+  heldHeadline,
+  waitingNotice,
   madeByLabel,
   proposalFacts,
   promptIsLong,
@@ -520,4 +523,20 @@ Deno.test("a long proposal prompt folds, with the rest a click away", () => {
   eq(promptIsLong(Array.from({ length: 9 }, (_, i) => `line ${i}`).join("\n")), true, "more than 8 lines");
   eq(promptIsLong("x".repeat(601)), true, "more than 600 characters");
   eq(promptIsLong(Array.from({ length: 8 }, (_, i) => `line ${i}`).join("\n")), false);
+});
+
+Deno.test("a schedule made or changed outside the window waits like a proposal, and says why", () => {
+  const made = sched({ id: 9, status: "held", next_run: null, updated_at: NOW - 5_000, held: { what: ["made"], at: NOW - 5_000, why: "it came from the command line" } });
+  eq([isHeld(made), isProposal(made)], [true, true]);
+  eq(nextLabel(made, NOW), { text: "waiting for your approval", tone: "paused" });
+  eq(heldHeadline(made), "Made from the command line or a script");
+  const changed = { ...made, id: 10, held: { what: ["changed" as const, "resumed" as const], at: NOW - 1_000, why: "x" } };
+  eq(heldHeadline(changed), "Changed and resumed from the command line or a script");
+  eq(heldHeadline({ ...made, held: { what: ["renewed"], at: 0, why: "x" } }), "Renewed for 7 days from the command line or a script");
+  eq(waitingNotice([made]), "1 schedule made or changed outside Muster's window waits for your approval");
+  const p = sched({ id: 7, status: "proposed", next_run: null, made_by: { agent_id: 2, agent: "reviewer", kind: "proposal", reason: "r", at: NOW - 60_000, approved_at: null } });
+  eq(waitingNotice([p]), "1 schedule proposed by reviewer waits for your approval");
+  eq(waitingNotice([p, made, changed]), "3 schedules wait for your approval (1 proposed by agents, 2 from the command line)");
+  eq(waitingProposals([changed, sched({ id: 1 }), made, p]).map((s) => s.id), [7, 9, 10], "oldest first");
+  eq(isHeld(sched({})), false);
 });

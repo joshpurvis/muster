@@ -507,7 +507,7 @@ export function isExpired(s: Schedule, now: number): boolean {
 }
 
 export function nextLabel(s: Schedule, now: number): { text: string; tone: "next" | "paused" | "expired" | "done" } {
-  if (s.status === "proposed") return { text: "waiting for your approval", tone: "paused" };
+  if (s.status === "proposed" || s.status === "held") return { text: "waiting for your approval", tone: "paused" };
   if (s.status === "done" || (s.next_run === null && s.when.kind === "once")) return { text: "done", tone: "done" };
   if (isExpired(s, now)) return { text: "expired", tone: "expired" };
   if (s.paused) return { text: "paused", tone: "paused" };
@@ -625,14 +625,56 @@ export function sortSchedules(list: Schedule[]): Schedule[] {
 
 // ---------------- what agents made (Phase 3) ----------------
 
-/** An agent's proposal that waits for your approval. */
+/** Waits for your approval: an agent's proposal, or a schedule made or changed outside
+ * Muster's window (`held`). Neither runs before you click Approve. */
 export function isProposal(s: Schedule): boolean {
-  return s.status === "proposed" || (!!s.made_by && s.made_by.kind === "proposal" && s.made_by.approved_at === null);
+  return s.status === "proposed" || isHeld(s) || (!!s.made_by && s.made_by.kind === "proposal" && s.made_by.approved_at === null);
 }
 
-/** Every proposal waiting, oldest first (the panel's notice, and its count). */
+/** Made or changed outside Muster's window (the command line, a script), waiting for your click. */
+export function isHeld(s: Schedule): boolean {
+  return s.status === "held" || !!s.held;
+}
+
+/** When it started waiting: when the agent proposed it, or when it was first held. */
+function waitingSince(s: Schedule): number {
+  return s.made_by && s.made_by.approved_at === null ? s.made_by.at : s.held?.at ?? s.updated_at;
+}
+
+/** Every schedule waiting for your approval, oldest first (the panel's notice, and its count). */
 export function waitingProposals(list: Schedule[]): Schedule[] {
-  return list.filter(isProposal).sort((a, b) => (a.made_by?.at ?? 0) - (b.made_by?.at ?? 0) || a.id - b.id);
+  return list.filter(isProposal).sort((a, b) => waitingSince(a) - waitingSince(b) || a.id - b.id);
+}
+
+/** The panel's notice: "2 schedules proposed by reviewer wait for your approval", "1 schedule
+ * made outside Muster's window waits for your approval", or both kinds together. */
+export function waitingNotice(waiting: Schedule[]): string {
+  const proposed = waiting.filter((s) => !isHeld(s) || (s.made_by && s.made_by.approved_at === null));
+  const held = waiting.length - proposed.length;
+  const n = (k: number) => (k === 1 ? "1 schedule" : `${k} schedules`);
+  const verb = waiting.length === 1 ? "waits" : "wait";
+  if (!held) {
+    const by = [...new Set(proposed.map((s) => s.made_by?.agent ?? "an agent"))].join(", ");
+    return `${n(proposed.length)} proposed by ${by} ${verb} for your approval`;
+  }
+  if (!proposed.length) return `${n(held)} made or changed outside Muster's window ${verb} for your approval`;
+  return `${n(waiting.length)} ${verb} for your approval (${proposed.length} proposed by agents, ${held} from the command line)`;
+}
+
+/** What a held schedule's card says was done outside the window: "Made from the command line",
+ * "Changed and resumed from the command line". */
+export function heldHeadline(s: Schedule): string {
+  const what = s.held?.what ?? ["made"];
+  if (what.includes("made")) return "Made from the command line or a script";
+  const words: Record<string, string> = {
+    changed: "changed",
+    resumed: "resumed",
+    unskipped: "its skipped run put back",
+    renewed: "renewed for 7 days",
+  };
+  const parts = what.map((w) => words[w]).filter(Boolean);
+  const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0] ?? "changed";
+  return `${list[0].toUpperCase()}${list.slice(1)} from the command line or a script`;
 }
 
 /** The chip on a row an agent made: "reminder" (it set it for itself) or "from reviewer" (its

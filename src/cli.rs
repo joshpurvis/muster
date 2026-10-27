@@ -1038,6 +1038,18 @@ fn schedule_line(s: &Value) -> String {
         s["status"].as_str().unwrap_or("?"), next, last, s["name"].as_str().unwrap_or(""), s["reading"].as_str().unwrap_or(""))
 }
 
+/// A schedule made or changed here waits for the owner's click in Muster's window: say so in
+/// plain words (nothing else on the line says it won't run).
+fn held_note(s: &Value) {
+    if s["status"].as_str() == Some("held") {
+        println!(
+            "  Waiting for your approval: made or changed from the command line, it doesn't run until you click \
+             Approve on its card in Muster's Agents panel (`muster schedule rm {}` drops it).",
+            s["id"]
+        );
+    }
+}
+
 fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option<i64>, all: bool, pause: bool) -> anyhow::Result<()> {
     if all {
         one("schedule.settings.set", json!({"paused": pause}))?;
@@ -1047,6 +1059,7 @@ fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option
     let id = id.ok_or_else(|| exit(2, "give a schedule id, or --all"))?;
     let s = one("schedule.pause", json!({"id": id, "on": pause}))?;
     println!("schedule {id}: {}", s["status"].as_str().unwrap_or("?"));
+    held_note(&s);
     Ok(())
 }
 
@@ -1104,10 +1117,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 if let Some(u) = s["url"].as_str() {
                     println!("  URL: {u} (POST, with its secret: `muster trigger --url {}`)", s["when"]["name"].as_str().unwrap_or(""));
                 }
+            } else if s["status"].as_str() == Some("held") {
+                println!("schedule {}: {} ({})", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             } else {
                 let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
                 println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             }
+            held_note(&s);
             if s["expires_at"].is_i64() {
                 println!("  {} is a Claude subscription agent: this schedule stops after 7 days unless you renew it \
                     (`muster schedule renew {}`). Quiet hours: {}.", s["agent"].as_str().unwrap_or("it"), s["id"],
@@ -1153,20 +1169,23 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 (false, Some(t)) => println!("schedule {id}: skipping the run at {}", local_time(t)),
                 _ => println!("schedule {id}: not skipping"),
             }
+            held_note(&s);
             Ok(())
         }
         ScheduleCmd::Renew { id } => {
             let s = one("schedule.renew", json!({"id": id}))?;
-            match s["expires_at"].as_i64() {
-                Some(e) => println!("schedule {id}: runs until {}", local_time(e)),
-                None => println!("schedule {id}: doesn't expire"),
+            match (s["status"].as_str(), s["expires_at"].as_i64()) {
+                (Some("held"), _) => println!("schedule {id}: renewal asked for (7 more days once you approve it)"),
+                (_, Some(e)) => println!("schedule {id}: runs until {}", local_time(e)),
+                (_, None) => println!("schedule {id}: doesn't expire"),
             }
+            held_note(&s);
             Ok(())
         }
         ScheduleCmd::Approve { id } => Err(exit(
             2,
             format!(
-                "schedule {id}: {}. Open Muster's Agents panel and click Approve on the proposal (`muster schedule rm {id}` dismisses it).",
+                "schedule {id}: {}. Open Muster's Agents panel and click Approve on its card (`muster schedule rm {id}` dismisses it).",
                 crate::rpc::APPROVE_BY_CLICK
             ),
         )),

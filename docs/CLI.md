@@ -138,20 +138,30 @@ muster note read release --json | jq .rev     # then: muster note write release 
 
 Recurring or one-off messages to a named agent (docs/PROTOCOL.md "Schedules", docs/UI.md "Agents
 panel"). Each run is an ordinary message with origin `schedule` at hop 0, so the agent must accept
-scheduled work (`muster agent edit <name> --accepts human,schedule`; a Codex agent does by
-default) and its caps apply. Only you make or change schedules: these commands are refused from an
+scheduled work (tick Schedule in Edit agent, in Muster's window; a Codex agent does by default)
+and its caps apply. Only you make or change schedules: these commands are refused from an
 agent's session, or from a shell tab an agent spawned or typed into (any other shell tab counts as
 you). Times print in this machine's zone.
 
+**From the command line, new or wider schedules wait for your click.** An agent can run
+`muster` as you, so what the command line makes can't run unattended on its word alone: a
+schedule you `add`, `resume`, un-skip (`skip --undo`) or `renew` here is made but **held**. It
+prints `Waiting for your approval: … click Approve on its card in Muster's Agents panel`, shows as
+`held` in `muster schedule ls`, and runs only once you click **Approve** on its card (or goes with
+`muster schedule rm <id>`; one nobody approves goes after 7 days). Pausing and removing apply at
+once. Settings that loosen a limit (`resume --all`, a higher cap, another watched folder), allowing
+triggers on a note and letting an agent take scheduled work are only in Muster's window: here they
+are refused with where to do it (docs/SCHEDULING_PLAN.md "Approval and its limits").
+
 | Command | What it does |
 |---|---|
-| `muster schedule add <agent> TIMING [options] [PROMPT...]` | Create one (`schedule.create`). TIMING is one of `--every 15m\|30m\|1h\|2h\|3h\|4h\|6h\|8h\|12h`, `--hourly` (or `--hourly=:MM`), `--daily HH:MM`, `--weekdays HH:MM`, `--weekly DAYS@HH:MM` (`mon@09:00`, `mon,thu@17:30`), `--cron "M H DOM MON DOW"` (at most every 15 minutes) or `--at WHEN` (once: `HH:MM` for the next one, `"YYYY-MM-DD HH:MM"`, or `+20m` / `+2h`). PROMPT as for `send` (none or `-`: stdin); it may use `{date}`, `{last_run}` and `{last_reply}`. Options: `--name`, `--tz ZONE` (default: this machine's), `--if-missed auto\|run\|skip`, `--fresh` (a new conversation each run), `--notify failure\|always\|never`, `--note <id\|title>` (append each reply there; a new title makes the note), `--quiet-hours on\|off` (default on for a Claude subscription agent), `--max-per-day N`, `--paused`. Prints `schedule ID: <reading> (<zone>); next <time>`, plus the 7-day expiry for a Claude subscription agent. |
+| `muster schedule add <agent> TIMING [options] [PROMPT...]` | Create one (`schedule.create`). TIMING is one of `--every 15m\|30m\|1h\|2h\|3h\|4h\|6h\|8h\|12h`, `--hourly` (or `--hourly=:MM`), `--daily HH:MM`, `--weekdays HH:MM`, `--weekly DAYS@HH:MM` (`mon@09:00`, `mon,thu@17:30`), `--cron "M H DOM MON DOW"` (at most every 15 minutes) or `--at WHEN` (once: `HH:MM` for the next one, `"YYYY-MM-DD HH:MM"`, or `+20m` / `+2h`). PROMPT as for `send` (none or `-`: stdin); it may use `{date}`, `{last_run}` and `{last_reply}`. Options: `--name`, `--tz ZONE` (default: this machine's), `--if-missed auto\|run\|skip`, `--fresh` (a new conversation each run), `--notify failure\|always\|never`, `--note <id\|title>` (append each reply there; a new title makes the note), `--quiet-hours on\|off` (default on for a Claude subscription agent), `--max-per-day N`, `--paused`. Prints `schedule ID: <reading> (<zone>)` and that it waits for your approval (above); made in Muster's window instead, it prints its next time and, for a Claude subscription agent, the 7-day expiry. |
 | `muster schedule ls [agent] [--json]` (alias `list`) | `ID  AGENT  STATUS  NEXT  LAST  NAME  (WHEN)`; says so first when all schedules are paused. `--json` prints `schedule.list`. |
 | `muster schedule rm <id>` | Remove it and its history. |
-| `muster schedule pause <id>` / `resume <id>` | Pause or resume one. `--all` instead: "Pause all schedules" on or off (each schedule's own pause stays). |
+| `muster schedule pause <id>` / `resume <id>` | Pause one; resume one (held for your click: above). `pause --all`: "Pause all schedules" on (each schedule's own pause stays); `resume --all` is refused here: resume all in the Agents panel. |
 | `muster schedule run <id>` | Run it now (origin `schedule`, outside its timing and quiet hours). Prints `run N: started`, or `skipped` when its previous run is still going. |
-| `muster schedule skip <id> [--undo]` | Skip its next run, or stop skipping it. |
-| `muster schedule renew <id>` | Renew a Claude subscription agent's recurring schedule for 7 days from now. |
+| `muster schedule skip <id> [--undo]` | Skip its next run, or stop skipping it (`--undo` is held for your click). |
+| `muster schedule renew <id>` | Ask to renew a Claude subscription agent's recurring schedule for 7 days: held, and your click on Approve renews it from then. |
 | `muster schedule history <id> [--limit N] [--json]` | Its runs, newest first: `RUN  TIME  KIND  OUTCOME  REASON` (with how long a run took). `--json` prints `schedule.runs`. |
 
 ```sh
@@ -164,8 +174,8 @@ muster schedule history 3
 ### Triggers and Then (Phase 2)
 
 `muster schedule add` takes `--on EVENT` instead of a timing: a **trigger**, whose runs have
-origin `webhook` ("Triggered"), so its agent must accept it (`--accepts human,webhook`; a Codex
-agent does by default). Triggers run at most every 15 minutes and 10 times a day unless
+origin `webhook` ("Triggered"), so its agent must accept it (tick Webhook in Edit agent; a Codex
+agent does by default). Like any schedule made here, it waits for your click on Approve. Triggers run at most every 15 minutes and 10 times a day unless
 `--max-per-day` says otherwise (docs/PROTOCOL.md "Schedules", Phase 2).
 
 | EVENT | Fires when | Options |
@@ -189,12 +199,12 @@ chain. (Deeper chains: `schedule.create` with nested `then`, at most 4 levels.)
 |---|---|
 | `muster trigger <name> [DATA...]` | Fire URL trigger `<name>` now, with DATA (words joined by spaces; `-` reads stdin) handed to its agent as quoted untrusted data. Prints when it runs (`at most every 15 minutes`). |
 | `muster trigger --url <name> [--rotate]` | Print the trigger's loopback URL, its secret and a ready `curl` line (`--rotate`: a new secret; the old one stops working). |
-| `muster note triggers <note> [on\|off]` | Allow triggers on a note, or not (no argument: say which). |
+| `muster note triggers <note> [on\|off]` | Say whether triggers are allowed on a note, or switch them `off`. `on` is refused here: allow them in Muster's window (the note's status line). |
 
 Like schedule changes, these are refused from an agent's session or a shell an agent drives.
 
 ```sh
-muster note triggers Ideas on
+muster note triggers Ideas          # allowed? (switch them on in the note's status line)
 muster schedule add researcher --on note:Ideas Expand the new items into a short plan each.
 muster schedule add worker --on git:~/projects/muster@master Update the changelog note with: {event}
 muster schedule add reviewer --on gh:octo/repo:pr-opened --poll-min 10 Review the new pull request.
@@ -211,7 +221,7 @@ the one exception is a one-off reminder an agent sets for itself up to 24 hours 
 "Schedules"). `muster schedule ls` shows a proposal as `proposed`, and `muster schedule rm <id>`
 dismisses one. There is no command to approve one: the command line is what an agent has, so
 `muster schedule approve` only says to click Approve (docs/SCHEDULING_PLAN.md "Approval and its
-limits").
+limits"). Schedules you make or widen from the command line wait the same way (above).
 
 | Command | What it does |
 |---|---|

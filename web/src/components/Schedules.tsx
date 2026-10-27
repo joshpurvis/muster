@@ -69,6 +69,9 @@ import {
   nestedSteps,
   noteOptions,
   isProposal,
+  isHeld,
+  heldHeadline,
+  waitingNotice,
   madeByLabel,
   proposalFacts,
   promptIsLong,
@@ -124,7 +127,8 @@ export function SchedulesPausedNotice() {
   );
 }
 
-/** "2 schedules proposed by agents wait for you · Show", under the panel header while any wait. */
+/** "2 schedules proposed by reviewer wait for your approval · Show" (or made outside Muster's
+ * window), under the panel header while any wait. */
 export function ProposalsNotice() {
   if (!schedulesSupported.value) return null;
   const waiting = waitingProposals(schedules.value);
@@ -134,31 +138,32 @@ export function ProposalsNotice() {
     el?.scrollIntoView({ block: "nearest" });
     el?.focus();
   };
-  const by = [...new Set(waiting.map((s) => s.made_by?.agent ?? "an agent"))].join(", ");
   return (
     <div class="sch-paused-note sch-prop-note" role="status">
       <IconSpark size={12} />
-      <span>
-        {waiting.length === 1 ? "1 schedule" : `${waiting.length} schedules`} proposed by {by} {waiting.length === 1 ? "waits" : "wait"}{" "}
-        for your approval
-      </span>
+      <span>{waitingNotice(waiting)}</span>
       <button type="button" class="sch-link" onClick={show}>Show</button>
     </div>
   );
 }
 
-/** A proposal's ⋯ menu: approve, edit first, or dismiss. Nothing else: it hasn't run. */
+/** A waiting schedule's ⋯ menu: approve, edit first, or dismiss (a held change of one of yours:
+ * remove it, with the usual question). Nothing else: it doesn't run until approved. */
 function proposalMenu(s: Schedule, x: number, y: number) {
+  const proposal = !!s.made_by && s.made_by.approved_at === null;
+  const fresh = proposal || (s.held?.what ?? []).includes("made");
   openMenu({
     x,
     y,
     minWidth: 180,
     items: [
-      { header: `${s.name} (proposed by ${s.made_by?.agent ?? "an agent"})` },
+      { header: proposal ? `${s.name} (proposed by ${s.made_by?.agent ?? "an agent"})` : `${s.name} (waits for your approval)` },
       { label: "Approve", run: () => A.approveSchedule(s) },
       { label: "Edit…", hint: "then approve", run: () => A.editSchedule(s.id) },
       "sep",
-      { label: "Dismiss", danger: true, run: () => A.dismissProposal(s) },
+      fresh
+        ? { label: "Dismiss", danger: true, run: () => A.dismissProposal(s) }
+        : { label: "Remove…", danger: true, run: () => A.removeSchedule(s) },
     ],
   });
 }
@@ -222,10 +227,15 @@ export function moveRow(e: KeyboardEvent) {
   rows[i + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
 }
 
-/** An agent's proposal, waiting for you: what will run, when, on which agent, why, and what it
- * would use, with Approve, Edit and Dismiss. It never runs before you approve it. */
+/** A schedule waiting for you: an agent's proposal, or one made or changed outside Muster's
+ * window (the command line, a script: `held`). What will run, when, on which agent, why, and
+ * what it would use, with Approve, Edit and Dismiss (Remove for a held change of one of yours).
+ * It never runs before you approve it. */
 function ProposalCard({ s, now }: { s: Schedule; now: number }) {
-  const m = s.made_by!;
+  const m = s.made_by && s.made_by.approved_at === null ? s.made_by : null;
+  const held = !m ? s.held ?? null : null;
+  const fresh = !!m || (held?.what ?? ["made"]).includes("made");
+  const since = m?.at ?? held?.at ?? s.updated_at;
   const sub = s.estimate?.billing === "claude_subscription";
   const facts = proposalFacts(s, browserZone());
   const when = facts[0].value;
@@ -233,7 +243,8 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
   /** A long prompt shows its start; "Show all" (or the keyboard, in the focusable box) the rest. */
   const [whole, setWhole] = useState(false);
   const promptId = useId();
-  const label = `Proposed by ${m.agent}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}. Waiting for your approval.`;
+  const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
+  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}. Waiting for your approval.`;
   return (
     <div
       role="listitem"
@@ -259,7 +270,8 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
       <div class="sch-prop-head">
         <IconSpark size={12} class="sch-prop-icon" />
         <span class="sch-prop-by">
-          Proposed by <b>{m.agent}</b> · <span data-tip={new Date(m.at).toLocaleString()}>{nextWhenPast(m.at, now)}</span>
+          {m ? <>Proposed by <b>{m.agent}</b></> : heldHeadline(s)} ·{" "}
+          <span data-tip={new Date(since).toLocaleString()}>{nextWhenPast(since, now)}</span>
         </span>
       </div>
       <div class="sch-prop-name">{s.name}</div>
@@ -278,7 +290,7 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
               class={cx("sch-prop-prompt", whole && "whole")}
               tabIndex={0}
               role="region"
-              aria-label={`The prompt ${m.agent} proposes${long && !whole ? " (scroll, or Show all)" : ""}`}
+              aria-label={`The prompt ${m ? `${m.agent} proposes` : "it would send"}${long && !whole ? " (scroll, or Show all)" : ""}`}
             >
               {s.prompt}
             </pre>
@@ -295,9 +307,17 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
             )}
           </dd>
         </div>
-        {m.reason && (
+        {m?.reason && (
           <div class="sch-prop-fact">
             <dt>Why</dt> <dd class="sch-prop-reason" data-tip={`${m.agent}'s own words`}>{m.reason}</dd>
+          </div>
+        )}
+        {held && (
+          <div class="sch-prop-fact">
+            <dt>Why</dt>
+            <dd class="sch-prop-reason">
+              Waits for your approval: {held.why}. Until you approve it, it doesn't run.
+            </dd>
           </div>
         )}
         {s.estimate && (
@@ -319,7 +339,9 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
           Approve
         </button>
         <button type="button" class="btn btn-sm" onClick={() => A.editSchedule(s.id)}>Edit…</button>
-        <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.dismissProposal(s)}>Dismiss</button>
+        {fresh
+          ? <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.dismissProposal(s)}>Dismiss</button>
+          : <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.removeSchedule(s)}>Remove…</button>}
       </div>
     </div>
   );
@@ -336,7 +358,7 @@ function nextWhenPast(ms: number, now: number): string {
 }
 
 function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
-  if (isProposal(s) && s.made_by) return <ProposalCard s={s} now={now} />;
+  if (isProposal(s) && (s.made_by || isHeld(s))) return <ProposalCard s={s} now={now} />;
   return <TimedRow s={s} now={now} />;
 }
 
@@ -795,7 +817,7 @@ export function ScheduleDialog(
         knowSchedule(s);
         overlay.value = null;
         if (!agentsPanelOpen.value) A.toggleAgentsPanel();
-        toast(
+        if (!A.heldToast(s)) toast(
           "success",
           s.trigger
             ? `${s.name} for ${s.agent ?? d.agent}: ${s.reading.replace(/^When /, "runs when ")}.`
@@ -808,7 +830,7 @@ export function ScheduleDialog(
       if (Object.keys(patch).length) {
         const s = await rpc.call<Schedule>("schedule.update", { id: sched.id, ...patch });
         knowSchedule(s);
-        toast("success", "Saved.", 2500);
+        if (sched.status === "held" || !A.heldToast(s)) toast("success", "Saved.", 2500);
       }
       overlay.value = null;
       A.focusActiveTerminalSoon();
@@ -1161,7 +1183,7 @@ export function ScheduleDialog(
           <h2>{sched ? sched.name : "New schedule"}</h2>
           <span class="muted">
             {proposal
-              ? `Proposed by ${sched!.made_by?.agent ?? "an agent"}: saving keeps it waiting; it runs only once you approve it.`
+              ? `${sched!.made_by && sched!.made_by.approved_at === null ? `Proposed by ${sched!.made_by.agent}` : heldHeadline(sched!)}: saving keeps it waiting; it runs only once you approve it.`
               : sched
               ? sched.reading
               : event

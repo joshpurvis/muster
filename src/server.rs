@@ -646,15 +646,36 @@ pub fn socket_owner(peer: SocketAddr, server: SocketAddr) -> Option<u32> {
     found
 }
 
-/// The processes holding the client end (`peer`) of an established loopback connection to
-/// `server`: the socket's inode from /proc/net/tcp and tcp6 (the whole 4-tuple must match), then
-/// every process of ours with a descriptor on it (`/proc/<pid>/fd`; others' can't be read). Empty
-/// without procfs or when nothing matches.
-pub fn socket_pids(peer: SocketAddr, server: SocketAddr) -> Vec<u32> {
+/// Which program a loopback connection comes from, as far as telling the owner's window from a
+/// program an agent started goes (`rpc::from_window`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    /// Every process that holds the connection, or might (one of the owner's processes that
+    /// hides its descriptors), was looked at, and none descends from a session's process.
+    Outside,
+    /// This process holds it, or might, and descends from a session's process.
+    Inside(u32),
+    /// It can't be told (no procfs, as on macOS; the connection isn't listed; nothing that holds
+    /// it was found; a lookup failed). Never taken as the owner's window.
+    Unknown(String),
+}
+
+/// Who holds the client end (`peer`) of an established loopback connection to `server`: the
+/// socket's inode and owner from /proc/net/tcp and tcp6 (the whole 4-tuple must match), then
+/// every process with a descriptor on it (`/proc/<pid>/fd`). A process of the socket's owner
+/// whose descriptors can't be read (it turned off `PR_SET_DUMPABLE`, as ssh-agent does, or an
+/// agent's program could) might be the one: it counts as a holder too, judged by its parents
+/// (`/proc/<pid>/stat` stays readable). Inside when any of them descends from one of `roots`
+/// (the sessions' processes); Unknown when anything can't be read or nothing holds it.
+pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>) -> Holder {
     const ESTABLISHED: &str = "01";
+    let unknown = |why: &str| Holder::Unknown(why.to_string());
     let mut inodes: Vec<String> = Vec::new();
+    let mut owner: Option<u32> = None;
+    let mut listed = false;
     for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(text) = std::fs::read_to_string(file) else { continue };
+        listed = true;
         for line in text.lines().skip(1) {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() < 10 || f[3] != ESTABLISHED {
@@ -664,41 +685,96 @@ pub fn socket_pids(peer: SocketAddr, server: SocketAddr) -> Vec<u32> {
                 && parse_proc_addr(f[2]).is_some_and(|a| same_endpoint(a, server))
                 && f[9] != "0"
             {
+                let Ok(uid) = f[7].parse::<u32>() else { return unknown("its owner in /proc/net/tcp can't be read") };
+                if owner.is_some_and(|o| o != uid) {
+                    return unknown("two users hold that connection");
+                }
+                owner = Some(uid);
                 inodes.push(format!("socket:[{}]", f[9]));
             }
         }
     }
-    if inodes.is_empty() {
-        return Vec::new();
+    if !listed {
+        return unknown("this system has no /proc/net/tcp to look the connection up in");
     }
-    let mut pids = Vec::new();
-    let Ok(procs) = std::fs::read_dir("/proc") else { return pids };
-    for p in procs.flatten() {
+    let Some(owner) = owner else { return unknown("the connection isn't listed in /proc/net/tcp") };
+    let Ok(procs) = std::fs::read_dir("/proc") else { return unknown("/proc can't be listed") };
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut holders: Vec<u32> = Vec::new();
+    let mut hidden: Vec<u32> = Vec::new();
+    for p in procs {
+        let Ok(p) = p else { return unknown("/proc can't be listed") };
         let Some(pid) = p.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
-        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else { continue };
-        if fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| inodes.iter().any(|i| l.as_os_str() == i.as_str()))) {
-            pids.push(pid);
+        // A process of the socket's owner whose descriptors can't be read may hold it.
+        let hides = |hidden: &mut Vec<u32>| {
+            if proc_uids(pid).is_some_and(|u| u.contains(&owner)) {
+                hidden.push(pid);
+            }
+        };
+        match std::fs::read_dir(p.path().join("fd")) {
+            Ok(fds) => {
+                let mut unreadable = false;
+                for fd in fds {
+                    match fd.and_then(|fd| std::fs::read_link(fd.path())) {
+                        Ok(l) if inodes.iter().any(|i| l.as_os_str() == i.as_str()) => {
+                            holders.push(pid);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if gone(&e) => {}
+                        Err(_) => unreadable = true,
+                    }
+                }
+                if unreadable && !holders.contains(&pid) {
+                    hides(&mut hidden);
+                }
+            }
+            Err(e) if gone(&e) => {}
+            Err(_) => hides(&mut hidden),
         }
     }
-    pids
+    if holders.is_empty() && hidden.is_empty() {
+        return unknown("no process holds the connection");
+    }
+    for pid in holders.iter().chain(hidden.iter()) {
+        match descent(*pid, roots) {
+            Some(true) => return Holder::Inside(*pid),
+            Some(false) => {}
+            // Gone meanwhile: it holds nothing now. Still there but its parents unreadable:
+            // can't tell.
+            None if !std::path::Path::new(&format!("/proc/{pid}")).exists() => {}
+            None => return Holder::Unknown(format!("the parents of process {pid} can't be read")),
+        }
+    }
+    Holder::Outside
+}
+
+/// A process's user ids (real, effective, saved, filesystem), from `/proc/<pid>/status`, which
+/// stays readable when its descriptors don't. None: gone, or unreadable.
+fn proc_uids(pid: u32) -> Option<Vec<u32>> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+    Some(line.split_whitespace().filter_map(|u| u.parse().ok()).collect())
 }
 
 /// Is `pid`, or a process it descends from (its parent, their parent, …), one of `roots`? From
-/// `/proc/<pid>/stat`; false without procfs. A process whose parent ended was handed to init or
-/// a subreaper, so it no longer descends from where it started.
-pub fn descends_from(pid: u32, roots: &std::collections::HashSet<u32>) -> bool {
+/// `/proc/<pid>/stat`. None when one of them can't be read (gone meanwhile, or no procfs). A
+/// process whose parent ended was handed to init or a subreaper, so it no longer descends from
+/// where it started.
+pub fn descent(pid: u32, roots: &std::collections::HashSet<u32>) -> Option<bool> {
     let mut cur = pid;
     for _ in 0..256 {
         if roots.contains(&cur) {
-            return true;
+            return Some(true);
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else { return false };
+        let stat = std::fs::read_to_string(format!("/proc/{cur}/stat")).ok()?;
         match crate::gui::parse_proc_stat(&stat) {
             Some((_, ppid)) if ppid > 1 && ppid != cur => cur = ppid,
-            _ => return false,
+            Some(_) => return Some(false),
+            None => return None,
         }
     }
-    false
+    None
 }
 
 fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
@@ -999,24 +1075,60 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_connections_processes_and_what_they_descend_from() {
+    fn a_connections_holder_and_what_it_descends_from() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (_srv, peer) = l.accept().unwrap();
         let me = std::process::id();
-        let pids = socket_pids(peer, l.local_addr().unwrap());
-        assert!(pids.contains(&me), "{pids:?}");
-        assert!(socket_pids(peer, "127.0.0.1:1".parse().unwrap()).is_empty(), "another destination: no one");
+        let server = l.local_addr().unwrap();
+        let none = std::collections::HashSet::new();
+        // Held by this process, which descends from no session: outside; this process as a
+        // session's: inside.
+        assert_eq!(connection_holder(peer, server, &none), Holder::Outside);
+        assert_eq!(connection_holder(peer, server, &[me].into_iter().collect()), Holder::Inside(me));
+        // A connection that isn't listed: unknown, never outside.
+        assert!(matches!(connection_holder(peer, "127.0.0.1:1".parse().unwrap(), &none), Holder::Unknown(_)), "another destination");
         // This process descends from itself and from its parent; not from an unrelated pid.
         let parent = std::os::unix::process::parent_id();
-        assert!(descends_from(me, &[me].into_iter().collect()));
-        assert!(descends_from(me, &[parent].into_iter().collect()));
-        assert!(!descends_from(me, &[u32::MAX - 1].into_iter().collect()));
+        assert_eq!(descent(me, &[me].into_iter().collect()), Some(true));
+        assert_eq!(descent(me, &[parent].into_iter().collect()), Some(true));
+        assert_eq!(descent(me, &[u32::MAX - 1].into_iter().collect()), Some(false));
+        assert_eq!(descent(u32::MAX - 1, &none), None, "no such process: can't tell");
         // A child process descends from us.
         let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
-        assert!(descends_from(child.id(), &[me].into_iter().collect()));
+        assert_eq!(descent(child.id(), &[me].into_iter().collect()), Some(true));
         let _ = child.kill();
         let _ = child.wait();
         drop(c);
+    }
+
+    /// A program that hides its descriptors (`PR_SET_DUMPABLE` off) while it holds the
+    /// connection: its parents still show, so one started in a session is still inside.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_holder_that_hides_its_descriptors_is_judged_by_its_parents() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = l.local_addr().unwrap();
+        let me = std::process::id();
+        // A python child connects, turns dumpable off and waits.
+        let code = format!(
+            "import ctypes,socket,sys,time\nctypes.CDLL(None).prctl(4,0,0,0,0)\ns=socket.create_connection(('127.0.0.1',{}))\nprint(s.getsockname()[1],flush=True)\ntime.sleep(10)",
+            server.port()
+        );
+        let Ok(mut child) = std::process::Command::new("python3").args(["-I", "-c", &code]).stdout(std::process::Stdio::piped()).spawn() else {
+            eprintln!("no python3: skipped");
+            return;
+        };
+        let (_srv, peer) = l.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line.trim().parse::<u16>().unwrap(), peer.port());
+        assert!(std::fs::read_dir(format!("/proc/{}/fd", child.id())).is_err(), "its descriptors are hidden");
+        // The child as a session's process (or this test as one): inside, though its
+        // descriptors can't be read.
+        assert_eq!(connection_holder(peer, server, &[child.id()].into_iter().collect()), Holder::Inside(child.id()));
+        assert_eq!(connection_holder(peer, server, &[me].into_iter().collect()), Holder::Inside(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

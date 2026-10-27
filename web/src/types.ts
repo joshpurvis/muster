@@ -437,8 +437,10 @@ export interface Schedule {
   /** Null: a one-off that ran. */
   next_run: number | null;
   last_slot: number | null;
-  /** "proposed": an agent's proposal waiting for the human's approval (it never runs before). */
-  status: "active" | "paused" | "expired" | "done" | "proposed";
+  /** "proposed": an agent's proposal waiting for the human's approval (it never runs before).
+   * "held": made or changed outside Muster's window (the command line, a script), waiting for
+   * the owner's click the same way (`held`). */
+  status: "active" | "paused" | "expired" | "done" | "proposed" | "held";
   /** Claude subscription agents' recurring schedules only. */
   expires_at: number | null;
   expires_soon: boolean;
@@ -458,8 +460,19 @@ export interface Schedule {
   url?: string | null;
   /** Phase 3: made by an agent (a proposal, or a reminder it set for itself); null: by you. */
   made_by?: MadeBy | null;
-  /** What it would use (only for schedules an agent made). */
+  /** What it would use (only for schedules an agent made, and held ones). */
   estimate?: ScheduleEstimate | null;
+  /** Made or changed outside Muster's window: it waits for your click on Approve. */
+  held?: ScheduleHeld | null;
+}
+
+/** Why a schedule waits for your approval when no agent proposed it. */
+export interface ScheduleHeld {
+  /** What was done outside the window, in order. */
+  what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[];
+  at: number;
+  /** Where it came from, in words. */
+  why: string;
 }
 
 /** Who made a schedule when it wasn't you. */

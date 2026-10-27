@@ -278,6 +278,56 @@ impl MadeBy {
     }
 }
 
+/// A schedule made or widened anywhere but a click in Muster's window (the command line,
+/// `/api/rpc`, a script, a WebSocket Muster can't tell is the owner's window: `rpc::Via`): it
+/// waits, as an agent's proposal does, until the owner approves it with a click, and doesn't run
+/// before. The change itself is already in the schedule, so the card shows exactly what the
+/// click approves. Changes that only narrow what runs (pause, a lower cap, a rename, removing)
+/// apply directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    /// What was done (in order, no repeats).
+    pub what: Vec<HeldWhat>,
+    /// When it was first held (scheduler clock).
+    pub at: i64,
+    /// Where it came from, in words ("not from a click in Muster's window").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldWhat {
+    /// Made outside the window: a new schedule.
+    Made,
+    /// Its prompt, timing, steps, note or another widening field changed.
+    Changed,
+    /// Resumed (it was paused).
+    Resumed,
+    /// "Skip next" was undone.
+    Unskipped,
+    /// Renewed for 7 more days (applied by the approval).
+    Renewed,
+}
+
+/// Held changes of new schedules waiting at once, at most (an agent with a shell can call the
+/// API as the owner: this bounds the cards it can pile up).
+pub const HELD_NEW_MAX: usize = 10;
+/// A new schedule held this long without approval is removed (a held change of an existing
+/// one stays: it is the owner's schedule).
+pub const HELD_KEEP_MS: i64 = 7 * plan::DAY_MS;
+
+/// Why a schedule is held, as the card and the command line say it.
+pub const HELD_WHY: &str = "it came from the command line or a script, not from a click in Muster's window";
+
+/// Hold `s` for the owner's click, adding `what` (where it came from: `why`).
+pub(crate) fn hold_change(s: &mut Schedule, what: HeldWhat, why: &str, now: i64) {
+    let h = s.held.get_or_insert_with(|| Held { what: Vec::new(), at: now, why: why.to_string() });
+    if !h.what.contains(&what) {
+        h.what.push(what);
+    }
+}
+
 /// "If missed": what a slot missed while Muster was off or asleep does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -360,6 +410,9 @@ pub struct Schedule {
     /// Made by an agent (a proposal or its reminder); None: the human made it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub made_by: Option<MadeBy>,
+    /// Made or widened outside Muster's window: waits for the owner's click (`Held`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held: Option<Held>,
 }
 
 impl Default for Schedule {
@@ -392,6 +445,7 @@ impl Default for Schedule {
             watch: WatchState::default(),
             secret: None,
             made_by: None,
+            held: None,
         }
     }
 }
@@ -405,9 +459,10 @@ impl Schedule {
     pub fn sender(&self) -> String {
         run::sender_of(self.id, self.when.is_trigger())
     }
-    /// An agent's proposal the human hasn't approved: it never runs (no next run is kept).
+    /// An agent's proposal the human hasn't approved, or a schedule made or widened outside
+    /// Muster's window (`held`): it never runs (no next run is kept) until the owner's click.
     pub fn waiting_approval(&self) -> bool {
-        self.made_by.as_ref().is_some_and(MadeBy::waiting)
+        self.held.is_some() || self.made_by.as_ref().is_some_and(MadeBy::waiting)
     }
 }
 
@@ -692,6 +747,15 @@ impl Schedules {
         self.inner.lock().list.values().cloned().collect()
     }
 
+    /// The schedules and the runs still pending, read together under the lock every claim takes
+    /// (`run::handle_due`), so a claim can't fall between the two reads: a one-off whose run was
+    /// just claimed shows either its next run or its pending run, never neither.
+    pub(crate) fn with_pending(&self) -> anyhow::Result<(Vec<Schedule>, Vec<Run>)> {
+        let g = self.inner.lock();
+        let pending = self.store.pending_runs()?;
+        Ok((g.list.values().cloned().collect(), pending))
+    }
+
     fn line(&self, agent: i64) -> Arc<tokio::sync::Mutex<()>> {
         self.agent_lines.lock().entry(agent).or_default().clone()
     }
@@ -806,8 +870,10 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
     let expires_at = plan::expires_at(s, &f);
     let expired = expires_at.is_some_and(|e| now >= e);
     let trigger = s.when.is_trigger();
-    let status = if s.waiting_approval() {
+    let status = if s.made_by.as_ref().is_some_and(MadeBy::waiting) {
         "proposed"
+    } else if s.held.is_some() {
+        "held"
     } else if expired {
         "expired"
     } else if s.next_run.is_none() && !trigger {
@@ -850,8 +916,10 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
             "at": m.at,
             "approved_at": m.approved_at,
         })),
-        // What it would cost in runs and money: shown with every proposal.
-        "estimate": agent.as_ref().filter(|_| s.made_by.is_some()).map(|a| agent::estimate(hub, a, s, now)),
+        // Made or changed outside Muster's window: what, when and why it waits for approval.
+        "held": s.held.as_ref().map(|h| json!({"what": h.what, "at": h.at, "why": h.why})),
+        // What it would cost in runs and money: shown with every proposal and held schedule.
+        "estimate": agent.as_ref().filter(|_| s.made_by.is_some() || s.held.is_some()).map(|a| agent::estimate(hub, a, s, now)),
         "trigger": trigger,
         "origin": s.origin(),
         "then": s.then.as_ref().map(|t| then_json(hub, t)),
@@ -1239,11 +1307,9 @@ fn check_agent(hub: &Hub, agent: &Agent, origin: Origin) -> anyhow::Result<()> {
             String::new()
         };
         anyhow::bail!(
-            "agent {} doesn't take {what} work: tick {tick} under \"Takes messages started by\" in Edit agent \
-             (or `muster agent edit {} --accepts human,{}`).{extra}",
+            "agent {} doesn't take {what} work: tick {tick} under \"Takes messages started by\" in Edit agent, \
+             in Muster's window (the Agents panel).{extra}",
             agent.name,
-            agent.name,
-            origin.as_str()
         );
     }
     Ok(())
@@ -1270,15 +1336,32 @@ fn resolve_note(hub: &Hub, choice: &NoteChoice) -> anyhow::Result<NoteId> {
     }
 }
 
+/// `schedule.create` from a click in Muster's window: the owner's, it runs as made.
 pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
-    let s = create_as(hub, req, None)?;
+    let s = create_as(hub, req, None, None)?;
+    Ok(schedule_json(hub, &s))
+}
+
+/// `schedule.create` from anywhere else (the command line, `/api/rpc`, a script): made as
+/// asked but held, so it runs only once the owner approves it with a click (`Held`).
+pub fn create_held(hub: &Hub, req: ScheduleInput, why: &str) -> anyhow::Result<Value> {
+    let waiting = hub.schedules.list().iter().filter(|s| s.held.as_ref().is_some_and(|h| h.what.contains(&HeldWhat::Made))).count();
+    ensure!(
+        waiting < HELD_NEW_MAX,
+        "{waiting} schedules made outside Muster's window already wait for your approval (at most {HELD_NEW_MAX}): \
+         approve or dismiss them in the Agents panel first"
+    );
+    let now = hub.schedules.now();
+    let held = Held { what: vec![HeldWhat::Made], at: now, why: why.to_string() };
+    let s = create_as(hub, req, None, Some(held))?;
     Ok(schedule_json(hub, &s))
 }
 
 /// Make a schedule: the human's (`made_by` None), or an agent's proposal or reminder
-/// (`agent.rs`, which checks the agent's limits first). A proposal is checked like any schedule
-/// but keeps no time to run until it is approved.
-pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>) -> anyhow::Result<Schedule> {
+/// (`agent.rs`, which checks the agent's limits first); `held`: made outside Muster's window.
+/// A proposal or a held one is checked like any schedule but keeps no time to run until it is
+/// approved.
+pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>, held: Option<Held>) -> anyhow::Result<Schedule> {
     let name = req.agent.as_deref().context("agent is required")?;
     let agent = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
     let when = req.when.context("when is required: {\"kind\":\"cron\",\"cron\":\"0 9 * * 1-5\"} or {\"kind\":\"once\",\"at\":<unix ms>}")?;
@@ -1339,6 +1422,7 @@ pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>) 
         watch: WatchState::default(),
         secret,
         made_by,
+        held,
     };
     if s.waiting_approval() {
         s.next_run = None;
@@ -1356,7 +1440,43 @@ pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>) 
     Ok(s)
 }
 
+/// `schedule.update` from a click in Muster's window.
 pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
+    update_as(hub, req, None)
+}
+
+/// `schedule.update` from anywhere else: a change that only narrows what runs (its name, its
+/// alerts, quiet hours on, a lower daily cap, pausing) takes effect; any other change is made
+/// but held for the owner's click (`Held`), so the schedule doesn't run until then.
+pub fn update_held(hub: &Hub, req: ScheduleInput, why: &str) -> anyhow::Result<Value> {
+    update_as(hub, req, Some(why))
+}
+
+/// Does the edit `before` → `after` widen what runs (anything but narrowing fields)?
+fn widened(before: &Schedule, after: &Schedule) -> Option<HeldWhat> {
+    let changed = before.prompt != after.prompt
+        || !same_timing(&before.when, &after.when)
+        || before.tz != after.tz
+        || before.then != after.then
+        || before.note_id != after.note_id
+        || before.missed != after.missed
+        || before.conversation != after.conversation
+        || (before.quiet_hours && !after.quiet_hours)
+        || match (before.daily_cap, after.daily_cap) {
+            (Some(b), Some(a)) => a > b,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+    if changed {
+        Some(HeldWhat::Changed)
+    } else if before.paused && !after.paused {
+        Some(HeldWhat::Resumed)
+    } else {
+        None
+    }
+}
+
+fn update_as(hub: &Hub, req: ScheduleInput, outside: Option<&str>) -> anyhow::Result<Value> {
     let id = req.id.context("id is required")?;
     ensure!(req.agent.is_none(), "a schedule's agent can't change: make a new schedule for the other agent");
     let note_id = match &req.note {
@@ -1390,6 +1510,7 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         None => None,
     };
     let s = hub.schedules.edit(id, |s| {
+        let was = s.clone();
         if let Some(p) = &req.prompt {
             s.prompt = clean_prompt(p)?;
         }
@@ -1445,14 +1566,25 @@ pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         if let Some(p) = req.paused {
             s.paused = p;
         }
+        if let Some(why) = outside
+            && let Some(what) = widened(&was, s)
+        {
+            hold_change(s, what, why, now);
+        }
         Ok(())
     })?;
+    if s.held.is_some() {
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
+    }
     if s.when.is_trigger() {
         triggers::changed(hub, s.id);
     }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
+
+/// Why runs of a held schedule still in an agent's queue were taken back.
+pub const HELD_CANCEL: &str = "it was changed outside Muster's window and waits for your approval";
 
 pub fn remove(hub: &Hub, id: i64) -> anyhow::Result<Value> {
     let s = {
@@ -1486,26 +1618,42 @@ pub fn agent_changed(hub: &Hub, agent_id: i64) {
     hub.schedules.wake.notify_one();
 }
 
-pub fn set_paused(hub: &Hub, id: i64, paused: bool) -> anyhow::Result<Value> {
+/// Pause or resume a schedule. Pausing always applies; resuming from outside Muster's window
+/// (`outside`: why) holds it for the owner's click instead (`Held`).
+pub fn set_paused(hub: &Hub, id: i64, paused: bool, outside: Option<&str>) -> anyhow::Result<Value> {
+    let now = hub.schedules.now();
     let s = hub.schedules.edit(id, |s| {
+        let resumed = s.paused && !paused;
         s.paused = paused;
+        if resumed && let Some(why) = outside {
+            hold_change(s, HeldWhat::Resumed, why, now);
+        }
         Ok(())
     })?;
     if paused {
         run::cancel_unsent(hub, Some(id), plan::PAUSED, false);
+    } else if outside.is_some() && s.held.is_some() {
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
     }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
 
-/// "Skip next" (skip the coming slot) or undo it.
-pub fn set_skip(hub: &Hub, id: i64, skip: bool) -> anyhow::Result<Value> {
+/// "Skip next" (skip the coming slot) or undo it. Undoing it from outside Muster's window
+/// (`outside`) holds the schedule for the owner's click (`Held`).
+pub fn set_skip(hub: &Hub, id: i64, skip: bool, outside: Option<&str>) -> anyhow::Result<Value> {
+    let now = hub.schedules.now();
     let s = hub.schedules.edit(id, |s| {
-        ensure!(!s.waiting_approval(), "this schedule is an agent's proposal: approve it first");
+        ensure!(!s.waiting_approval(), "this schedule waits for your approval: approve it first");
         ensure!(!s.when.is_trigger(), "a trigger has no next time to skip: pause it instead");
         if skip {
             s.skip_slot = Some(s.next_run.context("this schedule has no next run to skip")?);
         } else {
+            if s.skip_slot.is_some()
+                && let Some(why) = outside
+            {
+                hold_change(s, HeldWhat::Unskipped, why, now);
+            }
             s.skip_slot = None;
         }
         Ok(())
@@ -1514,12 +1662,16 @@ pub fn set_skip(hub: &Hub, id: i64, skip: bool) -> anyhow::Result<Value> {
     Ok(schedule_json(hub, &s))
 }
 
-/// `schedule.approve`: the human approves an agent's proposal. It is checked again as if made
-/// now (its agent still takes the work, its time still comes), and then runs like any schedule:
-/// a Claude subscription agent's 7 days start now.
-pub fn approve(hub: &Hub, id: i64) -> anyhow::Result<Value> {
+/// `schedule.approve`: the owner approves an agent's proposal, or a schedule made or changed
+/// outside Muster's window (`Held`). It is checked again as if made now (its agent still takes
+/// the work, its time still comes), and then runs like any schedule from its next time: a
+/// Claude subscription agent's 7 days start now for a new one (a proposal, one made outside)
+/// and for a renewal, and stay as they were for a change. `seen`: the `updated_at` the owner
+/// looked at; a schedule changed since is refused, to look at again.
+pub fn approve(hub: &Hub, id: i64, seen: Option<i64>) -> anyhow::Result<Value> {
     let before = hub.schedules.get(id).with_context(|| format!("no schedule {id} (see `muster schedule ls`)"))?;
     ensure!(before.waiting_approval(), "schedule {id} isn't waiting for approval");
+    ensure!(seen.is_none_or(|t| t == before.updated_at), "it was changed since you looked at it: look at it again");
     let agent = hub.agents().by_id(before.agent_id).context("this schedule's agent was removed")?;
     check_agent(hub, &agent, before.origin())?;
     for a in step_agents(before.then.as_ref()).into_iter().filter_map(|a| hub.agents().by_id(a)) {
@@ -1528,15 +1680,21 @@ pub fn approve(hub: &Hub, id: i64) -> anyhow::Result<Value> {
     let now = hub.schedules.now();
     let next = first_slot(&before.when, &before.tz, now)
         .map_err(|e| anyhow::anyhow!("can't approve it as it is: {e:#}. Edit its time, or dismiss it"))?;
+    // A new schedule's or a renewal's 7 days start now; a change keeps them.
+    let fresh = before.made_by.as_ref().is_some_and(MadeBy::waiting)
+        || before.held.as_ref().is_some_and(|h| h.what.iter().any(|w| matches!(w, HeldWhat::Made | HeldWhat::Renewed)));
     let s = hub.schedules.edit(id, |s| {
         ensure!(s.waiting_approval(), "schedule {id} isn't waiting for approval");
-        ensure!(s.when == before.when && s.tz == before.tz, "it was changed meanwhile: look at it again");
-        if let Some(m) = s.made_by.as_mut() {
+        ensure!(s.updated_at == before.updated_at, "it was changed meanwhile: look at it again");
+        if let Some(m) = s.made_by.as_mut().filter(|m| m.waiting()) {
             m.approved_at = Some(now);
         }
+        s.held = None;
         s.next_run = next;
-        s.renewed_at = now;
-        s.expiry_warned = false;
+        if fresh {
+            s.renewed_at = now;
+            s.expiry_warned = false;
+        }
         Ok(())
     })?;
     hub.schedules.expired_seen.lock().remove(&id);
@@ -1548,9 +1706,25 @@ pub fn approve(hub: &Hub, id: i64) -> anyhow::Result<Value> {
 }
 
 /// Renew a Claude subscription agent's recurring schedule for 7 days from now. An expired one
-/// starts again from its next time (the slots it missed stay skipped).
-pub fn renew(hub: &Hub, id: i64) -> anyhow::Result<Value> {
+/// starts again from its next time (the slots it missed stay skipped). From outside Muster's
+/// window (`outside`) the renewal is held for the owner's click, which applies it (`Held`).
+pub fn renew(hub: &Hub, id: i64, outside: Option<&str>) -> anyhow::Result<Value> {
     let now = hub.schedules.now();
+    if let Some(why) = outside {
+        let cur = hub.schedules.get(id).with_context(|| format!("no schedule {id}"))?;
+        let agent = hub.agents().by_id(cur.agent_id).context("this schedule's agent was removed")?;
+        // Nothing to renew (it doesn't expire): nothing to hold either.
+        if plan::expires_at(&cur, &facts_for(hub, &agent, &cur)).is_none() && cur.held.is_none() {
+            return Ok(schedule_json(hub, &cur));
+        }
+        let s = hub.schedules.edit(id, |s| {
+            hold_change(s, HeldWhat::Renewed, why, now);
+            Ok(())
+        })?;
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
+        publish(hub, &s);
+        return Ok(schedule_json(hub, &s));
+    }
     let s = hub.schedules.edit(id, |s| {
         s.renewed_at = now;
         s.expiry_warned = false;
@@ -1697,7 +1871,34 @@ fn cents(dollars: f64) -> anyhow::Result<u32> {
     Ok(c as u32)
 }
 
-pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
+/// What a settings change loosens, in words (empty: it only tightens or changes nothing): more
+/// may then run unattended, so from outside Muster's window it is refused.
+pub fn settings_widened(before: &Settings, after: &Settings) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if before.paused && !after.paused {
+        out.push("resuming all schedules");
+    }
+    if before.quiet_start != after.quiet_start || before.quiet_end != after.quiet_end {
+        out.push("moving the quiet hours");
+    }
+    if after.unattended_cap > before.unattended_cap {
+        out.push("a higher unattended cap");
+    }
+    if after.spend_cap_cents > before.spend_cap_cents {
+        out.push("a higher spend cap");
+    }
+    if before.agent_spend_caps.iter().any(|(id, c)| after.agent_spend_caps.get(id).is_none_or(|n| n > c)) {
+        out.push("a higher or cleared agent spend cap");
+    }
+    if after.watch_folders.iter().any(|f| !before.watch_folders.contains(f)) {
+        out.push("another watched folder");
+    }
+    out
+}
+
+/// `schedule.settings.set`. `window`: from a click in Muster's window; otherwise a change that
+/// loosens a limit (`settings_widened`) is refused, and only tightening applies.
+pub fn set_settings(hub: &Hub, c: SettingsChange, window: bool) -> anyhow::Result<Value> {
     let next = {
         let mut g = hub.schedules.inner.lock();
         let mut next = g.settings.clone();
@@ -1739,6 +1940,17 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
         if let Some(folders) = &c.watch_folders {
             next.watch_folders = triggers::check_watch_folders(folders)?;
         }
+        // Caps of agents that are gone don't count as cleared.
+        let mut base = g.settings.clone();
+        base.agent_spend_caps.retain(|id, _| hub.agents().by_id(*id).is_some());
+        let wider = settings_widened(&base, &next);
+        ensure!(
+            window || wider.is_empty(),
+            "{} would let more run unattended, so it takes a click in Muster's window (Agents panel → ⋯ → \
+             Scheduling settings). From the command line or a script these settings only tighten: pause all, lower caps, \
+             fewer watched folders",
+            capitalize(&wider.join(", "))
+        );
         hub.store().save_runtime(SETTINGS_KEY, &next)?;
         g.settings = next.clone();
         next
@@ -1761,11 +1973,16 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
     Ok(v)
 }
 
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 /// `schedule.run`: run it now (origin schedule, like any run), whatever its timing. Returns the
 /// run: pending, or skipped when its previous run is still going.
 pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
     let s = hub.schedules.get(id).with_context(|| format!("no schedule {id}"))?;
-    ensure!(!s.waiting_approval(), "this schedule is an agent's proposal: approve it before it runs");
+    ensure!(!s.waiting_approval(), "this schedule waits for your approval: approve it before it runs");
     let agent = hub.agents().by_id(s.agent_id).context("this schedule's agent was removed")?;
     check_agent(hub, &agent, s.origin())?;
     let now = hub.schedules.now();

@@ -87,6 +87,8 @@ docs/UI.md "Agents panel". Choices made while building it:
   "Approval and its limits" below; there is no CLI command for it), and checks it again as if
   made now. No tool approves, resumes, edits or makes a schedule directly: to change
   one an agent proposes a new one. A proposal nobody approves goes after 7 days.
+- Anything that makes or widens unattended work outside a click in Muster's window waits for one
+  too (fix round 2, 2026-10-27): see "Approval and its limits" below.
 - Only named agents propose, and never while handling scheduled or triggered work (their
   session's provenance isn't the human's): so a reminder can't set the next reminder, and a
   schedule can't breed schedules. An ask from another agent on a human-rooted chain is the
@@ -117,7 +119,13 @@ docs/UI.md "Agents panel". Choices made while building it:
   "Ignoring the agent's own writes": a change made while its agent, or any scheduled or
   triggered work, was working, or within 30 s after, counts as an agent's own (files have no
   author); who worked when comes from every session's state changes (a turn's start and end), so
-  a turn between two looks counts too, and it is saved so a reload keeps it. Watched folders are a
+  a turn between two looks counts too, and it is saved so a reload keeps it. Whether a turn was
+  unattended is recorded when the turn is seen (its start, while it runs, its end), not at the
+  next look, so a later turn can't hide an earlier one; who worked when is read after each
+  folder's look, so work that starts while a folder is read counts; it is kept until every file
+  trigger (paused ones too) has looked past it, and a change from a time whose record was dropped
+  (too many turns, or before Muster kept one) counts as an agent's own; the 5000-entry limit stops
+  reading a folder at the first entry over it (fix round 2, 2026-10-27). Watched folders are a
   settings list, empty by default (the owner's opt-in rule): no file trigger can be made until a
   folder is chosen, and removing one stops its triggers at once.
 - Phone push: not built here (feature/phone-push builds Web Push). Every schedule alert goes
@@ -125,30 +133,60 @@ docs/UI.md "Agents panel". Choices made while building it:
   sink needs to hook in.
 - No store migration: schedule records and the settings are JSON.
 
-### Approval and its limits (fix round, 2026-10-26)
+### Approval and its limits (fix rounds, 2026-10-26 and 2026-10-27)
 
-What approving takes: `schedule.approve` is answered only on a WebSocket that came in with the
+**What takes the owner's click.** Approving (`schedule.approve`), and since the second fix round
+everything that makes or widens unattended work: making a schedule, an edit that widens one (its
+prompt, timing, time zone, "Then…" steps, reply note, missed-run rule, conversation, quiet hours
+off, a higher or no daily cap), resuming one, undoing Skip next, renewing one, settings that
+loosen a limit (resuming all, moving quiet hours, a higher unattended or spend cap, clearing an
+agent's spend cap, another watched folder), allowing triggers on a note, and letting an agent
+take scheduled or triggered work. Done anywhere but a click in Muster's window, a schedule change
+is made but **held**: the schedule keeps no time to run and shows as a card in the Agents panel,
+"Made from the command line or a script" (or "Resumed …", "Changed …"), with its prompt, timing,
+agent and use, and Approve, Edit and Dismiss (Remove for a held change of one of yours), exactly
+like an agent's proposal. `muster schedule add` therefore prints the schedule and "Waiting for
+your approval: … click Approve on its card in Muster's Agents panel". At most 10 new held
+schedules wait at once, and one nobody approves goes after 7 days. The settings, a note's
+triggers and an agent's accepted work aren't held: from outside the window they are refused, with
+where to do it instead. Narrowing applies directly from anywhere: pausing, removing, a rename,
+alerts, quiet hours on, a lower cap, fewer watched folders. Approving takes what the owner looked
+at: the UI sends the schedule's `updated_at`, and a schedule changed since is refused, to look at
+again. Approving a held new schedule or a renewal starts a Claude subscription schedule's 7 days;
+approving a held change keeps them.
+
+**What counts as a click in the window** (`rpc::from_window`): a WebSocket that came in with the
 client token and an `Origin` of Muster's own UI, that has claimed a window (`window.claim`, what
-the desktop window and the UI in a browser do when they load), and whose TCP peer process (found
-from the socket's inode in `/proc/net/tcp` and the holders' `/proc/<pid>/fd`) does not descend
-from any session's process. `/api/rpc` (the CLI, any `curl`), a paired phone, a call naming an
-agent's session or an agent-driven shell, and a connection opened from inside a session are all
-refused; `muster schedule approve` exists only to say "click Approve". The card shows the whole
-prompt (Show all, and the box takes the keyboard) and the schedule's time zone before you click.
+the desktop window and the UI in a browser do when they load), that names no session
+(`from_session`), and whose program is known and runs outside every session. The program is found
+from the socket: its inode and owner in `/proc/net/tcp`, then every process holding it
+(`/proc/<pid>/fd`). A process of the owner's whose descriptors can't be read (one that turned off
+`PR_SET_DUMPABLE`, as ssh-agent does and an agent's program could) may be the holder, so it is
+judged too, by its parents (`/proc/<pid>/stat` stays readable): if any of them descends from a
+session's process, the call isn't the window's. When the program can't be told at all (no
+`/proc`, as on macOS; the connection not listed; nothing found holding it; a lookup error), the
+call isn't the window's either: it is held or refused, never trusted. The UI says so when that
+happens to a change made in the window ("Muster couldn't confirm this change came from its own
+window"). guess: on macOS nothing can be approved until a macOS lookup (libproc) is written.
 
-What a determined agent can still do, and why: agents run as the owner's own user, so nothing
-inside Muster can tell an agent's program from the owner's. An agent with a shell can read the
-client token (it is in Muster's discovery file, readable by that user), write a small WebSocket
-client that sends the UI's `Origin`, claims a window and approves, and start it **detached from
-its session** (for example a double fork or `setsid` whose parent exits, so the process is handed
-to init or the user's systemd and no longer descends from the session; or `systemd-run --user`).
-It could also drive the real window with input tools (`ydotool`, `xdotool`) or a browser's
-debugging port. How hard: tens of lines of code and knowing to detach, instead of one command;
-the old hole was `env -u MUSTER_SESSION_ID muster schedule approve <id>`. What would close it:
-running agents as another user or in a sandbox without the token and without `/proc` of the
-owner's processes (PROTOCOL.md "Channel permissions", "Limits": the same holds for every agent
-rule), or an approval only a person can give (a second factor on the phone). The audit stays: the
-approval is logged with the schedule (`made_by.approved_at`), and every proposal is in the MCP
+**What an agent with a shell can still do, and why.** Agents run as the owner's own user, so
+nothing inside Muster can tell an agent's program from the owner's for certain. `env -u
+MUSTER_SESSION_ID muster schedule add …`, `/api/rpc` with the client token, or a script's
+WebSocket now only make a held schedule the owner sees and must approve. To make or widen
+unattended work without the owner's click, an agent would have to read the client token (it is in
+Muster's discovery file, readable by that user), write a WebSocket client that sends the UI's
+`Origin` and claims a window, and run it **detached from its session** (a double fork or `setsid`
+whose parent exits, so the process is handed to init or the user's systemd and no longer descends
+from the session; or `systemd-run --user`), with its descriptors readable. It could also drive the
+real window with input tools (`ydotool`, `xdotool`) or a browser's debugging port. How hard: tens
+of lines of code and knowing to detach, instead of one command. Not covered by the click, on
+purpose: Run now and `muster trigger` run work the owner already approved, once, under the
+agent's unattended and spend caps; they are no more than what an agent typing as the owner could
+already do with `muster send` (docs/PROTOCOL.md "Limits"). What would close the rest: running
+agents as another user or in a sandbox without the token and without `/proc` of the owner's
+processes (PROTOCOL.md "Channel permissions", "Limits": the same holds for every agent rule), or
+an approval only a person can give (a second factor on the phone). The audit stays: approvals are
+logged with the schedule (`made_by.approved_at`, `held` cleared), and every proposal is in the MCP
 log.
 
 The "Today" section below describes the code before Phase 1.

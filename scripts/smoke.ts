@@ -1298,6 +1298,26 @@ async function filesContaining(dir: string, needle: string): Promise<string[]> {
 const cli = (args: string[], env: Record<string, string>) =>
   new Deno.Command(BIN, { args, env, stdin: "null", stdout: "piped", stderr: "piped" }).output();
 
+/** Muster's window as the owner has it: the UI's own Origin and a claimed window, from this test
+ * (a process outside every session). Schedules made or widened anywhere else (the CLI, a
+ * script's WebSocket) wait for its click on Approve; loosened settings only go through it. */
+async function ownerWindow(d: Daemon): Promise<Client> {
+  const w = new Client(d.token, `http://127.0.0.1:${PORT}`);
+  await w.open();
+  await w.call("window.claim", {});
+  return w;
+}
+
+/** The CLI's `schedule N: ...` line: held for the owner's click (it says so), then approved in
+ * the window. Returns the schedule's id. */
+async function approveHeld(w: Client, out: string, what: string): Promise<number> {
+  const id = Number(out.match(/schedule (\d+)/)![1]);
+  ok(out.includes("Waiting for your approval") && out.includes("click Approve"), `${what}: held for your click (${out.trim().slice(0, 160)})`);
+  const a = await w.call("schedule.approve", { id });
+  ok(a.status !== "held" && a.status !== "proposed", `${what}: approved in the window (${a.status})`);
+  return id;
+}
+
 /** Schedules (src/schedules/): made and listed through the CLI, a run is an agent message with
  * origin schedule, refusals, pause and skip, the busy rule, the reply in a note, and the missed-run
  * rule across a backend restart (a debug-build clock offset stands in for two days off). Returns
@@ -1318,6 +1338,7 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
     throw new Error(`timeout waiting for ${what}`);
   };
   const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+  const w = await ownerWindow(d);
 
   // A Claude agent that doesn't take scheduled work is refused, through the CLI too.
   await c.call("agent.create", { name: "nosched", kind: "claude" });
@@ -1329,8 +1350,13 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok(!fast.ok && fast.err.includes("every 15 minutes"), "schedule: faster than every 15 minutes is refused");
   const add = await sch("add", "sched", "--weekdays", "09:00", "--tz", "Europe/London", "--note", "Sched replies",
     "Summary for {date}, since {last_run}");
-  ok(add.ok && /schedule \d+: At 09:00, Monday to Friday \(Europe\/London\); next /.test(add.out), `muster schedule add (${add.out.trim()}${add.err})`);
-  const id = Number(add.out.match(/schedule (\d+)/)![1]);
+  ok(add.ok && /schedule \d+: At 09:00, Monday to Friday \(Europe\/London\)\n/.test(add.out), `muster schedule add (${add.out.trim()}${add.err})`);
+  const heldNow = JSON.parse((await sch("ls", "--json")).out).schedules.find((s: Json) => s.id === Number(add.out.match(/schedule (\d+)/)![1]));
+  ok(heldNow.status === "held" && heldNow.next_run === null && heldNow.held.what.join() === "made",
+    "made from the command line: held, no next run until the owner's click");
+  ok((await sch("run", String(heldNow.id))).err.includes("approve it"), "a held schedule can't be run");
+  ok((await w.call("schedule.list")).schedules.some((s: Json) => s.id === heldNow.id && s.estimate?.text), "its card says what it would use");
+  const id = await approveHeld(w, add.out, "muster schedule add");
   const ls = JSON.parse((await sch("ls", "--json")).out);
   const mine = ls.schedules.find((s: Json) => s.id === id);
   ok(mine && mine.agent === "sched" && mine.status === "active" && mine.next_run > Date.now() && mine.quiet_hours === false &&
@@ -1408,13 +1434,26 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   // Pause, resume, skip next.
   ok((await sch("pause", String(id))).out.includes("paused"), "muster schedule pause");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).paused, "paused shows in schedule.list");
-  ok((await sch("resume", String(id))).out.includes("active"), "muster schedule resume");
+  const resumed = await sch("resume", String(id));
+  ok(resumed.out.includes("held"), `muster schedule resume: held (${resumed.out.trim()})`);
+  await approveHeld(w, resumed.out, "muster schedule resume");
   ok((await sch("skip", String(id))).out.includes("skipping the run at"), "muster schedule skip");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === true, "skip_next is set");
-  await sch("skip", String(id), "--undo");
+  const unskip = await sch("skip", String(id), "--undo");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === false, "skip --undo");
+  await approveHeld(w, unskip.out, "muster schedule skip --undo");
+  // A WebSocket that isn't the owner's window (a script's: no window claimed) is held the same way.
+  const scripted = await c.call("schedule.update", { id, prompt: "Summary for {date}, since {last_run}, and more" });
+  ok(scripted.status === "held" && scripted.held.what.join() === "changed", "a widening edit from a script's WebSocket is held");
+  ok((await c.call("schedule.approve", { id }).then(() => "approved", (e: Error) => String(e))).includes("click on Approve"),
+    "and that WebSocket can't approve it");
+  ok((await w.call("schedule.approve", { id })).status === "active", "the window approves the edit");
+  ok((await w.call("schedule.update", { id, prompt: "Summary for {date}, since {last_run}" })).status === "active", "an edit in the window applies as made");
   ok((await sch("pause", "--all")).ok && (await c.call("schedule.settings.get")).paused === true, "muster schedule pause --all");
-  await sch("resume", "--all");
+  const resumeAll = await sch("resume", "--all");
+  ok(!resumeAll.ok && resumeAll.err.includes("Resuming all schedules") && resumeAll.err.includes("Muster's window"),
+    `muster schedule resume --all: only in the window (${resumeAll.err.trim()})`);
+  await w.call("schedule.settings.set", { paused: false });
 
   // The unattended cap: two schedule messages already today; at a cap of 2 the next is refused.
   await c.call("schedule.settings.set", { unattended_cap: 2 });
@@ -1423,7 +1462,9 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok((await runs(id))[0].reason.includes("unattended"), "a run past the unattended cap is refused, with the reason");
   const refusedMsgs = (await c.call("agent.messages", { agent: "sched" })).messages.filter((m: Json) => m.refused);
   ok(refusedMsgs.some((m: Json) => m.refused.includes("unattended") && m.origin === "schedule"), "the refusal is in the agent's message log");
-  await c.call("schedule.settings.set", { unattended_cap: 24 });
+  const raise = await c.call("schedule.settings.set", { unattended_cap: 24 }).then(() => "raised", (e: Error) => String(e));
+  ok(raise.includes("higher unattended cap"), `a script can lower a cap but not raise it (${raise})`);
+  await w.call("schedule.settings.set", { unattended_cap: 24 });
   await c.call("agent.remove", { name: "nosched" });
 
   // Missed runs across a restart: Muster is "off" for two days (a test clock offset), landing at
@@ -1432,12 +1473,13 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   const made = async (...args: string[]) => {
     const o = await sch("add", "sched", ...args);
     ok(o.ok, `muster schedule add ${args[0]} (${o.out.trim()}${o.err.trim()})`);
-    return Number(o.out.match(/schedule (\d+)/)![1]);
+    return await approveHeld(w, o.out, `muster schedule add ${args[0]}`);
   };
   const daily = await made("--daily", "09:00", "daily catch-up check");
   const hourly = await made("--hourly", "hourly check");
   const minute = new Date().getMinutes();
   const offset = 2 * 86_400_000 + ((90 - minute) % 60) * 60_000;
+  w.close();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon({ MUSTER_TEST_CLOCK_OFFSET_MS: String(offset), MUSTER_TEST_CATCHUP_GAP_MS: "300" });
@@ -1514,6 +1556,7 @@ cat '${BASE}/gh-body.json'
   });
   c = new Client(d.token);
   await c.open();
+  const w = await ownerWindow(d);
 
   // Two Codex agents (they take triggered work by default); their tokens answer the Stop hook.
   await c.call("agent.create", { name: "trig", kind: "codex" });
@@ -1541,15 +1584,17 @@ cat '${BASE}/gh-body.json'
   const add = await run(["schedule", "add", "trig", "--on", "note:Ideas", "Expand the new items: {event}"]);
   ok(add.ok && add.out.includes("When the note “Ideas” changes") && add.out.includes("Triggers are off for the note"),
     `muster schedule add --on note: (${add.out.trim()}${add.err})`);
-  const noteTrig = idOf(add.out);
+  const noteTrig = await approveHeld(w, add.out, "muster schedule add --on note:");
   ok((await sched(noteTrig)).origin === "webhook" && (await sched(noteTrig)).daily_cap === 10, "origin webhook, 10 runs a day by default");
   ok((await run(["note", "append", "Ideas", "second idea"])).ok, "you edit the note");
   await sleep(2500);
   ok((await sched(noteTrig)).pending === null && (await runs(noteTrig)).length === 0, "triggers off (the default): no event, no run");
   const fromAgent = await run(["note", "triggers", "Ideas", "on"], { MUSTER_SESSION_ID: String(sTrig) });
   ok(!fromAgent.ok && fromAgent.err.includes("only the human allows triggers"), `an agent's session can't allow triggers (${fromAgent.err.trim()})`);
-  const allow = await run(["note", "triggers", "Ideas", "on"]);
-  ok(allow.ok && allow.out.includes("triggers allowed"), `muster note triggers Ideas on (${allow.out.trim()})`);
+  const fromCli = await run(["note", "triggers", "Ideas", "on"]);
+  ok(!fromCli.ok && fromCli.err.includes("takes a click in Muster's window"), `muster note triggers Ideas on: only in the window (${fromCli.err.trim()})`);
+  const ideas = (await c.call("note.list")).find((n: Json) => n.title === "Ideas").id;
+  ok((await w.call("note.set_triggers", { id: ideas, on: true })).triggers === true, "triggers allowed on the note in the window");
   // The trigger's own agent editing the note doesn't count.
   const noteId = (await c.call("note.list")).find((n: Json) => n.title === "Ideas").id;
   await c.call("note.append", { id: noteId, text: "- from trig itself", from_session: sTrig });
@@ -1567,7 +1612,7 @@ cat '${BASE}/gh-body.json'
   // ---- A branch moving in a local repo
   const gAdd = await run(["schedule", "add", "trig", "--on", `git:${GREPO}@master`, "Update the changelog."]);
   ok(gAdd.ok && gAdd.out.includes(`When master moves in`), `muster schedule add --on git: (${gAdd.out.trim()}${gAdd.err})`);
-  const gitTrig = idOf(gAdd.out);
+  const gitTrig = await approveHeld(w, gAdd.out, "muster schedule add --on git:");
   await until("the git watcher's first look", async () => (await sched(gitTrig)).watch?.state === "ok");
   await sleep(1000);
   ok((await runs(gitTrig)).length === 0, "the first look only records where master is");
@@ -1581,7 +1626,7 @@ cat '${BASE}/gh-body.json'
   // ---- GitHub: a PR opened (a fake gh); then gh not signed in
   const hAdd = await run(["schedule", "add", "trig", "--on", "gh:octo/repo:pr-opened", "Review the new PR."]);
   ok(hAdd.ok && hAdd.out.includes("When a pull request is opened on octo/repo"), `muster schedule add --on gh: (${hAdd.out.trim()}${hAdd.err})`);
-  const ghTrig = idOf(hAdd.out);
+  const ghTrig = await approveHeld(w, hAdd.out, "muster schedule add --on gh:");
   await until("the first GitHub poll", async () => (await sched(ghTrig)).watch?.state === "ok");
   ok((await Deno.readTextFile(`${BASE}/gh-args`)).includes("repos/octo/repo/pulls?state=all"), "polled with gh api");
   ok((await runs(ghTrig)).length === 0, "the first poll is a baseline");
@@ -1602,7 +1647,7 @@ cat '${BASE}/gh-body.json'
   // ---- A trigger URL: loopback, its secret, a size cap; `muster trigger`
   const uAdd = await run(["schedule", "add", "trig", "--on", "url:deploy-done", "The deploy finished: {payload}"]);
   ok(uAdd.ok && uAdd.out.includes("/api/trigger/deploy-done"), `muster schedule add --on url: (${uAdd.out.trim()}${uAdd.err})`);
-  const urlTrig = idOf(uAdd.out);
+  const urlTrig = await approveHeld(w, uAdd.out, "muster schedule add --on url:");
   ok(!JSON.stringify(await c.call("schedule.list")).includes("Bearer"), "schedule.list has no secret");
   const shown = await run(["trigger", "--url", "deploy-done"]);
   const secret = shown.out.match(/Secret: (\w+)/)?.[1] ?? "";
@@ -1635,7 +1680,7 @@ cat '${BASE}/gh-body.json'
   const cAdd = await run(["schedule", "add", "trig", "--daily", "09:00", "--then", "trig2: The tests said: {reply} ({outcome})",
     "--on-failure", "notify", "Run the tests."]);
   ok(cAdd.ok, `muster schedule add --then (${cAdd.out.trim()}${cAdd.err})`);
-  const chained = idOf(cAdd.out);
+  const chained = await approveHeld(w, cAdd.out, "muster schedule add --then");
   const st = await sched(chained);
   ok(st.then.on_success.agent === "trig2" && st.then.on_failure.notify, "its steps");
   await c.call("schedule.run", { id: chained });
@@ -1655,7 +1700,7 @@ cat '${BASE}/gh-body.json'
   // ---- OpenRouter budget: $6 spent today, over the $5 default: unattended work is refused
   await c.call("agent.create", { name: "orw", kind: "codex", provider: "openrouter", model: "openai/gpt-6.1-sol" });
   const oAdd = await run(["schedule", "add", "orw", "--daily", "09:00", "Nightly check."]);
-  const orSched = idOf(oAdd.out);
+  const orSched = await approveHeld(w, oAdd.out, "muster schedule add (OpenRouter)");
   await c.call("schedule.run", { id: orSched });
   await until("the budget refusal", async () => (await runs(orSched))[0]?.outcome === "refused");
   r = (await runs(orSched))[0];
@@ -1670,8 +1715,8 @@ cat '${BASE}/gh-body.json'
   // What the human types is never blocked (the ask goes through; the fake agent never answers).
   const asked = await c.call("agent.ask", { agent: "orw", text: "hello", timeout_ms: 1000 }).then((x: Json) => JSON.stringify(x), (e: Error) => String(e));
   ok(!asked.includes("budget"), `a message from you is not refused by the budget (${asked.slice(0, 120)})`);
-  // Raised cap: it goes.
-  await c.call("schedule.settings.set", { spend_cap: 10 });
+  // Raised cap (in the window): it goes.
+  await w.call("schedule.settings.set", { spend_cap: 10 });
   ok(Math.abs((await c.call("schedule.settings.get")).spend.cap - 10) < 1e-9, "the cap can be raised");
   ok(!d.log.join("").includes(KEY), "the daemon log never shows the key");
   // Raw keys from unattended work into the OpenRouter agent go through the caps too: back at $5,
@@ -1680,9 +1725,10 @@ cat '${BASE}/gh-body.json'
   const orwSid: number = (await c.call("agent.list")).find((a: Json) => a.name === "orw").session_id;
   const keys = await run(["keys", String(orwSid), "text:hello", "enter"], { MUSTER_SESSION_ID: String(sTrig) });
   ok(!keys.ok && keys.err.includes("budget:"), `unattended raw keys to an OpenRouter session are refused at the cap (${keys.err.trim()})`);
-  await c.call("schedule.settings.set", { spend_cap: 10 });
+  await w.call("schedule.settings.set", { spend_cap: 10 });
   // A reload with another key: orw still runs (billing the first key), so its spend can't be
   // read and unattended work for it is refused until it restarts.
+  w.close();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon({
@@ -1822,11 +1868,15 @@ async function agentSchedules(c: Client, d: Daemon): Promise<{ c: Client; d: Dae
   ok(!refusedF.ok && refusedF.err.includes("Watched folders"), `no file trigger before a folder is chosen (${refusedF.err.trim()})`);
   const fromAgentF = await c.call("schedule.settings.set", { watch_folders: [INBOX], from_session: sPlan }).then(() => "ok", (e: Error) => String(e));
   ok(fromAgentF.includes("agent's session"), "an agent's session can't choose watched folders");
-  await c.call("schedule.settings.set", { watch_folders: [INBOX] });
+  const fromScript = await c.call("schedule.settings.set", { watch_folders: [INBOX] }).then(() => "ok", (e: Error) => String(e));
+  ok(fromScript.includes("Another watched folder") && fromScript.includes("Muster's window"), `nor a script: only the window (${fromScript})`);
+  const fw = await ownerWindow(d);
+  await fw.call("schedule.settings.set", { watch_folders: [INBOX] });
   ok((await c.call("schedule.settings.get")).watch_folders.length === 1, "watched folders are kept");
   const fAdd = await run(["schedule", "add", "planner", "--on", `files:${INBOX}/*.pdf`, "File the new PDFs: {event}"]);
   ok(fAdd.ok && fAdd.out.includes("files named *.pdf appear or change in"), `muster schedule add --on files: (${fAdd.out.trim()}${fAdd.err})`);
-  const fid = Number(fAdd.out.match(/schedule (\d+)/)![1]);
+  const fid = await approveHeld(fw, fAdd.out, "muster schedule add --on files:");
+  fw.close();
   await until("the folder's first look", async () => (await sched(fid)).watch?.state === "ok");
   await Deno.writeTextFile(`${INBOX}/notes.txt`, "not a pdf");
   await sleep(1500);

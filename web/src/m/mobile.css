@@ -818,7 +818,8 @@ time {
 .approval-prompt small {
   color: var(--text-muted);
 }
-.composer-disabled {
+.composer-disabled,
+.composer-asleep {
   color: var(--text-muted);
   font-size: 11px;
   padding: 6px 4px 0;

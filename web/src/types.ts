@@ -167,6 +167,9 @@ export interface SessionInfo {
   queued: number;
   /** Built-in subagents the agent is running right now (runtime only). */
   subagents?: number;
+  /** Sub-agents and commands it started in the background that haven't reported back; a named
+   * agent never sleeps while one runs (src/sleep.rs). Missing from older daemons. */
+  background?: number;
   created_at: number;
   /** The window showing this session as a tab. Missing before v2: then its channel's window. */
   window_id?: WindowId | null;
@@ -236,6 +239,15 @@ export interface Agent {
   session_id: SessionId | null;
   resumable: boolean;
   created_at: number;
+  /** Sleeps after this many idle minutes (null: never; older daemons: absent). */
+  sleep_after_min?: number | null;
+  /** Its process was stopped while idle; the next message wakes it (src/sleep.rs). */
+  asleep?: boolean;
+  /** Asleep since (Unix ms). */
+  asleep_at?: number | null;
+  /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
+   * typing tries again). */
+  wake_error?: string;
 }
 
 /** A message muster delivered to an agent, or refused to (`agent.messages`, `agent_message`). */

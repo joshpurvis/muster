@@ -45,7 +45,13 @@ struct InputJob {
     seq: u64,
     data: Vec<u8>,
     done: Option<std::sync::mpsc::SyncSender<anyhow::Result<()>>>,
+    /// Held until this job is settled (delivered, refused or dropped): the caller's proof that
+    /// its input is still on its way (src/sleep.rs `Admitted`). On the last chunk of an input.
+    hold: Option<Hold>,
 }
+
+/// Something a caller keeps alive until its input has been settled (`Terminal::send_keys_holding`).
+pub type Hold = Box<dyn std::any::Any + Send>;
 
 /// A run whose input may have a gap: some earlier input was lost, refused, dropped or its
 /// outcome is unknown. Every later input for that run is refused (never sent after the gap)
@@ -193,6 +199,7 @@ impl InputLink {
             while let Ok(job) = rx.recv() {
                 let length = job.data.len();
                 let run = job.run;
+                let hold = job.hold;
                 let gap = shared.state.lock().interrupted.get(&run)
                     .filter(|(_, before_gap)| job.seq > *before_gap).map(|(reason, _)| reason.clone());
                 let result = match gap {
@@ -225,6 +232,7 @@ impl InputLink {
                     if *count == 0 { state.pending.remove(&run); }
                 }
                 drop(state);
+                drop(hold);
                 shared.finished.notify_all();
             }
         })?;
@@ -317,13 +325,15 @@ impl InputLink {
     /// (keystrokes), never blocking on the host or the budget. Input that is refused after
     /// part of it was admitted, or keystrokes that are refused at all (nobody waits for their
     /// outcome), interrupt the run.
-    fn send(&self, run: RunId, data: &[u8], wait: bool) -> anyhow::Result<()> {
+    /// `hold` is kept until the last chunk has been settled (dropped at once if nothing is admitted).
+    fn send(&self, run: RunId, data: &[u8], wait: bool, mut hold: Option<Hold>) -> anyhow::Result<()> {
         let deadline = Instant::now() + INPUT_WAIT;
         let mut results = Vec::new();
         let mut state = self.shared.state.lock();
         if let Some((reason, _)) = state.interrupted.get(&run) {
             return Err(InputInterrupted { reason: reason.clone() }.into());
         }
+        let chunks = data.len().div_ceil(muster_terminal_protocol::MAX_INPUT);
         for (index, chunk) in data.chunks(muster_terminal_protocol::MAX_INPUT).enumerate() {
             let gap = !wait || index > 0;
             // A chunk always fits an empty queue, so input of any size can make progress.
@@ -345,7 +355,8 @@ impl InputLink {
                 return Err(self.refuse(state, run, gap, "the application backend is stopping"));
             }
             let seq = state.admitted + 1;
-            let job = InputJob { run, seq, data: chunk.to_vec(), done };
+            let job = InputJob { run, seq, data: chunk.to_vec(), done,
+                hold: if index + 1 == chunks { hold.take() } else { None } };
             if !state.tx.as_ref().is_some_and(|tx| tx.send(job).is_ok()) {
                 return Err(self.refuse(state, run, gap, "the terminal input thread stopped"));
             }
@@ -522,12 +533,21 @@ impl Terminal {
 
     /// Deliver input and wait for the host to accept it (prompt delivery, RPC input).
     pub fn write(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.input.send(self.run(), bytes, true)
+        self.input.send(self.run(), bytes, true, None)
+    }
+    /// `write`, keeping `hold` until the input has been settled (even past a timeout).
+    pub fn write_holding(&self, bytes: &[u8], hold: Hold) -> anyhow::Result<()> {
+        self.input.send(self.run(), bytes, true, Some(hold))
     }
     /// Queue keystrokes behind any earlier input without waiting for the host. Byte order
     /// across `write` and `send_keys` is the order of the calls.
+    #[cfg(test)]
     pub fn send_keys(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.input.send(self.run(), bytes, false)
+        self.input.send(self.run(), bytes, false, None)
+    }
+    /// `send_keys`, keeping `hold` until the keys have been settled with the host.
+    pub fn send_keys_holding(&self, bytes: &[u8], hold: Hold) -> anyhow::Result<()> {
+        self.input.send(self.run(), bytes, false, Some(hold))
     }
     /// Why this run's input is paused, if it is (see `InputInterrupted`).
     pub fn input_interrupted(&self) -> Option<String> {
@@ -1113,6 +1133,50 @@ mod tests {
         assert!(link.drain(Instant::now() + Duration::from_secs(5)), "admitted input settles and the thread ends");
         assert_eq!(server.join().unwrap(), vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         drop((one, service, link));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A keystroke's hold (a sleep's admission, src/sleep.rs) lasts until the host has answered
+    /// it, not only until it is queued; a refused one lets go at once.
+    #[test]
+    fn a_hold_lasts_until_the_host_answered_its_input() {
+        let (release_tx, release) = std::sync::mpsc::channel::<()>();
+        let (service, directory, server) = fake_host("input-hold", move |listener| {
+            let mut stream = listener.accept().unwrap().0;
+            let _: Request = wire::read(&mut stream).unwrap().decode().unwrap();
+            wire::write(&mut stream, &Frame::json(&Response::Attached).unwrap()).unwrap();
+            let mut seen = vec![];
+            while let Ok(frame) = wire::read(&mut stream) {
+                // A slow host: answered only when the test says so.
+                let _ = release.recv();
+                seen.push(input_of(frame).1);
+                wire::write(&mut stream, &Frame::json(&Response::Ok).unwrap()).unwrap();
+            }
+            seen
+        });
+        struct Held(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::SeqCst) }
+        }
+        let on_way = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let one = live(&service, 1, 1, &directory);
+        one.send_keys_holding(b"hi", Box::new(Held(on_way.clone()))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(on_way.load(std::sync::atomic::Ordering::SeqCst), "queued, not yet delivered: still held");
+        release_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while on_way.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(Instant::now() < until, "the hold is let go once the host answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let link = service.input().clone();
+        link.close();
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(one.send_keys_holding(b"x", Box::new(Held(refused.clone()))).is_err());
+        assert!(!refused.load(std::sync::atomic::Ordering::SeqCst), "refused: nothing on its way");
+        assert!(link.drain(Instant::now() + Duration::from_secs(5)));
+        drop((one, service, link, release_tx));
+        assert_eq!(server.join().unwrap(), vec![b"hi".to_vec()]);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

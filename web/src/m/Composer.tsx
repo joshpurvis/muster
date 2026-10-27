@@ -3,6 +3,7 @@ import type { SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
 import { rpc } from "../rpc.ts";
 import { act, canInteract, errorText, notify, ready } from "./store.ts";
+import { asleepNote, sessionAsleep } from "./logic.ts";
 import { Approval, Icon } from "./ui.tsx";
 
 const KEYS = [
@@ -35,9 +36,12 @@ export function Composer(
   const held = useRef(false);
   // Typing paused after an input interruption, until the user has checked the terminal.
   const paused = !!s.input_interrupted && s.state !== "exited";
+  // An asleep agent (src/sleep.rs): a message wakes it, so only sending stays on; its keys and
+  // Stop have no run to reach.
+  const asleep = sessionAsleep(s);
   const reason = !ready.value
     ? "Disconnected — reconnecting…"
-    : s.state === "exited"
+    : s.state === "exited" && !asleep
     ? "Session exited"
     : !canInteract.value
     ? "This device has view access only"
@@ -45,6 +49,7 @@ export function Composer(
     ? "Typing is paused until you continue"
     : "";
   const disabled = !!reason;
+  const keysOff = disabled || asleep;
   useLayoutEffect(() => {
     const ro = new ResizeObserver(() => onHeight(card.current?.getBoundingClientRect().height ?? 0));
     if (card.current) ro.observe(card.current);
@@ -187,7 +192,7 @@ export function Composer(
                 <button
                   type="button"
                   key={label}
-                  disabled={disabled}
+                  disabled={keysOff}
                   onPointerDown={(e) => e.preventDefault()}
                   onClick={() => key(data)}
                 >
@@ -197,7 +202,7 @@ export function Composer(
               <button
                 type="button"
                 class="stop"
-                disabled={disabled}
+                disabled={keysOff}
                 onPointerDown={(e) => e.preventDefault()}
                 onClick={() => act(s, "session.interrupt").catch((e) => notify(errorText(e)))}
               >
@@ -208,7 +213,7 @@ export function Composer(
               <button
                 type="button"
                 class="interrupt-send"
-                disabled={disabled || sending || !draft.trim()}
+                disabled={keysOff || sending || !draft.trim()}
                 onPointerDown={(e) => e.preventDefault()}
                 onClick={() => send("interrupt")}
               >
@@ -222,7 +227,7 @@ export function Composer(
                 rows={1}
                 placeholder={s.kind === "shell" ? "Command…" : `Message ${s.name}…`}
                 aria-label={s.kind === "shell" ? "Command" : `Message ${s.name}`}
-                readOnly={s.state === "exited"}
+                readOnly={s.state === "exited" && !asleep}
                 autoCapitalize="sentences"
                 autoCorrect="on"
                 spellcheck
@@ -264,7 +269,9 @@ export function Composer(
                 <Icon name="send" />
               </button>
             </div>
-            {reason && <p class="composer-disabled">{reason}</p>}
+            {reason
+              ? <p class="composer-disabled">{reason}</p>
+              : asleep && <p class="composer-asleep" role="note">{asleepNote(s, Date.now())}</p>}
           </section>
         )}
     </div>

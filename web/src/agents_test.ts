@@ -1,6 +1,10 @@
 import {
   agentStatus,
   ago,
+  asleepText,
+  isAsleep,
+  wakeFailedText,
+  parseSleepAfter,
   choiceOf,
   contextLabel,
   CUSTOM,
@@ -92,20 +96,62 @@ const msg = (id: number, to_agent = 1, over: Partial<AgentMessage> = {}): AgentM
 });
 
 Deno.test("agent status: never started, stopped, live", () => {
-  assertEquals(agentStatus(agent(), undefined), { state: null, live: false, label: "stopped", since: null });
+  assertEquals(agentStatus(agent(), undefined), { state: null, live: false, asleep: false, label: "stopped", since: null });
   const a = agent({ session_id: 7 });
   assertEquals(agentStatus(a, session("exited", 50)), {
     state: "exited",
     live: false,
+    asleep: false,
     label: "stopped",
     since: 50,
   });
   assertEquals(agentStatus(a, session("needs_approval")), {
     state: "needs_approval",
     live: true,
+    asleep: false,
     label: "needs approval",
     since: 100,
   });
+});
+
+Deno.test("agent status: asleep is its own state, never stopped or exited", () => {
+  const a = agent({ session_id: 7, asleep: true, asleep_at: 40 });
+  assertEquals(agentStatus(a, session("exited", 50)), {
+    state: "exited",
+    live: false,
+    asleep: true,
+    label: "asleep",
+    since: 40,
+  });
+  // Its tab was closed for good: still asleep.
+  check(isAsleep(a, undefined), "asleep without a session");
+  // Waking: the record may lag behind the run that already started.
+  check(!isAsleep(a, session("starting")), "a starting run is not asleep");
+  check(!isAsleep(agent({ session_id: 7 }), session("exited")), "a stopped agent is not asleep");
+  check(!isAsleep(undefined, session("exited")), "a plain tab is not asleep");
+});
+
+Deno.test("sleep: the idle time field and the asleep bar's words", () => {
+  assertEquals([parseSleepAfter("60"), parseSleepAfter(" 5 "), parseSleepAfter("10080")], [60, 5, 10080]);
+  assertEquals([parseSleepAfter("4"), parseSleepAfter("10081"), parseSleepAfter("1.5"), parseSleepAfter("")], [
+    null,
+    null,
+    null,
+    null,
+  ]);
+  const MIN = 60_000;
+  assertEquals(
+    asleepText("ada", 0, false, 90 * MIN),
+    "ada has been asleep for 1 h 30 m. The next message, or typing here, wakes it into the same conversation.",
+  );
+  const cold = asleepText("ada", null, true, 0);
+  check(cold.startsWith("ada is asleep. The next message") && cold.includes("full cost"), cold);
+  // A wake that failed: still asleep, says why and how to try again.
+  assertEquals(
+    wakeFailedText("ada", "account profile Work is disabled.", false),
+    "Waking ada failed: account profile Work is disabled. It is still asleep: the next message, or typing here, tries again.",
+  );
+  check(wakeFailedText("ada", "x", true).endsWith("at full cost."), "the cost still said");
 });
 
 Deno.test("ago and firstLine", () => {

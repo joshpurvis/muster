@@ -273,6 +273,9 @@ struct SessEntry {
     /// Exit reported before the PTY was installed (process died instantly).
     early_exit: Option<i32>,
     last_hook_at: i64,
+    /// Work the run started in the background that hasn't reported back (src/sleep.rs
+    /// `Background`); `info.background` counts it.
+    background: crate::sleep::Background,
     /// Unix ms of the last delivery out of the injection queue (queue length shrank), or 0.
     last_dequeue_at: i64,
     /// A spawn or restart is in progress (lifecycle ops on one session are serialized).
@@ -822,6 +825,8 @@ impl Hub {
             let opened = saved_hook.is_some();
             let hook = saved_hook.filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
+            let background = hook.as_ref().map_or_else(Default::default, |saved| saved.background.clone());
+            info.background = background.running();
             let last_hook_at = hook.as_ref().map_or(0, |saved| saved.last_hook_at);
             let (conversation, conversation_sure) = match hook {
                 Some(saved) => (saved.conversation, saved.conversation_sure),
@@ -848,6 +853,7 @@ impl Hub {
                     generation,
                     early_exit: None,
                     last_hook_at,
+                    background,
                     last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
@@ -1465,10 +1471,28 @@ impl Hub {
         }
     }
 
-    /// Keystrokes from a client: queued to the PTY in order without waiting on the host.
+    /// Keystrokes from a client: queued to the PTY in order without waiting on the host (the
+    /// application types them admitted, `send_keys_admitted`).
+    #[cfg(test)]
     pub fn send_keys(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
         match self.input_handle(id) {
             Some(p) => p.send_keys(bytes),
+            None => Err(self.not_running(id)),
+        }
+    }
+
+    /// `send_keys`, admitted for a sleep (src/sleep.rs) until the host has settled them.
+    pub fn send_keys_admitted(&self, id: SessionId, bytes: &[u8], admitted: crate::sleep::Admitted) -> anyhow::Result<()> {
+        match self.input_handle(id) {
+            Some(p) => p.send_keys_holding(bytes, Box::new(admitted)),
+            None => Err(self.not_running(id)),
+        }
+    }
+
+    /// `write_input`, admitted for a sleep (src/sleep.rs) until the host has settled it.
+    pub fn write_input_admitted(&self, id: SessionId, bytes: &[u8], admitted: crate::sleep::Admitted) -> anyhow::Result<()> {
+        match self.input_handle(id) {
+            Some(p) => p.write_holding(bytes, Box::new(admitted)),
             None => Err(self.not_running(id)),
         }
     }
@@ -1898,6 +1922,8 @@ impl Hub {
             e.info.pid = None;
             e.info.queued = 0;
             e.info.subagents = 0;
+            e.info.background = 0;
+            e.background = Default::default();
             // The conversation this run was launched to reopen; not for a kill (the run a
             // restart replaces, or a shutdown).
             let resumed = (code != 0 && e.killed_generation != Some(generation) && !e.kill_requested
@@ -1921,6 +1947,9 @@ impl Hub {
         } else if failed_resume {
             // Said in the tab: the CLI printed why (e.g. "No conversation found") above.
             failed_resume_detail(code)
+        } else if self.agents.sleep.is_asleep(id) {
+            // Stopped to sleep (src/sleep.rs): the next message wakes it.
+            crate::sleep::ASLEEP_DETAIL.to_string()
         } else {
             format!("exit code {code}")
         };
@@ -2984,6 +3013,7 @@ impl Hub {
                 rows,
                 queued: 0,
                 subagents: 0,
+                background: 0,
                 size_owner: None,
                 input_interrupted: false,
                 live_cwd: None,
@@ -3024,6 +3054,7 @@ impl Hub {
                     generation: 0,
                     early_exit: None,
                     last_hook_at: 0,
+                    background: Default::default(),
                     unverified_working: false,
                     last_dequeue_at: 0,
                     busy: true,
@@ -3326,6 +3357,7 @@ impl Hub {
             info.pid = None;
             info.exit_code = None;
             info.subagents = 0;
+            info.background = 0;
             info.title = None;
             info.queued = 0;
             self.store.update_session(&info)?;
@@ -3345,6 +3377,7 @@ impl Hub {
             records.insert(id, record.clone());
             e.info = info;
             e.last_hook_at = 0;
+            e.background = Default::default();
             e.unverified_working = false;
             previous
         };
@@ -3363,6 +3396,7 @@ impl Hub {
                         info.pid = previous.pid;
                         info.exit_code = previous.exit_code;
                         info.subagents = previous.subagents;
+                        info.background = previous.background;
                         info.title = previous.title.clone();
                         info.queued = previous.queued;
                         info.provider = previous.provider;
@@ -3581,7 +3615,17 @@ impl Hub {
         if let Some(args) = crate::agents::restart_args(&self.agents, id) {
             self.set_session_extra_args(id, args?)?;
         }
-        self.restart_inner(id).await
+        // An asleep agent restarted from its tab is awake from here on (src/sleep.rs), and asleep
+        // again if this restart fails.
+        let woke = crate::sleep::on_session_start(self, id)?;
+        let r = self.restart_inner(id).await;
+        if let Some((agent, at)) = woke {
+            match &r {
+                Ok(_) => crate::sleep::launched(self, agent),
+                Err(e) => crate::sleep::start_failed(self, agent, at, e),
+            }
+        }
+        r
     }
 
     async fn restart_inner(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
@@ -3700,6 +3744,71 @@ impl Hub {
             Some(p) => p.terminate(false),
             None if self.session(id).is_some() => Ok(()),
             None => anyhow::bail!("no such session: {id}"),
+        }
+    }
+
+    /// Stop run `generation` of session `id` for its agent to sleep (src/sleep.rs): like Stop,
+    /// and never read as a run that failed to reopen its conversation. Err: that run isn't the
+    /// one running (none runs, or a restart replaced it: never stop the replacement).
+    pub(crate) fn stop_for_sleep(&self, id: SessionId, generation: u64) -> anyhow::Result<()> {
+        let p = self.pty(id).filter(|p| p.is_alive()).ok_or_else(|| self.not_running(id))?;
+        anyhow::ensure!(p.generation == generation, "session {id} was restarted meanwhile");
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
+            e.killed_generation = Some(p.generation);
+        }
+        p.terminate(false)
+    }
+
+    /// An asleep agent's exited session says so ("asleep"), whatever its last run's exit or a
+    /// failed wake wrote (src/sleep.rs).
+    pub(crate) fn mark_asleep(&self, id: SessionId) {
+        let exited = self.session(id).is_some_and(|s| s.state == AgentState::Exited
+            && s.state_detail.as_deref() != Some(crate::sleep::ASLEEP_DETAIL));
+        if exited
+            && let Err(e) = self.update_session_info(id, |i| {
+                if i.state == AgentState::Exited {
+                    i.state_detail = Some(crate::sleep::ASLEEP_DETAIL.to_string());
+                }
+            })
+        {
+            tracing::warn!(session = id, "marking it asleep: {e:#}");
+        }
+    }
+
+    /// Session `id`'s current run and its background work (src/sleep.rs).
+    pub(crate) fn background_of(&self, id: SessionId) -> Option<(u64, crate::sleep::Background)> {
+        let g = self.inner.lock();
+        g.sessions.get(&id).map(|e| (e.generation, e.background.clone()))
+    }
+
+    /// Tests: session `id`'s current run is a launch whose acknowledgement was lost (`pending`),
+    /// or that launch was retired (`!pending`: exited with `detail`).
+    #[cfg(test)]
+    pub(crate) fn test_unconfirmed_launch(&self, id: SessionId, pending: bool, detail: &str) {
+        let generation = self.inner.lock().sessions.get(&id).map_or(0, |e| e.generation);
+        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(), key_refs: Default::default(),
+            key_fp: None, port_base: 20000, pending, retired: !pending,
+            spec: SpawnSpec { run: RunId { id, generation }, program: "/bin/true".into(),
+                args: vec![], env: BTreeMap::new(), cwd: std::env::temp_dir(), cols: 80, rows: 24 } };
+        self.terminal_records.lock().insert(id, record);
+        let _ = self.update_session_info(id, |i| {
+            i.state = if pending { AgentState::Starting } else { AgentState::Exited };
+            i.state_detail = (!pending).then(|| detail.to_string());
+        });
+    }
+
+    /// Apply `f` to the background work of run `generation` of session `id` as it is now, under
+    /// the hub lock (some reported back where no hook said so; a hook may have registered more
+    /// meanwhile, which `f` keeps). In memory: the saved hook state is rechecked the same way
+    /// after a reload.
+    pub(crate) fn edit_background(&self, id: SessionId, generation: u64, f: impl FnOnce(&mut crate::sleep::Background)) {
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return };
+        let before = e.background.running();
+        f(&mut e.background);
+        if e.background.running() != before {
+            e.info.background = e.background.running();
+            self.publish_session(&e.info);
         }
     }
 
@@ -4119,6 +4228,7 @@ impl Hub {
             let mut info = entry.info.clone();
             let from = info.state;
             let mut last_hook_at = entry.last_hook_at;
+            let mut background = entry.background.clone();
             let now = now_ms();
             let is_agent = self.agents.by_session(entry.info.id).is_some();
             let change = conversation_after_hook(info.kind, entry.conversation.as_deref(), entry.conversation_sure,
@@ -4137,6 +4247,10 @@ impl Hub {
                 if let Some(delta) = subagent_delta(event, &payload) {
                     info.subagents = delta.map_or(0, |d| info.subagents.saturating_add_signed(d));
                 }
+                // Background sub-agents and commands, which a sleep would end with the CLI.
+                if background.after_hook(event, &payload) {
+                    info.background = background.running();
+                }
                 // When the callback was captured: one replayed after an outage happened then.
                 let at = captured_at.map_or(now, |t| t.min(now));
                 if crate::cache::note_hook(&mut info, event, &payload, at) {
@@ -4147,11 +4261,14 @@ impl Hub {
                 }
             } else if info.state == AgentState::Exited {
                 info.subagents = 0;
+                info.background = 0;
+                background = Default::default();
             }
             // Start fresh is replacing this run: it changes no conversation anything resumes.
             let fenced = entry.fenced_generation == Some(entry.generation);
             let mut runtime = crate::store::HookSession { generation: entry.generation,
                 subagents: info.subagents, last_hook_at, conversation: change.conversation.clone(),
+                background: background.clone(),
                 conversation_sure: change.sure, fenced, child: change.child, ..Default::default() };
             if !fenced {
                 if is_agent {
@@ -4170,9 +4287,11 @@ impl Hub {
                 cursor, Some((&info, &runtime)), arrival)?;
             if fx.duplicate { return Ok(()) }
             let changed = info.state_seq != entry.info.state_seq || info.subagents != entry.info.subagents
+                || info.background != entry.info.background
                 || info.cache_cold_at != entry.info.cache_cold_at;
             entry.info = info.clone();
             entry.last_hook_at = last_hook_at;
+            entry.background = background;
             entry.conversation = runtime.conversation;
             entry.conversation_sure = runtime.conversation_sure;
             // Its CLI is running a conversation (the hook state just saved says so too).
@@ -4362,6 +4481,8 @@ impl Hub {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         self.save_input_interrupted();
+        // Typing held for agents still waking is lost: the next backend says so (src/sleep.rs).
+        crate::sleep::save_held(self);
     }
 
 }
@@ -4738,8 +4859,12 @@ fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal
         info.rows = status.rows;
         info.title = status.title.clone();
         if !status.alive {
+            // An agent asleep before the restart stays asleep (src/sleep.rs), never "exit code".
+            let asleep = info.state == AgentState::Exited && info.state_detail.as_deref() == Some(crate::sleep::ASLEEP_DETAIL);
             info.state = AgentState::Exited;
-            info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+            if !asleep {
+                info.state_detail = Some(format!("exit code {}", status.exit_code.unwrap_or(-1)));
+            }
             info.queued = 0;
         } else if info.state == AgentState::Exited {
             // The saved Exited belongs to an earlier run (a restart that crashed before
@@ -4934,7 +5059,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false,
+                    autostart: false, sleep_after_min: None, asleep_at: None,
                 })
                 .unwrap();
         })
@@ -5228,6 +5353,22 @@ mod tests {
         hub.handle_spooled_hook("callback-token", "Stop", serde_json::json!({}), &cursor, None).unwrap();
         assert_eq!(hub.session(2).unwrap().subagents, 0);
         assert_eq!(hub.store.load_hook_session(2, 42).unwrap().unwrap().subagents, 0);
+        // A sub-agent started in the background outlives the turn: counted (a sleep would end it)
+        // and checkpointed with the run, until it reports back.
+        cursor.sequence += 1;
+        hub.handle_spooled_hook("callback-token", "PreToolUse", serde_json::json!({"tool_name": "Agent",
+            "tool_use_id": "toolu_1", "tool_input": {"run_in_background": true}}), &cursor, None).unwrap();
+        cursor.sequence += 1;
+        hub.handle_spooled_hook("callback-token", "PostToolUse", serde_json::json!({"tool_name": "Agent",
+            "tool_use_id": "toolu_1", "tool_response": {"agentId": "a9"}}), &cursor, None).unwrap();
+        cursor.sequence += 1;
+        hub.handle_spooled_hook("callback-token", "Stop", serde_json::json!({}), &cursor, None).unwrap();
+        assert_eq!(hub.session(2).unwrap().background, 1);
+        assert_eq!(hub.store.load_hook_session(2, 42).unwrap().unwrap().background.running(), 1);
+        cursor.sequence += 1;
+        hub.handle_spooled_hook("callback-token", "SubagentStop", serde_json::json!({"agent_id": "a9"}), &cursor, None).unwrap();
+        assert_eq!(hub.session(2).unwrap().background, 0);
+        assert_eq!(hub.store.load_hook_session(2, 42).unwrap().unwrap().background.running(), 0);
     }
 
     #[test]
@@ -5450,7 +5591,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(),
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -6280,7 +6421,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
                 }).unwrap();
             }
         });
@@ -6572,7 +6713,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();

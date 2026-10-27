@@ -59,6 +59,9 @@ pub struct HookSession {
     pub generation: u64,
     pub subagents: u32,
     pub last_hook_at: i64,
+    /// Work the run started in the background that hasn't reported back (src/sleep.rs).
+    #[serde(default, skip_serializing_if = "crate::sleep::Background::is_empty")]
+    pub background: crate::sleep::Background,
     /// The run's conversation (Claude: the latest reported id; Codex: its top-level thread),
     /// `Hub::conversation_after_hook`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,6 +517,18 @@ const MIGRATIONS: &[&str] = &[
         last_error TEXT,
         last_error_at INTEGER
     );
+    "#,
+    // v24: sleep and wake for named agents (src/sleep.rs): how long an agent may sit idle before
+    // Muster stops its process (NULL: never), and since when it is asleep (NULL: awake). An
+    // asleep agent keeps its tab and record; the next message resumes its conversation. While
+    // asleep, `autostart` reads 0 and `asleep_autostart` holds the setting, so an older backend
+    // (which knows nothing of sleep) never starts it at its own start; `asleep_generation` is
+    // the run the sleep was stopping, so a restart that cut the stop off finishes it.
+    r#"
+    ALTER TABLE agents ADD COLUMN sleep_after_min INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_at INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_autostart INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_generation INTEGER;
     "#,
 ];
 
@@ -985,7 +1000,9 @@ impl Store {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart, account_profile_id, provider FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
+                    asleep_autostart
+             FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -1006,9 +1023,15 @@ impl Store {
                 resume_id: r.get(10)?,
                 created_at: r.get(11)?,
                 channel_id: r.get(12)?,
-                autostart: r.get::<_, i64>(13)? != 0,
+                // While asleep the setting is kept aside (migration v24); an older backend may have
+                // turned it on meanwhile.
+                autostart: r.get::<_, i64>(13)? != 0
+                    || r.get::<_, Option<i64>>(17)?.is_some() && r.get::<_, Option<i64>>(18)?.is_some_and(|v| v != 0),
                 account_profile_id: r.get(14)?,
                 provider: crate::openrouter::Provider::parse(&r.get::<_, String>(15)?),
+                // Out of range (written by hand): the nearest allowed value.
+                sleep_after_min: r.get::<_, Option<i64>>(16)?.map(crate::sleep::clamp_after),
+                asleep_at: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1020,8 +1043,9 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
+                               sleep_after_min, asleep_at, asleep_autostart)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1035,9 +1059,12 @@ impl Store {
                 b.resume_id,
                 b.created_at,
                 b.channel_id,
-                b.autostart as i64,
+                (b.autostart && b.asleep_at.is_none()) as i64,
                 b.account_profile_id,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min,
+                b.asleep_at,
+                b.asleep_at.map(|_| b.autostart as i64)
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1077,7 +1104,9 @@ impl Store {
     pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
-                    autostart = ?7, provider = ?8 WHERE id = ?1",
+                    autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
+                    asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
+                    provider = ?8, sleep_after_min = ?9 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1086,10 +1115,41 @@ impl Store {
                 perms_json(&b.permissions),
                 serde_json::to_string(&b.accepts_origins)?,
                 b.autostart as i64,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min
             ],
         )?;
         Ok(())
+    }
+
+    /// Agent `id` fell asleep at `at` (src/sleep.rs), stopping run `generation`, or woke (None).
+    /// While asleep its `autostart` column reads 0, the setting kept in `asleep_autostart`
+    /// (migration v24); an older backend that turned autostart on meanwhile keeps it on.
+    pub fn set_agent_asleep(&self, id: i64, at: Option<i64>, generation: Option<u64>) -> anyhow::Result<()> {
+        let kept = "MAX(autostart, COALESCE(asleep_autostart, 0))";
+        let conn = self.conn.lock();
+        match at {
+            Some(at) => conn.execute(
+                &format!("UPDATE agents SET asleep_autostart = CASE WHEN asleep_at IS NULL THEN autostart ELSE {kept} END,
+                    autostart = 0, asleep_at = ?2, asleep_generation = ?3 WHERE id = ?1"),
+                params![id, at, generation.map(|g| g as i64)],
+            )?,
+            None => conn.execute(
+                &format!("UPDATE agents SET autostart = CASE WHEN asleep_at IS NULL THEN autostart ELSE {kept} END,
+                    asleep_autostart = NULL, asleep_at = NULL, asleep_generation = NULL WHERE id = ?1"),
+                params![id],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// The run agent `id`'s sleep was stopping (`set_agent_asleep`), when it is asleep.
+    pub fn agent_asleep_generation(&self, id: i64) -> anyhow::Result<Option<u64>> {
+        Ok(self.conn.lock()
+            .query_row("SELECT asleep_generation FROM agents WHERE id = ?1", [id], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten()
+            .map(|g| g as u64))
     }
 
     /// The bots -> agents move (`agents::relocate_homes`): agent `id`'s home moved from one of
@@ -2078,6 +2138,7 @@ impl Store {
                     rows: r.get::<_, i64>(13)?.clamp(1, u16::MAX as i64) as u16,
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     subagents: 0,
+                    background: 0,
                     size_owner: None,
                     input_interrupted: false,
                     live_cwd: None,
@@ -2683,7 +2744,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.
@@ -2703,6 +2764,46 @@ mod tests {
         // Rows from before v17 (and anything unreadable) are the subscription.
         s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
         assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
+        // Sleep (v24): off by default; the setting is config, asleep is its own write.
+        assert_eq!((back.sleep_after_min, back.asleep_at), (None, None));
+        s.update_agent_config(&crate::agents::Agent { sleep_after_min: Some(45), ..sub.clone() }).unwrap();
+        s.set_agent_asleep(b.id, Some(7_000), Some(3)).unwrap();
+        let slept = &s.load_agents().unwrap()[0];
+        assert_eq!((slept.sleep_after_min, slept.asleep_at), (Some(45), Some(7_000)));
+        assert_eq!(s.agent_asleep_generation(b.id).unwrap(), Some(3));
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(s.agent_asleep_generation(b.id).unwrap(), None);
+        // An older backend reads only `autostart`: while asleep it reads 0, so a rollback never
+        // starts an asleep agent at its own start; this backend still sees the setting.
+        let col = |s: &Store| count(s, "SELECT autostart FROM agents");
+        s.update_agent_config(&crate::agents::Agent { autostart: true, ..sub.clone() }).unwrap();
+        assert_eq!(col(&s), 1);
+        s.set_agent_asleep(b.id, Some(8_000), None).unwrap();
+        assert_eq!(col(&s), 0);
+        let asleep = s.load_agents().unwrap()[0].clone();
+        assert!(asleep.autostart);
+        // A config change while asleep keeps the column at 0 (and the setting).
+        s.update_agent_config(&crate::agents::Agent { persona: "Asleep.".into(), ..asleep.clone() }).unwrap();
+        assert_eq!(col(&s), 0);
+        assert!(s.load_agents().unwrap()[0].autostart);
+        s.update_agent_config(&crate::agents::Agent { autostart: false, ..asleep.clone() }).unwrap();
+        assert!(!s.load_agents().unwrap()[0].autostart);
+        s.update_agent_config(&crate::agents::Agent { autostart: true, ..asleep.clone() }).unwrap();
+        // Awake: the column holds the setting again.
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(col(&s), 1);
+        assert!(s.load_agents().unwrap()[0].autostart);
+        // An older backend that turned autostart on while it was asleep keeps it on.
+        s.update_agent_config(&crate::agents::Agent { autostart: false, ..asleep.clone() }).unwrap();
+        s.set_agent_asleep(b.id, Some(9_000), None).unwrap();
+        s.conn.lock().execute("UPDATE agents SET autostart = 1", []).unwrap();
+        assert!(s.load_agents().unwrap()[0].autostart);
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(col(&s), 1);
+        s.update_agent_config(&crate::agents::Agent { autostart: false, asleep_at: None, ..asleep.clone() }).unwrap();
+        s.conn.lock().execute("UPDATE agents SET sleep_after_min = 1", []).unwrap();
+        let back2 = &s.load_agents().unwrap()[0];
+        assert_eq!((back2.sleep_after_min, back2.asleep_at), (Some(crate::sleep::AFTER_MIN), None));
 
         let m = AgentMessage {
             id: 0,

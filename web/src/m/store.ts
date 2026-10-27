@@ -8,6 +8,7 @@ import {
   normalizeCode,
   noteSession,
   type ProgramScroll,
+  sessionAsleep,
   type Since,
 } from "./logic.ts";
 
@@ -298,7 +299,8 @@ export function scrollProgram(sid: number, data: Uint8Array): boolean {
     return false;
   }
   const s = sessions.peek().get(sid);
-  if (!s || s.state === "exited" || !rpc.isOpen) return false;
+  // An asleep agent's tab takes typing: the daemon holds it and wakes the agent (src/sleep.rs).
+  if (!s || (s.state === "exited" && !sessionAsleep(s)) || !rpc.isOpen) return false;
   // Raw bytes: a legacy mouse report is one byte per value, never UTF-8.
   rpc.sendInput(sid, data);
   return true;
@@ -309,7 +311,10 @@ export async function act<T = unknown>(s: SessionInfo, method: string, params: o
   if (!canInteract.peek()) {
     throw new Error(ready.peek() ? "This device has view access only" : "Disconnected");
   }
-  if (s.state === "exited") throw new Error("Session exited");
+  // A message to an asleep agent wakes it (src/sleep.rs); nothing else reaches a stopped run.
+  if (s.state === "exited" && !(sessionAsleep(s) && method === "session.send")) {
+    throw new Error(sessionAsleep(s) ? `${s.name} is asleep: send it a message to wake it` : "Session exited");
+  }
   if (prefs.peek().termSize === "follow" && method !== "session.interrupt") {
     const target = viewer?.sid === s.id ? viewer.grid() : grid;
     if (!target) throw new Error("Open the session to measure the terminal");

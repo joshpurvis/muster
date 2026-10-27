@@ -565,7 +565,8 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
         }
         "session.restart" => {
             let p: IdParam<SessionId> = parse(params)?;
-            to_value(hub.restart_session(p.id).await?)
+            // A named agent's tab under the start lock, like every start of it (src/sleep.rs).
+            to_value(crate::agents::restart_session(hub, p.id).await?)
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;
@@ -654,11 +655,14 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                             return Err(RpcError(format!("session {} is the agent {}: use `muster ask {}`", p.id, b.name, b.name)));
                         }
                     }
-                    to_value(inject::send(hub, p.id, p.text, mode, format!("session:{s}"), source).await?)
+                    // An asleep agent wakes for it (src/sleep.rs).
+                    let (id, _delivering) = crate::sleep::for_send(hub, p.id).await?;
+                    to_value(inject::send(hub, id, p.text, mode, format!("session:{s}"), source).await?)
                 }
-                Caller::Human => to_value(
-                    inject::send(hub, p.id, p.text, mode, who.label(), crate::agents::Source::Human).await?,
-                ),
+                Caller::Human => {
+                    let (id, _delivering) = crate::sleep::for_send(hub, p.id).await?;
+                    to_value(inject::send(hub, id, p.text, mode, who.label(), crate::agents::Source::Human).await?)
+                }
             }
         }
         "session.approve" => {
@@ -877,7 +881,9 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                 Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
-            match chain {
+            // Admitted until the terminal host has them, so a sleep can't stop the run they are
+            // typed into (src/sleep.rs).
+            let admitted = match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
                     crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?;
@@ -886,18 +892,27 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                     if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {
                         hub.spend.ensure_fresh(hub).await;
                     }
-                    crate::spend::raw_input_gate(hub, p.id, r.origin).map_err(RpcError)?
+                    crate::spend::raw_input_gate(hub, p.id, r.origin).map_err(RpcError)?;
+                    // Keys can't wake an asleep agent: only a message does (its guard rails apply).
+                    crate::sleep::admit(hub, p.id)?
                 }
                 // The human's keys (a paired phone, `muster keys` outside a session) take the
                 // same path as a client's: no session lookup under the hub lock, no SQLite.
-                None => hub.note_human_input(p.id),
-            }
+                None => {
+                    hub.note_human_input(p.id);
+                    // An asleep agent's tab: held until it has woken (src/sleep.rs).
+                    match crate::sleep::keys(hub, p.id, p.data.as_bytes()) {
+                        crate::sleep::Keys::Held => return Ok(json!({})),
+                        crate::sleep::Keys::Pass(admitted) => admitted,
+                    }
+                }
+            };
             let data = if p.keys && hub.application_cursor(p.id) {
                 crate::pty::to_application_cursor(&p.data)
             } else {
                 p.data
             };
-            hub.write_input(p.id, data.as_bytes())?;
+            hub.write_input_admitted(p.id, data.as_bytes(), admitted)?;
             Ok(json!({}))
         }
         "session.output" => {
@@ -1027,14 +1042,14 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
             let b = crate::agents::update(hub, p, via == Via::Outside)?;
-            Ok(crate::agents::agent_json(&b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+            Ok(crate::agents::agent_view(hub, &b))
         }
         "agent.list" => {
             let out: Vec<Value> = hub
                 .agents()
                 .list()
                 .iter()
-                .map(|b| crate::agents::agent_json(b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
+                .map(|b| crate::agents::agent_view(hub, b))
                 .collect();
             Ok(Value::Array(out))
         }
@@ -1063,6 +1078,9 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
             }
             let p: P = parse(params)?;
             let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
+            if let Some(at) = bs.woke {
+                crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, "you chose Wake", true);
+            }
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
                 // The running process keeps the provider it started with: a change shows here
@@ -1070,7 +1088,18 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                 "provider_pending": !bs.started && bs.session.provider != bs.agent.provider,
                 "session": bs.session,
                 "started": bs.started,
+                "woke": bs.woke.is_some(),
             }))
+        }
+        "agent.sleep" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            struct P {
+                name: String,
+            }
+            let p: P = parse(params)?;
+            let a = crate::sleep::sleep(hub, &p.name, crate::sleep::Why::Manual).await?;
+            Ok(crate::agents::agent_view(hub, &a))
         }
         "agent.messages" => {
             #[derive(Deserialize)]
@@ -1986,7 +2015,13 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
                     // The marker is recorded in memory and committed off this path, so a
                     // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
                     hub.note_human_input(id);
-                    if let Err(e) = hub.send_keys(id, &data[5..]) {
+                    // An asleep agent's tab: held until it has woken (src/sleep.rs). Admitted
+                    // until the terminal host has them, so a sleep can't stop the run meanwhile.
+                    let admitted = match crate::sleep::keys(&hub, id, &data[5..]) {
+                        crate::sleep::Keys::Held => continue,
+                        crate::sleep::Keys::Pass(admitted) => admitted,
+                    };
+                    if let Err(e) = hub.send_keys_admitted(id, &data[5..], admitted) {
                         // Lost or refused keystrokes interrupt their run, which the user sees
                         // on the session (`input_interrupted`) and in a notice.
                         tracing::debug!("input for session {id}: {e:#}");
@@ -2432,6 +2467,7 @@ mod tests {
                 accepts: None,
                 permissions: None,
                 autostart: false,
+                sleep_after_min: None,
             },
         )
         .unwrap();
@@ -2826,7 +2862,7 @@ mod tests {
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
-            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();
         let sam = hub.agents().get("rpc-sam").unwrap();
         let wk = hub.agents().get("rpc-wk").unwrap();
@@ -2879,7 +2915,7 @@ mod tests {
         let (hub, _st) = fixture();
         crate::agents::create(&hub, NewAgent {
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
-            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();
         let wk = hub.agents().get("rpc-wk").unwrap();
         hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
@@ -2951,7 +2987,7 @@ mod tests {
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
-            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();
         let mk = json!({"agent": "rpc-wk", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}});
         // `muster schedule add` (no session: as the owner, through `/api/rpc`): held.

@@ -69,7 +69,7 @@ import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { providerPendingNote, upsertMessage } from "./agents.ts";
+import { isAsleep, providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
@@ -1370,12 +1370,16 @@ export function agentLive(a: Agent): boolean {
  * Click an agent (panel row, Jump): start it if no process runs (a new tab opens in this
  * window), then show its tab here exactly as Jump does (pulled into the focused group when it
  * is in another window, or hidden because its tab was closed). `fresh`: a new conversation,
- * restarting a running one.
+ * restarting a running one. An asleep agent's tab is only shown: looking never wakes it (that
+ * re-reads its whole conversation); `wake` does, as do its Wake button and typing into it.
  */
-export async function openAgent(name: string, fresh = false) {
+export async function openAgent(name: string, fresh = false, wake = false) {
   const a = agents.value.find((x) => x.name === name);
   if (!a) return;
   pushRecent("a:" + a.id);
+  if (!fresh && !wake && a.session_id !== null && isAsleep(a, sessions.value.get(a.session_id))) {
+    return gotoSession(a.session_id);
+  }
   if (!fresh && a.session_id !== null && agentLive(a)) {
     // A provider change applies only when it restarts: say so, as `agent.start` does.
     const pending = providerPendingNote(a, sessions.value.get(a.session_id));
@@ -1402,6 +1406,20 @@ export async function openAgent(name: string, fresh = false) {
 
 export function stopAgent(a: Agent) {
   if (a.session_id !== null) killSession(a.session_id);
+}
+
+/** Wake an asleep agent (Wake in its menu or its tab): it restarts into its conversation. */
+export function wakeAgent(a: Agent) {
+  return openAgent(a.name, false, true);
+}
+
+/** Put an idle agent to sleep now (`agent.sleep`): its process stops, its tab stays. The daemon
+ * says why when it can't (working, a draft in its input box, no saved conversation yet). */
+export function sleepAgent(a: Agent) {
+  rpc.call<Agent>("agent.sleep", { name: a.name }).then((r) => {
+    knowAgent(r);
+    toast("info", `${a.name} is asleep. The next message wakes it.`, 3000);
+  }).catch(fail("Couldn't put it to sleep")).catch(() => {});
 }
 
 export function setAgentAutostart(a: Agent, on: boolean) {

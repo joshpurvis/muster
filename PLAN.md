@@ -226,11 +226,30 @@ schedules can't breed schedules; every cap and rule above applies once one runs.
 file-change trigger, only inside folders the human lists in the settings (none by default).
 Phone push alerts for schedules wait for Android Web Push (feature/phone-push).
 
+**Sleep and wake (built; src/sleep.rs, docs/PROTOCOL.md "Sleep and wake").** A per-agent
+setting, off by default (`sleep_after_min`, 5 minutes to a week), plus a manual Sleep: an idle
+agent's process stops, its record, tab and conversation stay, shown as asleep (saved: it stays
+asleep across a reload and a restart, and autostart leaves it, also an older backend's). Never
+while it works, waits for approval or a question, is in a turn, has background sub-agents or
+commands running (also one moved to the background while it ran), has prompts queued or a
+message (or a panel batch) on its way, has keys on their way to its terminal, has text in its input box, or
+before its conversation id is known; the last check and the stop are one step against keys,
+sends and restarts, and only the run that was checked is stopped. Whatever would deliver to it wakes it
+through `agent.start` under the start lock (so two messages wake it once, and each keeps its
+durable queue path): `ask_agent` / `muster ask`, schedule runs (after every guard rail),
+`muster send` (a phone's message too), Start / Wake, a real panel action, and the human typing
+into its tab (keys held and typed once it is ready, as the human's). A failed wake (also a woken CLI
+that stops before it is ready) leaves it asleep and says why; the next message or typing tries
+again. A launch that is only unconfirmed is no failure: the wake waits for it. Panel notices (a panel closing), list and read tools, status checks and
+showing its tab never wake it. The wake's cost is shown as the cold-cache warning's is: the
+asleep bar, a `cold` marker, a timeline note, and the cold-start mark on the message. Store
+migration v24 (`agents.sleep_after_min`, `agents.asleep_at`, `agents.asleep_autostart`,
+`agents.asleep_generation`).
+
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
   `agent.*` method and no agent events).
-- Sleep and wake: stop an idle agent's process, resume it on the next message.
 - Phone push alerts for schedule runs (docs/SCHEDULING_PLAN.md Phase 3): they go through
   `schedules::run::alert`, the one place a push sink plugs in once Android Web Push lands.
   Triggers stay loopback-only, never exposed to anyone but the user. (Schedules and triggers are

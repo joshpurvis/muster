@@ -21,6 +21,7 @@ mod panel_apps;
 mod panel_kit;
 mod web_preview;
 mod skills;
+mod sleep;
 mod spend;
 mod statusline;
 mod notify;
@@ -488,6 +489,10 @@ enum AgentCmd {
         /// Start it whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
+        /// Stop its process after this long idle (minutes, 90m, 2h); the next message wakes it
+        /// into the same conversation. Default: never.
+        #[arg(long, value_name = "TIME")]
+        sleep_after: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -517,6 +522,10 @@ enum AgentCmd {
         /// Start it whenever the daemon starts.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         autostart: Option<String>,
+        /// Stop its process after this long idle (minutes, 90m, 2h), or `off`; the next message
+        /// wakes it into the same conversation.
+        #[arg(long, value_name = "TIME")]
+        sleep_after: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -529,7 +538,11 @@ enum AgentCmd {
     },
     /// Remove an agent and its session (its home folder stays on disk).
     Rm { name: String },
-    /// Start the agent's session (or report the running one); prints its session id.
+    /// Put an idle agent to sleep now: its process stops, its tab and conversation stay, and
+    /// the next message (or typing into its tab) wakes it.
+    Sleep { name: String },
+    /// Start the agent's session (or report the running one, or wake an asleep one); prints
+    /// its session id.
     Start {
         name: String,
         /// Start a new conversation instead of resuming the last one.
@@ -717,6 +730,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 persona_file,
                 accepts,
                 autostart,
+                sleep_after,
                 perms,
             } => cli::agent_new(
                 d,
@@ -730,6 +744,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     persona: read_persona(persona, persona_file)?,
                     accepts,
                     autostart: Some(autostart),
+                    sleep_after,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -743,6 +758,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 persona_file,
                 accepts,
                 autostart,
+                sleep_after,
                 perms,
             } => cli::agent_edit(
                 d,
@@ -756,12 +772,14 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     persona: read_persona(persona, persona_file)?,
                     accepts,
                     autostart: autostart.map(|a| a == "on"),
+                    sleep_after,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
             ),
             AgentCmd::Ls { json } => cli::agent_ls(d, json),
             AgentCmd::Rm { name } => cli::agent_rm(d, &name),
+            AgentCmd::Sleep { name } => cli::agent_sleep(d, &name),
             AgentCmd::Start { name, fresh } => cli::agent_start(d, &name, fresh),
         },
         Cmd::Profile { action } => match action {
@@ -1811,6 +1829,8 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
     // Runs that couldn't reopen their conversation while no backend watched: forget it before
     // anything (autostart, a restart) would try it again.
     hub.reconcile_failed_resumes();
+    // Agents that sleep when idle (src/sleep.rs); asleep ones stay asleep across a restart.
+    sleep::spawn(hub.clone());
     // Agents with autostart on (their homes were moved above, before anything could start).
     {
         let hub = hub.clone();
@@ -1933,6 +1953,8 @@ mod tests {
         assert!(parse(&["agent", "new", "ada", "--kind", "codex", "--autostart", "--codex-sandbox", "read_only"]).is_ok());
         assert!(parse(&["agent", "edit", "ada", "--persona", "x", "--autostart", "off", "--claude-mode", "plan"]).is_ok());
         assert!(parse(&["agent", "edit", "ada", "--autostart", "maybe"]).is_err());
+        assert!(parse(&["agent", "edit", "ada", "--sleep-after", "2h"]).is_ok());
+        assert!(parse(&["agent", "sleep", "ada"]).is_ok());
         assert!(parse(&["agent", "edit", "ada", "--claude-mode", "yolo"]).is_err());
         assert!(parse(&["bot", "ls"]).is_err());
         // `muster new --kind`, with `--agent` still accepted.

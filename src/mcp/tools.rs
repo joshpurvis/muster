@@ -222,14 +222,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state. Also returns your_origin: the origin and hop a message you send now would carry.",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
             empty_schema(),
             true,
         ),
         tool(
             "ask_agent",
             "Ask agent",
-            "Ask an agent something and wait for its answer. Starts the agent if it isn't running, delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
+            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {

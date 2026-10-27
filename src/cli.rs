@@ -2438,8 +2438,26 @@ pub struct AgentOpts {
     pub persona: Option<String>,
     pub accepts: Option<String>,
     pub autostart: Option<bool>,
+    /// `--sleep-after`: minutes, a duration (`90m`, `2h`), or `off`.
+    pub sleep_after: Option<String>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
+}
+
+/// `--sleep-after`: `off`, minutes (`45`), or a duration in minutes or hours (`90m`, `2h`).
+pub fn parse_sleep_after(s: &str) -> anyhow::Result<u32> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "off" | "never" | "0") {
+        return Ok(0);
+    }
+    let (num, mult) = match t.strip_suffix('h') {
+        Some(n) => (n, 60),
+        None => (t.strip_suffix("min").or_else(|| t.strip_suffix('m')).unwrap_or(&t), 1),
+    };
+    let n: u32 = num.trim().parse().map_err(|_| anyhow::anyhow!("--sleep-after: minutes (45), 90m, 2h or off, not `{s}`"))?;
+    let m = n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("--sleep-after: too long"))?;
+    crate::sleep::check_after(Some(m))?;
+    Ok(m)
 }
 
 impl AgentOpts {
@@ -2471,6 +2489,9 @@ impl AgentOpts {
         if let Some(a) = self.autostart {
             set("autostart", json!(a));
         }
+        if let Some(a) = &self.sleep_after {
+            set("sleep_after_min", json!(parse_sleep_after(a)?));
+        }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(
                 "permissions",
@@ -2497,6 +2518,9 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         if b["autostart"] == true { ", autostart" } else { "" },
         b["home_dir"].as_str().unwrap_or("?")
     );
+    if let Some(m) = b["sleep_after_min"].as_u64() {
+        println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
+    }
 }
 
 /// `muster agent new`.
@@ -2544,7 +2568,8 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
                 .unwrap_or_default();
-            let state = s(b, "state");
+            // An asleep agent's session has exited: say asleep, not stopped.
+            let state = if b["asleep"] == true { "asleep".to_string() } else { s(b, "state") };
             vec![
                 Cell::plain(s(b, "name")),
                 Cell::plain(match b["provider"].as_str() {
@@ -2573,6 +2598,13 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `muster agent sleep`: stop an idle agent's process now; its next message wakes it.
+pub fn agent_sleep(d: &Discovery, name: &str) -> anyhow::Result<()> {
+    let a = client::rpc_with_timeout(d, "agent.sleep", json!({ "name": name }), Duration::from_secs(30))?;
+    println!("{} is asleep; the next message wakes it", a["name"].as_str().unwrap_or(name));
+    Ok(())
+}
+
 pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
     let r = client::rpc(d, "agent.remove", json!({ "name": name }))?;
     println!(
@@ -2587,7 +2619,9 @@ pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
 pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
     let r = client::rpc_with_timeout(d, "agent.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
     let id = r["session"]["id"].as_u64().unwrap_or(0);
-    if r["started"] == true {
+    if r["woke"] == true {
+        println!("{id} (woke it: it re-reads its conversation)");
+    } else if r["started"] == true {
         println!("{id}");
     } else {
         println!("{id} (already running)");

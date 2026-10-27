@@ -107,6 +107,20 @@ export interface ProgramScroll {
   at: { col: number; row: number } | null;
 }
 
+/** An asleep named agent's tab (src/sleep.rs: its run stopped while idle, the "asleep" detail).
+ * Not exited for good: a message wakes it, so the composer stays open. */
+export function sessionAsleep(s: { state: string; state_detail: string | null } | undefined): boolean {
+  return !!s && s.state === "exited" && s.state_detail === "asleep";
+}
+
+/** The composer's line for an asleep agent: sending wakes it, at full cost once its prompt cache
+ * has likely expired (`cache_cold_at`). */
+export function asleepNote(s: { name: string; cache_cold_at?: number | null }, now: number): string {
+  const cold = s.cache_cold_at != null && now >= s.cache_cold_at;
+  return `${s.name} is asleep. Sending a message wakes it` +
+    (cold ? ": it re-reads the whole conversation at full cost, since its prompt cache has likely expired." : " into the same conversation.");
+}
+
 /** Output may be arriving: an agent not idle, or a shell (its state doesn't say). */
 export function sessionBusy(s: { kind: string; state: string }): boolean {
   return s.kind === "shell" || s.state !== "idle";

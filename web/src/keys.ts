@@ -6,6 +6,9 @@ import {
   agentsSupported,
   altHeld,
   confirmClose,
+  daemonRestarting,
+  daemonStopped,
+  lifecycleChecking,
   focusedSession,
   focusedTabId,
   focusedTask,
@@ -401,6 +404,12 @@ export const commands: Command[] = [
     run: () => (overlay.value = { kind: "shell" }),
   },
   {
+    id: "restart-muster",
+    title: "Restart Muster…",
+    group: "Window",
+    run: () => (overlay.value = { kind: "restart" }),
+  },
+  {
     id: "shutdown",
     title: "Shut down Muster…",
     group: "Window",
@@ -625,10 +634,19 @@ export function findBinding(e: KeyboardEvent, ctx: KeyCtx = ctxOf(e)): Binding |
 
 /** Keys the app claims while an overlay is open (the overlay handles its own keys). */
 function overlayAllows(b: Binding): boolean {
+  // Muster is restarting or shut down, or a confirmed Restart or Shut down is still being
+  // checked: no shortcut may act (one would reach a later backend, or none, or replace the
+  // dialog of a request that can't be withdrawn). The screen shown has nothing a shortcut drives.
+  if (lifecycleBusy()) return false;
   const o = overlay.value;
   if (!o) return true;
   // Toggle-style commands still work from inside overlays.
   return ["jump", "palette", "shortcuts"].includes(b.cmd.id);
+}
+
+/** A restart or shutdown is confirmed (being checked) or under way. */
+function lifecycleBusy(): boolean {
+  return lifecycleChecking.value !== null || daemonRestarting.value !== null || daemonStopped.value;
 }
 
 /** A pending "Close?" only takes keys while its question is on screen in this window. */
@@ -688,6 +706,9 @@ export function installKeys() {
   addEventListener(
     "keydown",
     (e) => {
+      // Restarting, shut down or being checked for either: no key acts on the app (see
+      // `overlayAllows`; the dialog handles its own keys).
+      if (lifecycleBusy()) return;
       // Inline "Close? ⏎ / Esc". Enter/Esc must not reach the terminal (Enter would submit the
       // agent's prompt), so terminal focus counts here.
       const pending = confirmClose.value;

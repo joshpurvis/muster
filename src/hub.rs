@@ -2840,6 +2840,16 @@ impl Hub {
                 extra_args: req.extra_args.clone(),
             };
             let id = self.store.insert_session(&stored)?;
+            // Linked before anyone can see the session (a snapshot or the window events): a
+            // client that closes it at once must find the agent, since session.remove hides an
+            // agent's session and never kills it. The registry's lock is a leaf, so taking it
+            // under this one is safe.
+            if let Some(agent) = req.agent_id
+                && let Err(e) = self.agents.link_session(&self.store, agent, Some(id))
+            {
+                let _ = self.store.delete_session(id);
+                return Err(e);
+            }
             let mut info = stored.info;
             info.id = id;
             g.sessions.insert(
@@ -2873,10 +2883,7 @@ impl Hub {
             Some(p) => crate::agents::Source::Chain(p),
             None => crate::agents::Source::Human,
         };
-        let started = match req.agent_id {
-            Some(agent) => self.agents.link_session(&self.store, agent, Some(id)),
-            None => Ok(()),
-        }.and_then(|()| self.start_process(id, prompt.clone(), Some(source)));
+        let started = self.start_process(id, prompt.clone(), Some(source));
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
             e.busy = false;
             e.kill_requested = false;

@@ -83,7 +83,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
   Alt keys, Jump focuses the other window, System title bar (native window only), Command
-  palette, Keyboard shortcuts, then Reload window, Close window, Shut down Muster…), plus a
+  palette, Keyboard shortcuts, then Reload window, Close window, Restart Muster…, Shut down Muster…), plus a
   "Reconnecting…" pill when disconnected. The top-right group is the one touching the window's
   right edge highest up; a zoomed group carries the controls; narrow strips keep only Jump and
   `⋯`.
@@ -198,8 +198,24 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   the window save first. A status line under it: Saved / Edited / Saving… / the reason a save
   failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
   with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
-  its editor (hidden behind the visible tab), so switching tabs keeps the undo history (Ctrl+Z);
-  moving the tab to another group or window, or someone else's change, starts it afresh.
+  its editor (hidden behind the visible tab), so switching tabs keeps its scroll.
+- **Undo**: Ctrl+Z undoes the human's own edits in the note, Ctrl+Shift+Z or Ctrl+Y redoes them
+  (⌘Z, ⇧⌘Z or ⌘Y on a Mac; on other keyboard layouts the keys in those places). Undo and redo
+  are keyboard only: the browser's context menu greys its Undo and Redo by its own history, so
+  they may be unavailable; when it does offer them they act on the note's history. It is the
+  editor's own history (`web/src/note_undo.ts`), not the browser's: WebKitGTK, the native
+  window's engine, has no key for its own, and a browser drops its own whenever an agent's
+  change replaces the text. Typing undoes a word or a burst at a time (a pause of a second ends
+  one), runs of Backspace or Delete likewise; a paste, a cut, a drop or each input method
+  composition is one step. Control characters typed or pasted (an ESC) are dropped at once, as
+  the daemon would drop them. An undo saves like typing, so the daemon and other windows get it,
+  and scrolls what it changed into view. Someone else's change never gets undone: Ctrl+Z steps
+  over it, taking back only the human's text around it. A step the change touched can't be
+  taken back without rewriting theirs, so the history ends there (Ctrl+Z then does nothing).
+  That includes a step the change may have touched where repeated text makes its place
+  ambiguous (removing one of two identical lines), and a step where an agent made the very
+  same change before it was saved. The history lives with the note in this window: moving the
+  tab to another group keeps it; another window, or a reload, starts afresh.
 - **Never lost**: typing not yet saved is kept in this browser until the daemon has it. After a
   reload, a closed window or a crash, the window's next page brings it back (a bar says so),
   merged onto the note as it is by then, and saves it. Reload window and Close window first wait
@@ -217,7 +233,8 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
 - **Keys**: in the editor, Muster's shortcuts that work in text fields still do (Ctrl+Space,
   Ctrl+K, Ctrl+Shift+P, Ctrl+Tab, Alt+Shift+…); Alt+letters and Alt+arrows stay with the text, as
   in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
-  the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
+  the corner, as for a terminal). Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y stay with the note ("Undo"),
+  never reaching a terminal or another shortcut. The notes list is a combobox: the field keeps focus and the
   arrow keys move the selected row, which screen readers announce.
 - **Allow triggers**: a small switch in the status line (a lightning icon, `triggers off` /
   `triggers on · N` with the number of triggers watching the note; role switch; the tooltip says
@@ -354,9 +371,10 @@ docs/PROTOCOL.md "Updates and window preferences"), in this order:
    reconnects.
 2. **UI update ready**: the installed UI release differs from the one this page loaded (after
    `muster ui-install`). "Reload" (Ctrl+Shift+R).
-3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. No button:
-   installing it needs a full restart, which ends all sessions; a "Shut down Muster…" link opens
-   the shutdown dialog.
+3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. Installing
+   it needs a restart of Muster, which ends all sessions: "Restart Muster…" (disabled while
+   disconnected) opens the restart dialog (see "Window and shutdown"), so the update is one
+   confirmed click.
 
 When the backend and the UI both changed, the backend banner comes first and the UI banner shows
 after the restart. The banner is hidden while a dialog is open, and has its own polite live
@@ -373,9 +391,34 @@ of the same kind arrives; the next waiting update shows meanwhile.
 - **System title bar** (`⋯`, palette; native windows only): shows or hides the window
   decorations of every native window. Kept by the backend (`prefs.set`), so new windows are built
   with it; open windows switch at once. Windows opened by an older build don't have the switch.
-- **Shut down Muster…** (`⋯`, palette, the terminal host banner): a dialog warning that it stops
+- **Restart Muster…** (`⋯`, palette, the terminal host banner): what `muster stop` then `muster`
+  do, without a terminal. A dialog warning that it stops the backend and the terminal host and
+  starts them again, ending every session and agent, with how many sessions are running, and that
+  windows reconnect by themselves and Claude tabs can be restarted afterwards to reopen their
+  conversation. Cancel is focused; "Restart" (red) calls `daemon.restart` with the builds this
+  window was shown (never queued). The dialog then says "Checking that Muster can restart…" and
+  that nothing has stopped yet, with no Cancel; Escape, the backdrop and shortcuts (the command
+  palette, Jump) no longer close or replace it, and nothing else takes the screen from it (the
+  request can't be withdrawn). A refusal (a build still being written or changed since, another
+  restart, reload or shutdown under way, a check of the restart command) comes back as a toast
+  before anything stopped. Otherwise every window shows "Restarting Muster…" (an alert dialog
+  that takes the focus; no shortcut works meanwhile, nor on the shut-down screen) and keeps
+  reconnecting; when a new backend on a new terminal host answers, the window carries on (the
+  terminal host banner is gone) and a toast says Muster restarted (or, when the backend that
+  answers runs another build than the restart was for, that something else started Muster
+  meanwhile and every session ended). If that backend needs another
+  UI, the screen says Muster restarted with a new interface, every session ended, and offers
+  Reload window. If none answers within 3 minutes, the window shows the stopped screen, "Muster
+  didn't come back": the restart didn't finish, sessions may have ended or some may still run, and
+  to run `muster stop`, then `muster` (which prints why the restart didn't finish when the restart
+  command recorded it), again after a minute if `muster stop` says the backend didn't stop or a
+  restart is under way. If the old backend still answers then (the restart never went ahead), a
+  toast says so instead. Native windows stay open and reconnect; no
+  new window opens.
+- **Shut down Muster…** (`⋯`, palette): a dialog warning that it stops
   the backend and the terminal host and ends every session and agent, with how many sessions are
-  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
+  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown` (the dialog then says
+  "Shutting down Muster…", with no Cancel, and holds the screen as a confirmed restart's does). Every window then shows
   "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
   `daemon_stopping` or the call's reply does that; a dropped connection just reconnects. Its
   Reconnect reloads the window only once Muster answers again; until then it says "Muster isn't
@@ -665,6 +708,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
+| Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y (in a note) | Undo / redo the human's own edits in the note (see "Notes") |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Terminal font size |
 | Alt+/ or F1 | Shortcuts sheet |

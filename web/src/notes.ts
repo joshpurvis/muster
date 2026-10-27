@@ -17,6 +17,9 @@ import { signal } from "@preact/signals";
 import type { Note, NoteAuthor, NoteInfo, NoteSummary } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { merge3 } from "./note_merge.ts";
+import {
+  applyChange, type Change, type History, type How, newHistory, rebaseHistory, record, redo, sameChange, undo,
+} from "./note_undo.ts";
 
 /** Every note, by id (`hello.notes`, then `note_upserted` / `note_removed`). */
 export const notes = signal<Map<number, NoteInfo>>(new Map());
@@ -56,6 +59,8 @@ export interface Draft {
   restored: boolean;
   /** The caret, kept while the editor is unmounted. */
   sel: [number, number] | null;
+  /** The human's edits, for Ctrl+Z / Ctrl+Shift+Z (note_undo.ts). */
+  history: History;
   /** The editor's own hook: the text changed under it (old, new). */
   onRemote: ((before: string, after: string) => void) | null;
 }
@@ -104,7 +109,7 @@ export function draftOf(n: NoteInfo): Draft | undefined {
 
 function newDraft(id: number, base: string, baseRev: number, text: string): Draft {
   return { id, base, baseRev, text, inflight: null, sent: null, waiting: null, timer: 0, persistTimer: 0, error: null,
-    conflictWith: null, restored: false, sel: null, onRemote: null };
+    conflictWith: null, restored: false, sel: null, history: newHistory(), onRemote: null };
 }
 
 export const isDirty = (d: Draft) => d.text !== d.base;
@@ -117,6 +122,7 @@ function setText(d: Draft, text: string) {
   if (text === d.text) return;
   const before = d.text;
   d.text = text;
+  rebaseHistory(d.history, before, text);
   d.onRemote?.(before, text);
 }
 
@@ -254,6 +260,8 @@ function rebase(d: Draft, n: Note) {
     return;
   }
   const m = merge3(d.base, d.text, n.body, authorName(n.updated_by));
+  // They made the human's change too (the merge is the draft as it was): it is theirs as well.
+  if (m.text === d.text && n.body !== d.base) sameChange(d.history, d.base, d.text);
   d.base = n.body;
   d.baseRev = n.rev;
   if (m.conflict) d.conflictWith = authorName(n.updated_by);
@@ -278,10 +286,11 @@ function schedule(d: Draft, ms = SAVE_DELAY_MS) {
   d.timer = setTimeout(() => void save(d), ms);
 }
 
-/** The editor's text changed (typing, paste, cut). */
-export function editDraft(id: number, text: string) {
+/** The editor's text changed (typing, paste, cut). `how` the human made it, for undo. */
+export function editDraft(id: number, text: string, how?: How) {
   const d = drafts.get(id);
   if (!d || text === d.text) return;
+  if (how) record(d.history, d.text, text, how, Date.now());
   d.text = text;
   d.error = null;
   d.conflictWith = null;
@@ -289,6 +298,16 @@ export function editDraft(id: number, text: string) {
   persistSoon(d);
   bump();
   schedule(d);
+}
+
+/** Ctrl+Z (or, `again`, Ctrl+Shift+Z): take back the human's last edit, saved like typing. The
+ * change for the editor to make; null when there is nothing to take back. */
+export function undoDraft(id: number, again = false): Change | null {
+  const d = drafts.get(id);
+  if (!d) return null;
+  const c = (again ? redo : undo)(d.history, d.text);
+  if (c) editDraft(id, applyChange(d.text, c));
+  return c;
 }
 
 /**

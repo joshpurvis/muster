@@ -10,7 +10,7 @@ license = "MIT"
 
 [features]
 default = []
-gui = ["dep:wry", "dep:tao", "dep:webkit2gtk"]
+gui = ["dep:wry", "dep:tao", "dep:webkit2gtk", "dep:gtk"]
 
 [dependencies]
 muster-terminal-protocol = { path = "crates/terminal-protocol" }
@@ -41,6 +41,13 @@ jiff = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 # The same version wry uses; only for the web-process-crash signal (src/gui.rs).
 webkit2gtk = { version = "=2.0.1", optional = true }
+# The same version tao uses; only for the window watchdog's "stopped responding" dialog (src/gui.rs).
+gtk = { version = "0.18", optional = true }
 
 [profile.release]
 lto = "thin"
+
+# Every backend start, `daemon.restart` and `restart-all` hash and snapshot the (debug: ~240 MB)
+# executables; unoptimized SHA-256 made that take ~15 s per start in tests and smoke runs.
+[profile.dev.package.sha2]
+opt-level = 3

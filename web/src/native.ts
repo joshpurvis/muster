@@ -20,6 +20,12 @@ function post(msg: Record<string, unknown>): boolean {
   }
 }
 
+/** Tell the native window which Muster window this page shows, so that reloading a frozen page
+ * from the native side (src/gui.rs, its watchdog) brings the same window back. */
+export function tellNativeWindow(id: number) {
+  if ((g.__musterNative?.ipc ?? 0) >= 3) post({ window: id });
+}
+
 /** Show or hide the native window's system title bar. */
 export function setNativeDecorations(on: boolean) {
   post({ decorations: on });

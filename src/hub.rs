@@ -291,6 +291,10 @@ struct SessEntry {
     /// Codex: `conversation` is known to be the top-level thread (resumed, or named by
     /// SessionStart), so a notify from another thread is a sub-agent's.
     conversation_sure: bool,
+    /// The current run sent a hook, so its CLI opened its conversation: its exit is never a
+    /// failed resume (`conversation_missing`), whatever its output quotes. Recovered from the
+    /// run's saved hook state (`store::HookSession`, written with every hook).
+    opened: bool,
     /// A Codex tab's saved thread (`store::CodexThread`; agents keep theirs on their record).
     codex_thread: Option<crate::store::CodexThread>,
     /// A run whose hooks no longer change the conversation its agent resumes (Start fresh is
@@ -799,13 +803,23 @@ impl Hub {
             info.cache_basis = record.map_or_else(Default::default, |r| {
                 crate::cache::basis_from_env(info.kind, |k| r.spec.env.get(k).map(String::as_str))
             });
-            let hook = store.load_hook_session(info.id, generation)?
-                .filter(|_| info.state != AgentState::Exited);
+            let saved_hook = store.load_hook_session(info.id, generation)?;
+            // Every hook saves it: the run's CLI sent one, so it opened its conversation.
+            let opened = saved_hook.is_some();
+            let hook = saved_hook.filter(|_| info.state != AgentState::Exited);
             info.subagents = hook.as_ref().map_or(0, |saved| saved.subagents);
             let last_hook_at = hook.as_ref().map_or(0, |saved| saved.last_hook_at);
-            let conversation_sure = hook.as_ref().is_some_and(|saved| saved.conversation_sure);
-            let conversation = hook.and_then(|saved| saved.conversation);
-            let codex_thread = if info.kind == SessionKind::Codex { store.codex_thread(info.id)? } else { None };
+            let (conversation, conversation_sure) = match hook {
+                Some(saved) => (saved.conversation, saved.conversation_sure),
+                // No hook from this run yet: a Codex run that resumed a thread has that one as
+                // its top-level conversation from the start (as `start_process` set it), read
+                // from its launch, so a sub-agent's first turn can't replace it.
+                None => recovered_conversation(info.kind, record.map(|r| r.spec.args.as_slice())),
+            };
+            let codex_thread = if info.kind == SessionKind::Codex {
+                tab_thread_at_load(store.codex_thread(info.id)?,
+                    terminal_records.get(&info.id).map(|r| r.spec.run.generation), generation)
+            } else { None };
             cache_rules.refresh(&mut info);
             store.update_session(&info)?;
             if let Some(token) = &token { inner.tokens.insert(token.clone(), info.id); }
@@ -829,6 +843,7 @@ impl Hub {
                     unverified_working,
                     conversation,
                     conversation_sure,
+                    opened,
                     codex_thread,
                     fenced_generation: None,
                 },
@@ -1724,7 +1739,7 @@ impl Hub {
     }
 
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
-        let (channel_id, kind, resumed) = {
+        let (channel_id, kind, opened, resumed) = {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else {
                 return;
@@ -1746,15 +1761,15 @@ impl Hub {
                 && !self.shutting_down.load(Ordering::SeqCst))
                 .then(|| self.launched_resume(id, e.info.kind)).flatten();
             let token = e.token.take();
-            let (ch, kind) = (e.info.channel_id, e.info.kind);
+            let (ch, kind, opened) = (e.info.channel_id, e.info.kind, e.opened);
             if let Some(t) = token {
                 g.tokens.remove(&t);
             }
-            (ch, kind, resumed)
+            (ch, kind, opened, resumed)
         };
         // Read outside the lock: the run's last output says whether the conversation is gone.
         let failed_resume = resumed.is_some_and(|resumed| {
-            conversation_missing(kind, code, resumed.as_deref(), self.recent_output_text(id, 40).as_deref())
+            conversation_missing(kind, code, opened, resumed.as_deref(), self.recent_output_text(id, 40).as_deref())
                 && self.forget_failed_resume(id, generation, resumed.as_deref())
         });
         crate::inject::drop_queue(self, id);
@@ -2870,6 +2885,7 @@ impl Hub {
                     port_base: 0,
                     conversation: None,
                     conversation_sure: false,
+                    opened: false,
                     codex_thread: None,
                     fenced_generation: None,
                 },
@@ -3028,6 +3044,7 @@ impl Hub {
             e.generation = generation;
             e.early_exit = None;
             e.fenced_generation = None;
+            e.opened = false;
             let resume = self.codex_resume(id, previous, e)?;
             // A resumed thread is the run's top-level conversation from the start.
             e.conversation = resume.clone();
@@ -3335,12 +3352,12 @@ impl Hub {
     /// later start would repeat the failed resume). Idempotent: once forgotten, nothing matches.
     pub fn reconcile_failed_resumes(&self) {
         let exited: Vec<(SessionId, u64, SessionKind, i32)> = self.inner.lock().sessions.values()
-            .filter(|e| e.info.state == AgentState::Exited)
+            .filter(|e| e.info.state == AgentState::Exited && !e.opened)
             .filter_map(|e| e.info.exit_code.filter(|c| *c != 0).map(|c| (e.info.id, e.generation, e.info.kind, c)))
             .collect();
         for (id, generation, kind, code) in exited {
             let Some(resumed) = self.launched_resume(id, kind) else { continue };
-            if !conversation_missing(kind, code, resumed.as_deref(), self.recent_output_text(id, 40).as_deref())
+            if !conversation_missing(kind, code, false, resumed.as_deref(), self.recent_output_text(id, 40).as_deref())
                 || !self.forget_failed_resume(id, generation, resumed.as_deref()) {
                 continue;
             }
@@ -3980,6 +3997,8 @@ impl Hub {
             entry.last_hook_at = last_hook_at;
             entry.conversation = runtime.conversation;
             entry.conversation_sure = runtime.conversation_sure;
+            // Its CLI is running a conversation (the hook state just saved says so too).
+            entry.opened = true;
             if let Some(args) = runtime.extra_args { entry.extra_args = args; }
             if let Some(thread) = runtime.tab_thread { entry.codex_thread = thread; }
             if changed {
@@ -4202,7 +4221,10 @@ struct ConversationChange {
 /// another thread is a sub-agent's once the top-level thread is known for sure; before that
 /// (no hooks, the first turn) it is ambiguous and the first thread is kept. Known gaps: with
 /// Codex's hooks off or not yet trusted, a sub-agent finishing before the first top-level turn
-/// is taken for the conversation, and `/new` isn't seen (the old thread stays saved).
+/// is taken for the conversation, and `/new` isn't seen (the old thread stays saved). Also then,
+/// a later sub-agent's notify still counts as the tab's own turn ending (its state turns idle
+/// and an `ask` waiting on it gets the sub-agent's message): without hooks it can't be told
+/// from the turns after an unseen `/new`, which must keep ending the tab's turns.
 ///
 /// Known gap: a restart that overtakes a hook still waiting in the inbox (an outage) misses it.
 fn conversation_after_hook(kind: SessionKind, conversation: Option<&str>, sure: bool, args: &[String], event: &str,
@@ -4260,9 +4282,39 @@ fn conversation_after_hook(kind: SessionKind, conversation: Option<&str>, sure: 
 /// reopen a conversation (`adapters::resumed_in_launch`), failed because the CLI no longer has
 /// it: only the CLI's own message says so (`adapters::says_conversation_missing`). Any other
 /// failure (Codex also exits 1 when its local database can't open) keeps the conversation.
-fn conversation_missing(kind: SessionKind, code: i32, resumed: Option<&str>, output: Option<&str>) -> bool {
-    code != 0 && output.is_some_and(|text| crate::adapters::says_conversation_missing(kind, text,
+/// `opened`: the run sent a hook (`SessEntry::opened`). Both CLIs print that message and exit
+/// before any hook, so a run that sent one did open its conversation, and its later exit keeps
+/// it even when its output quotes the message (a conversation about this very code).
+fn conversation_missing(kind: SessionKind, code: i32, opened: bool, resumed: Option<&str>, output: Option<&str>) -> bool {
+    code != 0 && !opened && output.is_some_and(|text| crate::adapters::says_conversation_missing(kind, text,
         resumed.filter(|_| kind == SessionKind::Codex)))
+}
+
+/// The conversation of a run recovered without any hook state (no hook from it yet), and
+/// whether it is known to be the top-level one: a Codex run launched to resume a thread
+/// (`codex resume … -- <id>`, `adapters::resumed_in_launch`) has that thread, as
+/// `Hub::start_process` set it. Claude's hooks all name theirs; nothing before them.
+fn recovered_conversation(kind: SessionKind, launched: Option<&[String]>) -> (Option<String>, bool) {
+    let resumed = launched.filter(|_| kind == SessionKind::Codex)
+        .and_then(|args| crate::adapters::resumed_in_launch(kind, args)).flatten()
+        .filter(|thread| crate::agents::valid_resume_id(thread));
+    let sure = resumed.is_some();
+    (resumed, sure)
+}
+
+/// A Codex tab's saved thread as a backend loads it, for a session whose current run is
+/// `generation` (0: none recovered). The thread was carried by launch `thread.generation`. It is
+/// still the tab's when no later launch was recorded (`latest_launch`: the session's terminal
+/// record, retired ones included): a launch that never started (its spawn failed, so its record
+/// was retired, maybe deleted since) or was never sent changes no conversation. It is then
+/// taken as carried by `generation`, which `Hub::codex_resume` compares with. A later launch
+/// (one an older backend started, a new conversation) leaves it as saved, so it is not resumed.
+fn tab_thread_at_load(saved: Option<crate::store::CodexThread>, latest_launch: Option<u64>, generation: u64)
+    -> Option<crate::store::CodexThread> {
+    saved.map(|thread| match latest_launch.is_none_or(|latest| latest <= thread.generation) {
+        true => crate::store::CodexThread { generation, ..thread },
+        false => thread,
+    })
 }
 
 /// The tab's status after a run couldn't reopen its conversation.
@@ -5901,10 +5953,10 @@ mod tests {
 
         // A run that couldn't reopen its conversation is forgotten only on Claude's own word.
         let c = SessionKind::Claude;
-        assert!(conversation_missing(c, 1, Some("conv-3"), Some("No conversation found with session ID: conv-3")));
-        assert!(!conversation_missing(c, 1, Some("conv-3"), Some("Error: something else")), "another failure keeps it");
-        assert!(!conversation_missing(c, 1, Some("conv-3"), None));
-        assert!(!conversation_missing(c, 0, Some("conv-3"), Some("No conversation found")));
+        assert!(conversation_missing(c, 1, false, Some("conv-3"), Some("No conversation found with session ID: conv-3")));
+        assert!(!conversation_missing(c, 1, false, Some("conv-3"), Some("Error: something else")), "another failure keeps it");
+        assert!(!conversation_missing(c, 1, false, Some("conv-3"), None));
+        assert!(!conversation_missing(c, 0, false, Some("conv-3"), Some("No conversation found")));
         assert!(hub.forget_failed_resume(2, 0, Some("conv-3")));
         assert!(args(&hub).is_empty(), "the next start is a new conversation");
         assert!(!hub.forget_failed_resume(2, 0, Some("conv-3")), "nothing left to forget");
@@ -5970,6 +6022,7 @@ mod tests {
         let previous = e.generation;
         e.generation = previous + 1;
         e.fenced_generation = None;
+        e.opened = false;
         let resume = hub.codex_resume(id, previous, e).unwrap();
         e.conversation = resume.clone();
         e.conversation_sure = resume.is_some();
@@ -6039,10 +6092,10 @@ mod tests {
         let generation = hub.inner.lock().sessions.get(&3).unwrap().generation;
         let x = SessionKind::Codex;
         let gone = "Error: No saved session found with ID th-1. Run `codex resume` without an ID to choose from existing sessions.";
-        assert!(conversation_missing(x, 1, Some("th-1"), Some(gone)));
-        assert!(!conversation_missing(x, 1, Some("th-1"), Some("Error: failed to initialize state runtime: database is locked")),
+        assert!(conversation_missing(x, 1, false, Some("th-1"), Some(gone)));
+        assert!(!conversation_missing(x, 1, false, Some("th-1"), Some("Error: failed to initialize state runtime: database is locked")),
             "Codex exits 1 for other reasons too");
-        assert!(!conversation_missing(x, 1, Some("th-2"), Some(gone)), "another thread's message");
+        assert!(!conversation_missing(x, 1, false, Some("th-2"), Some(gone)), "another thread's message");
         assert!(!hub.forget_failed_resume(3, generation, Some("th-2")), "a newer thread was saved");
         assert!(hub.forget_failed_resume(3, generation, Some("th-1")));
         assert_eq!(hub.store.codex_thread(3).unwrap(), None);
@@ -6081,6 +6134,123 @@ mod tests {
             assert_eq!(hub.store.codex_thread(3).unwrap().is_none(), gone, "{output}");
             assert_eq!(detail.contains("couldn't reopen its conversation"), gone, "{detail}");
             let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        }
+    }
+
+    /// A launch record for session `id`'s run `generation`, as `start_process` saves it.
+    fn launch_record(id: SessionId, generation: u64, args: &[&str], retired: bool) -> StoredTerminal {
+        StoredTerminal { host_instance: "gone".into(), token: format!("t-{id}-{generation}"),
+            key_refs: Default::default(), key_fp: None, port_base: 20000, pending: false, retired,
+            spec: SpawnSpec { run: RunId { id, generation }, program: "agent".into(),
+                args: args.iter().map(|s| s.to_string()).collect(), env: BTreeMap::new(),
+                cwd: std::env::temp_dir(), cols: 120, rows: 32 } }
+    }
+
+    /// A backend that starts on `hub`'s store (a reload).
+    fn reloaded(hub: &Hub) -> Arc<Hub> {
+        let cfg = HubConfig { port: 0, client_token: "reloaded".into(),
+            muster_bin: PathBuf::from("/bin/true"), terminal_host: None, openrouter_key: None };
+        Hub::new(cfg, hub.store.clone()).unwrap()
+    }
+
+    #[test]
+    fn a_reload_before_the_first_notify_keeps_the_resumed_thread_top_level() {
+        // Codex's hooks off: the run resumed th-a, and no hook came before the reload.
+        let hub = codex_fixture(&[], false);
+        let generation = 9_300_000;
+        hub.store.save_terminal(3, &launch_record(3, generation, &["resume", "-c", "k=v", "--", "th-a"], false)).unwrap();
+        hub.store.set_codex_thread(3, Some(&crate::store::CodexThread { thread: "th-a".into(), generation })).unwrap();
+        let hub = reloaded(&hub);
+        {
+            let g = hub.inner.lock();
+            let e = g.sessions.get(&3).unwrap();
+            assert_eq!((e.conversation.as_deref(), e.conversation_sure, e.opened), (Some("th-a"), true, false));
+        }
+        hub.inner.lock().tokens.insert("codex-token".into(), 3);
+        hub.set_state_for_test(3, AgentState::Working);
+        let hook = |event: &str, payload: serde_json::Value| hub.handle_hook("codex-token", event, payload).unwrap();
+        let saved = || hub.store.codex_thread(3).unwrap().map(|t| t.thread);
+        hook("notify", turn_done("th-b"));
+        assert_eq!(saved().as_deref(), Some("th-a"), "a sub-agent's turn isn't the conversation");
+        assert_eq!(hub.session(3).unwrap().state, AgentState::Working, "nor the tab's turn ending");
+        hook("notify", turn_done("th-a"));
+        assert_eq!(saved().as_deref(), Some("th-a"));
+        assert_eq!(hub.session(3).unwrap().state, AgentState::Idle);
+        // A fresh launch (no `resume`) has no conversation until it reports one.
+        assert_eq!(recovered_conversation(SessionKind::Codex, Some(&["-c".to_string(), "k=v".to_string()])), (None, false));
+        assert_eq!(recovered_conversation(SessionKind::Claude, Some(&["--resume".to_string(), "c-1".to_string()])), (None, false));
+        assert_eq!(recovered_conversation(SessionKind::Codex, None), (None, false));
+    }
+
+    #[test]
+    fn a_run_that_opened_its_conversation_keeps_it_whatever_its_output_quotes() {
+        let uuid = "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b";
+        let codex_gone = format!("Error: No saved session found with ID {uuid}. Run `codex resume` without an ID to choose from existing sessions.\r\n");
+        let claude_gone = "> grep for \"No conversation found with session ID\" in src/\r\n";
+        // (kind, a hook came from the run, forgotten). The Codex tab is 20 columns wide, so its
+        // message wraps through the id.
+        for (case, (kind, hooked, gone)) in [(SessionKind::Claude, true, false), (SessionKind::Claude, false, true),
+            (SessionKind::Codex, true, false), (SessionKind::Codex, false, true)].into_iter().enumerate() {
+            let hub = codex_fixture(&[], false);
+            let (id, output, args) = match kind {
+                SessionKind::Claude => (2, claude_gone.to_string(), vec!["--resume", "conv-1"]),
+                _ => (3, codex_gone.clone(), vec!["resume", "-c", "k=v", "--", uuid]),
+            };
+            let generation = 9_400_000 + case as u64;
+            hub.store.save_terminal(id, &launch_record(id, generation, &args, false)).unwrap();
+            match kind {
+                SessionKind::Claude => hub.store.set_session_extra_args(id, &["--resume".into(), "conv-1".into()]).unwrap(),
+                _ => hub.store.set_codex_thread(id, Some(&crate::store::CodexThread { thread: uuid.into(), generation })).unwrap(),
+            }
+            if hooked {
+                hub.store.save_runtime(&format!("hook-session:{id}"),
+                    &crate::store::HookSession { generation, ..Default::default() }).unwrap();
+            }
+            let mut info = hub.session(id).unwrap();
+            (info.state, info.exit_code, info.cols) = (AgentState::Exited, Some(1), 20);
+            hub.store.update_session(&info).unwrap();
+            let log = crate::terminal::host_log_path(id, generation);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+            std::fs::write(&log, &output).unwrap();
+            // The run ended while no backend watched; the next one checks it at startup.
+            let hub = reloaded(&hub);
+            assert_eq!(hub.inner.lock().sessions.get(&id).unwrap().opened, hooked);
+            hub.reconcile_failed_resumes();
+            let kept = match kind {
+                SessionKind::Claude => hub.inner.lock().sessions.get(&id).unwrap().extra_args == ["--resume", "conv-1"],
+                _ => hub.store.codex_thread(id).unwrap().is_some(),
+            };
+            assert_eq!(kept, !gone, "{kind:?} hooked={hooked}");
+            let _ = std::fs::remove_dir_all(log.parent().unwrap());
+        }
+        // A hook marks the live run as opened; a new run starts unopened.
+        let hub = codex_fixture(&[], false);
+        assert!(!hub.inner.lock().sessions.get(&3).unwrap().opened);
+        hub.handle_hook("codex-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"})).unwrap();
+        assert!(hub.inner.lock().sessions.get(&3).unwrap().opened);
+        next_codex_start(&hub, 3);
+        assert!(!hub.inner.lock().sessions.get(&3).unwrap().opened);
+        assert!(!conversation_missing(SessionKind::Claude, 1, true, None, Some("No conversation found with session ID: c-1")));
+    }
+
+    #[test]
+    fn a_tab_keeps_its_codex_thread_across_a_launch_that_never_started() {
+        // (the session's launch record at reload, resumed). The thread was carried by launch 8.
+        let retired = |generation| Some(launch_record(3, generation, &["resume", "--", "th-1"], true));
+        for (record, resumed) in [
+            (retired(8), true),                                      // its spawn failed
+            (None, true),                                            // that record cleaned up since
+            (Some(launch_record(3, 7, &["-c", "k=v"], false)), true), // it failed before its record
+            (Some(launch_record(3, 8, &["resume", "--", "th-1"], false)), true), // it ran (and ended)
+            (Some(launch_record(3, 9, &["-c", "k=v"], false)), false), // an older backend's run since
+            (retired(9), false),
+        ] {
+            let hub = codex_fixture(&[], false);
+            if let Some(record) = &record { hub.store.save_terminal(3, record).unwrap() }
+            hub.store.set_codex_thread(3, Some(&crate::store::CodexThread { thread: "th-1".into(), generation: 8 })).unwrap();
+            let hub = reloaded(&hub);
+            assert_eq!(next_codex_start(&hub, 3).is_some(), resumed, "{record:?}");
+            assert_eq!(hub.store.codex_thread(3).unwrap().is_some(), resumed, "{record:?}");
         }
     }
 

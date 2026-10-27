@@ -104,11 +104,14 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `codex resume … <thread>` once the conversation has a finished turn. Only the tab's own
   conversation counts, never a sub-agent's; after `/new` a restart starts empty until the new
   conversation has finished a turn. (Both need Codex's hooks; with them off or not yet
-  trusted, the first conversation to finish a turn is kept and `/new` isn't noticed.) If the
-  CLI says it no longer has that conversation (Claude: "No conversation found"; Codex: "No
-  saved session found with ID …"), the run ends, its status reads "couldn't reopen its
-  conversation, so the next start begins a new one", and the next restart starts empty; any
-  other failure keeps the conversation for the next try. For an empty conversation any time,
+  trusted, the first conversation to finish a turn is kept, `/new` isn't noticed, and a
+  sub-agent finishing its turn can make the tab read idle while its own turn goes on, and
+  answer an agent's `ask` with the sub-agent's message.) If the CLI says it no longer has that
+  conversation (Claude: "No conversation found"; Codex: "No saved session found with ID …",
+  also when a narrow pane wraps it) before the run sent any hook, the run ends, its status
+  reads "couldn't reopen its conversation, so the next start begins a new one", and the next
+  restart starts empty; any other failure keeps the conversation for the next try, as does a
+  run that got as far as a hook (it opened the conversation, whatever its output quotes later). For an empty conversation any time,
   open a new tab.
 
 ### Agent panel tabs

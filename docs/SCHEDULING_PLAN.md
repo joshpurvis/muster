@@ -2,7 +2,7 @@
 
 ## Plain English
 
-Phases 1 and 2 of this plan are built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes; then triggers (a note you allow, a branch moving, a PR or CI failure on GitHub, a local trigger URL), "Then…" steps that hand a reply to the next agent, and a daily dollar cap for OpenRouter agents (see "Status"). Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
+Phases 1, 2 and 3 of this plan are built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes; then triggers (a note you allow, a branch moving, a PR or CI failure on GitHub, a local trigger URL), "Then…" steps that hand a reply to the next agent, and a daily dollar cap for OpenRouter agents; then agents proposing schedules that you approve with a click (a one-off reminder for itself up to a day ahead needs no approval), and a trigger for files appearing in a folder you chose (see "Status"). Phone alerts for schedules wait for the phone's push alerts. Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
 
 ## Status
 
@@ -74,7 +74,46 @@ Choices made while building it:
 - The spend cap applies to every non-human message to an OpenRouter agent (agent asks on an
   unattended chain included), not only schedule runs.
 
-Not built yet: Phase 3 (agents proposing schedules, the file-change trigger).
+**Phase 3 is built** (2026-10-26, branch `feature/schedules-phase3`): agents propose schedules
+(10) and the file-change trigger (11), with the owner's decisions (question 3, answer b; the
+Phase 2 opt-in rule applied to files). Code in `src/schedules/agent.rs` (the MCP tools, the
+estimate) and `src/schedules/triggers.rs` (files); how it behaves is in docs/MCP.md "Schedules",
+docs/PROTOCOL.md "Schedules" (Phase 3), docs/CLI.md "Agents' proposals and reminders" and
+docs/UI.md "Agents panel". Choices made while building it:
+
+- A proposal is an ordinary schedule with `made_by` and no next run: nothing can make it due
+  (every write keeps it empty), and Run now and Skip next refuse it. Approval is a human-only RPC
+  (`schedule.approve`, refused from an agent's session or a shell an agent drives) that checks it
+  again as if made now. No tool approves, resumes, edits or makes a schedule directly: to change
+  one an agent proposes a new one. A proposal nobody approves goes after 7 days.
+- Only named agents propose, and never while handling scheduled or triggered work (their
+  session's provenance isn't the human's): so a reminder can't set the next reminder, and a
+  schedule can't breed schedules. An ask from another agent on a human-rooted chain is the
+  human's work and may propose.
+- Reminders: for the caller only, one-off, 5 minutes to 24 hours ahead, at most 3 waiting, 15
+  minutes apart, 10 a day (deleted ones count); a Claude subscription agent keeps quiet hours on
+  and a time inside them is refused up front. Proposals: at most 3 waiting, 10 a day; at most 5
+  live schedules per agent it made (the plan's "at most 5 active schedules"). guess: these
+  numbers; the owner may want them tighter or looser.
+- Agents propose times only (a cron line or a one-off), not triggers and not "Then…" steps:
+  those stay the human's to set up (question for the owner in the report).
+- Each agent-made schedule carries an estimate: runs in the coming week after quiet hours and
+  the caps, what pays (Claude subscription with its expiry, OpenRouter with its caps, Codex), and
+  the agent's unattended cap with its last 7 days. guess: no dollar figure per run for OpenRouter
+  (the spend ledger has today's per-agent estimate only).
+- The audit is the MCP log (every call, refused ones too) plus `made_by` on the schedule.
+- Files: polled every 15 s, no inotify (it works the same on macOS and Linux and costs one
+  listing); a ctime cursor kept with the schedule (catches files moved in, which keep their
+  modification time, and changes while Muster was off); at most 5000 entries and 3 levels;
+  hidden and partial files skipped; links never followed. "Ignoring the agent's own writes": a
+  change seen while its agent, or any scheduled or triggered work, is working, or within 30 s
+  after, counts as an agent's own (files have no author). Watched folders are a settings list,
+  empty by default (the owner's opt-in rule): no file trigger can be made until a folder is
+  chosen, and removing one stops its triggers at once.
+- Phone push: not built here (feature/phone-push builds Web Push). Every schedule alert goes
+  through `schedules::run::alert` (an in-app notice plus `notify::alert`), the one place a push
+  sink needs to hook in.
+- No store migration: schedule records and the settings are JSON.
 The "Today" section below describes the code before Phase 1.
 
 ## Today (before Phase 1)
@@ -176,7 +215,7 @@ PLAN.md §3 notes that Claude subscription limits assume "ordinary, individual u
 
 **Phase 2: Triggers and money (7's spend cap, 8, 9). Built.** Chaining, the note-changed trigger (opt-in per note), the local git watcher, GitHub polling, the local trigger URL with `muster trigger`, and OpenRouter spend caps. Size: L, splittable per trigger.
 
-**Phase 3: Agents schedule for themselves (10, and 11 if wanted).** The MCP tools with the approval flow and guard rails, the file-change trigger, and phone push alerts once Android Web Push lands. Size: M.
+**Phase 3: Agents schedule for themselves (10, and 11 if wanted). Built** (phone push alerts excepted: they wait for Android Web Push). The MCP tools with the approval flow and guard rails, the file-change trigger, and phone push alerts once Android Web Push lands. Size: M.
 
 ## Decisions (owner, 2026-10-20)
 

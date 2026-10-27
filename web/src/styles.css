@@ -5062,10 +5062,7 @@ fieldset.sch-then > legend {
   font-size: 12.5px;
 }
 
-.sch-trig-sub {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+.toggle.sch-trig-sub {
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -5110,25 +5107,20 @@ fieldset.sch-then > legend {
 
 .sch-prop-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 5px;
-  font-size: 11px;
+  font-size: 10.5px;
+  line-height: 1.35;
   color: var(--st-attn);
 }
 
 .sch-prop-icon {
   flex: none;
+  margin-top: 1px;
 }
 
 .sch-prop-by b {
   font-weight: 650;
-}
-
-.sch-prop-at {
-  margin-left: auto;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
 }
 
 .sch-prop-name {
@@ -5141,32 +5133,46 @@ fieldset.sch-then > legend {
 .sch-prop-facts {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   margin: 0;
 }
 
+/* A label and its value as one run of text, so a narrow panel wraps it under the label. */
 .sch-prop-fact {
-  display: grid;
-  grid-template-columns: 50px 1fr;
-  gap: 6px;
   font-size: 11.5px;
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .sch-prop-fact dt {
+  display: inline;
+  margin-right: 3px;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   color: var(--text-faint);
 }
 
 .sch-prop-fact dd {
+  display: inline;
   margin: 0;
-  min-width: 0;
   color: var(--text);
-  overflow-wrap: anywhere;
+}
+
+/* The prompt and the use estimate take the card's whole width, under their label. */
+.sch-prop-fact-block dt {
+  display: block;
+  margin: 0 0 2px;
+}
+
+.sch-prop-fact-block dd {
+  display: block;
 }
 
 .sch-prop-prompt {
   margin: 0;
-  max-height: 8.5em;
+  max-height: 9em;
   overflow: auto;
   padding: 4px 6px;
   border-radius: 4px;
@@ -5186,18 +5192,31 @@ fieldset.sch-then > legend {
 
 .sch-prop-use {
   display: flex;
-  gap: 5px;
-  align-items: flex-start;
-  color: var(--text-muted);
+  flex-direction: column;
+  gap: 2px;
 }
 
-.sch-prop-use.sub {
+.sch-prop-use-line {
+  display: block;
+  color: var(--text);
+}
+
+.sch-prop-use-line + .sch-prop-use-line {
+  margin-top: 2px;
+}
+
+.sch-prop-use-line.sub {
   color: var(--st-attn);
 }
 
-.sch-prop-use .icon {
-  flex: none;
-  margin-top: 2px;
+.sch-prop-use-line.cap {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.sch-prop-use-line .icon {
+  margin-right: 3px;
+  vertical-align: -1px;
 }
 
 .sch-prop-actions {

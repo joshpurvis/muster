@@ -381,9 +381,10 @@ Phase 1). Each run is an ordinary agent message with origin `schedule` at hop 0 
 sent through the same path as `agent.ask`, so the agent's accepted origins, the hop limit, the
 200-a-day cap and the unattended cap all apply, and a refusal is recorded like any other
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
-events. Only the human makes or changes schedules: a mutating call whose `from_session` is an
-agent's session, or a shell tab with an agent's provenance (one an agent spawned or typed into),
-is refused (agents proposing schedules is Phase 3).
+events. Only the human makes, approves or changes schedules: a mutating call whose
+`from_session` is an agent's session, or a shell tab with an agent's provenance (one an agent
+spawned or typed into), is refused. Agents propose schedules and set one-off reminders through
+their MCP tools (Phase 3, below; docs/MCP.md "Schedules").
 
 ```ts
 type When = { kind: "cron"; cron: string /* 5 fields, or @hourly/@daily/@weekly/@monthly/@yearly */ }
@@ -662,6 +663,63 @@ timed slots (`scheduled`, `catch_up`) unique per schedule, and adds `notes.trigg
 only: `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet minutes, `MUSTER_TEST_WATCH_EVERY_MS`
 the git and GitHub intervals, `MUSTER_TEST_GH` the `gh` program and
 `MUSTER_TEST_OPENROUTER_KEY_URL` the key endpoint (http allowed there).
+
+### Agents' proposals and reminders, the file trigger (Phase 3)
+
+Code: `src/schedules/agent.rs` (the agent tools and the estimate), `src/schedules/triggers.rs`
+(files). The agent side is MCP (docs/MCP.md "Schedules"); this is the client side.
+
+```ts
+// Added to Schedule:
+//   made_by: { agent_id, agent, kind: "proposal" | "reminder", reason, at, approved_at: number | null } | null
+//            // null: the human made it. A proposal with approved_at null waits for approval.
+//   estimate: { runs_per_week: number | null, max_per_day: number | null,
+//               billing: "claude_subscription" | "openrouter" | "codex" | "other",
+//               recent_unattended_7d: number, lines: string[], text: string } | null   // agent-made only
+//   status: also "proposed" (waiting for approval: it has no next_run and never runs)
+// Another kind of When / WhenInput (origin webhook, like every trigger):
+type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */; pattern: string | null /* "*.pdf": * and ? on file names */;
+                   recursive: boolean /* up to 3 levels down */; quiet_min: number /* 1..120, default 2 */ };
+// WhenInput also takes folder as "~/…"; pattern "" or "*" is none.
+// Added to ScheduleSettings: watch_folders: string[]  // folders file triggers may watch; [] (the default): none
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `schedule.approve` | `{id}` | `Schedule`. The human approves an agent's proposal: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule, and a Claude subscription agent's 7 days start now. Refused from an agent's session or an agent-driven shell (its own proposal included). Dismissing is `schedule.remove`. |
+| `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
+| `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
+| `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
+| `schedule.settings.set` | also `watch_folders: string[]` (the whole list; existing folders, `~/` allowed, made absolute with links resolved; not `/`; at most 20) | `ScheduleSettings`. Removing a folder stops the file triggers inside it: their waiting events go, their prompts still in an agent's queue are taken back, and a run due is `skipped`. |
+
+A proposal is stored like any schedule with `made_by` and no `next_run`; every write to it keeps
+`next_run` empty while it waits (the human may edit it before approving), and the scheduler,
+Run now and Skip next refuse it. A proposal nobody approves is removed after 7 days, and a reminder
+one day after it ran. Every schedule an agent made carries `estimate`: its runs in the coming 7
+days after quiet hours and the caps (its own daily cap and the agent's unattended cap), what pays
+(the agent's provider), and the caps that bound it, with the agent's unattended messages of the
+last 7 days. Making a proposal sends a notice (and a desktop notification) that it waits.
+
+**Files.** Only inside a folder in `watch_folders` (checked when the trigger is made, at every
+look, when a run is claimed, before it is sent and before its prompt is submitted). The folder is
+listed every 15 s while the trigger is active (not paused, not expired): at most 5000 entries per
+look (more: `watch.state` `error`, nothing read), `recursive` up to 3 levels, hidden names
+(`.…`), `node_modules`, `target`, `__pycache__` and partial files (`~`, `.swp`, `.tmp`, `.part`,
+`.crdownload`, `.download`, `.partial`) skipped, symbolic links never followed. A file whose
+change time (ctime: set by the system on every write, rename or move into the folder) is newer
+than the newest seen is new or changed; the newest is kept with the schedule
+(`watch.stamp`), so a change while Muster was off fires once after it starts, and the first look
+only records it. Removing a file starts nothing. An event names the folder and up to 10 changed
+files (`New or changed in ~/inbox: a.pdf, b.pdf (+3 more)`), quoted to the agent as data, and is
+debounced like a note's (`quiet_min` after the last change). A change seen while the trigger's
+own agent is working, or while any session handling scheduled or triggered work is, and for 30 s
+after, is taken as an agent's own: recorded as seen, never an event (so a file trigger can't feed
+itself or another). guess: ctime is the system's clock, so a clock set back can hide changes
+until it catches up. What it costs while idle: one directory listing (and a stat per entry) per
+15 s. Debug builds: `MUSTER_TEST_WATCH_EVERY_MS` and `MUSTER_TEST_TRIGGER_DELAY_MS` apply too.
+
+No store migration: schedule records and the settings are JSON (an older backend ignores a
+`files` schedule it can't read, and keeps a proposal waiting).
 
 ## Windows, tabs and naming
 

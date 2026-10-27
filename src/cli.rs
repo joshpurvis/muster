@@ -1157,7 +1157,7 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
         ScheduleCmd::Approve { id } => {
             let s = one("schedule.approve", json!({"id": id}))?;
             let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
-            println!("schedule {id} approved: {} on {}; next {next}", s["reading"].as_str().unwrap_or(""), s["agent"].as_str().unwrap_or("?"));
+            println!("schedule {id} approved: {} (agent {}); next {next}", s["reading"].as_str().unwrap_or(""), s["agent"].as_str().unwrap_or("?"));
             Ok(())
         }
         ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,

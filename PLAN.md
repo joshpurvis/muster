@@ -217,15 +217,22 @@ failure (desktop and in-app) and replies into a note; quiet hours, a per-schedul
 per-agent unattended cap (24 a day by default). Claude subscription agents: only with the
 Schedule opt-in, recurring schedules expire after 7 days unless renewed (a notice the day
 before), quiet hours on by default; Claude on OpenRouter doesn't expire. `muster schedule`,
-`schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (spend caps, chaining,
-triggers) and Phase 3 (agents proposing schedules) are not built.
+`schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (built): triggers (a note
+the human allows, a git branch, GitHub PRs and CI by polling, a loopback trigger URL),
+"Then…" steps and the OpenRouter spend caps. Phase 3 (built): agents propose schedules over MCP
+and only the human approves them (a click in the Agents panel), except a one-off reminder an
+agent sets for itself up to 24 hours ahead; none while handling scheduled or triggered work, so
+schedules can't breed schedules; every cap and rule above applies once one runs. And a
+file-change trigger, only inside folders the human lists in the settings (none by default).
+Phone push alerts for schedules wait for Android Web Push (feature/phone-push).
 
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
   `agent.*` method and no agent events).
 - Sleep and wake: stop an idle agent's process, resume it on the next message.
-- Webhooks and other triggers (docs/SCHEDULING_PLAN.md Phases 2 and 3): the `webhook` origin and
-  its policy exist; nothing fires it yet. Webhook triggers are never exposed to anyone but the
-  user. (Schedules are built: above.)
+- Phone push alerts for schedule runs (docs/SCHEDULING_PLAN.md Phase 3): they go through
+  `schedules::run::alert`, the one place a push sink plugs in once Android Web Push lands.
+  Triggers stay loopback-only, never exposed to anyone but the user. (Schedules and triggers are
+  built: above.)
 - An async `reply(msg_id)` tool, so an agent can answer later instead of in the same turn.

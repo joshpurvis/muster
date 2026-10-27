@@ -434,6 +434,8 @@ export interface ScheduleEstimate {
   recent_unattended_7d: number;
   /** In words: runs, what pays for them, the caps that bound them. */
   text: string;
+  /** The same, one sentence each (how often, what pays, the caps). */
+  lines?: string[];
 }
 
 /** OpenRouter spend today (UTC day) and the daily caps (`ScheduleSettings.spend`). */

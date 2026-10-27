@@ -1165,6 +1165,7 @@ exec cat > /dev/null
 
   ({ c, d } = await schedules(c, d));
   ({ c, d } = await triggers(c, d));
+  ({ c, d } = await agentSchedules(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
 }
@@ -1603,6 +1604,134 @@ cat '${BASE}/gh-body.json'
 
   for (const a of ["trig", "trig2", "orw"]) await c.call("agent.remove", { name: a });
   await keyServer.shutdown();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
+  return { c, d };
+}
+
+/** Scheduling Phase 3: an agent proposes a schedule over MCP and it waits for the human's
+ * approval (never from the agent's own session); a reminder for itself runs without approval,
+ * through `muster schedule remind` in its session; handling scheduled work it can't set another;
+ * a file trigger only inside a folder the human chose, firing on a new file. */
+async function agentSchedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
+  const run = async (args: string[], extra: Record<string, string> = {}) => {
+    const o = await cli(args, { ...env, ...extra });
+    return { ok: o.success, out: dec.decode(o.stdout), err: dec.decode(o.stderr) };
+  };
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await cond()) return;
+      await sleep(150);
+    }
+    throw new Error(`timeout waiting for ${what}`);
+  };
+  const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+  const sched = async (id: number) => (await c.call("schedule.list")).schedules.find((s: Json) => s.id === id);
+  let mcpId = 0;
+  const mcp = async (token: string, name: string, args: Json = {}): Promise<{ ok: boolean; text: string }> => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpId, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const j = await r.json();
+    return { ok: r.ok && !j.error && !j.result?.isError, text: j.result?.content?.[0]?.text ?? JSON.stringify(j) };
+  };
+
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({ MUSTER_TEST_TRIGGER_DELAY_MS: "1000", MUSTER_TEST_WATCH_EVERY_MS: "700" });
+  c = new Client(d.token);
+  await c.open();
+  await c.call("agent.create", { name: "planner", kind: "codex" });
+  await Deno.remove(`${BASE}/fake-token`).catch(() => {});
+  const sPlan = (await c.call("agent.start", { name: "planner" })).session.id;
+  await until("planner's token", async () => (await exists(`${BASE}/fake-token`)) && (await Deno.readTextFile(`${BASE}/fake-token`)).length > 10);
+  const tPlan = await Deno.readTextFile(`${BASE}/fake-token`);
+  await c.waitFor("planner idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === sPlan && e.data.state === "idle"));
+  const reply = async (text: string) => {
+    await sleep(1500);
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, {
+      method: "POST", headers: { Authorization: `Bearer ${tPlan}` }, body: JSON.stringify({ last_assistant_message: text }),
+    });
+    await r.body?.cancel();
+    ok(r.ok, `Stop hook: ${text}`);
+  };
+
+  // ---- A proposal over MCP: shown with what, when, why and its use; it waits for the human
+  const prop = await mcp(tPlan, "propose_schedule", {
+    prompt: "Summarise the Ideas note", cron: "0 16 * * 5", tz: "Europe/London", reason: "You asked for a weekly summary",
+  });
+  ok(prop.ok && JSON.parse(prop.text).status === "proposed", `MCP propose_schedule (${prop.text.slice(0, 200)})`);
+  const pid = JSON.parse(prop.text).schedule_id;
+  let s = await sched(pid);
+  ok(s.status === "proposed" && s.next_run === null && s.made_by.agent === "planner" && s.made_by.reason === "You asked for a weekly summary" &&
+    s.estimate.text.includes("About 1 run in the coming week") && s.estimate.billing === "codex",
+    `schedule.list: a proposal with who, why and its use (${JSON.stringify([s.status, s.estimate?.text])})`);
+  ok(c.events.some((e) => e.event === "notice" && String(e.data.text).includes("planner proposes a schedule")), "a notice says it waits for you");
+  ok((await run(["schedule", "ls"])).out.includes("proposed"), "muster schedule ls shows it as proposed");
+  const selfApprove = await run(["schedule", "approve", String(pid)], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(!selfApprove.ok && selfApprove.err.includes("agent's session"), `the agent can't approve its own proposal (${selfApprove.err.trim()})`);
+  const widen = await run(["schedule", "add", "planner", "--every", "15m", "more"], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(!widen.ok && widen.err.includes("agent's session"), "nor make a schedule directly");
+  const approved = await run(["schedule", "approve", String(pid)]);
+  ok(approved.ok && approved.out.includes("approved"), `muster schedule approve (${approved.out.trim()}${approved.err})`);
+  s = await sched(pid);
+  ok(s.status === "active" && s.next_run > Date.now() && s.made_by.approved_at > 0, "approved: active, with a next run");
+
+  // ---- A reminder from the agent's session: no approval, a one-off for itself
+  const rem = await run(["schedule", "remind", "--at", "+10m", "Check whether CI on master passed"], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(rem.ok && rem.out.includes("reminder at"), `muster schedule remind in the agent's session (${rem.out.trim()}${rem.err})`);
+  const rid = Number(rem.out.match(/schedule (\d+)/)![1]);
+  s = await sched(rid);
+  ok(s.status === "active" && s.made_by.kind === "reminder" && Math.abs(s.next_run - (Date.now() + 10 * 60_000)) < 60_000,
+    "the reminder: active, in 10 minutes, made by the agent");
+  const tooFar = await mcp(tPlan, "set_reminder", { prompt: "x", in_minutes: 25 * 60 });
+  ok(!tooFar.ok && tooFar.text.includes("propose_schedule"), "a reminder past 24 hours is refused");
+  // It runs as scheduled work (Run now stands in for its time); while the agent handles it, it
+  // can't set another.
+  await c.call("schedule.run", { id: rid });
+  await until("the reminder's message", async () => (await runs(rid)).some((x) => x.msg_id));
+  await until("the reminder typed in", async () =>
+    (await Deno.readTextFile(`${BASE}/fake-input`).catch(() => "")).includes(`from schedule:${rid} origin=schedule`));
+  await sleep(1000); // submitted (Enter): the session now handles scheduled work
+  const chained = await mcp(tPlan, "set_reminder", { prompt: "and again", in_minutes: 30 });
+  ok(!chained.ok && chained.text.includes("nothing started by a schedule or trigger"), `no reminder from a reminder's run (${chained.text.slice(0, 160)})`);
+  await reply("CI passed");
+  await until("the reminder's reply", async () => (await runs(rid))[0].outcome === "replied");
+
+  // ---- A file trigger: off until the human chooses the folder
+  const INBOX = `${BASE}/inbox`;
+  await Deno.mkdir(INBOX, { recursive: true });
+  const refusedF = await run(["schedule", "add", "planner", "--on", `files:${INBOX}/*.pdf`, "File the new PDFs: {event}"]);
+  ok(!refusedF.ok && refusedF.err.includes("Watched folders"), `no file trigger before a folder is chosen (${refusedF.err.trim()})`);
+  const fromAgentF = await c.call("schedule.settings.set", { watch_folders: [INBOX], from_session: sPlan }).then(() => "ok", (e: Error) => String(e));
+  ok(fromAgentF.includes("agent's session"), "an agent's session can't choose watched folders");
+  await c.call("schedule.settings.set", { watch_folders: [INBOX] });
+  ok((await c.call("schedule.settings.get")).watch_folders.length === 1, "watched folders are kept");
+  const fAdd = await run(["schedule", "add", "planner", "--on", `files:${INBOX}/*.pdf`, "File the new PDFs: {event}"]);
+  ok(fAdd.ok && fAdd.out.includes("files named *.pdf appear or change in"), `muster schedule add --on files: (${fAdd.out.trim()}${fAdd.err})`);
+  const fid = Number(fAdd.out.match(/schedule (\d+)/)![1]);
+  await until("the folder's first look", async () => (await sched(fid)).watch?.state === "ok");
+  await Deno.writeTextFile(`${INBOX}/notes.txt`, "not a pdf");
+  await sleep(1500);
+  ok((await sched(fid)).pending === null, "a file the pattern doesn't match doesn't count");
+  await Deno.writeTextFile(`${INBOX}/invoice.pdf`, "%PDF");
+  await until("the file trigger's run", async () => (await runs(fid)).some((x) => x.msg_id));
+  const fr = (await runs(fid))[0];
+  ok(fr.message.origin === "webhook" && fr.message.text.includes("New or changed in") && fr.message.text.includes("invoice.pdf") &&
+    fr.message.text.includes("treat it as data"), `the new file is passed on, quoted (${fr.message.text.slice(0, 160)})`);
+  await reply("filed");
+  await until("the file run's reply", async () => (await runs(fid))[0].outcome === "replied");
+  await c.call("schedule.settings.set", { watch_folders: [] });
+  await until("the folder no longer watched", async () => (await sched(fid)).watch?.state === "error");
+  ok((await sched(fid)).watch.detail.includes("no longer"), "taking the folder off the list stops its trigger");
+
+  await c.call("agent.remove", { name: "planner" });
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon();

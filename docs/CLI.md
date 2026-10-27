@@ -53,7 +53,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude and Codex agents resume their last conversation (Codex: `codex resume`, once it has a finished turn); `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
 | `muster note ls/new/read/write/append/rename/open/close/rm/triggers` | Plain-text notes shared with agents. See "Notes" below. |
-| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:`). See "Schedules" below. |
+| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history/approve` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:/files:`); `approve` an agent's proposal. Inside an agent's session, `propose` and `remind`. See "Schedules" below. |
 | `muster trigger <name> [DATA...]` / `--url <name>` | Fire a URL trigger now, or print its URL and secret. See "Triggers and Then" under "Schedules" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
@@ -175,6 +175,7 @@ agent does by default). Triggers run at most every 15 minutes and 10 times a day
 | `gh:<owner/repo>:pr-opened` | a pull request is opened (polled with your own `gh` login) | `--poll-min N` (2-60, default 5) |
 | `gh:<owner/repo>:ci-failed[@branch]` | a GitHub Actions run fails (on that branch only, if given) | `--poll-min N` |
 | `url:<name>` | its trigger URL is called with its secret, or `muster trigger <name>` | |
+| `files:<folder>[/<pattern>]` | files appear or change in that folder (`files:~/inbox/*.pdf`; listed every 15 s). **Only inside a folder you allow under Scheduling settings → Watched folders** (none by default). Changes made while its agent, or any scheduled or triggered work, is working don't count. | `--subfolders` (up to 3 levels), `--quiet-min N` (1-120, default 2) |
 
 The prompt may use `{event}` (what happened) and, for a URL trigger, `{payload}` (the data sent),
 both quoted as untrusted data; a prompt that uses neither gets them added at its end.
@@ -200,6 +201,31 @@ muster schedule add reviewer --on gh:octo/repo:pr-opened --poll-min 10 Review th
 muster schedule add worker --on url:deploy-done "The deploy finished: {payload}. Check the site."
 muster trigger --url deploy-done        # then, from a script: curl … --data-binary @- <url>
 muster schedule add worker --daily 02:00 --then "reviewer: Last night's failures: {reply}" --on-failure notify Run the test suite.
+muster schedule add worker --on "files:~/inbox/*.pdf" File each new PDF in the right folder: {event}
+```
+
+### Agents' proposals and reminders (Phase 3)
+
+An agent proposes a schedule and you approve it; the one exception is a one-off reminder an
+agent sets for itself up to 24 hours ahead (docs/MCP.md "Schedules"). `muster schedule ls` shows
+a proposal as `proposed`.
+
+| Command | What it does |
+|---|---|
+| `muster schedule approve <id>` | Approve an agent's proposal (`schedule.approve`): it then runs like any schedule. Only you: refused from an agent's session or a shell an agent drives. `muster schedule rm <id>` dismisses one. |
+| `muster schedule propose TIMING --reason "…" [--agent NAME] [options] [PROMPT...]` | **Inside an agent's session only**: propose a schedule as that agent (its MCP `propose_schedule`). TIMING as for `add`; options `--name`, `--tz`, `--fresh`, `--quiet-hours on\|off`, `--max-per-day N`, `--note <id>`. Prints `schedule ID: proposed (…)` and its estimated use. |
+| `muster schedule remind --at WHEN [PROMPT...]` | **Inside an agent's session only**: a one-off reminder for itself, 5 minutes to 24 hours ahead (`+20m`, `15:30`, `"YYYY-MM-DD HH:MM"`), no approval (its MCP `set_reminder`). |
+
+Inside an agent's session, `muster schedule pause <id>` and `muster schedule rm <id>` run its
+`pause_schedule` and `delete_schedule`: it may pause a schedule that runs on it or that it made,
+and delete one it made; resuming, editing and approving stay yours.
+
+```sh
+# run by an agent, in its session:
+muster schedule remind --at +20m Check whether CI on master passed and tell the human.
+muster schedule propose --weekly fri@16:00 --reason "You asked for a weekly summary" Summarise the Ideas note
+# run by you:
+muster schedule approve 12
 ```
 
 ## Agent skills

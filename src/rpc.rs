@@ -1093,6 +1093,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 if refused {
                     let what = match method {
                         "note.set_triggers" => "only the human allows triggers on a note",
+                        "schedule.approve" => "only the human approves an agent's proposal (an agent can only propose)",
                         m if m.starts_with("trigger.") => "only the human fires triggers from Muster or sees their secrets",
                         _ => "only the human makes and changes schedules",
                     };

@@ -452,9 +452,9 @@ pub fn estimate(hub: &Hub, agent: &Agent, s: &Schedule, now: i64) -> Value {
     });
     lines.push(match billing {
         "claude_subscription" => format!(
-            "Uses your Claude subscription (you opted {} in to scheduled work){}; quiet hours {}.",
+            "Uses your Claude subscription ({} is opted in to scheduled work){}; quiet hours {}.",
             agent.name,
-            if s.when.recurs() { ": it stops 7 days after you approve it unless you renew it" } else { "" },
+            if s.when.recurs() { ": stops 7 days after approval unless you renew it" } else { "" },
             if s.quiet_hours { "on" } else { "off" }
         ),
         "openrouter" => {
@@ -476,6 +476,8 @@ pub fn estimate(hub: &Hub, agent: &Agent, s: &Schedule, now: i64) -> Value {
         "max_per_day": busiest,
         "billing": billing,
         "recent_unattended_7d": recent,
+        // How often, what pays for it, the caps that bound it: one sentence each.
+        "lines": lines,
         "text": lines.join(" "),
     })
 }

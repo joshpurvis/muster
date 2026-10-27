@@ -251,16 +251,14 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
       <div class="sch-prop-head">
         <IconSpark size={12} class="sch-prop-icon" />
         <span class="sch-prop-by">
-          Proposed by <b>{m.agent}</b>
+          Proposed by <b>{m.agent}</b> · <span data-tip={new Date(m.at).toLocaleString()}>{nextWhenPast(m.at, now)}</span>
         </span>
-        <span class="sch-prop-at" data-tip={new Date(m.at).toLocaleString()}>{nextWhenPast(m.at, now)}</span>
       </div>
       <div class="sch-prop-name">{s.name}</div>
       <dl class="sch-prop-facts">
         {facts.map((f) => (
           <div key={f.label} class="sch-prop-fact">
-            <dt>{f.label}</dt>
-            <dd>{f.value}</dd>
+            <dt>{f.label}</dt> <dd>{f.value}</dd>
           </div>
         ))}
         <div class="sch-prop-fact sch-prop-fact-block">
@@ -270,17 +268,20 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
           </dd>
         </div>
         {m.reason && (
-          <div class="sch-prop-fact sch-prop-fact-block">
-            <dt>Why</dt>
-            <dd class="sch-prop-reason" data-tip={`${m.agent}'s words`}>{m.reason}</dd>
+          <div class="sch-prop-fact">
+            <dt>Why</dt> <dd class="sch-prop-reason" data-tip={`${m.agent}'s own words`}>{m.reason}</dd>
           </div>
         )}
         {s.estimate && (
           <div class="sch-prop-fact sch-prop-fact-block">
             <dt>Use</dt>
-            <dd class={cx("sch-prop-use", sub && "sub")}>
-              {sub && <IconShieldAlert size={12} />}
-              <span>{s.estimate.text}</span>
+            <dd class="sch-prop-use">
+              {(s.estimate.lines ?? [s.estimate.text]).map((l, i) => (
+                <span key={i} class={cx("sch-prop-use-line", i === 1 && sub && "sub", i === 2 && "cap")}>
+                  {i === 1 && sub && <IconShieldAlert size={11} />}
+                  {l}
+                </span>
+              ))}
             </dd>
           </div>
         )}
@@ -307,7 +308,7 @@ function nextWhenPast(ms: number, now: number): string {
 }
 
 function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
-  if (isProposal(s)) return <ProposalCard s={s} now={now} />;
+  if (isProposal(s) && s.made_by) return <ProposalCard s={s} now={now} />;
   return <TimedRow s={s} now={now} />;
 }
 
@@ -1056,8 +1057,15 @@ export function ScheduleDialog(
             <span class="sch-at">after</span>
             {num("sch-trig-quiet", t.quiet, "Minutes of quiet after the last change", (quiet) => setTrig({ quiet }))}
             <span class="sch-at">min of quiet</span>
-            <label class="sch-trig-sub">
-              <input type="checkbox" checked={t.subfolders} onChange={(e) => setTrig({ subfolders: (e.target as HTMLInputElement).checked })} />
+            <label class="toggle sch-trig-sub">
+              <input
+                type="checkbox"
+                checked={t.subfolders}
+                onChange={(e) => setTrig({ subfolders: (e.target as HTMLInputElement).checked })}
+              />
+              <span class="toggle-track">
+                <span class="toggle-thumb" />
+              </span>
               <span>and subfolders</span>
             </label>
           </>

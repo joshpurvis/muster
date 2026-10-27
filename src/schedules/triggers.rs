@@ -778,7 +778,12 @@ pub fn look_at_folder(folder: &Path, pattern: Option<&str>, recursive: bool, sin
     let mut seen = 0usize;
     let mut stack: Vec<(PathBuf, usize)> = vec![(folder.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        let rd = std::fs::read_dir(&dir).with_context(|| format!("reading {}", tilde(&dir.to_string_lossy())))?;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            // A subfolder it can't read is left out; the watched folder itself must be readable.
+            Err(_) if depth > 0 => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", tilde(&dir.to_string_lossy()))),
+        };
         for e in rd {
             let Ok(e) = e else { continue };
             seen += 1;
@@ -845,11 +850,14 @@ pub fn check_files(hub: &Hub) {
             continue;
         }
         let now = hub.schedules.now();
-        let path = Path::new(folder);
-        let got = if folder_allowed(&settings.watch_folders, path) {
-            look_at_folder(path, pattern.as_deref(), *recursive, s.watch.stamp)
-        } else {
-            Err(anyhow::anyhow!("{FOLDER_NOT_WATCHED}"))
+        // Resolved again at each look: a folder swapped for a link to somewhere else is read only
+        // if where it now leads is still inside a watched folder.
+        let got = match std::fs::canonicalize(folder) {
+            Ok(real) if folder_allowed(&settings.watch_folders, Path::new(folder)) && folder_allowed(&settings.watch_folders, &real) => {
+                look_at_folder(&real, pattern.as_deref(), *recursive, s.watch.stamp)
+            }
+            Ok(_) => Err(anyhow::anyhow!("{FOLDER_NOT_WATCHED}")),
+            Err(e) => Err(anyhow::anyhow!("can't read {}: {e}", tilde(folder))),
         };
         let busy = agents_at_work(hub, s.agent_id);
         let mut absorb = false;

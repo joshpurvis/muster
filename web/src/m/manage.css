@@ -114,6 +114,27 @@
 .sheet-confirm {
   padding: 0 4px;
 }
+.action-sheet .sheet-notice {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 12px 0 0;
+  color: var(--text);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.notice-retry {
+  display: block;
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.sheet-head h2:focus,
+.sheet-confirm h2:focus,
+.new-tab-screen h1:focus {
+  outline: none;
+}
 .sheet-confirm p {
   color: var(--text-muted);
   font-size: 14px;
@@ -230,18 +251,20 @@
 .choice-text strong,
 .choice-text span {
   display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .choice-text strong {
   font-size: 15px;
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+/* Paths wrap instead of losing their end: folders under one prefix must stay tellable apart. */
 .choice-text span {
   color: var(--text-muted);
   font-size: 12px;
   margin-top: 3px;
+  overflow-wrap: anywhere;
 }
 .choice-mark {
   flex-shrink: 0;
@@ -290,16 +313,26 @@
 .folder-suggestions button {
   display: block;
   width: 100%;
-  min-height: 44px;
-  padding: 10px 12px;
+  min-height: 48px;
+  padding: 8px 12px;
   text-align: left;
-  font: 13px var(--mono);
   background: transparent;
   border: 0;
   border-radius: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+}
+.folder-suggestions strong,
+.folder-suggestions span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.folder-suggestions strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+.folder-suggestions span {
+  color: var(--text-muted);
+  font: 12px var(--mono);
+  margin-top: 2px;
 }
 .folder-suggestions li + li button {
   border-top: 1px solid var(--border);

@@ -1,19 +1,10 @@
 // "New tab" for a manage-scoped phone: a folder, what to start in it, an optional first prompt.
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import type { SessionKind } from "../types.ts";
-import {
-  canManage,
-  hideNewTab,
-  info,
-  loadInfo,
-  newTabOpen,
-  openTab,
-  showNewTab,
-  showStarted,
-} from "./manage.ts";
-import { KIND_LABEL, tildify, workspaceChoices } from "./manage_logic.ts";
-import { errorText, ready, sessions } from "./store.ts";
+import { canManage, info, loadInfo, newTabOpen, openTab, useHistoryLayer, useModal } from "./manage.ts";
+import { KIND_LABEL, splitFolder, tildify, workspaceChoices } from "./manage_logic.ts";
+import { errorText, notify, ready, selected, sessions } from "./store.ts";
 import { Icon } from "./ui.tsx";
 import "./manage.css";
 
@@ -24,7 +15,12 @@ const OTHER = -1;
 export function NewTabButton() {
   if (!canManage.value) return null;
   return (
-    <button type="button" class="icon-button" aria-label="New tab" onClick={showNewTab}>
+    <button
+      type="button"
+      class="icon-button"
+      aria-label="New tab"
+      onClick={() => newTabOpen.value = true}
+    >
       <Icon name="plus" />
     </button>
   );
@@ -44,6 +40,10 @@ function NewTabScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
+  const root = useRef<HTMLElement>(null);
+  const layer = useHistoryLayer(() => newTabOpen.value = false);
+  useModal(root);
+  useLayoutEffect(() => root.current?.querySelector<HTMLElement>("h1")?.focus(), []);
   const data = info.value;
   const online = ready.value;
   // Fresh folders each time the screen opens, and again after a reconnect.
@@ -53,8 +53,12 @@ function NewTabScreen() {
   const choices = data
     ? workspaceChoices(data.workspaces, data.channels, [...sessions.value.values()], data.agents)
     : [];
-  // Until the user picks, the most recently used folder (or a typed one when there is none).
+  // The most recently used folder (or a typed one when there is none), fixed once the folders are
+  // known: later activity on the computer never switches it under the user.
   const picked = choice ?? (data ? choices[0]?.id ?? OTHER : null);
+  useEffect(() => {
+    if (choice === null && picked !== null) setChoice(picked);
+  }, [picked]);
   const ws = choices.find((w) => w.id === picked);
   const notGit = !!ws && !ws.is_git;
   const canOpen = ready.value && !busy && (ws ? true : picked === OTHER && !!path.trim());
@@ -70,20 +74,22 @@ function NewTabScreen() {
         agent,
         worktree: worktree && !notGit,
         prompt,
-      });
-      showStarted(s);
+      }, data?.home ?? "");
+      // Left with Back while it started: stay where the user went, and say it started.
+      if (layer.replaceWithSession(s.id)) selected.value = s.id;
+      else notify(`${KIND_LABEL[agent]} tab started: ${s.name}`);
     } catch (err) {
       setError(errorText(err));
       setBusy(false);
     }
   };
   return (
-    <main class="new-tab-screen" aria-labelledby="new-tab-title">
+    <main class="new-tab-screen" aria-labelledby="new-tab-title" ref={root}>
       <header class="topbar session-header">
-        <button type="button" class="icon-button" aria-label="Back to sessions" onClick={hideNewTab}>
+        <button type="button" class="icon-button" aria-label="Back to sessions" onClick={layer.close}>
           <Icon name="back" />
         </button>
-        <h1 id="new-tab-title">New tab</h1>
+        <h1 id="new-tab-title" tabIndex={-1}>New tab</h1>
       </header>
       <form class="new-tab-form" onSubmit={submit}>
         <div class="new-tab-body">
@@ -217,20 +223,25 @@ function FolderField({ value, onChange }: { value: string; onChange: (v: string)
       />
       {shown.length > 0 && (
         <ul class="folder-suggestions" aria-label="Folders">
-          {shown.map((entry) => (
-            <li key={entry}>
-              <button
-                type="button"
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => {
-                  onChange(entry.endsWith("/") ? entry : entry + "/");
-                  input.current?.focus();
-                }}
-              >
-                {entry}
-              </button>
-            </li>
-          ))}
+          {shown.map((entry) => {
+            const { name, parent } = splitFolder(entry);
+            return (
+              <li key={entry}>
+                <button
+                  type="button"
+                  aria-label={entry}
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    onChange(entry.endsWith("/") ? entry : entry + "/");
+                    input.current?.focus();
+                  }}
+                >
+                  <strong>{name}</strong>
+                  <span>{parent}</span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

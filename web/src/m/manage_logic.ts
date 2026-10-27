@@ -3,9 +3,13 @@ import type { Channel, SessionInfo, SessionKind, Workspace } from "../types.ts";
 
 export const KIND_LABEL: Record<SessionKind, string> = { claude: "Claude", codex: "Codex", shell: "Shell" };
 
-/** A named agent's session, as far as the phone knows: `hidden` is only ever set on one. */
-export function isAgent(s: SessionInfo, agents: Set<number> | null): boolean {
-  return !!s.hidden || !!agents?.has(s.id);
+/** Named agents' sessions: session id → the agent's name (`hello.agent_sessions`). */
+export type Agents = Map<number, string>;
+
+/** The named agent session `s` belongs to, or null. `hidden` is only ever set on an agent's
+ * session, so a hidden one counts even before the list is known (its tab name stands in). */
+export function agentName(s: SessionInfo, agents: Agents | null): string | null {
+  return agents?.get(s.id) ?? (s.hidden ? s.name : null);
 }
 
 export function tildify(path: string, home: string): string {
@@ -14,13 +18,21 @@ export function tildify(path: string, home: string): string {
   return path === h ? "~" : path.startsWith(h + "/") ? "~" + path.slice(h.length) : path;
 }
 
+/** A folder suggestion as its own name plus the folder it is in (`~/a/b/` → `b`, `~/a/`). */
+export function splitFolder(entry: string): { name: string; parent: string } {
+  const clean = entry.replace(/\/+$/, "");
+  const cut = clean.lastIndexOf("/");
+  if (cut < 0) return { name: clean || entry, parent: "" };
+  return { name: clean.slice(cut + 1) || "/", parent: clean.slice(0, cut + 1) };
+}
+
 /** Workspaces for the picker, most recently used first. The agents' own workspace (where named
  * agents live) is left out: a new tab there would be neither an agent nor a project. */
 export function workspaceChoices(
   workspaces: Workspace[],
   channels: Channel[],
   all: SessionInfo[],
-  agents: Set<number> | null,
+  agents: Agents | null,
 ): Workspace[] {
   const byId = new Map(channels.map((c) => [c.id, c]));
   const used = new Map<number, number>();
@@ -47,48 +59,55 @@ export interface Confirm {
   danger: boolean;
 }
 
+/** Two confirmations say the same thing (so one already read still describes what happens). */
+export const sameConfirm = (a: Confirm, b: Confirm) => JSON.stringify(a) === JSON.stringify(b);
+
 const MID_TURN = new Set(["working", "stuck", "needs_approval", "asking_question"]);
 export const midTurn = (s: SessionInfo) => s.kind !== "shell" && MID_TURN.has(s.state);
 
-/** Restart asks only while an agent is mid-turn (as on the desktop); null = act at once. */
+/** Restart asks only while an agent is mid-turn (as on the desktop); null = act at once. Claude
+ * and Codex both reopen their last conversation on a restart. */
 export function restartConfirm(s: SessionInfo): Confirm | null {
   if (s.state === "exited" || !midTurn(s)) return null;
   return {
     title: `Restart ${s.name}?`,
     body: [
       `${KIND_LABEL[s.kind]} is working. Its current turn is lost.`,
-      s.kind === "claude"
-        ? "It starts again in the same conversation."
-        : "The program starts fresh, without this conversation.",
+      "It starts again and reopens its last conversation.",
     ],
     action: "Restart",
     danger: true,
   };
 }
 
-export function stopConfirm(s: SessionInfo, agent: boolean): Confirm {
+/** `agent`: the named agent's name, or null. */
+export function stopConfirm(s: SessionInfo, agent: string | null): Confirm {
   const body = [
     s.kind === "shell"
       ? "Its program ends now, with anything running in it (a build, a dev server)."
       : `${KIND_LABEL[s.kind]} ends now${midTurn(s) ? " and its current turn is lost" : ""}.`,
     "The tab and its output stay, so you can read it or start it again from this menu.",
   ];
-  if (agent) body.push(`${s.name} is a named agent: it stays stopped until you restart it.`);
+  if (agent) {
+    body.push(
+      `${agent} is a named agent: the next message or schedule for it starts it again.`,
+    );
+  }
   return { title: `Stop ${s.name}?`, body, action: "Stop", danger: true };
 }
 
 /** `last`: the only tab of its task (removing it closes the task, docs/PROTOCOL.md). */
 export function closeConfirm(
   s: SessionInfo,
-  agent: boolean,
+  agent: string | null,
   task: Channel | undefined,
   last: boolean,
 ): Confirm {
   if (agent) {
     return {
-      title: `Close ${s.name}'s tab?`,
+      title: `Close ${agent}'s tab?`,
       body: [
-        `${s.name} is a named agent, so closing its tab only hides it. It keeps running and still gets messages.`,
+        `${agent} is a named agent, so closing its tab only hides it. It keeps running and still gets messages.`,
         "Show it again from the agents panel on your computer. To end it, use Stop.",
       ],
       action: "Close tab",
@@ -107,9 +126,9 @@ export function closeConfirm(
   return { title: `Close ${s.name}?`, body, action: "Close tab", danger: true };
 }
 
-export function archiveConfirm(task: Channel, inTask: SessionInfo[], agents: Set<number> | null): Confirm {
+export function archiveConfirm(task: Channel, inTask: SessionInfo[], agents: Agents | null): Confirm {
   const live = inTask.filter((s) => s.state !== "exited").length;
-  const named = inTask.filter((s) => isAgent(s, agents)).map((s) => s.name);
+  const named = inTask.map((s) => agentName(s, agents)).filter((n): n is string => !!n);
   const tabs = inTask.length === 1 ? "its tab" : `its ${inTask.length} tabs`;
   const body = [
     live

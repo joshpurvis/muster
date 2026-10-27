@@ -103,7 +103,9 @@ pub fn hello(hub: &Hub) -> Value {
         "sessions": hub.sessions(),
         // Which sessions are named agents' (`session.remove` hides those instead of stopping
         // them), so a client without `agent.list` (a paired phone) can say so before it closes one.
-        "agent_sessions": hub.agents().list().into_iter().filter_map(|a| a.session_id).collect::<Vec<_>>(),
+        "agent_sessions": hub.agents().list().into_iter()
+            .filter_map(|a| a.session_id.map(|id| json!({ "id": id, "name": a.name })))
+            .collect::<Vec<_>>(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "notes": crate::notes::list(hub).unwrap_or_default(),
@@ -2387,7 +2389,7 @@ mod tests {
         hub.agents().link_session(hub.store(), id, Some(2)).unwrap();
         // A device sees it too: it has no `agent.list`.
         let hello = dispatch(&hub, &Principal::Device { id: 1 }, "hello", json!({})).await.map_err(|e| e.0).unwrap();
-        assert_eq!(hello["agent_sessions"], json!([2]));
+        assert_eq!(hello["agent_sessions"], json!([{ "id": 2, "name": "rpc-ada" }]));
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 import {
+  agentName,
   archiveConfirm,
   closeConfirm,
-  isAgent,
   restartConfirm,
+  sameConfirm,
+  splitFolder,
   stopConfirm,
   tildify,
   workspaceChoices,
@@ -48,35 +50,45 @@ const channel = (over: Partial<Channel>) =>
 const workspace = (id: number, name: string, created_at = 0) =>
   ({ id, name, path: `/home/me/${name}`, is_git: true, created_at }) as Workspace;
 
-Deno.test("a named agent is known from the daemon's list, or from its hidden tab", () => {
-  equal(isAgent(session({}), null), false);
-  equal(isAgent(session({}), new Set([1])), true);
-  equal(isAgent(session({ hidden: true }), null), true);
+Deno.test("a named agent is known from the daemon's list (by its own name), or from its hidden tab", () => {
+  equal(agentName(session({}), null), null);
+  equal(agentName(session({}), new Map([[1, "scout"]])), "scout");
+  equal(agentName(session({ hidden: true }), null), "ada");
 });
 
 Deno.test("closing a named agent's tab says it keeps running; any other tab says it stops", () => {
-  const agent = closeConfirm(session({}), true, channel({}), true);
+  const agent = closeConfirm(session({}), "scout", channel({}), true);
+  has(agent.title, "scout's tab");
+  has(agent.body.join(" "), "scout is a named agent");
   has(agent.body.join(" "), "keeps running");
   lacks(agent.body.join(" "), "can't be undone");
   equal(agent.danger, false);
-  const plain = closeConfirm(session({ state: "working" }), false, channel({}), false);
+  const plain = closeConfirm(session({ state: "working" }), null, channel({}), false);
   has(plain.body.join(" "), "program stops");
   lacks(plain.body.join(" "), "task closes");
   equal(plain.danger, true);
-  const last = closeConfirm(session({}), false, channel({ owns_worktree: true, branch: "muster/7" }), true);
+  const last = closeConfirm(session({}), null, channel({ owns_worktree: true, branch: "muster/7" }), true);
   has(last.body.join(" "), "task closes too");
   has(last.body.join(" "), "muster/7");
-  has(closeConfirm(session({ state: "exited" }), false, channel({}), false).body[0], "saved output");
+  has(closeConfirm(session({ state: "exited" }), null, channel({}), false).body[0], "saved output");
 });
 
 Deno.test("stop and restart say what is lost", () => {
-  has(stopConfirm(session({ state: "working" }), false).body[0], "current turn is lost");
-  has(stopConfirm(session({ kind: "shell" }), false).body[0], "dev server");
-  has(stopConfirm(session({}), true).body.join(" "), "named agent");
+  has(stopConfirm(session({ state: "working" }), null).body[0], "current turn is lost");
+  has(stopConfirm(session({ kind: "shell" }), null).body[0], "dev server");
+  // A named agent doesn't stay stopped: the next message or schedule starts it.
+  has(
+    stopConfirm(session({}), "scout").body.join(" "),
+    "scout is a named agent: the next message or schedule",
+  );
   equal(restartConfirm(session({ state: "idle" })), null);
   equal(restartConfirm(session({ kind: "shell", state: "working" })), null);
-  has(restartConfirm(session({ state: "working" }))!.body.join(" "), "same conversation");
-  has(restartConfirm(session({ kind: "codex", state: "needs_approval" }))!.body.join(" "), "starts fresh");
+  // Claude and Codex both reopen their last conversation (Codex resume).
+  has(restartConfirm(session({ state: "working" }))!.body.join(" "), "reopens its last conversation");
+  has(
+    restartConfirm(session({ kind: "codex", state: "needs_approval" }))!.body.join(" "),
+    "reopens its last conversation",
+  );
 });
 
 Deno.test("archiving names the running terminals, any named agent, and what stays", () => {
@@ -87,7 +99,15 @@ Deno.test("archiving names the running terminals, any named agent, and what stay
   const c = archiveConfirm(channel({}), tabs, null);
   has(c.body[0], "its running terminal and removes its 2 tabs");
   has(c.body.join(" "), "folder and files stay");
-  has(archiveConfirm(channel({}), tabs, new Set([1])).body.join(" "), "named agent ada");
+  const withAgent = archiveConfirm(channel({}), tabs, new Map([[1, "scout"]]));
+  has(withAgent.body.join(" "), "named agent scout");
+  // A tab that starts, ends or turns out to be an agent changes the confirmation.
+  equal(sameConfirm(c, archiveConfirm(channel({}), tabs, null)), true);
+  equal(sameConfirm(c, withAgent), false);
+  equal(
+    sameConfirm(c, archiveConfirm(channel({}), [...tabs, session({ id: 3, state: "idle" })], null)),
+    false,
+  );
   has(archiveConfirm(channel({}), [tabs[1]], null).body[0], "Removes its tab.");
 });
 
@@ -98,7 +118,7 @@ Deno.test("folders: most recently used first, the agents' own workspace left out
     channel({ id: 30, workspace_id: 3, created_at: 60 }),
   ];
   const all = [session({ id: 7, channel_id: 30, created_at: 70 })];
-  equal(workspaceChoices(ws, channels, all, new Set([7])).map((w) => w.name), ["recent", "old"]);
+  equal(workspaceChoices(ws, channels, all, new Map([[7, "scout"]])).map((w) => w.name), ["recent", "old"]);
   // A folder that merely happens to be called "agents" stays.
   equal(workspaceChoices(ws, channels, all, null).map((w) => w.name), ["agents", "recent", "old"]);
 });
@@ -108,4 +128,13 @@ Deno.test("home becomes ~", () => {
   equal(tildify("/home/me", "/home/me/"), "~");
   equal(tildify("/home/meow", "/home/me"), "/home/meow");
   equal(tildify("/srv", ""), "/srv");
+});
+
+Deno.test("folder suggestions keep their own name and where they are", () => {
+  equal(splitFolder("~/src/muster/.claude/worktrees/agent-a1/"), {
+    name: "agent-a1",
+    parent: "~/src/muster/.claude/worktrees/",
+  });
+  equal(splitFolder("~/"), { name: "~", parent: "" });
+  equal(splitFolder("/"), { name: "/", parent: "" });
 });

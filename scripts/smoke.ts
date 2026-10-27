@@ -1366,10 +1366,24 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
   // `muster reply` is the agent's own tool; outside an agent's session it is refused.
   const outside = await new Deno.Command(BIN, { args: ["reply", String(id3), "hi"], env: ENV, stdout: "piped", stderr: "piped" }).output();
   ok(!outside.success && dec.decode(outside.stderr).includes("inside an agent's session"), "muster reply outside an agent's session is refused");
-  const plainCli = await new Deno.Command(BIN, {
-    args: ["reply", String(id3), "hi"], env: { ...ENV, MUSTER_SESSION_ID: String(askerS) }, stdout: "piped", stderr: "piped",
-  }).output();
-  ok(!plainCli.success && dec.decode(plainCli.stderr).includes("no message"), "muster reply as another agent is refused");
+  // The session's own token decides who replies: naming the helper's session id with the
+  // asker's token is the asker replying (refused), never the helper.
+  const cli = (env: Record<string, string>, ...args: string[]) =>
+    new Deno.Command(BIN, { args: ["reply", ...args], env: { ...ENV, ...env }, stdout: "piped", stderr: "piped" }).output();
+  const plainCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: askerT }, String(id3), "hi");
+  ok(!plainCli.success && dec.decode(plainCli.stderr).includes("no message"), "muster reply can't answer as another agent");
+  const noToken = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: "" }, String(id3), "hi");
+  ok(!noToken.success, "muster reply without the session's token is refused");
+  // The helper's own `muster reply` works.
+  const a5 = await mcp(askerT, "ask_agent", { agent: "helper", text: "and the docs?", timeout_seconds: 1 });
+  for (let n = 0; n < 50 && !(await got(helperS, `[muster msg ${a5.msg_id} `)); n++) await sleep(100);
+  let viaCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: helperT }, String(a5.msg_id), "docs", "built");
+  for (let n = 0; n < 50 && !viaCli.success && dec.decode(viaCli.stderr).includes("hasn't reached you"); n++) {
+    await sleep(100);
+    viaCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: helperT }, String(a5.msg_id), "docs", "built");
+  }
+  ok(viaCli.success && dec.decode(viaCli.stdout).includes("delivered to asker"), `the agent's own muster reply delivers (${dec.decode(viaCli.stdout)}${dec.decode(viaCli.stderr)})`);
+  ok(await got(askerS, "docs built"), "and the asker gets it");
   await c.call("session.remove", { id: plainS });
   await c.call("agent.remove", { name: "asker" });
   await c.call("agent.remove", { name: "helper" });

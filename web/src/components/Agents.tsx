@@ -34,6 +34,7 @@ import {
   effortsFor,
   feedFor,
   firstLine,
+  carriesLateReply,
   keepForKind,
   lateText,
   listedModels,
@@ -1711,16 +1712,16 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   if (!m) return null;
   const when = new Date(m.created_at).toLocaleString();
   // This message carried another one's late reply.
-  const answers = agentMessages.value.find((x) => x.answer?.msg === m.id);
+  const carried = carriesLateReply(m);
   return (
-    <Modal class="dialog msg-dlg" label={`Message ${m.id}`}>
+    <Modal class="dialog dialog-scroll msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
         <h2>
           {m.from} <span class="ap-arrow">→</span> {m.to}
         </h2>
         <span class="muted msg-meta">
           Message {m.id} · {when} · <OriginChip origin={m.origin} /> <span class="ap-chip">hop {m.hop}</span>
-          {m.reply_to !== null && (answers !== undefined
+          {m.reply_to !== null && (carried
             ? ` · late reply to message ${m.reply_to}`
             : ` · while handling message ${m.reply_to}`)}
           {m.cold_idle_ms != null && <>{" · "}<ColdChip ms={m.cold_idle_ms} /></>}
@@ -1735,7 +1736,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
         <div class="field">
           <span class="field-label">Message</span>
           {m.text !== null
-            ? <pre class="msg-pre">{m.text}</pre>
+            ? <pre class="msg-pre" tabIndex={0}>{m.text}</pre>
             : <span class="muted">Not kept (sent before muster stored message text).</span>}
         </div>
         {!m.refused && (
@@ -1745,7 +1746,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
               {m.replied_at && <span class="muted">({new Date(m.replied_at).toLocaleTimeString()})</span>}
             </span>
             {m.reply !== null
-              ? <pre class="msg-pre">{m.reply}</pre>
+              ? <pre class="msg-pre" tabIndex={0}>{m.reply}</pre>
               : m.answer
               ? <span class="muted">None in that turn; the agent answered later (below).</span>
               : <span class="muted">No reply yet. Replies arrive when the agent's turn ends.</span>}
@@ -1756,8 +1757,10 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             <span class="field-label">
               Later reply <span class="muted">({new Date(m.answer.at).toLocaleTimeString()})</span>
             </span>
-            <pre class="msg-pre">{m.answer.text}</pre>
+            <pre class="msg-pre" tabIndex={0}>{m.answer.text}</pre>
             <span
+              role="status"
+              aria-live="polite"
               class={cx(
                 "msg-late-status",
                 m.answer.status === "refused" || m.answer.status === "undelivered" ? "form-error" : "muted",

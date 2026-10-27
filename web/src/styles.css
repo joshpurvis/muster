@@ -34,6 +34,9 @@
   --st-attn: #f0a020;
   /* Warning-coloured text (>= 4.5:1 on every surface). */
   --warn-text: #f0a020;
+  /* Small status text (chips): >= 4.5:1 on the chip's background. */
+  --ok-text: var(--st-idle);
+  --error-text: var(--st-error);
   --st-idle: #3fb950;
   --st-error: #f85149;
   /* Filled destructive buttons: white 13px labels need 4.5:1 (#f85149 gives 3.35:1). */
@@ -105,6 +108,8 @@
   --st-attn: #c77a00;
   /* Warning-coloured text (>= 4.5:1 on every surface; --st-attn is 3.4:1 on white). */
   --warn-text: #8a5400;
+  --ok-text: #17692a;
+  --error-text: #b42318;
   --st-idle: #1f9d3a;
   --st-error: #d92d20;
   --danger-fill: #d92d20;
@@ -3411,7 +3416,7 @@ textarea {
 }
 
 .ap-chip-ok {
-  color: var(--st-idle);
+  color: var(--ok-text);
 }
 
 .ap-chip-cold {
@@ -3419,7 +3424,7 @@ textarea {
 }
 
 .ap-chip-warn {
-  color: var(--st-error);
+  color: var(--error-text);
 }
 
 .ap-msg-refused {

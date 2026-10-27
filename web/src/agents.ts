@@ -98,7 +98,9 @@ export function upsertMessage(list: AgentMessage[], m: AgentMessage, cap = 300):
   const out = list.filter((x) => x.id !== m.id);
   const i = out.findIndex((x) => x.id < m.id);
   out.splice(i < 0 ? out.length : i, 0, m);
-  return out.slice(0, cap);
+  // An older message that just got its late reply stays, even past the cap: it is news.
+  const fresh = m.answer && !list.some((x) => x.id === m.id && x.answer?.status === m.answer?.status);
+  return out.slice(0, fresh ? Math.max(cap, out.indexOf(m) + 1) : cap);
 }
 
 /** The log as the panel shows it: messages to agent `id` (or all), newest first. */
@@ -356,6 +358,12 @@ export function listedModels(
 /** Codex on OpenRouter has no usable default (its own model names lack the vendor prefix). */
 export function needsModel(provider: Provider, kind: Agent["kind"], model: string): boolean {
   return provider === "openrouter" && kind === "codex" && !model.trim();
+}
+
+/** Did message `m` carry another message's late reply to its asker? Its text says so
+ * (src/agent_reply.rs `delivered_text`), whatever part of the log is loaded. */
+export function carriesLateReply(m: AgentMessage): boolean {
+  return m.reply_to !== null && (m.text ?? "").startsWith(`Late reply to your message ${m.reply_to}`);
 }
 
 /** How an agent's late reply (`reply`) reached whoever asked, in a sentence. */

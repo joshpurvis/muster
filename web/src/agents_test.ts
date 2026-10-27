@@ -1,5 +1,6 @@
 import {
   agentStatus,
+  carriesLateReply,
   ago,
   asleepText,
   isAsleep,
@@ -377,4 +378,24 @@ Deno.test("a late reply says how it reached the asker", () => {
   );
   assertEquals(lateText({ ...a, status: "undelivered", note: "not delivered: session 4, which asked, has ended" }),
     "Kept here, not delivered: session 4, which asked, has ended.");
+});
+
+Deno.test("an old message that gets its late reply stays in the log past the cap", () => {
+  const log: AgentMessage[] = [];
+  for (let id = 10; id >= 1; id--) log.push(msg(id));
+  const late = { text: "done", at: 1, from_session: 3, origin: "human" as const, hop: 1, status: "shown" as const };
+  // Message 1 is the oldest, past a cap of 5: still kept once its late reply arrives.
+  const kept = upsertMessage(log.slice(0, 5), msg(1, 1, { answer: late }), 5);
+  assertEquals(kept.length, 6);
+  assertEquals(kept[5].answer?.text, "done");
+  // The same update again (nothing new about it) doesn't keep it past the cap.
+  assertEquals(upsertMessage(kept, msg(1, 1, { answer: late }), 5).length, 5);
+  // Without a late reply the cap holds.
+  assertEquals(upsertMessage(log.slice(0, 5), msg(1), 5).length, 5);
+});
+
+Deno.test("a message that carried a late reply is told by its own text", () => {
+  check(carriesLateReply(msg(9, 1, { reply_to: 4, text: 'Late reply to your message 4 ("x"):\nok' })), "carrier");
+  check(!carriesLateReply(msg(9, 1, { reply_to: 4, text: "while handling 4" })), "ordinary chained message");
+  check(!carriesLateReply(msg(9, 1, { reply_to: 5, text: "Late reply to your message 4:\nok" })), "another message's");
 });

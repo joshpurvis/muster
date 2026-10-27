@@ -741,7 +741,7 @@ typing in a shell tab, with that shell's provenance if an agent ever typed into 
 
 **Late replies.** An agent can answer a message after the turn that received it, e.g. once a
 long job finishes: it says so in that turn's reply, then calls `reply {msg_id, text}` (or runs
-`muster reply <msg_id> TEXT` in its terminal, which runs this tool as its session). Code:
+`muster reply <msg_id> TEXT` in its terminal, which calls this tool with its session's own token). Code:
 `src/agent_reply.rs`.
 
 - *Who:* only the named agent the message was addressed to (its current session, also after a
@@ -755,7 +755,18 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   plain session is marked "may not have arrived" rather than typed again).
 - *Route:* the stricter of the message's chain and the replier's current provenance (a
   non-human origin wins, then the higher hop), one hop on. So a reply written while handling a
-  scheduled job is unattended work, and a reply chain ends at hop 4 like any other.
+  scheduled job is unattended work, and a reply chain ends at hop 4 like any other. The reply
+  also keeps every non-human origin it is rooted in (`origins`: a webhook-rooted question
+  answered during scheduled work is both), and an asking agent must accept each of them; a
+  Claude session takes none. A waiting ask takes the reply only when it brings no origin the
+  question's chain didn't have; otherwise it goes the guarded way, as a new message.
+- *The asker* is the agent that sent the message: if it was removed and a new agent took its
+  name, the reply is kept in the log (`undelivered`), never sent to the newcomer.
+- *Recovery:* the late replies left unfinished are read at daemon start, before the server takes
+  requests. A carrying message that was recorded but never queued (the restart came in between)
+  is dropped and sent again; one the spend cap refuses later in the asker's queue marks the
+  reply `refused`. A delivery cut off by the backend shutting down stays `pending` for the next
+  start.
 - *How the asker gets it:*
 
   | Asker | What happens | Status |

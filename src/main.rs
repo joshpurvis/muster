@@ -1849,10 +1849,12 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
     // Agents with autostart on (their homes were moved above, before anything could start).
     {
         let hub = hub.clone();
+        // Late replies a previous backend stored but didn't deliver (src/agent_reply.rs), read
+        // now, before the server takes requests: this backend's own deliveries are never among them.
+        let unfinished = agent_reply::unfinished(&hub);
         tokio::spawn(async move {
             agents::autostart(&hub).await;
-            // Late replies a previous backend stored but didn't deliver (src/agent_reply.rs).
-            agent_reply::resume(&hub).await;
+            agent_reply::resume(&hub, unfinished).await;
         });
     }
     // Schedules: finish runs a previous backend left, then fire on time (src/schedules/); the

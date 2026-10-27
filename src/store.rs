@@ -1437,9 +1437,35 @@ impl Store {
 
     /// A message taken back before it was submitted (the spend caps): kept in the log with the
     /// reason, counted toward no cap.
-    pub fn set_agent_message_refused(&self, id: i64, why: &str) -> anyhow::Result<()> {
-        self.conn.lock().execute("UPDATE agent_messages SET refused=?2 WHERE id=?1 AND reply IS NULL", params![id, why])?;
-        Ok(())
+    /// A queued message was refused before it was typed in. When it carried another message's
+    /// late reply (src/agent_reply.rs), that reply is marked refused too: returns that message's
+    /// id, to publish.
+    pub fn set_agent_message_refused(&self, id: i64, why: &str) -> anyhow::Result<Option<i64>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        if tx.execute("UPDATE agent_messages SET refused=?2 WHERE id=?1 AND reply IS NULL", params![id, why])? == 0 {
+            return Ok(None);
+        }
+        let answered: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT o.id, o.answer FROM agent_messages c JOIN agent_messages o ON o.id = c.reply_to
+                 WHERE c.id = ?1 AND o.answer IS NOT NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let mut changed = None;
+        if let Some((orig, raw)) = answered
+            && let Ok(mut a) = serde_json::from_str::<crate::agent_reply::Answer>(&raw)
+            && a.msg == Some(id)
+        {
+            a.status = crate::agent_reply::AnswerStatus::Refused;
+            a.note = Some(format!("not delivered: message {id}, which carried it, was refused before it was typed in: {why}"));
+            tx.execute("UPDATE agent_messages SET answer = ?2 WHERE id = ?1", params![orig, serde_json::to_string(&a)?])?;
+            changed = Some(orig);
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn set_agent_message_reply(&self, id: i64, reply: &str, at: i64) -> anyhow::Result<()> {
@@ -1518,12 +1544,13 @@ impl Store {
     }
 
     /// The message that carried a late reply to an agent: to `to_agent`, answering `reply_to`,
-    /// from `from`, at or after `since`, with exactly `text`.
-    pub fn find_answer_delivery(&self, to_agent: i64, reply_to: i64, from: &str, since: i64, text: &str) -> anyhow::Result<Option<i64>> {
+    /// from `from`, with exactly `text` (which names the message answered, and a message takes
+    /// one late reply: no clock is needed to tell it apart).
+    pub fn find_answer_delivery(&self, to_agent: i64, reply_to: i64, from: &str, text: &str) -> anyhow::Result<Option<i64>> {
         Ok(self.conn.lock().query_row(
             "SELECT id FROM agent_messages WHERE to_agent = ?1 AND reply_to = ?2 AND from_label = ?3
-             AND created_at >= ?4 AND text = ?5 AND refused IS NULL ORDER BY id DESC LIMIT 1",
-            params![to_agent, reply_to, from, since, text],
+             AND text = ?4 ORDER BY id DESC LIMIT 1",
+            params![to_agent, reply_to, from, text],
             |r| r.get(0),
         ).optional()?)
     }

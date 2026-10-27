@@ -228,8 +228,10 @@ try:
     # Feed only the existing Muster hook protocol; this is not a provider authentication file.
     mcp = json.loads((DATA / "sessions" / str(named["id"]) / "claude-mcp.json").read_text())
     run_token = mcp["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
-    status, _ = http("/hook/SessionStart", {"session_id": "fixture-conversation"}, run_token)
-    assert status == 200
+    # Claude resumes a conversation only once a turn ended in it (Stop), not on SessionStart alone.
+    for event in ("SessionStart", "Stop"):
+        status, _ = http(f"/hook/{event}", {"session_id": "fixture-conversation"}, run_token)
+        assert status == 200, event
     resumed = rpc("session.restart", {"id": named["id"]})
     named_run = launched(named["id"], resumed["pid"])
     check(named_run["config_dir"] == str(BASE / "personal") and "fixture-conversation" in named_run["args"],
@@ -252,14 +254,14 @@ try:
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())
-    transcript = BASE / "transcript.jsonl"
-    transcript.write_text("{}\n")
+
+    def run_start(api=0):
+        # Before a run's first API response: no rate limits yet, only its API time.
+        return {"session_id": "fixture-conversation", "cwd": str(REPO),
+                "cost": {"total_api_duration_ms": api, "total_cost_usd": 0}}
 
     def limits(five, seven, api, five_reset=None):
-        # The transcript's modification time is the reporter's evidence of when numbers were fetched.
-        transcript.touch()
-        return {"session_id": "fixture-conversation", "cwd": str(REPO), "transcript_path": str(transcript),
-                "account": "Work", "cost": {"total_api_duration_ms": api, "total_cost_usd": 0},
+        return {**run_start(api), "account": "Work",
                 "rate_limits": {"five_hour": {"used_percentage": five, "resets_at": five_reset or now + 3 * 3600},
                                 "seven_day": {"used_percentage": seven, "resets_at": now + 4 * 86400}}}
 
@@ -272,6 +274,11 @@ try:
           "a session's status line wraps its profile's own one, options kept, nothing else copied")
     check(rpc("account_usage.get")["no_suggestion"] and usage_row("Work")["five_hour"]["status"] == "unknown",
           "before any report every account is unknown and nothing is suggested")
+    # A run's first numbers are only confirmed fresh against an earlier report's API time.
+    for sid in (a["id"], b["id"], legacy["id"]):
+        status_line(sid, run_start())
+    settled()
+    check(usage_row("Work")["five_hour"]["status"] == "unknown", "a report without numbers shows nothing")
     check(status_line(b["id"], limits(25, 40, 100)) == {"stdout": "WORK-USER-LINE\n", "code": 0},
           "the user's status line output is shown unchanged")
     check(status_line(a["id"], limits(92, 70, 100)) == {"stdout": "HOME-USER-LINE\n", "code": 3},
@@ -292,7 +299,7 @@ try:
     status_line(a["id"], limits(92, 70, 100))
     settled()
     check(usage_row("Home")["five_hour"]["observed_at"] == seen,
-          "a redraw of the same numbers does not renew freshness, even with a newer transcript")
+          "a redraw of the same numbers does not renew freshness")
     check(http("/usage/claude", limits(1, 1, 1))[0] == 401 and http("/usage/claude", limits(1, 1, 1), "forged")[0] == 401,
           "only a session token can report usage")
     cli("profile", "login-changed", "Home")

@@ -1147,7 +1147,9 @@ impl Hub {
             anyhow::ensure!(e.info.kind == SessionKind::Claude, "usage reports come from Claude sessions");
             (id, e.generation)
         };
-        if report.windows.is_empty() {
+        // A report with only the API time (before the run's first response) is the baseline
+        // the next one is measured against.
+        if report.windows.is_empty() && report.api_ms.is_none() {
             return Ok(());
         }
         if self.store.apply_usage(session, generation, &report, now)? {
@@ -4924,7 +4926,7 @@ mod tests {
         let body = |five: f64, api: u64| serde_json::json!({
             "rate_limits": {"five_hour": {"used_percentage": five, "resets_at": resets},
                 "seven_day": {"used_percentage": 40, "resets_at": resets + 86_400}},
-            "api_duration_ms": api, "data_at": now_ms(),
+            "api_duration_ms": api,
             // Labels in the payload are ignored: the run's launch decides.
             "account": "Personal", "account_profile_id": personal.id, "config_dir": personal.config_dir});
         let row = |hub: &Hub, name: &str| hub.account_usage().unwrap().rows.into_iter().find(|r| r.name == name).unwrap();
@@ -4932,6 +4934,11 @@ mod tests {
         hub.record_usage("claude-run", &body(25.0, 100)).unwrap();
         assert_eq!(row(&hub, "Work").five_hour.status, crate::usage::Status::Unknown);
         hub.store.start_usage_run(2, generation, Some(work.config_dir.clone())).unwrap();
+        // The run's first report has no baseline: shown, not confirmed fresh.
+        hub.record_usage("claude-run", &body(24.0, 50)).unwrap();
+        assert_eq!(row(&hub, "Work").five_hour.used_percentage, Some(24.0));
+        assert_eq!(row(&hub, "Work").five_hour.status, crate::usage::Status::Unconfirmed);
+        // More API time than that report: fresh.
         hub.record_usage("claude-run", &body(25.0, 100)).unwrap();
         assert_eq!(row(&hub, "Work").five_hour.used_percentage, Some(25.0));
         assert_eq!(row(&hub, "Work").five_hour.status, crate::usage::Status::Current);
@@ -4981,8 +4988,10 @@ mod tests {
         };
         hub.store.start_usage_run(2, generation, Some(default_dir.clone())).unwrap();
         let resets = now_ms() / 1000 + 3 * 3600;
-        hub.record_usage("claude-run", &serde_json::json!({"data_at": now_ms(), "rate_limits": {
+        hub.record_usage("claude-run", &serde_json::json!({"api_duration_ms": 0})).unwrap();
+        hub.record_usage("claude-run", &serde_json::json!({"api_duration_ms": 10, "rate_limits": {
             "five_hour": {"used_percentage": 30, "resets_at": resets}}})).unwrap();
+        assert_eq!(hub.account_usage().unwrap().rows[0].five_hour.status, crate::usage::Status::Current);
         let row = |hub: &Hub, name: &str| hub.account_usage().unwrap().rows.into_iter().find(|r| r.name == name).unwrap();
         assert_eq!(row(&hub, "Main").five_hour.used_percentage, Some(30.0));
         hub.account_login_changed(crate::account_profiles::ProfileChoice::pinned(None)).unwrap();

@@ -111,6 +111,13 @@ local file in a git repository", read 2026-10-26), the first file with a `status
 4. user settings, `settings.json` in the session's configuration folder (`CLAUDE_CONFIG_DIR`,
    else `~/.claude`).
 
+A `CLAUDE_CONFIG_DIR` that is relative or empty, or (without one) a relative `HOME`, is one
+Muster can't place: Claude Code would resolve it against the session's own working directory,
+not the backend's, and an empty value's meaning isn't documented. Such a session's status line is
+left to Claude Code (even when a project file decides it), its reports are filed nowhere, and
+Default shows unknown while the backend itself runs with one. Profiles always launch with an
+absolute folder.
+
 The repository root is found by reading `.git` entries, never by running git (a repository's own
 git config can run commands). Every file is opened beneath its (canonical) folder without
 following a link at any step, must be a plain file with one link and at most 1 MiB, and a name
@@ -119,8 +126,9 @@ that looks like a credentials file is refused outright; so a repository whose
 `statusLine` key is kept; the rest of each file is parsed past, never stored, logged or sent.
 This is the one read of a profile folder's contents, and only of `settings.json`. When a file
 exists but can't be read that way, or isn't valid JSON, or the status line is not a command, or
-a worktree belongs to a bare repository, Muster is unsure what Claude Code will show and leaves
-the session's status line to Claude Code entirely: no usage from that session. Every other option
+a worktree belongs to a bare repository, or the configuration folder can't be placed (above),
+Muster is unsure what Claude Code will show and leaves the session's status line to Claude Code
+entirely: no usage from that session. Every other option
 of your status line (`padding`, `refreshInterval`, `hideVimModeIndicator`, ...) is copied
 unchanged. Managed settings outrank `--settings`, so a managed status line keeps running and
 Muster gets no usage from it.
@@ -130,29 +138,46 @@ The composed command is a small shell script that runs your command itself, as i
 Claude Code's. In the background it hands a copy of the input to `muster statusline claude`,
 with that process's output discarded. Whatever happens to the reporter (an older Muster build
 that has no `statusline` after a reload back, a missing binary, a crash, a slow backend), your
-line is unaffected. The reporter POSTs only the two windows, `cost.total_api_duration_ms` and
-the transcript file's modification time (stat only) to `POST /usage/claude` with the run's
-session token, gives up after 600 ms, and is never in the hook path, the event log or agent
-state. Without a status line of your own only the reporter runs: Claude Code then shows an empty
-status row, and (per its docs) a configured status line hides most footer keyboard hints.
+line is unaffected. The reporter POSTs only the two windows and `cost.total_api_duration_ms`
+(before the run's first response, when there are no windows yet, the API time alone) to
+`POST /usage/claude` with the run's session token, connects only to a loopback address (the
+same check as hook callbacks: a `MUSTER_URL` naming another host is refused before it is looked
+up), gives up after 600 ms, and is never in the hook path, the event log or agent state. Without
+a status line of your own only the reporter runs: Claude Code then shows an empty status row,
+and (per its docs) a configured status line hides most footer keyboard hints.
 `MUSTER_USAGE_REPORTER=off` in the backend's environment disables the reporter for sessions
 started afterwards. A session started before this version has no reporter until it restarts.
+
+Known limit: your status line is looked up when the session starts. Editing or removing
+`statusLine` during a session keeps showing the command it started with, and adding one leaves
+the line empty, where Claude Code alone would pick the change up; restart the session to pick up
+a changed status line. (Looking it up again on every run would make your line wait on a Muster
+process each time, which the composition above is built to avoid.)
 
 **Attribution and freshness.** The daemon maps the token to its session and current run
 (generation). At launch Muster records the configuration folder that run really uses (its
 profile's, or Default's `CLAUDE_CONFIG_DIR` / `~/.claude` at the time), and observations are
 filed per folder: one folder, one login. Nothing in the payload is trusted to name an account or
 a folder (a session can still misreport its own folder's numbers); a run without a launch record
-reports nothing. A report is newly fetched data only with two kinds of evidence: something
-changed for the run (its first report of that window, more API time, or different numbers), and
-the transcript time says when Claude Code last wrote the conversation, which is no earlier than
-the API response the numbers came with. It is dated by that time, not by its arrival, so a report
-delivered late (its first callback lost during a backend reload, then a redraw an hour later) is
-an hour old and reads as stale; and it replaces an observation only if not older than it.
-Anything else is a redraw: it never replaces or renews another observation, and if nothing was
-stored it is kept as "not confirmed fresh". (A transcript written after the response, for a tool
-result, can make a report look up to that tool's duration fresher than it is.) Each window keeps
-its own time, so partial reports never age the other. Display states: **current** (fetched within
+reports nothing. Claude Code redraws the status line with its cached numbers for many reasons
+(a timer, a mode change, `/rename`, which also writes the transcript), and a callback can be lost
+(during a backend reload) so its numbers first arrive in a redraw much later. Neither the arrival
+time nor the transcript time says when the numbers were fetched. The one piece of evidence tied
+to an API response is the run's API time: a report whose `cost.total_api_duration_ms` is higher
+than the run's previous report's came with a response received after that previous report, so it
+is newly fetched data, dated by that previous report (the earliest it can be from; refreshed by
+redraws at most every 30 seconds). A report delivered late is therefore never younger than it
+can be: a lost callback followed by a redraw an hour later is dated before the hour and reads as
+stale. The reporter's API-time-only report at a run's start is the baseline that lets the run's
+first response count. Without an earlier report to compare with (a session started before this
+version, a first report whose start report was lost) a report is "not confirmed fresh". A fresh
+report replaces an observation only if not older than it. Anything else (a redraw, changed numbers
+without more API time, API time that went down, which becomes the new baseline) never replaces or
+renews a confirmed observation or another run's; it is kept, as "not confirmed fresh", only where
+nothing was stored or over the run's own unconfirmed numbers. The price of dating by the previous
+report: the first answer after a long pause reads as old as the pause until the next response (a
+`refreshInterval` narrows that). Each window keeps its own time, so partial reports never age the
+other. Display states: **current** (fetched within
 30 minutes, reset not passed), **stale** (older), **not confirmed fresh**, **reset** (its reset
 time passed: unknown, not zero) and **unknown** (nothing reported). The window re-judges its last
 snapshot by its own timestamps every 30 seconds, so a window that can't reach Muster turns

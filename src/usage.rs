@@ -11,10 +11,13 @@
 //!   record names the configuration folder it really used. Observations are filed per folder (one
 //!   folder, one login). Nothing in the payload names an account or a folder.
 //! - Freshness: Claude Code re-runs the status line for reasons other than new provider data (a
-//!   timer, a mode change, a reset passing). A report is newly fetched data only when something
-//!   changed for its run (its first report, more API time, other numbers) and it carries the time
-//!   Claude Code last wrote the conversation; it is dated by that time, not by its arrival.
-//!   Anything else never replaces or renews another observation.
+//!   timer, a mode change, /rename, a reset passing), and a callback can be lost (a backend
+//!   reload) and its numbers show up much later in a redraw. The only evidence tied to an API
+//!   response is the run's API time (`cost.total_api_duration_ms`) growing past what its previous
+//!   report said: the numbers were then fetched after that previous report, so they are dated by
+//!   it (the earliest they can be from), never by their arrival. A run's first report has no such
+//!   baseline and stays "not confirmed fresh"; anything unconfirmed never replaces or renews a
+//!   confirmed observation.
 //! - Unknown stays unknown: no observation, a stale one, an unconfirmed one or one whose reset has
 //!   passed never counts as headroom. Nothing here probes an account or reads a credential; the
 //!   only file contents read are settings files, without following links (see `read_beneath`).
@@ -71,17 +74,15 @@ pub struct Reading {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Report {
     pub windows: BTreeMap<Window, Reading>,
-    /// `cost.total_api_duration_ms`: grows with every API response of the run.
+    /// `cost.total_api_duration_ms`: grows with every API response of the run. A report may
+    /// carry only this (before the run's first response): the baseline later reports are
+    /// measured against.
     pub api_ms: Option<f64>,
-    /// Unix ms when Claude Code last wrote the conversation (its transcript's modification
-    /// time, read by the reporter): no earlier than the API response these numbers came with.
-    /// The only evidence of when they were fetched; None: unknown.
-    pub data_at: Option<i64>,
 }
 
-/// Validate a reporter body (`{"rate_limits": {...}, "api_duration_ms": n, "data_at": ms}`).
-/// Each window is taken only when both of its numbers are plausible; anything else is dropped,
-/// not guessed. A `data_at` in the future (beyond clock skew) or more than 8 days old is dropped.
+/// Validate a reporter body (`{"rate_limits": {...}, "api_duration_ms": n}`). Each window is
+/// taken only when both of its numbers are plausible; anything else is dropped, not guessed.
+/// Other fields (an older reporter's `data_at`) are ignored.
 pub fn parse_report(body: &Value, now_ms: i64) -> Report {
     let now_s = now_ms / 1000;
     let mut windows = BTreeMap::new();
@@ -97,10 +98,7 @@ pub fn parse_report(body: &Value, now_ms: i64) -> Report {
         }
     }
     let api_ms = body.get("api_duration_ms").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0);
-    let data_at = body.get("data_at").and_then(Value::as_f64)
-        .filter(|t| t.is_finite() && *t > (now_ms - 8 * DAY_S * 1000) as f64 && *t <= (now_ms + 5_000) as f64)
-        .map(|t| (t as i64).min(now_ms));
-    Report { windows, api_ms, data_at }
+    Report { windows, api_ms }
 }
 
 /// The run (session and process generation) a report came from.
@@ -129,7 +127,13 @@ pub struct RunMemory {
     /// Canonical; None when it could not be resolved at launch (its reports are then ignored).
     #[serde(default)]
     pub config_dir: Option<String>,
+    /// The API time of the run's newest report.
     pub api_ms: Option<f64>,
+    /// Unix ms when a report last showed `api_ms` (refreshed at most every [`RENEW_EVERY_MS`]):
+    /// the run had no newer API response then, so numbers that come with more API time were
+    /// fetched after it.
+    #[serde(default)]
+    pub api_seen_at: Option<i64>,
     pub last: BTreeMap<Window, Reading>,
 }
 
@@ -145,24 +149,30 @@ pub struct Applied {
 /// Merge one report from run `run` (whose launch record is `memory`) into the stored
 /// observations of its folder.
 ///
-/// A window's report is newly fetched data only with both kinds of evidence: something changed
-/// for this run (its first report of the window, more API time, or different numbers) and the
-/// reporter's `data_at` says when. It is then dated `data_at`, not when it arrived, so a report
-/// delivered late (a lost callback, then a redraw an hour later) is as old as its data, and it
-/// replaces an observation only if not older than it. Without that evidence a report is kept
-/// only where nothing better exists, as "not confirmed fresh".
+/// A window's report is newly fetched data only when the run's API time grew past what its
+/// previous report said (`memory.api_ms`, seen at `memory.api_seen_at`): the response these
+/// numbers came with arrived after that report, so they are dated by it, the earliest they can
+/// be from. Nothing else counts: not the arrival time (a callback lost in a reload, then a
+/// redraw an hour later), not a newer transcript (/rename writes it without fetching anything),
+/// not changed numbers. It replaces an observation only if not older than it. A report without
+/// that evidence (a run's first, a redraw) is kept only where nothing is stored or as this
+/// run's own newer unconfirmed numbers, as "not confirmed fresh": it never replaces a confirmed
+/// observation or another run's, nor renews its freshness. API time that went down (reporters overtaking
+/// each other, a counter Claude Code restarted) is no evidence and becomes the new baseline.
 pub fn apply(memory: &RunMemory, stored: &BTreeMap<Window, Observation>, run: RunKey, report: &Report, now: i64)
     -> Applied {
     let mut next = memory.clone();
-    let api_advanced = matches!((memory.api_ms, report.api_ms), (Some(a), Some(b)) if b > a);
+    let fetched_after = match (memory.api_ms, memory.api_seen_at, report.api_ms) {
+        (Some(before), Some(seen), Some(api)) if api > before => Some(seen.min(now)),
+        _ => None,
+    };
+    let api_grew = matches!((memory.api_ms, report.api_ms), (Some(a), Some(b)) if b > a);
     let mut out = Applied::default();
     for (&w, &reading) in &report.windows {
-        let last = memory.last.get(&w);
-        let changed = last.is_none() || api_advanced || last != Some(&reading);
+        let newer = api_grew || memory.last.get(&w) != Some(&reading);
         let mine = |o: &Observation| (o.session_id, o.generation) == run;
-        let fetched = report.data_at.filter(|_| changed);
         let observation = |observed_at| Observation { reading, observed_at, reported_at: now, session_id: run.0, generation: run.1 };
-        match (stored.get(&w), fetched) {
+        match (stored.get(&w), fetched_after) {
             // Coalesce: the same numbers from the same run, dated within the renew interval.
             (Some(o), Some(at)) if mine(o) && o.reading == reading
                 && o.observed_at.is_some_and(|t| (at - t).abs() < RENEW_EVERY_MS) => {}
@@ -175,21 +185,26 @@ pub fn apply(memory: &RunMemory, stored: &BTreeMap<Window, Observation>, run: Ru
                 out.updates.push((w, observation(None)));
                 out.notify = true;
             }
-            // This run's own newer numbers, without a date: newer than what it said before.
-            (Some(o), None) if mine(o) && o.reading != reading && changed => {
+            // This run's own newer numbers over its own unconfirmed ones.
+            (Some(o), None) if mine(o) && o.observed_at.is_none() && o.reading != reading && newer => {
                 out.updates.push((w, observation(None)));
                 out.notify = true;
             }
             (Some(o), None) if mine(o) && o.reading == reading && now - o.reported_at >= REPORTED_EVERY_MS => {
                 out.updates.push((w, Observation { reported_at: now, ..o.clone() }));
             }
-            // A redraw never replaces or renews another run's (or a newer) observation.
+            // Unconfirmed: never replaces a confirmed observation or another run's, nor renews
+            // its freshness.
             (Some(_), None) => {}
         }
         next.last.insert(w, reading);
     }
-    if report.api_ms.is_some() {
-        next.api_ms = report.api_ms;
+    if let Some(api) = report.api_ms {
+        let changed = memory.api_ms != Some(api);
+        if changed || memory.api_seen_at.is_none_or(|t| now - t >= RENEW_EVERY_MS || t > now) {
+            next.api_ms = Some(api);
+            next.api_seen_at = Some(now);
+        }
     }
     if next != *memory {
         out.run = Some(next);
@@ -289,14 +304,24 @@ pub struct UsageSnapshot {
 }
 
 /// The configuration folder Claude Code uses for a session launched with `env`:
-/// `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, canonical. Path resolution only, never contents.
-/// With the daemon's environment it is the folder of Default.
-pub fn effective_config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
-    let dir = match env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => PathBuf::from(d),
-        None => crate::account_profiles::launch_home(env)?.join(".claude"),
+/// `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, canonical; `Ok(None)` when it doesn't exist. Path
+/// resolution only, never contents. `Err` when that path is relative or empty (a relative
+/// `HOME` too): Claude Code would resolve it against its own working directory, not the
+/// daemon's, and how it treats an empty value is not documented, so Muster can't tell which
+/// folder (and which login) the session uses.
+fn config_dir_of(env: &BTreeMap<String, String>) -> Result<Option<PathBuf>, String> {
+    let dir = match env.get("CLAUDE_CONFIG_DIR") {
+        Some(d) if Path::new(d).is_absolute() => PathBuf::from(d),
+        Some(d) => return Err(format!("CLAUDE_CONFIG_DIR {d:?} is not an absolute path")),
+        None => crate::account_profiles::launch_home(env).ok_or("HOME is not an absolute path")?.join(".claude"),
     };
-    std::fs::canonicalize(dir).ok()
+    Ok(std::fs::canonicalize(dir).ok())
+}
+
+/// [`config_dir_of`], None when it is unknown or doesn't exist. With the daemon's environment it
+/// is the folder of Default.
+pub fn effective_config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    config_dir_of(env).ok().flatten()
 }
 
 fn find(parent: &mut [usize], i: usize) -> usize {
@@ -569,8 +594,11 @@ fn local_settings_root(cwd: &Path, home: Option<&Path>) -> Result<PathBuf, Strin
 /// and are left alone. Only the `statusLine` key is kept: the rest of each file is parsed past
 /// and dropped, never stored, logged or sent. Nothing is read through a link (see
 /// [`read_beneath`]). `Ok(None)`: no status line of the user's own. `Err`: unsure, so Muster
-/// must leave the session's status line alone.
+/// must leave the session's status line alone; this includes a configuration folder Muster can't
+/// place (see [`config_dir_of`]), even when a project file decides the line, since the run's
+/// reports could not be filed under the right folder either.
 pub fn user_status_line(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Option<Map<String, Value>>, String> {
+    let config_dir = config_dir_of(env)?;
     let cwd = std::fs::canonicalize(cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
     let home = crate::account_profiles::launch_home(env).and_then(|h| std::fs::canonicalize(h).ok());
     let local_root = local_settings_root(&cwd, home.as_deref())?;
@@ -585,7 +613,7 @@ pub fn user_status_line(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Op
         }
     }
     // A configuration folder that doesn't exist has no settings for Claude Code either.
-    match effective_config_dir(env) {
+    match config_dir {
         Some(dir) => status_line_in(&dir, &["settings.json"]),
         None => Ok(None),
     }
@@ -657,11 +685,16 @@ mod tests {
     const RESET: i64 = NOW / 1000 + 4 * 3600;
     const HOUR: i64 = 60 * 60 * 1000;
 
-    fn report(five: Option<f64>, seven: Option<f64>, api: Option<f64>, data_at: Option<i64>) -> Report {
+    fn report(five: Option<f64>, seven: Option<f64>, api: Option<f64>) -> Report {
         let mut windows = BTreeMap::new();
         if let Some(v) = five { windows.insert(Window::FiveHour, Reading { used_percentage: v, resets_at: RESET }); }
         if let Some(v) = seven { windows.insert(Window::SevenDay, Reading { used_percentage: v, resets_at: RESET + 86_400 }); }
-        Report { windows, api_ms: api, data_at }
+        Report { windows, api_ms: api }
+    }
+
+    /// Before the run's first API response: only its API time.
+    fn baseline(api: f64) -> Report {
+        report(None, None, Some(api))
     }
 
     /// Feed reports through `apply` like the store does (each run's launch record first).
@@ -690,104 +723,152 @@ mod tests {
         let r = parse_report(&body, NOW);
         assert_eq!(r.windows.len(), 1);
         assert_eq!(r.windows[&Window::FiveHour], Reading { used_percentage: 23.5, resets_at: RESET });
-        assert_eq!((r.api_ms, r.data_at), (Some(1200.0), Some(NOW - 5)));
+        assert_eq!(r.api_ms, Some(1200.0));
         for bad in [json!({}), json!("x"), json!({"rate_limits": {"five_hour": {"used_percentage": 5}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": "5", "resets_at": RESET}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 12}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": -1, "resets_at": RESET}}})] {
             assert!(parse_report(&bad, NOW).windows.is_empty(), "{bad}");
         }
-        // A data time from the future (beyond skew) or long ago is no evidence; slight skew is clamped.
-        for (at, want) in [(NOW + 60_000, None), (NOW - 9 * 24 * HOUR, None), (NOW + 2000, Some(NOW))] {
-            assert_eq!(parse_report(&json!({"data_at": at}), NOW).data_at, want, "{at}");
+        for (api, want) in [(json!(-1), None), (json!("5"), None), (json!(0), Some(0.0))] {
+            assert_eq!(parse_report(&json!({"api_duration_ms": api}), NOW).api_ms, want, "{api}");
         }
     }
 
+    /// A run's first report has nothing to compare its API time with: kept, never current. A
+    /// report with more API time than the run's previous one is fresh, dated by that previous
+    /// report (the earliest its numbers can be from), not by its arrival.
     #[test]
-    fn fresh_reports_are_dated_by_their_data_and_redraws_do_not_renew_them() {
+    fn only_more_api_time_than_the_previous_report_confirms_fresh_numbers() {
         let mut a = Account::new();
-        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(NOW - 2000)), NOW));
-        assert_eq!(a.five().observed_at, Some(NOW - 2000), "dated by the data, not by arrival");
-        // A timer redraw an hour later: same numbers, no new API time, though the transcript moved.
-        let later = NOW + HOUR;
-        assert!(!a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(later)), later));
-        assert_eq!(a.five().observed_at, Some(NOW - 2000), "a redraw must not renew freshness");
-        assert_eq!(a.five().reported_at, later);
-        assert_eq!(status(a.five(), later), Status::Stale);
-        // New API time: newly fetched, even though the numbers are unchanged.
-        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(900.0), Some(later + 1)), later + 1));
-        assert_eq!(a.five().observed_at, Some(later + 1));
-    }
-
-    /// A run's first report lost (a backend reload), then a redraw an hour later: its numbers are
-    /// an hour old and must read as such, never as current.
-    #[test]
-    fn a_first_report_delivered_late_is_as_old_as_its_data() {
-        let mut a = Account::new();
-        a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(NOW)), NOW + HOUR);
-        assert_eq!(a.five().observed_at, Some(NOW));
-        assert_eq!(status(a.five(), NOW + HOUR), Status::Stale);
-        // Without any date, a first report is kept but never current.
+        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), NOW));
+        assert_eq!((a.five().observed_at, status(a.five(), NOW)), (None, Status::Unconfirmed));
+        // A redraw (no new API time) confirms nothing, even later.
+        a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), NOW + 60_000);
+        assert_eq!(status(a.five(), NOW + 60_000), Status::Unconfirmed);
+        // The next response: fetched after the redraw at NOW + 60 s.
+        assert!(a.feed((1, 1), &report(Some(22.0), Some(41.0), Some(900.0)), NOW + 90_000));
+        assert_eq!(a.five().observed_at, Some(NOW + 60_000));
+        assert_eq!(status(a.five(), NOW + 90_000), Status::Current);
+        // Changed numbers without more API time are no evidence either.
         let mut b = Account::new();
-        assert!(b.feed((1, 1), &report(Some(20.0), None, Some(500.0), None), NOW));
-        assert_eq!(status(b.five(), NOW), Status::Unconfirmed);
-        // A later dated report from the same run confirms it.
-        b.feed((1, 1), &report(Some(21.0), None, Some(600.0), Some(NOW + 10)), NOW + 10);
-        assert_eq!(status(b.five(), NOW + 10), Status::Current);
+        b.feed((1, 1), &report(Some(20.0), None, Some(500.0)), NOW);
+        b.feed((1, 1), &report(Some(30.0), None, Some(500.0)), NOW + 1000);
+        assert_eq!((b.five().reading.used_percentage, b.five().observed_at), (30.0, None));
+        // A baseline sent before the run's first response lets that first response count.
+        let mut c = Account::new();
+        assert!(!c.feed((1, 1), &baseline(0.0), NOW));
+        assert!(c.stored.is_empty());
+        assert!(c.feed((1, 1), &report(Some(20.0), Some(40.0), Some(800.0)), NOW + 5000));
+        assert_eq!(c.five().observed_at, Some(NOW));
+        assert_eq!(status(c.five(), NOW + 5000), Status::Current);
+    }
+
+    /// The review's case: the first callback is lost during a backend reload, the session sits
+    /// idle for an hour, then /rename writes the transcript and redraws the status line with the
+    /// cached numbers. Another session has since seen higher usage on the same account.
+    #[test]
+    fn a_redraw_of_old_numbers_never_overwrites_newer_higher_usage() {
+        let mut a = Account::new();
+        // Session 2 confirmed 85% at NOW + 30 min (a baseline, then a response).
+        a.feed((2, 1), &baseline(100.0), NOW + 30 * 60_000 - 5000);
+        a.feed((2, 1), &report(Some(85.0), Some(60.0), Some(300.0)), NOW + 30 * 60_000);
+        assert_eq!(a.five().session_id, 2);
+        // Session 1's first report arrives an hour after its numbers (10%) were fetched.
+        let later = NOW + HOUR;
+        assert!(!a.feed((1, 1), &report(Some(10.0), Some(20.0), Some(500.0)), later));
+        assert_eq!((a.five().session_id, a.five().reading.used_percentage), (2, 85.0));
+        assert_eq!(a.five().observed_at, Some(NOW + 30 * 60_000 - 5000));
+        // Same flaw with a baseline: session 3 reported at NOW, its next callback was lost,
+        // and an hour later a redraw carries the newer API time. Dated by its previous report
+        // (NOW), so it is an hour old: stale, and older than session 2's.
+        a.feed((3, 1), &report(Some(5.0), Some(5.0), Some(100.0)), NOW);
+        assert!(!a.feed((3, 1), &report(Some(12.0), Some(22.0), Some(700.0)), later));
+        assert_eq!((a.five().session_id, a.five().reading.used_percentage), (2, 85.0));
+        let mut b = Account::new();
+        b.feed((3, 1), &report(Some(5.0), Some(5.0), Some(100.0)), NOW);
+        b.feed((3, 1), &report(Some(12.0), Some(22.0), Some(700.0)), later);
+        assert_eq!((b.five().observed_at, status(b.five(), later)), (Some(NOW), Status::Stale));
     }
 
     #[test]
-    fn an_idle_sessions_report_never_replaces_a_newer_observation() {
+    fn unconfirmed_reports_never_replace_or_renew_a_confirmed_observation() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
-        a.feed((2, 1), &report(Some(60.0), Some(50.0), Some(100.0), Some(NOW + 1000)), NOW + 1000);
-        assert_eq!(a.five().session_id, 2);
-        // Session 1 redraws its old numbers: they stay ignored.
-        assert!(!a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW + 5000)), NOW + 5000));
-        assert_eq!(a.five().reading.used_percentage, 60.0);
-        assert_eq!(a.five().reported_at, NOW + 1000);
-        // Session 3's first report arrives now but its data is older than session 2's: kept out.
-        assert!(!a.feed((3, 1), &report(Some(5.0), Some(5.0), Some(1.0), Some(NOW + 500)), NOW + 6000));
-        assert_eq!(a.five().session_id, 2);
-        // Session 1 gets a reply: its newer numbers win.
-        assert!(a.feed((1, 1), &report(Some(65.0), Some(51.0), Some(400.0), Some(NOW + 9000)), NOW + 9000));
+        a.feed((1, 1), &baseline(0.0), NOW);
+        a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), NOW + 1000);
+        assert_eq!(a.five().observed_at, Some(NOW));
+        // The same run, different numbers without new API time: kept out.
+        assert!(!a.feed((1, 1), &report(Some(25.0), Some(40.0), Some(500.0)), NOW + 2000));
+        assert_eq!(a.five().reading.used_percentage, 20.0);
+        // A redraw of the same numbers an hour later renews "reported", never "observed".
+        let later = NOW + HOUR;
+        assert!(!a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), later));
+        assert_eq!((a.five().observed_at, a.five().reported_at), (Some(NOW), later));
+        assert_eq!(status(a.five(), later), Status::Stale);
+        // Another run's first report: kept out too.
+        assert!(!a.feed((2, 1), &report(Some(5.0), Some(5.0), Some(1.0)), later));
         assert_eq!(a.five().session_id, 1);
+        // Another run's confirmed newer numbers win.
+        a.feed((2, 1), &report(Some(65.0), Some(51.0), Some(400.0)), later + 9000);
+        assert_eq!((a.five().session_id, a.five().observed_at), (2, Some(later)));
+        // An older-dated confirmed report never replaces a newer one.
+        let mut b = Account::new();
+        b.feed((1, 1), &baseline(0.0), NOW);
+        b.feed((2, 1), &baseline(0.0), NOW + 5000);
+        b.feed((2, 1), &report(Some(60.0), None, Some(10.0)), NOW + 6000);
+        assert!(!b.feed((1, 1), &report(Some(10.0), None, Some(10.0)), NOW + 7000));
+        assert_eq!(b.five().session_id, 2);
+    }
+
+    /// API time that goes down is no evidence of anything (an older reporter overtaken by a
+    /// newer one, or a counter that restarted); it becomes the baseline for the next report.
+    #[test]
+    fn api_time_going_down_is_a_new_baseline() {
+        let mut a = Account::new();
+        a.feed((1, 1), &baseline(0.0), NOW);
+        a.feed((1, 1), &report(Some(20.0), None, Some(900.0)), NOW + 1000);
+        assert!(!a.feed((1, 1), &report(Some(15.0), None, Some(500.0)), NOW + 1200));
+        assert_eq!((a.five().reading.used_percentage, a.five().observed_at), (20.0, Some(NOW)));
+        assert_eq!(a.runs[&1].api_ms, Some(500.0));
+        a.feed((1, 1), &report(Some(21.0), None, Some(600.0)), NOW + 4000);
+        assert_eq!((a.five().reading.used_percentage, a.five().observed_at), (21.0, Some(NOW + 1200)));
     }
 
     #[test]
     fn partial_reports_keep_each_windows_own_time() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
-        a.feed((1, 1), &report(Some(15.0), None, Some(200.0), Some(NOW + 60_000)), NOW + 60_000);
-        assert_eq!(a.five().observed_at, Some(NOW + 60_000));
-        assert_eq!(a.stored[&Window::SevenDay].observed_at, Some(NOW), "an absent window keeps its own time");
+        a.feed((1, 1), &baseline(0.0), NOW - 1000);
+        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW);
+        a.feed((1, 1), &report(Some(15.0), None, Some(200.0)), NOW + 60_000);
+        assert_eq!(a.five().observed_at, Some(NOW));
+        assert_eq!(a.stored[&Window::SevenDay].observed_at, Some(NOW - 1000), "an absent window keeps its own time");
         assert_eq!(a.stored[&Window::SevenDay].reading.used_percentage, 30.0);
     }
 
     #[test]
-    fn a_seen_redraw_is_unconfirmed_and_a_new_run_starts_over() {
+    fn a_new_run_starts_over() {
         let mut a = Account::new();
-        a.runs.insert(1, RunMemory { generation: 1, config_dir: Some("/c".into()), api_ms: Some(5.0),
-            last: BTreeMap::from([(Window::FiveHour, Reading { used_percentage: 70.0, resets_at: RESET })]) });
-        // Same run, same numbers, but nothing stored (e.g. cleared by a login change).
-        assert!(a.feed((1, 1), &report(Some(70.0), None, Some(5.0), Some(NOW)), NOW));
-        assert_eq!(a.five().observed_at, None);
-        assert_eq!(status(a.five(), NOW), Status::Unconfirmed);
-        // The session's next run (a restart) has its own first report.
-        assert!(a.feed((1, 2), &report(Some(70.0), None, Some(5.0), Some(NOW + 10)), NOW + 10));
-        assert_eq!(a.five().observed_at, Some(NOW + 10));
+        a.feed((1, 1), &baseline(0.0), NOW);
+        a.feed((1, 1), &report(Some(70.0), None, Some(5.0)), NOW + 10);
+        // The session's next run (a restart) has no baseline: its API time restarts too.
+        a.feed((1, 2), &report(Some(71.0), None, Some(3.0)), NOW + 20);
+        assert_eq!((a.five().generation, a.five().observed_at), (1, Some(NOW)), "unconfirmed: kept out");
+        a.feed((1, 2), &report(Some(72.0), None, Some(9.0)), NOW + 30);
+        assert_eq!((a.five().generation, a.five().observed_at), (2, Some(NOW + 20)));
     }
 
     #[test]
     fn duplicates_are_coalesced() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
+        a.feed((1, 1), &baseline(0.0), NOW);
+        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW + 500);
         let memory = a.runs[&1].clone();
         // A fresh report with the same numbers within the renew interval writes nothing.
-        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(150.0), Some(NOW + 1000)), NOW + 1000);
+        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(150.0)), NOW + 1000);
         assert!(r.updates.is_empty() && !r.notify);
         assert_eq!(r.run.unwrap().api_ms, Some(150.0));
-        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW + 1000);
+        // A redraw within the renew interval writes nothing at all.
+        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW + 1000);
         assert_eq!(r, Applied::default());
     }
 
@@ -940,6 +1021,38 @@ mod tests {
         // A local file Claude Code would reject: unsure, so Muster stays out of it.
         t.write("proj/.claude/settings.local.json", "not json");
         assert!(user_status_line(&penv, &proj).is_err());
+    }
+
+    /// A relative (or empty) CLAUDE_CONFIG_DIR, or a relative HOME, would be resolved by Claude
+    /// Code against the session's own working directory, never the daemon's: Muster doesn't
+    /// guess, files nothing under it and leaves the status line to Claude Code, even when a
+    /// project file decides the line.
+    #[test]
+    fn a_config_folder_muster_cant_place_leaves_the_status_line_alone() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        t.write("home/.claude/settings.json", &line("home-line"));
+        let proj = t.dir("proj");
+        t.write("proj/.claude/settings.json", &line("proj-line"));
+        // `proj/.claude` is a real folder relative to the session's cwd (and maybe the daemon's).
+        for (key, value) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CLAUDE_CONFIG_DIR", "profile"),
+            ("CLAUDE_CONFIG_DIR", "~/.claude"), ("CLAUDE_CONFIG_DIR", ""), ("HOME", "home")] {
+            let mut env = BTreeMap::from([("HOME".to_string(), home.to_string_lossy().to_string())]);
+            env.insert(key.into(), value.into());
+            assert!(user_status_line(&env, &proj).is_err(), "{key}={value:?}");
+            assert_eq!(effective_config_dir(&env), None, "{key}={value:?}: no folder to file reports under");
+            let settings = t.write("claude-settings.json", r#"{"hooks": {}}"#);
+            install_reporter(&settings, Path::new("/opt/muster"), &env, &proj);
+            assert_eq!(std::fs::read_to_string(&settings).unwrap(), r#"{"hooks": {}}"#, "{key}={value:?}");
+        }
+        // Absolute ones still resolve, a missing folder just has no settings.
+        let env = BTreeMap::from([("HOME".to_string(), home.to_string_lossy().to_string()),
+            ("CLAUDE_CONFIG_DIR".to_string(), t.0.join("missing").to_string_lossy().to_string())]);
+        assert_eq!(effective_config_dir(&env), None);
+        assert_eq!(cmd_of(user_status_line(&env, &t.dir("elsewhere"))), None);
+        let env = BTreeMap::from([("HOME".to_string(), home.to_string_lossy().to_string())]);
+        assert_eq!(effective_config_dir(&env), Some(home.join(".claude")));
+        assert_eq!(cmd_of(user_status_line(&env, &t.dir("elsewhere"))).as_deref(), Some("home-line"));
     }
 
     #[test]

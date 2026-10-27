@@ -93,10 +93,9 @@ export function UsageTable({ usage, now, selected }: {
 }
 
 /** The new-session flow's capacity table and suggestion. Choosing stays with the human. */
-function UsageHint({ value, onChange, disabled }: {
+function UsageHint({ value, onChange }: {
   value: ProfileChoice | undefined;
   onChange: (choice: ProfileChoice | undefined) => void;
-  disabled: boolean;
 }) {
   const now = useUsageClock();
   const usage = accountUsage.value;
@@ -110,7 +109,7 @@ function UsageHint({ value, onChange, disabled }: {
           <span>
             <strong>Suggested: {s.name}.</strong> {s.reason}
           </span>
-          <button class="btn btn-sm" type="button" disabled={disabled} onClick={() => onChange(s.choice)}>
+          <button class="btn btn-sm" type="button" onClick={() => onChange(s.choice)}>
             Use {s.name}
           </button>
         </div>
@@ -158,7 +157,8 @@ export function ProfileSelect({ value, onChange, disabled = false }: {
         </span>
         <span class="field-hint">Verify your account with /status inside Claude Code.</span>
       </label>
-      {profiles.length > 0 && <UsageHint value={value} onChange={onChange} disabled={disabled} />}
+      {/* Only where the choice is still open: an existing agent's profile is fixed. */}
+      {profiles.length > 0 && !disabled && <UsageHint value={value} onChange={onChange} />}
     </div>
   );
 }

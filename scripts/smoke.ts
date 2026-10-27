@@ -84,13 +84,13 @@ async function startDaemon(extraEnv: Record<string, string> = {}): Promise<Daemo
       for await (const chunk of s) log.push(dec.decode(chunk));
     })();
   }
-  const t0 = Date.now(); const deadline = Date.now() + 90000; // TEMP
+  const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
       const d = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`));
       const r = await fetch(`http://127.0.0.1:${PORT}/api/health`);
       const h = await r.json();
-      if (h.ok && d.port === PORT && d.pid === proc.pid) { console.log(`TEMP daemon up in ${Date.now() - t0} ms`); return (current = { proc, log, token: d.token }); }
+      if (h.ok && d.port === PORT && d.pid === proc.pid) return (current = { proc, log, token: d.token });
     } catch {
       // not up yet
     }
@@ -1353,6 +1353,15 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
   const w = await waiting;
   ok(r3.status === "returned" && w.reply === "done already" && w.timed_out === false,
     `a waiting ask ends with the late reply (${JSON.stringify(r3)}, ${JSON.stringify(w).slice(0, 200)})`);
+
+  // A plain Codex session asked and stopped waiting: the answer is typed into it after a header
+  // that is no agent envelope.
+  const a4 = await mcp(plainToken, "ask_agent", { agent: "helper", text: "which port?", timeout_seconds: 1 });
+  ok(a4.timed_out === true, "the plain session's ask timed out");
+  const r4 = await reply(helperT, a4.msg_id, "port 8080");
+  ok(r4.status === "delivered" && r4.session_id === plainS, `a late reply to a plain session is typed into it (${JSON.stringify(r4)})`);
+  ok(await got(plainS, `[muster reply to msg ${a4.msg_id} from helper origin=human hop=${r4.hop}]`) &&
+    await got(plainS, "port 8080"), "the plain session gets it after a reply header");
 
   // `muster reply` is the agent's own tool; outside an agent's session it is refused.
   const outside = await new Deno.Command(BIN, { args: ["reply", String(id3), "hi"], env: ENV, stdout: "piped", stderr: "piped" }).output();

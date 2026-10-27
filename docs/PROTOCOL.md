@@ -15,6 +15,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /api/device/logout` | device cookie | Revokes the calling device, clears the cookie. |
 | `GET /m/…` | none | The phone UI (`web/dist/m`), with a strict CSP. `/m` redirects to `/m/`. |
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
+| `POST /usage/claude` | `Authorization: Bearer <session token>` | A Claude session's status-line usage report (`muster statusline`): `{rate_limits: {five_hour?, seven_day?: {used_percentage, resets_at}}, api_duration_ms?}`, at most 16 KiB. Attributed by the token to its session, run and pinned profile only. See "Claude account profiles". |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
 | `POST /api/trigger/<name>` | `Authorization: Bearer <the trigger's secret>` | Fire a URL trigger (body: up to 16 KiB of data, handed to its agent as quoted untrusted text). This machine only; see "Schedules", Phase 2. |
@@ -116,7 +117,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], account_usage, home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -950,6 +951,25 @@ may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nul
 | `account_profile.create` | `{name, config_dir}` | `AccountProfile`; requires an existing directory, rejects duplicate canonical paths and case-insensitive duplicate names |
 | `account_profile.update` | `{id, name?, enabled?}` | `AccountProfile`; the directory is immutable; disabling leaves running processes alone |
 | `workspace.set_account_profile` | `{id, account_profile}` | `Workspace`; profile ID or `"default"`; affects only future selection |
+| `account_usage.get` | `{}` | `UsageSnapshot` (below) |
+| `account_profile.same_account` | `{id, with: number \| null}` | `AccountProfile`; `with`: the profile it signs in to the same account as, `null`: its own account |
+| `account_profile.login_changed` | `{account_profile: number \| "default"}` | `UsageSnapshot`; forgets that profile's (or Default's) usage and its same-account declaration |
+
+`AccountProfile` also has `account_group: string | null` (opaque; equal values were declared
+one account; migration v22). `UsageSnapshot` is `{evaluated_at, stale_after_ms, rows[],
+suggestion, no_suggestion}`: one row for Default, then one per profile, each `{choice, name,
+enabled, eligible, ineligible_reason, account, same_account_as[], five_hour, seven_day}`.
+`account` is equal for rows on one account (a declared group, or Default and a profile on its
+folder). A window is `{status, used_percentage, resets_at (Unix s), observed_at (Unix ms of the
+newest newly fetched report, or null), reported_at, reported_by}`, where `status` is `current`,
+`stale` (observed more than `stale_after_ms` ago), `unconfirmed` (never shown to be newly
+fetched), `reset` (its reset time passed) or `unknown`; `reported_by` names another profile on the
+same account when its session reported the figure. `suggestion` is `{choice, name, choices[],
+reason}` or null with `no_suggestion` saying why; it is advice only (docs/ACCOUNT_PROFILES.md
+"Usage display and suggestions"). `hello.account_usage` carries the snapshot (null if unreadable)
+and `account_usage_changed` sends a new one when an observation, a profile or a declaration
+changes. Statuses age with time, so a client showing them re-reads `account_usage.get`
+periodically.
 
 These management methods are local-client-only (not available to paired devices or MCP).
 There is no login, token, configuration-file copy, or directory deletion API.

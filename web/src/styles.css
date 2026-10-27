@@ -3500,6 +3500,113 @@ textarea {
   color: var(--text-muted);
 }
 
+/* Claude usage (src/usage.rs): only a current figure reads as a plain number. */
+.profile-field,
+.usage-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.profile-row .profile-account-row.field-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.usage-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+.usage-table thead th {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-2);
+  white-space: nowrap;
+}
+
+.usage-table tbody th {
+  font-weight: 500;
+}
+
+.usage-table tr.on {
+  background: var(--accent-softer);
+}
+
+.usage-table tr.on .usage-name {
+  color: var(--accent-strong);
+}
+
+.usage-main {
+  display: block;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-detail,
+.usage-note {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.usage-uncertain .usage-main {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.usage-high .usage-main {
+  color: var(--st-attn);
+}
+
+.usage-seen {
+  color: var(--text-muted);
+}
+
+.usage-off .usage-name {
+  color: var(--text-muted);
+}
+
+.usage-suggestion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--accent-softer);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.usage-suggestion .btn {
+  flex: 0 0 auto;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: 1fr 1fr;

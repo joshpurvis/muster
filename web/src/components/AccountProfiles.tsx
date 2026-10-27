@@ -1,10 +1,131 @@
 import type { ComponentChildren } from "preact";
-import { useState } from "preact/hooks";
-import { accountProfiles, accountProfilesSupported, toast } from "../state.ts";
+import { useEffect, useState } from "preact/hooks";
+import { accountProfiles, accountProfilesSupported, accountUsage, toast } from "../state.ts";
 import { rpc } from "../rpc.ts";
-import type { AccountProfile, ProfileChoice } from "../types.ts";
-import { parseProfileChoice } from "../account_profiles.ts";
+import type { AccountProfile, AccountUsage, ProfileChoice } from "../types.ts";
+import {
+  lastObserved,
+  parseProfileChoice,
+  sameChoice,
+  suggestionView,
+  type WindowCell,
+  windowCell,
+} from "../account_profiles.ts";
 import { IconChevronDown } from "../icons.tsx";
+import { cx } from "../util.ts";
+
+/** Keeps `accountUsage` current while mounted (statuses age on the backend's clock: a figure
+ * that was current goes stale) and returns a clock that ticks the "seen … ago" texts. */
+function useUsageClock(): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    let alive = true;
+    const refresh = () =>
+      rpc.call<AccountUsage>("account_usage.get", {}).then((u) => {
+        if (alive) accountUsage.value = u;
+      }).catch(() => {});
+    refresh();
+    const poll = setInterval(refresh, 60_000);
+    const tick = setInterval(() => setNow(Date.now()), 30_000);
+    return () => {
+      alive = false;
+      clearInterval(poll);
+      clearInterval(tick);
+    };
+  }, []);
+  return now;
+}
+
+function UsageCell({ cell }: { cell: WindowCell }) {
+  return (
+    <td class={cx("usage-cell", !cell.current && "usage-uncertain", cell.high && "usage-high")}>
+      <span class="usage-main">{cell.main}</span>
+      {cell.detail && <span class="usage-detail">{cell.detail}</span>}
+    </td>
+  );
+}
+
+/** Each account's last reported usage. Unknown, stale and unconfirmed figures say so. */
+export function UsageTable({ usage, now, selected }: {
+  usage: AccountUsage;
+  now: number;
+  /** Highlighted row (the new session's current choice). */
+  selected?: ProfileChoice;
+}) {
+  return (
+    <div class="usage-table-wrap">
+      <table class="usage-table">
+        <thead>
+          <tr>
+            <th scope="col">Profile</th>
+            <th scope="col">5-hour</th>
+            <th scope="col">Weekly</th>
+            <th scope="col">Last observed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {usage.rows.map((r) => (
+            <tr
+              key={String(r.choice)}
+              class={cx(
+                selected !== undefined && sameChoice(r.choice, selected) && "on",
+                !r.eligible && "usage-off",
+              )}
+            >
+              <th scope="row" title={r.ineligible_reason ?? undefined}>
+                <span class="usage-name">{r.name}</span>
+                {r.same_account_as.length > 0 && (
+                  <span class="usage-note">same account as {r.same_account_as.join(", ")}</span>
+                )}
+                {!r.eligible && (
+                  <span class="usage-note">{r.enabled ? "can't start here now" : "disabled"}</span>
+                )}
+              </th>
+              <UsageCell cell={windowCell(r.five_hour, now)} />
+              <UsageCell cell={windowCell(r.seven_day, now)} />
+              <td class="usage-seen">{lastObserved(r, now)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** The new-session flow's capacity table and suggestion. Choosing stays with the human. */
+function UsageHint({ value, onChange, disabled }: {
+  value: ProfileChoice | undefined;
+  onChange: (choice: ProfileChoice | undefined) => void;
+  disabled: boolean;
+}) {
+  const now = useUsageClock();
+  const usage = accountUsage.value;
+  if (!usage) return null;
+  const s = suggestionView(usage, value);
+  return (
+    <div class="usage-hint">
+      <UsageTable usage={usage} now={now} selected={value} />
+      {s.kind === "switch" && (
+        <div class="usage-suggestion" role="status">
+          <span>
+            <strong>Suggested: {s.name}.</strong> {s.reason}
+          </span>
+          <button class="btn btn-sm" type="button" disabled={disabled} onClick={() => onChange(s.choice)}>
+            Use {s.name}
+          </button>
+        </div>
+      )}
+      {s.kind === "keep" && (
+        <p class="usage-suggestion" role="status">
+          <span>
+            <strong>{s.name} has the most known room.</strong> {s.reason}
+          </span>
+        </p>
+      )}
+      {s.kind === "none" && <p class="field-hint">{s.reason}</p>}
+    </div>
+  );
+}
 
 export function ProfileSelect({ value, onChange, disabled = false }: {
   value: ProfileChoice | undefined;
@@ -15,27 +136,30 @@ export function ProfileSelect({ value, onChange, disabled = false }: {
   const profiles = accountProfiles.value;
   const missing = typeof value === "number" && !profiles.some((p) => p.id === value);
   return (
-    <label class="field">
-      <span class="field-label">Claude profile</span>
-      <span class="profile-select">
-        <select
-          value={value ?? "default"}
-          disabled={disabled}
-          onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
-        >
-          <option value="default">Default · ordinary Claude environment</option>
-          {missing && <option value={value} disabled>Unavailable profile #{value}</option>}
-          {profiles.map((p) => (
-            <option key={p.id} value={p.id} disabled={!p.enabled}>
-              {p.name}
-              {p.enabled ? "" : " (disabled)"}
-            </option>
-          ))}
-        </select>
-        <IconChevronDown size={14} />
-      </span>
-      <span class="field-hint">Verify your account with /status inside Claude Code.</span>
-    </label>
+    <div class="profile-field">
+      <label class="field">
+        <span class="field-label">Claude profile</span>
+        <span class="profile-select">
+          <select
+            value={value ?? "default"}
+            disabled={disabled}
+            onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
+          >
+            <option value="default">Default · ordinary Claude environment</option>
+            {missing && <option value={value} disabled>Unavailable profile #{value}</option>}
+            {profiles.map((p) => (
+              <option key={p.id} value={p.id} disabled={!p.enabled}>
+                {p.name}
+                {p.enabled ? "" : " (disabled)"}
+              </option>
+            ))}
+          </select>
+          <IconChevronDown size={14} />
+        </span>
+        <span class="field-hint">Verify your account with /status inside Claude Code.</span>
+      </label>
+      {profiles.length > 0 && <UsageHint value={value} onChange={onChange} disabled={disabled} />}
+    </div>
   );
 }
 
@@ -45,19 +169,43 @@ function ProfileRow({ profile }: { profile: AccountProfile }) {
   const [name, setName] = useState(profile.name);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const update = async (patch: { name?: string; enabled?: boolean }) => {
+  const others = accountProfiles.value.filter((p) => p.id !== profile.id);
+  const sameAs = profile.account_group
+    ? others.find((p) => p.account_group === profile.account_group)?.id ?? ""
+    : "";
+  const run = async (work: () => Promise<void>) => {
     setBusy(true);
     setError("");
     try {
-      const next = await rpc.call<AccountProfile>("account_profile.update", { id: profile.id, ...patch });
-      accountProfiles.value = accountProfiles.value.map((p) => p.id === next.id ? next : p);
-      setName(next.name);
+      await work();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   };
+  const update = (patch: { name?: string; enabled?: boolean }) =>
+    run(async () => {
+      const next = await rpc.call<AccountProfile>("account_profile.update", { id: profile.id, ...patch });
+      accountProfiles.value = accountProfiles.value.map((p) => p.id === next.id ? next : p);
+      setName(next.name);
+    });
+  const setSameAccount = (value: string) =>
+    run(async () => {
+      await rpc.call<AccountProfile>("account_profile.same_account", {
+        id: profile.id,
+        with: value ? Number(value) : null,
+      });
+      accountProfiles.value = await rpc.call<AccountProfile[]>("account_profile.list", {});
+    });
+  const loginChanged = () =>
+    run(async () => {
+      accountUsage.value = await rpc.call<AccountUsage>("account_profile.login_changed", {
+        account_profile: profile.id,
+      });
+      accountProfiles.value = await rpc.call<AccountProfile[]>("account_profile.list", {});
+      toast("success", `Forgot ${profile.name}'s usage. It reappears after its next session gets a reply.`);
+    });
   return (
     <form
       class="profile-row"
@@ -92,8 +240,80 @@ function ProfileRow({ profile }: { profile: AccountProfile }) {
       {!profile.enabled && (
         <span class="field-hint">New starts and restarts are blocked. Running sessions continue.</span>
       )}
+      {others.length > 0 && (
+        <div class="field-row profile-account-row">
+          <label class="field">
+            <span class="field-label">Signs in to</span>
+            <span class="profile-select">
+              <select
+                value={String(sameAs)}
+                disabled={busy}
+                onChange={(e) => setSameAccount(e.currentTarget.value)}
+              >
+                <option value="">Its own Claude account</option>
+                {others.map((p) => <option key={p.id} value={p.id}>The same account as {p.name}</option>)}
+              </select>
+              <IconChevronDown size={14} />
+            </span>
+          </label>
+          <button
+            class="btn"
+            type="button"
+            disabled={busy}
+            title="You signed in to a different account in this directory: forget its usage"
+            onClick={loginChanged}
+          >
+            Login changed
+          </button>
+        </div>
+      )}
+      {others.length === 0 && (
+        <div class="profile-account-row">
+          <button class="btn" type="button" disabled={busy} onClick={loginChanged}>Login changed</button>
+        </div>
+      )}
       {error && <p class="field-hint field-bad" role="alert">{error}</p>}
     </form>
+  );
+}
+
+/** The profiles dialog's usage overview, including Default. */
+function UsageSection() {
+  const now = useUsageClock();
+  const usage = accountUsage.value;
+  const [busy, setBusy] = useState(false);
+  if (!usage) return null;
+  const forgetDefault = async () => {
+    setBusy(true);
+    try {
+      accountUsage.value = await rpc.call<AccountUsage>("account_profile.login_changed", {
+        account_profile: "default",
+      });
+      toast("success", "Forgot Default's usage.");
+    } catch (e) {
+      toast("error", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const def = usage.rows.find((r) => r.choice === "default");
+  const hasDefault = !!def && (def.five_hour.status !== "unknown" || def.seven_day.status !== "unknown");
+  return (
+    <section class="profile-row usage-section" aria-label="Usage">
+      <h3>Usage</h3>
+      <p class="field-hint">
+        From the status line of Claude sessions Muster starts, after each reply. An account nobody used here
+        stays Unknown: Muster never asks Claude about it. Your own status line keeps showing as before.
+      </p>
+      <UsageTable usage={usage} now={now} />
+      {hasDefault && (
+        <div class="profile-account-row">
+          <button class="btn btn-sm" type="button" disabled={busy} onClick={forgetDefault}>
+            Default's login changed
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -130,6 +350,7 @@ export function AccountProfilesDialog({ Modal, close }: { Modal: ModalT; close: 
         </span>
       </div>
       <div class="dlg-body">
+        <UsageSection />
         {accountProfiles.value.map((p) => <ProfileRow key={p.id} profile={p} />)}
         <form
           class="profile-row"
@@ -142,8 +363,9 @@ export function AccountProfilesDialog({ Modal, close }: { Modal: ModalT; close: 
           <p class="field-hint">
             First, run <code>CLAUDE_CONFIG_DIR=/absolute/path claude</code>{" "}
             in your terminal and sign in normally. Then register that directory here. Its location stays
-            fixed. For the default <code>~/.claude</code> folder, sign in with plain <code>claude</code>{" "}
-            (or <code>env -u CLAUDE_CONFIG_DIR claude</code>) instead; its sessions start without{" "}
+            fixed. For the default <code>~/.claude</code> folder, sign in with plain <code>claude</code> (or
+            {" "}
+            <code>env -u CLAUDE_CONFIG_DIR claude</code>) instead; its sessions start without{" "}
             <code>CLAUDE_CONFIG_DIR</code>, so Claude Code uses <code>~/.claude</code> and{" "}
             <code>~/.claude.json</code>.
           </p>

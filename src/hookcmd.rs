@@ -39,7 +39,7 @@ const MAX_REPLY: usize = 64 * 1024;
 pub const TOKEN_FILE: &str = "hook-token";
 
 /// `$MUSTER_TOKEN`, else the token file of `$MUSTER_SESSION_ID`'s session.
-fn session_token() -> Option<String> {
+pub(crate) fn session_token() -> Option<String> {
     session_token_from(|k| std::env::var(k).ok())
 }
 
@@ -107,7 +107,7 @@ fn valid_name(s: &str) -> bool {
 }
 
 /// Read stdin with a deadline, never from a terminal (that would steal the user's keystrokes).
-fn read_stdin() -> Vec<u8> {
+pub(crate) fn read_stdin() -> Vec<u8> {
     #[cfg(unix)]
     if unsafe { libc::isatty(0) } == 1 {
         return Vec::new();
@@ -192,7 +192,7 @@ fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     ))
 }
 
-fn post(url: &str, path: &str, token: &str, agent: &str, body: &[u8]) -> Result<u16, String> {
+pub(crate) fn post(url: &str, path: &str, token: &str, agent: &str, body: &[u8]) -> Result<u16, String> {
     let (host, port, base) = parse_url(url)?;
     let addr = (host.as_str(), port)
         .to_socket_addrs()

@@ -41,6 +41,8 @@ pub enum ServerEvent {
     NoteUpserted(Note),
     NoteRemoved { id: NoteId },
     AccountProfilesChanged(Vec<crate::account_profiles::AccountProfile>),
+    /// Claude usage observations or profile accounts changed (`account_usage.get`).
+    AccountUsageChanged(crate::usage::UsageSnapshot),
     WorkspaceUpserted(Workspace),
     WorkspaceRemoved {
         id: WorkspaceId,
@@ -1060,6 +1062,7 @@ impl Hub {
         let directory = crate::account_profiles::config_directory(directory)?;
         let id = self.store.insert_account_profile(&name, &directory)?;
         self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        self.usage_changed();
         self.account_profile(id)
     }
 
@@ -1067,6 +1070,7 @@ impl Hub {
         let name = name.as_deref().map(crate::account_profiles::clean_name).transpose()?;
         self.store.update_account_profile(id, name.as_deref(), enabled)?;
         self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        self.usage_changed();
         self.account_profile(id)
     }
 
@@ -1077,6 +1081,68 @@ impl Hub {
 
     pub fn check_account_profile(&self, id: Option<i64>) -> anyhow::Result<()> {
         self.apply_account_profile(id, &mut std::env::vars().collect())
+    }
+
+    /// Each account's last reported usage and a placement suggestion (src/usage.rs).
+    pub fn account_usage(&self) -> anyhow::Result<crate::usage::UsageSnapshot> {
+        let profiles = self.account_profiles()?;
+        let observations = self.store.usage_observations()?;
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let default_dir = crate::usage::default_config_dir(&env);
+        Ok(crate::usage::snapshot(&profiles, &observations,
+            |id| self.check_account_profile(id).map_err(|e| format!("{e:#}")), default_dir.as_deref(), now_ms()))
+    }
+
+    fn usage_changed(&self) {
+        match self.account_usage() {
+            Ok(snapshot) => self.emit(ServerEvent::AccountUsageChanged(snapshot)),
+            Err(e) => tracing::warn!("reading Claude usage: {e:#}"),
+        }
+    }
+
+    /// A status-line report (`POST /usage/claude`), attributed only by its run's session token:
+    /// to that session, its current run and the profile it is pinned to.
+    pub fn record_usage(&self, token: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        let now = now_ms();
+        let report = crate::usage::parse_report(body, now);
+        let (session, generation, profile) = {
+            let g = self.inner.lock();
+            let id = *g.tokens.get(token).context("unknown session token")?;
+            let e = g.sessions.get(&id).context("unknown session token")?;
+            anyhow::ensure!(e.info.kind == SessionKind::Claude, "usage reports come from Claude sessions");
+            (id, e.generation, e.info.account_profile_id)
+        };
+        if report.windows.is_empty() {
+            return Ok(());
+        }
+        let key = crate::usage::account_key(profile);
+        if self.store.apply_usage(&key, session, generation, &report, now)? {
+            self.usage_changed();
+        }
+        Ok(())
+    }
+
+    /// The human says profile `id` signs in to the same account as `with` (None: its own).
+    pub fn set_same_account(&self, id: i64, with: Option<i64>) -> anyhow::Result<crate::account_profiles::AccountProfile> {
+        if let Some(with) = with { self.account_profile(with)?; }
+        self.store.set_same_account(id, with)?;
+        self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        self.usage_changed();
+        self.account_profile(id)
+    }
+
+    /// The human signed in to another account in this profile (or Default): its observations
+    /// and its declared account no longer apply.
+    pub fn account_login_changed(&self, choice: crate::account_profiles::ProfileChoice) -> anyhow::Result<()> {
+        let id = choice.id();
+        if let Some(id) = id {
+            self.account_profile(id)?;
+            self.store.set_same_account(id, None)?;
+            self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
+        }
+        self.store.clear_usage(&crate::usage::account_key(id))?;
+        self.usage_changed();
+        Ok(())
     }
 
     /// Resolve exactly once at creation. Restarts use SessionInfo's pinned ID; no fallback.
@@ -3068,6 +3134,12 @@ impl Hub {
         crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
         complete_env.extend(env);
         self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
+        if info.kind == SessionKind::Claude {
+            // Its status line becomes Muster's usage reporter around the user's own one, found
+            // with exactly the environment this run gets (src/usage.rs).
+            crate::usage::install_reporter(&session_dir.join("claude-settings.json"), &self.cfg.muster_bin,
+                &complete_env, Path::new(&info.cwd));
+        }
         let mut injected = Vec::new();
         if let Some(key) = &openrouter {
             injected = crate::openrouter::apply_session_env(info.kind, key, &mut complete_env)?;
@@ -4553,6 +4625,54 @@ mod tests {
             openrouter_key,
         };
         Hub::new(cfg, store).unwrap()
+    }
+
+    /// Usage reports are attributed by the run's token alone: to that session's pinned profile,
+    /// whatever the payload says, and never from a shell, an unknown or a replaced token.
+    #[test]
+    fn usage_reports_follow_the_session_to_profile_mapping() {
+        let hub = fixture(None);
+        let base = std::env::temp_dir().join(format!("muster-hub-usage-{}", paths::random_token()));
+        std::fs::create_dir_all(base.join("personal")).unwrap();
+        std::fs::create_dir_all(base.join("work")).unwrap();
+        let personal = hub.add_account_profile("Personal", base.join("personal").to_str().unwrap()).unwrap().id;
+        let work = hub.add_account_profile("Work", base.join("work").to_str().unwrap()).unwrap().id;
+        {
+            let mut g = hub.inner.lock();
+            g.sessions.get_mut(&2).unwrap().info.account_profile_id = Some(work);
+            g.tokens.insert("claude-run".into(), 2);
+            g.tokens.insert("shell-run".into(), 1);
+        }
+        let resets = now_ms() / 1000 + 3 * 3600;
+        let body = |five: f64, api: u64| serde_json::json!({
+            "rate_limits": {"five_hour": {"used_percentage": five, "resets_at": resets},
+                "seven_day": {"used_percentage": 40, "resets_at": resets + 86_400}},
+            "api_duration_ms": api,
+            // Labels in the payload are ignored: the session decides.
+            "account": "Personal", "account_profile_id": personal});
+        let row = |hub: &Hub, name: &str| hub.account_usage().unwrap().rows.into_iter().find(|r| r.name == name).unwrap();
+        hub.record_usage("claude-run", &body(25.0, 100)).unwrap();
+        assert_eq!(row(&hub, "Work").five_hour.used_percentage, Some(25.0));
+        assert_eq!(row(&hub, "Work").five_hour.status, crate::usage::Status::Current);
+        assert_eq!(row(&hub, "Personal").five_hour.status, crate::usage::Status::Unknown);
+        assert_eq!(row(&hub, "Default").five_hour.status, crate::usage::Status::Unknown);
+        assert!(hub.record_usage("shell-run", &body(1.0, 1)).is_err());
+        assert!(hub.record_usage("forged", &body(1.0, 1)).is_err());
+        // A replaced run's token no longer reports anything.
+        hub.inner.lock().tokens.remove("claude-run");
+        assert!(hub.record_usage("claude-run", &body(1.0, 900)).is_err());
+        assert_eq!(row(&hub, "Work").five_hour.used_percentage, Some(25.0));
+        // Declared one account: Personal shows Work's numbers, credited to Work.
+        hub.set_same_account(personal, Some(work)).unwrap();
+        let p = row(&hub, "Personal");
+        assert_eq!((p.five_hour.used_percentage, p.five_hour.reported_by.as_deref()), (Some(25.0), Some("Work")));
+        assert_eq!(p.same_account_as, vec!["Work".to_string()]);
+        // A login change forgets Work's usage and its same-account declaration.
+        hub.account_login_changed(crate::account_profiles::ProfileChoice::Id(work)).unwrap();
+        assert_eq!(row(&hub, "Work").five_hour.status, crate::usage::Status::Unknown);
+        assert!(hub.account_profile(work).unwrap().account_group.is_none());
+        assert!(hub.set_same_account(work, Some(work)).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

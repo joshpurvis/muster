@@ -89,6 +89,7 @@ pub fn hello(hub: &Hub) -> Value {
         "ui_protocol": crate::assets::UI_PROTOCOL,
         "workspaces": hub.workspaces(),
         "account_profiles": hub.account_profiles().unwrap_or_default(),
+        "account_usage": hub.account_usage().ok(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
@@ -379,6 +380,27 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             struct P { id: i64, name: Option<String>, enabled: Option<bool> }
             let p: P = parse(params)?;
             to_value(hub.update_account_profile(p.id, p.name, p.enabled)?)
+        }
+        "account_usage.get" => {
+            require_local(who, method)?;
+            to_value(hub.account_usage()?)
+        }
+        "account_profile.same_account" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { id: i64, with: Option<i64> }
+            let p: P = parse(params)?;
+            to_value(hub.set_same_account(p.id, p.with)?)
+        }
+        "account_profile.login_changed" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { account_profile: crate::account_profiles::ProfileChoice }
+            let p: P = parse(params)?;
+            hub.account_login_changed(p.account_profile)?;
+            to_value(hub.account_usage()?)
         }
         "workspace.set_account_profile" => {
             require_local(who, method)?;

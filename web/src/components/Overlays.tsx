@@ -182,9 +182,12 @@ export function Overlays() {
     case "agent_message":
       return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
     case "schedule":
-      return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} Modal={Modal} close={close} />;
-    case "schedule_settings":
-      return <ScheduleSettingsDialog Modal={Modal} close={close} />;
+      return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} keep={o.draft} Modal={Modal} close={close} />;
+    case "schedule_settings": {
+      // Opened from the schedule dialog: closing goes back to it, draft and all.
+      const back = o.back;
+      return <ScheduleSettingsDialog Modal={Modal} close={back ? () => (overlay.value = back) : close} back={!!back} />;
+    }
   }
 }
 

@@ -321,31 +321,46 @@ fn file_triggers_are_off_until_the_human_chooses_a_folder() {
     let _ = std::fs::remove_dir_all(&other);
 }
 
+fn rels(v: &[triggers::FileSeen]) -> Vec<String> {
+    v.iter().map(|f| f.rel.clone()).collect()
+}
+
+/// One look and what it found new, as `check_files` does (boundary: a little before it began).
+fn look_news(d: &std::path::Path, pattern: Option<&str>, recursive: bool, w: &WatchState) -> (Vec<String>, WatchState) {
+    let boundary = now_ns().saturating_sub(triggers::FILES_SCAN_MARGIN_NS);
+    let look = triggers::look_at_folder(d, pattern, recursive, w.dirs.as_deref()).unwrap();
+    let (fresh, next) = triggers::files_news(w, &look, boundary);
+    (rels(&fresh), next.unwrap_or_else(|| w.clone()))
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+}
+
 #[test]
 fn a_folder_look_finds_new_and_changed_files_only() {
     let d = temp_dir("look");
     std::fs::write(d.join("old.pdf"), "a").unwrap();
     std::fs::write(d.join(".hidden.pdf"), "a").unwrap();
     std::fs::write(d.join("note.txt"), "a").unwrap();
-    let first = triggers::look_at_folder(&d, Some("*.pdf"), false, None).unwrap();
-    assert!(first.changed.is_empty() && first.newest > 0);
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    let (first, w) = look_news(&d, Some("*.pdf"), false, &WatchState::default());
+    assert!(first.is_empty() && w.stamp.is_some(), "the first look only records");
     std::fs::write(d.join("new.pdf"), "b").unwrap();
     std::fs::write(d.join("other.txt"), "b").unwrap();
     std::fs::write(d.join("dl.pdf.part"), "b").unwrap();
     std::fs::create_dir(d.join("sub")).unwrap();
     std::fs::write(d.join("sub/deep.pdf"), "b").unwrap();
-    let next = triggers::look_at_folder(&d, Some("*.pdf"), false, Some(first.newest)).unwrap();
-    assert_eq!(next.changed, vec!["new.pdf".to_string()]);
-    let rec = triggers::look_at_folder(&d, Some("*.pdf"), true, Some(first.newest)).unwrap();
-    assert_eq!(rec.changed, vec!["new.pdf".to_string(), "sub/deep.pdf".to_string()]);
+    let (next, w2) = look_news(&d, Some("*.pdf"), false, &w);
+    assert_eq!(next, vec!["new.pdf".to_string()]);
+    // Seen once, not again (the overlap between looks reports nothing twice).
+    assert!(look_news(&d, Some("*.pdf"), false, &w2).0.is_empty());
+    let look = triggers::look_at_folder(&d, Some("*.pdf"), true, None).unwrap();
+    assert_eq!(rels(&look.files), vec!["new.pdf", "old.pdf", "sub/deep.pdf"]);
     // A file moved in keeps its old contents' times but gets a new change time.
-    std::thread::sleep(std::time::Duration::from_millis(20));
     let elsewhere = temp_dir("elsewhere");
     std::fs::write(elsewhere.join("moved.pdf"), "c").unwrap();
     std::fs::rename(elsewhere.join("moved.pdf"), d.join("moved.pdf")).unwrap();
-    let moved = triggers::look_at_folder(&d, Some("*.pdf"), false, Some(rec.newest)).unwrap();
-    assert_eq!(moved.changed, vec!["moved.pdf".to_string()]);
+    assert_eq!(look_news(&d, Some("*.pdf"), false, &w2).0, vec!["moved.pdf".to_string()]);
     // Too big a tree is refused, not read.
     let big = temp_dir("big");
     for i in 0..=triggers::FILES_SCAN_MAX {
@@ -359,16 +374,162 @@ fn a_folder_look_finds_new_and_changed_files_only() {
 }
 
 #[test]
+fn a_file_changed_during_a_look_is_not_skipped() {
+    // A look lists b (old) then a (just changed); b changes while it runs. The old cursor (the
+    // newest change seen, a's) would skip b's change; the boundary (before the look began) and
+    // the per-file record don't.
+    let f = |rel: &str, stamp: u64| triggers::FileSeen { rel: rel.into(), stamp, moved_in: None };
+    let prev = WatchState { stamp: Some(100), ..Default::default() };
+    let look1 = triggers::FolderLook { files: vec![f("a", 300), f("b", 50)], dirs: None };
+    let (fresh, w) = triggers::files_news(&prev, &look1, 250);
+    assert_eq!(rels(&fresh), vec!["a"]);
+    let w = w.unwrap();
+    assert_eq!((w.stamp, w.recent.clone()), (Some(250), vec![("a".to_string(), 300)]));
+    // Next look: b changed at 280 (after the boundary, before a's time): reported; a isn't again.
+    let look2 = triggers::FolderLook { files: vec![f("a", 300), f("b", 280)], dirs: None };
+    let (fresh, w) = triggers::files_news(&w, &look2, 400);
+    assert_eq!(rels(&fresh), vec!["b"]);
+    // Nothing new: nothing to save.
+    let w = w.unwrap();
+    assert!(triggers::files_news(&w, &look2, 500).1.is_none());
+    // a changed again (a new time): reported.
+    let look3 = triggers::FolderLook { files: vec![f("a", 450), f("b", 280)], dirs: None };
+    assert_eq!(rels(&triggers::files_news(&w, &look3, 600).0), vec!["a"]);
+}
+
+#[test]
+fn a_folder_moved_in_counts_its_files_as_new() {
+    let d = temp_dir("movedir");
+    std::fs::create_dir(d.join("kept")).unwrap();
+    std::fs::write(d.join("kept/x.pdf"), "x").unwrap();
+    let (_, w) = look_news(&d, None, true, &WatchState::default());
+    assert_eq!(w.dirs.as_ref().map(Vec::len), Some(1));
+    // A folder full of old files, moved in: only the folder's change time is new.
+    let elsewhere = temp_dir("movedir-src");
+    std::fs::create_dir_all(elsewhere.join("batch/inner")).unwrap();
+    std::fs::write(elsewhere.join("batch/a.pdf"), "a").unwrap();
+    std::fs::write(elsewhere.join("batch/inner/b.pdf"), "b").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let (_, w) = look_news(&d, None, true, &w); // the boundary moves past the files' own times
+    let w = WatchState { stamp: Some(now_ns()), ..w };
+    std::fs::rename(elsewhere.join("batch"), d.join("batch")).unwrap();
+    let (fresh, w2) = look_news(&d, None, true, &w);
+    assert_eq!(fresh, vec!["batch/a.pdf".to_string(), "batch/inner/b.pdf".to_string()], "everything in it is new");
+    assert_eq!(w2.dirs.as_ref().map(Vec::len), Some(3));
+    assert!(look_news(&d, None, true, &w2).0.is_empty(), "once");
+    // Renamed within the watched folder: not new content.
+    std::fs::rename(d.join("batch"), d.join("batch2")).unwrap();
+    let w3 = WatchState { stamp: Some(now_ns()), recent: vec![], ..w2 };
+    assert!(look_news(&d, None, true, &w3).0.is_empty(), "the same folders, moved: nothing new");
+    for p in [d, elsewhere] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[test]
+fn a_look_never_follows_a_folder_swapped_for_a_link() {
+    let d = temp_dir("swap");
+    let secret = temp_dir("swap-secret");
+    std::fs::write(secret.join("secret.pdf"), "s").unwrap();
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/mine.pdf"), "m").unwrap();
+    // A subfolder that is a link from the start: never read.
+    std::os::unix::fs::symlink(&secret, d.join("link")).unwrap();
+    let look = triggers::look_at_folder(&d, None, true, None).unwrap();
+    assert_eq!(rels(&look.files), vec!["sub/mine.pdf"]);
+    // Swapped for a link again and again while looks run: no look ever lists the other folder.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = {
+        let (d, secret, stop) = (d.clone(), secret.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::rename(d.join("sub"), d.join(".sub-real"));
+                let _ = std::os::unix::fs::symlink(&secret, d.join("sub"));
+                std::thread::yield_now();
+                let _ = std::fs::remove_file(d.join("sub"));
+                let _ = std::fs::rename(d.join(".sub-real"), d.join("sub"));
+            }
+        })
+    };
+    for _ in 0..400 {
+        if let Ok(look) = triggers::look_at_folder(&d, None, true, None) {
+            assert!(look.files.iter().all(|f| !f.rel.contains("secret")), "{:?}", rels(&look.files));
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    // The watched folder itself swapped for a link: refused, wherever the link leads.
+    let watched = temp_dir("swap-root");
+    std::fs::write(watched.join("w.pdf"), "w").unwrap();
+    std::fs::rename(&watched, watched.with_extension("real")).unwrap();
+    std::os::unix::fs::symlink(&secret, &watched).unwrap();
+    let e = triggers::look_at_folder(&watched, None, false, None).unwrap_err().to_string();
+    assert!(e.contains("replaced by a link"), "{e}");
+    // An earlier part of its path swapped: the open handle's real place shows it.
+    let parent = temp_dir("swap-parent");
+    std::fs::create_dir(parent.join("in")).unwrap();
+    let inner = parent.join("in");
+    std::fs::rename(&parent, parent.with_extension("real")).unwrap();
+    std::fs::create_dir_all(secret.join("in")).unwrap();
+    std::os::unix::fs::symlink(&secret, &parent).unwrap();
+    assert!(triggers::look_at_folder(&inner, None, false, None).is_err(), "a path through a link is refused");
+    for p in [d, secret, watched.with_extension("real"), parent.with_extension("real")] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+    let _ = std::fs::remove_file(&watched);
+    let _ = std::fs::remove_file(&parent);
+}
+
+#[test]
+fn a_held_event_stops_when_its_folder_is_swapped_for_a_link() {
+    let t0 = at(LONDON, "2026-10-19T10:00");
+    let f = Fixture::new(t0);
+    let root = temp_dir("held");
+    let d = root.join("inbox");
+    std::fs::create_dir(&d).unwrap();
+    let elsewhere_allowed = root.join("other");
+    std::fs::create_dir(&elsewhere_allowed).unwrap();
+    allow(&f, &[&root]);
+    let s = f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d, "quiet_min": 3}})).unwrap();
+    triggers::check_files(&f.hub);
+    std::fs::write(d.join("a.pdf"), "1").unwrap();
+    triggers::check_files(&f.hub);
+    assert!(f.hub.schedules.get(s.id).unwrap().event.is_some(), "an event waits out its quiet minutes");
+    // The folder is swapped for a link (even to another allowed folder) while it waits.
+    std::fs::rename(&d, root.join("inbox-real")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere_allowed, &d).unwrap();
+    let held = f.hub.schedules.get(s.id).unwrap();
+    assert!(matches!(triggers::event_flag(&f.hub, &held), Some(Action::Skip(w)) if w.contains("replaced by a link")), "checked again before it runs");
+    triggers::check_files(&f.hub);
+    let after = f.hub.schedules.get(s.id).unwrap();
+    assert!(after.event.is_none() && after.next_run.is_none(), "what it had waiting is dropped");
+    assert!(f.hub.triggers.live(s.id).unwrap().detail.unwrap().contains("replaced by a link"));
+    // The folder gone altogether: the same.
+    std::fs::remove_file(&d).unwrap();
+    assert!(matches!(triggers::event_flag(&f.hub, &after), Some(Action::Skip(w)) if w.contains("can't read")));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `worker` is session 41; a span of its work, or of unattended work, from `start` to `end`
+/// (unix ms, real clock).
+fn worked(f: &Fixture, sid: SessionId, start: i64, end: Option<i64>) {
+    f.hub.triggers.observe(sid, true, start);
+    if let Some(e) = end {
+        f.hub.triggers.observe(sid, false, e);
+    }
+}
+
+#[test]
 fn file_changes_are_debounced_and_an_agents_own_are_ignored() {
     let t0 = at(LONDON, "2026-10-19T10:00");
     let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
     let d = temp_dir("trig");
     allow(&f, &[&d]);
     let s = f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d, "quiet_min": 3}})).unwrap();
     triggers::check_files(&f.hub);
     let base = f.hub.schedules.get(s.id).unwrap();
     assert!(base.watch.stamp.is_some() && base.event.is_none(), "the first look only records");
-    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(d.join("a.pdf"), "1").unwrap();
     triggers::check_files(&f.hub);
     let held = f.hub.schedules.get(s.id).unwrap();
@@ -376,7 +537,6 @@ fn file_changes_are_debounced_and_an_agents_own_are_ignored() {
     assert!(held.event.as_ref().unwrap().text.contains("New or changed in") && held.event.as_ref().unwrap().text.contains("a.pdf"));
     // Another change a minute later moves the run on (one run for both).
     f.set(t0 + MIN);
-    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(d.join("b.pdf"), "2").unwrap();
     triggers::check_files(&f.hub);
     let held = f.hub.schedules.get(s.id).unwrap();
@@ -384,23 +544,143 @@ fn file_changes_are_debounced_and_an_agents_own_are_ignored() {
     f.set(t0 + 4 * MIN);
     let started = f.tick();
     assert_eq!((started.len(), started[0].kind), (1, RunKind::Triggered));
-    // While its agent works (or just after), a change is the agent's own: absorbed, no event.
-    triggers::absorb_for_test(&f.hub, s.id, f.hub.schedules.now() + triggers::ABSORB_GRACE_MS);
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Its agent's turn started, wrote and ended between two looks: still its own (the turn is
+    // recorded from the session's state changes, not seen at a look).
+    let real = now_ms();
+    f.hub.triggers.observe(41, true, real - 2_000);
     std::fs::write(d.join("written-by-agent.pdf"), "3").unwrap();
+    f.hub.triggers.observe(41, false, now_ms());
     triggers::check_files(&f.hub);
     let after = f.hub.schedules.get(s.id).unwrap();
     assert!(after.event.is_none(), "an agent's own change doesn't count");
-    assert!(after.watch.stamp > held.watch.stamp, "but it is recorded as seen");
+    assert!(after.watch.recent.iter().any(|(r, _)| r == "written-by-agent.pdf"), "but it is recorded as seen");
+    // Unattended work by any session (here 77, on a scheduled chain): its changes don't count.
+    f.hub.agents().set_prov(77, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) })).unwrap();
+    worked(&f, 77, now_ms() - 1_000, None);
+    std::fs::write(d.join("by-a-schedule.pdf"), "4").unwrap();
+    triggers::check_files(&f.hub);
+    assert!(f.hub.schedules.get(s.id).unwrap().event.is_none(), "unattended work's change doesn't count");
+    f.hub.triggers.observe(77, false, now_ms());
+    // Turns that ended well over 30 s ago don't make a change now anyone's own.
+    f.hub.triggers.forget_activity_for_test();
+    worked(&f, 41, now_ms() - 120_000, Some(now_ms() - 60_000));
+    std::fs::write(d.join("by-you.pdf"), "5").unwrap();
+    triggers::check_files(&f.hub);
+    let e = f.hub.schedules.get(s.id).unwrap().event.expect("a change of yours fires it");
+    assert!(e.text.contains("by-you.pdf") && !e.text.contains("by-a-schedule.pdf"), "{}", e.text);
     // The folder taken off the list: nothing is looked at or held.
     let other = temp_dir("trig-other");
     allow(&f, &[&other]);
-    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(d.join("c.pdf"), "4").unwrap();
-    f.set(t0 + 5 * MIN + triggers::ABSORB_GRACE_MS);
     triggers::check_files(&f.hub);
     assert!(f.hub.schedules.get(s.id).unwrap().event.is_none());
     assert_eq!(f.hub.triggers.live(s.id).unwrap().state, "error");
     let _ = std::fs::remove_dir_all(&d);
     let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn who_was_working_is_kept_across_a_reload() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    // Kept only while there is a file trigger to use it.
+    let d = temp_dir("reload");
+    allow(&f, &[&d]);
+    f.create(json!({"agent": "worker", "prompt": "File it", "when": {"kind": "files", "folder": d}})).unwrap();
+    let real = now_ms();
+    worked(&f, 41, real - 5_000, Some(real - 1_000));
+    worked(&f, 42, real - 500, None);
+    triggers::check_files(&f.hub); // settles (worker's agent id) and saves
+    let before = f.hub.triggers.spans_for_test();
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[0].agent, Some(f.hub.agents().get("worker").unwrap().id));
+    // A reload: the backend's memory is gone, the saved spans come back.
+    f.hub.triggers.forget_activity_for_test();
+    triggers::restore_activity(&f.hub);
+    let after = f.hub.triggers.spans_for_test();
+    assert_eq!(after[0], before[0]);
+    // Session 42's span was open at the save and the session isn't working now (it is gone):
+    // it is closed, at the save at the latest.
+    assert!(after[1].session == 42 && after[1].end.is_some_and(|e| e >= after[1].start), "{after:?}");
+    assert!(triggers::own_change(&after, -1, Some(42), real, now_ms()), "a change then is still its own");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ----- limits under concurrency, pending runs, the CLI's relative times -----
+
+#[test]
+fn reminders_made_at_once_still_keep_every_limit() {
+    let t0 = at(LONDON, "2026-10-19T10:00");
+    let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
+    // Eight calls at once for the same time: one gets it (15 minutes apart).
+    let ok = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8).map(|_| sc.spawn(|| tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 20})).is_ok())).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).filter(|x| *x).count()
+    });
+    assert_eq!(ok, 1, "no two reminders at the same time");
+    // Eight at once, each at its own time: only 3 may wait.
+    let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
+    let ok = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8)
+            .map(|i| {
+                let f = &f;
+                sc.spawn(move || tool(f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 20 + 20 * i})).is_ok())
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).filter(|x| *x).count()
+    });
+    assert_eq!(ok, agent::REMINDERS_WAITING_MAX);
+    // Proposals at once: at most 3 waiting.
+    let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
+    let ok = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..8)
+            .map(|i| {
+                let f = &f;
+                sc.spawn(move || tool(f, 41, "propose_schedule", json!({"prompt": "p", "cron": format!("{i} 9 * * *"), "reason": "r"})).is_ok())
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).filter(|x| *x).count()
+    });
+    assert_eq!(ok, agent::PROPOSALS_WAITING_MAX);
+}
+
+#[test]
+fn a_reminder_whose_run_is_still_to_happen_still_counts() {
+    let t0 = at(LONDON, "2026-10-19T10:00");
+    let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
+    let r = tool(&f, 41, "set_reminder", json!({"prompt": "check CI", "in_minutes": 20})).unwrap()["schedule_id"].as_i64().unwrap();
+    // Its time comes: the run is claimed (no next run any more) but waits, say behind a turn of
+    // the human's.
+    f.set(t0 + 20 * MIN);
+    assert_eq!(f.tick().len(), 1);
+    assert!(f.hub.schedules.get(r).unwrap().next_run.is_none());
+    // Still 15 minutes apart from it, and still one of the 3 waiting.
+    let e = err(tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 5})));
+    assert!(e.contains("15 minutes apart"), "{e}");
+    tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 20})).unwrap();
+    tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 40})).unwrap();
+    let e = err(tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 60})));
+    assert!(e.contains("3 reminders waiting"), "{e}");
+    // Exactly 5 minutes ahead is allowed (what `muster schedule remind --at +5m` sends).
+    let f = Fixture::new(t0);
+    as_agent(&f, "worker", 41);
+    assert!(tool(&f, 41, "set_reminder", json!({"prompt": "p", "in_minutes": 5})).is_ok());
+}
+
+#[test]
+fn a_proposals_timing_says_its_time_zone_when_it_isnt_this_computers() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    let here = cron::local_zone_name();
+    let tz = if here == "America/Los_Angeles" { "Asia/Tokyo" } else { "America/Los_Angeles" };
+    let r = tool(&f, 41, "propose_schedule", json!({"prompt": "p", "cron": "30 8 * * 1-5", "tz": tz, "reason": "r"})).unwrap();
+    let zone = tz.replace('_', " ");
+    assert!(r["estimate"].as_str().unwrap().contains(&format!("at {zone} times")), "{}", r["estimate"]);
+    let r = tool(&f, 41, "propose_schedule", json!({"prompt": "p", "in_minutes": 120, "tz": tz, "reason": "r"})).unwrap();
+    let e = r["estimate"].as_str().unwrap();
+    assert!(e.contains(&format!("{zone} time")) && e.contains("here)"), "{e}");
 }

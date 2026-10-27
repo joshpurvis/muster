@@ -63,20 +63,40 @@ pub const DONE_REMINDER_KEEP_MS: i64 = DAY_MS;
 pub const REASON_MAX: usize = 1000;
 
 /// What each agent made lately (scheduler clock), for the per-day limits: kept in memory, so a
-/// delete doesn't give the allowance back.
+/// delete doesn't give the allowance back. (After a restart it counts at least the schedules
+/// still there that were made in the last day: `made_today`.)
 #[derive(Default)]
-pub struct MadeLog(Mutex<HashMap<i64, Vec<(MadeKind, i64)>>>);
+pub struct MadeLog {
+    log: Mutex<HashMap<i64, Vec<(MadeKind, i64)>>>,
+    /// Held from the first limit check to the record of what was made, so two calls at once
+    /// (the MCP tool and `muster schedule remind` together, say) can't both pass a limit that
+    /// only one of them fits in. One lock for every agent: making a schedule is rare and quick.
+    making: Mutex<()>,
+}
 
 impl MadeLog {
     fn count(&self, agent: i64, kind: MadeKind, since: i64) -> usize {
-        self.0.lock().get(&agent).map_or(0, |v| v.iter().filter(|(k, t)| *k == kind && *t > since).count())
+        self.log.lock().get(&agent).map_or(0, |v| v.iter().filter(|(k, t)| *k == kind && *t > since).count())
     }
     fn add(&self, agent: i64, kind: MadeKind, at: i64) {
-        let mut g = self.0.lock();
+        let mut g = self.log.lock();
         let v = g.entry(agent).or_default();
         v.retain(|(_, t)| *t > at - DAY_MS);
         v.push((kind, at));
     }
+}
+
+/// How many `kind` schedules `agent` made in the 24 hours before `now`: what the log recorded,
+/// or, if more (the log starts empty after a restart), those still there.
+fn made_today(hub: &Hub, agent: i64, kind: MadeKind, now: i64) -> usize {
+    let logged = hub.schedules.made.count(agent, kind, now - DAY_MS);
+    let kept = hub
+        .schedules
+        .list()
+        .iter()
+        .filter(|s| s.made_by.as_ref().is_some_and(|m| m.agent_id == agent && m.kind == kind && m.at > now - DAY_MS))
+        .count();
+    logged.max(kept)
 }
 
 /// The calling agent: a named agent's own session.
@@ -101,21 +121,25 @@ fn attended(hub: &Hub, caller: SessionId) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Schedules `agent` made that are still live: waiting for approval, to run, or paused (not done
-/// or expired).
-fn live_made(hub: &Hub, agent: i64) -> Vec<Schedule> {
+/// Schedules `agent` made that are still live: waiting for approval, to run, paused, or with a
+/// run still to happen (a one-off whose run was claimed keeps no next run, but may still wait
+/// behind a turn of the human's). Not done or expired. Each with the time it runs at, for a
+/// one-off: its next run, or the slot of its run still pending.
+fn live_made(hub: &Hub, agent: i64) -> Vec<(Schedule, Option<i64>)> {
     let now = hub.schedules.now();
+    let pending: HashMap<i64, i64> = hub.store().pending_runs().unwrap_or_default().into_iter().map(|r| (r.schedule_id, r.slot)).collect();
     hub.schedules
         .list()
         .into_iter()
         .filter(|s| s.made_by.as_ref().is_some_and(|m| m.agent_id == agent))
-        .filter(|s| {
+        .filter_map(|s| {
+            let runs_at = s.next_run.or_else(|| pending.get(&s.id).copied());
             if s.waiting_approval() {
-                return true;
+                return Some((s, None));
             }
-            let Some(a) = hub.agents().by_id(s.agent_id) else { return false };
-            let expired = plan::expires_at(s, &super::facts_for(hub, &a, s)).is_some_and(|e| now >= e);
-            !expired && (s.next_run.is_some() || s.when.is_trigger())
+            let a = hub.agents().by_id(s.agent_id)?;
+            let expired = plan::expires_at(&s, &super::facts_for(hub, &a, &s)).is_some_and(|e| now >= e);
+            (!expired && (runs_at.is_some() || s.when.is_trigger())).then_some((s, runs_at))
         })
         .collect()
 }
@@ -223,11 +247,13 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 at - now >= REMINDER_MIN_AHEAD_MS && at - now <= REMINDER_MAX_AHEAD_MS,
                 "a reminder is a one-off for yourself 5 minutes to 24 hours ahead; for anything later or recurring, use propose_schedule (the human approves it)"
             );
+            // From the first check to the record of it: one call at a time.
+            let _making = hub.schedules.made.making.lock();
             let mine = live_made(hub, me.id);
             let waiting: Vec<i64> = mine
                 .iter()
-                .filter(|s| s.made_by.as_ref().is_some_and(|m| m.kind == MadeKind::Reminder))
-                .filter_map(|s| s.next_run)
+                .filter(|(s, _)| s.made_by.as_ref().is_some_and(|m| m.kind == MadeKind::Reminder))
+                .filter_map(|(_, at)| *at)
                 .collect();
             ensure!(waiting.len() < REMINDERS_WAITING_MAX, "you already have {} reminders waiting (at most {REMINDERS_WAITING_MAX}): delete one first", waiting.len());
             ensure!(
@@ -235,7 +261,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 "another of your reminders runs within 15 minutes of that time: reminders are at least 15 minutes apart"
             );
             ensure!(mine.len() < AGENT_MADE_MAX, "you already have {AGENT_MADE_MAX} schedules you made: delete one first");
-            let today = hub.schedules.made.count(me.id, MadeKind::Reminder, now - DAY_MS);
+            let today = made_today(hub, me.id, MadeKind::Reminder, now);
             ensure!(today < REMINDERS_PER_DAY, "you set {today} reminders in the last 24 hours (at most {REMINDERS_PER_DAY})");
             // Quiet hours: on by default for a Claude subscription agent, and not for the agent to
             // turn off. A reminder that would only be skipped is refused now.
@@ -307,11 +333,12 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 Some(n) => hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?,
                 None => me.clone(),
             };
+            let _making = hub.schedules.made.making.lock();
             let mine = live_made(hub, me.id);
-            let waiting = mine.iter().filter(|s| s.waiting_approval()).count();
+            let waiting = mine.iter().filter(|(s, _)| s.waiting_approval()).count();
             ensure!(waiting < PROPOSALS_WAITING_MAX, "{waiting} of your proposals are already waiting for the human (at most {PROPOSALS_WAITING_MAX})");
             ensure!(mine.len() < AGENT_MADE_MAX, "you already have {AGENT_MADE_MAX} schedules you made: delete one first");
-            let today = hub.schedules.made.count(me.id, MadeKind::Proposal, now - DAY_MS);
+            let today = made_today(hub, me.id, MadeKind::Proposal, now);
             ensure!(today < PROPOSALS_PER_DAY, "you made {today} proposals in the last 24 hours (at most {PROPOSALS_PER_DAY})");
             if let Some(n) = p.note_id {
                 crate::notes::get(hub, n)?;
@@ -331,6 +358,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
             let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Proposal, reason, at: now, approved_at: None };
             let s = super::create_as(hub, req, Some(made)).map_err(reword)?;
             hub.schedules.made.add(me.id, MadeKind::Proposal, now);
+            drop(_making);
             let j = super::schedule_json(hub, &s);
             let reading = j["reading"].as_str().unwrap_or("").to_string();
             let on = if target.id == me.id { String::new() } else { format!(" on {}", target.name) };
@@ -442,11 +470,27 @@ pub fn estimate(hub: &Hub, agent: &Agent, s: &Schedule, now: i64) -> Value {
         "other"
     };
     let recent = hub.store().count_unattended_since(agent.id, now_ms() - 7 * DAY_MS).unwrap_or(0);
+    // Its times are in its own zone: said whenever that isn't this computer's, with the time
+    // here for a one-off (an owner in London reading "08:30" for Los Angeles).
+    let here = cron::local_zone_name();
+    let other_zone = !s.when.is_trigger() && s.tz.trim() != here;
+    // "America/Los Angeles", as the panel writes it.
+    let zone = s.tz.trim().replace('_', " ");
     let mut lines = Vec::new();
     lines.push(match (&s.when, week, busiest) {
+        (When::Once { at }, _, _) if other_zone => format!(
+            "One run, {} {} time ({} here).",
+            cron::format(&tz, *at, "%a %-d %b at %H:%M"),
+            zone,
+            cron::format(&jiff::tz::TimeZone::system(), *at, "%a %H:%M")
+        ),
         (When::Once { at }, _, _) => format!("One run, {}.", cron::format(&tz, *at, "%a %-d %b at %H:%M")),
         (_, Some(0), _) => "No run in the coming week (quiet hours or its timing).".to_string(),
-        (_, Some(w), Some(b)) => format!("About {w} run{} in the coming week (at most {b} a day).", if w == 1 { "" } else { "s" }),
+        (_, Some(w), Some(b)) => format!(
+            "About {w} run{} in the coming week (at most {b} a day){}.",
+            if w == 1 { "" } else { "s" },
+            if other_zone { format!(", at {zone} times") } else { String::new() }
+        ),
         (_, None, Some(b)) => format!("Runs when its event comes, at most {b} a day."),
         _ => "Runs when its event comes.".to_string(),
     });

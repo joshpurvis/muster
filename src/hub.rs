@@ -1030,6 +1030,15 @@ impl Hub {
     }
 
     pub fn emit(&self, ev: ServerEvent) {
+        // Every session state change passes here: file triggers record who worked when from it
+        // (a leaf lock that calls nothing, so it is safe with `inner` held).
+        match &ev {
+            ServerEvent::SessionUpserted(i) => {
+                self.triggers.observe(i.id, crate::schedules::triggers::working_state(i.state), i.state_since)
+            }
+            ServerEvent::SessionRemoved { id } => self.triggers.session_gone(*id),
+            _ => {}
+        }
         let _ = self.tx.send(ev);
     }
 
@@ -1655,6 +1664,11 @@ impl Hub {
     #[cfg(test)]
     pub(crate) fn set_state_for_test(&self, id: SessionId, state: AgentState) {
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.info.state = state; }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pid_for_test(&self, id: SessionId, pid: Option<u32>) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.info.pid = pid; }
     }
 
     /// Mutate a session's info under the lock, persist, broadcast.
@@ -2373,6 +2387,11 @@ impl Hub {
         crate::panels::adopt_orphans(self, w.id)?;
         self.emit(ServerEvent::WindowUpserted(w.clone()));
         Ok(w)
+    }
+
+    /// Does connection `conn` hold a window (it claimed one with `window.claim`: a UI page)?
+    pub fn holds_window(&self, conn: u64) -> bool {
+        self.inner.lock().windows.values().any(|w| w.holder == Some(conn))
     }
 
     /// A connection closed: release its window (deleted when it has no tabs).

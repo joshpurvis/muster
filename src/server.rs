@@ -96,6 +96,8 @@ pub struct Peer {
     pub source: String,
     /// `Tailscale-User-Login`, only from a trusted proxy (headers from anyone else are ignored).
     pub ts_login: Option<String>,
+    /// The TCP peer (its processes are looked up for `schedule.approve`).
+    pub addr: Option<SocketAddr>,
 }
 
 impl Peer {
@@ -104,6 +106,7 @@ impl Peer {
             proxied: false,
             source: "local".into(),
             ts_login: None,
+            addr: None,
         }
     }
 }
@@ -159,6 +162,7 @@ async fn classify(State(hub): State<Arc<Hub>>, mut req: Request, next: Next) -> 
         _ => false,
     };
     let mut peer = Peer::local();
+    peer.addr = conn;
     peer.proxied = forwarded || trusted;
     if trusted {
         let h = req.headers();
@@ -284,6 +288,10 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // A page of Muster's own (the desktop window, or the UI in a browser) sends one of its
+    // origins; a script's WebSocket usually sends none. Only such a connection may approve an
+    // agent's proposal (`rpc::approve_from_window`).
+    let ui_origin = headers.contains_key(header::ORIGIN) && origin_allowed(&headers, hub.port());
     let who = if !q.token.is_empty() || headers.contains_key(header::AUTHORIZATION) {
         if peer.proxied || !hub.check_client_token(&q.token) {
             return unauthorized();
@@ -299,8 +307,9 @@ async fn ws_upgrade(
             Err(r) => return r,
         }
     };
+    let link = crate::rpc::WsLink { ui_origin, peer: peer.addr, server: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), hub.port())) };
     ws.max_message_size(16 * 1024 * 1024)
-        .on_upgrade(move |socket| crate::rpc::ws_session(socket, hub, who))
+        .on_upgrade(move |socket| crate::rpc::ws_session(socket, hub, who, link))
 }
 
 /// `POST /api/rpc`: bearer client token (local only) or a device cookie plus `X-Muster: 1`.
@@ -614,6 +623,61 @@ pub fn socket_owner(peer: SocketAddr, server: SocketAddr) -> Option<u32> {
     found
 }
 
+/// The processes holding the client end (`peer`) of an established loopback connection to
+/// `server`: the socket's inode from /proc/net/tcp and tcp6 (the whole 4-tuple must match), then
+/// every process of ours with a descriptor on it (`/proc/<pid>/fd`; others' can't be read). Empty
+/// without procfs or when nothing matches.
+pub fn socket_pids(peer: SocketAddr, server: SocketAddr) -> Vec<u32> {
+    const ESTABLISHED: &str = "01";
+    let mut inodes: Vec<String> = Vec::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 || f[3] != ESTABLISHED {
+                continue;
+            }
+            if parse_proc_addr(f[1]).is_some_and(|a| same_endpoint(a, peer))
+                && parse_proc_addr(f[2]).is_some_and(|a| same_endpoint(a, server))
+                && f[9] != "0"
+            {
+                inodes.push(format!("socket:[{}]", f[9]));
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+    let mut pids = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return pids };
+    for p in procs.flatten() {
+        let Some(pid) = p.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else { continue };
+        if fds.flatten().any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| inodes.iter().any(|i| l.as_os_str() == i.as_str()))) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+/// Is `pid`, or a process it descends from (its parent, their parent, …), one of `roots`? From
+/// `/proc/<pid>/stat`; false without procfs. A process whose parent ended was handed to init or
+/// a subreaper, so it no longer descends from where it started.
+pub fn descends_from(pid: u32, roots: &std::collections::HashSet<u32>) -> bool {
+    let mut cur = pid;
+    for _ in 0..256 {
+        if roots.contains(&cur) {
+            return true;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{cur}/stat")) else { return false };
+        match crate::gui::parse_proc_stat(&stat) {
+            Some((_, ppid)) if ppid > 1 && ppid != cur => cur = ppid,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn same_endpoint(a: SocketAddr, b: SocketAddr) -> bool {
     let canon = |ip: IpAddr| match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
@@ -868,5 +932,28 @@ mod tests {
         // The same client port towards another destination doesn't count.
         assert_eq!(socket_owner(peer, "127.0.0.1:1".parse().unwrap()), None);
         assert_eq!(socket_owner("127.0.0.1:1".parse().unwrap(), server), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connections_processes_and_what_they_descend_from() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (_srv, peer) = l.accept().unwrap();
+        let me = std::process::id();
+        let pids = socket_pids(peer, l.local_addr().unwrap());
+        assert!(pids.contains(&me), "{pids:?}");
+        assert!(socket_pids(peer, "127.0.0.1:1".parse().unwrap()).is_empty(), "another destination: no one");
+        // This process descends from itself and from its parent; not from an unrelated pid.
+        let parent = std::os::unix::process::parent_id();
+        assert!(descends_from(me, &[me].into_iter().collect()));
+        assert!(descends_from(me, &[parent].into_iter().collect()));
+        assert!(!descends_from(me, &[u32::MAX - 1].into_iter().collect()));
+        // A child process descends from us.
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(descends_from(child.id(), &[me].into_iter().collect()));
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(c);
     }
 }

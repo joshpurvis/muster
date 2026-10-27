@@ -441,6 +441,9 @@ export function pushRecentFolder(path: string) {
 // ---------------- overlays, toasts, inline UI ----------------
 
 // Overlays (only one modal at a time).
+/** The New / Edit schedule dialog. */
+export type ScheduleOverlay = { kind: "schedule"; id?: number; agent?: string; draft?: unknown };
+
 export type Overlay =
   | { kind: "account_profiles" }
   | { kind: "jump"; initial: string }
@@ -461,10 +464,12 @@ export type Overlay =
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
   | { kind: "agent"; name?: string; tab?: "settings" | "memory"; template?: string }
   | { kind: "agent_message"; id: number }
-  /** New schedule (no `id`; `agent` preselects one) or Edit schedule. */
-  | { kind: "schedule"; id?: number; agent?: string }
-  /** Scheduling settings: pause all, quiet hours, the unattended cap. */
-  | { kind: "schedule_settings" }
+  /** New schedule (no `id`; `agent` preselects one) or Edit schedule. `draft`: the fields as
+   * typed before Scheduling settings opened over it (the dialog's own shape). */
+  | ScheduleOverlay
+  /** Scheduling settings: pause all, quiet hours, the unattended cap, watched folders. `back`:
+   * opened from the schedule dialog, which it returns to (with its draft) when it closes. */
+  | { kind: "schedule_settings"; back?: ScheduleOverlay }
   | {
     kind: "confirm";
     title: string;

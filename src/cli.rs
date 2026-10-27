@@ -824,8 +824,9 @@ pub enum ScheduleCmd {
     },
     /// Renew a Claude subscription agent's schedule for 7 more days.
     Renew { id: i64 },
-    /// Approve an agent's proposed schedule (only you can): it then runs like any schedule.
-    /// `muster schedule rm` dismisses one.
+    /// Not here: an agent's proposal is approved only with a click on Approve in Muster's window
+    /// (so an agent can't approve its own from a shell). `muster schedule rm` dismisses one.
+    #[command(hide = true)]
     Approve { id: i64 },
     /// Inside an agent's session: propose a schedule; it runs only once the human approves it in
     /// the Agents panel. Give one timing as for `add`, and --reason.
@@ -976,20 +977,28 @@ fn schedule_when(every: Option<String>, hourly: Option<String>, daily: Option<St
 }
 
 /// `--at`: `+20m`/`+2h`, `HH:MM` (the next one), or `YYYY-MM-DD HH:MM`, in `tz` (else local).
+/// `--at +20m` / `+2h` / `+1d` (or `in 20m`): whole minutes from now. None: not a relative time.
+fn relative_minutes(s: &str) -> anyhow::Result<Option<i64>> {
+    let s = s.trim();
+    let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
+    let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) else { return Ok(None) };
+    let rel = rel.trim();
+    let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let per = match unit.trim() {
+        "m" | "min" | "mins" | "minutes" => 1,
+        "h" | "hour" | "hours" => 60,
+        "d" | "day" | "days" => 24 * 60,
+        _ => return Err(bad()),
+    };
+    Ok(Some(n.checked_mul(per).ok_or_else(bad)?))
+}
+
 fn once_at(s: &str, tz: Option<&str>) -> anyhow::Result<i64> {
     let s = s.trim();
     let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
-    if let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
-        let rel = rel.trim();
-        let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
-        let n: i64 = n.parse().map_err(|_| bad())?;
-        let ms = match unit.trim() {
-            "m" | "min" | "mins" | "minutes" => n * 60_000,
-            "h" | "hour" | "hours" => n * 3_600_000,
-            "d" | "day" | "days" => n * 86_400_000,
-            _ => return Err(bad()),
-        };
-        return Ok(now_ms() + ms);
+    if let Some(m) = relative_minutes(s)? {
+        return Ok(now_ms() + m * 60_000);
     }
     let zone = match tz {
         Some(t) => crate::schedules::cron::zone(t).map_err(|e| exit(2, e))?,
@@ -1154,12 +1163,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        ScheduleCmd::Approve { id } => {
-            let s = one("schedule.approve", json!({"id": id}))?;
-            let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
-            println!("schedule {id} approved: {} (agent {}); next {next}", s["reading"].as_str().unwrap_or(""), s["agent"].as_str().unwrap_or("?"));
-            Ok(())
-        }
+        ScheduleCmd::Approve { id } => Err(exit(
+            2,
+            format!(
+                "schedule {id}: {}. Open Muster's Agents panel and click Approve on the proposal (`muster schedule rm {id}` dismisses it).",
+                crate::rpc::APPROVE_BY_CLICK
+            ),
+        )),
         ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,
             quiet_hours, max_per_day, note } => {
             let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
@@ -1180,9 +1190,15 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             Ok(())
         }
         ScheduleCmd::Remind { prompt, at, name, tz } => {
-            let at = once_at(&at, tz.as_deref())?;
+            // `+20m` goes as minutes from now, counted by the daemon when it sets the reminder
+            // (a time worked out here would already be a moment short of `+5m`).
+            let when = match relative_minutes(&at)? {
+                Some(m) => json!({"in_minutes": m}),
+                None => json!({"at": once_at(&at, tz.as_deref())?}),
+            };
             let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
-            let mut p = json!({"prompt": text, "at": at, "name": name, "tz": tz});
+            let mut p = json!({"prompt": text, "name": name, "tz": tz});
+            p.as_object_mut().unwrap().extend(when.as_object().unwrap().clone());
             p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
             let r = one("schedule.remind", p)?;
             println!("schedule {}: reminder at {}", r["schedule_id"], r["runs_at"].as_str().unwrap_or("?"));
@@ -2833,6 +2849,34 @@ mod tests {
         let next = once_at("2030-01-02 03:04", Some("UTC")).unwrap();
         assert_eq!(next, 1893553440000);
         assert!(once_at("tomorrow-ish", None).is_err());
+    }
+
+    #[test]
+    fn remind_sends_a_relative_time_as_minutes_and_approve_is_a_click() {
+        use std::sync::{Arc, Mutex};
+        assert_eq!(relative_minutes("+5m").unwrap(), Some(5));
+        assert_eq!(relative_minutes("in 2h").unwrap(), Some(120));
+        assert_eq!(relative_minutes("+1d").unwrap(), Some(1440));
+        assert_eq!(relative_minutes("15:30").unwrap(), None);
+        assert!(relative_minutes("+5x").is_err());
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let log = calls.clone();
+        let d = mock_daemon(move |method, params| {
+            log.lock().unwrap().push((method.to_string(), params.clone()));
+            json!({"schedule_id": 9, "runs_at": "Mon 10:05"})
+        });
+        let remind = |at: &str| ScheduleCmd::Remind { prompt: vec!["check CI".into()], at: at.into(), name: None, tz: None };
+        schedule(&d, remind("+5m")).unwrap();
+        schedule(&d, remind("2030-01-02 03:04")).unwrap();
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got[0].0, "schedule.remind");
+        // Minutes from now, counted by the daemon: `+5m` is exactly 5 minutes ahead there.
+        assert_eq!((got[0].1["in_minutes"].as_i64(), got[0].1.get("at")), (Some(5), None), "{:?}", got[0].1);
+        assert!(got[1].1["at"].is_i64() && got[1].1.get("in_minutes").is_none());
+        // Approving isn't the command line's: nothing is sent.
+        let e = schedule(&d, ScheduleCmd::Approve { id: 3 }).unwrap_err().to_string();
+        assert!(e.contains("click on Approve"), "{e}");
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]

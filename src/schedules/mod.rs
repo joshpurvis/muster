@@ -228,10 +228,21 @@ pub struct WatchState {
     /// (a slow `gh` call) whose answer comes back after is thrown away, not saved.
     #[serde(default)]
     pub generation: u64,
-    /// Files: the newest change time (ctime, ns since the epoch) seen in the folder. A file
-    /// changed after it is new or changed (None: not looked yet; the first look only records it).
+    /// Files: the scan boundary (ctime, ns since the epoch): a file whose change time is after
+    /// it is new or changed, unless `recent` lists it with that time (None: not looked yet; the
+    /// first look only records). It is a little before the look that set it started, never the
+    /// newest change seen, so a file changed while a look ran is not skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stamp: Option<u64>,
+    /// Files: those already reported whose change time is after `stamp` (path below the
+    /// folder, ctime), so the overlap between looks reports nothing twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<(String, u64)>,
+    /// Files with subfolders: the folders seen at the last look (device, inode), sorted. A
+    /// folder not among them was made or moved in, and everything in it is new content (a
+    /// folder moved in keeps its files' change times). None: not recorded yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirs: Option<Vec<(u64, u64)>>,
 }
 
 /// Who made a schedule when it wasn't the human (Phase 3): an agent's proposal, which never runs

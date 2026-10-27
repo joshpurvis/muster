@@ -774,7 +774,7 @@ so agents can read each other's terminals but not reach the user's project works
 
 A named agent can schedule work for itself (docs/SCHEDULING_PLAN.md, Phase 3). The owner's rule:
 an agent **proposes** and the human **approves** each proposal with a click in the Agents panel
-(or `muster schedule approve`); the one exception is a **one-off reminder for the agent itself,
+(only there: no command, tool or script approves); the one exception is a **one-off reminder for the agent itself,
 5 minutes to 24 hours ahead**, which runs without approval. Code: `src/schedules/agent.rs`.
 
 | Tool | Arguments | Result |
@@ -788,9 +788,13 @@ an agent **proposes** and the human **approves** each proposal with a click in t
 Rules (every one is checked in the tool, whatever the client):
 
 - **Only the human approves, resumes or widens.** No tool approves, resumes, edits or makes a
-  schedule directly; `schedule.approve`, `schedule.update`, `schedule.create`, resuming and the
-  settings are refused from an agent's session and from a shell an agent has typed into
-  (docs/PROTOCOL.md "Schedules"). To change an approved schedule an agent proposes a new one.
+  schedule directly; `schedule.update`, `schedule.create`, resuming and the settings are refused
+  from an agent's session and from a shell an agent has typed into, and `schedule.approve` is
+  taken only from a click in Muster's window (a WebSocket of the UI's that holds a window, whose
+  process isn't inside any session: never the CLI, `/api/rpc` or a script; docs/PROTOCOL.md
+  "Schedules"). To change an approved schedule an agent proposes a new one. (Agents run as the
+  owner's user, so this raises the bar rather than closing it: docs/SCHEDULING_PLAN.md "Approval
+  and its limits".)
 - **Not from unattended work.** A session handling scheduled or triggered work (any chain a
   schedule or trigger started: its provenance's origin isn't `human`) can't propose or set a
   reminder. So a reminder can't set the next one, and a schedule can't breed more schedules; the
@@ -800,7 +804,10 @@ Rules (every one is checked in the tool, whatever the client):
   agent that takes scheduled work.
 - **Limits per agent:** reminders at most 3 waiting, at least 15 minutes apart, 10 set per rolling
   24 hours (deleted ones count); proposals at most 3 waiting, 10 per rolling 24 hours (deleted or
-  dismissed ones count); at most 5 live schedules it made (waiting, active or paused). The cron
+  dismissed ones count); at most 5 live schedules it made (waiting, active, paused, or a one-off
+  whose run is due but still waiting in line, which also counts as waiting and for the 15
+  minutes). Calls are checked and recorded one at a time, so calls made at once (MCP and
+  `muster schedule` together) can't overshoot a limit. The cron
   floor (every 15 minutes at most) applies as to the human's. Proposals and reminders share the
   post rate limit (30 per minute with note writes, panel updates and posts).
 - **Once made (a reminder) or approved (a proposal), it is an ordinary schedule:** origin

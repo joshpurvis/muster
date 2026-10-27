@@ -71,6 +71,9 @@ import {
   isProposal,
   madeByLabel,
   proposalFacts,
+  promptIsLong,
+  readingWithZone,
+  FILES_DEPTH,
   waitingProposals,
 } from "../schedules.ts";
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
@@ -224,8 +227,13 @@ export function moveRow(e: KeyboardEvent) {
 function ProposalCard({ s, now }: { s: Schedule; now: number }) {
   const m = s.made_by!;
   const sub = s.estimate?.billing === "claude_subscription";
-  const facts = proposalFacts(s);
-  const label = `Proposed by ${m.agent}: ${s.name}, ${s.reading}, on ${s.agent ?? "a removed agent"}. Waiting for your approval.`;
+  const facts = proposalFacts(s, browserZone());
+  const when = facts[0].value;
+  const long = promptIsLong(s.prompt);
+  /** A long prompt shows its start; "Show all" (or the keyboard, in the focusable box) the rest. */
+  const [whole, setWhole] = useState(false);
+  const promptId = useId();
+  const label = `Proposed by ${m.agent}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}. Waiting for your approval.`;
   return (
     <div
       role="listitem"
@@ -264,7 +272,27 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
         <div class="sch-prop-fact sch-prop-fact-block">
           <dt>Prompt</dt>
           <dd>
-            <pre class="sch-prop-prompt">{s.prompt}</pre>
+            {/* Focusable, so the keyboard scrolls it (WebKit doesn't focus a scrolling box itself). */}
+            <pre
+              id={promptId}
+              class={cx("sch-prop-prompt", whole && "whole")}
+              tabIndex={0}
+              role="region"
+              aria-label={`The prompt ${m.agent} proposes${long && !whole ? " (scroll, or Show all)" : ""}`}
+            >
+              {s.prompt}
+            </pre>
+            {long && (
+              <button
+                type="button"
+                class="sch-link sch-prop-more"
+                aria-controls={promptId}
+                aria-expanded={whole}
+                onClick={() => setWhole(!whole)}
+              >
+                {whole ? "Show less" : `Show all (${s.prompt.split("\n").length} lines)`}
+              </button>
+            )}
           </dd>
         </div>
         {m.reason && (
@@ -325,9 +353,10 @@ function TimedRow({ s, now }: { s: Schedule; now: number }) {
     e.stopPropagation();
     A.renewSchedule(s);
   };
+  const reading = readingWithZone(s, browserZone());
   const label = [
     s.name,
-    s.reading,
+    reading,
     made?.tip,
     next.text,
     watch && `${watch.text}: ${watch.tip}`,
@@ -343,7 +372,7 @@ function TimedRow({ s, now }: { s: Schedule; now: number }) {
         tabIndex={0}
         aria-expanded={open}
         aria-label={label}
-        data-tip={`${s.reading}${allPaused && next.tone === "next" ? " · all schedules are paused" : ""}`}
+        data-tip={`${reading}${allPaused && next.tone === "next" ? " · all schedules are paused" : ""}`}
         onClick={toggle}
         onKeyDown={(e) => {
           if (e.target !== e.currentTarget) return;
@@ -610,21 +639,30 @@ const groupLabel = (g: AgentChoice["group"], work: string) =>
 
 const MINUTES = Array.from({ length: 60 }, (_, i) => i);
 
+/** What the dialog keeps while Scheduling settings is open over it (`A.scheduleSettingsDialog`
+ * with a way back): the fields as typed, as they were when it first opened, and "More". */
+interface KeptDraft {
+  d: Draft;
+  initial: Draft;
+  more: boolean;
+}
+
 export function ScheduleDialog(
-  { id, agent: wanted, Modal, close }: { id?: number; agent?: string; Modal: ModalT; close: () => void },
+  { id, agent: wanted, keep, Modal, close }: { id?: number; agent?: string; keep?: unknown; Modal: ModalT; close: () => void },
 ) {
   const editing = id !== undefined;
   const sched = editing ? schedules.value.find((s) => s.id === id) : undefined;
+  const kept = keep as KeptDraft | undefined;
   const timeChoices = useMemo(() => scheduleAgents(agents.value), [agents.value]);
-  const [d, setD] = useState<Draft>(() => draftOf(sched, defaultScheduleAgent(timeChoices, wanted), Date.now()));
+  const [d, setD] = useState<Draft>(() => kept?.d ?? draftOf(sched, defaultScheduleAgent(timeChoices, wanted), Date.now()));
   /** The fields as the dialog opened: Save sends `when` only when the timing controls changed. */
-  const [initial] = useState(d);
+  const [initial] = useState(kept?.initial ?? d);
   const [preview, setPreview] = useState<SchedulePreview | null>(null);
   const [pErr, setPErr] = useState<string | null>(null);
   const [pBusy, setPBusy] = useState(false);
   /** Asks the backend again (after "Allow triggers" on the watched note). */
   const [pAgain, setPAgain] = useState(0);
-  const [more, setMore] = useState(() => !!sched && (sched.daily_cap !== null || sched.tz !== browserZone()));
+  const [more, setMore] = useState(() => kept?.more ?? (!!sched && (sched.daily_cap !== null || sched.tz !== browserZone())));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -1066,7 +1104,9 @@ export function ScheduleDialog(
               <span class="toggle-track">
                 <span class="toggle-thumb" />
               </span>
-              <span>and subfolders</span>
+              <span>
+                and subfolders <span class="sch-trig-sub-limit">(up to {FILES_DEPTH} levels down)</span>
+              </span>
             </label>
           </>
         );
@@ -1081,8 +1121,9 @@ export function ScheduleDialog(
     url: "This computer only, with a secret: after saving, copy the ready-made command from the schedule's menu. " +
       "Data sent with it is handed to the agent as untrusted text.",
     files: "Only inside folders you chose under Scheduling settings → Watched folders. Muster lists the folder every " +
-      "15 seconds (at most 5000 entries; hidden and partial files are skipped). Changes made while its agent, or any " +
-      "scheduled or triggered work, is working count as an agent's own and don't fire it.",
+      `15 seconds (at most 5000 entries${d.trig.subfolders ? `, and subfolders only ${FILES_DEPTH} levels down` : ""}; hidden ` +
+      "and partial files are skipped, links aren't followed). Changes made while its agent, or any scheduled or " +
+      "triggered work, is working count as an agent's own and don't fire it.",
   };
   const watchedNote = event && d.trig.kind === "note" && "when" in w && w.when.kind === "note" ? w.when.note_id : null;
   const stepAgents = choices.filter((c) => c.group !== "off");
@@ -1281,7 +1322,12 @@ export function ScheduleDialog(
                   File triggers are off until you choose the folders they may watch, so none can use your agents'
                   time without you deciding where.
                 </p>
-                <button type="button" class="btn btn-sm" onClick={() => A.scheduleSettingsDialog()}>
+                {/* Back here afterwards, with everything typed so far. */}
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  onClick={() => A.scheduleSettingsDialog({ kind: "schedule", id, agent: wanted, draft: { d, initial, more } })}
+                >
                   Scheduling settings…
                 </button>
               </div>
@@ -1506,7 +1552,8 @@ export function ScheduleDialog(
 
 // ---------------- Scheduling settings ----------------
 
-export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close: () => void }) {
+/** `back`: opened from the schedule dialog, which Cancel, Escape and Save return to. */
+export function ScheduleSettingsDialog({ Modal, close, back = false }: { Modal: ModalT; close: () => void; back?: boolean }) {
   const [cur, setCur] = useState<ScheduleSettings | null>(scheduleSettings.value);
   const [paused, setPaused] = useState(cur?.paused ?? false);
   const [from, setFrom] = useState(cur?.quiet_start ?? "23:00");
@@ -1591,7 +1638,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
     }
   };
   return (
-    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings">
+    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings" onClose={close}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1764,7 +1811,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">
-          <button type="button" class="btn" onClick={close}>Cancel</button>
+          <button type="button" class="btn" onClick={close}>{back ? "Back to the schedule" : "Cancel"}</button>
           <button type="submit" class="btn btn-primary" disabled={!ok}>
             {busy ? <Spinner size={12} /> : null} Save
           </button>

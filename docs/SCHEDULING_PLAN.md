@@ -82,16 +82,19 @@ docs/PROTOCOL.md "Schedules" (Phase 3), docs/CLI.md "Agents' proposals and remin
 docs/UI.md "Agents panel". Choices made while building it:
 
 - A proposal is an ordinary schedule with `made_by` and no next run: nothing can make it due
-  (every write keeps it empty), and Run now and Skip next refuse it. Approval is a human-only RPC
-  (`schedule.approve`, refused from an agent's session or a shell an agent drives) that checks it
-  again as if made now. No tool approves, resumes, edits or makes a schedule directly: to change
+  (every write keeps it empty), and Run now and Skip next refuse it. Approval is only a click on
+  Approve in Muster's window (`schedule.approve`, taken only over the UI's own WebSocket: see
+  "Approval and its limits" below; there is no CLI command for it), and checks it again as if
+  made now. No tool approves, resumes, edits or makes a schedule directly: to change
   one an agent proposes a new one. A proposal nobody approves goes after 7 days.
 - Only named agents propose, and never while handling scheduled or triggered work (their
   session's provenance isn't the human's): so a reminder can't set the next reminder, and a
   schedule can't breed schedules. An ask from another agent on a human-rooted chain is the
   human's work and may propose.
 - Reminders: for the caller only, one-off, 5 minutes to 24 hours ahead, at most 3 waiting, 15
-  minutes apart, 10 a day (deleted ones count); a Claude subscription agent keeps quiet hours on
+  minutes apart, 10 a day (deleted ones count; a reminder whose run is due but still waits in line
+  counts as waiting, at its time); the checks and the record of what was made run one call at a
+  time, so calls at once can't overshoot (fix round, 2026-10-26); a Claude subscription agent keeps quiet hours on
   and a time inside them is refused up front. Proposals: at most 3 waiting, 10 a day; at most 5
   live schedules per agent it made (the plan's "at most 5 active schedules"). guess: these
   numbers; the owner may want them tighter or looser.
@@ -103,17 +106,51 @@ docs/UI.md "Agents panel". Choices made while building it:
   (the spend ledger has today's per-agent estimate only).
 - The audit is the MCP log (every call, refused ones too) plus `made_by` on the schedule.
 - Files: polled every 15 s, no inotify (it works the same on macOS and Linux and costs one
-  listing); a ctime cursor kept with the schedule (catches files moved in, which keep their
-  modification time, and changes while Muster was off); at most 5000 entries and 3 levels;
-  hidden and partial files skipped; links never followed. "Ignoring the agent's own writes": a
-  change seen while its agent, or any scheduled or triggered work, is working, or within 30 s
-  after, counts as an agent's own (files have no author). Watched folders are a settings list,
-  empty by default (the owner's opt-in rule): no file trigger can be made until a folder is
-  chosen, and removing one stops its triggers at once.
+  listing); a ctime boundary kept with the schedule, 2 s before the last saved look began, plus
+  the files the overlap already reported (catches files moved in, which keep their modification
+  time, files changed while a look ran, and changes while Muster was off); a subfolder the last
+  look didn't see (made or moved in) counts all its files as new; at most 5000 entries and 3
+  levels; hidden and partial files skipped. Links are never followed: folders are read through
+  open handles (`O_NOFOLLOW`, each subfolder opened from its parent's handle), and the watched
+  folder must still resolve to the very path saved, at every look and before a run is sent; one
+  that is gone, swapped for a link or no longer allowed stops, and its waiting event goes.
+  "Ignoring the agent's own writes": a change made while its agent, or any scheduled or
+  triggered work, was working, or within 30 s after, counts as an agent's own (files have no
+  author); who worked when comes from every session's state changes (a turn's start and end), so
+  a turn between two looks counts too, and it is saved so a reload keeps it. Watched folders are a
+  settings list, empty by default (the owner's opt-in rule): no file trigger can be made until a
+  folder is chosen, and removing one stops its triggers at once.
 - Phone push: not built here (feature/phone-push builds Web Push). Every schedule alert goes
   through `schedules::run::alert` (an in-app notice plus `notify::alert`), the one place a push
   sink needs to hook in.
 - No store migration: schedule records and the settings are JSON.
+
+### Approval and its limits (fix round, 2026-10-26)
+
+What approving takes: `schedule.approve` is answered only on a WebSocket that came in with the
+client token and an `Origin` of Muster's own UI, that has claimed a window (`window.claim`, what
+the desktop window and the UI in a browser do when they load), and whose TCP peer process (found
+from the socket's inode in `/proc/net/tcp` and the holders' `/proc/<pid>/fd`) does not descend
+from any session's process. `/api/rpc` (the CLI, any `curl`), a paired phone, a call naming an
+agent's session or an agent-driven shell, and a connection opened from inside a session are all
+refused; `muster schedule approve` exists only to say "click Approve". The card shows the whole
+prompt (Show all, and the box takes the keyboard) and the schedule's time zone before you click.
+
+What a determined agent can still do, and why: agents run as the owner's own user, so nothing
+inside Muster can tell an agent's program from the owner's. An agent with a shell can read the
+client token (it is in Muster's discovery file, readable by that user), write a small WebSocket
+client that sends the UI's `Origin`, claims a window and approves, and start it **detached from
+its session** (for example a double fork or `setsid` whose parent exits, so the process is handed
+to init or the user's systemd and no longer descends from the session; or `systemd-run --user`).
+It could also drive the real window with input tools (`ydotool`, `xdotool`) or a browser's
+debugging port. How hard: tens of lines of code and knowing to detach, instead of one command;
+the old hole was `env -u MUSTER_SESSION_ID muster schedule approve <id>`. What would close it:
+running agents as another user or in a sandbox without the token and without `/proc` of the
+owner's processes (PROTOCOL.md "Channel permissions", "Limits": the same holds for every agent
+rule), or an approval only a person can give (a second factor on the phone). The audit stays: the
+approval is logged with the schedule (`made_by.approved_at`), and every proposal is in the MCP
+log.
+
 The "Today" section below describes the code before Phase 1.
 
 ## Today (before Phase 1)

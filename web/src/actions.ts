@@ -63,6 +63,7 @@ import {
   workspaceById,
   workspaces,
 } from "./state.ts";
+import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
@@ -1446,8 +1447,9 @@ export function editSchedule(id: number) {
   overlay.value = { kind: "schedule", id };
 }
 
-export function scheduleSettingsDialog() {
-  overlay.value = { kind: "schedule_settings" };
+/** `back`: the schedule dialog it was opened from, shown again (as it was) when it closes. */
+export function scheduleSettingsDialog(back?: ScheduleOverlay) {
+  overlay.value = { kind: "schedule_settings", back };
 }
 
 /** A `schedule.*` call that answers with the schedule: recorded at once, errors toasted. */

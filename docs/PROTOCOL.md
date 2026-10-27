@@ -686,7 +686,7 @@ type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */;
 
 | Method | Params | Result |
 |---|---|---|
-| `schedule.approve` | `{id}` | `Schedule`. The human approves an agent's proposal: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule, and a Claude subscription agent's 7 days start now. Refused from an agent's session or an agent-driven shell (its own proposal included). Dismissing is `schedule.remove`. |
+| `schedule.approve` | `{id}` | `Schedule`. The human approves an agent's proposal: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule, and a Claude subscription agent's 7 days start now. **Only over a WebSocket of the UI's own**: the client token, an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`, `wry://`), a window claimed on that connection (`window.claim`), and the connection's process (found from the socket in `/proc`) not descended from any session's process. Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove`. |
 | `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
 | `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
 | `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
@@ -700,23 +700,39 @@ days after quiet hours and the caps (its own daily cap and the agent's unattende
 (the agent's provider), and the caps that bound it, with the agent's unattended messages of the
 last 7 days. Making a proposal sends a notice (and a desktop notification) that it waits.
 
-**Files.** Only inside a folder in `watch_folders` (checked when the trigger is made, at every
-look, when a run is claimed, before it is sent and before its prompt is submitted). The folder is
-listed every 15 s while the trigger is active (not paused, not expired): at most 5000 entries per
-look (more: `watch.state` `error`, nothing read), `recursive` up to 3 levels, hidden names
-(`.…`), `node_modules`, `target`, `__pycache__` and partial files (`~`, `.swp`, `.tmp`, `.part`,
-`.crdownload`, `.download`, `.partial`) skipped, symbolic links never followed. A file whose
-change time (ctime: set by the system on every write, rename or move into the folder) is newer
-than the newest seen is new or changed; the newest is kept with the schedule
-(`watch.stamp`), so a change while Muster was off fires once after it starts, and the first look
-only records it. Removing a file starts nothing. An event names the folder and up to 10 changed
-files (`New or changed in ~/inbox: a.pdf, b.pdf (+3 more)`), quoted to the agent as data, and is
-debounced like a note's (`quiet_min` after the last change). A change seen while the trigger's
-own agent is working, or while any session handling scheduled or triggered work is, and for 30 s
-after, is taken as an agent's own: recorded as seen, never an event (so a file trigger can't feed
-itself or another). guess: ctime is the system's clock, so a clock set back can hide changes
-until it catches up. What it costs while idle: one directory listing (and a stat per entry) per
-15 s. Debug builds: `MUSTER_TEST_WATCH_EVERY_MS` and `MUSTER_TEST_TRIGGER_DELAY_MS` apply too.
+**Files.** Only inside a folder in `watch_folders`, and only while the folder is still the one
+the trigger was made on: it is resolved again when the trigger is made, at every look, when a run
+is claimed, before it is sent and before its prompt is submitted, and a folder that is gone, was
+swapped for a symbolic link (anywhere along its path, wherever the link leads) or is no longer
+allowed is not read; its waiting event is dropped and its prompts still in a queue are taken back
+(`watch.state` `error` with the reason). The folder is listed every 15 s while the trigger is
+active (not paused, not expired): at most 5000 entries per look (more: `watch.state` `error`,
+nothing read), `recursive` up to 3 levels, hidden names (`.…`), `node_modules`, `target`,
+`__pycache__` and partial files (`~`, `.swp`, `.tmp`, `.part`, `.crdownload`, `.download`,
+`.partial`) skipped. Symbolic links are never followed: the folder is opened with
+`O_NOFOLLOW | O_DIRECTORY` and where the open handle really is must be the saved path, every
+subfolder is opened through its parent's handle the same way, and every entry is looked at with
+`AT_SYMLINK_NOFOLLOW`, so swapping a folder for a link while a look runs leads nowhere. A file
+whose change time (ctime: set by the system on every write, rename or move into the folder) is
+after the last saved look's boundary (`watch.stamp`: 2 s before that look began, not the newest
+change seen, so a file changed during a look is not skipped), and that the overlap hasn't
+reported already (`watch.recent`), is new or changed; with subfolders, so is every file in a
+subfolder the last look didn't see (`watch.dirs`, device and inode: one made or moved in, whose
+files keep their old change times). A change while Muster was off fires once after it starts, and
+the first look only records. Removing a file starts nothing. An event names the folder and up to
+10 changed files (`New or changed in ~/inbox: a.pdf, b.pdf (+3 more)`), quoted to the agent as
+data, and is debounced like a note's (`quiet_min` after the last change). A change made while
+the trigger's own agent was working, or any session handling scheduled or triggered work was,
+or within 30 s after, is taken as an agent's own: recorded as seen, never an event (so a file
+trigger can't feed itself or another). Who worked when is recorded from every session's state
+changes (a span from entering a working state to leaving it), not seen at the looks, so a turn
+that starts, writes and ends between two looks still counts; the spans are kept for an hour and
+saved with the runtime state, so a backend reload keeps them (a session that worked in between
+has a span to its last turn). guess: ctime is the system's clock, so a clock set back (or a
+network file system's clock behind this one's) can hide changes until it catches up. What it
+costs while idle: one directory listing (and a stat per entry) per 15 s. Debug builds:
+`MUSTER_TEST_WATCH_EVERY_MS`, `MUSTER_TEST_TRIGGER_DELAY_MS` and `MUSTER_TEST_ABSORB_GRACE_MS`
+(the 30 s) apply.
 
 No store migration: schedule records and the settings are JSON (an older backend ignores a
 `files` schedule it can't read, and keeps a proposal waiting).

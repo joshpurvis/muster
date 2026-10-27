@@ -5067,6 +5067,11 @@ fieldset.sch-then > legend {
   color: var(--text-muted);
 }
 
+.sch-trig-sub-limit {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
 .sch-trig-none {
   margin-top: -4px;
 }
@@ -5183,6 +5188,17 @@ fieldset.sch-then > legend {
   line-height: 1.45;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* "Show all": the whole prompt, so it can be read in full before approving. */
+.sch-prop-prompt.whole {
+  max-height: none;
+}
+
+.sch-prop-more {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 11px;
 }
 
 .sch-prop-reason {

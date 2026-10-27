@@ -115,8 +115,12 @@ class Client {
   frames: { type: number; id: number; data: Uint8Array }[] = [];
   closed = false;
 
-  constructor(token: string) {
-    this.ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${token}`);
+  /** `origin`: the Origin header to send (Muster's own UI sends its origin; a script none). */
+  constructor(token: string, origin?: string) {
+    const url = `ws://127.0.0.1:${PORT}/ws?token=${token}`;
+    // Deno's WebSocket takes headers as its second argument.
+    // deno-lint-ignore no-explicit-any
+    this.ws = origin ? new (WebSocket as any)(url, { headers: { Origin: origin } }) : new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
     this.ws.onmessage = (m) => {
       if (typeof m.data === "string") {
@@ -1644,7 +1648,8 @@ async function agentSchedules(c: Client, d: Daemon): Promise<{ c: Client; d: Dae
 
   c.close();
   await stopDaemon(d, "SIGTERM");
-  d = await startDaemon({ MUSTER_TEST_TRIGGER_DELAY_MS: "1000", MUSTER_TEST_WATCH_EVERY_MS: "700" });
+  // A file change within the grace after the planner's last turn would be its own: shortened.
+  d = await startDaemon({ MUSTER_TEST_TRIGGER_DELAY_MS: "1000", MUSTER_TEST_WATCH_EVERY_MS: "700", MUSTER_TEST_ABSORB_GRACE_MS: "300" });
   c = new Client(d.token);
   await c.open();
   await c.call("agent.create", { name: "planner", kind: "codex" });
@@ -1675,11 +1680,26 @@ async function agentSchedules(c: Client, d: Daemon): Promise<{ c: Client; d: Dae
   ok(c.events.some((e) => e.event === "notice" && String(e.data.text).includes("planner proposes a schedule")), "a notice says it waits for you");
   ok((await run(["schedule", "ls"])).out.includes("proposed"), "muster schedule ls shows it as proposed");
   const selfApprove = await run(["schedule", "approve", String(pid)], { MUSTER_SESSION_ID: String(sPlan) });
-  ok(!selfApprove.ok && selfApprove.err.includes("agent's session"), `the agent can't approve its own proposal (${selfApprove.err.trim()})`);
+  ok(!selfApprove.ok && selfApprove.err.includes("click on Approve"), `the agent can't approve its own proposal (${selfApprove.err.trim()})`);
+  const unsetApprove = await run(["schedule", "approve", String(pid)]);
+  ok(!unsetApprove.ok && unsetApprove.err.includes("click on Approve"), "nor without its session id (the CLI never approves)");
+  const scripted = await c.call("schedule.approve", { id: pid }).then(() => "approved", (e: Error) => String(e));
+  ok(scripted.includes("click on Approve"), `nor a WebSocket of a script's that holds no window (${scripted})`);
+  const viaHttp = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+    method: "POST", headers: { Authorization: `Bearer ${d.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id: 1, method: "schedule.approve", params: { id: pid } }),
+  }).then((r) => r.json());
+  ok(String(viaHttp.error?.message).includes("click on Approve"), "nor /api/rpc");
   const widen = await run(["schedule", "add", "planner", "--every", "15m", "more"], { MUSTER_SESSION_ID: String(sPlan) });
   ok(!widen.ok && widen.err.includes("agent's session"), "nor make a schedule directly");
-  const approved = await run(["schedule", "approve", String(pid)]);
-  ok(approved.ok && approved.out.includes("approved"), `muster schedule approve (${approved.out.trim()}${approved.err})`);
+  // The window: Muster's own origin and a claimed window, the connection's process outside every
+  // session (this test isn't one of the daemon's sessions).
+  const win = new Client(d.token, `http://127.0.0.1:${PORT}`);
+  await win.open();
+  await win.call("window.claim", {});
+  const approved = await win.call("schedule.approve", { id: pid });
+  ok(approved.status === "active", `approved with a click in the window (${approved.status})`);
+  win.close();
   s = await sched(pid);
   ok(s.status === "active" && s.next_run > Date.now() && s.made_by.approved_at > 0, "approved: active, with a next run");
 

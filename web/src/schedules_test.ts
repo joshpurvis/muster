@@ -42,6 +42,8 @@ import {
   isProposal,
   madeByLabel,
   proposalFacts,
+  promptIsLong,
+  readingWithZone,
   waitingProposals,
 } from "./schedules.ts";
 import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
@@ -486,4 +488,36 @@ Deno.test("files trigger fields", () => {
   const d = draftOfTrigger({ kind: "files", folder: "/home/u/inbox", pattern: "*.pdf", recursive: true, quiet_min: 5 }, blankTrigger());
   eq([d.kind, d.folder, d.pattern, d.subfolders, d.quiet], ["files", "/home/u/inbox", "*.pdf", true, "5"]);
   eq(isTrigger({ kind: "files", folder: "/x", recursive: false, quiet_min: 2 }), true);
+});
+
+Deno.test("a proposal's timing says its time zone; a row says it only when it isn't yours", () => {
+  const la = sched({ tz: "America/Los_Angeles", reading: "At 08:30, Monday to Friday", when: { kind: "cron", cron: "30 8 * * 1-5" } });
+  eq(readingWithZone(la, "Europe/London", true), "At 08:30, Monday to Friday (America/Los Angeles time)");
+  eq(readingWithZone(la, "Europe/London"), "At 08:30, Monday to Friday (America/Los Angeles time)", "not yours: said on a row too");
+  const home = { ...la, tz: "Europe/London" };
+  eq(readingWithZone(home, "Europe/London"), "At 08:30, Monday to Friday", "yours: a row reads as before");
+  eq(readingWithZone(home, "Europe/London", true), "At 08:30, Monday to Friday (Europe/London time)", "a proposal always says it");
+  // A one-off elsewhere also says when that is here: 08:30 in Los Angeles is 16:30 in London.
+  const once = sched({
+    tz: "America/Los_Angeles",
+    reading: "Once, Tue 27 Oct 2026 at 08:30",
+    when: { kind: "once", at: Date.UTC(2026, 9, 27, 15, 30) },
+  });
+  eq(readingWithZone(once, "Europe/London", true), "Once, Tue 27 Oct 2026 at 08:30 (America/Los Angeles time; 15:30 your time)");
+  // ...and the day when it differs (23:30 in Los Angeles is the next morning in London).
+  const late = sched({ tz: "America/Los_Angeles", reading: "Once, Tue 27 Oct 2026 at 23:30", when: { kind: "once", at: Date.UTC(2026, 9, 28, 6, 30) } });
+  eq(readingWithZone(late, "Europe/London", true), "Once, Tue 27 Oct 2026 at 23:30 (America/Los Angeles time; Wed 06:30 your time)");
+  // Triggers have no time.
+  const trig = sched({ tz: "America/Los_Angeles", reading: "When its trigger URL is called", when: { kind: "url", name: "x" } });
+  eq(readingWithZone(trig, "Europe/London", true), "When its trigger URL is called");
+  // The card's When line carries it.
+  const made = { agent_id: 2, agent: "reviewer", kind: "proposal" as const, reason: "r", at: NOW, approved_at: null };
+  eq(proposalFacts({ ...la, status: "proposed", made_by: made }, "Europe/London")[0].value, "At 08:30, Monday to Friday (America/Los Angeles time)");
+});
+
+Deno.test("a long proposal prompt folds, with the rest a click away", () => {
+  eq(promptIsLong("Summarise the Ideas note"), false);
+  eq(promptIsLong(Array.from({ length: 9 }, (_, i) => `line ${i}`).join("\n")), true, "more than 8 lines");
+  eq(promptIsLong("x".repeat(601)), true, "more than 600 characters");
+  eq(promptIsLong(Array.from({ length: 8 }, (_, i) => `line ${i}`).join("\n")), false);
 });

@@ -186,6 +186,10 @@ export function whenToSend(initial: WhenDraft, cur: WhenDraft, tzChanged: boolea
 
 export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url" | "files";
 
+/** A file trigger with subfolders looks this many levels below its folder, no deeper (the
+ * backend's `FILES_DEPTH`). */
+export const FILES_DEPTH = 3;
+
 export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
   { id: "note", label: "A note changes" },
   { id: "git", label: "A branch moves in a git repository" },
@@ -642,10 +646,45 @@ export function madeByLabel(s: Schedule): { text: string; tip: string } | null {
   return { text: `from ${m.agent}`, tip: `Proposed by ${m.agent}${m.approved_at ? `, approved ${shortWhen(m.approved_at, Date.now())}` : ""}` };
 }
 
-/** A proposal card's facts, as plain lines: what runs, when, on which agent. */
-export function proposalFacts(s: Schedule): { label: string; value: string }[] {
+/** "America/Los_Angeles" as people read it: "America/Los Angeles". */
+export function zoneName(tz: string): string {
+  return tz.replaceAll("_", " ");
+}
+
+/** A timed schedule's reading with its time zone: always when `always` (a proposal: you approve
+ * its times), otherwise only when it isn't `here` (this computer's or browser's zone). A one-off
+ * in another zone also says when that is here. Triggers have no time: their reading as it is. */
+export function readingWithZone(s: Schedule, here: string, always = false): string {
+  const tz = s.tz?.trim() ?? "";
+  if (isTrigger(s.when) || !tz) return s.reading;
+  const other = !!here && tz !== here;
+  if (!always && !other) return s.reading;
+  let yours = "";
+  if (other && s.when.kind === "once") {
+    const [y, mo, d, h, mi] = partsIn(s.when.at, here);
+    const [y2, mo2, d2] = partsIn(s.when.at, tz);
+    const hm = `${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}`;
+    const sameDay = y === y2 && mo === mo2 && d === d2;
+    const day = sameDay ? "" : `${new Date(Date.UTC(y, mo - 1, d, 12)).toLocaleDateString("en-GB", { weekday: "short", timeZone: "UTC" })} `;
+    yours = `; ${day}${hm} your time`;
+  }
+  return `${s.reading} (${zoneName(tz)} time${yours})`;
+}
+
+/** A proposal's prompt is shown whole on request past this many lines or characters (the card
+ * shows the start, and the rest stays one click or key away before you approve). */
+export const PROMPT_FOLD_LINES = 8;
+export const PROMPT_FOLD_CHARS = 600;
+
+export function promptIsLong(prompt: string): boolean {
+  return prompt.length > PROMPT_FOLD_CHARS || prompt.split("\n").length > PROMPT_FOLD_LINES;
+}
+
+/** A proposal card's facts, as plain lines: what runs, when (with its time zone), on which agent.
+ * `here`: this browser's zone. */
+export function proposalFacts(s: Schedule, here = ""): { label: string; value: string }[] {
   const out = [
-    { label: "When", value: s.reading },
+    { label: "When", value: readingWithZone(s, here, true) },
     { label: "Agent", value: s.agent ?? "(removed)" },
   ];
   const extras: string[] = [];

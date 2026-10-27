@@ -175,7 +175,7 @@ agent does by default). Triggers run at most every 15 minutes and 10 times a day
 | `gh:<owner/repo>:pr-opened` | a pull request is opened (polled with your own `gh` login) | `--poll-min N` (2-60, default 5) |
 | `gh:<owner/repo>:ci-failed[@branch]` | a GitHub Actions run fails (on that branch only, if given) | `--poll-min N` |
 | `url:<name>` | its trigger URL is called with its secret, or `muster trigger <name>` | |
-| `files:<folder>[/<pattern>]` | files appear or change in that folder (`files:~/inbox/*.pdf`; listed every 15 s). **Only inside a folder you allow under Scheduling settings → Watched folders** (none by default). Changes made while its agent, or any scheduled or triggered work, is working don't count. | `--subfolders` (up to 3 levels), `--quiet-min N` (1-120, default 2) |
+| `files:<folder>[/<pattern>]` | files appear or change in that folder (`files:~/inbox/*.pdf`; listed every 15 s). **Only inside a folder you allow under Scheduling settings → Watched folders** (none by default); a folder later swapped for a link stops it. Changes made while its agent, or any scheduled or triggered work, is working (or within 30 s after) don't count. | `--subfolders` (up to 3 levels down; a folder moved in counts as new), `--quiet-min N` (1-120, default 2) |
 
 The prompt may use `{event}` (what happened) and, for a URL trigger, `{payload}` (the data sent),
 both quoted as untrusted data; a prompt that uses neither gets them added at its end.
@@ -206,15 +206,17 @@ muster schedule add worker --on "files:~/inbox/*.pdf" File each new PDF in the r
 
 ### Agents' proposals and reminders (Phase 3)
 
-An agent proposes a schedule and you approve it; the one exception is a one-off reminder an
-agent sets for itself up to 24 hours ahead (docs/MCP.md "Schedules"). `muster schedule ls` shows
-a proposal as `proposed`.
+An agent proposes a schedule and you approve it with a click on **Approve** in the Agents panel;
+the one exception is a one-off reminder an agent sets for itself up to 24 hours ahead (docs/MCP.md
+"Schedules"). `muster schedule ls` shows a proposal as `proposed`, and `muster schedule rm <id>`
+dismisses one. There is no command to approve one: the command line is what an agent has, so
+`muster schedule approve` only says to click Approve (docs/SCHEDULING_PLAN.md "Approval and its
+limits").
 
 | Command | What it does |
 |---|---|
-| `muster schedule approve <id>` | Approve an agent's proposal (`schedule.approve`): it then runs like any schedule. Only you: refused from an agent's session or a shell an agent drives. `muster schedule rm <id>` dismisses one. |
 | `muster schedule propose TIMING --reason "…" [--agent NAME] [options] [PROMPT...]` | **Inside an agent's session only**: propose a schedule as that agent (its MCP `propose_schedule`). TIMING as for `add`; options `--name`, `--tz`, `--fresh`, `--quiet-hours on\|off`, `--max-per-day N`, `--note <id>`. Prints `schedule ID: proposed (…)` and its estimated use. |
-| `muster schedule remind --at WHEN [PROMPT...]` | **Inside an agent's session only**: a one-off reminder for itself, 5 minutes to 24 hours ahead (`+20m`, `15:30`, `"YYYY-MM-DD HH:MM"`), no approval (its MCP `set_reminder`). |
+| `muster schedule remind --at WHEN [PROMPT...]` | **Inside an agent's session only**: a one-off reminder for itself, 5 minutes to 24 hours ahead (`+20m`, `15:30`, `"YYYY-MM-DD HH:MM"`), no approval (its MCP `set_reminder`). A relative time is sent as minutes (`in_minutes`), counted by the daemon, so `--at +5m` is exactly 5 minutes ahead. |
 
 Inside an agent's session, `muster schedule pause <id>` and `muster schedule rm <id>` run its
 `pause_schedule` and `delete_schedule`: it may pause a schedule that runs on it or that it made,
@@ -224,8 +226,7 @@ and delete one it made; resuming, editing and approving stay yours.
 # run by an agent, in its session:
 muster schedule remind --at +20m Check whether CI on master passed and tell the human.
 muster schedule propose --weekly fri@16:00 --reason "You asked for a weekly summary" Summarise the Ideas note
-# run by you:
-muster schedule approve 12
+# then you click Approve on its card in the Agents panel
 ```
 
 ## Agent skills

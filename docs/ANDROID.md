@@ -214,6 +214,34 @@ maths do not double-offset):
    "queued (n)" from `SendOutcome` (src/inject.rs:39-45). Long-press Send offers "Interrupt
    and send". A settings sheet holds `termSize` and notification opt-in.
 
+   **Scrolling back** (web/src/m/term.ts `scrollBy`): on the normal screen a drag scrolls the
+   phone's own xterm scrollback (10000 lines, filled by the replay and live output); while
+   scrolled up, new output does not move the view. A full-screen program on the alternate
+   screen has no scrollback there: Claude Code's fullscreen view (`"tui": "fullscreen"`) keeps
+   its conversation itself, so the phone showed only its one screen. When the alternate screen
+   is active and the program tracks the mouse (any mode but X10), a vertical drag first pans the
+   phone's view of the screen and the rest becomes mouse-wheel reports (one notch per text row,
+   at the cell under the finger), sent as raw `0x02` input frames like a desktop terminal's
+   wheel, in the program's mouse encoding as xterm.js has it: SGR, SGR pixels, or the legacy
+   one-byte-per-value form (never UTF-8; nothing is sent for a cell past 223, as xterm.js does).
+   The program scrolls its own history (Claude Code keeps its place while new output arrives
+   and shows "N new messages"). This needs the `interact` scope (a view-only phone gets a
+   one-time notice saying to pair again with `muster pair`) and is not resized to the phone in
+   `follow`. The scroll is the program's, so a desktop window showing the same session scrolls
+   with it.
+
+   The phone remembers, per session and process (a restart starts clean) and until the page
+   reloads, how far it scrolled a program back, where, and whether the agent was busy
+   meanwhile, from every session update, also while the session's view is closed (shells always
+   count as busy). So "Latest output" shows again after leaving and reopening the session.
+   "Latest output" sends, at the cell where the scroll happened, the wheel-down notches the
+   phone sent up and, if the agent was busy, more screens' worth (twenty for a Claude session,
+   five otherwise): new lines sit below the program's view, and a program stops at its bottom.
+   It sends wheel reports only, never keys: the session's kind doesn't say what is in front (an
+   editor opened from Claude, say). Dragging back down by the notches alone counts as the
+   newest only if the agent stayed idle. If the return can't be sent (offline, reconnecting),
+   or the replay hasn't arrived yet, the button and the saved state stay.
+
 ## Terminal width
 
 The daemon's resize is "last resizer wins" (src/rpc.rs:197-207 → src/pty.rs:460), and the

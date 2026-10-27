@@ -141,7 +141,7 @@ Deno.test("sleep: the idle time field and the asleep bar's words", () => {
   const MIN = 60_000;
   assertEquals(
     asleepText("ada", 0, false, 90 * MIN),
-    "ada is asleep for 1 h 30 m. The next message, or typing here, wakes it into the same conversation.",
+    "ada has been asleep for 1 h 30 m. The next message, or typing here, wakes it into the same conversation.",
   );
   const cold = asleepText("ada", null, true, 0);
   check(cold.startsWith("ada is asleep. The next message") && cold.includes("full cost"), cold);

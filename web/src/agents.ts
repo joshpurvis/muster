@@ -59,8 +59,10 @@ export function parseSleepAfter(v: string): number | null {
 /** The asleep bar's sentence: how long it has slept, that the next message wakes it, and when
  * its prompt cache has likely expired, what that wake costs (`cold`). */
 export function asleepText(name: string, asleepAt: number | null | undefined, cold: boolean, now: number): string {
-  const since = asleepAt != null ? ` for ${idleText(now - asleepAt)}` : "";
-  return `${name} is asleep${since}. The next message, or typing here, wakes it` +
+  const lead = asleepAt != null && now - asleepAt >= 60_000
+    ? `${name} has been asleep for ${idleText(now - asleepAt)}`
+    : `${name} is asleep`;
+  return `${lead}. The next message, or typing here, wakes it` +
     (cold
       ? `: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.`
       : " into the same conversation.");

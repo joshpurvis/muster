@@ -627,7 +627,76 @@ pub fn ensure_host(executable: &Path) -> anyhow::Result<Arc<TerminalService>> {
     Ok(service)
 }
 
-const LEGACY_DAEMON: &str = "an older Muster daemon is running for this runtime directory (it holds daemon.lock); \
+/// Start `executable` as a terminal host in scratch runtime and data directories under `dir`
+/// (created here, removed afterwards), and check what a backend start will require of it: it
+/// runs, answers this build's protocol hello for that data directory, and holds the fence lock
+/// it is given. Then it is shut down. The running host and its sessions are never touched. A
+/// truncated host, or one of another protocol version, fails here, before a restart ends
+/// anything.
+pub fn probe_host(executable: &Path, dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Scratch<'a>(&'a Path, Option<std::process::Child>);
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.1
+                && child.try_wait().ok().flatten().is_none()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+    crate::paths::ensure_private_dir(dir)?;
+    let mut scratch = Scratch(dir, None);
+    let (runtime, data, fence) = (dir.join("run"), dir.join("data"), dir.join("fence.lock"));
+    crate::paths::ensure_private_dir(&data)?;
+    std::fs::write(&fence, b"")?;
+    let log_path = dir.join("host.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log_path)?;
+    let tail = || {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let last: Vec<&str> = log.lines().rev().take(3).collect();
+        last.into_iter().rev().collect::<Vec<_>>().join(" / ")
+    };
+    let mut command = std::process::Command::new(executable);
+    command.arg("--runtime-dir").arg(&runtime).arg("--data-dir").arg(&data)
+        .env("MUSTER_TERMINAL_FENCE_LOCK", &fence)
+        // A restart's command carries the OpenRouter key for the new daemon; this host gets none.
+        .env_remove(crate::openrouter::ENV_KEY)
+        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    let child = scratch.1.insert(command.spawn().with_context(|| format!("running the terminal host {}", executable.display()))?);
+    let socket = runtime.join("terminal.sock");
+    let end = Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        match Client::connect(&socket) {
+            Ok(client) => break client,
+            Err(error) => match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+                // Not listening yet.
+                Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {}
+                Some(_) => return Err(error.context(format!("reaching the checked terminal host {}", executable.display()))),
+                None => anyhow::bail!("the terminal host {} doesn't speak this build's protocol: {error:#}", executable.display()),
+            },
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("the terminal host {} exited when started ({status}): {}", executable.display(), tail());
+        }
+        anyhow::ensure!(Instant::now() < end, "the terminal host {} did not answer within 10 s", executable.display());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    anyhow::ensure!(client.hello.data_dir == std::fs::canonicalize(&data)?,
+        "the terminal host {} reports another data directory than the one it was given", executable.display());
+    verify_fence(&client.hello, &fence)
+        .with_context(|| format!("the terminal host {} would be refused by this build", executable.display()))?;
+    client.call(Command::Shutdown).context("stopping the checked terminal host")?;
+    let end = Instant::now() + Duration::from_secs(5);
+    while child.try_wait()?.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+const LEGACY_DAEMON: &str ="an older Muster daemon is running for this runtime directory (it holds daemon.lock); \
     stop it with that build's `muster stop` before starting this one";
 
 /// The answering host must hold `lock` (the file at that path now, by device and inode).

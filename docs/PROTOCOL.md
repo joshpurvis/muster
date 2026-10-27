@@ -116,7 +116,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -747,7 +747,8 @@ for a Claude or Codex session. Only real model activity moves it, and never back
 It is null before the conversation's first turn and for shells. Claude's `SessionStart` with
 `source: "clear"` (`/clear`) clears it, and so does any new run that doesn't continue its
 conversation: only Claude's `--resume`/`--continue`, in any spelling the argument check accepts
-(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), keep it. Stored with the session (migration v20),
+(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), and a Codex run that reopens its saved thread
+(`codex resume … -- <id>`), keep it. Stored with the session (migration v20),
 so it survives a backend reload and restart. A session saved before v20 has none; at the next
 backend start, one that is resting (not `working`, `starting` or `exited`) and has had a turn (its
 CLI has set a task title, which Claude Code and Codex do after the first prompt) gets its
@@ -882,14 +883,28 @@ restart), for every agent in the channel, including agents spawned through MCP:
 Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
 `network_access` in the user's own config) decides how a Codex session starts. Claude's
 `default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
-there; the other Claude profiles pass `--permission-mode`. Approval policies are not touched.
+there; the other Claude profiles pass `--permission-mode`.
+New and restarted Codex sessions also receive `-c approval_policy="on-request"` and
+`-c approvals_reviewer="auto_review"`: the automatic approval-review behavior of
+`--approve-for-me`, while preserving the channel's sandbox and network settings. The shorthand
+itself conflicts with `--sandbox`, so Muster passes the equivalent settings separately.
+These are per-process overrides; the user's Codex config is not changed, and already-running
+sessions keep their current approval settings. Because Codex fires its `PermissionRequest` hook
+before the automatic reviewer decides, a Codex session reports `needs_approval` only when the
+approval dialog is on its screen, never from that hook. See the
+[Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and
+[sandbox configuration](https://learn.chatgpt.com/docs/sandboxing).
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
 MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
 later flag win they are checked against an **allowlist** (also again on every restart):
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
 with the keys `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
-`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. Values
+`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. (A Codex
+run that reopens its conversation launches as `codex resume <the same flags> -- <thread id>`;
+the thread is kept outside `extra_args`, so the stored arguments stay valid for older
+backends: `runtime_state` `codex-thread:<session>` for a tab, the agent's record for an
+agent.) Values
 may be attached (`--model=x`, `-mx`, `-cmodel=x`). Anything else (sandbox, approval policy,
 allowed tools, extra dirs, settings, profiles, positional arguments) is refused. Shells are
 not affected.
@@ -907,7 +922,7 @@ the discovery file with the client token, so with network access (`workspace_wri
 and in any unsandboxed mode (`full_access`, `bypass`, or commands the human approves), an agent
 can call this API as the user, e.g. `channel.set_permissions` on its own channel. Pick those
 modes only for work you would let run with your own access. Sources: `codex
---help` (0.155.1), the Codex config reference and "agent approvals & security" docs
+--help` (0.164.0), the Codex config reference and "agent approvals & security" docs
 (`sandbox_workspace_write.network_access`, off by default), `claude --help` (2.1.280) and
 code.claude.com/docs/en/permissions (`default` is labelled "Manual", `manual` is an alias).
 
@@ -1198,10 +1213,15 @@ watcher and no polling by clients.
 | `daemon.reload_handoff` | `{exe}` | `{exe}`. The backend restarts itself: it runs `<its launch path> reload` detached with its own environment plus its OpenRouter key (if any), as `daemon.reload` does. `muster reload` asks for it when run without `OPENROUTER_API_KEY` while the backend has a key (so the key carries over), and always from a command that can't see the backend's process (a sandboxed command in its own PID namespace, which couldn't signal it). Refused (an error starting `handoff refused:`; the CLI then reloads the usual way where it can) without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
+| `daemon.restart` | `{backend, host}` | `{exe}`. What `muster stop` then `muster` do, in one step: every session ends, then a new backend and terminal host start from the launch path `exe`, picked as a normal start picks them (so a waiting terminal host update is installed, and a waiting backend build too). `backend`, `host`: the `updates.backend` and `updates.host` ids the window was shown (null: none waiting). The backend hashes the launch file and the host beside it again and refuses unless they are still those builds (refused: still being written, or replaced since). It runs `<exe> restart-all --report-fd 3 --launch <exe> --app <sha256> [--host <sha256>]` detached (the full hashes it just read), with its own environment plus its OpenRouter key (if any), as `daemon.reload` runs `reload`. Before anything stops, that command takes the lifecycle lock (`<runtime>/lifecycle.lock`, which `muster stop` and `muster reload` also take, so one from a shell meanwhile is refused), checks that it can signal the backend and stop the terminal host (one of another protocol version too: identified by its `terminal.json` and the peer credentials of its socket, then sent SIGTERM), and prepares the release the new daemon will run (the snapshot a daemon start makes, under `<data>/application-releases/`), refusing unless its files have exactly those hashes and are executable. It reports on a socket pair (descriptor 3): `refused: <why>` (the call fails with that reason), or `ready`; then this backend emits `daemon_stopping` `{reason: "restart"}` and answers `go`, and only then does the command stop anything: this backend (waiting up to 120 s until it has really exited), then the host (30 s), then it starts the daemon from the release snapshot (`daemon --foreground --launch <exe>`: it runs that release and looks for updates at `exe`), without opening a window, and checks that the backend answering is the one it started (its `hello.build` that release's), on a new host started from the release's host. Before `ready` it also runs the snapshot once: its backend answers `--version` as this build, and its host starts on scratch directories and answers this build's protocol hello holding the fence it was given; a truncated host or one of another protocol version is refused there. If a step doesn't finish, it stops there and nothing is started over it. A command that exits without a word (an older build without `restart-all`) or says nothing for 20 s is ended and the call fails: nothing was stopped. A failure after `go` comes back as an error `notice` if this backend still runs, and is written to `<runtime>/restart-failed` for the next `muster` to print. Clients keep reconnecting after `{reason: "restart"}` and take only a `hello` from a backend with another `pid`, on a terminal host with another `instance`, as the restarted one; one whose `build` isn't the backend build the window was shown (or, with none shown, its previous build) is taken as restarted by something else, and says so. Never queued for a later connection. |
 | `prefs.get` | `{}` | `{decorations, shell?, cache_warn, cache_ttl, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
 | `prefs.set` | `{decorations?, shell?, cache_warn?, cache_ttl?}` | The new preferences; fields left out stay, unknown fields are refused. `cache_warn`, `cache_ttl`: see "Cold prompt cache". `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
 
-What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.shutdown` (and `prefs.set`, which needs
+`daemon.reload`, `daemon.reload_handoff`, `daemon.restart` and `daemon.shutdown` run one at a time: while one
+this backend started may still happen (until it fails, or this backend stops), the others are refused with
+"Muster is already restarting or shutting down" (`muster reload` reports that instead of waiting).
+
+What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.restart`, `daemon.shutdown` (and `prefs.set`, which needs
 the client token too): they are refused to paired devices (no device scope), to MCP (no tool)
 and hooks (session tokens can't reach this API), and `daemon.*` to calls carrying a
 `from_session` param (the CLI inside a session sends one). That is all. Any process running as

@@ -86,7 +86,7 @@ The "Today" section below describes the code before Phase 1.
 - **Alerts are thin.** Desktop notifications fire only when a session needs you, and there are in-app notices. Phone push is planned (Android phase 2) but not built.
 - **Gaps that matter here:**
   - The daemon listens only on this machine (plus the phone over Tailscale), so nothing on the internet can call it.
-  - Codex agents don't resume their conversation after a restart yet.
+  - (Built since: Codex agents now resume their conversation after a restart, like Claude agents.)
   - The OpenRouter branch (under review) knows each model's price but doesn't track spend.
 
 ## Proposed features (ranked by value per effort)
@@ -221,6 +221,6 @@ they can't waste usage.
 | Safe `gh` runner (for GitHub polling) | src/pr.rs:7 |
 | Notes MCP tools (for note triggers and reply-to-note) | docs/MCP.md:677 |
 | Unattended-use constraint | PLAN.md:39 |
-| Deferred: schedules/webhooks rules; Codex resume | PLAN.md:212, PLAN.md:217 |
+| Deferred: schedules/webhooks rules (Codex resume is built: PLAN.md "Continuity") | PLAN.md:212 |
 | Parked quota-aware scheduler | PLAN.md:130 |
 | OpenRouter model pricing (branch, no spend tracking) | feature/openrouter src/openrouter.rs:375 |

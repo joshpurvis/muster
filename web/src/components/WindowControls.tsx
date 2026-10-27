@@ -78,6 +78,7 @@ function moreMenu(): MenuItem[] {
     "sep",
     { label: "Reload window", keys: "Ctrl+Shift+R", run: () => A.reloadWindow() },
     ...(canCloseWindow() ? [{ label: "Close window", run: () => A.closeWindow() }] : []),
+    { label: "Restart Muster…", danger: true, run: () => (overlay.value = { kind: "restart" }) },
     { label: "Shut down Muster…", danger: true, run: () => (overlay.value = { kind: "shutdown" }) },
   ];
 }

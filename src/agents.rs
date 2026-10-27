@@ -4,8 +4,9 @@
 //! An agent is a stored record (`agents` table) plus at most one muster session at a time: a claude
 //! or codex agent whose cwd is the agent's home dir (`<data>/agents/<name>/`, with a CLAUDE.md or
 //! AGENTS.md written from its persona and a `memory/` dir), in the agent's own tab (channel,
-//! stored on the record) in the "agents" workspace (`<data>/agents`). Claude agents resume their
-//! conversation (`--resume <id>`, the id captured from the SessionStart hook).
+//! stored on the record) in the "agents" workspace (`<data>/agents`). Agents resume their
+//! conversation: Claude with `--resume <id>` (the id from the SessionStart hook), Codex with
+//! `codex resume … <id>` (the thread id from its turn-complete notify).
 //!
 //! Provenance: every session has the origin (`human`, `schedule`, `webhook`) and hop of the
 //! message it is handling ("prov", runtime only). It is set when muster actually types an
@@ -249,7 +250,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
-        resume = if kind == SessionKind::Claude { " and resumes your conversation when you restart" } else { "" },
+        resume = " and resumes your conversation when you restart",
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -570,8 +571,8 @@ pub fn route(agent: &Agent, prov: Option<Prov>, forced: Option<Origin>, recent: 
 pub const MODEL_MAX: usize = 128;
 
 /// `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex), plus
-/// `--resume <id>` for a Claude agent with a conversation to resume. Checked against the
-/// agent-argument allowlist.
+/// `--resume <id>` for a Claude agent with a conversation to resume (a Codex agent's thread is
+/// passed at start instead, `Hub::codex_resume`). Checked against the agent-argument allowlist.
 pub fn agent_args(
     kind: SessionKind,
     model: Option<&str>,
@@ -608,9 +609,9 @@ pub fn agent_args(
             if let Some(e) = effort {
                 out.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
             }
-            // TODO(codex resume): Codex resumes with a subcommand (`codex resume <id>`), which
-            // the adapter doesn't build and the argument allowlist refuses; the id is captured
-            // (`resume_id_from_hook`) but not passed until that is verified against the CLI.
+            // Its thread is not an argument: the hub hands it to the adapter at start
+            // (`Hub::codex_resume`), so stored arguments stay readable by older backends.
+            let _ = resume;
         }
         SessionKind::Shell => anyhow::bail!("agents are claude or codex agents"),
     }
@@ -621,8 +622,9 @@ pub fn agent_args(
 /// `args` with any conversation flag (`--resume`/`--continue`, in every spelling the argument
 /// check accepts) replaced by `--resume <id>`, or dropped for None: how a Claude tab that isn't
 /// a named agent's restarts into the conversation it last used. Its other arguments are kept.
+/// (A Codex tab's thread is kept outside its arguments: `Hub::codex_resume`.)
 pub fn with_resume(kind: SessionKind, args: &[String], id: Option<&str>) -> anyhow::Result<Vec<String>> {
-    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume a conversation");
+    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume through their arguments");
     anyhow::ensure!(id.is_none_or(valid_resume_id), "not a Claude conversation id: {id:?}");
     let mut out = Vec::new();
     for (long, values) in crate::adapters::parse_extra_args(kind, args)? {
@@ -650,12 +652,14 @@ pub fn valid_resume_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The agent's own conversation id from a hook payload: Claude's (and Codex's) SessionStart
-/// `session_id`, Codex notify's `thread-id`.
+/// The conversation id a hook payload reports: Claude's SessionStart `session_id`, Codex
+/// notify's `thread-id` (its turn-complete callback; never its internal title request's). For
+/// Codex that is any thread's, a sub-agent's too: which one a run resumes is the hub's call
+/// (`Hub::conversation_after_hook`), passed in `HookSession::thread`.
 pub fn resume_id_from_hook(kind: SessionKind, event: &str, payload: &Value) -> Option<String> {
     let key = match (kind, event) {
-        (SessionKind::Claude | SessionKind::Codex, "SessionStart") => "session_id",
-        (SessionKind::Codex, "notify") => "thread-id",
+        (SessionKind::Claude, "SessionStart") => "session_id",
+        (SessionKind::Codex, "notify") if !crate::adapters::codex::is_title_generation(payload) => "thread-id",
         _ => return None,
     };
     let id = payload.get(key)?.as_str()?.trim();
@@ -806,7 +810,18 @@ impl Registry {
             runtime: store.load_runtime("agent-attribution")?.unwrap_or_default(),
             ..Default::default()
         };
-        for b in store.load_agents()? {
+        for mut b in store.load_agents()? {
+            // A Codex thread this backend didn't confirm (an older backend saved every notify's,
+            // title requests and sub-agents included, and after a downgrade may have replaced
+            // it) is never resumed: the agent's next start is a new conversation.
+            if b.kind == SessionKind::Codex
+                && let Some(saved) = b.resume_id.clone()
+                && store.confirmed_codex_agent_thread(b.id)?.as_deref() != Some(saved.as_str())
+            {
+                tracing::info!(agent = b.name, "not resuming Codex thread {saved}: an older backend saved it");
+                store.update_agent_runtime(b.id, b.channel_id, b.session_id, None)?;
+                b.resume_id = None;
+            }
             inner.agents.insert(b.id, b);
         }
         Ok(Registry {
@@ -888,7 +903,7 @@ impl Registry {
         Ok(a)
     }
 
-    fn update(&self, store: &Store, id: i64, f: impl FnOnce(&mut Agent)) -> anyhow::Result<()> {
+    pub(crate) fn update(&self, store: &Store, id: i64, f: impl FnOnce(&mut Agent)) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
         let mut next = b.clone();
@@ -1079,7 +1094,9 @@ impl Registry {
                 _ => {},
             }
         }
-        let reply = reply_from_hook(info.kind, event, payload)
+        // A Codex sub-agent's turn ending is not the agent's reply (`HookSession::child`).
+        let child = session.is_some_and(|(_, runtime)| runtime.child);
+        let reply = reply_from_hook(info.kind, event, payload).filter(|_| !child)
             .and_then(|reply| next.active.get(&info.id).copied().map(|msg| (msg, reply)));
         if let Some((msg, _)) = &reply {
             next.active.remove(&info.id);
@@ -1088,11 +1105,19 @@ impl Registry {
         }
         let mut agent = g.agents.values().find(|agent| agent.session_id == Some(info.id)).cloned();
         if let Some(agent) = &mut agent {
-            if let Some(resume_id) = resume_id_from_hook(info.kind, event, payload) {
-                if agent.resume_id.as_deref() != Some(resume_id.as_str()) {
-                    agent.resume_id = Some(resume_id);
-                    fx.agent = Some(agent.id);
-                }
+            // What the hook changes about the conversation the agent resumes, as the hub reads
+            // it (`Hub::conversation_after_hook`: Claude's once it has a prompt, Codex's
+            // top-level thread). Nothing from a run Start fresh is replacing (`fenced`).
+            let fenced = session.is_some_and(|(_, runtime)| runtime.fenced);
+            let change = match session {
+                Some((_, runtime)) => runtime.thread.clone(),
+                None => resume_id_from_hook(info.kind, event, payload).map(Some),
+            };
+            if let Some(resume_id) = change.filter(|_| !fenced)
+                && agent.resume_id != resume_id
+            {
+                agent.resume_id = resume_id;
+                fx.agent = Some(agent.id);
             }
         }
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
@@ -1426,6 +1451,11 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
     hub.check_account_profile(agent.account_profile_id)?;
     check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     if fresh {
+        // First stop the old run's hooks from saving a conversation again (a turn-complete
+        // still queued would otherwise undo the fresh start before the restart replaces it).
+        if let Some(sid) = agent.session_id {
+            hub.fence_conversation(sid);
+        }
         hub.agents().update(hub.store(), agent.id, |b| b.resume_id = None)?;
         agent.resume_id = None;
     }
@@ -1512,6 +1542,23 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
 pub fn restart_args(reg: &Registry, sid: SessionId) -> Option<anyhow::Result<Vec<String>>> {
     let a = reg.by_session(sid)?;
     Some(agent_args(a.kind, a.model.as_deref(), a.effort.as_deref(), a.resume_id.as_deref()))
+}
+
+/// Session `sid`'s run couldn't reopen its agent's conversation (the CLI no longer has it), so
+/// the agent forgets it and its next start is a new conversation instead of failing the same
+/// way. `failed`: the id that run was given (None: unknown, forget whatever is saved). Ok(false):
+/// `sid` is no agent's session, or the agent has since saved another conversation.
+pub fn forget_conversation(hub: &Hub, sid: SessionId, failed: Option<&str>) -> anyhow::Result<bool> {
+    let Some(a) = hub.agents().by_session(sid) else { return Ok(false) };
+    if a.resume_id.is_none() || failed.is_some_and(|f| a.resume_id.as_deref() != Some(f)) {
+        return Ok(false);
+    }
+    hub.agents().update(hub.store(), a.id, |b| b.resume_id = None)?;
+    tracing::info!(agent = a.name, "its conversation couldn't be reopened; the next start begins a new one");
+    if let Some(a) = hub.agents().by_id(a.id) {
+        publish(hub, &a);
+    }
+    Ok(true)
 }
 
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
@@ -2784,7 +2831,9 @@ mod tests {
             a(&["--model=opus", "--verbose", "--debug", "--resume", "x"])
         );
         assert!(with_resume(c, &[], Some("--evil")).is_err());
-        assert!(with_resume(SessionKind::Codex, &[], Some("x")).is_err());
+        assert!(with_resume(SessionKind::Shell, &[], Some("x")).is_err());
+        // A Codex tab's thread is kept outside its arguments (`Hub::codex_resume`).
+        assert!(with_resume(SessionKind::Codex, &[], Some("t-1")).is_err());
     }
 
     #[test]
@@ -2800,14 +2849,21 @@ mod tests {
             resume_id_from_hook(SessionKind::Codex, "notify", &json!({"thread-id": "t-1"})).as_deref(),
             Some("t-1")
         );
-        // And it goes back as --resume for Claude only.
+        // Codex: only a finished turn's thread (one Codex can resume), never its title request's
+        // nor SessionStart's (a thread without a turn yet).
+        let title = json!({"thread-id": "t-2", "input-messages": ["Generate a concise, single-line task title of at most 36 characters"]});
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "notify", &title), None);
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "SessionStart", &p), None);
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "notify", &json!({"thread-id": "-x"})), None);
+        // And it goes back as --resume for Claude; a Codex agent's thread is passed at start
+        // (`Hub::codex_resume`), so its arguments stay valid for older backends.
         assert_eq!(
             agent_args(SessionKind::Claude, Some("opus"), None, Some("abc-1")).unwrap(),
             vec!["--model", "opus", "--resume", "abc-1"]
         );
         assert_eq!(
-            agent_args(SessionKind::Codex, None, Some("xhigh"), Some("abc-1")).unwrap(),
-            vec!["-c", "model_reasoning_effort=xhigh"]
+            agent_args(SessionKind::Codex, Some("gpt-6-sol"), Some("xhigh"), Some("abc-1")).unwrap(),
+            vec!["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]
         );
         assert!(agent_args(SessionKind::Shell, None, None, None).is_err());
         // Through the registry, into the store.

@@ -5,9 +5,14 @@
 // The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
 // Never uses port 7433 or the default data dirs.
 
-const [BASE, BIN] = Deno.args;
-if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary>");
-const PORT = 17433;
+const [BASE, BIN, PORT_ARG] = Deno.args;
+if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary> [port]");
+// A port of its own lets two worktrees run the smoke test at once (scripts/smoke.sh passes
+// MUSTER_SMOKE_PORT).
+const PORT = Number(PORT_ARG || 17433);
+if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 7433) {
+  throw new Error(`bad smoke port ${PORT_ARG}: use 1024-65535, never 7433`);
+}
 const DATA = `${BASE}/data`;
 const RUNTIME = `${BASE}/run`;
 const REPO = `${BASE}/repo`;
@@ -204,11 +209,15 @@ const LAUNCH_DUMP = (cli: string) =>
   `{ printf 'ARGS'; printf ' %s' "$@"; printf '\\n'; for v in ${LAUNCH_VARS}; do if [ -n "\${!v+set}" ]; then printf '%s=%s\\n' "$v" "\${!v}"; fi; done; } > '${BASE}/launch-${cli}-'"$MUSTER_SESSION_ID"`;
 
 async function main() {
-  // Stand-in only: renders an empty Codex composer, records input, never starts an agent.
+  // Stand-in only: renders an empty Codex composer, records input, never starts an agent. Asked
+  // to resume the thread "stale-thread", it fails the way Codex does for a thread it doesn't
+  // have (guess: exit 1 before its TUI and hooks start).
   await Deno.mkdir(`${BASE}/bin`, { recursive: true });
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
 ${LAUNCH_DUMP("codex")}
+if [ "$1" = resume ] && [ "\${@: -1}" = stale-thread ]; then echo 'Error: No saved session found with ID stale-thread. Run \`codex resume\` without an ID to choose from existing sessions.'; exit 1; fi
+if [ "$1" = resume ] && [ -e '${BASE}/codex-broken' ]; then echo 'Error: failed to initialize state runtime: database is locked'; exit 1; fi
 stty -echo -icanon min 1 time 0
 printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
 exec cat > '${BASE}/fake-input'
@@ -1045,6 +1054,77 @@ exec cat > /dev/null
   const agentCh: number = started.session.channel_id;
   const sessOf = async (id: number) => (await c.call("hello")).sessions.find((x: Json) => x.id === id);
   await c.waitFor("fake agent idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === agentSid && e.data.state === "idle"));
+
+  // Codex resume: a finished turn's thread is reopened as `codex resume <flags> -- <thread>` on
+  // the next start, for a plain Codex tab and a named Codex agent alike; a thread Codex no
+  // longer has ends that run, says so, and the next start is a new conversation.
+  const agentToken = await Deno.readTextFile(`${BASE}/fake-token`);
+  /** The launch `act` makes of session `id`, its token, and the events from `act` on. */
+  const codexLaunch = async (id: number, act: () => Promise<unknown>) => {
+    await Deno.remove(`${BASE}/launch-codex-${id}`).catch(() => {});
+    const mark = c.events.length;
+    await act();
+    const args = (await launchOf("codex", id)).args;
+    const since = () => c.events.slice(mark).filter((e) => e.event === "session_upserted" && e.data.id === id).map((e) => e.data);
+    return { args, token: await Deno.readTextFile(`${BASE}/fake-token`), since };
+  };
+  const turnDone = async (id: number, token: string, thread: string) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ type: "agent-turn-complete", "thread-id": thread, "input-messages": ["hi"], "last-assistant-message": `done ${thread}` }),
+    });
+    ok(r.ok, `codex resume: notify for ${thread} accepted`);
+    await c.waitFor(`notify ${thread}`, () => c.events.some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state_detail === `done ${thread}`));
+  };
+  const codexTab: number = (await c.call("session.spawn", { channel_id: agentCh, kind: "codex", extra_args: ["-m", "gpt-smoke"] })).id;
+  const firstArgs = (await launchOf("codex", codexTab)).args;
+  ok(!firstArgs.startsWith("ARGS resume") && !firstArgs.includes(" -- "), `codex resume: a new tab starts a new conversation: ${firstArgs.slice(0, 80)}`);
+  await c.waitFor("codex tab idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === codexTab && e.data.state === "idle"));
+  await turnDone(codexTab, await Deno.readTextFile(`${BASE}/fake-token`), "thread-tab-1");
+  const tab = await codexLaunch(codexTab, () => c.call("session.restart", { id: codexTab }));
+  ok(
+    tab.args.startsWith("ARGS resume -c notify=") && tab.args.endsWith(" -- thread-tab-1") && tab.args.includes(" --sandbox ") &&
+      tab.args.includes(" -m gpt-smoke ") && !tab.args.includes("--resume"),
+    `codex resume: a restarted tab reopens its thread with its flags: ${tab.args.slice(0, 40)}…${tab.args.slice(-60)}`,
+  );
+  await c.call("session.remove", { id: codexTab });
+  // The agent: its thread is on its record, so a restart (and agent.start) reopens it.
+  await turnDone(agentSid, agentToken, "thread-agent-1");
+  ok((await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: the agent keeps its thread");
+  let ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.startsWith("ARGS resume ") && ag.args.endsWith(" -- thread-agent-1"), `codex resume: a restarted agent reopens its thread: ${ag.args.slice(-60)}`);
+  await c.waitFor("resumed agent idle", () => ag.since().some((s) => s.state === "idle"));
+  // A sub-agent's turn (its own thread) never replaces the agent's.
+  const child = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+    method: "POST", headers: { Authorization: `Bearer ${ag.token}` },
+    body: JSON.stringify({ type: "agent-turn-complete", "thread-id": "thread-child", "input-messages": ["sub task"], "last-assistant-message": "child done" }),
+  });
+  ok(child.ok, "codex resume: a sub-agent's notify accepted");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.endsWith(" -- thread-agent-1"), `codex resume: a sub-agent's turn didn't replace the thread: ${ag.args.slice(-40)}`);
+  // Any other failure (here: Codex's database can't open) keeps the thread.
+  await Deno.writeTextFile(`${BASE}/codex-broken`, "");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  await c.waitFor("broken run ends", () => ag.since().some((s) => s.state === "exited" && s.exit_code === 1));
+  await Deno.remove(`${BASE}/codex-broken`);
+  ok(!(await sessOf(agentSid)).state_detail?.includes("couldn't reopen"), "codex resume: an unrelated exit 1 says nothing about the conversation");
+  ok((await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: an unrelated exit 1 keeps the thread");
+  // Start fresh, then a thread Codex no longer has: that run ends, the tab says so, the next
+  // start is new.
+  ag = await codexLaunch(agentSid, () => c.call("agent.start", { name: "bg", fresh: true }));
+  ok(!ag.args.startsWith("ARGS resume"), `codex resume: Start fresh starts a new conversation: ${ag.args.slice(0, 40)}`);
+  await c.waitFor("fresh agent idle", () => ag.since().some((s) => s.state === "idle"));
+  await turnDone(agentSid, ag.token, "stale-thread");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.endsWith(" -- stale-thread"), "codex resume: the restart tries the stale thread");
+  await c.waitFor("stale resume ends", () => ag.since().some((s) => s.state === "exited" && s.exit_code === 1));
+  const failed = await sessOf(agentSid);
+  ok(failed.state_detail?.includes("couldn't reopen its conversation"), `codex resume: the tab says the conversation couldn't be reopened: ${failed.state_detail}`);
+  ok(!(await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: the agent forgets the stale thread");
+  ag = await codexLaunch(agentSid, () => c.call("agent.start", { name: "bg" }));
+  ok(!ag.args.startsWith("ARGS resume") && !ag.args.includes("stale-thread"), `codex resume: the next start is a new conversation: ${ag.args.slice(0, 60)}`);
+  await c.waitFor("fresh agent idle", () => ag.since().some((s) => s.state === "idle"));
+
   const plainTab = await c.call("session.spawn", { channel_id: agentCh, kind: "shell" });
   await c.call("session.hide", { id: plainTab.id }).then(
     () => ok(false, "session.hide refuses a tab that isn't an agent's"),
@@ -1745,6 +1825,75 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
     "openrouter: still in no file after the reloads (the detached backend's log included)",
   );
+
+  // "Restart Muster" (`daemon.restart`): every session ends, then a new backend and a new
+  // terminal host start by themselves from the launch path, and the API answers again.
+  c = await connect();
+  const h0 = await c.call("hello");
+  const live = await c.call("channel.create", { workspace_id: h0.workspaces[0].id, agent: "shell" });
+  let liveSess: Json | undefined;
+  for (let n = 0; n < 100 && !(liveSess?.pid > 0); n++) {
+    liveSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === live.id);
+    if (!(liveSess?.pid > 0)) await sleep(50);
+  }
+  ok(liveSess?.pid > 0 && liveSess.state !== "exited", "restart: a shell runs before it");
+  const stale = await c.call("daemon.restart", { backend: "0123456789ab", host: h0.updates.host })
+    .then(() => "", (e: Error) => e.message);
+  ok(stale.includes("nothing was stopped"), `restart: builds other than the ones shown are refused: ${stale}`);
+  const still = await c.call("hello");
+  ok(still.pid === h0.pid && still.sessions.find((s: Json) => s.id === liveSess!.id)?.state !== "exited",
+    "restart: ...and nothing stopped");
+  const restarted = await c.call("daemon.restart", { backend: h0.updates.backend, host: h0.updates.host });
+  ok(String(restarted.exe).endsWith("/muster"), `restart: started from the launch path (${restarted.exe})`);
+  for (let n = 0; n < 100 && !c.closed && !c.events.some((e) => e.event === "daemon_stopping"); n++) await sleep(20);
+  ok(c.events.some((e) => e.event === "daemon_stopping" && e.data.reason === "restart"),
+    "restart: windows hear daemon_stopping {reason: restart}");
+  let h1: Json | null = null;
+  for (const end = Date.now() + 60000; !h1 && Date.now() < end; await sleep(200)) {
+    try {
+      const disc = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`));
+      if (disc.pid === h0.pid) continue;
+      const k = new Client(disc.token);
+      await k.open();
+      h1 = await k.call("hello");
+      c.close();
+      c = k;
+    } catch { /* not up yet */ }
+  }
+  ok(h1 && h1.pid !== h0.pid, `restart: a new backend answers (pid ${h0.pid} -> ${h1?.pid})`);
+  ok(
+    h1!.terminal_host.instance !== h0.terminal_host.instance && h1!.terminal_host.pid !== h0.terminal_host.pid,
+    `restart: ...with a new terminal host (pid ${h0.terminal_host.pid} -> ${h1!.terminal_host.pid})`,
+  );
+  ok(h1!.sessions.find((s: Json) => s.id === liveSess!.id)?.state === "exited", "restart: the running shell ended");
+  ok(typeof h1!.build === "string" && h1!.build === (h0.updates.backend ?? h0.build),
+    `restart: the new backend runs the build the restart was for (${h0.build} -> ${h1!.build})`);
+  ok(!(await Deno.stat(`${RUNTIME}/restart-failed`).then(() => true, () => false)), "restart: no failure is recorded");
+  ok(h1!.updates.host === null && h1!.updates.backend === null, "restart: no update is left waiting at the launch path");
+  // It runs the release checked before anything stopped (its read-only snapshot), not the build output.
+  // (python3 reads the link: the smoke has no read permission for /proc.)
+  const exeOf = async (pid: number) =>
+    dec.decode((await new Deno.Command("python3", {
+      args: ["-I", "-c", "import os, sys; print(os.readlink(sys.argv[1]))", `/proc/${pid}/exe`],
+      stdout: "piped", stderr: "null",
+    }).output()).stdout).trim();
+  const [appExe, hostExe] = [await exeOf(h1!.pid), await exeOf(h1!.terminal_host.pid)];
+  ok(appExe.includes("/application-releases/") && hostExe.includes("/application-releases/") &&
+    appExe.split("/").slice(0, -1).join("/") === hostExe.split("/").slice(0, -1).join("/"),
+    `restart: the new backend and host run from one checked release (${appExe}, ${hostExe})`);
+  ok(h1!.openrouter.key_present === true, "restart: the restarted backend keeps the OpenRouter key");
+  const after = await c.call("channel.create", { workspace_id: h1!.workspaces[0].id, agent: "shell" });
+  let afterSess: Json | undefined;
+  for (let n = 0; n < 100 && !(afterSess?.pid > 0); n++) {
+    afterSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === after.id);
+    if (!(afterSess?.pid > 0)) await sleep(50);
+  }
+  ok(afterSess?.pid > 0, "restart: the API answers again and a new shell starts on the new host");
+  ok(
+    (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
+    "restart: the key is still in no file",
+  );
+  c.close();
   const stop = await cli(["stop"], ENV);
   ok(stop.success, "openrouter: the reloaded backend stops");
   // `current` (the first backend) has exited; the cleanup below finds nothing left to stop.

@@ -1,7 +1,16 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { SessionInfo } from "../types.ts";
 import { Composer } from "./Composer.tsx";
-import { bindTerminal, channels, closeSession, markOpened, notify, prefs, setPrefs } from "./store.ts";
+import {
+  bindTerminal,
+  channels,
+  closeSession,
+  markOpened,
+  notify,
+  prefs,
+  scrollProgram,
+  setPrefs,
+} from "./store.ts";
 import { PhoneTerminal } from "./term.ts";
 import { Icon, Settings, StateDot } from "./ui.tsx";
 
@@ -40,6 +49,7 @@ export function SessionView({ session: s }: { session: SessionInfo }) {
         parseFloat(getComputedStyle(el.querySelector(".composer-wrap")!).paddingBottom),
       setBottom,
       (size) => setPrefs({ fontSize: size }),
+      (data) => scrollProgram(s.id, data),
     );
     terminal.current = term;
     bindTerminal(term);

@@ -66,6 +66,9 @@ const CODEX_ARGS: &[(&str, Option<char>, Val)] = &[
     ("--config", Some('c'), Val::One),
     ("--image", Some('i'), Val::Many),
     ("--no-alt-screen", None, Val::None),
+    // Muster's own, not a Codex flag: the adapter turns `--resume <id>` into
+    // `codex resume … -- <id>` (`codex::CodexAdapter::command`). Its value is a conversation id.
+    ("--resume", None, Val::One),
 ];
 /// `codex -c key=value` keys that don't touch permissions.
 const CODEX_CONFIG_KEYS: &[&str] = &[
@@ -142,6 +145,9 @@ pub fn parse_extra_args<'a>(kind: SessionKind, args: &'a [String]) -> anyhow::Re
                     }
                 }
             }
+        }
+        if kind == SessionKind::Codex && long == "--resume" && !values.iter().all(|v| crate::agents::valid_resume_id(v)) {
+            anyhow::bail!("{a} needs a conversation id (letters, digits, - and _), not {values:?}");
         }
         if kind == SessionKind::Codex && long == "--config" {
             for kv in &values {
@@ -249,6 +255,8 @@ mod tests {
             &["--model=gpt-6-sol", "-cmodel_reasoning_effort=high", "--config", "model_verbosity=low"],
             &["-mgpt-6-luna"],
             &["-i", "a.png", "b.png", "--no-alt-screen"],
+            &["--resume", "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b", "-m", "x"],
+            &["--resume=t-1"],
         ] {
             assert!(check(Codex, ok), "{ok:?}");
         }
@@ -282,6 +290,11 @@ mod tests {
             &["-c", "profiles.loose.sandbox_mode=danger-full-access"],
             &["--model"],
             &["stray-positional"],
+            &["--resume"],
+            &["--resume", "--sandbox"],
+            &["--resume=-x"],
+            &["--resume", "a b"],
+            &["-r", "x"],
         ] {
             assert!(!check(Codex, bad), "{bad:?}");
         }

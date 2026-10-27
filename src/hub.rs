@@ -271,6 +271,10 @@ struct SessEntry {
     busy: bool,
     /// `kill_session` arrived while a process was being started.
     kill_requested: bool,
+    /// The run a restart killed to replace it: its exit is no failed start (`pty_exited`).
+    /// The replacement's own exit, also one while the restart is still in progress (a CLI
+    /// that can't reopen its conversation exits at once), is.
+    killed_generation: Option<u64>,
     /// The last title this session set that was usable as a channel name (`clean_title`).
     /// Later unusable titles (a shell prompt, the program name) don't clear it.
     usable_title: Option<String>,
@@ -280,8 +284,9 @@ struct SessEntry {
     /// Its `Working` was put there by backend recovery, not seen: leaving it is no sign of a
     /// model request (src/cache.rs). Cleared by the next state change.
     unverified_working: bool,
-    /// The run's latest Claude conversation id (SessionStart) for a tab that isn't a named
-    /// agent's; None until this run reports one (`resume_after_hook`).
+    /// The run's latest conversation id (Claude: any hook's `session_id`; Codex: notify's
+    /// `thread-id` or a hook's `session_id`); None until this run reports one
+    /// (`resume_after_hook`). None at exit means the run never opened a conversation.
     conversation: Option<String>,
 }
 
@@ -808,6 +813,7 @@ impl Hub {
                     last_dequeue_at: 0,
                     busy: false,
                     kill_requested: false,
+                    killed_generation: None,
                     usable_title,
                     port_base,
                     unverified_working,
@@ -1705,7 +1711,8 @@ impl Hub {
     }
 
     pub(crate) fn pty_exited(&self, id: SessionId, generation: u64, code: i32) {
-        let channel_id = {
+        let mut agent_lost = None;
+        let (channel_id, mut failed_resume) = {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id) else {
                 return;
@@ -1721,14 +1728,23 @@ impl Hub {
             e.info.pid = None;
             e.info.queued = 0;
             e.info.subagents = 0;
-            // Not for a kill (a restart or shutdown), nor a named agent's tab.
-            if !e.busy && !e.kill_requested && !self.shutting_down.load(Ordering::SeqCst)
+            // Not for a kill (the run a restart replaces, or a shutdown). A named agent's
+            // conversation is on its record (cleared below, outside this lock); a tab's is in
+            // its stored arguments.
+            let mut failed_resume = false;
+            if e.killed_generation != Some(generation) && !e.kill_requested && !self.shutting_down.load(Ordering::SeqCst)
                 && let Some(next) = without_failed_resume(e.info.kind, &e.extra_args, e.conversation.as_deref(), code)
-                && self.agents.by_session(id).is_none()
             {
-                match self.store.set_session_extra_args(id, &next) {
-                    Ok(()) => e.extra_args = next,
-                    Err(error) => tracing::warn!(session = id, "dropping a conversation Claude couldn't resume: {error:#}"),
+                failed_resume = true;
+                agent_lost = self.agents.by_session(id).map(|a| a.id);
+                if agent_lost.is_none() {
+                    match self.store.set_session_extra_args(id, &next) {
+                        Ok(()) => e.extra_args = next,
+                        Err(error) => {
+                            failed_resume = false;
+                            tracing::warn!(session = id, "dropping a conversation the agent couldn't resume: {error:#}");
+                        }
+                    }
                 }
             }
             let token = e.token.take();
@@ -1736,11 +1752,18 @@ impl Hub {
             if let Some(t) = token {
                 g.tokens.remove(&t);
             }
-            ch
+            (ch, failed_resume)
         };
+        if agent_lost.is_some() && let Err(error) = crate::agents::forget_conversation(self, id) {
+            failed_resume = false;
+            tracing::warn!(session = id, "dropping a conversation the agent couldn't resume: {error:#}");
+        }
         crate::inject::drop_queue(self, id);
         let detail = if self.shutting_down.load(Ordering::SeqCst) {
             "daemon stopped".to_string()
+        } else if failed_resume {
+            // Said in the tab: the CLI printed why (e.g. "No conversation found") above.
+            format!("exit code {code}: couldn't reopen its conversation, so the next start begins a new one")
         } else {
             format!("exit code {code}")
         };
@@ -2833,6 +2856,7 @@ impl Hub {
                     last_dequeue_at: 0,
                     busy: true,
                     kill_requested: false,
+                    killed_generation: None,
                     usable_title: None,
                     port_base: 0,
                     conversation: None,
@@ -3029,8 +3053,10 @@ impl Hub {
             crate::openrouter::Provider::OpenRouter => {
                 let key = self.openrouter_key().cloned().ok_or_else(crate::openrouter::missing_key_error)?;
                 if info.kind == SessionKind::Codex {
-                    // Muster's own provider settings, ahead of the stored (allowlisted) args.
-                    spec.args.splice(0..0, crate::openrouter::codex_args());
+                    // Muster's own provider settings, ahead of the stored (allowlisted) args
+                    // (after `resume`: a subcommand comes first).
+                    let at = usize::from(spec.args.first().is_some_and(|a| a == crate::adapters::codex::RESUME));
+                    spec.args.splice(at..at, crate::openrouter::codex_args());
                 }
                 Some(key)
             }
@@ -3273,6 +3299,9 @@ impl Hub {
 
     async fn restart_inner(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
         if let Some(p) = self.pty(id) {
+            if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
+                e.killed_generation = Some(p.generation);
+            }
             // Also reaps leftovers (background jobs) of an already exited process.
             p.kill();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
@@ -3812,10 +3841,11 @@ impl Hub {
             }
             let mut runtime = crate::store::HookSession { generation: entry.generation,
                 subagents: info.subagents, last_hook_at, conversation: entry.conversation.clone(), extra_args: None };
-            if info.kind == SessionKind::Claude && self.agents.by_session(entry.info.id).is_none() {
-                let (conversation, args) = resume_after_hook(entry.conversation.as_deref(), &entry.extra_args, event, &payload);
+            if info.kind != SessionKind::Shell {
+                let (conversation, args) = resume_after_hook(info.kind, entry.conversation.as_deref(), &entry.extra_args, event, &payload);
                 runtime.conversation = conversation;
-                runtime.extra_args = args;
+                // A named agent's conversation is on its record, its arguments rebuilt from it.
+                if self.agents.by_session(entry.info.id).is_none() { runtime.extra_args = args; }
             }
             // State/count/grace and reply attribution all commit with the cursor.
             // A crash before publishing memory can recover state and attribution.
@@ -4015,23 +4045,33 @@ impl Hub {
 
 }
 
-/// What a hook means for the conversation a Claude tab that isn't a named agent's restarts
-/// into (named agents keep theirs on their record, `agents::restart_args`): the run's latest
-/// conversation id (every Claude hook carries it), and the session's new stored arguments when
-/// they change. A conversation becomes `--resume <id>` only once a prompt was sent in it or a
-/// turn ended (Claude can't resume one without messages), so a tab already running when this
-/// shipped picks its conversation up at its next turn; a `/clear` drops the old one until then.
+/// What a hook means for the conversation a Claude or Codex tab that isn't a named agent's
+/// restarts into (named agents keep theirs on their record, `agents::restart_args`, and use
+/// only the first half): the run's latest conversation id, and the session's new stored
+/// arguments when they change.
+///
+/// Claude: every hook carries the id. It becomes `--resume <id>` only once a prompt was sent in
+/// it or a turn ended (Claude can't resume one without messages), so a tab already running when
+/// this shipped picks its conversation up at its next turn; a `/clear` drops the old one until
+/// then.
+///
+/// Codex: the turn-complete notify's `thread-id` becomes `--resume <id>` (`codex resume`), so a
+/// thread is resumed only once it has a finished turn, and a `/new` thread replaces the old one
+/// at its first. A hook's `session_id` only marks the run as having opened a conversation.
+///
 /// Known gap: a restart that overtakes a hook still waiting in the inbox (an outage) misses it.
-fn resume_after_hook(conversation: Option<&str>, args: &[String], event: &str, payload: &serde_json::Value)
+fn resume_after_hook(kind: SessionKind, conversation: Option<&str>, args: &[String], event: &str, payload: &serde_json::Value)
     -> (Option<String>, Option<Vec<String>>) {
-    let kind = SessionKind::Claude;
     let reported = payload.get("session_id").and_then(|v| v.as_str()).map(str::trim)
         .filter(|id| crate::agents::valid_resume_id(id));
-    let conversation = reported.or(conversation).map(str::to_string);
-    let next = match event {
-        "SessionStart" if reported.is_some() && payload.get("source").and_then(|v| v.as_str()) == Some("clear") =>
+    let thread = crate::agents::resume_id_from_hook(kind, event, payload).filter(|_| kind == SessionKind::Codex);
+    let conversation = thread.clone().or(reported.map(str::to_string)).or(conversation.map(str::to_string));
+    let next = match (kind, event) {
+        (SessionKind::Claude, "SessionStart") if reported.is_some() && payload.get("source").and_then(|v| v.as_str()) == Some("clear") =>
             Some(crate::agents::with_resume(kind, args, None)),
-        "UserPromptSubmit" | "Stop" => conversation.as_deref().map(|c| crate::agents::with_resume(kind, args, Some(c))),
+        (SessionKind::Claude, "UserPromptSubmit" | "Stop") =>
+            conversation.as_deref().map(|c| crate::agents::with_resume(kind, args, Some(c))),
+        (SessionKind::Codex, _) => thread.as_deref().map(|t| crate::agents::with_resume(kind, args, Some(t))),
         _ => None,
     };
     let next = match next {
@@ -4045,9 +4085,11 @@ fn resume_after_hook(conversation: Option<&str>, args: &[String], event: &str, p
     (conversation, next)
 }
 
-/// A Claude tab's arguments without the `--resume` its run ended on, when it ended the way a
-/// conversation Claude can't open does ("No conversation found": exit 1 before any
-/// SessionStart), so the next restart starts empty instead of failing the same way.
+/// A Claude or Codex tab's arguments without the `--resume` its run ended on, when it ended the
+/// way a conversation the CLI can't open does: exit 1 before reporting any conversation
+/// (Claude: "No conversation found"; Codex, guess: "No saved session found with ID …", printed
+/// before its TUI and hooks start), so the next restart starts empty instead of failing the
+/// same way. A named agent's run in that case forgets the id on its record instead.
 fn without_failed_resume(kind: SessionKind, args: &[String], conversation: Option<&str>, code: i32) -> Option<Vec<String>> {
     (code == 1 && conversation.is_none() && crate::cache::continues_conversation(kind, args))
         .then(|| crate::agents::with_resume(kind, args, None).ok())
@@ -5698,6 +5740,79 @@ mod tests {
         hook(&hub, "agent-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"}));
         assert!(args(&hub).is_empty());
         assert_eq!(hub.agents.by_session(2).unwrap().resume_id.as_deref(), Some("conv-1"));
+        assert_eq!(hub.inner.lock().sessions.get(&2).unwrap().conversation.as_deref(), Some("conv-1"),
+            "the run opened a conversation (so an exit 1 now isn't a failed resume)");
+        // A run that couldn't reopen it: the agent forgets it, so its next start is a new one.
+        assert!(crate::agents::forget_conversation(&hub, 2).unwrap());
+        assert_eq!(hub.agents.by_session(2).unwrap().resume_id, None);
+        assert_eq!(hub.store.load_agents().unwrap()[0].resume_id, None);
+        assert!(!crate::agents::forget_conversation(&hub, 1).unwrap(), "not an agent's session");
+    }
+
+    /// `fixture_with` plus session 3, a Codex tab in channel 1, with `extra` stored arguments
+    /// (and a named agent "cody" on it when `agent`).
+    fn codex_fixture(extra: &[&str], agent: bool) -> Arc<Hub> {
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let hub = fixture_with(None, |store| {
+            let mut info = crate::mcp::guard::test_session(0, None);
+            info.kind = SessionKind::Codex;
+            info.window_id = Some(1);
+            assert_eq!(store.insert_session(&StoredSession { info, extra_args: extra }).unwrap(), 3);
+            if agent {
+                store.insert_agent(&crate::agents::Agent {
+                    account_profile_id: None, provider: Default::default(), id: 0, name: "cody".into(),
+                    kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
+                    home_dir: "/x".into(), permissions: Permissions::default(),
+                    accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false,
+                }).unwrap();
+            }
+        });
+        hub.inner.lock().tokens.insert("codex-token".into(), 3);
+        hub.set_state_for_test(3, AgentState::Idle);
+        hub
+    }
+
+    #[test]
+    fn a_plain_codex_tab_restarts_into_its_last_thread() {
+        let hub = codex_fixture(&["-m", "gpt-6-sol"], false);
+        let args = |hub: &Hub| hub.inner.lock().sessions.get(&3).unwrap().extra_args.clone();
+        let hook = |event: &str, payload: serde_json::Value| hub.handle_hook("codex-token", event, payload).unwrap();
+        let done = |thread: &str| serde_json::json!({"type": "agent-turn-complete", "thread-id": thread,
+            "input-messages": ["hi"], "last-assistant-message": "ok"});
+        // A hook's session_id marks the run as opened, but a thread without a turn isn't resumed.
+        hook("SessionStart", serde_json::json!({"session_id": "th-1", "source": "startup"}));
+        hook("UserPromptSubmit", serde_json::json!({"session_id": "th-1", "prompt": "hi"}));
+        assert_eq!(args(&hub), ["-m", "gpt-6-sol"]);
+        assert_eq!(hub.inner.lock().sessions.get(&3).unwrap().conversation.as_deref(), Some("th-1"));
+        // Its first finished turn: the next start is `codex resume … -- th-1`, model kept.
+        hook("notify", done("th-1"));
+        assert_eq!(args(&hub), ["--model=gpt-6-sol", "--resume", "th-1"]);
+        assert_eq!(hub.store.load_sessions().unwrap().into_iter().find(|s| s.info.id == 3).unwrap().extra_args,
+            ["--model=gpt-6-sol", "--resume", "th-1"], "kept across a backend restart");
+        // Codex's title request isn't the conversation; a `/new` thread replaces it at its first turn.
+        hook("notify", serde_json::json!({"type": "agent-turn-complete", "thread-id": "th-title",
+            "input-messages": ["Generate a concise, single-line task title of at most 36 characters"]}));
+        assert_eq!(args(&hub), ["--model=gpt-6-sol", "--resume", "th-1"]);
+        hook("notify", done("th-2"));
+        assert_eq!(args(&hub), ["--model=gpt-6-sol", "--resume", "th-2"]);
+        hook("notify", done("--evil"));
+        assert_eq!(args(&hub), ["--model=gpt-6-sol", "--resume", "th-2"], "never a flag");
+
+        // A run that can't open its thread ends before reporting anything: the next starts new.
+        let (x, resume) = (SessionKind::Codex, ["-m".to_string(), "x".to_string(), "--resume".to_string(), "th-2".to_string()]);
+        assert_eq!(without_failed_resume(x, &resume, None, 1), Some(vec!["--model=x".to_string()]));
+        assert_eq!(without_failed_resume(x, &resume, Some("th-2"), 1), None, "it opened");
+        assert_eq!(without_failed_resume(x, &resume, None, 0), None);
+        assert_eq!(without_failed_resume(x, &resume[..2], None, 1), None, "it wasn't resuming");
+        assert_eq!(without_failed_resume(SessionKind::Shell, &resume, None, 1), None);
+
+        // A named Codex agent keeps its thread on its record; its arguments are rebuilt from it.
+        let hub = codex_fixture(&[], true);
+        hub.handle_hook("codex-token", "notify", done("th-9")).unwrap();
+        assert!(args(&hub).is_empty());
+        assert_eq!(hub.agents.by_session(3).unwrap().resume_id.as_deref(), Some("th-9"));
+        assert_eq!(crate::agents::restart_args(&hub.agents, 3).unwrap().unwrap(), ["--resume", "th-9"]);
     }
 
     #[test]

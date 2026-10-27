@@ -840,10 +840,9 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
   overlay.value = {
     kind: "confirm",
     title: `${KIND_LABEL[s.kind]} is working`,
+    // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
     body: what === "restart"
-      ? s.kind === "claude"
-        ? "Restart it? Its current turn is lost; it reopens the same conversation."
-        : "Restart it? Its current turn is lost and the program starts fresh."
+      ? "Restart it? Its current turn is lost; it reopens the same conversation."
       : "Stop its current turn?",
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,

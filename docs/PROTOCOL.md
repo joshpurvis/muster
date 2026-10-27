@@ -889,7 +889,9 @@ later flag win they are checked against an **allowlist** (also again on every re
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
 with the keys `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
-`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. Values
+`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`, and
+Muster's own `--resume <thread id>` (not a Codex flag: the run launches as `codex resume <the
+same flags> -- <thread id>`; how a Codex tab or agent reopens its conversation). Values
 may be attached (`--model=x`, `-mx`, `-cmodel=x`). Anything else (sandbox, approval policy,
 allowed tools, extra dirs, settings, profiles, positional arguments) is refused. Shells are
 not affected.

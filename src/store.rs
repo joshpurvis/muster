@@ -59,8 +59,7 @@ pub struct HookSession {
     pub generation: u64,
     pub subagents: u32,
     pub last_hook_at: i64,
-    /// The run's latest Claude conversation id (SessionStart), for a tab that isn't a named
-    /// agent's (`Hub::resume_after_hook`).
+    /// The run's latest Claude or Codex conversation id (`Hub::resume_after_hook`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
     /// Not part of the record: the session's new stored arguments, saved in the same

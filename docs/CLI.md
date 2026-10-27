@@ -396,6 +396,16 @@ one fixed profile for their lifetime, including fresh conversations and replacem
 | `muster profile disable PROFILE` | Prevent new launches and restarts; running sessions remain usable. |
 | `muster profile enable PROFILE` | Allow new launches again. |
 | `muster profile default PATH PROFILE` | Set a workspace default for future Claude tasks; `default` clears it. |
+| `muster profile usage [--json]` | Each account's last reported 5-hour and weekly usage, reset times and when it was last observed, then a suggestion for where a new task has the most known room (or why there is none). Unknown, stale, unconfirmed and reset figures say so. |
+| `muster profile same-account PROFILE [OTHER]` | Declare that PROFILE signs in to the same Claude account as OTHER: one set of limits, shown on both, never added. Without OTHER it is its own account again. |
+| `muster profile login-changed PROFILE` | You signed in to another account in PROFILE (or `default`): forget its usage and its same-account declaration. |
+
+Usage comes from Claude Code's own status line in the Claude sessions Muster starts: Muster
+keeps running your status line unchanged (your `statusLine` setting, found the way Claude Code finds it, never through a link; if unsure, Muster leaves that session's status line alone)
+and forwards only the 5-hour and weekly figures. An account no session used here stays unknown;
+Muster never sends a request to find out. `MUSTER_USAGE_REPORTER=off` in the backend's
+environment turns the reporter off for sessions started afterwards. Details:
+[ACCOUNT_PROFILES.md](ACCOUNT_PROFILES.md#usage-display-and-suggestions-implemented).
 
 Use `/status` inside Claude Code to verify the actual account. A profile label identifies a
 directory, not a checked identity. Known authentication or endpoint environment overrides

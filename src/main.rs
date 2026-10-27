@@ -22,6 +22,7 @@ mod panel_kit;
 mod web_preview;
 mod skills;
 mod spend;
+mod statusline;
 mod notify;
 mod openrouter;
 mod paths;
@@ -36,6 +37,7 @@ mod server;
 mod store;
 mod terminal;
 mod updates;
+mod usage;
 mod wm;
 mod worktree;
 
@@ -123,6 +125,12 @@ enum Cmd {
         agent: String,
         event: String,
         payload: Option<String>,
+    },
+    /// Claude sessions' usage reporter: reads the status-line JSON on stdin and reports the usage
+    /// windows to the daemon, printing nothing (src/statusline.rs).
+    #[command(hide = true)]
+    Statusline {
+        agent: String,
     },
     /// Show whether the daemon is running.
     Status,
@@ -432,6 +440,18 @@ enum ProfileCmd {
     Disable { profile: String },
     /// Select a workspace's default for new Claude sessions. PROFILE may be "default".
     Default { path: PathBuf, profile: String },
+    /// Each account's last reported 5-hour and weekly usage, and where a new task has the most
+    /// known room. Unknown or stale usage is shown as such, never as free.
+    Usage {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Declare that PROFILE signs in to the same Claude account as OTHER, so they share one set
+    /// of limits. Without OTHER, PROFILE is its own account again.
+    SameAccount { profile: String, other: Option<String> },
+    /// You signed in to a different account in PROFILE (or "default"): forget its usage and
+    /// its same-account declaration.
+    LoginChanged { profile: String },
 }
 
 #[derive(Subcommand)]
@@ -549,6 +569,10 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
+    if args.get(1).map(String::as_str) == Some("statusline") {
+        let code = statusline::run(args.get(2).map(String::as_str).unwrap_or(""));
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
 
     let cli = Cli::parse();
     // Printing commands die quietly on a closed pipe (`muster ls | head`) instead of panicking.
@@ -566,7 +590,7 @@ fn main() -> ExitCode {
         None => ensure_daemon().and_then(|d| open_ui(&d, None)),
         Some(Cmd::Daemon { foreground: true, launch, lifecycle_locked }) => run_daemon(launch, lifecycle_locked),
         Some(Cmd::Daemon { foreground: false, .. }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
-        Some(Cmd::Hook { .. }) => unreachable!("handled above"),
+        Some(Cmd::Hook { .. } | Cmd::Statusline { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Reload) => reload(),
@@ -746,6 +770,9 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             ProfileCmd::Enable { profile } => cli::profile_update(d, &profile, None, Some(true)),
             ProfileCmd::Disable { profile } => cli::profile_update(d, &profile, None, Some(false)),
             ProfileCmd::Default { path, profile } => cli::profile_default(d, &path, &profile),
+            ProfileCmd::Usage { json } => cli::profile_usage(d, json),
+            ProfileCmd::SameAccount { profile, other } => cli::profile_same_account(d, &profile, other.as_deref()),
+            ProfileCmd::LoginChanged { profile } => cli::profile_login_changed(d, &profile),
         },
         Cmd::Ask {
             agent,

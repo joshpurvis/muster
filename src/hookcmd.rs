@@ -39,7 +39,7 @@ const MAX_REPLY: usize = 64 * 1024;
 pub const TOKEN_FILE: &str = "hook-token";
 
 /// `$MUSTER_TOKEN`, else the token file of `$MUSTER_SESSION_ID`'s session.
-fn session_token() -> Option<String> {
+pub(crate) fn session_token() -> Option<String> {
     session_token_from(|k| std::env::var(k).ok())
 }
 
@@ -107,7 +107,7 @@ fn valid_name(s: &str) -> bool {
 }
 
 /// Read stdin with a deadline, never from a terminal (that would steal the user's keystrokes).
-fn read_stdin() -> Vec<u8> {
+pub(crate) fn read_stdin() -> Vec<u8> {
     #[cfg(unix)]
     if unsafe { libc::isatty(0) } == 1 {
         return Vec::new();
@@ -166,6 +166,27 @@ fn truncate_strings_max(v: &mut serde_json::Value, max: usize) {
     }
 }
 
+/// The daemon is always on this machine (hub::daemon_url is 127.0.0.1), but MUSTER_URL reaches
+/// us through the agent's environment, which a project's settings can override. The bearer
+/// token goes only to a loopback address: an IP literal, or `localhost` resolving to one. No
+/// other name is even looked up.
+fn loopback_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip
+            .is_loopback()
+            .then(|| std::net::SocketAddr::new(ip, port))
+            .ok_or_else(|| format!("MUSTER_URL host {host} is not loopback"));
+    }
+    if !host.eq_ignore_ascii_case("localhost") {
+        return Err(format!("MUSTER_URL host {host:?} is not loopback"));
+    }
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}: {e}"))?
+        .find(|a| a.ip().is_loopback())
+        .ok_or_else(|| format!("resolve {host}: no loopback address"))
+}
+
 /// `http://host:port[/base]` -> (host, port, base path without trailing slash).
 fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     let rest = url
@@ -192,13 +213,9 @@ fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     ))
 }
 
-fn post(url: &str, path: &str, token: &str, agent: &str, body: &[u8]) -> Result<u16, String> {
+pub(crate) fn post(url: &str, path: &str, token: &str, agent: &str, body: &[u8]) -> Result<u16, String> {
     let (host, port, base) = parse_url(url)?;
-    let addr = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("resolve {host}: no address"))?;
+    let addr = loopback_addr(&host, port)?;
     let mut s =
         TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| format!("connect {addr}: {e}"))?;
     s.set_read_timeout(Some(TIMEOUT)).ok();
@@ -287,6 +304,19 @@ mod tests {
         assert_eq!(out["n"], 1);
         assert_eq!(shrink_payload(b"  "), b"{}");
         assert_eq!(shrink_payload(b"not json"), b"\"not json\"");
+    }
+
+    #[test]
+    fn the_token_goes_only_to_loopback() {
+        for host in ["127.0.0.1", "127.8.9.10", "::1"] {
+            assert!(loopback_addr(host, 7433).is_ok(), "{host}");
+        }
+        for host in ["10.0.0.1", "0.0.0.0", "192.168.1.5", "::", "fe80::1", "example.com", "localhost.evil.com", "127.0.0.1.nip.io"] {
+            assert!(loopback_addr(host, 7433).is_err(), "{host}");
+        }
+        // Refused before connecting or sending anything.
+        let err = post("http://example.com:80", "/hook/Stop", "secret", "claude", b"{}").unwrap_err();
+        assert!(err.contains("not loopback"), "{err}");
     }
 
     #[test]

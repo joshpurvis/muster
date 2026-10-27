@@ -484,7 +484,38 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind IN ('scheduled', 'catch_up');
     ALTER TABLE notes ADD COLUMN triggers INTEGER NOT NULL DEFAULT 0;
     "#,
-    // v22: sleep and wake for named agents (src/sleep.rs): how long an agent may sit idle before
+    // v22: Claude usage windows reported to the status line (src/usage.rs). One row per window
+    // per profile key the reporting session was pinned to ('default' or 'profile:<id>'); what
+    // each session's latest run last reported (to tell fresh data from a redraw); and which
+    // profiles the human declared to be one account. Numbers and times only, never credentials.
+    r#"
+    CREATE TABLE usage_observations (
+        account TEXT NOT NULL,
+        window TEXT NOT NULL,
+        record TEXT NOT NULL,
+        PRIMARY KEY (account, window)
+    );
+    CREATE TABLE usage_runs (
+        session_id INTEGER PRIMARY KEY,
+        record TEXT NOT NULL
+    );
+    ALTER TABLE account_profiles ADD COLUMN account_group TEXT;
+    "#,
+    // v23: phone alerts (src/push.rs): one Web Push subscription per paired device, with how its
+    // last delivery went. Foreign keys are off, so revoking a device deletes its row explicitly.
+    r#"
+    CREATE TABLE push_subscriptions (
+        device_id INTEGER PRIMARY KEY,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_ok_at INTEGER,
+        last_error TEXT,
+        last_error_at INTEGER
+    );
+    "#,
+    // v24: sleep and wake for named agents (src/sleep.rs): how long an agent may sit idle before
     // Muster stops its process (NULL: never), and since when it is asleep (NULL: awake). An
     // asleep agent keeps its tab and record; the next message resumes its conversation.
     r#"
@@ -913,6 +944,45 @@ impl Store {
             "INSERT OR IGNORE INTO remote_origins (origin, added_at) VALUES (?1, ?2)",
             params![origin, now],
         )?;
+        Ok(())
+    }
+
+    pub fn load_push_subscriptions(&self) -> anyhow::Result<Vec<(i64, crate::push::Subscription)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at
+             FROM push_subscriptions",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                crate::push::Subscription {
+                    endpoint: r.get(1)?,
+                    p256dh: r.get(2)?,
+                    auth: r.get(3)?,
+                    created_at: r.get(4)?,
+                    last_ok_at: r.get(5)?,
+                    last_error: r.get(6)?,
+                    last_error_at: r.get(7)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Insert or replace a device's subscription (with its delivery status).
+    pub fn put_push_subscription(&self, device_id: i64, s: &crate::push::Subscription) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO push_subscriptions
+                 (device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![device_id, s.endpoint, s.p256dh, s.auth, s.created_at, s.last_ok_at, s.last_error, s.last_error_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_push_subscription(&self, device_id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [device_id])?;
         Ok(())
     }
 
@@ -1639,10 +1709,10 @@ impl Store {
 
     pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
         let conn = self.conn.lock();
-        let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
+        let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at, account_group FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
         let rows = statement.query_map([], |r| Ok(crate::account_profiles::AccountProfile {
             id: r.get(0)?, name: r.get(1)?, config_dir: r.get(2)?,
-            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?,
+            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?, account_group: r.get(5)?,
         }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1661,6 +1731,108 @@ impl Store {
             params![id, name, enabled.map(i64::from)],
         )?;
         anyhow::ensure!(changed == 1, "no such account profile: {id}");
+        Ok(())
+    }
+
+    /// Declare `id` to be on the same account as `with` (None: its own account). Joins `with`'s
+    /// group, creating one for both when it has none.
+    pub fn set_same_account(&self, id: i64, with: Option<i64>) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let group_of = |tx: &rusqlite::Transaction, p: i64| -> anyhow::Result<Option<String>> {
+            tx.query_row("SELECT account_group FROM account_profiles WHERE id=?1", [p], |r| r.get(0))
+                .optional()?.with_context(|| format!("no such account profile: {p}"))
+        };
+        group_of(&tx, id)?;
+        let group = match with {
+            None => None,
+            Some(other) => {
+                anyhow::ensure!(other != id, "a profile is always on its own account");
+                Some(match group_of(&tx, other)? {
+                    Some(g) => g,
+                    None => {
+                        let g = crate::paths::random_token()[..16].to_string();
+                        tx.execute("UPDATE account_profiles SET account_group=?2 WHERE id=?1", params![other, g])?;
+                        g
+                    }
+                })
+            }
+        };
+        tx.execute("UPDATE account_profiles SET account_group=?2 WHERE id=?1", params![id, group])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ----- Claude usage observations (src/usage.rs) -----
+
+    pub fn usage_observations(&self) -> anyhow::Result<Vec<(String, crate::usage::Window, crate::usage::Observation)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT account, window, record FROM usage_observations")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (account, window, record) = row?;
+            // An unreadable row is dropped (unknown), never guessed.
+            if let (Some(w), Ok(o)) = (crate::usage::Window::from_key(&window), serde_json::from_str(&record)) {
+                out.push((account, w, o));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record a Claude run's launch: the configuration folder its reports are filed under.
+    /// Replaces the session's previous run.
+    pub fn start_usage_run(&self, session: SessionId, generation: u64, config_dir: Option<String>) -> anyhow::Result<()> {
+        let run = crate::usage::RunMemory { generation, config_dir, ..Default::default() };
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // Forget the runs of sessions that no longer exist.
+        tx.execute("DELETE FROM usage_runs WHERE session_id NOT IN (SELECT id FROM sessions)", [])?;
+        tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
+            ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(&run)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply one report from run (`session`, `generation`) to the observations of the folder
+    /// that run was launched with, in one transaction. A run with no launch record (or another
+    /// generation's) is ignored. Returns whether a client-visible observation changed.
+    pub fn apply_usage(&self, session: SessionId, generation: u64, report: &crate::usage::Report, now: i64)
+        -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let run: Option<crate::usage::RunMemory> = tx.query_row("SELECT record FROM usage_runs WHERE session_id=?1", [session],
+            |r| r.get::<_, String>(0)).optional()?.and_then(|j| serde_json::from_str(&j).ok());
+        let Some(run) = run.filter(|r| r.generation == generation) else { return Ok(false) };
+        let Some(account) = run.config_dir.as_deref().map(crate::usage::folder_key) else { return Ok(false) };
+        let mut stored = std::collections::BTreeMap::new();
+        {
+            let mut st = tx.prepare("SELECT window, record FROM usage_observations WHERE account=?1")?;
+            let rows = st.query_map([&account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (w, record) = row?;
+                if let (Some(w), Ok(o)) = (crate::usage::Window::from_key(&w), serde_json::from_str(&record)) {
+                    stored.insert(w, o);
+                }
+            }
+        }
+        let applied = crate::usage::apply(&run, &stored, (session, generation), report, now);
+        for (w, o) in &applied.updates {
+            tx.execute("INSERT INTO usage_observations(account, window, record) VALUES (?1, ?2, ?3)
+                ON CONFLICT(account, window) DO UPDATE SET record=excluded.record",
+                params![account, w.key(), serde_json::to_string(o)?])?;
+        }
+        if let Some(m) = &applied.run {
+            tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
+                ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(m)?])?;
+        }
+        tx.commit()?;
+        Ok(applied.notify)
+    }
+
+    /// Forget `account`'s observations (the human reported a login change there).
+    pub fn clear_usage(&self, account: &str) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM usage_observations WHERE account=?1", [account])?;
         Ok(())
     }
 
@@ -2552,7 +2724,7 @@ mod tests {
         // Rows from before v17 (and anything unreadable) are the subscription.
         s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
         assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
-        // Sleep (v22): off by default; the setting is config, asleep is its own write.
+        // Sleep (v24): off by default; the setting is config, asleep is its own write.
         assert_eq!((back.sleep_after_min, back.asleep_at), (None, None));
         s.update_agent_config(&crate::agents::Agent { sleep_after_min: Some(45), ..sub.clone() }).unwrap();
         s.set_agent_asleep(b.id, Some(7_000)).unwrap();

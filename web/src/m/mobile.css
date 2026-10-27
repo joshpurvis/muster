@@ -439,6 +439,8 @@ time {
   right: 0;
   top: 48px;
   width: 260px;
+  max-height: calc(var(--view-height, 100dvh) - 72px);
+  overflow-y: auto;
   padding: 18px;
   background: var(--bg-overlay);
   border: 1px solid var(--border-strong);
@@ -476,6 +478,84 @@ time {
 .logout {
   width: 100%;
   margin-top: 16px;
+}
+.alert-settings {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.alert-settings h2 {
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.settings-panel .alert-status {
+  margin-bottom: 10px;
+}
+.settings-panel .alert-status.ok {
+  color: var(--text);
+}
+.settings-panel .alert-status.ok::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--st-idle);
+  vertical-align: 1px;
+}
+.settings-panel .alert-status.warn {
+  color: var(--text);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+}
+.alert-on {
+  width: 100%;
+  background: var(--action-bg);
+  border-color: transparent;
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.alert-on:active {
+  background: var(--action-hover);
+}
+.alert-actions {
+  display: flex;
+  gap: 8px;
+}
+.alert-on + .alert-actions {
+  margin-top: 8px;
+}
+.alert-actions button {
+  flex: 1;
+  padding: 8px 10px;
+}
+.alert-banner {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg-2);
+}
+.alert-banner p {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.alert-banner.warn {
+  background: var(--attn-bg);
+  border-color: var(--attn-border);
+}
+.alert-banner-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.alert-banner-actions .alert-on {
+  width: auto;
+  flex: 1;
 }
 .pair-screen {
   display: flex;

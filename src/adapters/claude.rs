@@ -5,7 +5,9 @@
 //! channel's permission profile (`permission_mode`).
 //! - `settings.json` adds command hooks for this session only (merged with the user's own
 //!   settings): every event runs `<muster_bin> hook claude <Event>`, which reads the hook's JSON
-//!   payload on stdin and POSTs it to the daemon (see hookcmd.rs).
+//!   payload on stdin and POSTs it to the daemon (see hookcmd.rs). At launch the hub also sets
+//!   its `statusLine` to Muster's usage reporter wrapped around the user's own status line
+//!   (src/usage.rs `install_reporter`, src/statusline.rs).
 //! - `mcp.json` registers the daemon's MCP server as `muster` (HTTP transport, bearer session
 //!   token). `--strict-mcp-config` is NOT used, so the user's own servers keep working.
 //!

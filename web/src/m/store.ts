@@ -57,6 +57,8 @@ export const online = signal(navigator.onLine);
 export const pairError = signal("");
 export const pairBusy = signal(false);
 export const toast = signal("");
+/** Counts `push_changed` events (this phone's alert status changed in the daemon). */
+export const pushChanged = signal(0);
 export const ready = computed(() => auth.value === "paired" && connStatus.value === "open");
 export const canInteract = computed(() =>
   ready.value && !!device.value?.scopes.some((s) => s === "interact" || s === "manage")
@@ -264,8 +266,13 @@ export function markOpened(s: SessionInfo) {
   if (canInteract.peek()) rpc.call("channel.mark_read", { id: s.channel_id }).catch(() => {});
 }
 export function openSession(s: SessionInfo) {
-  history.pushState({ musterSession: true }, "", `#s=${s.id}`);
-  selected.value = s.id;
+  openSessionId(s.id);
+}
+/** Also from a tapped alert while the app is open (the service worker's message). */
+export function openSessionId(id: number) {
+  if (selected.peek() === id) return;
+  history.pushState({ musterSession: true }, "", `#s=${id}`);
+  selected.value = id;
 }
 export function closeSession() {
   if (history.state?.musterSession) history.back();
@@ -380,6 +387,9 @@ export function start() {
         break;
       case "attach_info":
         if (viewer?.sid === event.data.id) viewer.attachInfo(event.data);
+        break;
+      case "push_changed":
+        pushChanged.value++;
         break;
     }
   };

@@ -99,6 +99,7 @@ pub fn hello(hub: &Hub) -> Value {
         "ui_protocol": crate::assets::UI_PROTOCOL,
         "workspaces": hub.workspaces(),
         "account_profiles": hub.account_profiles().unwrap_or_default(),
+        "account_usage": hub.account_usage().ok(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
         // Which sessions are named agents' (`session.remove` hides those instead of stopping
@@ -398,6 +399,27 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             struct P { id: i64, name: Option<String>, enabled: Option<bool> }
             let p: P = parse(params)?;
             to_value(hub.update_account_profile(p.id, p.name, p.enabled)?)
+        }
+        "account_usage.get" => {
+            require_local(who, method)?;
+            to_value(hub.account_usage()?)
+        }
+        "account_profile.same_account" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { id: i64, with: Option<i64> }
+            let p: P = parse(params)?;
+            to_value(hub.set_same_account(p.id, p.with)?)
+        }
+        "account_profile.login_changed" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P { account_profile: crate::account_profiles::ProfileChoice }
+            let p: P = parse(params)?;
+            hub.account_login_changed(p.account_profile)?;
+            to_value(hub.account_usage()?)
         }
         "workspace.set_account_profile" => {
             require_local(who, method)?;
@@ -952,7 +974,22 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     .ok_or_else(|| RpcError(format!("no such pairing: {}", p.pairing_id)))?,
             )
         }
-        "device.list" => to_value(hub.devices().list()),
+        "device.list" => {
+            let devices = hub.devices();
+            let list: Vec<Value> = devices
+                .list()
+                .into_iter()
+                .map(|d| {
+                    let mut v = json!(d);
+                    v["push"] = devices.push_subscription(d.id).map_or(Value::Null, |s| s.summary());
+                    v
+                })
+                .collect();
+            Ok(json!(list))
+        }
+        "push.key" | "push.status" | "push.subscribe" | "push.unsubscribe" | "push.test" => {
+            push_method(hub, who, method, params).await
+        }
         "device.revoke" => {
             #[derive(Deserialize)]
             struct P {
@@ -1281,6 +1318,103 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
     }
 }
 
+/// Whether a connection gets `ev`: `own_device` is the paired device it belongs to, None for the
+/// desktop client token. Named agents, schedules, panels and notes aren't on the phone (no
+/// agent.*, panel.* or note.* method is either; docs/ANDROID.md); a phone's alert status
+/// (`push_changed`) goes to that phone only, never to other phones or the desktop.
+fn forwarded(own_device: Option<i64>, ev: &ServerEvent) -> bool {
+    if let ServerEvent::PushChanged { device_id } = ev {
+        return own_device == Some(*device_id);
+    }
+    own_device.is_none()
+        || !matches!(
+            ev,
+            ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
+            | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
+            | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
+            | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
+            | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
+        )
+}
+
+/// `push.status` and what the other `push.*` methods answer: the daemon's public key and this
+/// device's own subscription (its endpoint too, so the phone can tell whether its browser's
+/// subscription is the one the daemon has), never the keys.
+fn push_status(hub: &Hub, device: i64) -> RpcResult {
+    let sub = hub.devices().push_subscription(device).map(|s| {
+        let mut v = s.summary();
+        v["endpoint"] = json!(s.endpoint);
+        v
+    });
+    Ok(json!({ "public_key": crate::push::vapid()?.public_key, "subscription": sub }))
+}
+
+/// Phone alerts (docs/PROTOCOL.md "Phone alerts"): a paired device manages its own Web Push
+/// subscription, one per device. Never for the client token: there is no phone to alert.
+async fn push_method(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
+    let Principal::Device { id } = *who else {
+        return Err(RpcError(format!("{method} is for a paired phone's own alerts")));
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    match method {
+        "push.subscribe" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P {
+                endpoint: String,
+                p256dh: String,
+                auth: String,
+            }
+            let p: P = parse(params)?;
+            let refused = |e: String| RpcError(format!("{}{e}", crate::push::REFUSED));
+            let endpoint = crate::push::check_endpoint(&p.endpoint, &crate::push::allowed_hosts()).map_err(refused)?;
+            crate::push::check_keys(&p.p256dh, &p.auth).map_err(refused)?;
+            hub.devices().set_push(
+                hub.store(),
+                id,
+                crate::push::Subscription {
+                    endpoint: p.endpoint,
+                    p256dh: p.p256dh.trim().to_string(),
+                    auth: p.auth.trim().to_string(),
+                    created_at: now_ms(),
+                    last_ok_at: None,
+                    last_error: None,
+                    last_error_at: None,
+                },
+            )?;
+            tracing::info!("device {id}: phone alerts on (via {})", endpoint.host);
+            crate::push::changed(hub, id);
+        }
+        "push.unsubscribe" => {
+            parse::<Empty>(params)?;
+            if hub.devices().remove_push(hub.store(), id)? {
+                tracing::info!("device {id}: phone alerts off");
+                crate::push::changed(hub, id);
+            }
+        }
+        "push.test" => {
+            parse::<Empty>(params)?;
+            let outcome = crate::push::test(hub, id).await.map_err(RpcError)?;
+            let mut v = push_status(hub, id)?;
+            v["delivered"] = json!(outcome == crate::push::Outcome::Delivered);
+            v["error"] = match outcome {
+                crate::push::Outcome::Delivered => Value::Null,
+                crate::push::Outcome::Gone(code) => {
+                    json!(format!("the push service says this phone's subscription is gone ({code}); turn alerts on again"))
+                }
+                crate::push::Outcome::Failed(e) => json!(e),
+            };
+            return Ok(v);
+        }
+        _ => {
+            parse::<Empty>(params)?;
+        }
+    }
+    push_status(hub, id)
+}
+
 /// Agent writes (create, update, remove, memory) are for the client token only: never a paired
 /// device, whatever scopes it holds (`devices::method_scope` lists no agent method either).
 fn require_local(who: &Principal, method: &str) -> Result<(), RpcError> {
@@ -1557,23 +1691,16 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     // `workspace.add` result). If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
     let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
+    let own_device = match who {
+        Principal::Device { id } => Some(id),
+        Principal::Local => None,
+    };
     let events = {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
-            // Named agents, panels and notes aren't on the phone (no agent.*, panel.* or note.*
-            // method is either; docs/ANDROID.md).
             let forward = |ev: ServerEvent| {
-                if is_device
-                    && matches!(
-                        ev,
-                        ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
-                        | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
-                        | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
-                        | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
-                        | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
-                    )
-                {
+                if !forwarded(own_device, &ev) {
                     return None;
                 }
                 serde_json::to_string(&ev).ok().map(|t| Message::Text(t.into()))
@@ -2075,6 +2202,17 @@ mod tests {
     use crate::mcp::McpState;
     use crate::mcp::backend::HubBackend;
     use crate::store::{Store, StoredSession};
+
+    #[test]
+    fn a_phones_alert_status_goes_to_that_phone_only() {
+        let ev = ServerEvent::PushChanged { device_id: 4 };
+        assert!(forwarded(Some(4), &ev));
+        assert!(!forwarded(Some(5), &ev), "another phone");
+        assert!(!forwarded(None, &ev), "the desktop");
+        let note = ServerEvent::NoteRemoved { id: 1 };
+        assert!(forwarded(None, &note) && !forwarded(Some(4), &note));
+        assert!(forwarded(Some(4), &ServerEvent::SessionRemoved { id: 1 }));
+    }
 
     /// A hub with workspace 1, channel 1 and exited sessions 1 (shell), 2 (claude), 3 (codex),
     /// with the MCP server state attached. Nothing here starts a process: every call below is

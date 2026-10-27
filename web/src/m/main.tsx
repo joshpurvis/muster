@@ -1,5 +1,7 @@
 import { connStatus } from "../rpc.ts";
+import { effect } from "@preact/signals";
 import { render } from "preact";
+import { listenToServiceWorker, refreshAlerts } from "./alerts.ts";
 import "@xterm/xterm/css/xterm.css";
 import "./mobile.css";
 import { Pair } from "./Pair.tsx";
@@ -9,7 +11,9 @@ import {
   auth,
   closeSession,
   online,
+  openSessionId,
   pairBusy,
+  pushChanged,
   ready,
   reconnect,
   selected,
@@ -69,5 +73,12 @@ visualViewport?.addEventListener("scroll", viewport);
 addEventListener("resize", viewport);
 viewport();
 start();
+listenToServiceWorker(openSessionId);
+// Each (re)connection asks how alerts stand (the daemon may have dropped the subscription), and
+// so does each change the daemon reports (a delivery failed or worked again).
+effect(() => {
+  pushChanged.value;
+  if (ready.value) refreshAlerts();
+});
 render(<App />, document.getElementById("app")!);
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js", { scope: "/m/" }).catch(() => {});

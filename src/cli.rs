@@ -1239,6 +1239,15 @@ struct DeviceRow {
     last_source: Option<String>,
     expires_at: i64,
     revoked_at: Option<i64>,
+    /// Phone alerts: None when they are off.
+    #[serde(default)]
+    push: Option<PushRow>,
+}
+
+#[derive(Deserialize)]
+struct PushRow {
+    last_ok_at: Option<i64>,
+    last_error_at: Option<i64>,
 }
 
 /// `muster devices`.
@@ -1270,10 +1279,19 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 None if x.expires_at <= now => "expired".to_string(),
                 None => x.scopes.last().cloned().unwrap_or_default(),
             };
+            let alerts = match &x.push {
+                None => "off".to_string(),
+                Some(p) if p.last_error_at.is_some_and(|e| p.last_ok_at.is_none_or(|ok| e > ok)) => "failing".to_string(),
+                Some(p) => match p.last_ok_at {
+                    Some(t) => format!("on (sent {})", ago(t)),
+                    None => "on".to_string(),
+                },
+            };
             vec![
                 Cell::plain(x.id.to_string()),
                 Cell::plain(x.name.clone()),
                 Cell::plain(status),
+                Cell::plain(alerts),
                 Cell::plain(format!(
                     "seen {}{}",
                     ago(x.last_seen_at),
@@ -1282,7 +1300,7 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "LAST"]), &rows, None, false));
+    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "ALERTS", "LAST"]), &rows, None, false));
     Ok(())
 }
 
@@ -2208,6 +2226,85 @@ pub fn profile_default(d: &Discovery, path: &std::path::Path, profile: &str) -> 
     let ws = client::rpc(d, "workspace.add", json!({"path": path}))?;
     client::rpc(d, "workspace.set_account_profile", json!({"id": ws["id"], "account_profile": choice}))?;
     println!("New Claude sessions in {} will default to {profile}. Existing sessions retain their selection.", path.display());
+    Ok(())
+}
+
+fn usage_age(ms: i64, now: i64) -> String {
+    let m = (now - ms).max(0) / 60_000;
+    match m {
+        0 => "just now".into(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 48 * 60 => format!("{} h ago", m / 60),
+        m => format!("{} days ago", m / (24 * 60)),
+    }
+}
+
+fn usage_cell(w: &Value) -> String {
+    let at = |s: i64| jiff::Timestamp::from_second(s).map(|t| t.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%a %H:%M").to_string()).unwrap_or_default();
+    let pct = w["used_percentage"].as_f64().map(|v| format!("{}%", v.round() as i64)).unwrap_or_default();
+    let resets = w["resets_at"].as_i64().map(at).unwrap_or_default();
+    match w["status"].as_str().unwrap_or("unknown") {
+        "current" => format!("{pct}, resets {resets}"),
+        "stale" => format!("{pct} (stale), resets {resets}"),
+        "unconfirmed" => format!("{pct} (not confirmed fresh)"),
+        "reset" => format!("unknown (reset {resets})"),
+        _ => "unknown".into(),
+    }
+}
+
+pub fn profile_usage(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
+    let u = client::rpc(d, "account_usage.get", json!({}))?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&u)?);
+        return Ok(());
+    }
+    let now = crate::model::now_ms();
+    let empty = Vec::new();
+    let rows = u["rows"].as_array().unwrap_or(&empty);
+    let mut table = vec![["Profile".to_string(), "5-hour".into(), "Weekly".into(), "Last observed".into()]];
+    for r in rows {
+        let mut name = r["name"].as_str().unwrap_or("?").to_string();
+        if let Some(why) = r["ineligible_reason"].as_str() { name.push_str(&format!(" (can't start: {why})")); }
+        let shared: Vec<&str> = r["same_account_as"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if !shared.is_empty() { name.push_str(&format!(" [same account as {}]", shared.join(", "))); }
+        let seen = ["five_hour", "seven_day"].iter().filter_map(|w| r[*w]["observed_at"].as_i64()).max()
+            .map(|t| usage_age(t, now))
+            .or_else(|| ["five_hour", "seven_day"].iter().filter_map(|w| r[*w]["reported_at"].as_i64()).max()
+                .map(|t| format!("reported {}, freshness unknown", usage_age(t, now))))
+            .unwrap_or_else(|| "never".into());
+        table.push([name, usage_cell(&r["five_hour"]), usage_cell(&r["seven_day"]), seen]);
+    }
+    let width = |i: usize| table.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    for r in &table {
+        println!("{:w0$}  {:w1$}  {:w2$}  {}", r[0], r[1], r[2], r[3]);
+    }
+    match (u["suggestion"].as_object(), u["no_suggestion"].as_str()) {
+        (Some(s), _) => println!("\nSuggested for a new task: {}. {}", s["name"].as_str().unwrap_or("?"), s["reason"].as_str().unwrap_or("")),
+        (None, Some(why)) => println!("\nNo suggestion: {why}"),
+        _ => {}
+    }
+    println!("Usage comes from Claude Code's status line in sessions Muster started; an account nobody used here stays unknown.");
+    Ok(())
+}
+
+pub fn profile_same_account(d: &Discovery, profile: &str, other: Option<&str>) -> anyhow::Result<()> {
+    let id = profile_choice(d, profile)?.as_i64().context("Default joins an account by registering its folder (~/.claude) as a profile")?;
+    let with = other.map(|o| profile_choice(d, o)?.as_i64()
+        .context("Default joins an account by registering its folder (~/.claude) as a profile")).transpose()?;
+    let p = client::rpc(d, "account_profile.same_account", json!({"id": id, "with": with}))?;
+    match other {
+        Some(o) => println!("{} and {o} now count as one Claude account: one set of limits.", p["name"].as_str().unwrap_or(profile)),
+        None => println!("{} is its own Claude account again.", p["name"].as_str().unwrap_or(profile)),
+    }
+    Ok(())
+}
+
+pub fn profile_login_changed(d: &Discovery, profile: &str) -> anyhow::Result<()> {
+    let choice = profile_choice(d, profile)?;
+    client::rpc(d, "account_profile.login_changed", json!({"account_profile": choice}))?;
+    println!("Forgot {profile}'s usage and same-account setting. New usage appears after its next session gets a reply.");
     Ok(())
 }
 

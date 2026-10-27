@@ -31,6 +31,8 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .route("/api/device/logout", post(device_logout))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
+        // Status-line usage reports (src/statusline.rs): a few numbers, never a whole payload.
+        .route("/usage/{agent}", post(usage_report).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         // Trigger URLs (src/schedules/triggers.rs): this machine only, each with its secret.
         .route("/api/trigger/{name}", post(trigger).layer(axum::extract::DefaultBodyLimit::max(crate::schedules::triggers::PAYLOAD_MAX + 1)))
         .with_state(hub.clone())
@@ -584,6 +586,27 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     }
 }
 
+/// `POST /usage/claude` with the run's session token: attributed by the token alone (to that
+/// session, run and pinned profile), kept out of hooks, events and agent state.
+async fn usage_report(State(hub): State<Arc<Hub>>, Path(agent): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return unauthorized();
+    };
+    if agent != "claude" {
+        return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": { "message": "usage reports come from Claude" } }))).into_response();
+    }
+    if hub.session_by_token(token).is_none() {
+        return unauthorized();
+    }
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": { "message": "send JSON" } }))).into_response();
+    };
+    match hub.record_usage(token, &payload) {
+        Ok(()) => axum::Json(json!({})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": { "message": format!("{e:#}") } }))).into_response(),
+    }
+}
+
 /// Uid owning the client end (`peer`) of an established loopback connection to `server`, from
 /// /proc/net/tcp and /proc/net/tcp6. The whole 4-tuple must match (a local port can be shared
 /// by sockets to other destinations, and TIME_WAIT rows belong to no one). None unless exactly
@@ -750,8 +773,12 @@ mod tests {
             let hello = r#"{"id":1,"method":"hello","params":{}}"#;
             // Local client token works; through the proxy it doesn't, and the rest is hidden.
             assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok"], hello).0, 200);
+            // Usage reports need a session token: not the client's, not none.
+            for auth in [&["Authorization: Bearer tok"][..], &[]] {
+                assert_eq!(http(port, "POST", "/usage/claude", auth, "{}").0, 401);
+            }
             assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok", FWD], hello).0, 401);
-            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x"] {
+            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude"] {
                 assert_eq!(http(port, "GET", path, &[FWD], "").0, 404, "{path}");
             }
             assert_eq!(http(port, "GET", "/m/", &["Tailscale-Funnel-Request: ?1"], "").0, 403);
@@ -819,6 +846,37 @@ mod tests {
                 r#"{"id":3,"method":"session.approve","params":{"id":1,"decision":"approve"}}"#,
             );
             assert!(body.contains("state_seq is required"), "{body}");
+
+            // Phone alerts: the device's own subscription, under the endpoint rules.
+            let rpc = |body: &str| {
+                let (st, _, b) = http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN, "X-Muster: 1"], body);
+                assert_eq!(st, 200, "{b}");
+                serde_json::from_str::<serde_json::Value>(&b).unwrap()
+            };
+            let (pk, auth) = crate::push::test_keys();
+            let subscribe = |endpoint: &str| {
+                rpc(&json!({"id": 5, "method": "push.subscribe",
+                    "params": {"endpoint": endpoint, "p256dh": pk, "auth": auth}}).to_string())
+            };
+            let v = rpc(r#"{"id":5,"method":"push.key","params":{}}"#);
+            assert_eq!(crate::push::unb64(v["result"]["public_key"].as_str().unwrap()).unwrap().len(), 65);
+            for bad in ["http://fcm.googleapis.com/fcm/send/x", "https://evil.example/fcm/send/x", "https://127.0.0.1:9/x"] {
+                let v = subscribe(bad);
+                assert!(v["error"]["message"].as_str().unwrap().starts_with(crate::push::REFUSED), "{bad} accepted: {v}");
+            }
+            let v = rpc(r#"{"id":5,"method":"push.status","params":{}}"#);
+            assert!(v["result"]["subscription"].is_null(), "{v}");
+            let v = subscribe("https://fcm.googleapis.com/fcm/send/abc");
+            assert_eq!(v["result"]["subscription"]["endpoint_host"], "fcm.googleapis.com", "{v}");
+            let (_, _, body) = http(port, "POST", "/api/rpc", &["Authorization: Bearer tok"],
+                r#"{"id":6,"method":"push.status","params":{}}"#);
+            assert!(body.contains("for a paired phone"), "the desktop has no alerts of its own: {body}");
+            let (_, _, body) = http(port, "POST", "/api/rpc", &["Authorization: Bearer tok"],
+                r#"{"id":6,"method":"device.list","params":{}}"#);
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(list["result"][0]["push"]["endpoint_host"], "fcm.googleapis.com", "{list}");
+            assert!(list["result"][0]["push"].get("p256dh").is_none() && !body.contains(&auth), "keys stay in the daemon");
+
             assert_eq!(http(port, "POST", "/api/rpc", &[FWD, &cookie, ORIGIN], hello).0, 403);
             assert_eq!(http(port, "POST", "/api/rpc", &[FWD, &cookie, "X-Muster: 1"], hello).0, 403);
 
@@ -852,6 +910,11 @@ mod tests {
                 }
             }
             assert_eq!(http(port, "GET", "/api/device/me", &[FWD, &cookie], "").0, 401);
+            // Revoking deleted the device's push subscription.
+            let (_, _, body) = http(port, "POST", "/api/rpc", &["Authorization: Bearer tok"],
+                r#"{"id":7,"method":"device.list","params":{}}"#);
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(list["result"][0]["push"].is_null(), "{list}");
         });
         t.await.unwrap();
     }

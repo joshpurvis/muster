@@ -127,7 +127,7 @@ Design requirements:
 Phase 0 → 1 → 2 → 3 → 4, but build the Phase 3 adapter trait early (Phase 1) since injection and state detection share it. Dogfood from Phase 1 onward: use the tool to build the tool.
 
 ## 8. Parked ideas (from brainstorming)
-- **Quota-aware scheduler:** track subscription usage windows, queue work for resets, fall back between providers. Revisit against provider terms first.
+- **Quota-aware scheduler:** track subscription usage windows, queue work for resets, fall back between providers. Revisit against provider terms first. Usage display and a manual placement suggestion exist (docs/ACCOUNT_PROFILES.md "Usage display and suggestions"); queuing, automatic choice and fallback do not.
 - **Tournament mode:** same task to multiple agents in separate worktrees, compare/rank results.
 - **File leases / collision detection:** agents declare files they're touching; warn on overlap.
 - **Agent-to-agent review:** reviewer agent watches an implementer's channel (largely enabled by the MCP server).
@@ -232,7 +232,7 @@ durable queue path): `ask_agent` / `muster ask`, schedule runs (after every guar
 typed once it is ready). Panel notices (a panel closing), list and read tools, status checks and
 showing its tab never wake it. The wake's cost is shown as the cold-cache warning's is: the
 asleep bar, a `cold` marker, a timeline note, and the cold-start mark on the message. Store
-migration v22 (`agents.sleep_after_min`, `agents.asleep_at`).
+migration v24 (`agents.sleep_after_min`, `agents.asleep_at`).
 
 **Deferred** (don't design them out):
 

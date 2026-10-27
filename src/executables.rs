@@ -193,7 +193,7 @@ fn hash_and_copy(source: &mut impl Read, target: &mut impl Write) -> anyhow::Res
         hash.update(&buffer[..count]);
         target.write_all(&buffer[..count])?;
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 struct RemoveOnDrop(PathBuf);

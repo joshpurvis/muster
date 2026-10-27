@@ -15,10 +15,58 @@ export interface AccountProfile {
   config_dir: string;
   enabled: boolean;
   created_at: number;
+  /** Profiles with the same value were declared to sign in to one account. */
+  account_group?: string | null;
 }
 
 /** Omitted: inherit. "default": explicitly use the ordinary inherited Claude environment. */
 export type ProfileChoice = number | "default";
+
+/** src/usage.rs `Status`: only "current" counts as known room. */
+export type UsageStatus = "unknown" | "current" | "stale" | "unconfirmed" | "reset";
+
+/** One usage window of one account as last reported to Claude Code's status line. */
+export interface UsageWindow {
+  status: UsageStatus;
+  used_percentage: number | null;
+  /** Unix seconds. */
+  resets_at: number | null;
+  /** Unix ms of the newest report that carried newly fetched data; null: never confirmed. */
+  observed_at: number | null;
+  reported_at: number | null;
+  /** Another profile on the same account whose session reported it. */
+  reported_by: string | null;
+}
+
+export interface UsageRow {
+  choice: ProfileChoice;
+  name: string;
+  enabled: boolean;
+  eligible: boolean;
+  ineligible_reason: string | null;
+  /** Rows with the same value are one account. */
+  account: string;
+  same_account_as: string[];
+  five_hour: UsageWindow;
+  seven_day: UsageWindow;
+}
+
+export interface UsageSuggestion {
+  choice: ProfileChoice;
+  name: string;
+  /** Every eligible choice on the suggested account. */
+  choices: ProfileChoice[];
+  reason: string;
+}
+
+/** `account_usage.get` / `hello.account_usage`. */
+export interface AccountUsage {
+  evaluated_at: number;
+  stale_after_ms: number;
+  rows: UsageRow[];
+  suggestion: UsageSuggestion | null;
+  no_suggestion: string | null;
+}
 
 export type AgentState =
   | "starting"
@@ -467,6 +515,7 @@ export type ServerEvent =
   | { event: "note_upserted"; data: Note }
   | { event: "note_removed"; data: { id: number } }
   | { event: "account_profiles_changed"; data: AccountProfile[] }
+  | { event: "account_usage_changed"; data: AccountUsage }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
   | { event: "channel_upserted"; data: Channel }
@@ -498,7 +547,9 @@ export type ServerEvent =
       epoch: string;
       size_rev: number | null;
     };
-  };
+  }
+  /** Phone only: this device's alert subscription or its delivery status changed. */
+  | { event: "push_changed"; data: { device_id: number } };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
 /** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */
@@ -528,6 +579,8 @@ export interface HelloResult {
   /** Missing from backends without notes. */
   notes?: NoteSummary[];
   account_profiles?: AccountProfile[];
+  /** Missing from backends without usage reporting; null if it could not be read. */
+  account_usage?: AccountUsage | null;
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
   version: string;

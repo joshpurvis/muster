@@ -19,6 +19,10 @@ pub struct AccountProfile {
     pub config_dir: String,
     pub enabled: bool,
     pub created_at: i64,
+    /// Opaque: profiles with the same value were declared by the human to sign in to one
+    /// account, so they share its limits (src/usage.rs). Never derived from login files.
+    #[serde(default)]
+    pub account_group: Option<String>,
 }
 
 /// Omitted/null on creation means inherit; "default" explicitly selects the ordinary
@@ -199,6 +203,7 @@ mod tests {
                 config_dir: config_directory(self.0.to_str().unwrap()).unwrap(),
                 enabled: true,
                 created_at: 1,
+                account_group: None,
             }
         }
     }
@@ -278,7 +283,7 @@ mod tests {
         std::os::unix::fs::symlink(&default, home.0.join("link")).unwrap();
         std::fs::create_dir(home.0.join("other")).unwrap();
         let profile = |dir: &std::path::Path| AccountProfile {
-            id: 2, name: "Work".into(), enabled: true, created_at: 1,
+            id: 2, name: "Work".into(), enabled: true, created_at: 1, account_group: None,
             config_dir: config_directory(dir.to_str().unwrap()).unwrap(),
         };
         let launch = |p: &AccountProfile, home: String| {

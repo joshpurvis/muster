@@ -1,6 +1,6 @@
 # Android remote support: implementation plan
 
-Status: phases 0, 1 and 3 are implemented, and phase 4's `manage` UI. That covers pairing,
+Status: phases 0, 1, 2 and 3 are implemented, and phase 4's `manage` UI. That covers pairing,
 device cookie auth, the proxied-request policy, scopes, `/m/` (sessions list, approvals,
 read-only terminal with touch scroll, pinch zoom and select/copy, floating composer,
 `follow`/`keep` size), suspend on background, and the replay economy: `attach_info`, `screen`
@@ -8,7 +8,8 @@ and `delta` replays (a phone coming back gets only the output it missed), and pi
 A manage-scoped phone opens new tabs (folder, agent kind, optional first prompt and worktree,
 `fs.complete` for typed folders) and restarts, stops, renames or closes a tab and renames or
 archives its task, from the session title's sheet; stop, close and archive ask first in plain
-words. Not done yet: Web Push (phase 2) and WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
+words. Phone alerts go over Web Push (phase 2: src/push.rs, web/m/sw.js; tested against the RFC 8291
+vectors and a local fake push service, not yet on a real phone). Not done yet: WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
 device tokens are hashed with a small in-crate SHA-256. The wire contract is in docs/PROTOCOL.md
 "Remote devices"; where this plan and PROTOCOL.md differ, PROTOCOL.md wins.
 
@@ -104,7 +105,8 @@ What changes behind `tailscale serve`:
 Store: a new entry in `MIGRATIONS` (src/store.rs:25) adds
 `devices(id, name, token_hash, scopes, ts_login, created_at, last_seen_at, last_source,
 expires_at, revoked_at)`, `remote_origins(origin, added_at)` and, in phase 2,
-`push_subscriptions(device_id, endpoint, p256dh, auth, created_at)`. `token_hash` is
+`push_subscriptions(device_id PRIMARY KEY, endpoint, p256dh, auth, created_at, last_ok_at,
+last_error, last_error_at)` (migration v23). `token_hash` is
 `UNIQUE`, `scopes` is a JSON array, `p256dh`/`auth` are stored as received. Foreign keys are
 off (src/store.rs:141), so revocation deletes subscriptions explicitly. `size_owner` (below) is
 runtime state, not persisted: no column, null after a daemon restart.
@@ -295,18 +297,59 @@ Decision: **B is the default, A is a per-client setting.** Both run on the same 
 | Delivery | Best effort (RFC 8030): set `TTL: 300`, `Urgency: high`; Doze can delay | Comparable, app keeps its own socket |
 | Effort | ~2-3 days | ~half a day |
 
-Recommend Web Push: no extra app, encrypted, opens the right session, works while the tab is
-frozen. Protocol: `push.key {}` → `{public_key}`; `push.subscribe {endpoint, p256dh, auth}`
-(device only, replaces this device's row); `push.unsubscribe {}`. Endpoint rules: `https`
-only, host on an allowlist (`fcm.googleapis.com`, `*.push.services.mozilla.com`,
-`*.notify.windows.com`, extendable via config), no redirects followed, 5 s timeout; rows
-deleted on 404/410, on revoke and on expiry. Implementation: refactor `notify.rs` so
-`decide()` (src/notify.rs:63-106, with its 60 s / 5 s dedup) feeds sinks; `Note`
-(src/notify.rs:29-32) gains `session_id`, `state_since` and `channel_id`; the desktop worker
-(:118-146) is one sink, push another; `MUSTER_NO_NOTIFY` (:35) then disables only the desktop
-sink. The service worker uses `tag = session id` so a newer alert replaces an older one and
-drops an alert whose `state_since` is older than one it already showed. Keep ntfy as a
-one-function fallback (`MUSTER_NTFY_URL`) for people who self-host it.
+Chosen and built: Web Push (no extra app, encrypted, opens the right session, works while the
+tab is frozen), with ntfy as a fallback (`MUSTER_NTFY_URL`) for people who self-host it. The wire
+contract is docs/PROTOCOL.md "Phone alerts"; in short:
+
+- **Protocol.** `push.key`, `push.status`, `push.subscribe {endpoint, p256dh, auth}` (device
+  only, one row per device, replaces the earlier one), `push.unsubscribe`, and `push.test` (one
+  alert now, so the phone can tell whether alerts work). Each answers `{public_key,
+  subscription}`, where `subscription` carries `last_ok_at`, `last_error` and `last_error_at`.
+  `device.list` (and `muster devices`, column ALERTS) shows each device's alert status.
+- **Endpoint rules** (src/push.rs `check_endpoint`): `https` only, a lowercase DNS host on the
+  allowlist `fcm.googleapis.com`, `*.push.services.mozilla.com`, `*.notify.windows.com` at port
+  443, extended only by the owner's `MUSTER_PUSH_HOSTS`; no redirects followed; 5 s for the whole
+  request; no `[ ] { }` in an endpoint and curl's `--globoff`, so a URL is one request. Rows are
+  deleted on 404/410, on revoke (`Registry::revoke`) and on expiry (at the next alert).
+- **Crypto.** RFC 8291 `aes128gcm` and RFC 8292 VAPID (ES256 JWT, `exp` 12 h, `sub`
+  `https://muster.invalid/web-push` unless `MUSTER_PUSH_SUBJECT` says otherwise) on the RustCrypto
+  crates `p256`, `hkdf` and `aes-gcm` rather than the `web-push` crate, which was last released in
+  February 2025 and pulls in OpenSSL and the MPL-licensed `ece`. Plaintext is padded to 1024 bytes,
+  so every alert is 1126 bytes on the wire. The VAPID key is generated once into
+  `<data>/push_vapid_key` (0600).
+- **Transport.** `curl`, as for the OpenRouter model list, so the daemon has no TLS stack of its
+  own; endpoint and signed token go on curl's stdin, never its command line. `TTL: 300`,
+  `Urgency: high`, `Topic: muster-s<id>`.
+- **Sinks.** src/notify.rs `decide()` (unchanged 60 s / 5 s dedup) makes one `Note` (now with
+  `session_id`, `channel_id`, `state`, `state_since`, `state_seq`) for every sink: the desktop
+  worker, and the push sink (src/push.rs `Sink`, never blocking the loop). One admission control
+  covers every alert request (deliveries, `push.test`, ntfy): 4 at once, 64 waiting; a waiting
+  delivery is checked again when its turn comes and dropped if the phone was revoked or expired
+  or its subscription changed meanwhile. `MUSTER_NO_NOTIFY` disables only the desktop sink. Schedule alerts (`notify::alert`) stay
+  desktop only: they open no session.
+- **Service worker** (web/m/sw.js): `tag = "s<session id>"`, so a newer alert replaces an older
+  one; an alert older (by `state_since`, then send time) than the one already shown re-shows
+  that one silently instead, because Chrome expects every push to show a notification. Tapping
+  focuses the open app and opens the session (a message to the page), or opens
+  `/m/#s=<id>`. The newest alert shown per tag is remembered (Cache Storage), so a late older
+  one is dropped even after the newer one was tapped or closed. `pushsubscriptionchange`
+  re-subscribes and keeps the new subscription until the daemon took it or refused it for good
+  (`subscription refused: `; anything else is retried on later pushes and by the page on its
+  next connection). A new worker takes over at once
+  (`skipWaiting`), and answers the page's alerts handshake.
+- **Phone UI** (web/src/m/alerts.ts, the ⋯ menu's "Alerts on this phone"): Turn on (asks for
+  notification permission, checks the service worker shows alerts, subscribes, sends the
+  subscription), Turn off, Send test (says "arrived" once the service worker showed it, even
+  before the daemon answers, or warns after 15 s), and a status line: on and when the last alert
+  went out, the last failure and why, blocked by the browser, needs a reload (an older service
+  worker still in charge), not supported by this Muster (an older backend), or not supported by
+  the browser. Turning on reuses the browser's subscription only when the daemon holds that very
+  one, else it makes a fresh one (one deleted on 404/410 is still handed out by the browser). While alerts fail, "Turn on again" starts over with
+  a new subscription and sends a test; alerts show as working again only when that test went
+  out. Alerts count as on only when the daemon holds the subscription this browser has. The
+  status follows the daemon: each connection, each `push_changed` event and each opening of the
+  menu ask `push.status` again. The sessions list shows a dismissable "Turn on" nudge while alerts
+  are off and a warning while they fail. Opening or approving a session closes its alert.
 
 ## Reconnect and battery
 
@@ -351,7 +394,7 @@ Implemented (web/src/m/store.ts, web/src/m/term.ts, src/replay_tail.rs, src/rpc.
 |---|---|---|---|
 | 0 Approve from phone | `remote_origins`, proxied-request policy and proxy-uid header trust, cookie auth, `Principal` + scope checks on all three paths, `devices` table, `device.*`, `/api/device/me`, `muster pair/devices`, `/m/` sessions screen with Approve/Deny (+`state_since`), CSP, ts_login pinning | 4-5 days | Phone on the tailnet approves a Claude Code permission prompt; a stale approve is refused; `muster devices revoke` disconnects it within a second and the PWA shows "unpaired". |
 | 1 Terminal + composer | Read-only xterm, `resizePolicy`, `session.keys`, chip row, textarea via `session.send`, visualViewport bar, `attach_info` + `screen` replay, `size_owner` + `termSize` setting | 4-5 days | A dictated multi-line prompt to a busy agent is delivered once idle; Esc interrupts; output is live; in `follow` the PTY follows the phone on send and returns to the desktop on its next keypress. |
-| 2 Notifications | VAPID, `sw.js`, `push.*`, endpoint rules, notify sinks | 2-3 days | Screen-off phone shows the alert typically within ~10 s of `needs_approval`; tapping opens that session; revoke deletes the subscription. |
+| 2 Notifications (built; real-device check pending) | VAPID, `sw.js`, `push.*`, endpoint rules, notify sinks, ntfy fallback, alerts setting with test alert | 2-3 days | Screen-off phone shows the alert typically within ~10 s of `needs_approval`; tapping opens that session; revoke deletes the subscription. Covered so far: RFC 8291 vectors, endpoint and sink unit tests, and the smoke test's fake push service (alert decrypts to the session well within 10 s, revoke and 410 delete the row). |
 | 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. **Done** (measured 2026-10-26 against a throwaway daemon, phone grid 59×40, page WebSocket bytes in up to and including the replay): busy normal-screen log (~1 KiB/s), back after 10 min: 258.5 KiB before (capped replay) → 66.6 KiB after (`screen`); after 15 s: 55.5 KiB → 16.8 KiB (`delta`, byte-exact against a reference client). Busy full-screen agent (alternate screen, spinner and repaints): 5.0 → 5.2 KiB either way (its screen is smaller than any delta, so it gets the screen). Both include a 2.6 KiB `hello` (it grows with the number of sessions). |
 | 4 Polish | `manage` scope UI (new tab; done: web/src/m/NewTab.tsx, SessionActions.tsx), install prompt, WebAuthn gate (if wanted), transport/auth seams tidy enough for the paid track | ongoing | Per item. |
 
@@ -414,20 +457,32 @@ of the Tailscale/PWA phases.
   touch) against `dev/mock.ts` for screenshots of the screens; the keyboard-open layout is
   approximated by shrinking the emulated viewport height (do not resize the desktop window
   under Hyprland). Headless cannot exercise the Android IME or push; those are device-only.
+- Phone alerts: unit tests for the RFC 8291 example and its intermediate values, padding and a
+  round trip, the VAPID JWT (verified), the VAPID key file, every endpoint rule, curl config
+  quoting, status mapping, ntfy, the registry (status per endpoint, 410, revoke, expiry), the
+  sinks (`MUSTER_NO_NOTIFY` stops only the desktop); the HTTP device test subscribes through the
+  rules. `scripts/smoke.ts` "phone alerts" runs a fake push service over https on loopback
+  (self-signed, trusted through `CURL_CA_BUNDLE`, allowed through `MUSTER_PUSH_HOSTS`): a
+  permission request reaches it as a VAPID-signed, fixed-size message that WebCrypto decrypts to
+  that session; then a redirect (refused, not followed), a silent service (given up after 5 s; no
+  command line holds the endpoint or token), a 410 (row deleted), and revoke (row deleted).
 - Real device, each phase: run the `tailscale serve` line `muster pair` prints; scan with the
   camera; Chrome → "Install app"; checklist: approve, deny, approve after the prompt changed
   (refused), dictate a prompt to a busy agent, Esc, Ctrl-C in a shell, background 10 min then
   return (network panel shows a delta or screen, not megabytes), airplane mode on/off, revoke
   from the laptop and confirm "unpaired", second device pairing, wrong code ×3 then burnt,
-  `follow` resize and desktop take-back. Use `chrome://inspect` over USB for console and
-  network sizes.
+  `follow` resize and desktop take-back. Phase 2: ⋯ → Turn on alerts → allow; Send test shows
+  "arrived"; lock the phone, make an agent ask for approval, the alert shows within ~10 s; tap
+  it, that session opens; a second approval in the same session replaces the alert; `muster
+  devices` shows ALERTS on; `muster devices revoke` and the next approval shows nothing. Use
+  `chrome://inspect` over USB for console and network sizes.
 
 ## Open questions
 
 1. Width is decided (B default, A as a setting). Should `follow` also resize on plain
    viewing after a long press on the terminal, or only on send/keys/approve as planned?
 2. Default scope for `muster pair`: `interact` (recommended) or also `manage` (spawn tabs)?
-3. Web Push (daemon makes outbound HTTPS to Google's push endpoint) or self-hosted ntfy?
+3. Decided and built: Web Push, with self-hosted ntfy as an optional fallback (`MUSTER_NTFY_URL`).
 4. Pin devices to `Tailscale-User-Login` as planned (enforced only when the header is present
    and trusted)? It makes tailscale serve the only proxy that gets pinning.
 5. 30-day sliding expiry acceptable, or a fixed lifetime?

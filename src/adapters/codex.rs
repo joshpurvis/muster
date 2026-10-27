@@ -6,13 +6,14 @@
 //! [-- <initial prompt>]`. The sandbox flags come from the channel's permission profile
 //! (`sandbox_args`). All settings are `-c` overrides for this process only;
 //! `~/.codex/config.toml` is never touched.
-//! - Resume: stored arguments carrying Muster's own `--resume <thread id>` (allowlisted for
-//!   Codex in `adapters::CODEX_ARGS`; not a Codex flag) launch `codex resume <the same flags>
-//!   -- <thread id> [<initial prompt>]` instead. Checked against `codex resume --help` of
+//! - Resume: a run the hub gives a thread (`SpawnCtx::resume`; saved outside the stored
+//!   arguments, which older backends must keep accepting) launches `codex resume <the same
+//!   flags> -- <thread id> [<initial prompt>]`. Checked against `codex resume --help` of
 //!   codex-cli 0.164.0: the subcommand takes every flag Muster passes (`-c`, `--sandbox`, `-m`,
 //!   `-i`, `--no-alt-screen`) after it, then `[SESSION_ID] [PROMPT]`. A thread Codex no longer
-//!   has ends the run before any hook (guess: exit 1, "No saved session found with ID …"), which
-//!   `Hub::pty_exited` reads as a failed resume, so the next start is a new conversation.
+//!   has makes it print "No saved session found with ID <id>. …" (that string is in the 0.164.0
+//!   binary) and exit; only that message makes Muster forget the thread
+//!   (`adapters::says_conversation_missing`).
 //! - approvals: `approval_policy="on-request"` and `approvals_reviewer="auto_review"` give
 //!   new sessions the approval behavior of `--approve-for-me`. That shorthand conflicts with
 //!   `--sandbox`, so use its settings directly to preserve the channel's selected sandbox.
@@ -132,27 +133,6 @@ fn first_line(v: Option<&Value>, max: usize) -> Option<String> {
 /// [PROMPT]`). It comes first, so anything Muster adds to a launch goes after it.
 pub const RESUME: &str = "resume";
 
-/// The thread to resume (Muster's `--resume <id>`, the last one if several) and the other
-/// stored arguments. Unchanged when there is none, else normalised the way the argument check
-/// reads them (`--flag=v`).
-fn split_resume(args: &[String]) -> anyhow::Result<(Option<String>, Vec<String>)> {
-    let flags = parse_extra_args(SessionKind::Codex, args)?;
-    if !flags.iter().any(|(long, _)| *long == "--resume") {
-        return Ok((None, args.to_vec()));
-    }
-    let (mut resume, mut rest) = (None, Vec::new());
-    for (long, values) in flags {
-        match (long, values.as_slice()) {
-            ("--resume", [id]) => resume = Some(id.to_string()),
-            (_, [v]) => rest.push(format!("{long}={v}")),
-            (_, values) => {
-                rest.push(long.to_string());
-                rest.extend(values.iter().map(|v| v.to_string()));
-            }
-        }
-    }
-    Ok((resume, rest))
-}
 
 /// Codex fires notify for its internal "generate a title" request too.
 pub(crate) fn is_title_generation(payload: &Value) -> bool {
@@ -293,7 +273,9 @@ impl Adapter for CodexAdapter {
 
     fn command(&self, ctx: &SpawnCtx) -> anyhow::Result<CommandSpec> {
         let bin = ctx.muster_bin.to_string_lossy();
-        let (resume, extra) = split_resume(&ctx.extra_args)?;
+        let resume = ctx.resume.clone();
+        anyhow::ensure!(resume.as_deref().is_none_or(crate::agents::valid_resume_id), "not a Codex thread id: {resume:?}");
+        let extra = ctx.extra_args.iter().cloned();
         let mut args = Vec::new();
         if resume.is_some() {
             args.push(RESUME.to_string());
@@ -650,6 +632,7 @@ mod tests {
                 codex_sandbox: sandbox,
                 claude_mode: ClaudeMode::Bypass,
             },
+            resume: None,
         }
     }
 
@@ -719,13 +702,15 @@ mod tests {
     #[test]
     fn resume_builds_the_resume_subcommand_with_every_flag_after_it() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        let launch = |extra: &[&str], prompt: Option<&str>| {
+        let id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let launch_from = |extra: &[&str], resume: Option<&str>, prompt: Option<&str>| {
             let mut c = ctx(CodexSandbox::WorkspaceWrite, prompt);
             c.extra_args = s(extra);
+            c.resume = resume.map(str::to_string);
             CodexAdapter.command(&c).unwrap()
         };
-        let id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
-        let spec = launch(&["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh", "--resume", id], None);
+        let launch = |extra: &[&str], prompt: Option<&str>| launch_from(extra, Some(id), prompt);
+        let spec = launch(&["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"], None);
         let a = &spec.args;
         assert_eq!(a[0], "resume", "the subcommand comes first: {a:?}");
         assert_eq!(&a[a.len() - 2..], &["--", id]);
@@ -734,26 +719,27 @@ mod tests {
         assert!(a.windows(2).any(|w| w[0] == "-c" && w[1].starts_with("mcp_servers.muster.url=")));
         assert!(a.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
         assert!(a.windows(2).any(|w| w == ["-c", "sandbox_workspace_write.network_access=false"]));
-        assert!(a.contains(&"--model=gpt-6-sol".to_string()) && a.contains(&"--config=model_reasoning_effort=xhigh".to_string()));
+        assert!(a.windows(2).any(|w| w == ["-m", "gpt-6-sol"]) && a.windows(2).any(|w| w == ["-c", "model_reasoning_effort=xhigh"]));
+        assert!(a.windows(2).any(|w| w == ["-c", "approval_policy=\"on-request\""]));
         assert!(!a.iter().any(|x| x.starts_with("--resume")), "never passed to Codex as a flag");
         assert!(!spec.consumed_initial_prompt);
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, a), Some(Some(id.to_string())));
         // An initial prompt follows the thread id.
-        let spec = launch(&["--resume", id, "-i", "a.png", "b.png"], Some("go on"));
+        let spec = launch(&["-i", "a.png", "b.png"], Some("go on"));
         assert_eq!(spec.args[0], "resume");
-        assert_eq!(&spec.args[spec.args.len() - 6..], &["--image", "a.png", "b.png", "--", id, "go on"]);
+        assert_eq!(&spec.args[spec.args.len() - 6..], &["-i", "a.png", "b.png", "--", id, "go on"]);
         assert!(spec.consumed_initial_prompt);
-        // The last --resume wins; without one nothing changes.
-        let spec = launch(&["--resume=old", "--resume", "new"], None);
-        assert_eq!(&spec.args[spec.args.len() - 2..], &["--", "new"]);
-        assert_eq!(spec.args.iter().filter(|x| *x == "--").count(), 1);
-        let spec = launch(&["--model", "x"], Some("hi"));
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, &spec.args), Some(Some(id.to_string())));
+        // Without a thread nothing changes.
+        let spec = launch_from(&["--model", "x"], None, Some("hi"));
         assert_ne!(spec.args[0], "resume");
         assert_eq!(&spec.args[spec.args.len() - 4..], &["--model", "x", "--", "hi"]);
-        let spec = launch(&[], None);
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, &spec.args), None);
+        let spec = launch_from(&[], None, None);
         assert!(!spec.args.iter().any(|x| x == "resume" || x == "--"));
         // A bad id never reaches a command line.
         let mut c = ctx(CodexSandbox::ReadOnly, None);
-        c.extra_args = s(&["--resume", "--sandbox"]);
+        c.resume = Some("--sandbox".into());
         assert!(CodexAdapter.command(&c).is_err());
     }
 

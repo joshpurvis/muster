@@ -216,7 +216,8 @@ async function main() {
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
 ${LAUNCH_DUMP("codex")}
-if [ "$1" = resume ] && [ "\${@: -1}" = stale-thread ]; then echo 'Error: No saved session found with ID stale-thread.'; exit 1; fi
+if [ "$1" = resume ] && [ "\${@: -1}" = stale-thread ]; then echo 'Error: No saved session found with ID stale-thread. Run \`codex resume\` without an ID to choose from existing sessions.'; exit 1; fi
+if [ "$1" = resume ] && [ -e '${BASE}/codex-broken' ]; then echo 'Error: failed to initialize state runtime: database is locked'; exit 1; fi
 stty -echo -icanon min 1 time 0
 printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
 exec cat > '${BASE}/fake-input'
@@ -1083,7 +1084,7 @@ exec cat > /dev/null
   const tab = await codexLaunch(codexTab, () => c.call("session.restart", { id: codexTab }));
   ok(
     tab.args.startsWith("ARGS resume -c notify=") && tab.args.endsWith(" -- thread-tab-1") && tab.args.includes(" --sandbox ") &&
-      tab.args.includes(" --model=gpt-smoke ") && !tab.args.includes("--resume"),
+      tab.args.includes(" -m gpt-smoke ") && !tab.args.includes("--resume"),
     `codex resume: a restarted tab reopens its thread with its flags: ${tab.args.slice(0, 40)}…${tab.args.slice(-60)}`,
   );
   await c.call("session.remove", { id: codexTab });
@@ -1093,7 +1094,26 @@ exec cat > /dev/null
   let ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
   ok(ag.args.startsWith("ARGS resume ") && ag.args.endsWith(" -- thread-agent-1"), `codex resume: a restarted agent reopens its thread: ${ag.args.slice(-60)}`);
   await c.waitFor("resumed agent idle", () => ag.since().some((s) => s.state === "idle"));
-  // A thread Codex no longer has: that run ends, the tab says so, the next start is new.
+  // A sub-agent's turn (its own thread) never replaces the agent's.
+  const child = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+    method: "POST", headers: { Authorization: `Bearer ${ag.token}` },
+    body: JSON.stringify({ type: "agent-turn-complete", "thread-id": "thread-child", "input-messages": ["sub task"], "last-assistant-message": "child done" }),
+  });
+  ok(child.ok, "codex resume: a sub-agent's notify accepted");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.endsWith(" -- thread-agent-1"), `codex resume: a sub-agent's turn didn't replace the thread: ${ag.args.slice(-40)}`);
+  // Any other failure (here: Codex's database can't open) keeps the thread.
+  await Deno.writeTextFile(`${BASE}/codex-broken`, "");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  await c.waitFor("broken run ends", () => ag.since().some((s) => s.state === "exited" && s.exit_code === 1));
+  await Deno.remove(`${BASE}/codex-broken`);
+  ok(!(await sessOf(agentSid)).state_detail?.includes("couldn't reopen"), "codex resume: an unrelated exit 1 says nothing about the conversation");
+  ok((await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: an unrelated exit 1 keeps the thread");
+  // Start fresh, then a thread Codex no longer has: that run ends, the tab says so, the next
+  // start is new.
+  ag = await codexLaunch(agentSid, () => c.call("agent.start", { name: "bg", fresh: true }));
+  ok(!ag.args.startsWith("ARGS resume"), `codex resume: Start fresh starts a new conversation: ${ag.args.slice(0, 40)}`);
+  await c.waitFor("fresh agent idle", () => ag.since().some((s) => s.state === "idle"));
   await turnDone(agentSid, ag.token, "stale-thread");
   ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
   ok(ag.args.endsWith(" -- stale-thread"), "codex resume: the restart tries the stale thread");

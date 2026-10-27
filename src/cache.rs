@@ -254,11 +254,10 @@ pub fn estimated_turn(info: &SessionInfo) -> Option<i64> {
 }
 
 /// A new run of a `kind` session started with `args` carries its conversation on (Claude's
-/// `--resume`/`--continue`, in every spelling the argument check accepts; Codex's Muster-only
-/// `--resume`, launched as `codex resume`), so the cache clock carries on too. Any other start
-/// is a new, empty conversation.
+/// `--resume`/`--continue`, in every spelling the argument check accepts), so the cache clock
+/// carries on too. Any other start is a new, empty conversation.
 pub fn continues_conversation(kind: SessionKind, args: &[String]) -> bool {
-    kind != SessionKind::Shell
+    kind == SessionKind::Claude
         && crate::adapters::parse_extra_args(kind, args)
             .is_ok_and(|flags| flags.iter().any(|(long, _)| matches!(*long, "--resume" | "--continue")))
 }
@@ -441,10 +440,8 @@ mod tests {
         assert!(continues_conversation(SessionKind::Claude, &a(&["--continue"])));
         assert!(continues_conversation(SessionKind::Claude, &a(&["--model", "opus", "-r"])));
         assert!(!continues_conversation(SessionKind::Claude, &a(&["--model", "opus"])));
-        // Codex's -c is a config override; Muster's --resume reopens a thread (`codex resume`).
+        // Codex's -c is a config override, and Codex runs never resume in Muster.
         assert!(!continues_conversation(SessionKind::Codex, &a(&["-c", "model=x"])));
-        assert!(continues_conversation(SessionKind::Codex, &a(&["-c", "model=x", "--resume", "t-1"])));
-        assert!(!continues_conversation(SessionKind::Shell, &a(&["--resume", "t-1"])));
     }
 
     #[test]

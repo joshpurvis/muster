@@ -3,13 +3,16 @@
 import { signal } from "@preact/signals";
 import { rpc } from "../rpc.ts";
 import {
+  alertsFailure,
   type AlertState,
   alertState,
   fromB64url,
+  keepBrowserSubscription,
   type PushInfo,
   renewal,
   repairedState,
   sameBytes,
+  subscriptionRefused,
   type TestAlert,
   testAlertStep,
 } from "./logic.ts";
@@ -153,7 +156,11 @@ export async function refreshAlerts() {
   try {
     const reg = await registration().catch(() => null);
     const [status, worker, sub, pending] = await Promise.all([
-      rpc.call<PushStatus>("push.status"),
+      rpc.call<PushStatus>("push.status").catch((e) => {
+        const state = alertsFailure(errorText(e));
+        if (state) alerts.value = state;
+        throw e;
+      }),
       reg ? ensureAlertWorker(reg) : Promise.resolve(false),
       reg ? reg.pushManager.getSubscription().catch(() => null) : Promise.resolve(null),
       pendingRenewal(),
@@ -167,8 +174,14 @@ export async function refreshAlerts() {
     const plan = renewal(status.subscription, ours?.endpoint ?? null, pending, Notification.permission);
     let now = status;
     if (plan.send && ours) {
-      now = await rpc.call<PushStatus>("push.subscribe", subscribeParams(ours));
-      await dropPendingRenewal();
+      try {
+        now = await rpc.call<PushStatus>("push.subscribe", subscribeParams(ours));
+        await dropPendingRenewal();
+      } catch (e) {
+        // Kept for the next connection unless the daemon refused it for good.
+        if (subscriptionRefused(errorText(e))) await dropPendingRenewal();
+        throw e;
+      }
     } else if (plan.dropPending) {
       await dropPendingRenewal();
     }
@@ -203,7 +216,8 @@ export async function turnOnAlerts(repair = false) {
       if (permission !== "denied") notify("Alerts need permission to show notifications");
       return;
     }
-    const key = fromB64url((await rpc.call<PushStatus>("push.key")).public_key);
+    const status = await rpc.call<PushStatus>("push.status");
+    const key = fromB64url(status.public_key);
     const reg = await registration();
     if (!await ensureAlertWorker(reg)) {
       alerts.value = { kind: "outdated" };
@@ -211,9 +225,15 @@ export async function turnOnAlerts(repair = false) {
       return;
     }
     let sub = await reg.pushManager.getSubscription();
-    // Subscribed for another key (a different daemon, or its key was replaced), or starting over
-    // after failures: a new subscription.
-    if (sub && (repair || !sameBytes(sub.options.applicationServerKey, key))) {
+    // Only the very subscription the daemon holds is reused (logic.ts `keepBrowserSubscription`):
+    // one it deleted on 404/410 is still handed out by the browser but is dead.
+    const keep = sub && keepBrowserSubscription(
+      repair,
+      sameBytes(sub.options.applicationServerKey, key),
+      status.subscription?.endpoint ?? null,
+      sub.endpoint,
+    );
+    if (sub && !keep) {
       await sub.unsubscribe();
       sub = null;
     }

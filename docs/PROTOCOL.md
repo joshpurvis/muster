@@ -1179,7 +1179,7 @@ the daemon).
 |---|---|---|
 | `push.key` | `{}` | `PushStatus` |
 | `push.status` | `{}` | `PushStatus` |
-| `push.subscribe` | `{endpoint, p256dh, auth}` (from `PushSubscription.toJSON()`) | `PushStatus`. One subscription per device: replaces the device's earlier one. The same endpoint again keeps its delivery history. |
+| `push.subscribe` | `{endpoint, p256dh, auth}` (from `PushSubscription.toJSON()`) | `PushStatus`. One subscription per device: replaces the device's earlier one. The same endpoint again keeps its delivery history. An error that refuses the subscription itself (endpoint or keys break the rules below, the device is revoked) begins `subscription refused: `; any other error may pass on a retry. |
 | `push.unsubscribe` | `{}` | `PushStatus` (subscription null) |
 | `push.test` | `{}` | `PushStatus` plus `{delivered, error}`: one test alert to this device, sent before the call returns. At most one per 5 s per device; it waits its turn like any alert and is refused at once when 64 alert requests already wait. |
 
@@ -1221,15 +1221,20 @@ every alert is 1126 bytes on the wire): `{v: 1, kind: "session" | "test", sessio
 channel_id, state, state_since, state_seq, at, title, body}`; `title` is `#channel · session`
 (at most 120 characters), `body` the state detail (at most 400; both are shortened until the
 JSON fits). The service worker (web/m/sw.js) shows it with `tag = "s<session_id>"`, so a newer
-alert replaces an older one, and keeps an already shown alert whose `state_since` (then `at`) is
-newer than an arriving one (one check-and-show at a time per tag, so two pushes handled at once
-can't swap). Tapping it opens `/m/#s=<session_id>`. The worker answers the page's
+alert replaces an older one. The worker keeps the newest `(state_since, at)` it has shown per tag
+(Cache Storage `muster-push`) and drops an arriving alert that is not newer, whether or not the
+newer one is still on screen (one check at a time per tag, so two pushes handled at once can't
+swap); a dropped one re-shows what is on screen silently, or shows and closes a silent one. Tapping it opens `/m/#s=<session_id>`. The worker answers the page's
 `{type: "muster-sw-hello"}` (on a `MessageChannel` port) with `{alerts: 1}`; the page turns
 alerts on, or shows them as on, only when the active worker answers that, and otherwise lets a
 waiting newer worker take over (`muster-skip-waiting`) or asks for a reload. When the browser
 renews the subscription (`pushsubscriptionchange`) the worker keeps it (Cache Storage
-`muster-push`) until `push.subscribe` reached the daemon, and retries on later pushes; the page
-also sends it on its next connection.
+`muster-push`) until the daemon took it (a `result`) or refused it for good (HTTP 401/403, or an
+error beginning `subscription refused: `); a network error, a 5xx, an unreadable answer or any
+other error keeps it, and it is retried on later pushes and sent by the page on its next
+connection. Turning alerts on reuses the browser's subscription only when the daemon holds that
+very one; otherwise (it was deleted on 404/410, but the browser still hands it out) the page
+unsubscribes and makes a fresh one.
 
 **ntfy fallback.** With `MUSTER_NTFY_URL` set (an `http(s)` ntfy topic URL), every phone alert is
 also posted there as plain text: `Title` (RFC 2047 encoded), `Priority: high`, `Click:

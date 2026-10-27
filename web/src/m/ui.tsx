@@ -142,6 +142,8 @@ function alertStatus(now: number): { text: string; tone: "ok" | "warn" | "muted"
         text: "Notifications are blocked for this site. Allow them in Chrome's site settings, then come back.",
         tone: "warn",
       };
+    case "unavailable":
+      return { text: "This Muster doesn't support phone alerts. Update Muster on your computer.", tone: "muted" };
     case "outdated":
       return {
         text: "Muster updated and needs a reload before alerts can show on this phone.",

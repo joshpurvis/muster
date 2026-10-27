@@ -39,6 +39,11 @@ pub const DEFAULT_SUBJECT: &str = "https://muster.invalid/web-push";
 /// ntfy; ntfy.sh would see the text).
 pub const ENV_NTFY: &str = "MUSTER_NTFY_URL";
 
+/// How every `push.subscribe` error that refuses the subscription itself begins (bad endpoint or
+/// keys, a revoked device); any other error (a store error) is worth retrying. web/m/sw.js and
+/// web/src/m/alerts.ts drop a kept renewal only on a refusal.
+pub const REFUSED: &str = "subscription refused: ";
+
 /// RFC 8030: how long the push service keeps an alert for an unreachable phone (an approval
 /// older than 5 minutes is better seen in the session list than as a late alert).
 pub const TTL_S: u32 = 300;

@@ -47,24 +47,52 @@ self.addEventListener("fetch", (event) => {
 // ----- phone alerts (docs/ANDROID.md "Notifications") -----
 // The daemon sends {v: 1, kind: "session" | "test", session_id, state_since, at, title, body},
 // encrypted to this browser. One notification per session (tag), so a newer alert replaces an
-// older one; an alert older than the one already shown (they can arrive out of order) is dropped.
+// older one. The newest alert seen per tag is kept (Cache Storage), so one arriving late that is
+// not newer is dropped, whether or not the newer one is still on screen (it may have been tapped
+// or closed by opening the session).
 
 /** What the page asks for before it turns alerts on (web/src/m/alerts.ts, bump both together). */
 const ALERTS_VERSION = 1;
 /** A renewed subscription not yet handed to the daemon (kept outside the shell cache). */
 const PENDING_CACHE = "muster-push";
 const PENDING_KEY = "/m/push-pending.json";
+/** Where the newest alert seen for a tag is kept: `{state_since, at}`. */
+const latestKey = (tag) => `/m/push-latest/${encodeURIComponent(tag)}.json`;
+/** If Cache Storage fails, this worker's own memory still orders what it handles. */
+const latestInMemory = new Map();
+
+async function loadLatest(tag) {
+  try {
+    const r = await (await caches.open(PENDING_CACHE)).match(latestKey(tag));
+    if (r) return await r.json();
+  } catch {
+    // Fall back to memory.
+  }
+  return latestInMemory.get(tag) ?? null;
+}
+
+async function saveLatest(tag, alert) {
+  const v = { state_since: Number(alert.state_since) || 0, at: Number(alert.at) || 0 };
+  latestInMemory.set(tag, v);
+  try {
+    await (await caches.open(PENDING_CACHE)).put(
+      latestKey(tag),
+      new Response(JSON.stringify(v), { headers: { "Content-Type": "application/json" } }),
+    );
+  } catch {
+    // Memory only.
+  }
+}
 
 function sessionUrl(id) {
   return Number.isSafeInteger(id) && id > 0 ? `/m/#s=${id}` : "/m/";
 }
 
-/** Is the shown notification's alert newer than `alert`? */
-function newer(shown, alert) {
-  const since = Number(shown?.state_since) || 0;
-  const at = Number(shown?.at) || 0;
-  const aSince = Number(alert.state_since) || 0;
-  return since > aSince || (since === aSince && at > (Number(alert.at) || 0));
+/** Is alert `a` newer than `b` (by `state_since`, then send time `at`)? */
+function newer(a, b) {
+  const since = Number(a?.state_since) || 0;
+  const bSince = Number(b?.state_since) || 0;
+  return since > bSince || (since === bSince && (Number(a?.at) || 0) > (Number(b?.at) || 0));
 }
 
 /**
@@ -97,19 +125,25 @@ async function showAlert(data) {
   const test = alert.kind === "test";
   const id = Number(alert.session_id);
   const tag = test ? "test" : `s${id}`;
-  await inLane(tag, async () => {
-    const shown = await reg.getNotifications({ tag });
-    const later = shown.find((n) => newer(n.data, alert));
-    if (later) {
-      // Keep the newer one as it is, silently (re-showing it counts as this push's notification).
-      return reg.showNotification(later.title, {
-        body: later.body,
+  const fresh = await inLane(tag, async () => {
+    const latest = await loadLatest(tag);
+    if (latest && !newer(alert, latest)) {
+      // Not newer than one already seen: dropped. Chrome wants every push to show something, so
+      // the newer one still on screen is re-shown as it is, silently; with none on screen, a
+      // silent notification is shown and closed at once.
+      const shown = await reg.getNotifications({ tag });
+      const kept = shown[0];
+      await reg.showNotification(kept?.title ?? "Muster", {
+        body: kept?.body ?? "",
         tag,
-        icon: later.icon,
-        data: later.data,
+        icon: kept?.icon,
+        data: kept?.data,
         silent: true,
       });
+      if (!kept) for (const n of await reg.getNotifications({ tag })) n.close();
+      return false;
     }
+    await saveLatest(tag, alert);
     await reg.showNotification(String(alert.title || "Muster"), {
       body: String(alert.body || ""),
       tag,
@@ -123,8 +157,9 @@ async function showAlert(data) {
         at: alert.at,
       },
     });
+    return true;
   });
-  if (test) {
+  if (test && fresh) {
     for (const client of await self.clients.matchAll({ type: "window", includeUncontrolled: true })) {
       client.postMessage({ type: "alert-shown", kind: "test" });
     }
@@ -180,11 +215,29 @@ async function dropPending() {
   await (await caches.open(PENDING_CACHE)).delete(PENDING_KEY);
 }
 
+/** What became of handing a renewal over: "taken", "refused" (for good) or "retry". */
+async function subscribeOutcome(response) {
+  // Unauthorized or forbidden: this phone's pairing is gone, no retry will help.
+  if (response.status === 401 || response.status === 403) return "refused";
+  if (!response.ok) return "retry";
+  let v = null;
+  try {
+    v = await response.json();
+  } catch {
+    return "retry";
+  }
+  if (v && v.result !== undefined && !v.error) return "taken";
+  const message = String(v?.error?.message ?? "");
+  // The daemon refused this subscription itself (src/push.rs REFUSED); anything else (a store
+  // error, a backend without alerts) may pass later.
+  return message.startsWith("subscription refused: ") ? "refused" : "retry";
+}
+
 /**
- * Hand a kept renewal to the daemon. Kept while the daemon can't be reached (restarting, the
- * tailnet down: a network error or a 5xx); dropped once it answered (taken, or refused for good),
- * or when the browser no longer has that subscription. The page also sends it on its next
- * connection (web/src/m/alerts.ts `refreshAlerts`).
+ * Hand a kept renewal to the daemon. Kept on anything retryable (no network, a 5xx, a daemon
+ * error that isn't a refusal); dropped once taken or refused for good, or when the browser no
+ * longer has that subscription. The page also sends it on its next connection
+ * (web/src/m/alerts.ts `refreshAlerts`).
  */
 async function sendPending() {
   const p = await loadPending();
@@ -206,8 +259,7 @@ async function sendPending() {
   } catch {
     return;
   }
-  if (r.status >= 500 || r.status === 0) return;
-  await dropPending();
+  if (await subscribeOutcome(r) !== "retry") await dropPending();
 }
 
 // The browser replaced the subscription (rare): keep the new one, then hand it to the daemon.

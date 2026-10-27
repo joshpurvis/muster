@@ -25,18 +25,25 @@ function worker(opts: {
 } = {}) {
   const handlers = new Map<string, Handler>();
   let shown: Shown[] = [];
+  /** Every showNotification call, in order. */
+  const log: Shown[] = [];
   const fetched: any[] = [];
   const stores = new Map<string, Map<string, string>>();
   let calls = 0;
   const registration = {
     showNotification(title: string, o: any) {
       shown = shown.filter((n) => n.tag !== o.tag);
-      shown.push({ title, tag: o.tag, body: o.body, data: o.data, silent: o.silent });
+      const n = { title, tag: o.tag, body: o.body, data: o.data, silent: o.silent };
+      shown.push(n);
+      log.push(n);
       return Promise.resolve();
     },
     getNotifications({ tag }: { tag: string }) {
       // What is shown when asked, answered after a delay (as a busy browser would).
-      const snapshot = shown.filter((n) => n.tag === tag).map((n) => ({ ...n }));
+      const snapshot = shown.filter((n) => n.tag === tag).map((n) => ({
+        ...n,
+        close: () => void (shown = shown.filter((m) => m.tag !== tag || m.title !== n.title)),
+      }));
       const delay = opts.getNotificationsDelay?.(calls++) ?? 0;
       return new Promise((r) => setTimeout(() => r(snapshot), delay));
     },
@@ -80,7 +87,9 @@ function worker(opts: {
   };
   const push = (alert: unknown) => dispatch("push", { data: { json: () => alert } });
   const pending = () => stores.get("muster-push")?.get("/m/push-pending.json") ?? null;
-  return { dispatch, push, shown: () => shown, fetched, pending };
+  /** The user tapped or the page closed a tag's notification. */
+  const close = (tag: string) => void (shown = shown.filter((n) => n.tag !== tag));
+  return { dispatch, push, shown: () => shown, log, close, fetched, pending };
 }
 
 const alert = (state_since: number, at: number, title: string) => ({
@@ -122,7 +131,10 @@ Deno.test("a renewed subscription the daemon couldn't take is kept and sent late
   };
   const w = worker({
     subscription: sub,
-    fetch: () => up ? Promise.resolve(new Response("{}")) : Promise.reject(new TypeError("network down")),
+    fetch: () =>
+      up
+        ? Promise.resolve(new Response(JSON.stringify({ id: 1, result: { subscription: null } })))
+        : Promise.reject(new TypeError("network down")),
   });
   await w.dispatch("pushsubscriptionchange", { newSubscription: sub, oldSubscription: null });
   equal(w.fetched.length, 1, "tried at once");
@@ -150,4 +162,39 @@ Deno.test("a kept renewal waits out 5xx, is dropped once the daemon answered or 
   await gone.dispatch("pushsubscriptionchange", { newSubscription: sub });
   equal(gone.pending(), null, "the browser no longer has it: nothing to send");
   equal(gone.fetched.length, 0);
+});
+
+Deno.test("a late older alert is dropped even after the newer one was closed", async () => {
+  const w = worker();
+  await w.push(alert(2000, 2, "newer"));
+  w.close("s7"); // tapped, or the session was opened on the phone
+  await w.push(alert(1000, 1, "older, delayed"));
+  equal(w.shown().filter((n) => n.tag === "s7").length, 0, "nothing back on screen");
+  equal(w.log.filter((n) => n.title === "older, delayed").length, 0, "the older one never shown");
+  equal(w.log.slice(1).every((n) => n.silent), true, "no sound for the dropped one");
+  // The same alert delivered twice: shown once.
+  await w.push(alert(2000, 2, "newer"));
+  equal(w.log.filter((n) => n.title === "newer" && !n.silent).length, 1);
+  // A newer one still shows.
+  await w.push(alert(3000, 3, "newest"));
+  equal(w.shown().find((n) => n.tag === "s7")?.title, "newest");
+});
+
+Deno.test("a renewal is dropped only once the daemon took it or refused it for good", async () => {
+  const sub = { endpoint: "https://fcm.googleapis.com/fcm/send/n", toJSON: () => ({ keys: { p256dh: "P", auth: "A" } }) };
+  let answer: Response = new Response("");
+  const w = worker({ subscription: sub, fetch: () => Promise.resolve(answer) });
+  const rpcError = (message: string) => new Response(JSON.stringify({ id: 1, error: { message } }));
+  answer = rpcError("database is locked");
+  await w.dispatch("pushsubscriptionchange", { newSubscription: sub });
+  equal(w.pending() !== null, true, "a daemon error (HTTP 200) that isn't a refusal: kept");
+  answer = rpcError("unknown method: push.subscribe");
+  await w.dispatch("message", { data: { type: "muster-push-retry" } });
+  equal(w.pending() !== null, true, "a backend without alerts: kept");
+  answer = new Response("not json");
+  await w.dispatch("message", { data: { type: "muster-push-retry" } });
+  equal(w.pending() !== null, true, "an unreadable answer: kept");
+  answer = rpcError("subscription refused: push endpoint has characters a URL can't have");
+  await w.dispatch("message", { data: { type: "muster-push-retry" } });
+  equal(w.pending(), null, "refused for good: dropped");
 });

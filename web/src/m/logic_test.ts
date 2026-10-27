@@ -1,7 +1,9 @@
 import {
+  alertsFailure,
   alertState,
   bufferText,
   fromB64url,
+  keepBrowserSubscription,
   normalizeCode,
   noteBusy,
   noteSession,
@@ -17,6 +19,7 @@ import {
   repeatBytes,
   returnNotches,
   sameBytes,
+  subscriptionRefused,
   scrollPosition,
   sessionOrder,
   splitPan,
@@ -166,6 +169,25 @@ Deno.test("a renewal the worker couldn't hand over is sent on the next connectio
   equal(renewal(PUSH, PUSH.endpoint, renewed, "granted"), { send: false, dropPending: true });
   equal(renewal(PUSH, renewed, renewed, "denied"), { send: false, dropPending: true });
   equal(renewal(PUSH, null, renewed, "granted"), { send: false, dropPending: true });
+});
+
+Deno.test("a backend without alerts says so; a lost connection keeps what is shown", () => {
+  equal(alertsFailure("unknown method: push.status"), { kind: "unavailable" });
+  equal(alertsFailure("Connection lost"), null);
+  equal(alertsFailure("Disconnected"), null);
+  equal(alertsFailure("Timed out"), null);
+  equal(subscriptionRefused("subscription refused: p256dh is not base64url"), true);
+  equal(subscriptionRefused("database is locked"), false);
+});
+
+Deno.test("turning alerts on reuses only the subscription the daemon holds", () => {
+  const e = "https://fcm.googleapis.com/fcm/send/a";
+  equal(keepBrowserSubscription(false, true, e, e), true);
+  // The daemon deleted it on 410 but the browser still hands it out: a fresh one.
+  equal(keepBrowserSubscription(false, true, null, e), false);
+  equal(keepBrowserSubscription(false, true, "https://fcm.googleapis.com/fcm/send/b", e), false);
+  equal(keepBrowserSubscription(false, false, e, e), false, "another daemon key");
+  equal(keepBrowserSubscription(true, true, e, e), false, "turn on again starts fresh");
 });
 
 Deno.test("application server keys decode from base64url and compare by bytes", () => {

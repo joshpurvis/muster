@@ -199,6 +199,8 @@ export type AlertState =
   | { kind: "denied" }
   /** The page's service worker is an older one without alerts (an update is still waiting). */
   | { kind: "outdated" }
+  /** The daemon has no phone alerts (an older backend: `push.*` is an unknown method). */
+  | { kind: "unavailable" }
   | { kind: "off" }
   | { kind: "on"; info: PushInfo; failing: boolean };
 
@@ -267,6 +269,35 @@ export function renewal(
   const pendingIsCurrent = pendingEndpoint !== null && pendingEndpoint === browserEndpoint;
   const send = usable && (pendingIsCurrent || (server !== null && server.endpoint !== browserEndpoint));
   return { send, dropPending: pendingEndpoint !== null && (!pendingIsCurrent || !usable) };
+}
+
+/**
+ * What a failed `push.status` means for the setting: an older backend without alerts answers
+ * "unknown method" (say so plainly); anything else is a lost connection (null: keep what is
+ * shown until the next connection asks again).
+ */
+export function alertsFailure(message: string): AlertState | null {
+  return /^unknown method: push\./.test(message) ? { kind: "unavailable" } : null;
+}
+
+/** The daemon refused a subscription itself (src/push.rs `REFUSED`): retrying won't help. */
+export function subscriptionRefused(message: string): boolean {
+  return message.startsWith("subscription refused: ");
+}
+
+/**
+ * Turning alerts on: keep the browser's subscription only when the daemon holds exactly it (for
+ * this daemon's key). Any other one may be what the push service called gone (the daemon deleted
+ * it on 404/410, but the browser still hands it out), so a fresh one is made; "Turn on again"
+ * (`repair`) always starts fresh.
+ */
+export function keepBrowserSubscription(
+  repair: boolean,
+  keyMatches: boolean,
+  daemonEndpoint: string | null,
+  browserEndpoint: string,
+): boolean {
+  return !repair && keyMatches && daemonEndpoint === browserEndpoint;
 }
 
 /** A test alert's way: sent to the push service, then shown here (or not, after a while). */

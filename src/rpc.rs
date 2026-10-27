@@ -1304,8 +1304,9 @@ async fn push_method(hub: &Arc<Hub>, who: &Principal, method: &str, params: Valu
                 auth: String,
             }
             let p: P = parse(params)?;
-            let endpoint = crate::push::check_endpoint(&p.endpoint, &crate::push::allowed_hosts()).map_err(RpcError)?;
-            crate::push::check_keys(&p.p256dh, &p.auth).map_err(RpcError)?;
+            let refused = |e: String| RpcError(format!("{}{e}", crate::push::REFUSED));
+            let endpoint = crate::push::check_endpoint(&p.endpoint, &crate::push::allowed_hosts()).map_err(refused)?;
+            crate::push::check_keys(&p.p256dh, &p.auth).map_err(refused)?;
             hub.devices().set_push(
                 hub.store(),
                 id,

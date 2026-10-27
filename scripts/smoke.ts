@@ -1659,7 +1659,7 @@ async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon
   await refused("push: http endpoint refused", phone("push.subscribe", { endpoint: `http://localhost:${pushPort}/push/a`, ...keys }), "https");
   await refused("push: host off the allowlist refused", phone("push.subscribe", { endpoint: "https://push.example.com/push/a", ...keys }), "not a known push service");
   await refused("push: allowlisted host on another port refused", phone("push.subscribe", { endpoint: "https://localhost/push/a", ...keys }), "not a known push service");
-  await refused("push: a curl glob pattern in the endpoint refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/x[1-10000]`, ...keys }), "characters");
+  await refused("push: a curl glob pattern in the endpoint refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/x[1-10000]`, ...keys }), "subscription refused: push endpoint has characters");
   await refused("push: bad keys refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/a`, p256dh: b64u(new Uint8Array(65)), auth: keys.auth }), "p256dh");
   await refused("push: the desktop client has no alerts of its own", c.call("push.status"), "paired phone");
   const endpoint = `${pushOrigin}/push/phone-1`;

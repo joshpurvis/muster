@@ -328,16 +328,20 @@ contract is docs/PROTOCOL.md "Phone alerts"; in short:
   one; an alert older (by `state_since`, then send time) than the one already shown re-shows
   that one silently instead, because Chrome expects every push to show a notification. Tapping
   focuses the open app and opens the session (a message to the page), or opens
-  `/m/#s=<id>`. One check-and-show at a time per tag. `pushsubscriptionchange` re-subscribes,
-  keeps the new subscription in Cache Storage until the daemon took it (retried on later pushes,
-  and sent by the page on its next connection). A new worker takes over at once
+  `/m/#s=<id>`. The newest alert shown per tag is remembered (Cache Storage), so a late older
+  one is dropped even after the newer one was tapped or closed. `pushsubscriptionchange`
+  re-subscribes and keeps the new subscription until the daemon took it or refused it for good
+  (`subscription refused: `; anything else is retried on later pushes and by the page on its
+  next connection). A new worker takes over at once
   (`skipWaiting`), and answers the page's alerts handshake.
 - **Phone UI** (web/src/m/alerts.ts, the ⋯ menu's "Alerts on this phone"): Turn on (asks for
   notification permission, checks the service worker shows alerts, subscribes, sends the
   subscription), Turn off, Send test (says "arrived" once the service worker showed it, even
   before the daemon answers, or warns after 15 s), and a status line: on and when the last alert
   went out, the last failure and why, blocked by the browser, needs a reload (an older service
-  worker still in charge), or not supported. While alerts fail, "Turn on again" starts over with
+  worker still in charge), not supported by this Muster (an older backend), or not supported by
+  the browser. Turning on reuses the browser's subscription only when the daemon holds that very
+  one, else it makes a fresh one (one deleted on 404/410 is still handed out by the browser). While alerts fail, "Turn on again" starts over with
   a new subscription and sends a test; alerts show as working again only when that test went
   out. Alerts count as on only when the daemon holds the subscription this browser has. The
   status follows the daemon: each connection, each `push_changed` event and each opening of the

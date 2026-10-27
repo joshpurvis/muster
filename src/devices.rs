@@ -277,7 +277,7 @@ impl Registry {
     pub fn set_push(&self, store: &Store, id: i64, mut sub: crate::push::Subscription) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         if !g.devices.get(&id).is_some_and(|d| d.live(now_ms())) {
-            anyhow::bail!("device revoked or expired");
+            anyhow::bail!("{}device revoked or expired", crate::push::REFUSED);
         }
         if let Some(old) = g.push.get(&id)
             && old.endpoint == sub.endpoint

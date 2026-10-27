@@ -835,7 +835,7 @@ mod tests {
             assert_eq!(crate::push::unb64(v["result"]["public_key"].as_str().unwrap()).unwrap().len(), 65);
             for bad in ["http://fcm.googleapis.com/fcm/send/x", "https://evil.example/fcm/send/x", "https://127.0.0.1:9/x"] {
                 let v = subscribe(bad);
-                assert!(v["error"]["message"].is_string(), "{bad} accepted: {v}");
+                assert!(v["error"]["message"].as_str().unwrap().starts_with(crate::push::REFUSED), "{bad} accepted: {v}");
             }
             let v = rpc(r#"{"id":5,"method":"push.status","params":{}}"#);
             assert!(v["result"]["subscription"].is_null(), "{v}");

@@ -480,7 +480,9 @@ export type ServerEvent =
   | { event: "schedule_settings"; data: ScheduleSettings }
   | { event: "updates_changed"; data: UpdateStatus }
   | { event: "prefs_changed"; data: WindowPrefs }
-  | { event: "daemon_stopping"; data: { reason: string } };
+  | { event: "daemon_stopping"; data: { reason: string } }
+  /** Phone only: this device's alert subscription or its delivery status changed. */
+  | { event: "push_changed"; data: { device_id: number } };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
 /** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */

@@ -9,6 +9,7 @@ import {
   alertsBusy,
   clearAlert,
   forgetBrowserSubscription,
+  refreshAlerts,
   sendTestAlert,
   testAlert,
   turnOffAlerts,
@@ -69,7 +70,11 @@ export function Settings() {
         class="icon-button"
         aria-label="Settings"
         aria-expanded={open}
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          // Opening the menu asks again how alerts stand (a delivery may have failed meanwhile).
+          if (!open) refreshAlerts();
+          setOpen(!open);
+        }}
       >
         <Icon name="more" />
       </button>
@@ -137,6 +142,11 @@ function alertStatus(now: number): { text: string; tone: "ok" | "warn" | "muted"
         text: "Notifications are blocked for this site. Allow them in Chrome's site settings, then come back.",
         tone: "warn",
       };
+    case "outdated":
+      return {
+        text: "Muster updated and needs a reload before alerts can show on this phone.",
+        tone: "warn",
+      };
     case "off":
       return { text: "Off. Turn on to get an alert when an agent needs you, even with the screen off.", tone: "muted" };
     case "on": {
@@ -179,9 +189,12 @@ function AlertSettings() {
           {TEST_TEXT[test]}
         </p>
       )}
+      {a.kind === "outdated" && (
+        <button type="button" class="alert-on" onClick={() => location.reload()}>Reload</button>
+      )}
       {(a.kind === "off" || (a.kind === "on" && a.failing)) && (
-        <button type="button" class="alert-on" disabled={busy} onClick={turnOnAlerts}>
-          {a.kind === "off" ? "Turn on alerts" : "Turn on again"}
+        <button type="button" class="alert-on" disabled={busy} onClick={() => turnOnAlerts(a.kind === "on")}>
+          {a.kind === "off" ? "Turn on alerts" : alertsBusy.value ? "Checking…" : "Turn on again"}
         </button>
       )}
       {a.kind === "on" && (
@@ -212,7 +225,7 @@ export function AlertBanner() {
     <div class="alert-banner" role="region" aria-label="Alerts">
       <p>Get an alert on this phone when an agent needs you.</p>
       <div class="alert-banner-actions">
-        <button type="button" class="alert-on" disabled={alertsBusy.value || !ready.value} onClick={turnOnAlerts}>
+        <button type="button" class="alert-on" disabled={alertsBusy.value || !ready.value} onClick={() => turnOnAlerts()}>
           Turn on
         </button>
         <button

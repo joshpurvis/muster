@@ -50,9 +50,9 @@ pub const PADDED_LEN: usize = 1024;
 /// RFC 8188 record size: one record holds a whole padded alert plus its tag.
 const RECORD_SIZE: u32 = 4096;
 const ENDPOINT_MAX: usize = 2048;
-/// Curl processes running at once.
+/// Alert requests (deliveries, tests, ntfy) running at once: curl processes ([`Admission`]).
 const CONCURRENCY: usize = 4;
-/// Deliveries waiting or running at once, all devices together.
+/// Alert requests waiting or running at once, all devices and sessions together.
 const QUEUE_MAX: usize = 64;
 /// `push.test` at most this often per device.
 const TEST_GAP_S: u64 = 5;
@@ -152,12 +152,16 @@ fn host_allowed(host_port: &str, allow: &[String]) -> bool {
 }
 
 /// Syntax only: `https://host[:port]/path...`, plain ASCII URL characters (nothing that needs
-/// quoting for curl), no user info, no fragment, a lowercase DNS-style host.
+/// quoting for curl), no user info, no fragment, a lowercase DNS-style host. No `[ ] { }`
+/// either: they are curl's URL globbing (`/x[1-1000]` would be a thousand requests; curl also
+/// runs with `--globoff`, this is the second wall).
 fn check_endpoint_syntax(url: &str) -> Result<Endpoint, String> {
     if url.len() > ENDPOINT_MAX {
         return Err("push endpoint is too long".into());
     }
-    if !url.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b'<' | b'>' | b'`' | b'{' | b'}' | b'|' | b'^')) {
+    if !url.bytes().all(|b| {
+        b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b'<' | b'>' | b'`' | b'{' | b'}' | b'[' | b']' | b'|' | b'^')
+    }) {
         return Err("push endpoint has characters a URL can't have".into());
     }
     let rest = url.strip_prefix("https://").ok_or("push endpoint must be an https URL")?;
@@ -452,9 +456,10 @@ fn curl_quote(s: &str) -> Result<String, String> {
     Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
 }
 
-/// curl's config (read from stdin) for one push.
+/// curl's config (read from stdin) for one push. `globoff` first: the URL is one request, never
+/// a `[1-100]` / `{a,b}` pattern (the command line says `--globoff` too).
 pub fn push_config(endpoint: &str, authorization: &str, topic: Option<&str>, body_path: &str) -> Result<String, String> {
-    let mut c = String::new();
+    let mut c = String::from("globoff\n");
     c.push_str(&format!("url = {}\n", curl_quote(endpoint)?));
     for h in [
         format!("TTL: {TTL_S}"),
@@ -477,16 +482,23 @@ fn user_agent() -> String {
     format!("Muster/{} (web push)", env!("CARGO_PKG_VERSION"))
 }
 
-/// Run curl with `config` on stdin: POST, only `protos` (`=https` for push endpoints), no
-/// redirects, at most [`TIMEOUT_S`]. The HTTP status, 0 when nothing answered.
-async fn curl_post(config: String, protos: &str) -> Result<u16, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let args = [
-        "-q", "-sS", "--proto", protos, "--max-redirs", "0", "--max-time", &TIMEOUT_S.to_string(),
+/// curl's command line: POST, only `protos`, no redirects, no URL globbing, at most
+/// [`TIMEOUT_S`], the config (URL, headers, body) from stdin.
+fn curl_args(protos: &str) -> Vec<String> {
+    [
+        "-q", "-sS", "--globoff", "--proto", protos, "--max-redirs", "0", "--max-time", &TIMEOUT_S.to_string(),
         "--connect-timeout", &TIMEOUT_S.to_string(), "--max-filesize", "65536", "-o", "/dev/null",
         "-w", "%{http_code}", "-A", &user_agent(), "-X", "POST", "-K", "-",
     ]
-    .map(|s| s.to_string());
+    .map(|s| s.to_string())
+    .to_vec()
+}
+
+/// Run curl with `config` on stdin ([`curl_args`]; `protos` is `=https` for push endpoints).
+/// The HTTP status, 0 when nothing answered.
+async fn curl_post(config: String, protos: &str) -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let args = curl_args(protos);
     let mut child = tokio::process::Command::new("curl")
         .args(&args)
         .env_remove("OPENROUTER_API_KEY")
@@ -511,7 +523,10 @@ async fn curl_post(config: String, protos: &str) -> Result<u16, String> {
     let (status, out, err) = tokio::time::timeout(Duration::from_secs(TIMEOUT_S + 3), work)
         .await
         .map_err(|_| format!("no answer from the push service within {TIMEOUT_S} s"))??;
-    let code: u16 = String::from_utf8_lossy(&out).trim().parse().unwrap_or(0);
+    // Exactly one status: with globbing off there is one request, so anything else is no answer.
+    let out = String::from_utf8_lossy(&out);
+    let out = out.trim();
+    let code: u16 = if out.len() == 3 && out.bytes().all(|b| b.is_ascii_digit()) { out.parse().unwrap_or(0) } else { 0 };
     if code == 0 && !status.success() {
         let why = String::from_utf8_lossy(&err);
         let why = why.trim().trim_start_matches("curl: ");
@@ -541,23 +556,74 @@ pub async fn deliver(vapid: &Vapid, sub: &Subscription, alert: &Alert, allow: &[
         Ok(b) => b,
         Err(e) => return Outcome::Failed(e),
     };
-    // The ciphertext goes through a private temp file (curl's stdin carries the config).
-    let dir = crate::paths::runtime_dir();
-    let path = dir.join(format!("push-{:016x}.bin", rand::random::<u64>()));
-    if let Err(e) = crate::paths::write_private(&path, &body) {
-        return Outcome::Failed(format!("writing the alert: {e}"));
-    }
+    // The ciphertext goes through a private temp file (curl's stdin carries the config), removed
+    // however this ends: done, failed, or the future dropped by a backend reload (and what a
+    // killed backend left is swept at the next start, [`sweep_stale_bodies`]).
+    let file = match BodyFile::write(&crate::paths::runtime_dir(), &body) {
+        Ok(f) => f,
+        Err(e) => return Outcome::Failed(format!("writing the alert: {e}")),
+    };
     let topic = alert.session_id.map(|s| format!("muster-s{s}"));
     let auth_header = vapid.authorization(&endpoint.origin, &subject(), now_ms() / 1000);
-    let result = match push_config(&sub.endpoint, &auth_header, topic.as_deref(), &path.to_string_lossy()) {
+    let result = match push_config(&sub.endpoint, &auth_header, topic.as_deref(), &file.0.to_string_lossy()) {
         Ok(config) => curl_post(config, "=https").await,
         Err(e) => Err(e),
     };
-    let _ = std::fs::remove_file(&path);
+    drop(file);
     match result {
         Ok(code) => outcome_of(code),
         Err(e) => Outcome::Failed(e),
     }
+}
+
+/// An encrypted alert body on disk, `<runtime>/push-<random>.bin` (0600), deleted on drop.
+struct BodyFile(std::path::PathBuf);
+
+impl BodyFile {
+    fn write(dir: &std::path::Path, body: &[u8]) -> std::io::Result<BodyFile> {
+        let path = dir.join(format!("{BODY_PREFIX}{:016x}{BODY_SUFFIX}", rand::random::<u64>()));
+        crate::paths::write_private(&path, body)?;
+        Ok(BodyFile(path))
+    }
+}
+
+impl Drop for BodyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+const BODY_PREFIX: &str = "push-";
+const BODY_SUFFIX: &str = ".bin";
+/// A body file older than this belongs to no running delivery (each lasts at most
+/// [`TIMEOUT_S`] + 3 s), so a fresh backend may delete it while the old one is still finishing.
+const STALE_BODY: Duration = Duration::from_secs(60);
+
+/// Delete alert bodies a killed backend left in `dir` (at start): only `push-<hex>.bin` files
+/// (and `push-<hex>.tmp<hex>`, one cut short while being written) older than `older_than`. The
+/// count deleted.
+pub fn sweep_stale_bodies(dir: &std::path::Path, older_than: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut n = 0;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let ours = name.strip_prefix(BODY_PREFIX).is_some_and(|rest| match rest.split_once('.') {
+            Some((id, ext)) => hex(id) && (ext == &BODY_SUFFIX[1..] || ext.strip_prefix("tmp").is_some_and(hex)),
+            None => false,
+        });
+        if !ours {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let old = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age >= older_than);
+        if meta.is_file() && old && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
 }
 
 // ----- ntfy fallback -----
@@ -574,7 +640,7 @@ pub fn ntfy_config(url: &str, alert: &Alert, click: Option<&str>) -> Result<Stri
     if !ok_scheme || url.chars().any(|c| c.is_control() || c == ' ') {
         return Err(format!("{ENV_NTFY} must be an http(s) URL"));
     }
-    let mut c = format!("url = {}\n", curl_quote(url)?);
+    let mut c = format!("globoff\nurl = {}\n", curl_quote(url)?);
     c.push_str(&format!("header = {}\n", curl_quote(&format!("Title: {}", mime_word(&clip_chars(&alert.title, 120))))?));
     c.push_str(&format!("header = {}\n", curl_quote("Priority: high")?));
     if let Some(click) = click {
@@ -606,34 +672,116 @@ async fn ntfy(hub: &Hub, url: &str, alert: &Alert) {
     }
 }
 
-// ----- the sink -----
+// ----- admission and the sink -----
 
-/// Phone alerts (one sink of src/notify.rs). Never blocks the notify loop: each delivery runs
-/// in its own task, at most [`CONCURRENCY`] curl processes at once.
+/// Admission control for every request the daemon makes for alerts: push deliveries,
+/// `push.test` and the ntfy fallback, all devices and sessions together. At most `max` of them
+/// waiting or running (past that a new one is refused at once: a push service that hangs must not
+/// pile up tasks), at most `running` curl processes at once.
+pub struct Admission {
+    gate: tokio::sync::Semaphore,
+    queued: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+/// A place in the [`Admission`] queue, given back on drop.
+pub struct Ticket {
+    adm: &'static Admission,
+}
+
+impl Admission {
+    pub fn new(running: usize, max: usize) -> Admission {
+        Admission { gate: tokio::sync::Semaphore::new(running), queued: Default::default(), max }
+    }
+
+    /// A place in the queue, or None when [`Admission::max`] requests already wait or run.
+    pub fn reserve(&'static self) -> Option<Ticket> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.queued
+            .fetch_update(SeqCst, SeqCst, |n| (n < self.max).then_some(n + 1))
+            .ok()
+            .map(|_| Ticket { adm: self })
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Ticket {
+    /// Wait for one of the running slots.
+    pub async fn admit(&self) -> tokio::sync::SemaphorePermit<'static> {
+        self.adm.gate.acquire().await.expect("the gate is never closed")
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.adm.queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The daemon's one admission control (docs/PROTOCOL.md "Phone alerts": 4 at once, 64 waiting).
+static ADMISSION: std::sync::LazyLock<Admission> = std::sync::LazyLock::new(|| Admission::new(CONCURRENCY, QUEUE_MAX));
+
+/// One delivery: wait for a running slot, then check again that the device is still live and
+/// `sub` is still its subscription (same endpoint and keys). While it waited the phone may have
+/// been revoked or expired, turned alerts off, subscribed again, or had the row deleted by a
+/// 404/410; then nothing is sent (None), so no alert text goes to a subscription the daemon no
+/// longer holds. `send` makes the request; its outcome is recorded.
+async fn deliver_admitted<F, Fut>(hub: &Hub, ticket: Ticket, device: i64, sub: &Subscription, send: F) -> Option<Outcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Outcome>,
+{
+    let _permit = ticket.admit().await;
+    if !hub.devices().push_is_current(device, sub) {
+        tracing::info!("device {device}: phone alert dropped (its subscription changed or ended while it waited)");
+        return None;
+    }
+    let outcome = send().await;
+    record(hub, device, &sub.endpoint, &outcome);
+    drop(ticket);
+    Some(outcome)
+}
+
+fn ntfy_url() -> Option<String> {
+    std::env::var(ENV_NTFY).ok().map(|u| u.trim().to_string()).filter(|u| !u.is_empty())
+}
+
+/// Phone alerts (one sink of src/notify.rs). Never blocks the notify loop: each request runs in
+/// its own task under [`ADMISSION`].
 pub struct Sink {
     hub: Arc<Hub>,
-    gate: Arc<tokio::sync::Semaphore>,
-    /// Deliveries started and not finished; past [`QUEUE_MAX`] new ones are dropped (a push
-    /// service that hangs must not pile up tasks).
-    queued: Arc<std::sync::atomic::AtomicUsize>,
+    adm: &'static Admission,
 }
 
 impl Sink {
+    /// At daemon start (also sweeps what a killed backend left, [`sweep_stale_bodies`]).
     pub fn new(hub: Arc<Hub>) -> Sink {
-        Sink {
-            hub,
-            gate: Arc::new(tokio::sync::Semaphore::new(CONCURRENCY)),
-            queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        let n = sweep_stale_bodies(&crate::paths::runtime_dir(), STALE_BODY);
+        if n > 0 {
+            tracing::info!("deleted {n} phone alert bodies a stopped backend left behind");
         }
+        Sink { hub, adm: &ADMISSION }
     }
 
     /// Send `alert` to every live device that has alerts on (and to ntfy when configured).
     pub fn send(&self, alert: Alert) {
-        let targets = self.hub.devices().push_targets(self.hub.store());
-        if let Some(url) = std::env::var(ENV_NTFY).ok().filter(|u| !u.trim().is_empty()) {
-            let (hub, alert) = (self.hub.clone(), alert.clone());
-            tokio::spawn(async move { ntfy(&hub, url.trim(), &alert).await });
+        if let Some(url) = ntfy_url() {
+            match self.adm.reserve() {
+                None => tracing::warn!("ntfy alert dropped ({QUEUE_MAX} alert requests already waiting)"),
+                Some(ticket) => {
+                    let (hub, alert) = (self.hub.clone(), alert.clone());
+                    tokio::spawn(async move {
+                        let _permit = ticket.admit().await;
+                        ntfy(&hub, &url, &alert).await;
+                    });
+                }
+            }
         }
+        let targets = self.hub.devices().push_targets(self.hub.store());
         if targets.is_empty() {
             return;
         }
@@ -642,42 +790,56 @@ impl Sink {
             Err(e) => return tracing::warn!("phone alerts: {e:#}"),
         };
         let allow = Arc::new(allowed_hosts());
-        use std::sync::atomic::Ordering;
         for (device, sub) in targets {
-            if self.queued.fetch_add(1, Ordering::SeqCst) >= QUEUE_MAX {
-                self.queued.fetch_sub(1, Ordering::SeqCst);
-                tracing::warn!("device {device}: phone alert dropped ({QUEUE_MAX} deliveries already waiting)");
+            let Some(ticket) = self.adm.reserve() else {
+                tracing::warn!("device {device}: phone alert dropped ({QUEUE_MAX} alert requests already waiting)");
                 continue;
-            }
-            let (hub, gate, alert, allow) = (self.hub.clone(), self.gate.clone(), alert.clone(), allow.clone());
-            let queued = self.queued.clone();
+            };
+            let (hub, alert, allow) = (self.hub.clone(), alert.clone(), allow.clone());
             tokio::spawn(async move {
-                if let Ok(_permit) = gate.acquire().await {
-                    let outcome = deliver(vapid, &sub, &alert, &allow).await;
-                    record(&hub, device, &sub.endpoint, &outcome);
-                }
-                queued.fetch_sub(1, Ordering::SeqCst);
+                deliver_admitted(&hub, ticket, device, &sub, || deliver(vapid, &sub, &alert, &allow)).await;
             });
         }
     }
 }
 
-/// Keep a delivery's result on the subscription it went to (not a newer one), and log it.
+/// Keep a delivery's result on the subscription it went to (not a newer one), log it, and tell
+/// the device's open pages (`push_changed`) so their status line follows.
 pub fn record(hub: &Hub, device: i64, endpoint: &str, outcome: &Outcome) {
     match outcome {
         Outcome::Delivered => {}
         Outcome::Gone(code) => tracing::info!("device {device}: push subscription gone ({code}); removed"),
         Outcome::Failed(e) => tracing::warn!("device {device}: phone alert failed: {e}"),
     }
-    hub.devices().record_push(hub.store(), device, endpoint, outcome);
+    if hub.devices().record_push(hub.store(), device, endpoint, outcome) {
+        changed(hub, device);
+    }
+}
+
+/// The device's subscription or its status changed: its pages ask `push.status` again.
+pub fn changed(hub: &Hub, device: i64) {
+    hub.emit(crate::hub::ServerEvent::PushChanged { device_id: device });
 }
 
 /// `push.test`: one alert to the calling device now, awaited, so the phone can say at once
-/// whether alerts work.
+/// whether alerts work. Under the same admission control as every other alert.
 pub async fn test(hub: &Hub, device: i64) -> Result<Outcome, String> {
+    let vapid = vapid().map_err(|e| format!("{e:#}"))?;
+    test_with(hub, &ADMISSION, device, |sub, alert| async move { deliver(vapid, &sub, &alert, &allowed_hosts()).await })
+        .await
+}
+
+async fn test_with<F, Fut>(hub: &Hub, adm: &'static Admission, device: i64, send: F) -> Result<Outcome, String>
+where
+    F: FnOnce(Subscription, Alert) -> Fut,
+    Fut: std::future::Future<Output = Outcome>,
+{
     static LAST: parking_lot::Mutex<Option<std::collections::HashMap<i64, std::time::Instant>>> =
         parking_lot::Mutex::new(None);
     let sub = hub.devices().push_subscription(device).ok_or("alerts are off on this device")?;
+    let ticket = adm
+        .reserve()
+        .ok_or("too many alerts are waiting to go out; try again in a minute")?;
     {
         let mut g = LAST.lock();
         let map = g.get_or_insert_with(Default::default);
@@ -687,7 +849,6 @@ pub async fn test(hub: &Hub, device: i64) -> Result<Outcome, String> {
         }
         map.insert(device, now);
     }
-    let vapid = vapid().map_err(|e| format!("{e:#}"))?;
     let alert = Alert {
         session_id: None,
         channel_id: None,
@@ -697,9 +858,9 @@ pub async fn test(hub: &Hub, device: i64) -> Result<Outcome, String> {
         title: "Muster".into(),
         body: "Test alert: alerts work on this phone.".into(),
     };
-    let outcome = deliver(vapid, &sub, &alert, &allowed_hosts()).await;
-    record(hub, device, &sub.endpoint, &outcome);
-    Ok(outcome)
+    deliver_admitted(hub, ticket, device, &sub, || send(sub.clone(), alert))
+        .await
+        .ok_or_else(|| "alerts on this device were turned off or changed meanwhile".to_string())
 }
 
 /// A browser-style `(p256dh, auth)` pair for tests elsewhere.
@@ -925,8 +1086,221 @@ mod tests {
             assert!(c.contains(&format!("header = \"{h}\"\n")), "{h}: {c}");
         }
         assert!(c.contains(r#"data-binary = "@/run/a \"b\"\\c.bin""#), "{c}");
-        assert_eq!(c.lines().count(), 8);
+        assert_eq!(c.lines().next(), Some("globoff"), "URL globbing off before the URL: {c}");
+        assert_eq!(c.lines().count(), 9);
         assert!(push_config("https://x/\n", "a", None, "/p").is_err());
+        let args = curl_args("=https");
+        assert!(args.iter().any(|a| a == "--globoff"), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--proto", "=https"]) && args.windows(2).any(|w| w == ["--max-redirs", "0"]));
+    }
+
+    /// An allowlisted host with a curl glob pattern (`[1-10000]`, `{a,b}`) would fan out into
+    /// many requests: refused at subscribe (and before every delivery), and curl runs with
+    /// globbing off anyway.
+    #[test]
+    fn glob_patterns_are_refused() {
+        let a = allow(&[]);
+        for bad in [
+            "https://fcm.googleapis.com/fcm/send/x[1-10000]",
+            "https://fcm.googleapis.com/fcm/send/[a-z]",
+            "https://fcm.googleapis.com/fcm/send/x]",
+            "https://fcm.googleapis.com/fcm/send/{a,b,c}",
+            "https://fcm.googleapis.com/fcm/send/x?y=[1-9]",
+        ] {
+            assert!(check_endpoint(bad, &a).is_err(), "{bad:?} should be refused");
+        }
+        let n = Alert { session_id: None, channel_id: None, state: None, state_since: 0, state_seq: 0, title: "t".into(), body: "b".into() };
+        assert!(ntfy_config("https://ntfy.example.org/m[1-3]", &n, None).unwrap().starts_with("globoff\n"));
+    }
+
+    fn fixture_hub() -> Arc<Hub> {
+        let cfg = crate::hub::HubConfig {
+            port: 0,
+            client_token: "t".into(),
+            muster_bin: std::path::PathBuf::from("/bin/true"),
+            terminal_host: None,
+            openrouter_key: None,
+        };
+        Hub::new(cfg, crate::store::Store::open_memory().unwrap()).unwrap()
+    }
+
+    fn pair(hub: &Hub) -> i64 {
+        let p = hub.devices().begin_pairing(120, None, vec![crate::devices::Scope::View]);
+        hub.devices().redeem(hub.store(), &p.code, None, &format!("src-{:x}", rand::random::<u64>()), None).unwrap().0.id
+    }
+
+    fn subscription(endpoint: &str) -> Subscription {
+        let (p256dh, auth) = test_keys();
+        Subscription { endpoint: endpoint.into(), p256dh, auth, created_at: 1, last_ok_at: None, last_error: None, last_error_at: None }
+    }
+
+    fn leak(running: usize, max: usize) -> &'static Admission {
+        Box::leak(Box::new(Admission::new(running, max)))
+    }
+
+    #[test]
+    fn admission_bounds_the_queue() {
+        let adm = leak(2, 3);
+        let t: Vec<Ticket> = (0..3).map(|_| adm.reserve().expect("room")).collect();
+        assert!(adm.reserve().is_none(), "the 4th waits nowhere: refused at once");
+        assert_eq!(adm.queued(), 3);
+        drop(t);
+        assert_eq!(adm.queued(), 0);
+        assert!(adm.reserve().is_some());
+    }
+
+    #[tokio::test]
+    async fn admission_bounds_what_runs_at_once() {
+        let adm = leak(2, 64);
+        let (now, most) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let ticket = adm.reserve().unwrap();
+            let (now, most) = (now.clone(), most.clone());
+            tasks.push(tokio::spawn(async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                let _permit = ticket.admit().await;
+                let n = now.fetch_add(1, SeqCst) + 1;
+                most.fetch_max(n, SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                now.fetch_sub(1, SeqCst);
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(most.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(adm.queued(), 0);
+    }
+
+    /// A delivery queued behind slow ones is checked again when its turn comes: a phone revoked,
+    /// turned off, subscribed again (new endpoint or new keys) or deleted by a 410 meanwhile gets
+    /// nothing, so no alert text reaches a subscription the daemon no longer holds.
+    #[tokio::test]
+    async fn a_queued_delivery_is_dropped_when_its_subscription_ended() {
+        let hub = fixture_hub();
+        type Change = fn(&Hub, i64, &Subscription);
+        let cases: [(&str, Change); 6] = [
+            ("unchanged", |_, _, _| {}),
+            ("revoked", |h, d, _| {
+                h.devices().revoke(h.store(), Some(d)).unwrap();
+            }),
+            ("turned off", |h, d, _| {
+                h.devices().remove_push(h.store(), d).unwrap();
+            }),
+            ("subscribed again elsewhere", |h, d, _| {
+                h.devices().set_push(h.store(), d, subscription("https://fcm.googleapis.com/fcm/send/new")).unwrap();
+            }),
+            ("same endpoint, new keys", |h, d, s| {
+                h.devices().set_push(h.store(), d, subscription(&s.endpoint)).unwrap();
+            }),
+            ("deleted by a 410", |h, d, s| {
+                h.devices().record_push(h.store(), d, &s.endpoint, &Outcome::Gone(410));
+            }),
+        ];
+        for (what, change) in cases {
+            let device = pair(&hub);
+            let sub = subscription(&format!("https://fcm.googleapis.com/fcm/send/{device}"));
+            hub.devices().set_push(hub.store(), device, sub.clone()).unwrap();
+            let adm = leak(1, 8);
+            // A slow delivery holds the only running slot.
+            let slow = adm.reserve().unwrap();
+            let held = slow.admit().await;
+            let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (h, s, flag) = (hub.clone(), sub.clone(), sent.clone());
+            let ticket = adm.reserve().unwrap();
+            let job = tokio::spawn(async move {
+                deliver_admitted(&h, ticket, device, &s, || async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Outcome::Delivered
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            change(&hub, device, &sub);
+            drop(held);
+            let outcome = job.await.unwrap();
+            let was_sent = sent.load(std::sync::atomic::Ordering::SeqCst);
+            if what == "unchanged" {
+                assert_eq!(outcome, Some(Outcome::Delivered), "{what}");
+                assert!(was_sent, "{what}");
+                assert!(hub.devices().push_subscription(device).unwrap().last_ok_at.is_some(), "{what}: recorded");
+            } else {
+                assert_eq!(outcome, None, "{what}");
+                assert!(!was_sent, "{what}: nothing may be sent");
+            }
+            drop(slow);
+            assert_eq!(adm.queued(), 0, "{what}: tickets given back");
+        }
+    }
+
+    /// `push.test` waits its turn like any alert, is refused when the queue is full, and is
+    /// checked again before it goes; its result reaches the phone's pages as `push_changed`.
+    #[tokio::test]
+    async fn test_alerts_share_the_admission_control() {
+        let hub = fixture_hub();
+        let device = pair(&hub);
+        let sub = subscription("https://fcm.googleapis.com/fcm/send/t");
+        hub.devices().set_push(hub.store(), device, sub.clone()).unwrap();
+        let send = |s: Subscription, a: Alert| async move {
+            assert!(a.session_id.is_none() && s.endpoint.ends_with("/t"));
+            Outcome::Delivered
+        };
+        let full = leak(1, 1);
+        let _taken = full.reserve().unwrap();
+        let e = test_with(&hub, full, device, send).await.unwrap_err();
+        assert!(e.contains("too many alerts"), "{e}");
+
+        let adm = leak(1, 4);
+        let slow = adm.reserve().unwrap();
+        let held = slow.admit().await;
+        let mut events = hub.subscribe();
+        let h = hub.clone();
+        let job = tokio::spawn(async move { test_with(&h, adm, device, send).await });
+        tokio::task::yield_now().await;
+        assert!(!job.is_finished(), "a test alert waits for a running slot");
+        drop(held);
+        assert_eq!(job.await.unwrap(), Ok(Outcome::Delivered));
+        assert!(hub.devices().push_subscription(device).unwrap().last_ok_at.is_some());
+        let ev = tokio::time::timeout(Duration::from_secs(1), events.recv()).await.unwrap().unwrap();
+        assert!(matches!(ev, crate::hub::ServerEvent::PushChanged { device_id } if device_id == device), "{ev:?}");
+    }
+
+    #[test]
+    fn body_files_go_away_however_the_delivery_ends() {
+        let dir = std::env::temp_dir().join(format!("muster-push-{:x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = BodyFile::write(&dir, b"x").unwrap();
+        let path = f.0.clone();
+        assert!(path.exists());
+        drop(f);
+        assert!(!path.exists());
+        // A delivery future dropped mid-flight (a backend reload) takes its file with it.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let d = dir.clone();
+        let fut = async move {
+            let _f = BodyFile::write(&d, b"x").unwrap();
+            std::future::pending::<()>().await;
+        };
+        rt.block_on(async {
+            let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        });
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left behind");
+
+        // The start-up sweep: stale push-<hex>.bin (and cut-short .tmp) files only.
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        for name in ["push-00ab.bin", "push-00ac.tmp9f", "push-00ad.bin", "push-notes.bin", "other.bin", "push-1.txt"] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            if name != "push-00ad.bin" {
+                std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+            }
+        }
+        assert_eq!(sweep_stale_bodies(&dir, STALE_BODY), 2);
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, ["other.bin", "push-00ad.bin", "push-1.txt", "push-notes.bin"], "a fresh one and other files stay");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

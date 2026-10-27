@@ -11,7 +11,10 @@ const SHELL = [
 ];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  // Take over at once: an older worker has no push handler, so alerts the page turned on would
+  // otherwise go unshown until every Muster tab closed. Pages are network-first, so a newer worker
+  // under an older page is harmless.
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
@@ -46,6 +49,12 @@ self.addEventListener("fetch", (event) => {
 // encrypted to this browser. One notification per session (tag), so a newer alert replaces an
 // older one; an alert older than the one already shown (they can arrive out of order) is dropped.
 
+/** What the page asks for before it turns alerts on (web/src/m/alerts.ts, bump both together). */
+const ALERTS_VERSION = 1;
+/** A renewed subscription not yet handed to the daemon (kept outside the shell cache). */
+const PENDING_CACHE = "muster-push";
+const PENDING_KEY = "/m/push-pending.json";
+
 function sessionUrl(id) {
   return Number.isSafeInteger(id) && id > 0 ? `/m/#s=${id}` : "/m/";
 }
@@ -56,6 +65,21 @@ function newer(shown, alert) {
   const at = Number(shown?.at) || 0;
   const aSince = Number(alert.state_since) || 0;
   return since > aSince || (since === aSince && at > (Number(alert.at) || 0));
+}
+
+/**
+ * One check-and-show at a time per tag: two pushes for a session handled at once would both see
+ * nothing shown, and the older could replace the newer.
+ */
+const lanes = new Map();
+function inLane(tag, job) {
+  const run = (lanes.get(tag) ?? Promise.resolve()).then(job, job);
+  const tail = run.catch(() => {});
+  lanes.set(tag, tail);
+  tail.then(() => {
+    if (lanes.get(tag) === tail) lanes.delete(tag);
+  });
+  return run;
 }
 
 async function showAlert(data) {
@@ -73,30 +97,32 @@ async function showAlert(data) {
   const test = alert.kind === "test";
   const id = Number(alert.session_id);
   const tag = test ? "test" : `s${id}`;
-  const shown = await reg.getNotifications({ tag });
-  const later = shown.find((n) => newer(n.data, alert));
-  if (later) {
-    // Keep the newer one as it is, silently (re-showing it counts as this push's notification).
-    return reg.showNotification(later.title, {
-      body: later.body,
+  await inLane(tag, async () => {
+    const shown = await reg.getNotifications({ tag });
+    const later = shown.find((n) => newer(n.data, alert));
+    if (later) {
+      // Keep the newer one as it is, silently (re-showing it counts as this push's notification).
+      return reg.showNotification(later.title, {
+        body: later.body,
+        tag,
+        icon: later.icon,
+        data: later.data,
+        silent: true,
+      });
+    }
+    await reg.showNotification(String(alert.title || "Muster"), {
+      body: String(alert.body || ""),
       tag,
-      icon: later.icon,
-      data: later.data,
-      silent: true,
+      renotify: true,
+      icon: "/m/icon-192.png",
+      timestamp: Number(alert.at) || Date.now(),
+      data: {
+        session_id: test ? null : id,
+        url: test ? "/m/" : sessionUrl(id),
+        state_since: alert.state_since,
+        at: alert.at,
+      },
     });
-  }
-  await reg.showNotification(String(alert.title || "Muster"), {
-    body: String(alert.body || ""),
-    tag,
-    renotify: true,
-    icon: "/m/icon-192.png",
-    timestamp: Number(alert.at) || Date.now(),
-    data: {
-      session_id: test ? null : id,
-      url: test ? "/m/" : sessionUrl(id),
-      state_since: alert.state_since,
-      at: alert.at,
-    },
   });
   if (test) {
     for (const client of await self.clients.matchAll({ type: "window", includeUncontrolled: true })) {
@@ -106,7 +132,7 @@ async function showAlert(data) {
 }
 
 self.addEventListener("push", (event) => {
-  event.waitUntil(showAlert(event.data));
+  event.waitUntil(Promise.all([showAlert(event.data), sendPending().catch(() => {})]));
 });
 
 self.addEventListener("notificationclick", (event) => {
@@ -124,7 +150,67 @@ self.addEventListener("notificationclick", (event) => {
   })());
 });
 
-// The browser replaced the subscription (rare): hand the new one to the daemon, as the page does.
+// The page's handshake (does this worker show alerts?) and its "take over now".
+self.addEventListener("message", (event) => {
+  const d = event.data;
+  if (d?.type === "muster-sw-hello") event.ports?.[0]?.postMessage({ type: "muster-sw", alerts: ALERTS_VERSION });
+  else if (d?.type === "muster-skip-waiting") self.skipWaiting();
+  else if (d?.type === "muster-push-retry") event.waitUntil?.(sendPending().catch(() => {}));
+});
+
+async function loadPending() {
+  const r = await (await caches.open(PENDING_CACHE)).match(PENDING_KEY);
+  if (!r) return null;
+  try {
+    const v = await r.json();
+    return typeof v?.endpoint === "string" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+async function savePending(p) {
+  await (await caches.open(PENDING_CACHE)).put(
+    PENDING_KEY,
+    new Response(JSON.stringify(p), { headers: { "Content-Type": "application/json" } }),
+  );
+}
+
+async function dropPending() {
+  await (await caches.open(PENDING_CACHE)).delete(PENDING_KEY);
+}
+
+/**
+ * Hand a kept renewal to the daemon. Kept while the daemon can't be reached (restarting, the
+ * tailnet down: a network error or a 5xx); dropped once it answered (taken, or refused for good),
+ * or when the browser no longer has that subscription. The page also sends it on its next
+ * connection (web/src/m/alerts.ts `refreshAlerts`).
+ */
+async function sendPending() {
+  const p = await loadPending();
+  if (!p) return;
+  const current = await self.registration.pushManager.getSubscription();
+  if (!current || current.endpoint !== p.endpoint) return dropPending();
+  let r;
+  try {
+    r = await fetch("/api/rpc", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Muster": "1" },
+      body: JSON.stringify({
+        id: 1,
+        method: "push.subscribe",
+        params: { endpoint: p.endpoint, p256dh: p.p256dh, auth: p.auth },
+      }),
+    });
+  } catch {
+    return;
+  }
+  if (r.status >= 500 || r.status === 0) return;
+  await dropPending();
+}
+
+// The browser replaced the subscription (rare): keep the new one, then hand it to the daemon.
 self.addEventListener("pushsubscriptionchange", (event) => {
   event.waitUntil((async () => {
     const key = event.oldSubscription?.options?.applicationServerKey;
@@ -132,15 +218,7 @@ self.addEventListener("pushsubscriptionchange", (event) => {
       (key ? await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }) : null);
     if (!sub) return;
     const keys = sub.toJSON().keys ?? {};
-    await fetch("/api/rpc", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-Muster": "1" },
-      body: JSON.stringify({
-        id: 1,
-        method: "push.subscribe",
-        params: { endpoint: sub.endpoint, p256dh: keys.p256dh ?? "", auth: keys.auth ?? "" },
-      }),
-    });
+    await savePending({ endpoint: sub.endpoint, p256dh: keys.p256dh ?? "", auth: keys.auth ?? "" });
+    await sendPending();
   })().catch(() => {}));
 });

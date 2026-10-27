@@ -197,26 +197,101 @@ export type AlertState =
   | { kind: "checking" }
   | { kind: "unsupported" }
   | { kind: "denied" }
+  /** The page's service worker is an older one without alerts (an update is still waiting). */
+  | { kind: "outdated" }
   | { kind: "off" }
   | { kind: "on"; info: PushInfo; failing: boolean };
 
 /**
  * What the alerts setting shows. Alerts are on only when the daemon holds a subscription and it is
  * the one this browser has: after site data was cleared, or once the push service said the old one
- * is gone, they are off, and turning them on again fixes it.
+ * is gone, they are off, and turning them on again fixes it. `worker`: the active service worker
+ * answered the alerts handshake (web/m/sw.js), so pushes would be shown.
  */
 export function alertState(
   supported: boolean,
   permission: string,
   server: PushInfo | null,
   browserEndpoint: string | null,
+  worker = true,
 ): AlertState {
   if (!supported) return { kind: "unsupported" };
   if (permission === "denied") return { kind: "denied" };
+  if (!worker) return { kind: "outdated" };
   if (!server || !browserEndpoint || server.endpoint !== browserEndpoint) return { kind: "off" };
-  const failing = server.last_error_at !== null &&
-    (server.last_ok_at === null || server.last_error_at > server.last_ok_at);
-  return { kind: "on", info: server, failing };
+  return { kind: "on", info: server, failing: isFailing(server) };
+}
+
+function isFailing(info: PushInfo): boolean {
+  return info.last_error_at !== null && (info.last_ok_at === null || info.last_error_at > info.last_ok_at);
+}
+
+/**
+ * After "Turn on again" renewed the subscription and sent a test: on and working only if the test
+ * was delivered. The new subscription starts with a clean record, so a test that failed or never
+ * ran (`error` without a result) still shows as failing; one the push service called gone is off.
+ */
+export function repairedState(
+  result: { delivered: boolean; subscription: PushInfo | null } | null,
+  subscribed: PushInfo | null,
+  error: string | null,
+  now: number,
+): AlertState {
+  if (result ? !result.subscription : !subscribed) return { kind: "off" };
+  const info = (result?.subscription ?? subscribed)!;
+  if (result?.delivered && !isFailing(info)) return { kind: "on", info, failing: false };
+  if (!result?.delivered && !isFailing(info)) {
+    return {
+      kind: "on",
+      info: { ...info, last_error: error ?? "the test alert didn't go out", last_error_at: now },
+      failing: true,
+    };
+  }
+  return { kind: "on", info, failing: true };
+}
+
+/**
+ * The browser renewed its subscription (`pushsubscriptionchange`) and the worker couldn't tell the
+ * daemon then (web/m/sw.js keeps it as `pending`). On the next connection: send the browser's
+ * subscription when it is that pending one, or when the daemon holds an older one for this
+ * phone; drop a pending renewal the browser no longer has. Never re-sends when the daemon holds
+ * none and nothing is pending (alerts were turned off, or the push service said it's gone).
+ */
+export function renewal(
+  server: PushInfo | null,
+  browserEndpoint: string | null,
+  pendingEndpoint: string | null,
+  permission: string,
+): { send: boolean; dropPending: boolean } {
+  const usable = browserEndpoint !== null && permission === "granted";
+  const pendingIsCurrent = pendingEndpoint !== null && pendingEndpoint === browserEndpoint;
+  const send = usable && (pendingIsCurrent || (server !== null && server.endpoint !== browserEndpoint));
+  return { send, dropPending: pendingEndpoint !== null && (!pendingIsCurrent || !usable) };
+}
+
+/** A test alert's way: sent to the push service, then shown here (or not, after a while). */
+export type TestAlert = "idle" | "sending" | "sent" | "arrived" | "late";
+
+/**
+ * `shown`: the service worker says it showed the test alert, which can come before `push.test`
+ * answers (`delivered`/`failed`), and then stays "arrived" whatever that answer says.
+ */
+export function testAlertStep(
+  s: TestAlert,
+  e: "start" | "shown" | "delivered" | "failed" | "timeout",
+): TestAlert {
+  switch (e) {
+    case "start":
+      return "sending";
+    case "shown":
+      return s === "idle" ? "idle" : "arrived";
+    case "delivered":
+      return s === "sending" ? "sent" : s;
+    case "failed":
+      return s === "arrived" ? "arrived" : "idle";
+    case "timeout":
+      return s === "sent" ? "late" : s;
+  }
 }
 
 /** Base64url (padding optional) to bytes, as `applicationServerKey` wants it. */

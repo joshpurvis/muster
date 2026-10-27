@@ -1181,11 +1181,15 @@ the daemon).
 | `push.status` | `{}` | `PushStatus` |
 | `push.subscribe` | `{endpoint, p256dh, auth}` (from `PushSubscription.toJSON()`) | `PushStatus`. One subscription per device: replaces the device's earlier one. The same endpoint again keeps its delivery history. |
 | `push.unsubscribe` | `{}` | `PushStatus` (subscription null) |
-| `push.test` | `{}` | `PushStatus` plus `{delivered, error}`: one test alert to this device, sent before the call returns. At most one per 5 s per device. |
+| `push.test` | `{}` | `PushStatus` plus `{delivered, error}`: one test alert to this device, sent before the call returns. At most one per 5 s per device; it waits its turn like any alert and is refused at once when 64 alert requests already wait. |
+
+Event, to that device's own connections only (never another device or the desktop):
+`push_changed` `{device_id}`, after its subscription changed (subscribe, unsubscribe, a 404/410
+deleting it) or a delivery's result was recorded. The phone asks `push.status` again.
 
 **Endpoint rules** (checked on subscribe and again before every delivery): `https://` only,
 lowercase; a plain DNS host name (no IP literals, no user info, no fragment, no trailing dot, at
-most 2048 characters, only URL characters); the host on the allowlist `fcm.googleapis.com`,
+most 2048 characters, only URL characters, and none of `[ ] { }`, curl's URL globbing); the host on the allowlist `fcm.googleapis.com`,
 `*.push.services.mozilla.com`, `*.notify.windows.com` (`*.` = any subdomain, not the domain
 itself), on port 443. `MUSTER_PUSH_HOSTS` (comma-separated `host`, `*.domain` or `host:port`;
 an entry with a port allows only that port) extends it; it is the owner's configuration, never
@@ -1197,12 +1201,20 @@ id>` (a newer alert for a session replaces one still waiting at the push service
 `Content-Encoding: aes128gcm` and `Authorization: vapid t=<JWT>, k=<public_key>`; the JWT is
 ES256 with `aud` = the endpoint's origin, `exp` = now + 12 h, and `sub` = `MUSTER_PUSH_SUBJECT`
 (an `https:` or `mailto:` URI), default `https://muster.invalid/web-push`, a neutral value that
-says nothing about the owner. Redirects are never followed, the whole request is limited to 5 s,
-and at most 4 deliveries run at once. 2xx records `last_ok_at`; 404 and 410 delete the
+says nothing about the owner. Redirects are never followed and the whole request is limited to
+5 s. Every request made for alerts (each delivery, `push.test`, the ntfy post) goes through one
+admission control, all devices and sessions together: at most 4 run at once and at most 64 wait
+or run, past which new ones are dropped (`push.test` refused). A waiting delivery is checked
+again when its turn comes: if the device was revoked or expired, or its subscription is no longer
+the one it was queued for (same endpoint and keys; turned off, subscribed again, deleted by a
+404/410), nothing is sent. 2xx records `last_ok_at`; 404 and 410 delete the
 subscription; anything else (a redirect, 4xx, 5xx, no answer) records `last_error` and
 `last_error_at`. A revoked device's subscription is deleted at once, an expired device's at the
-next alert. The request goes through `curl` (`--proto =https`, `-q`); the endpoint and the token
-reach it on stdin, never on its command line.
+next alert. The request goes through `curl` (`--proto =https`, `-q`, `--globoff`, and `globoff`
+in its config: a URL is always one request); the endpoint and the token reach it on stdin, never
+on its command line. The encrypted body is a 0600 file `<runtime>/push-<hex>.bin`, deleted when
+the delivery ends however it ends; a start deletes such files older than 60 s that a killed
+backend left.
 
 **Payload** (the plaintext, padded with the RFC 8291 delimiter and zeros to exactly 1024 bytes, so
 every alert is 1126 bytes on the wire): `{v: 1, kind: "session" | "test", session_id,
@@ -1210,7 +1222,14 @@ channel_id, state, state_since, state_seq, at, title, body}`; `title` is `#chann
 (at most 120 characters), `body` the state detail (at most 400; both are shortened until the
 JSON fits). The service worker (web/m/sw.js) shows it with `tag = "s<session_id>"`, so a newer
 alert replaces an older one, and keeps an already shown alert whose `state_since` (then `at`) is
-newer than an arriving one. Tapping it opens `/m/#s=<session_id>`.
+newer than an arriving one (one check-and-show at a time per tag, so two pushes handled at once
+can't swap). Tapping it opens `/m/#s=<session_id>`. The worker answers the page's
+`{type: "muster-sw-hello"}` (on a `MessageChannel` port) with `{alerts: 1}`; the page turns
+alerts on, or shows them as on, only when the active worker answers that, and otherwise lets a
+waiting newer worker take over (`muster-skip-waiting`) or asks for a reload. When the browser
+renews the subscription (`pushsubscriptionchange`) the worker keeps it (Cache Storage
+`muster-push`) until `push.subscribe` reached the daemon, and retries on later pushes; the page
+also sends it on its next connection.
 
 **ntfy fallback.** With `MUSTER_NTFY_URL` set (an `http(s)` ntfy topic URL), every phone alert is
 also posted there as plain text: `Title` (RFC 2047 encoded), `Priority: high`, `Click:

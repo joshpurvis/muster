@@ -13,6 +13,7 @@ import {
   online,
   openSessionId,
   pairBusy,
+  pushChanged,
   ready,
   reconnect,
   selected,
@@ -73,8 +74,10 @@ addEventListener("resize", viewport);
 viewport();
 start();
 listenToServiceWorker(openSessionId);
-// Each (re)connection asks how alerts stand: the daemon may have dropped the subscription.
+// Each (re)connection asks how alerts stand (the daemon may have dropped the subscription), and
+// so does each change the daemon reports (a delivery failed or worked again).
 effect(() => {
+  pushChanged.value;
   if (ready.value) refreshAlerts();
 });
 render(<App />, document.getElementById("app")!);

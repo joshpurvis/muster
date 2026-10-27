@@ -1254,6 +1254,25 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
     }
 }
 
+/// Whether a connection gets `ev`: `own_device` is the paired device it belongs to, None for the
+/// desktop client token. Named agents, schedules, panels and notes aren't on the phone (no
+/// agent.*, panel.* or note.* method is either; docs/ANDROID.md); a phone's alert status
+/// (`push_changed`) goes to that phone only, never to other phones or the desktop.
+fn forwarded(own_device: Option<i64>, ev: &ServerEvent) -> bool {
+    if let ServerEvent::PushChanged { device_id } = ev {
+        return own_device == Some(*device_id);
+    }
+    own_device.is_none()
+        || !matches!(
+            ev,
+            ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
+            | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
+            | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
+            | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
+            | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
+        )
+}
+
 /// `push.status` and what the other `push.*` methods answer: the daemon's public key and this
 /// device's own subscription (its endpoint too, so the phone can tell whether its browser's
 /// subscription is the one the daemon has), never the keys.
@@ -1301,11 +1320,13 @@ async fn push_method(hub: &Arc<Hub>, who: &Principal, method: &str, params: Valu
                 },
             )?;
             tracing::info!("device {id}: phone alerts on (via {})", endpoint.host);
+            crate::push::changed(hub, id);
         }
         "push.unsubscribe" => {
             parse::<Empty>(params)?;
             if hub.devices().remove_push(hub.store(), id)? {
                 tracing::info!("device {id}: phone alerts off");
+                crate::push::changed(hub, id);
             }
         }
         "push.test" => {
@@ -1591,24 +1612,16 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     // `workspace.add` result). If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
     let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
-    let is_device = matches!(who, Principal::Device { .. });
+    let own_device = match who {
+        Principal::Device { id } => Some(id),
+        Principal::Local => None,
+    };
     let events = {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
-            // Named agents, panels and notes aren't on the phone (no agent.*, panel.* or note.*
-            // method is either; docs/ANDROID.md).
             let forward = |ev: ServerEvent| {
-                if is_device
-                    && matches!(
-                        ev,
-                        ServerEvent::AgentUpserted(_) | ServerEvent::AgentRemoved { .. } | ServerEvent::AgentMessage(_)
-                        | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
-                        | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
-                        | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
-                        | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
-                    )
-                {
+                if !forwarded(own_device, &ev) {
                     return None;
                 }
                 serde_json::to_string(&ev).ok().map(|t| Message::Text(t.into()))
@@ -1938,6 +1951,17 @@ mod tests {
     use crate::mcp::McpState;
     use crate::mcp::backend::HubBackend;
     use crate::store::{Store, StoredSession};
+
+    #[test]
+    fn a_phones_alert_status_goes_to_that_phone_only() {
+        let ev = ServerEvent::PushChanged { device_id: 4 };
+        assert!(forwarded(Some(4), &ev));
+        assert!(!forwarded(Some(5), &ev), "another phone");
+        assert!(!forwarded(None, &ev), "the desktop");
+        let note = ServerEvent::NoteRemoved { id: 1 };
+        assert!(forwarded(None, &note) && !forwarded(Some(4), &note));
+        assert!(forwarded(Some(4), &ServerEvent::SessionRemoved { id: 1 }));
+    }
 
     /// A hub with workspace 1, channel 1 and exited sessions 1 (shell), 2 (claude), 3 (codex),
     /// with the MCP server state attached. Nothing here starts a process: every call below is

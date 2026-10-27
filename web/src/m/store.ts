@@ -37,6 +37,8 @@ export const online = signal(navigator.onLine);
 export const pairError = signal("");
 export const pairBusy = signal(false);
 export const toast = signal("");
+/** Counts `push_changed` events (this phone's alert status changed in the daemon). */
+export const pushChanged = signal(0);
 export const ready = computed(() => auth.value === "paired" && connStatus.value === "open");
 export const canInteract = computed(() =>
   ready.value && !!device.value?.scopes.some((s) => s === "interact" || s === "manage")
@@ -310,6 +312,9 @@ export function start() {
       }
       case "notice":
         notify(event.data.text);
+        break;
+      case "push_changed":
+        pushChanged.value++;
         break;
     }
   };

@@ -1594,7 +1594,7 @@ async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon
     stdout: "null", stderr: "piped",
   }).output();
   if (!made.success) throw new Error(`openssl: ${dec.decode(made.stderr)}`);
-  interface Got { path: string; headers: Headers; body: Uint8Array; at: number }
+  interface Got { path: string; headers: Headers; body: Uint8Array; at: number; end?: number }
   const got: Got[] = [];
   let reply: (path: string) => Promise<Response> = async () => new Response(null, { status: 201 });
   const pushServer = Deno.serve({
@@ -1602,17 +1602,24 @@ async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon
     cert: await Deno.readTextFile(`${tls}/cert.pem`), key: await Deno.readTextFile(`${tls}/key.pem`),
   }, async (req) => {
     const path = new URL(req.url).pathname;
-    got.push({ path, headers: new Headers(req.headers), body: new Uint8Array(await req.arrayBuffer()), at: Date.now() });
-    return await reply(path);
+    const g: Got = { path, headers: new Headers(req.headers), body: new Uint8Array(await req.arrayBuffer()), at: Date.now() };
+    got.push(g);
+    try {
+      return await reply(path);
+    } finally {
+      g.end = Date.now();
+    }
   });
   const pushPort = pushServer.addr.port;
   const pushOrigin = `https://localhost:${pushPort}`;
+  // A curl URL glob in the owner's ntfy URL: with globbing off it is one request to that very path.
+  const NTFY_PATH = "/ntfy/muster[1-3]";
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon({
     MUSTER_PUSH_HOSTS: `localhost:${pushPort}`,
     CURL_CA_BUNDLE: `${tls}/cert.pem`,
-    MUSTER_NTFY_URL: `${pushOrigin}/ntfy/muster`,
+    MUSTER_NTFY_URL: `${pushOrigin}${NTFY_PATH}`,
   });
   c = new Client(d.token);
   await c.open();
@@ -1652,6 +1659,7 @@ async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon
   await refused("push: http endpoint refused", phone("push.subscribe", { endpoint: `http://localhost:${pushPort}/push/a`, ...keys }), "https");
   await refused("push: host off the allowlist refused", phone("push.subscribe", { endpoint: "https://push.example.com/push/a", ...keys }), "not a known push service");
   await refused("push: allowlisted host on another port refused", phone("push.subscribe", { endpoint: "https://localhost/push/a", ...keys }), "not a known push service");
+  await refused("push: a curl glob pattern in the endpoint refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/x[1-10000]`, ...keys }), "characters");
   await refused("push: bad keys refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/a`, p256dh: b64u(new Uint8Array(65)), auth: keys.auth }), "p256dh");
   await refused("push: the desktop client has no alerts of its own", c.call("push.status"), "paired phone");
   const endpoint = `${pushOrigin}/push/phone-1`;
@@ -1705,8 +1713,10 @@ async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon
   for (let n = 0; n < 50 && !(st = await phone("push.status")).subscription.last_ok_at; n++) await sleep(100);
   ok(st.subscription.last_ok_at > 0 && st.subscription.last_error === null, "push: push.status shows the last delivery");
   // The ntfy fallback got the same alert, as plain text with a tap link to the phone page.
-  await waitFor("push: the ntfy fallback is posted too", () => got.some((g) => g.path === "/ntfy/muster"));
-  const nt = got.find((g) => g.path === "/ntfy/muster")!;
+  await waitFor("push: the ntfy fallback is posted too", () => got.some((g) => g.path === NTFY_PATH));
+  const nt = got.find((g) => g.path === NTFY_PATH)!;
+  await sleep(300);
+  ok(got.filter((g) => g.path.startsWith("/ntfy/")).length === 1, `push: curl globbing is off (one ntfy request, not three): ${got.map((g) => g.path)}`);
   ok(nt.headers.get("click") === `${ORIGIN}/m/#s=${claude.id}` && dec.decode(nt.body).includes("rm -rf build") &&
     (nt.headers.get("title") ?? "").startsWith("=?UTF-8?B?"), "push: ntfy gets title, text and the tap link");
 
@@ -1777,6 +1787,86 @@ print(sum(1 for c in seen if "vapid" in c or "/push/phone-1" in c))`],
   reply = async () => new Response(null, { status: 201 });
   await phone("push.subscribe", { endpoint, ...keys });
   ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push !== null, "push: subscribed again");
+
+  // One admission control for every alert request (deliveries, push.test, ntfy): at most 4 at
+  // once. And a delivery queued behind slow ones is checked again when its turn comes: a phone
+  // revoked, turned off or subscribed elsewhere meanwhile gets nothing.
+  const pairPhone = async (name: string, path: string) => {
+    const code = (await c.call("device.pair_code", { url: ORIGIN, name })).code;
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/device/pair`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    ok(r.ok, `push: ${name} pairs`);
+    const id = (await r.json()).device.id;
+    const ck = r.headers.get("set-cookie")!.split(";")[0];
+    const call = async (method: string, params: Json = {}) => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+        method: "POST",
+        headers: { Cookie: ck, Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+        body: JSON.stringify({ id: 1, method, params }),
+      });
+      const v = await res.json();
+      if (v.error) throw new Error(v.error.message);
+      return v.result;
+    };
+    await call("push.subscribe", { endpoint: `${pushOrigin}${path}`, ...keys });
+    return { id, call };
+  };
+  const [slowA, slowB, slowC, victim] = [
+    await pairPhone("slow phone a", "/push/slow-a"),
+    await pairPhone("slow phone b", "/push/slow-b"),
+    await pairPhone("slow phone c", "/push/slow-c"),
+    await pairPhone("revoked phone", "/push/victim"),
+  ];
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const section = Date.now();
+  const since = () => got.filter((g) => g.at >= section);
+  const count = (path: string) => since().filter((g) => g.path === path).length;
+  reply = async (path) => {
+    if (path.startsWith("/push/slow-") || path === "/push/phone-1") await held;
+    return new Response(null, { status: 201 });
+  };
+  // Four test alerts hold the four slots (the first phone's after its 5 s gap).
+  const tests: Promise<Json>[] = [nextTest().then((x) => x.r)];
+  await waitFor("push: the first slow test alert is waiting on the push service", () => count("/push/phone-1") === 1, 8000);
+  tests.push(slowA.call("push.test"), slowB.call("push.test"), slowC.call("push.test"));
+  await waitFor("push: four test alerts run at once", () => since().filter((g) => g.path.startsWith("/push/")).length === 4);
+  // An agent asks again (after working a while: a new approval, so a new alert): its alerts (and
+  // ntfy's) have to queue behind the four.
+  await fetch(`http://127.0.0.1:${PORT}/hook/PostToolUse`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: {} }),
+  }).then((r) => r.text());
+  await sleep(200);
+  const asked2 = await fetch(`http://127.0.0.1:${PORT}/hook/PermissionRequest`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf dist" } }),
+  });
+  ok(asked2.ok, "push: a second permission request is accepted");
+  await sleep(700);
+  ok(since().length === 4, `push: nothing beyond the 4 slots went out while they were busy (ntfy included): ${since().map((g) => g.path)}`);
+  // While those alerts wait: one phone is revoked, one turns alerts off, one subscribes elsewhere.
+  await c.call("device.revoke", { id: victim.id });
+  await slowA.call("push.unsubscribe");
+  await slowB.call("push.subscribe", { endpoint: `${pushOrigin}/push/slow-b2`, ...keys });
+  release();
+  const results = await Promise.all(tests);
+  ok(results.every((x) => x.delivered === true), `push: the held test alerts were delivered: ${JSON.stringify(results.map((x) => x.error))}`);
+  await waitFor("push: the queued alert reaches the phones still subscribed", () =>
+    count("/push/slow-c") === 2 && count("/push/phone-1") === 2 && count(NTFY_PATH) === 1);
+  await sleep(500);
+  ok(count("/push/victim") === 0, "push: a phone revoked while its alert waited got nothing");
+  ok(count("/push/slow-a") === 1, "push: a phone that turned alerts off while its alert waited got nothing more");
+  ok(count("/push/slow-b") === 1 && count("/push/slow-b2") === 0, "push: an alert queued for an old subscription is not sent (to either)");
+  const ends = since().map((g) => [g.at, g.end ?? Date.now()]);
+  const most = Math.max(...ends.map(([at]) => ends.filter(([a, e]) => a <= at && at < e).length));
+  ok(most === 4, `push: at most 4 alert requests at once, tests and ntfy included (${most})`);
+  reply = async () => new Response(null, { status: 201 });
   await c.call("device.revoke", { id: phoneId });
   ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push === null, "push: revoking the phone deletes its subscription");
   await refused("push: a revoked phone can't subscribe", phone("push.subscribe", { endpoint, ...keys }), "unauthorized");

@@ -323,23 +323,32 @@ impl Registry {
         v
     }
 
+    /// Is `sub` still what a delivery may go to: the device live, and `sub` its subscription
+    /// (same endpoint and keys)? Checked once a queued delivery gets its turn (src/push.rs).
+    pub fn push_is_current(&self, id: i64, sub: &crate::push::Subscription) -> bool {
+        let g = self.inner.lock();
+        g.devices.get(&id).is_some_and(|d| d.live(now_ms()))
+            && g.push.get(&id).is_some_and(|s| s.endpoint == sub.endpoint && s.p256dh == sub.p256dh && s.auth == sub.auth)
+    }
+
     /// A delivery's result, kept only if `endpoint` is still the device's subscription (the
-    /// phone may have subscribed again meanwhile). Gone (404/410) deletes the row.
-    pub fn record_push(&self, store: &Store, id: i64, endpoint: &str, outcome: &crate::push::Outcome) {
+    /// phone may have subscribed again meanwhile). Gone (404/410) deletes the row. True when
+    /// the subscription changed.
+    pub fn record_push(&self, store: &Store, id: i64, endpoint: &str, outcome: &crate::push::Outcome) -> bool {
         use crate::push::Outcome;
         let now = now_ms();
         let mut g = self.inner.lock();
         if !g.push.get(&id).is_some_and(|s| s.endpoint == endpoint) {
-            return;
+            return false;
         }
         if matches!(outcome, Outcome::Gone(_)) {
-            match store.delete_push_subscription(id) {
-                Ok(()) => {
-                    g.push.remove(&id);
+            return match store.delete_push_subscription(id) {
+                Ok(()) => g.push.remove(&id).is_some(),
+                Err(e) => {
+                    tracing::warn!("deleting device {id}'s push subscription: {e:#}");
+                    false
                 }
-                Err(e) => tracing::warn!("deleting device {id}'s push subscription: {e:#}"),
-            }
-            return;
+            };
         }
         let sub = g.push.get_mut(&id).expect("checked above");
         let result = match outcome {
@@ -358,6 +367,7 @@ impl Registry {
         if let Err(e) = result {
             tracing::warn!("saving device {id}'s push status: {e:#}");
         }
+        true
     }
 
     // ----- pairing -----
@@ -830,5 +840,22 @@ mod tests {
         assert!(Registry::load(&s).unwrap().push_subscription(c.id).is_none());
 
         assert!(!r.remove_push(&s, a.id).unwrap());
+    }
+
+    /// What a queued delivery checks when its turn comes (src/push.rs `deliver_admitted`).
+    #[test]
+    fn a_subscription_is_current_only_while_the_device_and_its_keys_are() {
+        let (r, s) = reg();
+        let p = r.begin_pairing(120, None, vec![Scope::View]);
+        let d = r.redeem(&s, &p.code, None, "s", None).unwrap().0;
+        let mine = sub("https://fcm.googleapis.com/a");
+        assert!(!r.push_is_current(d.id, &mine), "no subscription yet");
+        r.set_push(&s, d.id, mine.clone()).unwrap();
+        assert!(r.push_is_current(d.id, &mine));
+        assert!(!r.push_is_current(d.id, &sub("https://fcm.googleapis.com/b")), "another endpoint");
+        assert!(!r.push_is_current(d.id, &crate::push::Subscription { auth: "other".into(), ..mine.clone() }), "other keys");
+        assert!(!r.push_is_current(d.id, &crate::push::Subscription { p256dh: "other".into(), ..mine.clone() }), "other keys");
+        r.inner.lock().devices.get_mut(&d.id).unwrap().expires_at = now_ms() - 1;
+        assert!(!r.push_is_current(d.id, &mine), "an expired device gets nothing");
     }
 }

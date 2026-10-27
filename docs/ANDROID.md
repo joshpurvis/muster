@@ -306,8 +306,8 @@ contract is docs/PROTOCOL.md "Phone alerts"; in short:
 - **Endpoint rules** (src/push.rs `check_endpoint`): `https` only, a lowercase DNS host on the
   allowlist `fcm.googleapis.com`, `*.push.services.mozilla.com`, `*.notify.windows.com` at port
   443, extended only by the owner's `MUSTER_PUSH_HOSTS`; no redirects followed; 5 s for the whole
-  request. Rows are deleted on 404/410, on revoke (`Registry::revoke`) and on expiry (at the next
-  alert).
+  request; no `[ ] { }` in an endpoint and curl's `--globoff`, so a URL is one request. Rows are
+  deleted on 404/410, on revoke (`Registry::revoke`) and on expiry (at the next alert).
 - **Crypto.** RFC 8291 `aes128gcm` and RFC 8292 VAPID (ES256 JWT, `exp` 12 h, `sub`
   `https://muster.invalid/web-push` unless `MUSTER_PUSH_SUBJECT` says otherwise) on the RustCrypto
   crates `p256`, `hkdf` and `aes-gcm` rather than the `web-push` crate, which was last released in
@@ -319,21 +319,30 @@ contract is docs/PROTOCOL.md "Phone alerts"; in short:
   `Urgency: high`, `Topic: muster-s<id>`.
 - **Sinks.** src/notify.rs `decide()` (unchanged 60 s / 5 s dedup) makes one `Note` (now with
   `session_id`, `channel_id`, `state`, `state_since`, `state_seq`) for every sink: the desktop
-  worker, and the push sink (src/push.rs `Sink`, at most 4 deliveries at once, never blocking the
-  loop). `MUSTER_NO_NOTIFY` disables only the desktop sink. Schedule alerts (`notify::alert`) stay
+  worker, and the push sink (src/push.rs `Sink`, never blocking the loop). One admission control
+  covers every alert request (deliveries, `push.test`, ntfy): 4 at once, 64 waiting; a waiting
+  delivery is checked again when its turn comes and dropped if the phone was revoked or expired
+  or its subscription changed meanwhile. `MUSTER_NO_NOTIFY` disables only the desktop sink. Schedule alerts (`notify::alert`) stay
   desktop only: they open no session.
 - **Service worker** (web/m/sw.js): `tag = "s<session id>"`, so a newer alert replaces an older
   one; an alert older (by `state_since`, then send time) than the one already shown re-shows
   that one silently instead, because Chrome expects every push to show a notification. Tapping
   focuses the open app and opens the session (a message to the page), or opens
-  `/m/#s=<id>`. `pushsubscriptionchange` re-subscribes and tells the daemon.
+  `/m/#s=<id>`. One check-and-show at a time per tag. `pushsubscriptionchange` re-subscribes,
+  keeps the new subscription in Cache Storage until the daemon took it (retried on later pushes,
+  and sent by the page on its next connection). A new worker takes over at once
+  (`skipWaiting`), and answers the page's alerts handshake.
 - **Phone UI** (web/src/m/alerts.ts, the ⋯ menu's "Alerts on this phone"): Turn on (asks for
-  notification permission, subscribes, sends the subscription), Turn off, Send test (says
-  "arrived" once the service worker showed it, or warns after 15 s), and a status line: on and
-  when the last alert went out, the last failure and why, blocked by the browser, or not
-  supported. Alerts count as on only when the daemon holds the subscription this browser has. The
-  sessions list shows a dismissable "Turn on" nudge while alerts are off and a warning while they
-  fail. Opening or approving a session closes its alert.
+  notification permission, checks the service worker shows alerts, subscribes, sends the
+  subscription), Turn off, Send test (says "arrived" once the service worker showed it, even
+  before the daemon answers, or warns after 15 s), and a status line: on and when the last alert
+  went out, the last failure and why, blocked by the browser, needs a reload (an older service
+  worker still in charge), or not supported. While alerts fail, "Turn on again" starts over with
+  a new subscription and sends a test; alerts show as working again only when that test went
+  out. Alerts count as on only when the daemon holds the subscription this browser has. The
+  status follows the daemon: each connection, each `push_changed` event and each opening of the
+  menu ask `push.status` again. The sessions list shows a dismissable "Turn on" nudge while alerts
+  are off and a warning while they fail. Opening or approving a session closes its alert.
 
 ## Reconnect and battery
 

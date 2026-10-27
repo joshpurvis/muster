@@ -12,20 +12,23 @@ import {
   programScrollFor,
   programScrolls,
   relativeTime,
+  renewal,
+  repairedState,
   repeatBytes,
   returnNotches,
   sameBytes,
   scrollPosition,
   sessionOrder,
   splitPan,
+  testAlertStep,
   wheelReport,
   wheelSteps,
 } from "./logic.ts";
 import type { SessionInfo } from "../types.ts";
 
-function equal(actual: unknown, expected: unknown) {
+function equal(actual: unknown, expected: unknown, what = "") {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    throw new Error(`${what ? what + ": " : ""}Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
 }
 
@@ -99,6 +102,70 @@ Deno.test("alerts are on only when the daemon has this browser's subscription", 
   equal(alertState(true, "granted", failed, info.endpoint), { kind: "on", info: failed, failing: true });
   const recovered = { ...failed, last_ok_at: 10 };
   equal(alertState(true, "granted", recovered, info.endpoint), { kind: "on", info: recovered, failing: false });
+});
+
+const PUSH = {
+  endpoint: "https://fcm.googleapis.com/fcm/send/a",
+  endpoint_host: "fcm.googleapis.com",
+  created_at: 1,
+  last_ok_at: null,
+  last_error: null,
+  last_error_at: null,
+};
+
+Deno.test("an older service worker that can't show alerts never reads as alerts on", () => {
+  equal(alertState(true, "granted", PUSH, PUSH.endpoint, false).kind, "outdated");
+  equal(alertState(true, "granted", null, null, false).kind, "outdated");
+  equal(alertState(true, "denied", PUSH, PUSH.endpoint, false).kind, "denied");
+});
+
+Deno.test("a test alert shown before push.test answers stays arrived", () => {
+  const run = (...events: Parameters<typeof testAlertStep>[1][]) =>
+    events.reduce((s, e) => testAlertStep(s, e), "idle" as ReturnType<typeof testAlertStep>);
+  equal(run("start", "shown", "delivered"), "arrived");
+  equal(run("start", "shown", "delivered", "timeout"), "arrived");
+  equal(run("start", "delivered", "shown"), "arrived");
+  equal(run("start", "delivered", "timeout"), "late");
+  equal(run("start", "delivered", "timeout", "shown"), "arrived");
+  // The daemon gave up waiting but the phone did show it: it works.
+  equal(run("start", "shown", "failed"), "arrived");
+  equal(run("start", "failed"), "idle");
+  equal(run("shown"), "idle", "no test in flight");
+});
+
+Deno.test("turn on again shows alerts working only after a delivered test", () => {
+  const fresh = { ...PUSH, endpoint: "https://fcm.googleapis.com/fcm/send/new" };
+  const ok = { ...fresh, last_ok_at: 50 };
+  equal(repairedState({ delivered: true, subscription: ok }, fresh, null, 99), { kind: "on", info: ok, failing: false });
+  const failed = { ...fresh, last_error: "the push service answered 500", last_error_at: 60 };
+  equal(repairedState({ delivered: false, subscription: failed }, fresh, failed.last_error, 99), {
+    kind: "on",
+    info: failed,
+    failing: true,
+  });
+  // The test never ran (rate limited, disconnected): the clean new row still reads as failing.
+  const s = repairedState(null, fresh, "wait 5 seconds between test alerts", 99);
+  equal(s.kind === "on" && s.failing && s.info.last_error, "wait 5 seconds between test alerts");
+  // The push service said the new one is gone (410): off, so "Turn on alerts" is offered.
+  equal(repairedState({ delivered: false, subscription: null }, fresh, "gone", 99).kind, "off");
+  equal(repairedState(null, null, "x", 99).kind, "off");
+});
+
+Deno.test("a renewal the worker couldn't hand over is sent on the next connection", () => {
+  const renewed = "https://fcm.googleapis.com/fcm/send/new";
+  // Pending and still the browser's: send it, whatever the daemon holds.
+  equal(renewal(PUSH, renewed, renewed, "granted"), { send: true, dropPending: false });
+  equal(renewal(null, renewed, renewed, "granted"), { send: true, dropPending: false });
+  // Nothing pending, but the daemon holds an older subscription for this phone.
+  equal(renewal(PUSH, renewed, null, "granted"), { send: true, dropPending: false });
+  // In step: nothing to do.
+  equal(renewal(PUSH, PUSH.endpoint, null, "granted"), { send: false, dropPending: false });
+  // The daemon holds none and nothing is pending (turned off, or 410): never re-sent.
+  equal(renewal(null, PUSH.endpoint, null, "granted"), { send: false, dropPending: false });
+  // A pending renewal the browser no longer has, or without permission: dropped.
+  equal(renewal(PUSH, PUSH.endpoint, renewed, "granted"), { send: false, dropPending: true });
+  equal(renewal(PUSH, renewed, renewed, "denied"), { send: false, dropPending: true });
+  equal(renewal(PUSH, null, renewed, "granted"), { send: false, dropPending: true });
 });
 
 Deno.test("application server keys decode from base64url and compare by bytes", () => {

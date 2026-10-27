@@ -322,7 +322,8 @@ export type TriggerWhen =
   | { kind: "note"; note_id: number; quiet_min: number }
   | { kind: "git"; repo: string; branch: string }
   | { kind: "github"; repo: string; event: GhEvent; branch: string | null; every_min: number }
-  | { kind: "url"; name: string };
+  | { kind: "url"; name: string }
+  | { kind: "files"; folder: string; pattern?: string | null; recursive: boolean; quiet_min: number };
 /** When a schedule runs: a 5-field cron line (or `@daily` and friends), once at a time, or when
  * something happens (a trigger). */
 export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number } | TriggerWhen;
@@ -335,7 +336,8 @@ export type WhenInput =
   | { kind: "note"; note_id: number; quiet_min?: number }
   | { kind: "git"; repo: string; branch: string }
   | { kind: "github"; repo: string; event: GhEvent; branch?: string | null; every_min?: number }
-  | { kind: "url"; name: string };
+  | { kind: "url"; name: string }
+  | { kind: "files"; folder: string; pattern?: string | null; recursive?: boolean; quiet_min?: number };
 
 /** A "Then…" step: ask an agent (the prompt may quote `{reply}`), or on failure just notify. */
 export interface ThenStep {
@@ -401,7 +403,7 @@ export interface ScheduleRun {
   event?: TriggerEvent | null;
 }
 
-/** A git or GitHub trigger's watcher. */
+/** A git, GitHub or files trigger's watcher. */
 export interface TriggerWatch {
   state: "ok" | "waiting" | "gh_not_signed_in" | "gh_missing" | "error";
   detail: string | null;
@@ -435,7 +437,10 @@ export interface Schedule {
   /** Null: a one-off that ran. */
   next_run: number | null;
   last_slot: number | null;
-  status: "active" | "paused" | "expired" | "done";
+  /** "proposed": an agent's proposal waiting for the human's approval (it never runs before).
+   * "held": made or changed outside Muster's window (the command line, a script), waiting for
+   * the owner's click the same way (`held`). */
+  status: "active" | "paused" | "expired" | "done" | "proposed" | "held";
   /** Claude subscription agents' recurring schedules only. */
   expires_at: number | null;
   expires_soon: boolean;
@@ -453,6 +458,45 @@ export interface Schedule {
   note?: { id: number; title: string; triggers: boolean } | null;
   /** A URL trigger's address (its secret: `trigger.secret`). */
   url?: string | null;
+  /** Phase 3: made by an agent (a proposal, or a reminder it set for itself); null: by you. */
+  made_by?: MadeBy | null;
+  /** What it would use (only for schedules an agent made, and held ones). */
+  estimate?: ScheduleEstimate | null;
+  /** Made or changed outside Muster's window: it waits for your click on Approve. */
+  held?: ScheduleHeld | null;
+}
+
+/** Why a schedule waits for your approval when no agent proposed it. */
+export interface ScheduleHeld {
+  /** What was done outside the window, in order. */
+  what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[];
+  at: number;
+  /** Where it came from, in words. */
+  why: string;
+}
+
+/** Who made a schedule when it wasn't you. */
+export interface MadeBy {
+  agent_id: number;
+  agent: string;
+  kind: "proposal" | "reminder";
+  /** Why, in the agent's own words. */
+  reason: string;
+  at: number;
+  /** When you approved it (a proposal); null: waiting. */
+  approved_at: number | null;
+}
+
+/** A proposal's estimated use. */
+export interface ScheduleEstimate {
+  runs_per_week: number | null;
+  max_per_day: number | null;
+  billing: "claude_subscription" | "openrouter" | "codex" | "other";
+  recent_unattended_7d: number;
+  /** In words: runs, what pays for them, the caps that bound them. */
+  text: string;
+  /** The same, one sentence each (how often, what pays, the caps). */
+  lines?: string[];
 }
 
 /** OpenRouter spend today (UTC day) and the daily caps (`ScheduleSettings.spend`). */
@@ -483,6 +527,8 @@ export interface ScheduleSettings {
   tz: string;
   /** OpenRouter spend and caps (Phase 2 backends). */
   spend?: SpendInfo;
+  /** Folders file triggers may watch (Phase 3 backends; empty: none, the default). */
+  watch_folders?: string[];
 }
 
 /** `schedule.preview`: what a timing means, before saving it. */

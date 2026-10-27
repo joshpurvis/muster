@@ -5186,3 +5186,223 @@ fieldset.sch-then > legend {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* ---------- Phase 3: agents' proposals, the files trigger ---------- */
+
+.field .sch-trig-folder {
+  flex: 1 1 180px;
+  min-width: 150px;
+  width: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field .sch-trig-pattern {
+  width: 110px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.toggle.sch-trig-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sch-trig-sub-limit {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.sch-trig-none {
+  margin-top: -4px;
+}
+
+.sch-watch-folders {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* A chip on a row an agent made: "reminder", "from reviewer". */
+.sch-made {
+  flex: none;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--accent-strong);
+  background: var(--accent-softer);
+  cursor: help;
+}
+
+/* An agent's proposal, waiting for approval: a card under its agent, never a plain row. */
+.sch-prop {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 3px 2px 6px 4px;
+  padding: 8px 9px 9px;
+  border-radius: var(--r);
+  border: 1px solid var(--attn-border);
+  background: var(--attn-bg);
+  outline: none;
+}
+
+.sch-prop:focus-visible {
+  box-shadow: 0 0 0 1.5px var(--pane-focus-ring);
+}
+
+.sch-prop-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--st-attn);
+}
+
+.sch-prop-icon {
+  flex: none;
+  margin-top: 1px;
+}
+
+.sch-prop-by b {
+  font-weight: 650;
+}
+
+.sch-prop-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+
+/* A label and its value as one run of text, so a narrow panel wraps it under the label. */
+.sch-prop-fact {
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-fact dt {
+  display: inline;
+  margin-right: 3px;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.sch-prop-fact dd {
+  display: inline;
+  margin: 0;
+  color: var(--text);
+}
+
+/* The prompt and the use estimate take the card's whole width, under their label. */
+.sch-prop-fact-block dt {
+  display: block;
+  margin: 0 0 2px;
+}
+
+.sch-prop-fact-block dd {
+  display: block;
+}
+
+.sch-prop-prompt {
+  margin: 0;
+  max-height: 9em;
+  overflow: auto;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The "Then…" steps: each with what starts it and its agent, its prompt under it; a nested
+   step is indented under the step it follows. */
+.sch-prop-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sch-prop-step-when {
+  color: var(--text-muted);
+}
+
+.sch-prop-step-prompt {
+  margin-top: 2px;
+}
+
+/* "Show all": the whole prompt, so it can be read in full before approving. */
+.sch-prop-prompt.whole {
+  max-height: none;
+}
+
+.sch-prop-more {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.sch-prop-reason {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.sch-prop-use {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sch-prop-use-line {
+  display: block;
+  color: var(--text);
+}
+
+.sch-prop-use-line + .sch-prop-use-line {
+  margin-top: 2px;
+}
+
+.sch-prop-use-line.sub {
+  color: var(--st-attn);
+}
+
+.sch-prop-use-line.cap {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.sch-prop-use-line .icon {
+  display: inline-block;
+  margin-right: 3px;
+  vertical-align: -1px;
+}
+
+.sch-prop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.sch-prop-note {
+  color: var(--st-attn);
+}

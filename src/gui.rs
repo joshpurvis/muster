@@ -266,7 +266,7 @@ impl Watchdog {
 }
 
 /// From a `/proc/<pid>/stat` line: the process's command name (at most 15 bytes) and parent pid.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// (Also `server::descent`.)
 pub fn parse_proc_stat(stat: &str) -> Option<(&str, u32)> {
     // `pid (comm) state ppid ...`; comm may itself hold spaces and parentheses.
     let (_, rest) = stat.split_once(" (")?;

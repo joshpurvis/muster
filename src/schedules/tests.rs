@@ -431,7 +431,7 @@ fn downtime_follows_the_missed_rule_per_schedule() {
 fn pauses_are_recorded_once_and_skip_next_skips_one() {
     let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
     let s = f.create(json!({"agent": "worker", "prompt": "p", "tz": LONDON, "when": {"kind": "cron", "cron": "0 * * * *"}})).unwrap();
-    set_settings(&f.hub, SettingsChange { paused: Some(true), ..Default::default() }).unwrap();
+    set_settings(&f.hub, SettingsChange { paused: Some(true), ..Default::default() }, true).unwrap();
     for h in ["09", "10", "11"] {
         f.set(at(LONDON, &format!("2026-10-19T{h}:00")) + 100);
         assert!(f.tick().is_empty());
@@ -439,8 +439,8 @@ fn pauses_are_recorded_once_and_skip_next_skips_one() {
     let rs = f.runs(s.id);
     assert_eq!(rs.len(), 1, "one row for the whole pause");
     assert_eq!(rs[0].reason.as_deref(), Some(plan::PAUSED_ALL));
-    set_settings(&f.hub, SettingsChange { paused: Some(false), ..Default::default() }).unwrap();
-    set_skip(&f.hub, s.id, true).unwrap();
+    set_settings(&f.hub, SettingsChange { paused: Some(false), ..Default::default() }, true).unwrap();
+    set_skip(&f.hub, s.id, true, None).unwrap();
     assert!(schedule_json(&f.hub, &f.hub.schedules.get(s.id).unwrap())["skip_next"].as_bool().unwrap());
     f.set(at(LONDON, "2026-10-19T12:00") + 100);
     assert!(f.tick().is_empty());
@@ -468,7 +468,7 @@ fn an_expired_claude_schedule_stops_until_renewed() {
     assert!(f.tick().is_empty());
     assert_eq!(f.runs(s.id).len(), 3, "the expiry is recorded once");
     assert_eq!(schedule_json(&f.hub, &f.hub.schedules.get(s.id).unwrap())["status"], "expired");
-    renew(&f.hub, s.id).unwrap();
+    renew(&f.hub, s.id, None).unwrap();
     let r = f.hub.schedules.get(s.id).unwrap();
     assert_eq!(show(r.next_run.unwrap()), "Wed 2026-10-21 09:00");
     assert!(!r.expiry_warned);
@@ -480,7 +480,7 @@ fn an_expired_claude_schedule_stops_until_renewed() {
 fn the_same_timing_resent_keeps_skip_next() {
     let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
     let s = f.create(json!({"agent": "worker", "prompt": "p", "tz": LONDON, "when": {"kind": "cron", "cron": "@daily"}})).unwrap();
-    set_skip(&f.hub, s.id, true).unwrap();
+    set_skip(&f.hub, s.id, true, None).unwrap();
     update(&f.hub, serde_json::from_value(json!({"id": s.id, "prompt": "q", "when": {"kind": "cron", "cron": "0 0 * * *"}})).unwrap()).unwrap();
     let after = f.hub.schedules.get(s.id).unwrap();
     assert_eq!((after.prompt.as_str(), after.skip_slot.is_some()), ("q", true), "@daily is 0 0 * * *: not a change");
@@ -491,11 +491,11 @@ fn the_same_timing_resent_keeps_skip_next() {
 #[test]
 fn settings_are_checked_and_kept() {
     let f = Fixture::new(0);
-    let e = set_settings(&f.hub, SettingsChange { quiet_start: Some("25:00".into()), ..Default::default() }).unwrap_err();
+    let e = set_settings(&f.hub, SettingsChange { quiet_start: Some("25:00".into()), ..Default::default() }, true).unwrap_err();
     assert!(e.to_string().contains("HH:MM"));
-    let e = set_settings(&f.hub, SettingsChange { unattended_cap: Some(500), ..Default::default() }).unwrap_err();
+    let e = set_settings(&f.hub, SettingsChange { unattended_cap: Some(500), ..Default::default() }, true).unwrap_err();
     assert!(e.to_string().contains("1 to 200"));
-    set_settings(&f.hub, SettingsChange { quiet_start: Some("22:30".into()), unattended_cap: Some(10), ..Default::default() }).unwrap();
+    set_settings(&f.hub, SettingsChange { quiet_start: Some("22:30".into()), unattended_cap: Some(10), ..Default::default() }, true).unwrap();
     let again = Schedules::load(f.hub.store(), Arc::new(FakeClock::default())).unwrap();
     assert_eq!((again.settings().quiet_start.as_str(), again.settings().unattended_cap), ("22:30", 10));
 }
@@ -551,3 +551,7 @@ fn migration_v19_adds_the_tables_and_a_slot_is_unique() {
 // Phase 2: triggers, chains and the spend caps.
 #[path = "tests_phase2.rs"]
 mod phase2;
+
+// Phase 3: agents' proposals and reminders, the file-change trigger.
+#[path = "tests_phase3.rs"]
+mod phase3;

@@ -68,12 +68,23 @@ import {
   withSteps,
   nestedSteps,
   noteOptions,
+  isProposal,
+  isHeld,
+  heldHeadline,
+  waitingNotice,
+  madeByLabel,
+  proposalFacts,
+  promptIsLong,
+  readingWithZone,
+  FILES_DEPTH,
+  waitingProposals,
+  thenSteps,
 } from "../schedules.ts";
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, openMenuAt } from "./Menu.tsx";
-import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconZap } from "../icons.tsx";
+import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
 
@@ -117,7 +128,49 @@ export function SchedulesPausedNotice() {
   );
 }
 
+/** "2 schedules proposed by reviewer wait for your approval · Show" (or made outside Muster's
+ * window), under the panel header while any wait. */
+export function ProposalsNotice() {
+  if (!schedulesSupported.value) return null;
+  const waiting = waitingProposals(schedules.value);
+  if (!waiting.length) return null;
+  const show = () => {
+    const el = document.querySelector<HTMLElement>(`.sch-prop[data-schedule="${waiting[0].id}"]`);
+    el?.scrollIntoView({ block: "nearest" });
+    el?.focus();
+  };
+  return (
+    <div class="sch-paused-note sch-prop-note" role="status">
+      <IconSpark size={12} />
+      <span>{waitingNotice(waiting)}</span>
+      <button type="button" class="sch-link" onClick={show}>Show</button>
+    </div>
+  );
+}
+
+/** A waiting schedule's ⋯ menu: approve, edit first, or dismiss (a held change of one of yours:
+ * remove it, with the usual question). Nothing else: it doesn't run until approved. */
+function proposalMenu(s: Schedule, x: number, y: number) {
+  const proposal = !!s.made_by && s.made_by.approved_at === null;
+  const fresh = proposal || (s.held?.what ?? []).includes("made");
+  openMenu({
+    x,
+    y,
+    minWidth: 180,
+    items: [
+      { header: proposal ? `${s.name} (proposed by ${s.made_by?.agent ?? "an agent"})` : `${s.name} (waits for your approval)` },
+      { label: "Approve", run: () => A.approveSchedule(s) },
+      { label: "Edit…", hint: "then approve", run: () => A.editSchedule(s.id) },
+      "sep",
+      fresh
+        ? { label: "Dismiss", danger: true, run: () => A.dismissProposal(s) }
+        : { label: "Remove…", danger: true, run: () => A.removeSchedule(s) },
+    ],
+  });
+}
+
 function scheduleMenu(s: Schedule, x: number, y: number) {
+  if (isProposal(s)) return proposalMenu(s, x, y);
   const open = scheduleHistoryOpen.value.has(s.id);
   const over = s.status === "done" || isExpired(s, Date.now()) || s.next_run === null;
   openMenu({
@@ -170,16 +223,185 @@ export function AgentSchedules({ agent, now }: { agent: Agent; now: number }) {
 /** Up / Down move through agent and schedule rows alike. */
 export function moveRow(e: KeyboardEvent) {
   e.preventDefault();
-  const rows = [...document.querySelectorAll<HTMLElement>(".ap-row, .sch-row")];
+  const rows = [...document.querySelectorAll<HTMLElement>(".ap-row, .sch-row, .sch-prop")];
   const i = rows.indexOf(e.currentTarget as HTMLElement);
   rows[i + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
 }
 
+/** A schedule waiting for you: an agent's proposal, or one made or changed outside Muster's
+ * window (the command line, a script: `held`). What will run, when, on which agent, why, and
+ * what it would use, with Approve, Edit and Dismiss (Remove for a held change of one of yours).
+ * It never runs before you approve it. */
+function ProposalCard({ s, now }: { s: Schedule; now: number }) {
+  const m = s.made_by && s.made_by.approved_at === null ? s.made_by : null;
+  const held = !m ? s.held ?? null : null;
+  const fresh = !!m || (held?.what ?? ["made"]).includes("made");
+  const since = m?.at ?? held?.at ?? s.updated_at;
+  const sub = s.estimate?.billing === "claude_subscription";
+  const facts = proposalFacts(s, browserZone());
+  const when = facts[0].value;
+  const steps = thenSteps(s.then);
+  /** "Show all" unfolds the steps' prompts too. */
+  const long = promptIsLong(s.prompt) || steps.some((st) => promptIsLong(st.prompt));
+  /** A long prompt shows its start; "Show all" (or the keyboard, in the focusable box) the rest. */
+  const [whole, setWhole] = useState(false);
+  const promptId = useId();
+  const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
+  const more = steps.length ? ` Then ${steps.length} more ${steps.length === 1 ? "step" : "steps"}.` : "";
+  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}.${more} Waiting for your approval.`;
+  return (
+    <div
+      role="listitem"
+      class="sch-prop"
+      data-schedule={s.id}
+      tabIndex={0}
+      aria-label={label}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
+        else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          e.preventDefault();
+          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+          proposalMenu(s, r.left + 24, r.top + 24);
+        }
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        proposalMenu(s, e.clientX, e.clientY);
+      }}
+    >
+      <div class="sch-prop-head">
+        <IconSpark size={12} class="sch-prop-icon" />
+        <span class="sch-prop-by">
+          {m ? <>Proposed by <b>{m.agent}</b></> : heldHeadline(s)} ·{" "}
+          <span data-tip={new Date(since).toLocaleString()}>{nextWhenPast(since, now)}</span>
+        </span>
+      </div>
+      <div class="sch-prop-name">{s.name}</div>
+      <dl class="sch-prop-facts">
+        {facts.map((f) => (
+          <div key={f.label} class="sch-prop-fact">
+            <dt>{f.label}</dt> <dd>{f.value}</dd>
+          </div>
+        ))}
+        <div class="sch-prop-fact sch-prop-fact-block">
+          <dt>Prompt</dt>
+          <dd>
+            {/* Focusable, so the keyboard scrolls it (WebKit doesn't focus a scrolling box itself). */}
+            <pre
+              id={promptId}
+              class={cx("sch-prop-prompt", whole && "whole")}
+              tabIndex={0}
+              role="region"
+              aria-label={`The prompt ${m ? `${m.agent} proposes` : "it would send"}${long && !whole ? " (scroll, or Show all)" : ""}`}
+            >
+              {s.prompt}
+            </pre>
+            {long && (
+              <button
+                type="button"
+                class="sch-link sch-prop-more"
+                aria-controls={promptId}
+                aria-expanded={whole}
+                onClick={() => setWhole(!whole)}
+              >
+                {whole
+                  ? "Show less"
+                  : promptIsLong(s.prompt)
+                  ? `Show all (${s.prompt.split("\n").length} lines${steps.length ? ", and the steps'" : ""})`
+                  : "Show all of the steps' prompts"}
+              </button>
+            )}
+          </dd>
+        </div>
+        {steps.length > 0 && (
+          <div class="sch-prop-fact sch-prop-fact-block">
+            <dt>Then</dt>
+            <dd>
+              {/* Every step, nested ones indented under the step they follow: approving lets all of them run. */}
+              <ol class="sch-prop-steps">
+                {steps.map((st, i) => (
+                  <li key={i} class="sch-prop-step" style={{ marginLeft: `${st.depth * 14}px` }}>
+                    <span class="sch-prop-step-when">{st.when}:</span>{" "}
+                    {st.agent === null ? "notify you" : <>ask <b>{st.agent}</b></>}
+                    {st.agent !== null && (
+                      <pre
+                        class={cx("sch-prop-prompt", "sch-prop-step-prompt", whole && "whole")}
+                        tabIndex={0}
+                        role="region"
+                        aria-label={`What it asks ${st.agent}`}
+                      >
+                        {st.prompt}
+                      </pre>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </dd>
+          </div>
+        )}
+        {m?.reason && (
+          <div class="sch-prop-fact">
+            <dt>Why</dt> <dd class="sch-prop-reason" data-tip={`${m.agent}'s own words`}>{m.reason}</dd>
+          </div>
+        )}
+        {held && (
+          <div class="sch-prop-fact">
+            <dt>Why</dt>
+            <dd class="sch-prop-reason">
+              Waits for your approval: {held.why}. Until you approve it, it doesn't run.
+            </dd>
+          </div>
+        )}
+        {s.estimate && (
+          <div class="sch-prop-fact sch-prop-fact-block">
+            <dt>Use</dt>
+            <dd class="sch-prop-use">
+              {(s.estimate.lines ?? [s.estimate.text]).map((l, i) => (
+                <span key={i} class={cx("sch-prop-use-line", i === 1 && sub && "sub", i === 2 && "cap")}>
+                  {i === 1 && sub && <IconShieldAlert size={11} />}
+                  {l}
+                </span>
+              ))}
+            </dd>
+          </div>
+        )}
+      </dl>
+      <div class="sch-prop-actions">
+        <button type="button" class="btn btn-sm btn-primary sch-approve" onClick={() => A.approveSchedule(s)}>
+          Approve
+        </button>
+        <button type="button" class="btn btn-sm" onClick={() => A.editSchedule(s.id)}>Edit…</button>
+        {fresh
+          ? <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.dismissProposal(s)}>Dismiss</button>
+          : <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.removeSchedule(s)}>Remove…</button>}
+      </div>
+    </div>
+  );
+}
+
+/** "today 10:02", "yesterday 18:40", "Mon 09:00": when a proposal was made. */
+function nextWhenPast(ms: number, now: number): string {
+  const d = new Date(ms), n = new Date(now);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  if (d.toDateString() === n.toDateString()) return `today ${hm}`;
+  const y = new Date(n.getFullYear(), n.getMonth(), n.getDate() - 1, 12);
+  if (d.toDateString() === y.toDateString()) return `yesterday ${hm}`;
+  return nextWhen(ms, now);
+}
+
 function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
+  if (isProposal(s) && (s.made_by || isHeld(s))) return <ProposalCard s={s} now={now} />;
+  return <TimedRow s={s} now={now} />;
+}
+
+function TimedRow({ s, now }: { s: Schedule; now: number }) {
   const open = scheduleHistoryOpen.value.has(s.id);
   const next = nextLabel(s, now);
   const exp = expiresLabel(s, now);
   const watch = watchLabel(s);
+  const made = madeByLabel(s);
   const last = s.last_run;
   const allPaused = !!scheduleSettings.value?.paused;
   const toggle = () => A.toggleScheduleHistory(s.id);
@@ -187,9 +409,11 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
     e.stopPropagation();
     A.renewSchedule(s);
   };
+  const reading = readingWithZone(s, browserZone());
   const label = [
     s.name,
-    s.reading,
+    reading,
+    made?.tip,
     next.text,
     watch && `${watch.text}: ${watch.tip}`,
     exp,
@@ -204,7 +428,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
         tabIndex={0}
         aria-expanded={open}
         aria-label={label}
-        data-tip={`${s.reading}${allPaused && next.tone === "next" ? " · all schedules are paused" : ""}`}
+        data-tip={`${reading}${allPaused && next.tone === "next" ? " · all schedules are paused" : ""}`}
         onClick={toggle}
         onKeyDown={(e) => {
           if (e.target !== e.currentTarget) return;
@@ -231,6 +455,7 @@ function ScheduleRow({ s, now }: { s: Schedule; now: number }) {
             {next.tone === "paused" && s.paused
               ? <span class="sch-badge">paused</span>
               : <span class={cx("sch-next", next.tone, allPaused && next.tone === "next" && "held")}>{next.text}</span>}
+            {made && <span class="sch-made" data-tip={made.tip}>{made.text}</span>}
             {watch && <span class="sch-chip sch-bad sch-watch" data-tip={watch.tip}>{watch.text}</span>}
             {next.tone === "expired" && s.expires_at !== null && (
               <button type="button" class="sch-link" onClick={renew}>Renew</button>
@@ -470,21 +695,30 @@ const groupLabel = (g: AgentChoice["group"], work: string) =>
 
 const MINUTES = Array.from({ length: 60 }, (_, i) => i);
 
+/** What the dialog keeps while Scheduling settings is open over it (`A.scheduleSettingsDialog`
+ * with a way back): the fields as typed, as they were when it first opened, and "More". */
+interface KeptDraft {
+  d: Draft;
+  initial: Draft;
+  more: boolean;
+}
+
 export function ScheduleDialog(
-  { id, agent: wanted, Modal, close }: { id?: number; agent?: string; Modal: ModalT; close: () => void },
+  { id, agent: wanted, keep, Modal, close }: { id?: number; agent?: string; keep?: unknown; Modal: ModalT; close: () => void },
 ) {
   const editing = id !== undefined;
   const sched = editing ? schedules.value.find((s) => s.id === id) : undefined;
+  const kept = keep as KeptDraft | undefined;
   const timeChoices = useMemo(() => scheduleAgents(agents.value), [agents.value]);
-  const [d, setD] = useState<Draft>(() => draftOf(sched, defaultScheduleAgent(timeChoices, wanted), Date.now()));
+  const [d, setD] = useState<Draft>(() => kept?.d ?? draftOf(sched, defaultScheduleAgent(timeChoices, wanted), Date.now()));
   /** The fields as the dialog opened: Save sends `when` only when the timing controls changed. */
-  const [initial] = useState(d);
+  const [initial] = useState(kept?.initial ?? d);
   const [preview, setPreview] = useState<SchedulePreview | null>(null);
   const [pErr, setPErr] = useState<string | null>(null);
   const [pBusy, setPBusy] = useState(false);
   /** Asks the backend again (after "Allow triggers" on the watched note). */
   const [pAgain, setPAgain] = useState(0);
-  const [more, setMore] = useState(() => !!sched && (sched.daily_cap !== null || sched.tz !== browserZone()));
+  const [more, setMore] = useState(() => kept?.more ?? (!!sched && (sched.daily_cap !== null || sched.tz !== browserZone())));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
@@ -497,7 +731,13 @@ export function ScheduleDialog(
 
   /** Triggers and "Then…" (Phase 2 backends: their settings carry the OpenRouter spend). */
   const phase2 = !!scheduleSettings.value?.spend || sched?.trigger !== undefined;
+  /** File triggers (Phase 3 backends: their settings carry the watched folders). */
+  const watched = scheduleSettings.value?.watch_folders ?? [];
+  const phase3 = scheduleSettings.value?.watch_folders !== undefined;
+  const proposal = !!sched && isProposal(sched);
   const event = d.mode === "event";
+  /** A file trigger, but no folder may be watched yet (the default): it can't be saved. */
+  const noWatched = event && d.trig.kind === "files" && phase3 && watched.length === 0;
   const origin = event ? "webhook" : "schedule";
   const choices = useMemo(() => scheduleAgents(agents.value, origin), [agents.value, origin]);
   const chosen = agents.value.find((a) => a.name === d.agent);
@@ -559,7 +799,7 @@ export function ScheduleDialog(
   const note = noteChoice(d.noteOn, d.noteTitle, noteList);
   const noteBad = d.noteOn && !d.noteTitle.trim();
   const canSave = !busy && !!d.prompt.trim() && "when" in w && !("error" in cap) && !noteBad && "then" in steps &&
-    (editing || (!!choice && choice.group !== "off"));
+    !noWatched && (editing || (!!choice && choice.group !== "off"));
   /** What Save sends as `when`: a changed trigger, a switch between time and event, or the
    * timing controls' own rule. */
   const whenForSave = (): WhenInput | null => {
@@ -611,7 +851,7 @@ export function ScheduleDialog(
         knowSchedule(s);
         overlay.value = null;
         if (!agentsPanelOpen.value) A.toggleAgentsPanel();
-        toast(
+        if (!A.heldToast(s)) toast(
           "success",
           s.trigger
             ? `${s.name} for ${s.agent ?? d.agent}: ${s.reading.replace(/^When /, "runs when ")}.`
@@ -624,7 +864,7 @@ export function ScheduleDialog(
       if (Object.keys(patch).length) {
         const s = await rpc.call<Schedule>("schedule.update", { id: sched.id, ...patch });
         knowSchedule(s);
-        toast("success", "Saved.", 2500);
+        if (sched.status === "held" || !A.heldToast(s)) toast("success", "Saved.", 2500);
       }
       overlay.value = null;
       A.focusActiveTerminalSoon();
@@ -884,6 +1124,48 @@ export function ScheduleDialog(
             />
           </>
         );
+      case "files":
+        return (
+          <>
+            <input
+              class="sch-trig-folder"
+              value={t.folder}
+              aria-label="The folder to watch"
+              placeholder={watched[0] ?? "~/inbox"}
+              list="sch-watch-folders"
+              spellcheck={false}
+              onInput={(e) => setTrig({ folder: (e.target as HTMLInputElement).value })}
+            />
+            <datalist id="sch-watch-folders">
+              {watched.map((f) => <option key={f} value={f} />)}
+            </datalist>
+            <span class="sch-at">files named</span>
+            <input
+              class="sch-trig-pattern"
+              value={t.pattern}
+              aria-label="File names to watch, like *.pdf (empty: any file)"
+              placeholder="any (or *.pdf)"
+              spellcheck={false}
+              onInput={(e) => setTrig({ pattern: (e.target as HTMLInputElement).value })}
+            />
+            <span class="sch-at">after</span>
+            {num("sch-trig-quiet", t.quiet, "Minutes of quiet after the last change", (quiet) => setTrig({ quiet }))}
+            <span class="sch-at">min of quiet</span>
+            <label class="toggle sch-trig-sub">
+              <input
+                type="checkbox"
+                checked={t.subfolders}
+                onChange={(e) => setTrig({ subfolders: (e.target as HTMLInputElement).checked })}
+              />
+              <span class="toggle-track">
+                <span class="toggle-thumb" />
+              </span>
+              <span>
+                and subfolders <span class="sch-trig-sub-limit">(up to {FILES_DEPTH} levels down)</span>
+              </span>
+            </label>
+          </>
+        );
     }
   })();
   const triggerHint: Record<TriggerKind, string> = {
@@ -894,6 +1176,10 @@ export function ScheduleDialog(
     ci_failed: "Polled with your own gh login; nothing from GitHub reaches Muster. The first check only notes past failures.",
     url: "This computer only, with a secret: after saving, copy the ready-made command from the schedule's menu. " +
       "Data sent with it is handed to the agent as untrusted text.",
+    files: "Only inside folders you chose under Scheduling settings → Watched folders. Muster lists the folder every " +
+      `15 seconds (at most 5000 entries${d.trig.subfolders ? `, and subfolders only ${FILES_DEPTH} levels down` : ""}; hidden ` +
+      "and partial files are skipped, links aren't followed). Changes made while its agent, or any scheduled or " +
+      "triggered work, is working count as an agent's own and don't fire it.",
   };
   const watchedNote = event && d.trig.kind === "note" && "when" in w && w.when.kind === "note" ? w.when.note_id : null;
   const stepAgents = choices.filter((c) => c.group !== "off");
@@ -930,7 +1216,9 @@ export function ScheduleDialog(
         <div class="dlg-head">
           <h2>{sched ? sched.name : "New schedule"}</h2>
           <span class="muted">
-            {sched
+            {proposal
+              ? `${sched!.made_by && sched!.made_by.approved_at === null ? `Proposed by ${sched!.made_by.agent}` : heldHeadline(sched!)}: saving keeps it waiting; it runs only once you approve it.`
+              : sched
               ? sched.reading
               : event
               ? "A message Muster sends an agent when something happens, marked as triggered."
@@ -1009,7 +1297,9 @@ export function ScheduleDialog(
                       value={d.trig.kind}
                       onChange={(e) => setTrig({ kind: e.currentTarget.value as TriggerKind })}
                     >
-                      {TRIGGER_KINDS.map((k) => <option key={k.id} value={k.id}>{k.label}</option>)}
+                      {TRIGGER_KINDS.filter((k) => k.id !== "files" || phase3 || d.trig.kind === "files").map((k) => (
+                        <option key={k.id} value={k.id}>{k.label}</option>
+                      ))}
                     </select>
                     <IconChevronDown size={14} />
                   </span>
@@ -1081,7 +1371,24 @@ export function ScheduleDialog(
                 : <span class="muted">{pBusy ? <Spinner size={10} /> : null} Reading it…</span>}
             </div>
           </div>
-          {event && <span class="field-hint sch-trig-hint">{triggerHint[d.trig.kind]}</span>}
+          {noWatched
+            ? (
+              <div class="sch-none sch-trig-none" role="note">
+                <p>
+                  File triggers are off until you choose the folders they may watch, so none can use your agents'
+                  time without you deciding where.
+                </p>
+                {/* Back here afterwards, with everything typed so far. */}
+                <button
+                  type="button"
+                  class="btn btn-sm"
+                  onClick={() => A.scheduleSettingsDialog({ kind: "schedule", id, agent: wanted, draft: { d, initial, more } })}
+                >
+                  Scheduling settings…
+                </button>
+              </div>
+            )
+            : event && <span class="field-hint sch-trig-hint">{triggerHint[d.trig.kind]}</span>}
           {!event && (
             <div class="field">
               <Seg
@@ -1301,7 +1608,8 @@ export function ScheduleDialog(
 
 // ---------------- Scheduling settings ----------------
 
-export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close: () => void }) {
+/** `back`: opened from the schedule dialog, which Cancel, Escape and Save return to. */
+export function ScheduleSettingsDialog({ Modal, close, back = false }: { Modal: ModalT; close: () => void; back?: boolean }) {
   const [cur, setCur] = useState<ScheduleSettings | null>(scheduleSettings.value);
   const [paused, setPaused] = useState(cur?.paused ?? false);
   const [from, setFrom] = useState(cur?.quiet_start ?? "23:00");
@@ -1312,6 +1620,8 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
   const [agentCaps, setAgentCaps] = useState<Record<string, string>>(() =>
     Object.fromEntries((cur?.spend?.agents ?? []).map((a) => [a.name, a.cap === null ? "" : String(a.cap)]))
   );
+  /** Watched folders, one per line (Phase 3 backends). */
+  const [foldersText, setFoldersText] = useState((cur?.watch_folders ?? []).join("\n"));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const first = useRef<HTMLInputElement>(null);
@@ -1335,6 +1645,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
       setFrom(s.quiet_start);
       setTo(s.quiet_end);
       setCapText(String(s.unattended_cap));
+      setFoldersText((s.watch_folders ?? []).join("\n"));
       if (s.spend) {
         setSpendText(String(s.spend.cap));
         setAgentCaps(Object.fromEntries(s.spend.agents.map((a) => [a.name, a.cap === null ? "" : String(a.cap)])));
@@ -1358,6 +1669,8 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
     if (!cur || from.trim() !== cur.quiet_start) change.quiet_start = from.trim();
     if (!cur || to.trim() !== cur.quiet_end) change.quiet_end = to.trim();
     if (!cur || capN !== cur.unattended_cap) change.unattended_cap = capN;
+    const folders = foldersText.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (cur?.watch_folders !== undefined && folders.join("\n") !== cur.watch_folders.join("\n")) change.watch_folders = folders;
     if (cur?.spend) {
       if (spendN !== cur.spend.cap) change.spend_cap = spendN;
       const caps: Record<string, number | null> = {};
@@ -1381,7 +1694,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
     }
   };
   return (
-    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings">
+    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings" onClose={close}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1465,6 +1778,25 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
               </span>
             </span>
           </label>
+          {cur?.watch_folders !== undefined && (
+            <label class="field">
+              <span class="field-label">Watched folders</span>
+              <textarea
+                class="sch-watch-folders"
+                rows={3}
+                value={foldersText}
+                placeholder="None yet, so file triggers are off. For example: ~/inbox"
+                spellcheck={false}
+                onInput={(e) => setFoldersText((e.target as HTMLTextAreaElement).value)}
+              />
+              <span class="field-hint sch-hint-wrap">
+                <span>
+                  One folder per line. A file trigger may watch only these folders (or folders inside them); with none,
+                  file triggers are off. Removing a folder stops the triggers that watch it.
+                </span>
+              </span>
+            </label>
+          )}
           {spend && (
             <div class="field sch-spend">
               <span class="field-label">OpenRouter spend</span>
@@ -1535,7 +1867,7 @@ export function ScheduleSettingsDialog({ Modal, close }: { Modal: ModalT; close:
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">
-          <button type="button" class="btn" onClick={close}>Cancel</button>
+          <button type="button" class="btn" onClick={close}>{back ? "Back to the schedule" : "Cancel"}</button>
           <button type="submit" class="btn btn-primary" disabled={!ok}>
             {busy ? <Spinner size={12} /> : null} Save
           </button>

@@ -782,13 +782,16 @@ pub enum ScheduleCmd {
         /// Create it paused.
         #[arg(long)] paused: bool,
         /// A trigger instead of a time (runs are origin webhook, "Triggered"): `note:<note>`,
-        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`
-        /// or `url:<name>`.
+        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`,
+        /// `url:<name>`, or `files:<folder>[/<pattern>]` (e.g. `files:~/inbox/*.pdf`; only inside a
+        /// folder you allow under Scheduling settings → Watched folders).
         #[arg(long, value_name = "EVENT")] on: Option<String>,
         /// A note trigger waits this many minutes of quiet after the last edit (default 2).
         #[arg(long, value_name = "N")] quiet_min: Option<u32>,
         /// A GitHub trigger checks every N minutes (2 to 60, default 5).
         #[arg(long, value_name = "N")] poll_min: Option<u32>,
+        /// A files trigger also looks in subfolders (up to 3 levels).
+        #[arg(long)] subfolders: bool,
         /// Then, when a run replies: `AGENT: prompt` (the prompt may quote the reply as {reply}).
         #[arg(long, value_name = "AGENT: PROMPT")] then: Option<String>,
         /// When a run fails: `notify`, or `AGENT: prompt` ({reply}, {outcome}).
@@ -821,6 +824,43 @@ pub enum ScheduleCmd {
     },
     /// Renew a Claude subscription agent's schedule for 7 more days.
     Renew { id: i64 },
+    /// Not here: an agent's proposal is approved only with a click on Approve in Muster's window
+    /// (so an agent can't approve its own from a shell). `muster schedule rm` dismisses one.
+    #[command(hide = true)]
+    Approve { id: i64 },
+    /// Inside an agent's session: propose a schedule; it runs only once the human approves it in
+    /// the Agents panel. Give one timing as for `add`, and --reason.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule propose --weekly fri@16:00 --reason \"You asked for a weekly summary\" Summarise the Ideas note")]
+    Propose {
+        prompt: Vec<String>,
+        /// Why (the human reads it before approving).
+        #[arg(long)] reason: String,
+        /// The agent it runs on (default: the one proposing).
+        #[arg(long)] agent: Option<String>,
+        #[arg(long)] every: Option<String>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0")] hourly: Option<String>,
+        #[arg(long)] daily: Option<String>,
+        #[arg(long)] weekdays: Option<String>,
+        #[arg(long)] weekly: Option<String>,
+        #[arg(long)] cron: Option<String>,
+        #[arg(long)] at: Option<String>,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+        #[arg(long)] fresh: bool,
+        #[arg(long, value_parser = ["on", "off"])] quiet_hours: Option<String>,
+        #[arg(long)] max_per_day: Option<u32>,
+        /// Also add each reply to this note (its id).
+        #[arg(long)] note: Option<i64>,
+    },
+    /// Inside an agent's session: have Muster send you PROMPT once, 5 minutes to 24 hours from
+    /// now, without approval. `--at +20m`, `--at 15:30` or `--at "YYYY-MM-DD HH:MM"`.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule remind --at +20m Check whether CI on master passed")]
+    Remind {
+        prompt: Vec<String>,
+        #[arg(long)] at: String,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+    },
     /// A schedule's runs, newest first: RUN  TIME  KIND  OUTCOME  REASON.
     History {
         id: i64,
@@ -830,9 +870,9 @@ pub enum ScheduleCmd {
 }
 
 /// `--on EVENT` as a trigger `when`.
-fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>) -> anyhow::Result<Value> {
+fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>, subfolders: bool) -> anyhow::Result<Value> {
     let bad = |why: &str| exit(2, format!("--on {on}: {why}"));
-    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed or url:<name>"))?;
+    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed, url:<name> or files:<folder>"))?;
     let v = match kind {
         "note" => json!({"kind": "note", "note_id": note_target(d, rest)?, "quiet_min": quiet_min}),
         "git" => {
@@ -857,7 +897,19 @@ fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Optio
             json!({"kind": "github", "repo": repo, "event": event, "branch": branch, "every_min": poll_min})
         }
         "url" => json!({"kind": "url", "name": rest}),
-        _ => return Err(bad("the kind is note, git, gh or url")),
+        "files" => {
+            // A last part with * or ? is the file pattern: files:~/inbox/*.pdf.
+            let (folder, pattern) = match rest.rsplit_once('/') {
+                Some((f, p)) if p.contains(['*', '?']) => (f, Some(p)),
+                _ => (rest, None),
+            };
+            let folder = match folder.strip_prefix("~/") {
+                Some(r) => crate::paths::home_dir().join(r),
+                None => std::path::absolute(folder).map_err(|e| bad(&e.to_string()))?,
+            };
+            json!({"kind": "files", "folder": folder, "pattern": pattern, "recursive": subfolders, "quiet_min": quiet_min})
+        }
+        _ => return Err(bad("the kind is note, git, gh, url or files")),
     };
     let mut v = v;
     v.as_object_mut().unwrap().retain(|_, x| !x.is_null());
@@ -925,20 +977,28 @@ fn schedule_when(every: Option<String>, hourly: Option<String>, daily: Option<St
 }
 
 /// `--at`: `+20m`/`+2h`, `HH:MM` (the next one), or `YYYY-MM-DD HH:MM`, in `tz` (else local).
+/// `--at +20m` / `+2h` / `+1d` (or `in 20m`): whole minutes from now. None: not a relative time.
+fn relative_minutes(s: &str) -> anyhow::Result<Option<i64>> {
+    let s = s.trim();
+    let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
+    let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) else { return Ok(None) };
+    let rel = rel.trim();
+    let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let per = match unit.trim() {
+        "m" | "min" | "mins" | "minutes" => 1,
+        "h" | "hour" | "hours" => 60,
+        "d" | "day" | "days" => 24 * 60,
+        _ => return Err(bad()),
+    };
+    Ok(Some(n.checked_mul(per).ok_or_else(bad)?))
+}
+
 fn once_at(s: &str, tz: Option<&str>) -> anyhow::Result<i64> {
     let s = s.trim();
     let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
-    if let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
-        let rel = rel.trim();
-        let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
-        let n: i64 = n.parse().map_err(|_| bad())?;
-        let ms = match unit.trim() {
-            "m" | "min" | "mins" | "minutes" => n * 60_000,
-            "h" | "hour" | "hours" => n * 3_600_000,
-            "d" | "day" | "days" => n * 86_400_000,
-            _ => return Err(bad()),
-        };
-        return Ok(now_ms() + ms);
+    if let Some(m) = relative_minutes(s)? {
+        return Ok(now_ms() + m * 60_000);
     }
     let zone = match tz {
         Some(t) => crate::schedules::cron::zone(t).map_err(|e| exit(2, e))?,
@@ -978,6 +1038,18 @@ fn schedule_line(s: &Value) -> String {
         s["status"].as_str().unwrap_or("?"), next, last, s["name"].as_str().unwrap_or(""), s["reading"].as_str().unwrap_or(""))
 }
 
+/// A schedule made or changed here waits for the owner's click in Muster's window: say so in
+/// plain words (nothing else on the line says it won't run).
+fn held_note(s: &Value) {
+    if s["status"].as_str() == Some("held") {
+        println!(
+            "  Waiting for your approval: made or changed from the command line, it doesn't run until you click \
+             Approve on its card in Muster's Agents panel (`muster schedule rm {}` drops it).",
+            s["id"]
+        );
+    }
+}
+
 fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option<i64>, all: bool, pause: bool) -> anyhow::Result<()> {
     if all {
         one("schedule.settings.set", json!({"paused": pause}))?;
@@ -987,6 +1059,7 @@ fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option
     let id = id.ok_or_else(|| exit(2, "give a schedule id, or --all"))?;
     let s = one("schedule.pause", json!({"id": id, "on": pause}))?;
     println!("schedule {id}: {}", s["status"].as_str().unwrap_or("?"));
+    held_note(&s);
     Ok(())
 }
 
@@ -999,13 +1072,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
     };
     match cmd {
         ScheduleCmd::Add { agent, prompt, every, hourly, daily, weekdays, weekly, cron, at, name, tz, if_missed, fresh,
-            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, then, on_failure } => {
+            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, subfolders, then, on_failure } => {
             let when = match &on {
                 Some(on) => {
                     if [&every, &hourly, &daily, &weekdays, &weekly, &cron, &at].iter().any(|o| o.is_some()) {
                         return Err(exit(2, "give a timing or --on EVENT, not both"));
                     }
-                    trigger_when(d, on, quiet_min, poll_min)?
+                    trigger_when(d, on, quiet_min, poll_min, subfolders)?
                 }
                 None => schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?,
             };
@@ -1044,10 +1117,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 if let Some(u) = s["url"].as_str() {
                     println!("  URL: {u} (POST, with its secret: `muster trigger --url {}`)", s["when"]["name"].as_str().unwrap_or(""));
                 }
+            } else if s["status"].as_str() == Some("held") {
+                println!("schedule {}: {} ({})", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             } else {
                 let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
                 println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             }
+            held_note(&s);
             if s["expires_at"].is_i64() {
                 println!("  {} is a Claude subscription agent: this schedule stops after 7 days unless you renew it \
                     (`muster schedule renew {}`). Quiet hours: {}.", s["agent"].as_str().unwrap_or("it"), s["id"],
@@ -1093,14 +1169,58 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 (false, Some(t)) => println!("schedule {id}: skipping the run at {}", local_time(t)),
                 _ => println!("schedule {id}: not skipping"),
             }
+            held_note(&s);
             Ok(())
         }
         ScheduleCmd::Renew { id } => {
             let s = one("schedule.renew", json!({"id": id}))?;
-            match s["expires_at"].as_i64() {
-                Some(e) => println!("schedule {id}: runs until {}", local_time(e)),
-                None => println!("schedule {id}: doesn't expire"),
+            match (s["status"].as_str(), s["expires_at"].as_i64()) {
+                (Some("held"), _) => println!("schedule {id}: renewal asked for (7 more days once you approve it)"),
+                (_, Some(e)) => println!("schedule {id}: runs until {}", local_time(e)),
+                (_, None) => println!("schedule {id}: doesn't expire"),
             }
+            held_note(&s);
+            Ok(())
+        }
+        ScheduleCmd::Approve { id } => Err(exit(
+            2,
+            format!(
+                "schedule {id}: {}. Open Muster's Agents panel and click Approve on its card (`muster schedule rm {id}` dismisses it).",
+                crate::rpc::APPROVE_BY_CLICK
+            ),
+        )),
+        ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,
+            quiet_hours, max_per_day, note } => {
+            let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({
+                "prompt": text, "reason": reason, "agent": agent, "name": name, "tz": tz,
+                "cron": when.get("cron"), "at": when.get("at"),
+                "conversation": fresh.then_some("fresh"), "quiet_hours": quiet_hours.map(|q| q == "on"),
+                "daily_cap": max_per_day, "note_id": note,
+            });
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.propose", p)?;
+            println!("schedule {}: proposed ({}{}). It runs once the human approves it in the Agents panel.",
+                r["schedule_id"], r["when"].as_str().unwrap_or(""), r["agent"].as_str().map(|a| format!(", on {a}")).unwrap_or_default());
+            if let Some(e) = r["estimate"].as_str() {
+                println!("  {e}");
+            }
+            Ok(())
+        }
+        ScheduleCmd::Remind { prompt, at, name, tz } => {
+            // `+20m` goes as minutes from now, counted by the daemon when it sets the reminder
+            // (a time worked out here would already be a moment short of `+5m`).
+            let when = match relative_minutes(&at)? {
+                Some(m) => json!({"in_minutes": m}),
+                None => json!({"at": once_at(&at, tz.as_deref())?}),
+            };
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({"prompt": text, "name": name, "tz": tz});
+            p.as_object_mut().unwrap().extend(when.as_object().unwrap().clone());
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.remind", p)?;
+            println!("schedule {}: reminder at {}", r["schedule_id"], r["runs_at"].as_str().unwrap_or("?"));
             Ok(())
         }
         ScheduleCmd::History { id, limit, json } => {
@@ -2845,6 +2965,34 @@ mod tests {
         let next = once_at("2030-01-02 03:04", Some("UTC")).unwrap();
         assert_eq!(next, 1893553440000);
         assert!(once_at("tomorrow-ish", None).is_err());
+    }
+
+    #[test]
+    fn remind_sends_a_relative_time_as_minutes_and_approve_is_a_click() {
+        use std::sync::{Arc, Mutex};
+        assert_eq!(relative_minutes("+5m").unwrap(), Some(5));
+        assert_eq!(relative_minutes("in 2h").unwrap(), Some(120));
+        assert_eq!(relative_minutes("+1d").unwrap(), Some(1440));
+        assert_eq!(relative_minutes("15:30").unwrap(), None);
+        assert!(relative_minutes("+5x").is_err());
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let log = calls.clone();
+        let d = mock_daemon(move |method, params| {
+            log.lock().unwrap().push((method.to_string(), params.clone()));
+            json!({"schedule_id": 9, "runs_at": "Mon 10:05"})
+        });
+        let remind = |at: &str| ScheduleCmd::Remind { prompt: vec!["check CI".into()], at: at.into(), name: None, tz: None };
+        schedule(&d, remind("+5m")).unwrap();
+        schedule(&d, remind("2030-01-02 03:04")).unwrap();
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got[0].0, "schedule.remind");
+        // Minutes from now, counted by the daemon: `+5m` is exactly 5 minutes ahead there.
+        assert_eq!((got[0].1["in_minutes"].as_i64(), got[0].1.get("at")), (Some(5), None), "{:?}", got[0].1);
+        assert!(got[1].1["at"].is_i64() && got[1].1.get("in_minutes").is_none());
+        // Approving isn't the command line's: nothing is sent.
+        let e = schedule(&d, ScheduleCmd::Approve { id: 3 }).unwrap_err().to_string();
+        assert!(e.contains("click on Approve"), "{e}");
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]

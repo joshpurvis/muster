@@ -243,7 +243,12 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
          your final message for that turn goes back to the sender. To ask other agents, use the muster \
-         MCP tools `list_agents` and `ask_agent`.\n",
+         MCP tools `list_agents` and `ask_agent`.\n\n\
+         ## Schedules\n\n\
+         To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
+         one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
+         `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
+         shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         resume = " and resumes your conversation when you restart",
         persona = if persona.is_empty() { "(none given)" } else { persona },
@@ -797,9 +802,34 @@ pub struct Registry {
     inner: Mutex<RegInner>,
     /// Serializes agent starts, so two asks can't start one agent twice.
     start_lock: tokio::sync::Mutex<()>,
+    /// Serializes `agent.update`: the record it reads, the check that it doesn't widen unattended
+    /// work from outside the window (`widens_unattended`) and the write happen as one, so a
+    /// change made meanwhile (the owner taking back Schedule) can't be undone by an older read.
+    config_lock: Mutex<()>,
+    /// The sessions whose provenance is now unattended work (a schedule's or trigger's chain),
+    /// kept beside `inner.runtime.prov` behind a lock of its own that calls nothing: file
+    /// triggers read it on every session event (`Hub::emit`, sometimes with the hub's lock
+    /// held), so each turn is marked when it is seen, not at a later look.
+    unattended: Mutex<HashSet<SessionId>>,
+}
+
+/// The sessions `rt` says are doing unattended work.
+fn unattended_of(rt: &Attributions) -> HashSet<SessionId> {
+    rt.prov.iter().filter(|(_, p)| p.origin != Origin::Human).map(|(id, _)| *id).collect()
 }
 
 impl Registry {
+    /// Is session `id` doing unattended work now (its provenance a schedule's or a trigger's)?
+    /// A leaf lock: safe from anywhere.
+    pub fn unattended_now(&self, id: SessionId) -> bool {
+        self.unattended.lock().contains(&id)
+    }
+
+    /// Keep `unattended` in step with the provenance just saved (with `inner` held).
+    fn mark(&self, rt: &Attributions) {
+        *self.unattended.lock() = unattended_of(rt);
+    }
+
     pub fn load(store: &Store) -> anyhow::Result<Self> {
         let mut inner = RegInner {
             runtime: store.load_runtime("agent-attribution")?.unwrap_or_default(),
@@ -819,10 +849,13 @@ impl Registry {
             }
             inner.agents.insert(b.id, b);
         }
+        let unattended = Mutex::new(unattended_of(&inner.runtime));
         Ok(Registry {
             store: store.clone(),
             inner: Mutex::new(inner),
             start_lock: Default::default(),
+            config_lock: Default::default(),
+            unattended,
         })
     }
 
@@ -834,6 +867,7 @@ impl Registry {
         let result = edit(&mut next);
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         // Stamps describe only sessions still marked.
@@ -995,6 +1029,7 @@ impl Registry {
         }
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         for (id, (first, last)) in marks {
@@ -1118,6 +1153,7 @@ impl Registry {
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
         if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some() {
             store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
+            self.mark(&next);
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
         }
@@ -1284,8 +1320,11 @@ pub struct AgentUpdate {
 
 /// Model, effort and permissions apply from the agent's next start; the persona file is
 /// rewritten now (the CLI reads it when a conversation starts). Its own tab gets the new
-/// profile, so a restart runs with it.
-pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
+/// profile, so a restart runs with it. `outside`: not a click in Muster's window
+/// (`rpc::Via::Outside`): a change that widens unattended work (`widens_unattended`) is refused.
+/// Read, checked and written under `Registry::config_lock`, one update at a time.
+pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agent> {
+    let _one = hub.agents().config_lock.lock();
     let cur = hub.agents().get(&req.name).ok_or_else(|| no_agent(hub, &req.name))?;
     let mut next = cur.clone();
     if let Some(m) = req.model {
@@ -1312,6 +1351,9 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
     if let Some(p) = req.permissions {
         next.permissions = p.into();
     }
+    if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
+        anyhow::bail!("{why}");
+    }
     if next.persona != cur.persona {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
@@ -1328,6 +1370,37 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
         crate::schedules::agent_changed(hub, next.id);
     }
     Ok(next)
+}
+
+/// Does changing `cur` to `next` widen unattended work, which takes a click in Muster's window?
+/// `Some(what to do instead)` when it lets the agent take scheduled or triggered work it didn't,
+/// or changes the provider of a Claude agent that takes such work or is named in a schedule (its
+/// own or a "Then…" step): leaving the subscription drops its schedules' 7-day expiry (an
+/// expired one would run again) and their quiet-hours default; joining it puts that work on the
+/// subscription, which the Schedule opt-in's warning is about. Model, effort, persona,
+/// permissions and autostart don't change whether or when unattended work runs (the tab's
+/// permissions are the owner's to set from anywhere: `channel.set_permissions`).
+pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String> {
+    let unattended = |o: &Origin| matches!(o, Origin::Schedule | Origin::Webhook);
+    if next.accepts_origins.iter().any(|o| unattended(o) && !cur.accepts_origins.contains(o)) {
+        return Some(format!(
+            "letting {} take scheduled or triggered work takes a click in Muster's window: tick it under \
+             \"Takes messages started by\" in Edit agent (Agents panel). From here an agent's accepted work can only shrink",
+            cur.name
+        ));
+    }
+    if next.provider != cur.provider
+        && cur.kind == SessionKind::Claude
+        && (next.accepts_origins.iter().any(unattended) || crate::schedules::names_agent(hub, cur.id))
+    {
+        return Some(format!(
+            "changing the provider of {}, which takes scheduled or triggered work or is named in a schedule, takes a click in \
+             Muster's window (Edit agent, in the Agents panel): it changes whether its schedules stop after 7 days and what \
+             pays for them. From here, first take away its Schedule and Webhook and remove the schedules that name it",
+            cur.name
+        ));
+    }
+    None
 }
 
 /// `agent.remove`: removes the agent's session (if any) and its record. The home dir (persona,

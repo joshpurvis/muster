@@ -164,7 +164,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
 | `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -335,7 +335,7 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
 | `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
 | `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
-| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. |
+| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. `on: true` only from a click in Muster's window (see "Schedules", Phase 3, "Held"); `off` from anywhere. |
 
 `from_session` (the CLI passes `$MUSTER_SESSION_ID`) says who wrote: a shell tab, or no
 `from_session`, is the human. An agent's session (Claude or Codex) makes `updated_by` that agent
@@ -383,9 +383,10 @@ Phase 1). Each run is an ordinary agent message with origin `schedule` at hop 0 
 sent through the same path as `agent.ask`, so the agent's accepted origins, the hop limit, the
 200-a-day cap and the unattended cap all apply, and a refusal is recorded like any other
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
-events. Only the human makes or changes schedules: a mutating call whose `from_session` is an
-agent's session, or a shell tab with an agent's provenance (one an agent spawned or typed into),
-is refused (agents proposing schedules is Phase 3).
+events. Only the human makes, approves or changes schedules: a mutating call whose
+`from_session` is an agent's session, or a shell tab with an agent's provenance (one an agent
+spawned or typed into), is refused. Agents propose schedules and set one-off reminders through
+their MCP tools (Phase 3, below; docs/MCP.md "Schedules").
 
 ```ts
 type When = { kind: "cron"; cron: string /* 5 fields, or @hourly/@daily/@weekly/@monthly/@yearly */ }
@@ -429,7 +430,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
 | `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
-| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. |
+| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. A change that loosens a limit is taken only from a click in Muster's window (Phase 3, "Held"). |
 
 Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next run moves,
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
@@ -542,6 +543,8 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 `trigger.*`, `note.set_triggers` and every schedule change are the human's: refused from an
 agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
 an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
+Since Phase 3's second fix round, what makes or widens unattended work also needs a click in
+Muster's window; elsewhere it is held or refused (Phase 3, "Held").
 
 **Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
 daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
@@ -664,6 +667,111 @@ timed slots (`scheduled`, `catch_up`) unique per schedule, and adds `notes.trigg
 only: `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet minutes, `MUSTER_TEST_WATCH_EVERY_MS`
 the git and GitHub intervals, `MUSTER_TEST_GH` the `gh` program and
 `MUSTER_TEST_OPENROUTER_KEY_URL` the key endpoint (http allowed there).
+
+### Agents' proposals and reminders, the file trigger (Phase 3)
+
+Code: `src/schedules/agent.rs` (the agent tools and the estimate), `src/schedules/triggers.rs`
+(files). The agent side is MCP (docs/MCP.md "Schedules"); this is the client side.
+
+```ts
+// Added to Schedule:
+//   made_by: { agent_id, agent, kind: "proposal" | "reminder", reason, at, approved_at: number | null } | null
+//            // null: the human made it. A proposal with approved_at null waits for approval.
+//   estimate: { runs_per_week: number | null, max_per_day: number | null,
+//               billing: "claude_subscription" | "openrouter" | "codex" | "other",
+//               recent_unattended_7d: number, lines: string[], text: string } | null   // agent-made only
+//   status: also "proposed" (waiting for approval: it has no next_run and never runs)
+//           and "held" (made or widened outside Muster's window: waits the same way)
+//   held: { what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[], at: number,
+//           why: string } | null   // what was done outside the window, waiting for the owner's click
+//   estimate is also set on a held schedule
+// Another kind of When / WhenInput (origin webhook, like every trigger):
+type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */; pattern: string | null /* "*.pdf": * and ? on file names */;
+                   recursive: boolean /* up to 3 levels down */; quiet_min: number /* 1..120, default 2 */ };
+// WhenInput also takes folder as "~/…"; pattern "" or "*" is none.
+// Added to ScheduleSettings: watch_folders: string[]  // folders file triggers may watch; [] (the default): none
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `schedule.approve` | `{id, seen?}` | `Schedule`. The owner approves an agent's proposal or a held schedule: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule from its next time. A Claude subscription agent's 7 days start now for a proposal, a held new schedule or a held renewal, and stay as they were for a held change. `seen`: the `updated_at` the owner looked at (the UI sends it); a schedule changed since is refused. **Only a click in Muster's window** (below). Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session, a connection whose program can't be told. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove`. |
+| `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
+| `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
+| `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
+| `schedule.settings.set` | also `watch_folders: string[]` (the whole list; existing folders, `~/` allowed, made absolute with links resolved; not `/`; at most 20) | `ScheduleSettings`. Removing a folder stops the file triggers inside it: their waiting events go, their prompts still in an agent's queue are taken back, and a run due is `skipped`. |
+
+**Held** (fix round 2). A click in Muster's window is a call over a WebSocket that came in with the
+client token and an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`,
+`wry://`), that holds a window (`window.claim`), names no `from_session`, and whose program is
+known and outside every session: the socket's holders found in `/proc`, none of them descended
+from a session's process. Only the processes seen holding the socket decide; when none is seen, the
+owner's processes whose descriptors can't be read count as possible holders, judged by their
+parents (fix round 3: a hidden program that doesn't hold the connection no longer decides for one
+a process is seen holding). A program that can't be told (no `/proc`, as on macOS; the
+connection not listed; no holder found; a lookup error) is not the window. Anything else is
+outside the window, and there:
+
+| Call | From outside the window |
+|---|---|
+| `schedule.create` | Made, but held: `status: "held"`, `held.what: ["made"]`, no `next_run`. At most 10 new held schedules wait at once (counted with the insert, so calls at once can't pass it); one nobody approves is removed after 7 days (decided again as it is removed: one approved meanwhile stays). |
+| `schedule.update` | A change that only narrows (name, notify, quiet hours on, a lower or new daily cap, pausing) applies; any other (prompt, timing, time zone, steps, note, missed rule, conversation, quiet hours off, a higher or no cap) is made but held (`changed`), and its prompts still in an agent's queue are taken back, Run now's included. |
+| `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
+| `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
+| `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
+| `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
+| `note.set_triggers` | `on: true` refused; `off` applies. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+
+A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
+or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
+sent and its prompt isn't submitted) until `schedule.approve`. Edits from the window keep it held; `schedule.remove` drops it.
+`schedule.run` and `trigger.fire` stay as they were for an approved schedule: they run work already
+approved, once, under the agent's caps.
+
+A proposal is stored like any schedule with `made_by` and no `next_run`; every write to it keeps
+`next_run` empty while it waits (the human may edit it before approving), and the scheduler,
+Run now and Skip next refuse it. A proposal nobody approves is removed after 7 days, and a reminder
+one day after it ran. Every schedule an agent made carries `estimate`: its runs in the coming 7
+days after quiet hours and the caps (its own daily cap and the agent's unattended cap), what pays
+(the agent's provider), and the caps that bound it, with the agent's unattended messages of the
+last 7 days. Making a proposal sends a notice (and a desktop notification) that it waits.
+
+**Files.** Only inside a folder in `watch_folders`, and only while the folder is still the one
+the trigger was made on: it is resolved again when the trigger is made, at every look, when a run
+is claimed, before it is sent and before its prompt is submitted, and a folder that is gone, was
+swapped for a symbolic link (anywhere along its path, wherever the link leads) or is no longer
+allowed is not read; its waiting event is dropped and its prompts still in a queue are taken back
+(`watch.state` `error` with the reason). The folder is listed every 15 s while the trigger is
+active (not paused, not expired): at most 5000 entries per look (more: `watch.state` `error`,
+nothing read), `recursive` up to 3 levels, hidden names (`.…`), `node_modules`, `target`,
+`__pycache__` and partial files (`~`, `.swp`, `.tmp`, `.part`, `.crdownload`, `.download`,
+`.partial`) skipped. Symbolic links are never followed: the folder is opened with
+`O_NOFOLLOW | O_DIRECTORY` and where the open handle really is must be the saved path, every
+subfolder is opened through its parent's handle the same way, and every entry is looked at with
+`AT_SYMLINK_NOFOLLOW`, so swapping a folder for a link while a look runs leads nowhere. A file
+whose change time (ctime: set by the system on every write, rename or move into the folder) is
+after the last saved look's boundary (`watch.stamp`: 2 s before that look began, not the newest
+change seen, so a file changed during a look is not skipped), and that the overlap hasn't
+reported already (`watch.recent`), is new or changed; with subfolders, so is every file in a
+subfolder the last look didn't see (`watch.dirs`, device and inode: one made or moved in, whose
+files keep their old change times). A change while Muster was off fires once after it starts, and
+the first look only records. Removing a file starts nothing. An event names the folder and up to
+10 changed files (`New or changed in ~/inbox: a.pdf, b.pdf (+3 more)`), quoted to the agent as
+data, and is debounced like a note's (`quiet_min` after the last change). A change made while
+the trigger's own agent was working, or any session handling scheduled or triggered work was,
+or within 30 s after, is taken as an agent's own: recorded as seen, never an event (so a file
+trigger can't feed itself or another). Who worked when is recorded from every session's state
+changes (a span from entering a working state to leaving it), not seen at the looks, so a turn
+that starts, writes and ends between two looks still counts; the spans are kept for an hour and
+saved with the runtime state, so a backend reload keeps them (a session that worked in between
+has a span to its last turn). guess: ctime is the system's clock, so a clock set back (or a
+network file system's clock behind this one's) can hide changes until it catches up. What it
+costs while idle: one directory listing (and a stat per entry) per 15 s. Debug builds:
+`MUSTER_TEST_WATCH_EVERY_MS`, `MUSTER_TEST_TRIGGER_DELAY_MS` and `MUSTER_TEST_ABSORB_GRACE_MS`
+(the 30 s) apply.
+
+No store migration: schedule records and the settings are JSON (an older backend ignores a
+`files` schedule it can't read, and keeps a proposal waiting).
 
 ## Windows, tabs and naming
 

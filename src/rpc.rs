@@ -167,8 +167,25 @@ pub fn authorize(hub: &Hub, who: &Principal, method: &str, params: &Value) -> Re
 }
 
 /// Every method except `session.attach` / `session.detach` (connection-scoped, WS only).
-/// Callers check `authorize` first.
+/// Callers check `authorize` first. Anything but a click in Muster's window (`Via::Outside`).
 pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
+    dispatch_via(hub, who, method, params, Via::Outside).await
+}
+
+/// Where a call that could make or widen unattended work came from (`from_window`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// A click in the owner's window: a WebSocket of Muster's own UI, holding a window, whose
+    /// program is known and runs outside every session.
+    Window,
+    /// Anything else: the CLI, `/api/rpc`, a script's WebSocket, a connection Muster can't
+    /// attribute. A new or widened schedule waits for the owner's click (`schedules::Held`); a
+    /// setting that loosens a limit is refused.
+    Outside,
+}
+
+/// `dispatch`, told where the call came from.
+pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value, via: Via) -> RpcResult {
     match method {
         // A liveness check: the phone calls it while visible to notice a dead socket.
         "ping" => Ok(json!({})),
@@ -1006,7 +1023,10 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         "agent.update" => {
             require_local(who, method)?;
             let p: crate::agents::AgentUpdate = parse(params)?;
-            let b = crate::agents::update(hub, p)?;
+            // Letting an agent take scheduled or triggered work, or moving one that does to or
+            // from the subscription, only with a click in the owner's window: checked with the
+            // record it changes, under one lock (`agents::widens_unattended`).
+            let b = crate::agents::update(hub, p, via == Via::Outside)?;
             Ok(crate::agents::agent_json(&b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
         }
         "agent.list" => {
@@ -1126,12 +1146,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
         }
 
-        // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes or changes them: a call
-        // on an agent session's behalf is refused (agents proposing schedules is a later phase).
+        // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes, approves or changes them:
+        // a call on an agent session's behalf is refused, except what an agent may do through its
+        // MCP schedule tools (propose, set a reminder, pause, delete its own), which `muster
+        // schedule propose/remind/pause/rm` inside an agent's session run as that agent.
         m if m.starts_with("schedule.") || m.starts_with("trigger.") || m == "note.set_triggers" => {
             require_local(who, method)?;
             let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
             let reads = matches!(method, "schedule.list" | "schedule.runs" | "schedule.preview" | "schedule.settings.get");
+            if let Some(r) = agent_schedule_call(hub, method, &params, from).await {
+                return r;
+            }
             // An agent's session, or a shell tab an agent has typed into (its provenance is an
             // agent's chain): only a shell the human drives may make or change schedules, so
             // unattended work can't set up more of itself.
@@ -1144,6 +1169,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 if refused {
                     let what = match method {
                         "note.set_triggers" => "only the human allows triggers on a note",
+                        "schedule.approve" => "only the human approves an agent's proposal (an agent can only propose)",
                         m if m.starts_with("trigger.") => "only the human fires triggers from Muster or sees their secrets",
                         _ => "only the human makes and changes schedules",
                     };
@@ -1169,8 +1195,16 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     let p: P = parse(params)?;
                     Ok(crate::schedules::list(hub, p.agent.as_deref())?)
                 }
-                "schedule.create" => Ok(crate::schedules::create(hub, parse(params)?)?),
-                "schedule.update" => Ok(crate::schedules::update(hub, parse(params)?)?),
+                // Outside the owner's window a new schedule, or a change that widens one, is made
+                // but held: it runs only once the owner approves it with a click.
+                "schedule.create" => Ok(match via {
+                    Via::Window => crate::schedules::create(hub, parse(params)?)?,
+                    Via::Outside => crate::schedules::create_held(hub, parse(params)?, crate::schedules::HELD_WHY)?,
+                }),
+                "schedule.update" => Ok(match via {
+                    Via::Window => crate::schedules::update(hub, parse(params)?)?,
+                    Via::Outside => crate::schedules::update_held(hub, parse(params)?, crate::schedules::HELD_WHY)?,
+                }),
                 "schedule.remove" => Ok(crate::schedules::remove(hub, parse::<Id>(params)?.id)?),
                 "schedule.pause" | "schedule.skip" => {
                     #[derive(Deserialize)]
@@ -1183,13 +1217,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                         true
                     }
                     let p: P = parse(params)?;
+                    let outside = outside(via);
                     Ok(if method == "schedule.pause" {
-                        crate::schedules::set_paused(hub, p.id, p.on)?
+                        crate::schedules::set_paused(hub, p.id, p.on, outside)?
                     } else {
-                        crate::schedules::set_skip(hub, p.id, p.on)?
+                        crate::schedules::set_skip(hub, p.id, p.on, outside)?
                     })
                 }
-                "schedule.renew" => Ok(crate::schedules::renew(hub, parse::<Id>(params)?.id)?),
+                "schedule.renew" => Ok(crate::schedules::renew(hub, parse::<Id>(params)?.id, outside(via))?),
+                // Never here (the CLI, `/api/rpc`, a script): only a click in Muster's window
+                // approves, through `approve_from_window`.
+                "schedule.approve" => Err(RpcError(APPROVE_BY_CLICK.into())),
                 "schedule.run" => Ok(crate::schedules::run_now(hub, parse::<Id>(params)?.id)?),
                 "schedule.runs" => {
                     #[derive(Deserialize)]
@@ -1272,6 +1310,13 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                         from_session: Option<SessionId>,
                     }
                     let p: P = parse(params)?;
+                    if p.on && via == Via::Outside {
+                        return Err(RpcError(
+                            "allowing triggers on a note lets its changes start runs, so it takes a click in Muster's window \
+                             (the note's status line, or the trigger's ⋯ menu in the Agents panel). From here you can only switch them off"
+                                .into(),
+                        ));
+                    }
                     to_value(crate::notes::set_triggers(hub, p.id, p.on)?)
                 }
                 "schedule.settings.get" => {
@@ -1283,7 +1328,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     }
                     Ok(crate::schedules::settings_json(hub, &hub.schedules.settings()))
                 }
-                "schedule.settings.set" => Ok(crate::schedules::set_settings(hub, parse(params)?)?),
+                "schedule.settings.set" => Ok(crate::schedules::set_settings(hub, parse(params)?, via == Via::Window)?),
                 _ => Err(RpcError(format!("unknown method: {method}"))),
             }
         }
@@ -1293,6 +1338,134 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
     }
+}
+
+/// `muster schedule propose/remind` (`schedule.propose`, `schedule.remind`: an agent's only), and
+/// `pause` and `rm` inside an agent's session: run as that agent's MCP schedule tool, so the
+/// CLI and MCP share one set of rules. None: an ordinary schedule call (the human's, or refused).
+async fn agent_schedule_call(hub: &Arc<Hub>, method: &str, params: &Value, from: Option<SessionId>) -> Option<RpcResult> {
+    let agent_only = matches!(method, "schedule.propose" | "schedule.remind");
+    let session = match caller(hub, from) {
+        Ok(Caller::Agent(s)) => s,
+        Err(e) => return agent_only.then_some(Err(e)),
+        Ok(_) if agent_only => {
+            return Some(Err(RpcError(format!(
+                "{method} is for agents (it runs as the agent whose session calls it): make a schedule with `muster schedule add`"
+            ))));
+        }
+        Ok(_) => return None,
+    };
+    let mut args = params.clone();
+    let o = args.as_object_mut()?;
+    o.remove("from_session");
+    let tool = match method {
+        "schedule.propose" => "propose_schedule",
+        "schedule.remind" => "set_reminder",
+        // Pausing is the agent's (its own or one that runs on it); resuming stays the human's.
+        "schedule.pause" if o.get("on").is_none_or(|v| v.as_bool() == Some(true)) => {
+            let id = o.get("id").cloned().unwrap_or(Value::Null);
+            args = json!({"schedule_id": id});
+            "pause_schedule"
+        }
+        "schedule.remove" => {
+            let id = o.get("id").cloned().unwrap_or(Value::Null);
+            args = json!({"schedule_id": id});
+            "delete_schedule"
+        }
+        _ => return None,
+    };
+    Some(mcp_json(crate::mcp::call_as(hub, session, tool, args).await))
+}
+
+/// Why `schedule.approve` was refused from anything but a click in Muster's window.
+pub const APPROVE_BY_CLICK: &str = "a schedule waiting for approval (an agent's proposal, or one made or changed outside Muster's \
+     window) is approved only with a click on Approve in Muster's window (the Agents panel): not from the command line, a script \
+     or an agent, so an agent can't approve its own";
+
+/// How a WebSocket connection came in (`server::ws_upgrade`).
+#[derive(Debug, Clone, Default)]
+pub struct WsLink {
+    /// It sent one of the UI's own origins (Muster's window or the UI in a browser; a script's
+    /// WebSocket usually sends none).
+    pub ui_origin: bool,
+    /// The TCP peer and the address it connected to, to find the processes behind it.
+    pub peer: Option<std::net::SocketAddr>,
+    pub server: Option<std::net::SocketAddr>,
+}
+
+/// `Some(why)` for a call from outside the owner's window (`schedules::hold_change`).
+fn outside(via: Via) -> Option<&'static str> {
+    (via == Via::Outside).then_some(crate::schedules::HELD_WHY)
+}
+
+/// The methods that make or widen unattended work, which the WebSocket checks the window for
+/// before they run (`from_window`); `schedule.approve` has its own (`approve_from_window`).
+fn widening(method: &str) -> bool {
+    matches!(
+        method,
+        "schedule.create" | "schedule.update" | "schedule.pause" | "schedule.skip" | "schedule.renew"
+            | "schedule.settings.set" | "note.set_triggers" | "agent.update"
+    )
+}
+
+/// Is this call a click in the owner's window? Only a WebSocket that came in with the client
+/// token and an `Origin` of Muster's own UI (`server::ws_upgrade`), that has claimed a window
+/// (`window.claim`, what the desktop window and the UI in a browser do when they load), names no
+/// session (`from_session`: the CLI, or an agent), and whose program is known and runs outside
+/// every session's process tree (`server::connection_holder`: a program an agent started, one
+/// that hides what it has open, or one Muster can't look up, as on a system without `/proc`, is
+/// not the window). Err: why not, in words. With the owner's user an agent can still get round
+/// this (docs/SCHEDULING_PLAN.md "Approval and its limits").
+pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, from: Option<SessionId>) -> Result<(), String> {
+    if !matches!(who, Principal::Local) {
+        return Err("it comes from a paired device".into());
+    }
+    if from.is_some() {
+        return Err("it was made on a session's behalf (the command line or an agent)".into());
+    }
+    if !link.ui_origin || !hub.holds_window(conn) {
+        return Err("it doesn't come from a window of Muster's (a script, or a page that holds no window)".into());
+    }
+    let (Some(peer), Some(server)) = (link.peer, link.server) else {
+        return Err("Muster can't tell which program it comes from".into());
+    };
+    let roots: std::collections::HashSet<u32> = hub.sessions().iter().filter_map(|s| s.pid).collect();
+    let holder = tokio::task::spawn_blocking(move || crate::server::connection_holder(peer, server, &roots))
+        .await
+        .unwrap_or_else(|e| crate::server::Holder::Unknown(format!("the lookup failed: {e}")));
+    match holder {
+        crate::server::Holder::Outside => Ok(()),
+        crate::server::Holder::Inside(pid) => {
+            tracing::warn!("a window call refused: the connection's process {pid} runs inside a Muster session");
+            Err("this connection comes from a program started in one of Muster's sessions".into())
+        }
+        crate::server::Holder::Unknown(why) => {
+            tracing::warn!("a window call refused: its program can't be told ({why})");
+            Err(format!("Muster can't tell which program this connection comes from ({why})"))
+        }
+    }
+}
+
+/// `schedule.approve`, the owner approving an agent's proposal or a schedule made or changed
+/// outside the window: only a click in the owner's window (`from_window`), never the CLI or
+/// `/api/rpc` (`dispatch` refuses it). `seen`: the schedule's `updated_at` the owner looked at;
+/// approving refuses a schedule that changed since.
+pub async fn approve_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, params: Value) -> RpcResult {
+    require_local(who, "schedule.approve")?;
+    let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
+    from_window(hub, who, conn, link, from).await.map_err(|why| RpcError(format!("{APPROVE_BY_CLICK} ({why})")))?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct P {
+        id: i64,
+        #[serde(default)]
+        seen: Option<i64>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        from_session: Option<SessionId>,
+    }
+    let p: P = parse(params)?;
+    Ok(crate::schedules::approve(hub, p.id, p.seen)?)
 }
 
 /// Whether a connection gets `ev`: `own_device` is the paired device it belongs to, None for the
@@ -1633,7 +1806,7 @@ pub async fn http_call(hub: &Arc<Hub>, who: &Principal, body: &[u8]) -> Value {
 type Outbox = mpsc::Sender<Message>;
 
 /// One WebSocket client connection, authenticated as `who`.
-pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
+pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: WsLink) {
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
@@ -1801,7 +1974,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     let _ = out_tx.send(Message::Text(response(&req.id, Err(e)).to_string().into())).await;
                     continue;
                 }
-                handle_request(&hub, &who, conn, req, &out_tx, &resp_tx, &attachments).await;
+                handle_request(&hub, &who, conn, &link, req, &out_tx, &resp_tx, &attachments).await;
             }
             Message::Binary(data) => {
                 if device_id.is_some() && authorize(&hub, &who, "session.input", &Value::Null).is_err() {
@@ -1841,10 +2014,12 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     let _ = writer.await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     hub: &Arc<Hub>,
     who: &Principal,
     conn: u64,
+    link: &WsLink,
     req: Request,
     out: &Outbox,
     resp: &Outbox,
@@ -1968,6 +2143,28 @@ async fn handle_request(
             // Through the response queue, after the events it emits.
             let r = parse::<P>(req.params).and_then(|p| to_value(hub.claim_window(conn, p.id)?));
             let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+        }
+        // Making or widening unattended work: as asked only from a click in the owner's
+        // window (`from_window`); anywhere else it is held for one, or refused.
+        m if widening(m) => {
+            let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
+            tokio::spawn(async move {
+                let from = req.params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
+                let via = match from_window(&hub, &who, conn, &link, from).await {
+                    Ok(()) => Via::Window,
+                    Err(_) => Via::Outside,
+                };
+                let r = dispatch_via(&hub, &who, &req.method, req.params, via).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+            });
+        }
+        // Approving: only a click in a UI window (see `approve_from_window`).
+        "schedule.approve" => {
+            let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
+            tokio::spawn(async move {
+                let r = approve_from_window(&hub, &who, conn, &link, req.params).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+            });
         }
         "session.detach" => {
             let r = parse::<IdParam<SessionId>>(req.params).map(|p| {
@@ -2348,14 +2545,18 @@ mod tests {
         let mut rx = hub.subscribe();
         agent(&hub, "rpc-eve");
         assert_eq!(drain(&mut rx, "agent_upserted").len(), 1);
-        let r = call(
+        // Edit agent in the owner's window (taking scheduled work needs that click).
+        let r = dispatch_via(
             &hub,
+            &Principal::Local,
             "agent.update",
             json!({"name": "RPC-EVE", "persona": "Writes docs.", "autostart": true, "model": "opus",
                    "accepts": ["human", "schedule"],
                    "permissions": {"claude_mode": "plan", "codex_sandbox": "read_only"}}),
+            Via::Window,
         )
         .await
+        .map_err(|e| e.0)
         .unwrap();
         assert_eq!((r["autostart"].clone(), r["model"].clone()), (json!(true), json!("opus")));
         assert_eq!(r["permissions"]["claude_mode"], "plan");
@@ -2617,5 +2818,183 @@ mod tests {
         // A program the backend runs: never chosen from a paired device.
         let e = dispatch(&hub, &Principal::Device { id: 1 }, "prefs.set", json!({"shell": "sh"})).await.unwrap_err();
         assert!(e.0.contains("only available on this computer"), "{}", e.0);
+    }
+
+    #[tokio::test]
+    async fn agents_propose_from_their_session_but_only_the_human_approves() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-sam"); // Claude: takes human work only
+        crate::agents::create(&hub, NewAgent {
+            account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+        }).unwrap();
+        let sam = hub.agents().get("rpc-sam").unwrap();
+        let wk = hub.agents().get("rpc-wk").unwrap();
+        hub.agents().link_session(hub.store(), sam.id, Some(2)).unwrap();
+        hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
+        // `muster schedule remind` in an agent's session is its set_reminder (its rules, audited).
+        let e = call(&hub, "schedule.remind", json!({"prompt": "p", "in_minutes": 20, "from_session": 2})).await.unwrap_err();
+        assert!(e.contains("doesn't take scheduled work"), "{e}");
+        let r = call(&hub, "schedule.propose", json!({"prompt": "p", "cron": "0 9 * * 1-5", "reason": "weekday check", "from_session": 3})).await.unwrap();
+        let id = r["schedule_id"].as_i64().unwrap();
+        assert_eq!(r["status"], "proposed");
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["tool"] == "propose_schedule"), "audited like MCP");
+        // The human has no agent-only methods.
+        let e = call(&hub, "schedule.propose", json!({"prompt": "p", "cron": "0 9 * * *", "reason": "r"})).await.unwrap_err();
+        assert!(e.contains("is for agents"), "{e}");
+        // Approving, resuming, making or changing a schedule: never from an agent's session, nor
+        // from a shell an agent has typed into.
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
+        for from in [3, 2, 1] {
+            for (m, p) in [
+                ("schedule.approve", json!({"id": id})),
+                ("schedule.pause", json!({"id": id, "on": false})),
+                ("schedule.update", json!({"id": id, "prompt": "wider"})),
+                ("schedule.create", json!({"agent": "rpc-wk", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})),
+                ("schedule.settings.set", json!({"watch_folders": ["/tmp"]})),
+            ] {
+                let mut p = p;
+                p["from_session"] = json!(from);
+                let e = call(&hub, m, p).await.unwrap_err();
+                assert!(e.contains("can't be called from an agent's session"), "{m} from {from}: {e}");
+            }
+        }
+        assert!(hub.schedules.get(id).unwrap().waiting_approval());
+        // Pausing its own is the agent's (the MCP pause_schedule); the human approves, and only
+        // with a click in a window: never through `dispatch` (the CLI, `/api/rpc`).
+        let r = call(&hub, "schedule.pause", json!({"id": id, "from_session": 3})).await.unwrap();
+        assert_eq!(r["status"], "proposed", "still waiting, now also paused");
+        let e = call(&hub, "schedule.approve", json!({"id": id})).await.unwrap_err();
+        assert!(e.contains("only with a click on Approve"), "{e}");
+        let (window, _conn) = window_link();
+        hub.claim_window(7, None).unwrap();
+        let r = approve_from_window(&hub, &Principal::Local, 7, &window, json!({"id": id})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["status"], "paused");
+        assert!(r["made_by"]["approved_at"].is_i64());
+    }
+
+    #[tokio::test]
+    async fn approving_takes_a_click_in_a_window_never_a_script_or_an_agent() {
+        let (hub, _st) = fixture();
+        crate::agents::create(&hub, NewAgent {
+            account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+        }).unwrap();
+        let wk = hub.agents().get("rpc-wk").unwrap();
+        hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
+        let propose = || async {
+            call(&hub, "schedule.propose", json!({"prompt": "p", "cron": "0 9 * * 1-5", "reason": "r", "from_session": 3})).await.unwrap()["schedule_id"]
+                .as_i64()
+                .unwrap()
+        };
+        let id = propose().await;
+        let (ok, _conn) = window_link();
+        let refused = |r: RpcResult| {
+            let e = r.unwrap_err().0;
+            assert!(e.contains("only with a click on Approve"), "{e}");
+        };
+        // A connection that holds no window (a script's WebSocket), or one without the UI's
+        // origin, or a device: refused.
+        refused(approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id})).await);
+        hub.claim_window(21, None).unwrap();
+        let no_origin = WsLink { ui_origin: false, ..ok.clone() };
+        refused(approve_from_window(&hub, &Principal::Local, 21, &no_origin, json!({"id": id})).await);
+        assert!(approve_from_window(&hub, &Principal::Device { id: 1 }, 21, &ok, json!({"id": id})).await.is_err());
+        // Saying it comes from an agent's session, or a shell an agent drives: refused.
+        refused(approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id, "from_session": 3})).await);
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
+        refused(approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id, "from_session": 1})).await);
+        assert!(hub.schedules.get(id).unwrap().waiting_approval());
+        // A connection Muster can't attribute (no address to look up; on a system without
+        // /proc, or one not listed there): refused, never taken as the window.
+        let unknown = WsLink { ui_origin: true, peer: None, server: None };
+        let e = approve_from_window(&hub, &Principal::Local, 21, &unknown, json!({"id": id})).await.unwrap_err().0;
+        assert!(e.contains("can't tell which program"), "{e}");
+        let unlisted = WsLink { server: Some("127.0.0.1:1".parse().unwrap()), ..ok.clone() };
+        let e = approve_from_window(&hub, &Principal::Local, 21, &unlisted, json!({"id": id})).await.unwrap_err().0;
+        assert!(e.contains("can't tell which program"), "{e}");
+        // A window's page whose connection comes from a program inside a session's process tree
+        // (here: this test process is that session's process): refused. The same connection
+        // from outside every session: approved.
+        #[cfg(target_os = "linux")]
+        {
+            hub.set_pid_for_test(2, Some(std::process::id()));
+            let e = approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id})).await.unwrap_err().0;
+            assert!(e.contains("started in one of Muster's sessions"), "{e}");
+            assert!(hub.schedules.get(id).unwrap().waiting_approval());
+            hub.set_pid_for_test(2, None);
+        }
+        // What the owner looked at must still be what is approved.
+        let e = approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id, "seen": 1})).await.unwrap_err().0;
+        assert!(e.contains("changed since you looked"), "{e}");
+        let r = approve_from_window(&hub, &Principal::Local, 21, &ok, json!({"id": id})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["status"], "active");
+    }
+
+    /// A loopback connection held by this test process (outside every session): what Muster's
+    /// window looks like to `from_window`. Keep the streams alive while it is used.
+    fn window_link() -> (WsLink, (std::net::TcpStream, std::net::TcpStream, std::net::TcpListener)) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_end, _) = listener.accept().unwrap();
+        let link = WsLink { ui_origin: true, peer: Some(client.local_addr().unwrap()), server: Some(listener.local_addr().unwrap()) };
+        (link, (client, server_end, listener))
+    }
+
+    /// Where the owner's window isn't the caller (the CLI, `/api/rpc`, a script, an agent that
+    /// dropped `MUSTER_SESSION_ID`): a new schedule, or a change that widens one, is held for a
+    /// click; settings, a note's triggers and an agent's accepted work only tighten.
+    #[tokio::test]
+    async fn outside_the_window_new_work_waits_for_a_click_and_limits_only_tighten() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-sam"); // Claude: takes human work only
+        crate::agents::create(&hub, NewAgent {
+            account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+        }).unwrap();
+        let mk = json!({"agent": "rpc-wk", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}});
+        // `muster schedule add` (no session: as the owner, through `/api/rpc`): held.
+        let r = call(&hub, "schedule.create", mk.clone()).await.unwrap();
+        let id = r["id"].as_i64().unwrap();
+        assert_eq!((r["status"].as_str(), r["next_run"].as_i64()), (Some("held"), None));
+        assert!(r["held"]["why"].as_str().unwrap().contains("not from a click in Muster's window"));
+        // Pausing applies; resuming is held; neither approves it.
+        assert_eq!(call(&hub, "schedule.pause", json!({"id": id})).await.unwrap()["paused"], true);
+        assert_eq!(call(&hub, "schedule.pause", json!({"id": id, "on": false})).await.unwrap()["status"], "held");
+        assert!(call(&hub, "schedule.approve", json!({"id": id})).await.unwrap_err().contains("only with a click on Approve"));
+        // The owner's click approves it.
+        let (link, _conn) = window_link();
+        hub.claim_window(9, None).unwrap();
+        let r = approve_from_window(&hub, &Principal::Local, 9, &link, json!({"id": id})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["status"], "active");
+        // From the window itself: as asked.
+        let r = dispatch_via(&hub, &Principal::Local, "schedule.create", mk.clone(), Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["status"], "active");
+        // A widening edit from outside: held; a rename: applied.
+        assert_eq!(call(&hub, "schedule.update", json!({"id": id, "prompt": "more"})).await.unwrap()["status"], "held");
+        let other = r["id"].as_i64().unwrap();
+        assert_eq!(call(&hub, "schedule.update", json!({"id": other, "name": "n"})).await.unwrap()["status"], "active");
+        // Settings: tightening applies, loosening is refused.
+        call(&hub, "schedule.settings.set", json!({"unattended_cap": 5})).await.unwrap();
+        let e = call(&hub, "schedule.settings.set", json!({"unattended_cap": 6})).await.unwrap_err();
+        assert!(e.contains("takes a click in Muster's window"), "{e}");
+        let e = call(&hub, "schedule.settings.set", json!({"watch_folders": ["/tmp"]})).await.unwrap_err();
+        assert!(e.contains("watched folder"), "{e}");
+        // A note's triggers: off from anywhere, on only from the window.
+        let n = crate::notes::create(&hub, Some("Ideas"), "", crate::model::NoteAuthor::human(), None, None).unwrap();
+        let e = call(&hub, "note.set_triggers", json!({"id": n.id, "on": true})).await.unwrap_err();
+        assert!(e.contains("takes a click in Muster's window"), "{e}");
+        call(&hub, "note.set_triggers", json!({"id": n.id, "on": false})).await.unwrap();
+        dispatch_via(&hub, &Principal::Local, "note.set_triggers", json!({"id": n.id, "on": true}), Via::Window).await.map_err(|e| e.0).unwrap();
+        // An agent's accepted work: it can shrink from anywhere, grow only from the window.
+        let e = call(&hub, "agent.update", json!({"name": "rpc-sam", "accepts": ["human", "schedule"]})).await.unwrap_err();
+        assert!(e.contains("takes a click in Muster's window"), "{e}");
+        call(&hub, "agent.update", json!({"name": "rpc-wk", "accepts": ["human"]})).await.unwrap();
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-sam", "accepts": ["human", "schedule"]}), Via::Window)
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert!(r["accepts_origins"].as_array().unwrap().iter().any(|o| o == "schedule"));
     }
 }

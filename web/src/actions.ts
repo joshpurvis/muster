@@ -63,6 +63,7 @@ import {
   workspaceById,
   workspaces,
 } from "./state.ts";
+import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
@@ -1446,14 +1447,26 @@ export function editSchedule(id: number) {
   overlay.value = { kind: "schedule", id };
 }
 
-export function scheduleSettingsDialog() {
-  overlay.value = { kind: "schedule_settings" };
+/** `back`: the schedule dialog it was opened from, shown again (as it was) when it closes. */
+export function scheduleSettingsDialog(back?: ScheduleOverlay) {
+  overlay.value = { kind: "schedule_settings", back };
+}
+
+/** A change from this window came back held: Muster couldn't confirm the window is yours (it
+ * can't tell which program the connection comes from, or it comes from one started in a
+ * session), so it waits for a click on Approve like a change from the command line. True when
+ * it said so. */
+export function heldToast(s: Schedule): boolean {
+  if (s.status !== "held") return false;
+  toast("warn", `${s.name} waits for your approval: Muster couldn't confirm this change came from its own window. Click Approve on its card.`, 6000);
+  return true;
 }
 
 /** A `schedule.*` call that answers with the schedule: recorded at once, errors toasted. */
 function scheduleCall(method: string, params: Record<string, unknown>, what: string, done?: (s: Schedule) => void) {
   rpc.call<Schedule>(method, params).then((s) => {
     knowSchedule(s);
+    if (method !== "schedule.approve" && heldToast(s)) return;
     done?.(s);
   }).catch(fail(what)).catch(() => {});
 }
@@ -1515,6 +1528,25 @@ export function setNoteTriggers(id: number, on: boolean) {
     knowNote(n);
     toast("info", on ? `Triggers allowed on ${n.title}: its changes can now start runs` : `Triggers off for ${n.title}`, 3000);
   }).catch(fail("Couldn't change it")).catch(() => {});
+}
+
+/** Approve an agent's proposal, or a schedule made or changed outside the window: from now on
+ * it runs like any schedule. `seen`: what the card showed (one changed since is refused). */
+export function approveSchedule(s: Schedule) {
+  scheduleCall("schedule.approve", { id: s.id, seen: s.updated_at }, "Couldn't approve it", (r) => {
+    const next = r.next_run !== null ? `: next ${nextWhen(r.next_run, Date.now())}` : "";
+    toast("success", `Approved ${r.name} for ${r.agent ?? "its agent"}${next}.`, 3500);
+  });
+}
+
+/** Dismiss an agent's proposal, or a schedule made outside the window: it is removed (it never
+ * ran). */
+export function dismissProposal(s: Schedule) {
+  rpc.call("schedule.remove", { id: s.id }).then(() => {
+    schedules.value = schedules.value.filter((x) => x.id !== s.id);
+    const whose = s.made_by && s.made_by.approved_at === null ? `${s.made_by.agent}'s proposal` : "the schedule";
+    toast("info", `Dismissed ${whose} ${s.name}.`, 3000);
+  }).catch(fail("Couldn't dismiss it")).catch(() => {});
 }
 
 export function removeSchedule(s: Schedule) {

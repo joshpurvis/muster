@@ -810,6 +810,11 @@ pub fn facts_for(hub: &Hub, agent: &Agent, s: &Schedule) -> Facts {
     f
 }
 
+/// Is agent `agent_id` named in a schedule: its own, or one of a schedule's "Then…" steps?
+pub fn names_agent(hub: &Hub, agent_id: i64) -> bool {
+    hub.schedules.list().iter().any(|s| s.agent_id == agent_id || step_agents(s.then.as_ref()).contains(&agent_id))
+}
+
 /// Every agent a schedule's "Then…" steps ask.
 pub fn step_agents(then: Option<&Then>) -> Vec<i64> {
     let mut out = Vec::new();
@@ -1345,16 +1350,23 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
 /// `schedule.create` from anywhere else (the command line, `/api/rpc`, a script): made as
 /// asked but held, so it runs only once the owner approves it with a click (`Held`).
 pub fn create_held(hub: &Hub, req: ScheduleInput, why: &str) -> anyhow::Result<Value> {
-    let waiting = hub.schedules.list().iter().filter(|s| s.held.as_ref().is_some_and(|h| h.what.contains(&HeldWhat::Made))).count();
+    // Up front, so a refused one makes no note; again as it is added (`create_as`).
+    held_room(hub.schedules.inner.lock().list.values())?;
+    let now = hub.schedules.now();
+    let held = Held { what: vec![HeldWhat::Made], at: now, why: why.to_string() };
+    let s = create_as(hub, req, None, Some(held))?;
+    Ok(schedule_json(hub, &s))
+}
+
+/// Is there room for another new held schedule (`HELD_NEW_MAX`)?
+fn held_room<'a>(list: impl Iterator<Item = &'a Schedule>) -> anyhow::Result<()> {
+    let waiting = list.filter(|s| s.held.as_ref().is_some_and(|h| h.what.contains(&HeldWhat::Made))).count();
     ensure!(
         waiting < HELD_NEW_MAX,
         "{waiting} schedules made outside Muster's window already wait for your approval (at most {HELD_NEW_MAX}): \
          approve or dismiss them in the Agents panel first"
     );
-    let now = hub.schedules.now();
-    let held = Held { what: vec![HeldWhat::Made], at: now, why: why.to_string() };
-    let s = create_as(hub, req, None, Some(held))?;
-    Ok(schedule_json(hub, &s))
+    Ok(())
 }
 
 /// Make a schedule: the human's (`made_by` None), or an agent's proposal or reminder
@@ -1428,7 +1440,13 @@ pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>, 
         s.next_run = None;
     }
     {
+        // The limits again, counted with the insert under one lock: calls at once can't
+        // overshoot them.
         let mut g = hub.schedules.inner.lock();
+        ensure!(g.list.len() < MAX_SCHEDULES, "Muster already has {MAX_SCHEDULES} schedules; remove some first");
+        if s.held.as_ref().is_some_and(|h| h.what.contains(&HeldWhat::Made)) {
+            held_room(g.list.values())?;
+        }
         s.id = hub.store().insert_schedule(&s)?;
         g.list.insert(s.id, s.clone());
     }
@@ -1574,7 +1592,7 @@ fn update_as(hub: &Hub, req: ScheduleInput, outside: Option<&str>) -> anyhow::Re
         Ok(())
     })?;
     if s.held.is_some() {
-        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, true);
     }
     if s.when.is_trigger() {
         triggers::changed(hub, s.id);
@@ -1587,17 +1605,26 @@ fn update_as(hub: &Hub, req: ScheduleInput, outside: Option<&str>) -> anyhow::Re
 pub const HELD_CANCEL: &str = "it was changed outside Muster's window and waits for your approval";
 
 pub fn remove(hub: &Hub, id: i64) -> anyhow::Result<Value> {
-    let s = {
+    remove_if(hub, id, |_| Some(()))?.with_context(|| format!("no schedule {id}"))?;
+    Ok(json!({ "removed": id }))
+}
+
+/// Remove schedule `id` only if `still` says so of it as it is now, decided and removed under one
+/// lock (the tidying: an approval just before must keep it). `Some(what still said)`: removed;
+/// None: kept, or already gone.
+pub(crate) fn remove_if<T>(hub: &Hub, id: i64, still: impl FnOnce(&Schedule) -> Option<T>) -> anyhow::Result<Option<T>> {
+    let (s, said) = {
         let mut g = hub.schedules.inner.lock();
-        let s = g.list.get(&id).cloned().with_context(|| format!("no schedule {id}"))?;
+        let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
+        let Some(said) = still(&s) else { return Ok(None) };
         hub.store().delete_schedule(id)?;
         g.list.remove(&id);
-        s
+        (s, said)
     };
     hub.emit(ServerEvent::ScheduleRemoved { id, agent_id: s.agent_id });
     hub.triggers.forget(id);
     run::cancel_unsent(hub, Some(id), "its schedule was removed", true);
-    Ok(json!({ "removed": id }))
+    Ok(Some(said))
 }
 
 /// An agent was removed: so are its schedules.
@@ -1633,7 +1660,7 @@ pub fn set_paused(hub: &Hub, id: i64, paused: bool, outside: Option<&str>) -> an
     if paused {
         run::cancel_unsent(hub, Some(id), plan::PAUSED, false);
     } else if outside.is_some() && s.held.is_some() {
-        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, true);
     }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
@@ -1721,7 +1748,7 @@ pub fn renew(hub: &Hub, id: i64, outside: Option<&str>) -> anyhow::Result<Value>
             hold_change(s, HeldWhat::Renewed, why, now);
             Ok(())
         })?;
-        run::cancel_unsent(hub, Some(id), HELD_CANCEL, false);
+        run::cancel_unsent(hub, Some(id), HELD_CANCEL, true);
         publish(hub, &s);
         return Ok(schedule_json(hub, &s));
     }
@@ -2023,6 +2050,10 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
     }
     let Some(s) = hub.schedules.get(r.schedule_id) else { return deny("its schedule was removed") };
     let Some(agent) = hub.agents().by_id(s.agent_id) else { return deny("its agent was removed") };
+    // Held: no prompt of it goes, Run now's and steps' included.
+    if s.waiting_approval() {
+        return deny(plan::WAITING);
+    }
     if r.kind != RunKind::Manual {
         let settings = hub.schedules.settings();
         // A step is part of its run: the schedule's daily cap and floor were its run's.

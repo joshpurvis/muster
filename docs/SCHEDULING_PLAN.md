@@ -140,15 +140,21 @@ everything that makes or widens unattended work: making a schedule, an edit that
 prompt, timing, time zone, "Then…" steps, reply note, missed-run rule, conversation, quiet hours
 off, a higher or no daily cap), resuming one, undoing Skip next, renewing one, settings that
 loosen a limit (resuming all, moving quiet hours, a higher unattended or spend cap, clearing an
-agent's spend cap, another watched folder), allowing triggers on a note, and letting an agent
-take scheduled or triggered work. Done anywhere but a click in Muster's window, a schedule change
+agent's spend cap, another watched folder), allowing triggers on a note, letting an agent
+take scheduled or triggered work, and changing the provider of a Claude agent that takes such work
+or is named in a schedule (fix round 3: leaving the subscription drops its schedules' 7-day expiry,
+so an expired one would run again; joining it puts that work on the subscription). Done anywhere but a click in Muster's window, a schedule change
 is made but **held**: the schedule keeps no time to run and shows as a card in the Agents panel,
 "Made from the command line or a script" (or "Resumed …", "Changed …"), with its prompt, timing,
-agent and use, and Approve, Edit and Dismiss (Remove for a held change of one of yours), exactly
+agent, every "Then…" step (nested ones too, with their agents and prompts: fix round 3) and use,
+and Approve, Edit and Dismiss (Remove for a held change of one of yours), exactly
 like an agent's proposal. `muster schedule add` therefore prints the schedule and "Waiting for
 your approval: … click Approve on its card in Muster's Agents panel". At most 10 new held
-schedules wait at once, and one nobody approves goes after 7 days. The settings, a note's
-triggers and an agent's accepted work aren't held: from outside the window they are refused, with
+schedules wait at once (counted under the lock that adds one), and one nobody approves goes after
+7 days (decided again as it is removed, so one approved at that moment stays). Nothing of a held
+schedule runs: a Run now or a "Then…" step already waiting in line is skipped, and its prompt in an
+agent's queue is taken back (fix round 3). The settings, a note's triggers and an agent's accepted
+work and provider aren't held: from outside the window they are refused, with
 where to do it instead. Narrowing applies directly from anywhere: pausing, removing, a rename,
 alerts, quiet hours on, a lower cap, fewer watched folders. Approving takes what the owner looked
 at: the UI sends the schedule's `updated_at`, and a schedule changed since is refused, to look at
@@ -160,10 +166,15 @@ client token and an `Origin` of Muster's own UI, that has claimed a window (`win
 the desktop window and the UI in a browser do when they load), that names no session
 (`from_session`), and whose program is known and runs outside every session. The program is found
 from the socket: its inode and owner in `/proc/net/tcp`, then every process holding it
-(`/proc/<pid>/fd`). A process of the owner's whose descriptors can't be read (one that turned off
-`PR_SET_DUMPABLE`, as ssh-agent does and an agent's program could) may be the holder, so it is
-judged too, by its parents (`/proc/<pid>/stat` stays readable): if any of them descends from a
-session's process, the call isn't the window's. When the program can't be told at all (no
+(`/proc/<pid>/fd`). The processes seen holding it decide. When none is seen, a process of the
+owner's whose descriptors can't be read (one that turned off `PR_SET_DUMPABLE`, as ssh-agent does
+and an agent's program could) may be the holder, so those are judged instead, by their parents
+(`/proc/<pid>/stat` stays readable): if any of them descends from a session's process, the call
+isn't the window's. A hidden program that doesn't hold the connection never decides for one a
+process is seen holding, so an agent running such a program in its tab can't block the owner's
+clicks (fix round 3). The cost: a hidden program in a session that hands its socket to a program
+outside every session (descriptor passing) would pass as that program, which needs a program
+outside the session, as below. When the program can't be told at all (no
 `/proc`, as on macOS; the connection not listed; nothing found holding it; a lookup error), the
 call isn't the window's either: it is held or refused, never trusted. The UI says so when that
 happens to a change made in the window ("Muster couldn't confirm this change came from its own

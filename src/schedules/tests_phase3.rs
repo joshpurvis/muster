@@ -87,7 +87,7 @@ fn approving_checks_the_proposal_again() {
     assert_eq!(j["expires_at"], Value::Null, "the 7 days start at approval");
     assert!(j["estimate"]["text"].as_str().unwrap().contains("Claude subscription"), "{}", j["estimate"]["text"]);
     let edit: crate::agents::AgentUpdate = serde_json::from_value(json!({"name": "cleo", "accepts": ["human"]})).unwrap();
-    crate::agents::update(&f.hub, edit).unwrap();
+    crate::agents::update(&f.hub, edit, false).unwrap();
     assert!(approve(&f.hub, id, None).unwrap_err().to_string().contains("doesn't take scheduled work"));
 }
 
@@ -934,4 +934,155 @@ fn a_reminder_being_claimed_is_never_missed_by_the_limits() {
         });
         assert_eq!(admitted, 0, "a fourth reminder slipped in while the others were claimed");
     }
+}
+
+// ----- fix round 3 -----
+
+fn edit_agent(f: &Fixture, v: Value, outside: bool) -> Result<crate::agents::Agent, String> {
+    crate::agents::update(&f.hub, serde_json::from_value(v).unwrap(), outside).map_err(|e| format!("{e:#}"))
+}
+
+#[test]
+fn outside_the_window_an_agents_provider_stays_while_it_takes_unattended_work() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+    // orla (OpenRouter, takes scheduled work): moving it onto the subscription from outside is
+    // refused; from the window it applies.
+    let e = edit_agent(&f, json!({"name": "orla", "provider": "subscription"}), true).unwrap_err();
+    assert!(e.contains("changing the provider of orla") && e.contains("Muster's window"), "{e}");
+    assert_eq!(f.hub.agents().get("orla").unwrap().provider, crate::openrouter::Provider::OpenRouter);
+    // Named in a schedule (a "Then…" step) but taking no unattended work itself: still refused.
+    let orla = f.hub.agents().get("orla").unwrap().id;
+    let s = f.create(json!({"agent": "worker", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"},
+        "then": {"on_success": {"agent": "orla", "prompt": "q"}}})).unwrap();
+    edit_agent(&f, json!({"name": "orla", "accepts": ["human"]}), true).unwrap();
+    assert!(names_agent(&f.hub, orla));
+    assert!(edit_agent(&f, json!({"name": "orla", "provider": "subscription"}), true).is_err());
+    remove(&f.hub, s.id).unwrap();
+    // Neither: it applies from anywhere, as do changes that don't widen (autostart, accepted
+    // work shrinking).
+    edit_agent(&f, json!({"name": "orla", "provider": "subscription"}), true).unwrap();
+    edit_agent(&f, json!({"name": "cleo", "autostart": true}), true).unwrap();
+    // Taking scheduled work: only from the window.
+    let e = edit_agent(&f, json!({"name": "ada", "accepts": ["human", "webhook"]}), true).unwrap_err();
+    assert!(e.contains("letting ada take scheduled or triggered work"), "{e}");
+    edit_agent(&f, json!({"name": "ada", "accepts": ["human", "webhook"]}), false).unwrap();
+}
+
+#[test]
+fn an_older_edit_never_puts_back_scheduled_work_the_owner_took_away() {
+    // A script's edits (autostart) race the owner unticking Schedule in the window: whichever
+    // order they land in, cleo ends up not taking scheduled work.
+    for _ in 0..20 {
+        let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+        std::thread::scope(|sc| {
+            let script = sc.spawn(|| {
+                for i in 0..50 {
+                    edit_agent(&f, json!({"name": "cleo", "autostart": i % 2 == 0}), true).unwrap();
+                }
+            });
+            edit_agent(&f, json!({"name": "cleo", "accepts": ["human"]}), false).unwrap();
+            script.join().unwrap();
+        });
+        assert_eq!(f.hub.agents().get("cleo").unwrap().accepts_origins, vec![Origin::Human]);
+    }
+}
+
+#[test]
+fn a_run_now_of_a_schedule_held_meanwhile_never_goes_out() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+    let s = f.create(json!({"agent": "worker", "prompt": "approved prompt", "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap();
+    // A Run now's prompt waits in the agent's prompt queue.
+    let worker = f.hub.agents().get("worker").unwrap();
+    let route = crate::agents::Route { origin: Origin::Schedule, hop: 0, reply_to: None };
+    let msg = f.hub.store().insert_agent_message(&crate::agents::message_record(&worker, &s.sender(), None, route, "approved prompt")).unwrap();
+    let mut r = Run::new(s.id, 1, RunKind::Manual, 1);
+    r.msg_id = Some(msg);
+    r.id = f.hub.store().insert_run(&r).unwrap();
+    let source = crate::agents::Source::Chain(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) });
+    assert!(submit_gate(&f.hub, &source, false).is_none(), "approved: it may go");
+    // Its prompt is changed from the command line: held, and the queued prompt no longer goes.
+    update_held(&f.hub, serde_json::from_value(json!({"id": s.id, "prompt": "something else"})).unwrap(), WHY).unwrap();
+    assert!(matches!(submit_gate(&f.hub, &source, false), Some(Action::Skip(w)) if w == plan::WAITING));
+}
+
+#[tokio::test]
+async fn a_run_waiting_in_line_for_a_held_schedule_is_skipped() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+    let s = f.create(json!({"agent": "worker", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap();
+    let mut r = Run::new(s.id, 1, RunKind::Manual, f.hub.schedules.now());
+    r.id = f.hub.store().insert_run(&r).unwrap();
+    update_held(&f.hub, serde_json::from_value(json!({"id": s.id, "prompt": "held"})).unwrap(), WHY).unwrap();
+    run::spawn_execute(f.hub.clone(), r.clone());
+    let mut done = None;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        let now = f.hub.store().run(r.id).unwrap().unwrap();
+        if now.outcome != Outcome::Pending {
+            done = Some(now);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let done = done.expect("the run ended");
+    assert_eq!((done.outcome, done.reason.as_deref()), (Outcome::Skipped, Some(plan::WAITING)));
+    assert!(done.msg_id.is_none(), "nothing was sent");
+}
+
+#[test]
+fn a_span_marked_unattended_while_it_is_settled_stays_marked() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 77);
+    // A turn starts as the human's; while its agent is looked up, it is seen to be a schedule's
+    // and ends.
+    let start = now_ms() - 1_000;
+    f.hub.triggers.observe(77, true, start, false);
+    let hub = f.hub.clone();
+    f.hub.triggers.settle_around_for_test(&f.hub, || hub.triggers.observe(77, false, now_ms(), true));
+    let spans = f.hub.triggers.spans_for_test();
+    assert!(spans[0].unattended && spans[0].end.is_some(), "{spans:?}");
+    assert_eq!(spans[0].agent, Some(f.hub.agents().get("worker").unwrap().id));
+}
+
+#[test]
+fn held_schedules_made_at_once_never_pass_the_limit() {
+    for _ in 0..10 {
+        let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
+        for i in 0..HELD_NEW_MAX - 1 {
+            create_held(&f.hub, serde_json::from_value(json!({"agent": "worker", "prompt": format!("p{i}"), "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap(), WHY).unwrap();
+        }
+        let made: usize = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..8)
+                .map(|i| {
+                    let f = &f;
+                    sc.spawn(move || {
+                        let v = json!({"agent": "worker", "prompt": format!("q{i}"), "when": {"kind": "cron", "cron": "0 9 * * *"}});
+                        usize::from(create_held(&f.hub, serde_json::from_value(v).unwrap(), WHY).is_ok())
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(made, 1, "only one more fits");
+        assert_eq!(f.hub.schedules.list().len(), HELD_NEW_MAX);
+    }
+}
+
+#[test]
+fn the_tidying_keeps_a_schedule_approved_as_it_goes() {
+    let t0 = at(LONDON, "2026-10-19T08:00");
+    let f = Fixture::new(t0);
+    let j = create_held(&f.hub, serde_json::from_value(json!({"agent": "worker", "prompt": "p", "tz": LONDON, "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap(), WHY).unwrap();
+    let id = j["id"].as_i64().unwrap();
+    let late = t0 + HELD_KEEP_MS;
+    // The tidying decided to remove it from its list; the owner approves it before the removal:
+    // decided again under the lock, it stays.
+    approve(&f.hub, id, None).unwrap();
+    let kept = remove_if(&f.hub, id, |cur| {
+        (cur.held.as_ref().is_some_and(|h| late - h.at >= HELD_KEEP_MS)).then_some(())
+    })
+    .unwrap();
+    assert!(kept.is_none() && f.hub.schedules.get(id).is_some());
+    f.set(late);
+    agent::tidy(&f.hub, late);
+    assert!(f.hub.schedules.get(id).is_some(), "approved: not tidied");
 }

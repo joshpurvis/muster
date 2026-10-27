@@ -48,8 +48,9 @@ import {
   promptIsLong,
   readingWithZone,
   waitingProposals,
+  thenSteps,
 } from "./schedules.ts";
-import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
+import type { Agent, Schedule, ScheduleRun, Then, WhenInput } from "./types.ts";
 
 function eq<T>(a: T, b: T, msg = "") {
   const x = JSON.stringify(a), y = JSON.stringify(b);
@@ -539,4 +540,20 @@ Deno.test("a schedule made or changed outside the window waits like a proposal, 
   eq(waitingNotice([p, made, changed]), "3 schedules wait for your approval (1 proposed by agents, 2 from the command line)");
   eq(waitingProposals([changed, sched({ id: 1 }), made, p]).map((s) => s.id), [7, 9, 10], "oldest first");
   eq(isHeld(sched({})), false);
+});
+
+Deno.test("the approval card lists every \"Then…\" step, nested ones included", () => {
+  const step = (agent: string, prompt: string, then: Then | null = null) => ({ notify: false, agent, agent_id: 1, prompt, then });
+  const t: Then = {
+    on_success: step("reviewer", "Check {reply}", { on_success: step("deployer", "Ship it", null), on_failure: { notify: true, agent: null, agent_id: null, prompt: "", then: null } }),
+    on_failure: step("fixer", "Fix it"),
+  };
+  eq(thenSteps(t), [
+    { depth: 0, when: "When it replies", agent: "reviewer", prompt: "Check {reply}" },
+    { depth: 1, when: "When that step replies", agent: "deployer", prompt: "Ship it" },
+    { depth: 1, when: "If that step fails", agent: null, prompt: "" },
+    { depth: 0, when: "If it fails", agent: "fixer", prompt: "Fix it" },
+  ]);
+  eq(thenSteps(null), []);
+  eq(thenSteps({ on_success: { ...step("x", "p"), agent: null }, on_failure: null })[0].agent, "(a removed agent)");
 });

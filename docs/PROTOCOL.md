@@ -164,7 +164,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
 | `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -703,27 +703,30 @@ type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */;
 **Held** (fix round 2). A click in Muster's window is a call over a WebSocket that came in with the
 client token and an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`,
 `wry://`), that holds a window (`window.claim`), names no `from_session`, and whose program is
-known and outside every session: the socket's holders found in `/proc` (a process of the owner's
-whose descriptors can't be read counts as a possible holder, judged by its parents), none of them
-descended from a session's process. A program that can't be told (no `/proc`, as on macOS; the
+known and outside every session: the socket's holders found in `/proc`, none of them descended
+from a session's process. Only the processes seen holding the socket decide; when none is seen, the
+owner's processes whose descriptors can't be read count as possible holders, judged by their
+parents (fix round 3: a hidden program that doesn't hold the connection no longer decides for one
+a process is seen holding). A program that can't be told (no `/proc`, as on macOS; the
 connection not listed; no holder found; a lookup error) is not the window. Anything else is
 outside the window, and there:
 
 | Call | From outside the window |
 |---|---|
-| `schedule.create` | Made, but held: `status: "held"`, `held.what: ["made"]`, no `next_run`. At most 10 new held schedules wait at once; one nobody approves is removed after 7 days. |
-| `schedule.update` | A change that only narrows (name, notify, quiet hours on, a lower or new daily cap, pausing) applies; any other (prompt, timing, time zone, steps, note, missed rule, conversation, quiet hours off, a higher or no cap) is made but held (`changed`), and its prompts still in an agent's queue are taken back. |
+| `schedule.create` | Made, but held: `status: "held"`, `held.what: ["made"]`, no `next_run`. At most 10 new held schedules wait at once (counted with the insert, so calls at once can't pass it); one nobody approves is removed after 7 days (decided again as it is removed: one approved meanwhile stays). |
+| `schedule.update` | A change that only narrows (name, notify, quiet hours on, a lower or new daily cap, pausing) applies; any other (prompt, timing, time zone, steps, note, missed rule, conversation, quiet hours off, a higher or no cap) is made but held (`changed`), and its prompts still in an agent's queue are taken back, Run now's included. |
 | `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
 | `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
 | `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Adding `schedule` or `webhook` to `accepts` refused; anything else applies. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
-or fired) until `schedule.approve`. Edits from the window keep it held; `schedule.remove` drops it.
-`schedule.run` and `trigger.fire` stay as they were: they run work already approved, once, under
-the agent's caps.
+or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
+sent and its prompt isn't submitted) until `schedule.approve`. Edits from the window keep it held; `schedule.remove` drops it.
+`schedule.run` and `trigger.fire` stay as they were for an approved schedule: they run work already
+approved, once, under the agent's caps.
 
 A proposal is stored like any schedule with `made_by` and no `next_run`; every write to it keeps
 `next_run` empty while it waits (the human may edit it before approving), and the scheduler,

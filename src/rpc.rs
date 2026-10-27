@@ -1023,20 +1023,10 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
         "agent.update" => {
             require_local(who, method)?;
             let p: crate::agents::AgentUpdate = parse(params)?;
-            // Letting an agent take scheduled or triggered work starts its schedules again:
-            // only with a click in the owner's window.
-            if via == Via::Outside
-                && let Some(a) = &p.accepts
-                && let Some(cur) = hub.agents().get(&p.name)
-                && a.iter().any(|o| matches!(o, crate::agents::Origin::Schedule | crate::agents::Origin::Webhook) && !cur.accepts_origins.contains(o))
-            {
-                return Err(RpcError(format!(
-                    "letting {} take scheduled or triggered work takes a click in Muster's window: tick it under \
-                     \"Takes messages started by\" in Edit agent (Agents panel). From here an agent's accepted work can only shrink",
-                    cur.name
-                )));
-            }
-            let b = crate::agents::update(hub, p)?;
+            // Letting an agent take scheduled or triggered work, or moving one that does to or
+            // from the subscription, only with a click in the owner's window: checked with the
+            // record it changes, under one lock (`agents::widens_unattended`).
+            let b = crate::agents::update(hub, p, via == Via::Outside)?;
             Ok(crate::agents::agent_json(&b, b.session_id.and_then(|s| hub.session(s)).as_ref()))
         }
         "agent.list" => {

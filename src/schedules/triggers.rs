@@ -233,8 +233,25 @@ impl Watchers {
     /// boundary, unix ms); past `SPANS_MAX` the oldest go. Lookups run without the lock held
     /// (they take other locks).
     fn settled(&self, hub: &Hub, now: i64, keep_from: Option<i64>) -> (Vec<Span>, i64) {
+        let updates = self.lookups(hub);
+        let mut g = self.activity.lock();
+        apply_lookups(&mut g, updates);
+        let keep = keep_from.map_or(now - SPAN_KEEP_MS, |k| k.min(now - SPAN_KEEP_MS));
+        let (kept, dropped): (Vec<Span>, Vec<Span>) = std::mem::take(&mut g.spans).into_iter().partition(|s| s.end.is_none_or(|e| e >= keep));
+        g.spans = kept;
+        let over = g.spans.len().saturating_sub(SPANS_MAX);
+        let dropped: Vec<Span> = dropped.into_iter().chain(g.spans.drain(..over)).collect();
+        for s in &dropped {
+            g.forget(s, now);
+        }
+        (g.spans.clone(), g.complete_since)
+    }
+
+    /// Each span's agent and unattended mark as looked up now (`settled`), read from a copy
+    /// with the lock released: `observe` may change the spans meanwhile.
+    fn lookups(&self, hub: &Hub) -> Vec<(SessionId, i64, Option<i64>, bool)> {
         let snapshot = self.activity.lock().spans.clone();
-        let mut updates: Vec<(SessionId, i64, Option<i64>, bool)> = Vec::new();
+        let mut updates = Vec::new();
         for (i, s) in snapshot.iter().enumerate() {
             let later = snapshot[i + 1..].iter().any(|x| x.session == s.session);
             let agent = s.agent.or_else(|| hub.agents().by_session(s.session).map(|a| a.id));
@@ -245,23 +262,7 @@ impl Watchers {
                 updates.push((s.session, s.start, agent, unattended));
             }
         }
-        let mut g = self.activity.lock();
-        for (session, start, agent, unattended) in updates {
-            if let Some(x) = g.spans.iter_mut().find(|x| x.session == session && x.start == start) {
-                x.agent = agent;
-                x.unattended = unattended;
-                g.dirty = true;
-            }
-        }
-        let keep = keep_from.map_or(now - SPAN_KEEP_MS, |k| k.min(now - SPAN_KEEP_MS));
-        let (kept, dropped): (Vec<Span>, Vec<Span>) = std::mem::take(&mut g.spans).into_iter().partition(|s| s.end.is_none_or(|e| e >= keep));
-        g.spans = kept;
-        let over = g.spans.len().saturating_sub(SPANS_MAX);
-        let dropped: Vec<Span> = dropped.into_iter().chain(g.spans.drain(..over)).collect();
-        for s in &dropped {
-            g.forget(s, now);
-        }
-        (g.spans.clone(), g.complete_since)
+        updates
     }
 
     /// Save the spans if they changed since the last save.
@@ -291,9 +292,30 @@ impl Watchers {
         self.activity.lock().spans.clone()
     }
 
+    /// `settled` in its two halves, with `between` run after the lookups and before they apply.
+    #[cfg(test)]
+    pub(super) fn settle_around_for_test(&self, hub: &Hub, between: impl FnOnce()) {
+        let updates = self.lookups(hub);
+        between();
+        apply_lookups(&mut self.activity.lock(), updates);
+    }
+
     #[cfg(test)]
     pub(super) fn settled_for_test(&self, hub: &Hub, now: i64, keep_from: Option<i64>) -> (Vec<Span>, i64) {
         self.settled(hub, now, keep_from)
+    }
+}
+
+/// Apply `Watchers::lookups` to the spans as they are now. Only ever adds: an agent found, a
+/// span found unattended. `observe` may have marked a span unattended since the lookup read it
+/// as not; that mark stays.
+fn apply_lookups(g: &mut Activity, updates: Vec<(SessionId, i64, Option<i64>, bool)>) {
+    for (session, start, agent, unattended) in updates {
+        if let Some(x) = g.spans.iter_mut().find(|x| x.session == session && x.start == start) {
+            x.agent = x.agent.or(agent);
+            x.unattended |= unattended;
+            g.dirty = true;
+        }
     }
 }
 

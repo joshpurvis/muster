@@ -78,6 +78,7 @@ import {
   readingWithZone,
   FILES_DEPTH,
   waitingProposals,
+  thenSteps,
 } from "../schedules.ts";
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
@@ -239,12 +240,15 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
   const sub = s.estimate?.billing === "claude_subscription";
   const facts = proposalFacts(s, browserZone());
   const when = facts[0].value;
-  const long = promptIsLong(s.prompt);
+  const steps = thenSteps(s.then);
+  /** "Show all" unfolds the steps' prompts too. */
+  const long = promptIsLong(s.prompt) || steps.some((st) => promptIsLong(st.prompt));
   /** A long prompt shows its start; "Show all" (or the keyboard, in the focusable box) the rest. */
   const [whole, setWhole] = useState(false);
   const promptId = useId();
   const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
-  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}. Waiting for your approval.`;
+  const more = steps.length ? ` Then ${steps.length} more ${steps.length === 1 ? "step" : "steps"}.` : "";
+  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}.${more} Waiting for your approval.`;
   return (
     <div
       role="listitem"
@@ -302,11 +306,41 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
                 aria-expanded={whole}
                 onClick={() => setWhole(!whole)}
               >
-                {whole ? "Show less" : `Show all (${s.prompt.split("\n").length} lines)`}
+                {whole
+                  ? "Show less"
+                  : promptIsLong(s.prompt)
+                  ? `Show all (${s.prompt.split("\n").length} lines${steps.length ? ", and the steps'" : ""})`
+                  : "Show all of the steps' prompts"}
               </button>
             )}
           </dd>
         </div>
+        {steps.length > 0 && (
+          <div class="sch-prop-fact sch-prop-fact-block">
+            <dt>Then</dt>
+            <dd>
+              {/* Every step, nested ones indented under the step they follow: approving lets all of them run. */}
+              <ol class="sch-prop-steps">
+                {steps.map((st, i) => (
+                  <li key={i} class="sch-prop-step" style={{ marginLeft: `${st.depth * 14}px` }}>
+                    <span class="sch-prop-step-when">{st.when}:</span>{" "}
+                    {st.agent === null ? "notify you" : <>ask <b>{st.agent}</b></>}
+                    {st.agent !== null && (
+                      <pre
+                        class={cx("sch-prop-prompt", "sch-prop-step-prompt", whole && "whole")}
+                        tabIndex={0}
+                        role="region"
+                        aria-label={`What it asks ${st.agent}`}
+                      >
+                        {st.prompt}
+                      </pre>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            </dd>
+          </div>
+        )}
         {m?.reason && (
           <div class="sch-prop-fact">
             <dt>Why</dt> <dd class="sch-prop-reason" data-tip={`${m.agent}'s own words`}>{m.reason}</dd>

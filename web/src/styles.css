@@ -5331,6 +5331,25 @@ fieldset.sch-then > legend {
   overflow-wrap: anywhere;
 }
 
+/* The "Then…" steps: each with what starts it and its agent, its prompt under it; a nested
+   step is indented under the step it follows. */
+.sch-prop-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sch-prop-step-when {
+  color: var(--text-muted);
+}
+
+.sch-prop-step-prompt {
+  margin-top: 2px;
+}
+
 /* "Show all": the whole prompt, so it can be read in full before approving. */
 .sch-prop-prompt.whole {
   max-height: none;

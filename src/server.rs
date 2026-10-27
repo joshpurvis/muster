@@ -650,8 +650,9 @@ pub fn socket_owner(peer: SocketAddr, server: SocketAddr) -> Option<u32> {
 /// program an agent started goes (`rpc::from_window`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
-    /// Every process that holds the connection, or might (one of the owner's processes that
-    /// hides its descriptors), was looked at, and none descends from a session's process.
+    /// Every process seen holding the connection (or, when none is seen, every one of the
+    /// owner's processes that hides its descriptors and so might) was looked at, and none
+    /// descends from a session's process.
     Outside,
     /// This process holds it, or might, and descends from a session's process.
     Inside(u32),
@@ -662,11 +663,13 @@ pub enum Holder {
 
 /// Who holds the client end (`peer`) of an established loopback connection to `server`: the
 /// socket's inode and owner from /proc/net/tcp and tcp6 (the whole 4-tuple must match), then
-/// every process with a descriptor on it (`/proc/<pid>/fd`). A process of the socket's owner
-/// whose descriptors can't be read (it turned off `PR_SET_DUMPABLE`, as ssh-agent does, or an
-/// agent's program could) might be the one: it counts as a holder too, judged by its parents
-/// (`/proc/<pid>/stat` stays readable). Inside when any of them descends from one of `roots`
-/// (the sessions' processes); Unknown when anything can't be read or nothing holds it.
+/// every process with a descriptor on it (`/proc/<pid>/fd`). When no process is seen holding
+/// it, a process of the socket's owner whose descriptors can't be read (it turned off
+/// `PR_SET_DUMPABLE`, as ssh-agent does, or an agent's program could) might be the one: those
+/// count as the holders then, judged by their parents (`/proc/<pid>/stat` stays readable). When
+/// a holder is seen, only the holders seen decide: a hidden program elsewhere can't make the
+/// window's connection look like an agent's. Inside when any holder descends from one of
+/// `roots` (the sessions' processes); Unknown when anything can't be read or nothing holds it.
 pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>) -> Holder {
     const ESTABLISHED: &str = "01";
     let unknown = |why: &str| Holder::Unknown(why.to_string());
@@ -733,10 +736,14 @@ pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::coll
             Err(_) => hides(&mut hidden),
         }
     }
-    if holders.is_empty() && hidden.is_empty() {
+    // The processes seen holding it decide. Only when none is seen do the ones that might hold
+    // it (hidden) decide: one of them is the holder. An unrelated program that hides its
+    // descriptors, in a session or not, never decides for a connection someone visibly holds.
+    let judged = if holders.is_empty() { &hidden } else { &holders };
+    if judged.is_empty() {
         return unknown("no process holds the connection");
     }
-    for pid in holders.iter().chain(hidden.iter()) {
+    for pid in judged {
         match descent(*pid, roots) {
             Some(true) => return Holder::Inside(*pid),
             Some(false) => {}
@@ -1128,6 +1135,31 @@ mod tests {
         // descriptors can't be read.
         assert_eq!(connection_holder(peer, server, &[child.id()].into_iter().collect()), Holder::Inside(child.id()));
         assert_eq!(connection_holder(peer, server, &[me].into_iter().collect()), Holder::Inside(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A program that hides its descriptors but doesn't hold the connection (one an agent runs
+    /// in its tab) doesn't decide for a connection a process is seen holding: the window's
+    /// clicks still count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unrelated_hidden_program_doesnt_decide_for_a_seen_holder() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = l.local_addr().unwrap();
+        let _c = std::net::TcpStream::connect(server).unwrap();
+        let (_srv, peer) = l.accept().unwrap();
+        let code = "import ctypes,time\nctypes.CDLL(None).prctl(4,0,0,0,0)\nprint('ready',flush=True)\ntime.sleep(10)";
+        let Ok(mut child) = std::process::Command::new("python3").args(["-I", "-c", code]).stdout(std::process::Stdio::piped()).spawn() else {
+            eprintln!("no python3: skipped");
+            return;
+        };
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        assert!(std::fs::read_dir(format!("/proc/{}/fd", child.id())).is_err(), "its descriptors are hidden");
+        // The hidden child as a session's process: this process holds the connection and isn't
+        // a session's, so it is outside.
+        assert_eq!(connection_holder(peer, server, &[child.id()].into_iter().collect()), Holder::Outside);
         let _ = child.kill();
         let _ = child.wait();
     }

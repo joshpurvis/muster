@@ -30,7 +30,7 @@ pub const JUMP_MS: i64 = 2 * MINUTE_MS;
 
 pub const PAUSED: &str = "paused";
 pub const PAUSED_ALL: &str = "all schedules paused";
-pub const WAITING: &str = "an agent's proposal that you haven't approved";
+pub const WAITING: &str = "it waits for your approval (an agent's proposal, or made or changed outside Muster's window)";
 
 /// What the rules need to know about a schedule's agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

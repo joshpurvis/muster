@@ -387,6 +387,11 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         {
             return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
         }
+        // Held (or a proposal): nothing of it runs before the owner's click, Run now and a
+        // "Then…" step included (they read the prompt as it is now, maybe the held change's).
+        if s.waiting_approval() {
+            return finish(hub, &s, &mut run, Outcome::Skipped, Some(plan::WAITING.into()));
+        }
         if run.kind != RunKind::Manual {
             let settings = sched.settings();
             // A step belongs to its run: the schedule's daily cap and floor were the run's.
@@ -720,7 +725,8 @@ pub(super) fn run_for_msg(hub: &Hub, msg: i64, from: &str) -> Option<Run> {
 
 /// Take back the prompts of pending runs (of `schedule`, else of every schedule) that are still
 /// waiting in an agent's prompt queue, unsubmitted: paused, removed or expired, they mustn't go
-/// out later. Run now's prompts are the human's and stay, unless the schedule is removed.
+/// out later. Run now's prompts are the human's and stay (`manual_too` false), unless the
+/// schedule is removed or held for the owner's click.
 pub(super) fn cancel_unsent(hub: &Hub, schedule: Option<i64>, why: &str, manual_too: bool) {
     let Ok(pending) = hub.store().pending_runs() else { return };
     for r in pending {

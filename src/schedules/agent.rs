@@ -531,37 +531,38 @@ pub fn estimate(hub: &Hub, agent: &Agent, s: &Schedule, now: i64) -> Value {
 
 /// The scheduler's tidying (`run::tick`): proposals nobody approved within 7 days go, and so do
 /// schedules made outside Muster's window that nobody approved within 7 days (`Held`), and
-/// reminders a day after they ran.
+/// reminders a day after they ran. Each is decided again as it is removed, under the schedules'
+/// lock (`remove_if`): one approved meanwhile stays.
 pub fn tidy(hub: &Hub, now: i64) {
     for s in hub.schedules.list() {
-        if s.made_by.is_none()
-            && let Some(h) = &s.held
-            && h.what.contains(&super::HeldWhat::Made)
-            && now - h.at >= super::HELD_KEEP_MS
-        {
-            hub.notice("info", format!("The schedule \"{}\", made outside Muster's window, waited 7 days without approval and was removed.", s.name));
-            if let Err(e) = super::remove(hub, s.id) {
-                tracing::warn!(schedule = s.id, "tidying a held schedule: {e:#}");
-            }
+        if stale(hub, &s, now).is_none() {
             continue;
         }
-        let Some(m) = &s.made_by else { continue };
-        let stale = if m.waiting() {
-            now - m.at >= PROPOSAL_KEEP_MS
-        } else {
-            m.kind == MadeKind::Reminder
-                && s.next_run.is_none()
-                && s.last_slot.is_some_and(|t| now - t >= DONE_REMINDER_KEEP_MS)
-                && !hub.store().pending_runs().unwrap_or_default().iter().any(|r| r.schedule_id == s.id)
-        };
-        if !stale {
-            continue;
-        }
-        if m.waiting() {
-            hub.notice("info", format!("{}'s proposal \"{}\" waited 7 days without approval and was removed.", m.agent, s.name));
-        }
-        if let Err(e) = super::remove(hub, s.id) {
-            tracing::warn!(schedule = s.id, "tidying an agent's schedule: {e:#}");
+        match super::remove_if(hub, s.id, |cur| stale(hub, cur, now)) {
+            Ok(Some(Some(notice))) => hub.notice("info", notice),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(schedule = s.id, "tidying a schedule: {e:#}"),
         }
     }
+}
+
+/// Should the tidying remove `s` now? `Some(the notice to show, if any)`.
+fn stale(hub: &Hub, s: &Schedule, now: i64) -> Option<Option<String>> {
+    if s.made_by.is_none()
+        && let Some(h) = &s.held
+        && h.what.contains(&super::HeldWhat::Made)
+        && now - h.at >= super::HELD_KEEP_MS
+    {
+        return Some(Some(format!("The schedule \"{}\", made outside Muster's window, waited 7 days without approval and was removed.", s.name)));
+    }
+    let m = s.made_by.as_ref()?;
+    if m.waiting() {
+        return (now - m.at >= PROPOSAL_KEEP_MS)
+            .then(|| Some(format!("{}'s proposal \"{}\" waited 7 days without approval and was removed.", m.agent, s.name)));
+    }
+    (m.kind == MadeKind::Reminder
+        && s.next_run.is_none()
+        && s.last_slot.is_some_and(|t| now - t >= DONE_REMINDER_KEEP_MS)
+        && !hub.store().pending_runs().unwrap_or_default().iter().any(|r| r.schedule_id == s.id))
+    .then_some(None)
 }

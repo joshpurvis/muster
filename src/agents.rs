@@ -802,6 +802,10 @@ pub struct Registry {
     inner: Mutex<RegInner>,
     /// Serializes agent starts, so two asks can't start one agent twice.
     start_lock: tokio::sync::Mutex<()>,
+    /// Serializes `agent.update`: the record it reads, the check that it doesn't widen unattended
+    /// work from outside the window (`widens_unattended`) and the write happen as one, so a
+    /// change made meanwhile (the owner taking back Schedule) can't be undone by an older read.
+    config_lock: Mutex<()>,
     /// The sessions whose provenance is now unattended work (a schedule's or trigger's chain),
     /// kept beside `inner.runtime.prov` behind a lock of its own that calls nothing: file
     /// triggers read it on every session event (`Hub::emit`, sometimes with the hub's lock
@@ -850,6 +854,7 @@ impl Registry {
             store: store.clone(),
             inner: Mutex::new(inner),
             start_lock: Default::default(),
+            config_lock: Default::default(),
             unattended,
         })
     }
@@ -1315,8 +1320,11 @@ pub struct AgentUpdate {
 
 /// Model, effort and permissions apply from the agent's next start; the persona file is
 /// rewritten now (the CLI reads it when a conversation starts). Its own tab gets the new
-/// profile, so a restart runs with it.
-pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
+/// profile, so a restart runs with it. `outside`: not a click in Muster's window
+/// (`rpc::Via::Outside`): a change that widens unattended work (`widens_unattended`) is refused.
+/// Read, checked and written under `Registry::config_lock`, one update at a time.
+pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agent> {
+    let _one = hub.agents().config_lock.lock();
     let cur = hub.agents().get(&req.name).ok_or_else(|| no_agent(hub, &req.name))?;
     let mut next = cur.clone();
     if let Some(m) = req.model {
@@ -1343,6 +1351,9 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
     if let Some(p) = req.permissions {
         next.permissions = p.into();
     }
+    if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
+        anyhow::bail!("{why}");
+    }
     if next.persona != cur.persona {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
@@ -1359,6 +1370,37 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
         crate::schedules::agent_changed(hub, next.id);
     }
     Ok(next)
+}
+
+/// Does changing `cur` to `next` widen unattended work, which takes a click in Muster's window?
+/// `Some(what to do instead)` when it lets the agent take scheduled or triggered work it didn't,
+/// or changes the provider of a Claude agent that takes such work or is named in a schedule (its
+/// own or a "Then…" step): leaving the subscription drops its schedules' 7-day expiry (an
+/// expired one would run again) and their quiet-hours default; joining it puts that work on the
+/// subscription, which the Schedule opt-in's warning is about. Model, effort, persona,
+/// permissions and autostart don't change whether or when unattended work runs (the tab's
+/// permissions are the owner's to set from anywhere: `channel.set_permissions`).
+pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String> {
+    let unattended = |o: &Origin| matches!(o, Origin::Schedule | Origin::Webhook);
+    if next.accepts_origins.iter().any(|o| unattended(o) && !cur.accepts_origins.contains(o)) {
+        return Some(format!(
+            "letting {} take scheduled or triggered work takes a click in Muster's window: tick it under \
+             \"Takes messages started by\" in Edit agent (Agents panel). From here an agent's accepted work can only shrink",
+            cur.name
+        ));
+    }
+    if next.provider != cur.provider
+        && cur.kind == SessionKind::Claude
+        && (next.accepts_origins.iter().any(unattended) || crate::schedules::names_agent(hub, cur.id))
+    {
+        return Some(format!(
+            "changing the provider of {}, which takes scheduled or triggered work or is named in a schedule, takes a click in \
+             Muster's window (Edit agent, in the Agents panel): it changes whether its schedules stop after 7 days and what \
+             pays for them. From here, first take away its Schedule and Webhook and remove the schedules that name it",
+            cur.name
+        ));
+    }
+    None
 }
 
 /// `agent.remove`: removes the agent's session (if any) and its record. The home dir (persona,

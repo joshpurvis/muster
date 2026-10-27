@@ -410,6 +410,32 @@ export function nestedSteps(t: Then | null | undefined): number {
   return Math.max(0, depth(t) - 1);
 }
 
+/** One "Then…" step as the approval card lists it: what starts it, the agent it asks (null: it
+ * only notifies you) and its prompt; `depth` 0 for a step after the run, 1 for one after that
+ * step, and so on. */
+export interface StepLine {
+  depth: number;
+  when: string;
+  agent: string | null;
+  prompt: string;
+}
+
+/** Every "Then…" step, nested ones included, in order (each followed by its own steps), so
+ * approving shows all the work it lets run, not only the first prompt. */
+export function thenSteps(t: Then | null | undefined, depth = 0): StepLine[] {
+  if (!t) return [];
+  const out: StepLine[] = [];
+  const whose = depth ? "that step" : "it";
+  for (const [step, when] of [[t.on_success, `When ${whose} replies`], [t.on_failure, `If ${whose} fails`]] as const) {
+    if (!step) continue;
+    out.push(step.notify
+      ? { depth, when, agent: null, prompt: "" }
+      : { depth, when, agent: step.agent ?? "(a removed agent)", prompt: step.prompt });
+    out.push(...thenSteps(step.then, depth + 1));
+  }
+  return out;
+}
+
 /** A trigger's watcher, as its row shows it: "gh isn't signed in", a git error, or null. */
 export function watchLabel(s: Schedule): { text: string; tip: string } | null {
   const w = s.watch;

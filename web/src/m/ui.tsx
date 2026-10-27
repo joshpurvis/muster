@@ -5,8 +5,9 @@ import { phoneGrid } from "./logic.ts";
 import { cellSize } from "./term.ts";
 import { approve, canInteract, errorText, logout, notify, prefs, setPrefs } from "./store.ts";
 
-export function Icon({ name }: { name: "back" | "more" | "send" | "down" | "compose" }) {
+export function Icon({ name }: { name: "back" | "more" | "send" | "down" | "compose" | "plus" }) {
   const paths = {
+    plus: "M12 5v14M5 12h14",
     back: "m14 6-6 6 6 6M8 12h12",
     more: "M5 12h.01M12 12h.01M19 12h.01",
     send: "m5 12 7-7 7 7M12 5v15",

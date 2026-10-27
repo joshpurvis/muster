@@ -1,0 +1,395 @@
+/* The manage scope's screens (new tab, the tab/task action sheet); tokens from mobile.css. */
+
+/* ---------- session title as the action sheet's trigger ---------- */
+.session-title-button {
+  display: block;
+  text-align: left;
+  min-height: 44px;
+  padding: 4px 6px;
+  margin: 0 -6px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+}
+.session-title-button:active {
+  background: var(--hover-strong);
+}
+.session-title-button h1 {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.session-title-button .title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-title-button h1 svg {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--text-faint);
+}
+
+/* ---------- bottom action sheet ---------- */
+.sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  align-items: flex-end;
+  background: var(--backdrop);
+}
+.action-sheet {
+  width: 100%;
+  max-height: calc(100% - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 16px calc(16px + env(safe-area-inset-bottom));
+  background: var(--bg-overlay);
+  border-top: 1px solid var(--border-strong);
+  border-radius: 16px 16px 0 0;
+  box-shadow: var(--shadow);
+}
+.sheet-grabber {
+  display: block;
+  width: 36px;
+  height: 4px;
+  margin: 0 auto 12px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+.sheet-head {
+  padding: 0 4px 12px;
+}
+.sheet-head h2,
+.sheet-confirm h2 {
+  font-size: 16px;
+  overflow-wrap: anywhere;
+}
+.sheet-head p {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.sheet-label {
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 16px 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sheet-group {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-2);
+  overflow: hidden;
+}
+.sheet-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 48px;
+  padding: 12px 16px;
+  text-align: left;
+  font-size: 15px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.sheet-item + .sheet-item {
+  border-top: 1px solid var(--border);
+}
+.sheet-item.danger {
+  color: var(--st-error);
+}
+.sheet-cancel {
+  width: 100%;
+  min-height: 48px;
+  margin-top: 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.sheet-confirm {
+  padding: 0 4px;
+}
+.action-sheet .sheet-notice {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 12px 0 0;
+  color: var(--text);
+  background: var(--attn-bg);
+  border: 1px solid var(--attn-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.notice-retry {
+  display: block;
+  margin-top: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.sheet-head h2:focus,
+.sheet-confirm h2:focus,
+.new-tab-screen h1:focus {
+  outline: none;
+}
+.sheet-confirm p {
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.55;
+  margin-top: 10px;
+}
+.sheet-input {
+  display: block;
+  width: 100%;
+  height: 48px;
+  margin-top: 14px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-2);
+  font-size: 16px;
+}
+.sheet-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 20px;
+}
+.sheet-actions button {
+  flex: 1;
+  min-height: 48px;
+  font-size: 15px;
+  font-weight: 600;
+}
+/* One red in both themes: white on it is ≥4.5:1 (the dark theme's --st-error is too light). */
+.danger-fill {
+  color: #fff;
+  background: #d92d20;
+  border-color: transparent;
+}
+.danger-fill:active {
+  background: #b42318;
+}
+
+/* ---------- new tab ---------- */
+.new-tab-screen {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-0);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+.new-tab-screen .topbar h1 {
+  font-size: 17px;
+}
+.new-tab-form {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+.new-tab-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 20px 16px 24px;
+}
+.new-tab-body .field {
+  display: block;
+  border: 0;
+  margin: 0 0 24px;
+  padding: 0;
+  min-width: 0;
+}
+.new-tab-body legend,
+.field-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  padding: 0;
+}
+.optional {
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-left: 4px;
+}
+.field-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.choice-list {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-2);
+  overflow: hidden;
+}
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 56px;
+  padding: 10px 14px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.choice + .choice {
+  border-top: 1px solid var(--border);
+}
+.choice-text {
+  flex: 1;
+  min-width: 0;
+}
+.choice-text strong,
+.choice-text span {
+  display: block;
+}
+.choice-text strong {
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Paths wrap instead of losing their end: folders under one prefix must stay tellable apart. */
+.choice-text span {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+.choice-mark {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+}
+.choice[aria-checked="true"] {
+  background: var(--accent-softer);
+}
+.choice[aria-checked="true"] .choice-mark {
+  border: 6px solid var(--accent);
+}
+.folder-field {
+  margin-top: 12px;
+}
+.folder-field input,
+.new-tab-body textarea {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-2);
+  font-size: 16px;
+}
+.folder-field input {
+  height: 48px;
+  padding: 0 12px;
+  font-family: var(--mono);
+  font-size: 15px;
+}
+.new-tab-body textarea {
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 104px;
+}
+.folder-suggestions {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.folder-suggestions button {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  padding: 8px 12px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.folder-suggestions strong,
+.folder-suggestions span {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.folder-suggestions strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+.folder-suggestions span {
+  color: var(--text-muted);
+  font: 12px var(--mono);
+  margin-top: 2px;
+}
+.folder-suggestions li + li button {
+  border-top: 1px solid var(--border);
+}
+.segmented {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-2);
+}
+.segmented button {
+  flex: 1;
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.segmented button[aria-checked="true"] {
+  background: var(--bg-4);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 48px;
+  margin-bottom: 24px;
+  font-size: 15px;
+}
+.check-row input {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+.check-row small {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.check-row.disabled {
+  color: var(--text-faint);
+}
+.new-tab-foot {
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  background: var(--bg-1);
+}
+.new-tab-foot .primary {
+  width: 100%;
+  height: 48px;
+  font-weight: 600;
+}

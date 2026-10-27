@@ -61,20 +61,78 @@ export function wheelSteps(px: number, remainder: number, step: number) {
 }
 
 /** One mouse-wheel report as xterm.js sends it to a program tracking the mouse, at 1-based
- * cell `col`, `row` in the program's active encoding (`DEFAULT`, `SGR` or `SGR_PIXELS`). */
-export function wheelReport(up: boolean, col: number, row: number, encoding: string, cell: Cell): string {
+ * cell `col`, `row` in the program's active encoding, as the raw bytes to write. xterm.js has
+ * only `DEFAULT`, `SGR` and `SGR_PIXELS` (it ignores the UTF-8 and URXVT modes, 1005/1015, so
+ * a program asking for those gets `DEFAULT` from the desktop too). `DEFAULT` is one byte per
+ * value, never UTF-8, and can't address a cell past 223: xterm.js sends nothing there, nor
+ * does this (null), as for an encoding it doesn't know. */
+export function wheelReport(
+  up: boolean,
+  col: number,
+  row: number,
+  encoding: string,
+  cell: Cell,
+): Uint8Array | null {
   const button = up ? 64 : 65;
+  const text = (s: string) => new TextEncoder().encode(s);
   if (encoding === "DEFAULT") {
-    const byte = (n: number) => String.fromCharCode(32 + Math.min(223, n));
-    return `\x1b[M${byte(button)}${byte(col)}${byte(row)}`;
+    if (col > 223 || row > 223) return null;
+    return Uint8Array.of(0x1b, 0x5b, 0x4d, 32 + button, 32 + col, 32 + row);
   }
   if (encoding === "SGR_PIXELS") {
     const x = Math.floor((col - 0.5) * cell.width);
     const y = Math.floor((row - 0.5) * cell.height);
-    return `\x1b[<${button};${x};${y}M`;
+    return text(`\x1b[<${button};${x};${y}M`);
   }
-  return `\x1b[<${button};${col};${row}M`;
+  if (encoding === "SGR") return text(`\x1b[<${button};${col};${row}M`);
+  return null;
 }
+
+/** `report` `count` times, as one write. */
+export function repeatBytes(report: Uint8Array, count: number): Uint8Array {
+  const out = new Uint8Array(report.length * Math.max(0, count));
+  for (let i = 0; i < count; i++) out.set(report, i * report.length);
+  return out;
+}
+
+/** How a phone left a full-screen program it scrolled back (per session, kept across leaving
+ * and reopening it): `back` wheel notches up not yet sent back down, at cell `at`; `behind`
+ * once the agent was busy meanwhile, so new lines may sit below the program's view and
+ * returning the notches alone would fall short of the newest. */
+export interface ProgramScroll {
+  back: number;
+  behind: boolean;
+  at: { col: number; row: number } | null;
+}
+
+/** `count` notches were sent (negative = up) at `at`, while the agent was `busy` or not. */
+export function noteWheel(p: ProgramScroll, count: number, at: ProgramScroll["at"], busy: boolean) {
+  p.back = Math.max(0, p.back - count);
+  if (count < 0) {
+    p.at = at;
+    if (busy) p.behind = true;
+  }
+}
+
+/** The agent got busy (or still is): while scrolled back, new lines land below the view. */
+export function noteBusy(p: ProgramScroll, busy: boolean) {
+  if (busy && p.back > 0) p.behind = true;
+}
+
+/** Whether the phone's view of a program it scrolled back can be taken as the newest output. */
+export function programAtLatest(p: ProgramScroll): boolean {
+  return p.back === 0 && !p.behind;
+}
+
+/** Wheel notches down that bring a program back to its newest line: the ones sent up, plus,
+ * when output may have arrived meanwhile, five screens more (a program stops at its bottom). */
+export function returnNotches(p: ProgramScroll, rows: number): number {
+  return p.back + (p.behind ? 5 * rows : 0);
+}
+
+/** Ctrl+End as xterm.js sends it: Claude Code's fullscreen view binds it to "scroll to bottom"
+ * in the same context as the wheel, so it reaches the newest line however much arrived. */
+export const CTRL_END = new TextEncoder().encode("\x1b[1;5F");
 
 export interface BufferLine {
   isWrapped: boolean;

@@ -206,18 +206,22 @@ let viewOnlyScrollNoted = false;
 /** Wheel reports that scroll a full-screen program (Claude Code) back through its own history,
  * sent like a desktop terminal's mouse wheel: raw input, without the resize `act` does in
  * `follow`. False when this device can't send input (view access only, or disconnected). */
-export function scrollProgram(sid: number, data: string): boolean {
+export function scrollProgram(sid: number, data: Uint8Array): boolean {
   if (!canInteract.peek()) {
     if (ready.peek() && !viewOnlyScrollNoted) {
       viewOnlyScrollNoted = true;
-      notify("This device has view access only, so it can't scroll back in a full-screen agent");
+      notify(
+        "View-only device: it can't scroll back in a full-screen agent. To allow it, run muster pair " +
+          "on your computer and pair this phone again.",
+      );
     }
     return false;
   }
   const s = sessions.peek().get(sid);
-  if (!s || s.state === "exited") return false;
+  if (!s || s.state === "exited" || !rpc.isOpen) return false;
+  // Raw bytes: a legacy mouse report is one byte per value, never UTF-8.
   rpc.sendInput(sid, data);
-  return rpc.isOpen;
+  return true;
 }
 
 /** Resize only on an explicit action; approval uses the version rendered by its caller. */

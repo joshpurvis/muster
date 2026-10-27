@@ -219,12 +219,23 @@ maths do not double-offset):
    its conversation itself, so the phone showed only its one screen. When the alternate screen
    is active and the program tracks the mouse (any mode but X10), a vertical drag first pans the
    phone's view of the screen and the rest becomes mouse-wheel reports (one notch per text row,
-   in the program's mouse encoding, at the cell under the finger), sent as `0x02` input frames
-   like a desktop terminal's wheel. The program scrolls its own history (Claude Code keeps its
-   place while new output arrives and shows "N new messages"). This needs the `interact` scope
-   (a view-only phone gets a one-time notice) and is not resized to the phone in `follow`.
-   The scroll is the program's, so a desktop window showing the same session scrolls with it.
-   "Latest output" sends back the wheel-down notches the phone sent up, then pans to the bottom.
+   at the cell under the finger), sent as raw `0x02` input frames like a desktop terminal's
+   wheel, in the program's mouse encoding as xterm.js has it: SGR, SGR pixels, or the legacy
+   one-byte-per-value form (never UTF-8; nothing is sent for a cell past 223, as xterm.js does).
+   The program scrolls its own history (Claude Code keeps its place while new output arrives
+   and shows "N new messages"). This needs the `interact` scope (a view-only phone gets a
+   one-time notice saying to pair again with `muster pair`) and is not resized to the phone in
+   `follow`. The scroll is the program's, so a desktop window showing the same session scrolls
+   with it.
+
+   The phone remembers, per session and until the page reloads, how far it scrolled a program
+   back, where, and whether the agent was busy meanwhile (shells always count as busy), so
+   "Latest output" shows again after leaving and reopening the session. "Latest output" sends,
+   at the cell where the scroll happened, the wheel-down notches the phone sent up, five screens
+   more if the agent was busy (new lines sit below the program's view; a program stops at its
+   bottom), and for a Claude session Ctrl+End, which Claude Code's fullscreen view binds to
+   "scroll to bottom". Dragging back down by the notches alone counts as the newest only if the
+   agent stayed idle. If the return can't be sent (offline, reconnecting), the button stays.
 
 ## Terminal width
 

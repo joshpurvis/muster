@@ -3,18 +3,29 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 // UMD build on purpose; see web/src/terms.ts.
 import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
-import type { SessionInfo } from "../types.ts";
+import type { AgentState, SessionInfo, SessionKind } from "../types.ts";
 import {
   bufferText,
   type Cell,
+  CTRL_END,
   FONT_FAMILY,
+  noteBusy,
+  noteWheel,
   phoneGrid,
+  programAtLatest,
+  type ProgramScroll,
   programScrolls,
+  repeatBytes,
+  returnNotches,
   scrollPosition,
   splitPan,
   wheelReport,
   wheelSteps,
 } from "./logic.ts";
+
+/** Per session, so leaving a session and opening it again still offers "Latest output" while
+ * the program is scrolled back (the program keeps its place; a new view would start at 0). */
+const programScroll = new Map<number, ProgramScroll>();
 
 export function cellSize(fontSize: number, term?: Terminal): Cell {
   const cell = (term as any)?._core?._renderService?.dimensions?.css?.cell;
@@ -66,10 +77,12 @@ export class PhoneTerminal {
   private disposed = false;
   private selecting = false;
   private pinned = true;
-  /** Wheel notches this view sent up into a full-screen program, net of the ones sent down. */
-  private programBack = 0;
+  private program: ProgramScroll;
   private wheelRemainder = 0;
-  private replaying = false;
+  /** Until the first replay is parsed the buffer isn't the program's yet: keep `program`. */
+  private replaying = true;
+  private kind: SessionKind;
+  private state: AgentState;
   private observer: ResizeObserver;
   private media = matchMedia("(prefers-color-scheme: light)");
   private events = new AbortController();
@@ -84,9 +97,13 @@ export class PhoneTerminal {
     private closedHeight: () => number,
     private onBottom: (bottom: boolean) => void,
     private onFont: (size: number) => void,
-    /** Sends input bytes to the session; false when this device may not. */
-    private scrollProgram: (data: string) => boolean,
+    /** Sends input bytes to the session; false when this device may not or it's offline. */
+    private scrollProgram: (data: Uint8Array) => boolean,
   ) {
+    this.kind = info.kind;
+    this.state = info.state;
+    this.program = programScroll.get(sid) ?? { back: 0, behind: false, at: null };
+    programScroll.set(sid, this.program);
     this.term = new Terminal({
       cols: info.cols,
       rows: info.rows,
@@ -138,7 +155,7 @@ export class PhoneTerminal {
   }
   private atBottom() {
     const b = this.term.buffer.active;
-    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1 && this.programBack === 0;
+    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1 && programAtLatest(this.program);
   }
   private programScrolls() {
     return programScrolls(this.term.buffer.active.type, this.term.modes.mouseTrackingMode);
@@ -156,23 +173,29 @@ export class PhoneTerminal {
     this.scrollRemainder = 0;
     const steps = wheelSteps(split.rest, this.wheelRemainder, this.cell().height);
     this.wheelRemainder = steps.remainder;
-    if (steps.count) this.wheel(steps.count, at);
+    if (steps.count && !this.wheel(steps.count, this.cellAt(at))) this.wheelRemainder = 0;
     this.render();
   }
-  /** Send |count| wheel notches, up when negative, at the cell under client point `at`. */
-  private wheel(count: number, at: { x: number; y: number }) {
+  /** The 1-based terminal cell under client point `at`. */
+  private cellAt(at: { x: number; y: number }) {
     const cell = this.cell();
     const rect = this.surface.getBoundingClientRect();
     const clamp = (n: number, max: number) => Math.max(1, Math.min(max, n));
-    const col = clamp(Math.floor((at.x - rect.left + this.panX) / cell.width) + 1, this.term.cols);
-    const row = clamp(Math.floor((at.y - rect.top + this.panY) / cell.height) + 1, this.term.rows);
+    return {
+      col: clamp(Math.floor((at.x - rect.left + this.panX) / cell.width) + 1, this.term.cols),
+      row: clamp(Math.floor((at.y - rect.top + this.panY) / cell.height) + 1, this.term.rows),
+    };
+  }
+  /** Send |count| wheel notches, up when negative, at `at`, then `extra` bytes. True when sent. */
+  private wheel(count: number, at: { col: number; row: number }, extra?: Uint8Array) {
     const encoding = (this.term as any)._core?.coreMouseService?.activeEncoding ?? "SGR";
-    const report = wheelReport(count < 0, col, row, encoding, cell);
-    if (this.scrollProgram(report.repeat(Math.abs(count)))) {
-      this.programBack = Math.max(0, this.programBack - count);
-    } else {
-      this.wheelRemainder = 0;
-    }
+    const report = wheelReport(count < 0, at.col, at.row, encoding, this.cell());
+    if (!report) return false;
+    const notches = repeatBytes(report, Math.abs(count));
+    const data = extra ? new Uint8Array([...notches, ...extra]) : notches;
+    if (!this.scrollProgram(data)) return false;
+    noteWheel(this.program, count, at, this.busy());
+    return true;
   }
   private position() {
     return this.term.buffer.active.viewportY * this.cell().height + this.panY + this.scrollRemainder;
@@ -192,18 +215,32 @@ export class PhoneTerminal {
     this.panX = Math.max(0, Math.min(this.panX, this.term.cols * cell.width - this.surface.clientWidth));
     this.host.style.width = `${Math.ceil(this.term.cols * cell.width)}px`;
     this.host.style.transform = `translate(${-this.panX}px, ${-this.panY}px)`;
-    if (!this.replaying && !this.programScrolls()) this.programBack = this.wheelRemainder = 0;
+    if (!this.replaying && !this.programScrolls()) this.forgetProgram();
     this.pinned = this.atBottom();
     this.onBottom(this.pinned);
   }
-  /** "Latest output": also scrolls a full-screen program back down as far as this view took it
-   * up (more notches than needed are harmless; the program stops at its newest line). */
+  /** Output may be arriving: an agent not idle, or a shell (its state doesn't say). */
+  private busy() {
+    return this.kind === "shell" || this.state !== "idle";
+  }
+  private forgetProgram() {
+    Object.assign(this.program, { back: 0, behind: false, at: null });
+    this.wheelRemainder = 0;
+  }
+  /** "Latest output": also brings a full-screen program this view scrolled back to its newest
+   * line, where the scroll happened (a tmux pane, say): the notches sent up, more if the agent
+   * was busy meanwhile (a program stops at its bottom), and for Claude Code its own Ctrl+End.
+   * If that can't be sent (offline), the program stays marked as scrolled back. */
   bottom() {
-    if (this.programBack && this.programScrolls()) {
+    const p = this.program;
+    if (!programAtLatest(p) && this.programScrolls()) {
       const rect = this.surface.getBoundingClientRect();
-      this.wheel(this.programBack, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      const at = p.at ?? this.cellAt({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      const notches = Math.max(1, returnNotches(p, this.term.rows));
+      if (this.wheel(notches, at, this.kind === "claude" ? CTRL_END : undefined)) this.forgetProgram();
+    } else {
+      this.forgetProgram();
     }
-    this.programBack = this.wheelRemainder = 0;
     this.end();
   }
   private end() {
@@ -213,6 +250,9 @@ export class PhoneTerminal {
     return phoneGrid(this.surface.clientWidth, this.closedHeight(), this.cell());
   }
   update(info: SessionInfo) {
+    this.kind = info.kind;
+    this.state = info.state;
+    noteBusy(this.program, this.busy());
     if (info.cols === this.term.cols && info.rows === this.term.rows) return;
     const pinned = this.atBottom();
     this.term.resize(info.cols, info.rows);
@@ -247,7 +287,7 @@ export class PhoneTerminal {
       cancelAnimationFrame(this.raf);
       this.raf = 0;
       this.queue = [];
-      // A program scrolled up stays scrolled across a reattach: keep the count of notches.
+      // A program scrolled back stays so across a reattach: keep `program` until it's parsed.
       this.replaying = true;
       this.term.write("\x1bc");
       this.term.write(payload.slice(), () => {

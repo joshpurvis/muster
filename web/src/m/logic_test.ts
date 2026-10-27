@@ -1,9 +1,16 @@
 import {
   bufferText,
+  CTRL_END,
   normalizeCode,
+  noteBusy,
+  noteWheel,
   phoneGrid,
+  programAtLatest,
+  type ProgramScroll,
   programScrolls,
   relativeTime,
+  repeatBytes,
+  returnNotches,
   scrollPosition,
   sessionOrder,
   splitPan,
@@ -108,11 +115,48 @@ Deno.test("drag pixels become one wheel notch per row, carrying the rest either 
   equal(count, -20);
 });
 
-Deno.test("wheel reports match what xterm.js sends in each mouse encoding", () => {
+const bytes = (b: Uint8Array | null) => b && [...b];
+const ascii = (t: string) => [...new TextEncoder().encode(t)];
+
+Deno.test("wheel reports are the bytes xterm.js sends in each mouse encoding", () => {
   const cell = { width: 8, height: 16 };
-  equal(wheelReport(true, 10, 5, "SGR", cell), "\x1b[<64;10;5M");
-  equal(wheelReport(false, 10, 5, "SGR", cell), "\x1b[<65;10;5M");
-  equal(wheelReport(true, 1, 2, "DEFAULT", cell), '\x1b[M`!"');
-  equal(wheelReport(false, 300, 2, "DEFAULT", cell), '\x1b[Ma\xff"');
-  equal(wheelReport(true, 2, 3, "SGR_PIXELS", cell), "\x1b[<64;12;40M");
+  equal(bytes(wheelReport(true, 10, 5, "SGR", cell)), ascii("\x1b[<64;10;5M"));
+  equal(bytes(wheelReport(false, 10, 5, "SGR", cell)), ascii("\x1b[<65;10;5M"));
+  equal(bytes(wheelReport(true, 2, 3, "SGR_PIXELS", cell)), ascii("\x1b[<64;12;40M"));
+  // Legacy: one raw byte per value. Col 100, row 81 is 0x84 and 0x71, not UTF-8 (c2 84), which
+  // a legacy decoder would cut after six bytes, leaving a stray `q` typed into the program.
+  equal(bytes(wheelReport(false, 100, 81, "DEFAULT", cell)), [0x1b, 0x5b, 0x4d, 97, 132, 113]);
+  equal(bytes(wheelReport(true, 223, 223, "DEFAULT", cell)), [0x1b, 0x5b, 0x4d, 96, 255, 255]);
+  // Past 223 legacy can't say where: xterm.js sends nothing, and neither does the phone.
+  equal(wheelReport(true, 224, 5, "DEFAULT", cell), null);
+  equal(wheelReport(true, 5, 300, "DEFAULT", cell), null);
+  equal(wheelReport(true, 5, 5, "URXVT", cell), null);
+  equal(bytes(repeatBytes(Uint8Array.of(1, 2), 3)), [1, 2, 1, 2, 1, 2]);
+  equal(bytes(CTRL_END), ascii("\x1b[1;5F"));
+});
+
+Deno.test("returning to the newest line covers output that arrived while scrolled back", () => {
+  const p: ProgramScroll = { back: 0, behind: false, at: null };
+  // Idle agent: scrolled up 10, back down 4, the rest returns exactly what was sent.
+  noteWheel(p, -10, { col: 3, row: 7 }, false);
+  noteWheel(p, 4, { col: 9, row: 9 }, false);
+  equal(p, { back: 6, behind: false, at: { col: 3, row: 7 } });
+  equal(programAtLatest(p), false);
+  equal(returnNotches(p, 40), 6);
+  noteWheel(p, 6, { col: 3, row: 7 }, false);
+  equal(programAtLatest(p), true);
+  // Busy agent: new lines sit below the view, so the notches alone fall short. Dragging back
+  // down by them doesn't count as the newest; the return over-sends (programs stop at the end).
+  noteWheel(p, -5, { col: 1, row: 2 }, false);
+  noteBusy(p, true);
+  noteWheel(p, 5, { col: 1, row: 2 }, true);
+  equal(p.back, 0);
+  equal(programAtLatest(p), false);
+  equal(returnNotches(p, 40), 200);
+  // Busy only after the view was back at the bottom: nothing below to miss.
+  const q: ProgramScroll = { back: 0, behind: false, at: null };
+  noteBusy(q, true);
+  equal(programAtLatest(q), true);
+  noteWheel(q, -1, null, true);
+  equal(q.behind, true);
 });

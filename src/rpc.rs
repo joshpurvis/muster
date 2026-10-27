@@ -1766,7 +1766,7 @@ async fn handle_request(
             let mut tail = if mode.screen { hub.join_tail(id) } else { None };
             // Read before the replay is taken: a resize bumps it only once the host has the new
             // size, so the replay is drawn at this revision's size or a later one.
-            let mut size_rev = Some(hub.size_rev(id));
+            let mut size_rev = hub.size_rev(id);
             match hub.attach(id, limit).await {
                 Ok(att) => {
                     let (kind, replay, rx, generation, offset) = match att {
@@ -1779,14 +1779,14 @@ async fn handle_request(
                             let delta = match (&since, &tail) {
                                 (Some(s), Some(t))
                                     if s.epoch == hub.replay_epoch() && s.generation == generation
-                                        && Some(s.size_rev) == size_rev && hub.pty_alive(id) =>
+                                        && s.size_rev.is_some() && s.size_rev == size_rev =>
                                 {
                                     t.delta(s.offset, offset).await
                                 }
                                 _ => None,
                             }
-                            .filter(|_| Some(hub.size_rev(id)) == size_rev && hub.pty_alive(id));
-                            if Some(hub.size_rev(id)) != size_rev {
+                            .filter(|_| hub.size_rev(id) == size_rev && hub.pty_alive(id));
+                            if hub.size_rev(id) != size_rev {
                                 // Resized while the replay was taken: unknown which size it has.
                                 size_rev = None;
                             }
@@ -1889,7 +1889,9 @@ struct Since {
     offset: u64,
     generation: u64,
     epoch: String,
-    size_rev: u64,
+    /// Absent from phones loaded before it existed: then unknown, so never a delta.
+    #[serde(default)]
+    size_rev: Option<u64>,
 }
 
 /// How an attachment's replays are sent.
@@ -2023,7 +2025,7 @@ async fn resend_replay(
     state.tail.take_if(|t| Some(t.generation()) != new_gen);
     state.generation = new_gen;
     *rx = new_rx;
-    let size_rev = Some(size_rev).filter(|r| *r == hub.size_rev(id));
+    let size_rev = size_rev.filter(|r| Some(*r) == hub.size_rev(id));
     if state.mode.info && out.send(attach_info(hub, id, state.mode.kind(), offset, new_gen, size_rev)).await.is_err() {
         return false;
     }

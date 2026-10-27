@@ -549,6 +549,11 @@ impl Terminal {
             _ => None,
         }
     }
+    /// The host's own answer whether the run is still running (not the cached status). False
+    /// when the host can't be asked.
+    pub fn alive_now(&self) -> bool {
+        matches!(self.client.call(Command::Status { run: self.run() }), Ok(Response::Status(status)) if status.alive)
+    }
     pub fn has_processes(&self) -> bool {
         match self.client.call(Command::Status { run: self.run() }) {
             Ok(Response::Status(status)) => status.has_processes,

@@ -482,7 +482,8 @@ pub struct Hub {
     tails: Arc<crate::replay_tail::Tails>,
     /// Per session, how many times its terminal was resized this daemon run: a client's offset
     /// from an earlier size revision is never resumed with a `delta` (docs/PROTOCOL.md).
-    size_revs: Mutex<HashMap<SessionId, u64>>,
+    /// The value is (revision, resizes in progress).
+    size_revs: Mutex<HashMap<SessionId, (u64, u32)>>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
     /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
@@ -1526,15 +1527,21 @@ impl Hub {
         self.tails.epoch()
     }
 
-    /// Session `id`'s terminal size revision (see `size_revs`).
-    pub fn size_rev(&self, id: SessionId) -> u64 {
-        self.size_revs.lock().get(&id).copied().unwrap_or(0)
+    /// Session `id`'s terminal size revision (see `size_revs`); None while a resize is on its
+    /// way to the terminal host (the size a replay is drawn at is unknown then).
+    pub fn size_rev(&self, id: SessionId) -> Option<u64> {
+        match self.size_revs.lock().get(&id).copied() {
+            None => Some(0),
+            Some((_, busy)) if busy > 0 => None,
+            Some((rev, _)) => Some(rev),
+        }
     }
 
-    /// Whether session `id`'s current run is still running. A run that ended replays
-    /// differently (an ended full-screen view moves into history), so it never gets a `delta`.
+    /// Whether session `id`'s current run is still running, asked of the terminal host (the
+    /// cached status can lag an exit). A run that ended replays differently (an ended
+    /// full-screen view moves into history), so it never gets a `delta`.
     pub fn pty_alive(&self, id: SessionId) -> bool {
-        self.pty(id).is_some_and(|p| p.is_alive())
+        self.pty(id).is_some_and(|p| p.alive_now())
     }
 
     /// Keep a raw output tail of session `id`'s current run for a `delta` replay later, and
@@ -3902,8 +3909,21 @@ impl Hub {
             // Bumped once the host has the new size (never before, so a replay labelled with
             // the new revision is drawn at the new size) and on every call: comparing with
             // `cur` could miss a concurrent resize.
+            // Marked in progress (and bumped) before the host is asked, since it applies the
+            // size before it answers: an attach overlapping it sees None or a newer revision.
+            {
+                let mut revs = self.size_revs.lock();
+                let e = revs.entry(id).or_default();
+                e.0 += 1;
+                e.1 += 1;
+            }
             let resized = p.resize(cols, rows);
-            *self.size_revs.lock().entry(id).or_default() += 1;
+            {
+                let mut revs = self.size_revs.lock();
+                let e = revs.entry(id).or_default();
+                e.0 += 1;
+                e.1 -= 1;
+            }
             resized?;
         }
         if cur.cols != cols || cur.rows != rows || cur.size_owner.as_deref() != Some(owner) {

@@ -761,11 +761,14 @@ exec cat > /dev/null
     return infos(back)[n - 1];
   };
   ok((await away(position(back), 3)).kind === "delta", "a phone that was away without a resize gets a delta");
+  // A phone still on the bundle from before size_rev existed: attaches, gets a screen.
+  const { size_rev: _unknown, ...oldShape } = position(back);
+  ok((await away(oldShape, 4)).kind === "screen", "an old phone's since without size_rev gets a screen");
   const preResize = position(back);
   await c.call("session.resize", { id: sid, cols: 60, rows: 30 });
   await c.call("session.resize", { id: sid, cols: 100, rows: 30 });
-  const afterResize = await away(preResize, 4);
-  ok(afterResize.kind === "screen" && afterResize.size_rev === preResize.size_rev + 2,
+  const afterResize = await away(preResize, 5);
+  ok(afterResize.kind === "screen" && afterResize.size_rev === preResize.size_rev + 4,
     "a phone that was away during a resize gets a screen");
   // A run that ended while the phone was away replays as ended (a full-screen view moves into
   // history): never a delta, even with nothing printed since.

@@ -1172,7 +1172,7 @@ Prompts a device sends are logged with `from: "device:<id>"`.
   from the `attach_info` of its last replay. The daemon answers `delta`, the raw output bytes
   from `offset` to now, when it still holds all of them (see below), `generation` and `epoch`
   are this run's, `size_rev` is the terminal's current size revision (no resize since, nor while
-  this attach is taken), the run is still running (an ended run's replay moves a full-screen
+  this attach is taken), the run is still running as the terminal host itself answers (an ended run's replay moves a full-screen
   view into history, which appending can't do), the range is at most 64 KiB, and it is no
   bigger than the `screen` it would send instead; otherwise that `screen`.
 
@@ -1185,10 +1185,13 @@ connection ends first. `offset` is the raw output offset (bytes the run has writ
 terminal host counts them) right after the replay: the client adds the length of every `0x01`
 payload it receives to it, and sends the sum as `since` when it reattaches. `generation` is the
 run's (null for a session from an earlier daemon run, which cannot be resumed); `epoch` is
-random per daemon start; `size_rev` counts the session's resizes this daemon run, read before
-the replay is taken (a resize counts only once the terminal host has the new size), and is null
-when the daemon can't tell which size the replay was drawn at (a resize during the attach, or a
-replay after a terminal host stream reset); such a replay can't be resumed. A client attached
+random per daemon start; `size_rev` is the session's size revision this daemon run, read before
+the replay is taken. A resize moves it before the terminal host is asked and again after it
+answered, and while one is on its way the revision reads as unknown, so an attach that overlaps
+a resize never gets a `delta`. `size_rev` is null when the daemon can't tell which size the
+replay was drawn at (a resize during the attach, or a replay after a terminal host stream
+reset); such a replay can't be resumed, and neither can a `since` without `size_rev` (sent by a
+phone page loaded before the field existed: it gets a screen). A client attached
 across a resize keeps its earlier `size_rev`, so its next return gets a screen. A `full` or `screen` replay
 replaces the terminal; a `delta` is appended without a reset, so the client's terminal (and
 its normal-screen scrollback) stays as it was. Replays after the first are `screen` for a

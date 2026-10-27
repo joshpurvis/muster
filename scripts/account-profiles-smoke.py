@@ -252,12 +252,20 @@ try:
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())
+    transcript = BASE / "transcript.jsonl"
+    transcript.write_text("{}\n")
 
     def limits(five, seven, api, five_reset=None):
-        return {"session_id": "fixture-conversation", "cwd": str(REPO), "transcript_path": "/fixture/t.jsonl",
+        # The transcript's modification time is the reporter's evidence of when numbers were fetched.
+        transcript.touch()
+        return {"session_id": "fixture-conversation", "cwd": str(REPO), "transcript_path": str(transcript),
                 "account": "Work", "cost": {"total_api_duration_ms": api, "total_cost_usd": 0},
                 "rate_limits": {"five_hour": {"used_percentage": five, "resets_at": five_reset or now + 3 * 3600},
                                 "seven_day": {"used_percentage": seven, "resets_at": now + 4 * 86400}}}
+
+    def settled():
+        # The reporter runs beside the user's line and posts within 600 ms.
+        time.sleep(1)
     work_line = json.loads((DATA / "sessions" / str(b["id"]) / "claude-settings.json").read_text())["statusLine"]
     check(work_line["padding"] == 1 and "statusline claude" in work_line["command"]
           and "WORK-USER-LINE" in work_line["command"] and "FIXTURE" not in json.dumps(work_line),
@@ -268,25 +276,30 @@ try:
           "the user's status line output is shown unchanged")
     check(status_line(a["id"], limits(92, 70, 100)) == {"stdout": "HOME-USER-LINE\n", "code": 3},
           "the user's status line exit code passes through")
-    check(status_line(legacy["id"], limits(50, 50, 10, five_reset=now + 2)) == {"stdout": "", "code": 0},
+    check(status_line(legacy["id"], limits(50, 50, 10, five_reset=now + 3)) == {"stdout": "", "code": 0},
           "without a status line of its own a session shows an empty one")
+    until("the three reports", lambda: usage_row("Work")["five_hour"]["status"] == "current"
+          and usage_row("Home")["seven_day"]["status"] == "current"
+          and usage_row("Default")["seven_day"]["status"] == "current")
     work_row, home_row = usage_row("Work"), usage_row("Home")
-    check(work_row["five_hour"]["used_percentage"] == 25 and work_row["five_hour"]["status"] == "current"
-          and home_row["seven_day"]["used_percentage"] == 70 and usage_row("Default")["seven_day"]["status"] == "current",
-          "reports are attributed to each session's pinned profile, not a label in the payload")
+    check(work_row["five_hour"]["used_percentage"] == 25 and home_row["seven_day"]["used_percentage"] == 70
+          and usage_row("Default")["seven_day"]["used_percentage"] == 50,
+          "reports are filed under each run's own folder, not a label in the payload")
     usage = rpc("account_usage.get")
     check(usage["suggestion"]["name"] == "Work" and "Work used 25%" in usage["suggestion"]["reason"],
           "the suggestion names the account with the most known room and why")
     seen = home_row["five_hour"]["observed_at"]
     status_line(a["id"], limits(92, 70, 100))
-    check(usage_row("Home")["five_hour"]["observed_at"] == seen, "a redraw of the same numbers does not renew freshness")
+    settled()
+    check(usage_row("Home")["five_hour"]["observed_at"] == seen,
+          "a redraw of the same numbers does not renew freshness, even with a newer transcript")
     check(http("/usage/claude", limits(1, 1, 1))[0] == 401 and http("/usage/claude", limits(1, 1, 1), "forged")[0] == 401,
           "only a session token can report usage")
     cli("profile", "login-changed", "Home")
     check(usage_row("Home")["five_hour"]["status"] == "unknown", "a login change forgets the profile's usage")
     status_line(a["id"], limits(92, 70, 100))
-    check(usage_row("Home")["five_hour"]["status"] == "unconfirmed",
-          "an old redraw seen afterwards is kept as unconfirmed, not as fresh")
+    until("Home's redraw", lambda: usage_row("Home")["five_hour"]["status"] == "unconfirmed")
+    check(True, "an old redraw seen afterwards is kept as unconfirmed, not as fresh")
     until("Default's 5-hour window to reset", lambda: usage_row("Default")["five_hour"]["status"] == "reset")
     check(True, "a passed reset reads as unknown, not as zero")
     text = cli("profile", "usage")
@@ -299,6 +312,14 @@ try:
           "profiles declared to be one account share one set of numbers")
     cli("profile", "same-account", "Home")
     check(usage_row("Home")["same_account_as"] == [], "a profile can be its own account again")
+    # A repository whose settings file links to a credentials file: never read, and the
+    # session's status line is left to Claude Code.
+    (REPO / ".claude").mkdir(exist_ok=True)
+    (REPO / ".claude" / "settings.json").symlink_to(BASE / "personal" / ".credentials.json")
+    linked = spawn(ch, account_profile=work)
+    check("statusLine" not in json.loads((DATA / "sessions" / str(linked["id"]) / "claude-settings.json").read_text()),
+          "a linked project settings file is not followed; the status line is left alone")
+    (REPO / ".claude" / "settings.json").unlink()
     if "--browser" in sys.argv:
         with socket.socket() as reserve:
             reserve.bind(("127.0.0.1", 0))

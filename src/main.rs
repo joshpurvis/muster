@@ -125,12 +125,11 @@ enum Cmd {
         event: String,
         payload: Option<String>,
     },
-    /// Claude sessions' status line: runs COMMAND (the user's own) unchanged and reports the
-    /// session's usage windows to the daemon (src/statusline.rs).
+    /// Claude sessions' usage reporter: reads the status-line JSON on stdin and reports the usage
+    /// windows to the daemon, printing nothing (src/statusline.rs).
     #[command(hide = true)]
     Statusline {
         agent: String,
-        command: Option<String>,
     },
     /// Show whether the daemon is running.
     Status,
@@ -570,7 +569,7 @@ fn main() -> ExitCode {
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
     if args.get(1).map(String::as_str) == Some("statusline") {
-        let code = statusline::run(args.get(2).map(String::as_str).unwrap_or(""), args.get(3).map(String::as_str));
+        let code = statusline::run(args.get(2).map(String::as_str).unwrap_or(""));
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
 

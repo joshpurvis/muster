@@ -1615,18 +1615,35 @@ impl Store {
         Ok(out)
     }
 
-    /// Apply one report from run (`session`, `generation`) to `account`'s observations in one
-    /// transaction. Returns whether a client-visible observation changed.
-    pub fn apply_usage(&self, account: &str, session: SessionId, generation: u64,
-        report: &crate::usage::Report, now: i64) -> anyhow::Result<bool> {
+    /// Record a Claude run's launch: the configuration folder its reports are filed under.
+    /// Replaces the session's previous run.
+    pub fn start_usage_run(&self, session: SessionId, generation: u64, config_dir: Option<String>) -> anyhow::Result<()> {
+        let run = crate::usage::RunMemory { generation, config_dir, ..Default::default() };
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // Forget the runs of sessions that no longer exist.
+        tx.execute("DELETE FROM usage_runs WHERE session_id NOT IN (SELECT id FROM sessions)", [])?;
+        tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
+            ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(&run)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply one report from run (`session`, `generation`) to the observations of the folder
+    /// that run was launched with, in one transaction. A run with no launch record (or another
+    /// generation's) is ignored. Returns whether a client-visible observation changed.
+    pub fn apply_usage(&self, session: SessionId, generation: u64, report: &crate::usage::Report, now: i64)
+        -> anyhow::Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let run: Option<crate::usage::RunMemory> = tx.query_row("SELECT record FROM usage_runs WHERE session_id=?1", [session],
             |r| r.get::<_, String>(0)).optional()?.and_then(|j| serde_json::from_str(&j).ok());
+        let Some(run) = run.filter(|r| r.generation == generation) else { return Ok(false) };
+        let Some(account) = run.config_dir.as_deref().map(crate::usage::folder_key) else { return Ok(false) };
         let mut stored = std::collections::BTreeMap::new();
         {
             let mut st = tx.prepare("SELECT window, record FROM usage_observations WHERE account=?1")?;
-            let rows = st.query_map([account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows = st.query_map([&account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (w, record) = row?;
                 if let (Some(w), Ok(o)) = (crate::usage::Window::from_key(&w), serde_json::from_str(&record)) {
@@ -1634,17 +1651,13 @@ impl Store {
                 }
             }
         }
-        let applied = crate::usage::apply(run.as_ref(), &stored, (session, generation), report, now);
+        let applied = crate::usage::apply(&run, &stored, (session, generation), report, now);
         for (w, o) in &applied.updates {
             tx.execute("INSERT INTO usage_observations(account, window, record) VALUES (?1, ?2, ?3)
                 ON CONFLICT(account, window) DO UPDATE SET record=excluded.record",
                 params![account, w.key(), serde_json::to_string(o)?])?;
         }
         if let Some(m) = &applied.run {
-            if run.as_ref().is_none_or(|r| r.generation != m.generation) {
-                // A new run: forget the runs of sessions that no longer exist.
-                tx.execute("DELETE FROM usage_runs WHERE session_id NOT IN (SELECT id FROM sessions)", [])?;
-            }
             tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
                 ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(m)?])?;
         }

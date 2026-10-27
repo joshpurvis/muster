@@ -1,4 +1,5 @@
 import {
+  asOf,
   formatAge,
   inheritedProfile,
   lastObserved,
@@ -136,4 +137,43 @@ Deno.test("missing or disabled profile bindings stay visible instead of appearin
     }
     equal(rejected, true);
   }
+});
+
+Deno.test("a snapshot that can't be refreshed expires its own figures and suggestion", () => {
+  const current = (at: number) =>
+    win({
+      status: "current",
+      used_percentage: 20,
+      resets_at: NOW / 1000 + 3600,
+      observed_at: at,
+      reported_at: at,
+    });
+  const usage: AccountUsage = {
+    evaluated_at: NOW,
+    stale_after_ms: 1_800_000,
+    rows: [
+      row({
+        choice: 2,
+        name: "Work",
+        account: "account-2",
+        five_hour: current(NOW),
+        seven_day: current(NOW),
+      }),
+    ],
+    suggestion: { choice: 2, name: "Work", choices: [2], reason: "Work used 20%." },
+    no_suggestion: null,
+  };
+  equal(asOf(usage, NOW + 60_000), usage);
+  // Past the stale age: stale, and no suggestion built on it.
+  const later = asOf({ ...usage, evaluated_at: NOW + 1_790_000 }, NOW + 1_800_001);
+  equal([later.rows[0].five_hour.status, later.suggestion], ["stale", null]);
+  equal(later.no_suggestion, "Work's usage is no longer current.");
+  // Past the reset: reset, whatever it said before.
+  equal(asOf(usage, NOW + 3_600_000).rows[0].five_hour.status, "reset");
+  // A snapshot nobody could refresh for minutes keeps no suggestion.
+  const old = asOf(usage, NOW + 200_000);
+  equal([old.suggestion, old.no_suggestion], [
+    null,
+    "Usage could not be refreshed from Muster, so nothing is suggested.",
+  ]);
 });

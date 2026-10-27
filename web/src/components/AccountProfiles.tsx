@@ -1,9 +1,10 @@
 import type { ComponentChildren } from "preact";
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { accountProfiles, accountProfilesSupported, accountUsage, toast } from "../state.ts";
 import { rpc } from "../rpc.ts";
 import type { AccountProfile, AccountUsage, ProfileChoice } from "../types.ts";
 import {
+  asOf,
   lastObserved,
   parseProfileChoice,
   sameChoice,
@@ -92,36 +93,38 @@ export function UsageTable({ usage, now, selected }: {
   );
 }
 
-/** The new-session flow's capacity table and suggestion. Choosing stays with the human. */
-function UsageHint({ value, onChange }: {
+/** The new-session flow's capacity table and suggestion. Choosing stays with the human: "Use"
+ * changes the picker and moves focus to it. The status region stays mounted, so screen readers
+ * hear the new text instead of losing it with a removed node. */
+function UsageHint({ value, onUse }: {
   value: ProfileChoice | undefined;
-  onChange: (choice: ProfileChoice | undefined) => void;
+  onUse: (choice: ProfileChoice) => void;
 }) {
   const now = useUsageClock();
-  const usage = accountUsage.value;
-  if (!usage) return null;
+  if (!accountUsage.value) return null;
+  const usage = asOf(accountUsage.value, now);
   const s = suggestionView(usage, value);
   return (
     <div class="usage-hint">
       <UsageTable usage={usage} now={now} selected={value} />
-      {s.kind === "switch" && (
-        <div class="usage-suggestion" role="status">
-          <span>
-            <strong>Suggested: {s.name}.</strong> {s.reason}
-          </span>
-          <button class="btn btn-sm" type="button" onClick={() => onChange(s.choice)}>
-            Use {s.name}
-          </button>
-        </div>
-      )}
-      {s.kind === "keep" && (
-        <p class="usage-suggestion" role="status">
+      <div class={cx("usage-suggestion", s.kind === "none" && "usage-none")} role="status">
+        {s.kind === "switch" && (
+          <>
+            <span>
+              <strong>Suggested: {s.name}.</strong> {s.reason}
+            </span>
+            <button class="btn btn-sm" type="button" onClick={() => onUse(s.choice)}>
+              Use {s.name}
+            </button>
+          </>
+        )}
+        {s.kind === "keep" && (
           <span>
             <strong>{s.name} has the most known room.</strong> {s.reason}
           </span>
-        </p>
-      )}
-      {s.kind === "none" && <p class="field-hint">{s.reason}</p>}
+        )}
+        {s.kind === "none" && <span>{s.reason}</span>}
+      </div>
     </div>
   );
 }
@@ -131,6 +134,7 @@ export function ProfileSelect({ value, onChange, disabled = false }: {
   onChange: (choice: ProfileChoice | undefined) => void;
   disabled?: boolean;
 }) {
+  const picker = useRef<HTMLSelectElement>(null);
   if (!accountProfilesSupported.value) return null;
   const profiles = accountProfiles.value;
   const missing = typeof value === "number" && !profiles.some((p) => p.id === value);
@@ -140,6 +144,7 @@ export function ProfileSelect({ value, onChange, disabled = false }: {
         <span class="field-label">Claude profile</span>
         <span class="profile-select">
           <select
+            ref={picker}
             value={value ?? "default"}
             disabled={disabled}
             onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
@@ -158,11 +163,19 @@ export function ProfileSelect({ value, onChange, disabled = false }: {
         <span class="field-hint">Verify your account with /status inside Claude Code.</span>
       </label>
       {/* Only where the choice is still open: an existing agent's profile is fixed. */}
-      {profiles.length > 0 && !disabled && <UsageHint value={value} onChange={onChange} />}
+      {profiles.length > 0 && !disabled && (
+        <UsageHint
+          value={value}
+          onUse={(choice) => {
+            onChange(choice);
+            // The button is about to disappear; keep focus on the choice it made.
+            picker.current?.focus();
+          }}
+        />
+      )}
     </div>
   );
 }
-
 type ModalT = (p: { children: ComponentChildren; class?: string; label: string }) => ComponentChildren;
 
 function ProfileRow({ profile }: { profile: AccountProfile }) {
@@ -280,16 +293,18 @@ function ProfileRow({ profile }: { profile: AccountProfile }) {
 /** The profiles dialog's usage overview, including Default. */
 function UsageSection() {
   const now = useUsageClock();
-  const usage = accountUsage.value;
   const [busy, setBusy] = useState(false);
-  if (!usage) return null;
+  if (!accountUsage.value) return null;
+  const usage = asOf(accountUsage.value, now);
   const forgetDefault = async () => {
     setBusy(true);
     try {
       accountUsage.value = await rpc.call<AccountUsage>("account_profile.login_changed", {
         account_profile: "default",
       });
-      toast("success", "Forgot Default's usage.");
+      // Profiles on Default's folder lose their same-account setting too.
+      accountProfiles.value = await rpc.call<AccountProfile[]>("account_profile.list", {});
+      toast("success", "Forgot the usage of Default's folder.");
     } catch (e) {
       toast("error", e instanceof Error ? e.message : String(e));
     } finally {

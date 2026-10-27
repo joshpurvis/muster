@@ -3,17 +3,21 @@
 //! runs").
 //!
 //! - Source: the documented status-line JSON, `rate_limits.five_hour` / `rate_limits.seven_day`
-//!   (`used_percentage` 0-100, `resets_at` Unix seconds). Muster's reporter (`muster statusline`,
-//!   src/statusline.rs) is the session's status-line command: it runs the user's own status line
-//!   unchanged and forwards only those numbers, authenticated by the run's session token.
-//! - Attribution: the daemon maps the token to its session, run (generation) and pinned profile.
-//!   Nothing in the payload names an account.
+//!   (`used_percentage` 0-100, `resets_at` Unix seconds). The session's status-line command runs
+//!   the user's own status line itself and hands a copy of the JSON to Muster's reporter
+//!   (`muster statusline`, src/statusline.rs), which forwards only those numbers, authenticated by
+//!   the run's session token.
+//! - Attribution: the daemon maps the token to its session and run (generation); the run's launch
+//!   record names the configuration folder it really used. Observations are filed per folder (one
+//!   folder, one login). Nothing in the payload names an account or a folder.
 //! - Freshness: Claude Code re-runs the status line for reasons other than new provider data (a
-//!   timer, a mode change, a reset passing), so a report counts as newly fetched only when the
-//!   run's API time advanced, its numbers changed, or it is the run's first report. Anything else
-//!   is a cached redraw: it never replaces or renews another observation.
+//!   timer, a mode change, a reset passing). A report is newly fetched data only when something
+//!   changed for its run (its first report, more API time, other numbers) and it carries the time
+//!   Claude Code last wrote the conversation; it is dated by that time, not by its arrival.
+//!   Anything else never replaces or renews another observation.
 //! - Unknown stays unknown: no observation, a stale one, an unconfirmed one or one whose reset has
-//!   passed never counts as headroom. Nothing here probes an account or reads a credential.
+//!   passed never counts as headroom. Nothing here probes an account or reads a credential; the
+//!   only file contents read are settings files, without following links (see `read_beneath`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,12 +57,6 @@ impl Window {
     pub fn from_key(key: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|w| w.key() == key)
     }
-    fn label(self) -> &'static str {
-        match self {
-            Window::FiveHour => "5-hour",
-            Window::SevenDay => "weekly",
-        }
-    }
 }
 
 /// One window as one report gave it.
@@ -75,10 +73,15 @@ pub struct Report {
     pub windows: BTreeMap<Window, Reading>,
     /// `cost.total_api_duration_ms`: grows with every API response of the run.
     pub api_ms: Option<f64>,
+    /// Unix ms when Claude Code last wrote the conversation (its transcript's modification
+    /// time, read by the reporter): no earlier than the API response these numbers came with.
+    /// The only evidence of when they were fetched; None: unknown.
+    pub data_at: Option<i64>,
 }
 
-/// Validate a reporter body (`{"rate_limits": {...}, "api_duration_ms": n}`). Each window is
-/// taken only when both of its numbers are plausible; anything else is dropped, not guessed.
+/// Validate a reporter body (`{"rate_limits": {...}, "api_duration_ms": n, "data_at": ms}`).
+/// Each window is taken only when both of its numbers are plausible; anything else is dropped,
+/// not guessed. A `data_at` in the future (beyond clock skew) or more than 8 days old is dropped.
 pub fn parse_report(body: &Value, now_ms: i64) -> Report {
     let now_s = now_ms / 1000;
     let mut windows = BTreeMap::new();
@@ -94,19 +97,22 @@ pub fn parse_report(body: &Value, now_ms: i64) -> Report {
         }
     }
     let api_ms = body.get("api_duration_ms").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0);
-    Report { windows, api_ms }
+    let data_at = body.get("data_at").and_then(Value::as_f64)
+        .filter(|t| t.is_finite() && *t > (now_ms - 8 * DAY_S * 1000) as f64 && *t <= (now_ms + 5_000) as f64)
+        .map(|t| (t as i64).min(now_ms));
+    Report { windows, api_ms, data_at }
 }
 
 /// The run (session and process generation) a report came from.
 pub type RunKey = (SessionId, u64);
 
-/// The newest usable observation of one window for one profile key.
+/// The newest usable observation of one window for one Claude configuration folder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
     #[serde(flatten)]
     pub reading: Reading,
-    /// Unix ms when a report carried newly fetched data. None: reported, but freshness was
-    /// never established (a cached redraw seen before any fresh report).
+    /// Unix ms when these numbers were newly fetched, as far as the evidence shows. None:
+    /// reported, but when they were fetched was never established.
     pub observed_at: Option<i64>,
     /// Unix ms of the newest callback that carried these numbers.
     pub reported_at: i64,
@@ -114,10 +120,15 @@ pub struct Observation {
     pub generation: u64,
 }
 
-/// What a run last reported, to tell new provider data from a redraw.
+/// One run of a Claude session: the configuration folder it was launched with (recorded at
+/// launch, so reports are filed under the folder that run really used) and what it last
+/// reported, to tell new provider data from a redraw.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunMemory {
     pub generation: u64,
+    /// Canonical; None when it could not be resolved at launch (its reports are then ignored).
+    #[serde(default)]
+    pub config_dir: Option<String>,
     pub api_ms: Option<f64>,
     pub last: BTreeMap<Window, Reading>,
 }
@@ -131,53 +142,65 @@ pub struct Applied {
     pub notify: bool,
 }
 
-/// Merge one report from run `run` into the stored observations of its profile key.
-pub fn apply(previous: Option<&RunMemory>, stored: &BTreeMap<Window, Observation>, run: RunKey,
-    report: &Report, now: i64) -> Applied {
-    let previous = previous.filter(|m| m.generation == run.1);
-    let api_advanced = matches!((previous.and_then(|m| m.api_ms), report.api_ms), (Some(a), Some(b)) if b > a);
-    let mut memory = previous.cloned().unwrap_or(RunMemory { generation: run.1, ..Default::default() });
+/// Merge one report from run `run` (whose launch record is `memory`) into the stored
+/// observations of its folder.
+///
+/// A window's report is newly fetched data only with both kinds of evidence: something changed
+/// for this run (its first report of the window, more API time, or different numbers) and the
+/// reporter's `data_at` says when. It is then dated `data_at`, not when it arrived, so a report
+/// delivered late (a lost callback, then a redraw an hour later) is as old as its data, and it
+/// replaces an observation only if not older than it. Without that evidence a report is kept
+/// only where nothing better exists, as "not confirmed fresh".
+pub fn apply(memory: &RunMemory, stored: &BTreeMap<Window, Observation>, run: RunKey, report: &Report, now: i64)
+    -> Applied {
+    let mut next = memory.clone();
+    let api_advanced = matches!((memory.api_ms, report.api_ms), (Some(a), Some(b)) if b > a);
     let mut out = Applied::default();
     for (&w, &reading) in &report.windows {
-        let last = previous.and_then(|m| m.last.get(&w));
-        let fresh = last.is_none() || api_advanced || last != Some(&reading);
+        let last = memory.last.get(&w);
+        let changed = last.is_none() || api_advanced || last != Some(&reading);
         let mine = |o: &Observation| (o.session_id, o.generation) == run;
-        match stored.get(&w) {
-            Some(o) if fresh && mine(o) && o.reading == reading
-                && o.observed_at.is_some_and(|t| now - t < RENEW_EVERY_MS) => {}
-            _ if fresh => {
-                let o = Observation { reading, observed_at: Some(now), reported_at: now, session_id: run.0, generation: run.1 };
-                out.updates.push((w, o));
+        let fetched = report.data_at.filter(|_| changed);
+        let observation = |observed_at| Observation { reading, observed_at, reported_at: now, session_id: run.0, generation: run.1 };
+        match (stored.get(&w), fetched) {
+            // Coalesce: the same numbers from the same run, dated within the renew interval.
+            (Some(o), Some(at)) if mine(o) && o.reading == reading
+                && o.observed_at.is_some_and(|t| (at - t).abs() < RENEW_EVERY_MS) => {}
+            (Some(o), Some(at)) if o.observed_at.is_some_and(|t| t > at) => {}
+            (_, Some(at)) => {
+                out.updates.push((w, observation(Some(at))));
                 out.notify = true;
             }
-            None => {
-                let o = Observation { reading, observed_at: None, reported_at: now, session_id: run.0, generation: run.1 };
-                out.updates.push((w, o));
+            (None, None) => {
+                out.updates.push((w, observation(None)));
                 out.notify = true;
             }
-            Some(o) if mine(o) && o.reading == reading && now - o.reported_at >= REPORTED_EVERY_MS => {
+            // This run's own newer numbers, without a date: newer than what it said before.
+            (Some(o), None) if mine(o) && o.reading != reading && changed => {
+                out.updates.push((w, observation(None)));
+                out.notify = true;
+            }
+            (Some(o), None) if mine(o) && o.reading == reading && now - o.reported_at >= REPORTED_EVERY_MS => {
                 out.updates.push((w, Observation { reported_at: now, ..o.clone() }));
             }
             // A redraw never replaces or renews another run's (or a newer) observation.
-            Some(_) => {}
+            (Some(_), None) => {}
         }
-        memory.last.insert(w, reading);
+        next.last.insert(w, reading);
     }
     if report.api_ms.is_some() {
-        memory.api_ms = report.api_ms;
+        next.api_ms = report.api_ms;
     }
-    if previous != Some(&memory) {
-        out.run = Some(memory);
+    if next != *memory {
+        out.run = Some(next);
     }
     out
 }
 
-/// Observations are stored under the profile the reporting session was pinned to.
-pub fn account_key(profile: Option<ProfileId>) -> String {
-    match profile {
-        Some(id) => format!("profile:{id}"),
-        None => "default".into(),
-    }
+/// Observations are filed under the configuration folder the reporting run used: one folder,
+/// one login, whichever profile (or Default) reached it.
+pub fn folder_key(config_dir: &str) -> String {
+    format!("dir:{config_dir}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,7 +236,8 @@ pub struct WindowView {
     pub resets_at: Option<i64>,
     pub observed_at: Option<i64>,
     pub reported_at: Option<i64>,
-    /// The profile whose session reported it, when that is another profile on the same account.
+    /// The profile whose folder it was reported for, when that is another profile on the same
+    /// account.
     pub reported_by: Option<String>,
 }
 
@@ -264,9 +288,10 @@ pub struct UsageSnapshot {
     pub no_suggestion: Option<String>,
 }
 
-/// Claude Code's folder for a session launched with `env` and no profile: `CLAUDE_CONFIG_DIR`,
-/// else `$HOME/.claude`, canonical. Only stat-like path resolution, never its contents.
-pub fn default_config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+/// The configuration folder Claude Code uses for a session launched with `env`:
+/// `CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, canonical. Path resolution only, never contents.
+/// With the daemon's environment it is the folder of Default.
+pub fn effective_config_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let dir = match env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         Some(d) => PathBuf::from(d),
         None => crate::account_profiles::launch_home(env)?.join(".claude"),
@@ -282,39 +307,44 @@ fn find(parent: &mut [usize], i: usize) -> usize {
 }
 
 /// The rows (Default first, then every profile), each with its account's newest observation
-/// per window, and a suggestion among the eligible ones.
+/// per window, and a suggestion among the eligible ones. `default_dir` is the folder new
+/// Default sessions would use now; observations filed under a folder no row uses are not shown.
 pub fn snapshot(profiles: &[AccountProfile], observations: &[(String, Window, Observation)],
     eligible: impl Fn(Option<ProfileId>) -> Result<(), String>, default_dir: Option<&Path>, now: i64) -> UsageSnapshot {
     // Row 0 is Default. Rows on one folder, or in one group the human declared, share an account.
     let n = profiles.len() + 1;
+    let dirs: Vec<Option<String>> = std::iter::once(default_dir.map(|d| d.to_string_lossy().into_owned()))
+        .chain(profiles.iter().map(|p| Some(p.config_dir.clone()))).collect();
     let mut parent: Vec<usize> = (0..n).collect();
     let union = |parent: &mut Vec<usize>, a: usize, b: usize| {
         let (ra, rb) = (find(parent, a), find(parent, b));
         if ra != rb { parent[ra.max(rb)] = ra.min(rb); }
     };
-    for (i, p) in profiles.iter().enumerate() {
-        if default_dir.is_some_and(|d| Path::new(&p.config_dir) == d) {
-            union(&mut parent, 0, i + 1);
+    for i in 1..n {
+        if let Some(j) = (0..i).find(|&j| dirs[j].is_some() && dirs[j] == dirs[i]) {
+            union(&mut parent, j, i);
         }
-        if let Some(g) = &p.account_group {
-            if let Some(j) = profiles[..i].iter().position(|q| q.account_group.as_ref() == Some(g)) {
-                union(&mut parent, j + 1, i + 1);
-            }
+        if let Some(g) = &profiles[i - 1].account_group
+            && let Some(j) = profiles[..i - 1].iter().position(|q| q.account_group.as_ref() == Some(g))
+        {
+            union(&mut parent, j + 1, i);
         }
     }
     let roots: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
     let name = |i: usize| if i == 0 { "Default".to_string() } else { profiles[i - 1].name.clone() };
-    let key = |i: usize| if i == 0 { account_key(None) } else { account_key(Some(profiles[i - 1].id)) };
+    let key = |i: usize| dirs[i].as_deref().map(folder_key);
     let rank = |o: &Observation| (o.observed_at.is_some(), o.observed_at, o.reported_at);
     let mut rows = Vec::with_capacity(n);
     for i in 0..n {
         let members: Vec<usize> = (0..n).filter(|&j| roots[j] == roots[i]).collect();
         let view = |w: Window| {
             let best = observations.iter()
-                .filter(|(k, ow, _)| *ow == w && members.iter().any(|&j| key(j) == *k))
+                .filter(|(k, ow, _)| *ow == w && members.iter().any(|&j| key(j).as_deref() == Some(k.as_str())))
                 .max_by_key(|(_, _, o)| rank(o));
             let Some((k, _, o)) = best else { return WindowView::unknown() };
-            let by = members.iter().copied().find(|&j| key(j) == *k).filter(|&j| j != i).map(name);
+            let by = (key(i).as_deref() != Some(k.as_str()))
+                .then(|| members.iter().copied().find(|&j| key(j).as_deref() == Some(k.as_str())).map(name))
+                .flatten();
             WindowView { status: status(o, now), used_percentage: Some(o.reading.used_percentage),
                 resets_at: Some(o.reading.resets_at), observed_at: o.observed_at, reported_at: Some(o.reported_at),
                 reported_by: by }
@@ -398,61 +428,207 @@ pub fn suggest(rows: &[UsageRow]) -> Result<Suggestion, String> {
 
 // ----- composing with the user's own status line -----
 
-/// The `statusLine` object Claude Code would use for a session launched with `env` in `cwd`,
-/// were it not for Muster's own `--settings`: the first of the project's local settings, its
-/// shared settings and the user's settings that sets one. Managed settings outrank `--settings`
-/// and are left alone. Only the `statusLine` key is kept: the rest of each file is parsed past
-/// and dropped, never stored, logged or sent.
-pub fn user_status_line(env: &BTreeMap<String, String>, cwd: &Path) -> Option<Map<String, Value>> {
-    let user_dir = match env.get("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => Some(PathBuf::from(d)),
-        None => crate::account_profiles::launch_home(env).map(|h| h.join(".claude")),
+/// The largest settings file read (Claude Code's own are a few KiB).
+const MAX_SETTINGS: u64 = 1 << 20;
+
+/// Read `rel` (plain names, no separators) beneath the canonical folder `base` without following
+/// a link anywhere below `base`: each folder and the file are opened with `O_NOFOLLOW`, the file
+/// must be a regular file with a single link and at most `max` bytes. `Ok(None)`: it does not
+/// exist. `Err`: it exists but could not be read safely (a link, a special file, too large ...):
+/// the caller must not guess what it says. A name that looks like a credentials file is refused
+/// outright, whatever it points at.
+fn read_beneath(base: &Path, rel: &[&str], max: u64) -> Result<Option<Vec<u8>>, String> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let shown = || rel.iter().fold(base.to_path_buf(), |p, c| p.join(c)).display().to_string();
+    if !base.is_absolute()
+        || rel.is_empty()
+        || rel.iter().any(|c| c.is_empty() || *c == "." || *c == ".." || c.contains('/') || c.contains('\0')
+            || c.to_ascii_lowercase().contains("credential"))
+    {
+        return Err(format!("refusing to read {}", shown()));
+    }
+    let at = |dir: libc::c_int, name: &[u8], flags: libc::c_int| -> std::io::Result<OwnedFd> {
+        let c = std::ffi::CString::new(name).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+        // SAFETY: a valid NUL-terminated path and flags; the result is checked before use.
+        let fd = unsafe { libc::openat(dir, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
     };
-    let files = [Some(cwd.join(".claude/settings.local.json")), Some(cwd.join(".claude/settings.json")),
-        user_dir.map(|d| d.join("settings.json"))];
-    files.into_iter().flatten().find_map(|f| status_line_of(&f))
+    let fail = |e: std::io::Error| -> Result<Option<Vec<u8>>, String> {
+        match e.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(format!("{} is or passes through a link", shown())),
+            _ => Err(format!("{}: {e}", shown())),
+        }
+    };
+    let mut dir = match at(libc::AT_FDCWD, base.as_os_str().as_bytes(), libc::O_RDONLY | libc::O_DIRECTORY) {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let (last, folders) = rel.split_last().expect("not empty");
+    for folder in folders {
+        dir = match at(dir.as_raw_fd(), folder.as_bytes(), libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(d) => d,
+            Err(e) => return fail(e),
+        };
+    }
+    // Non-blocking, so a FIFO planted under the name can't hang the launch.
+    let file = match at(dir.as_raw_fd(), last.as_bytes(), libc::O_RDONLY | libc::O_NONBLOCK) {
+        Ok(f) => std::fs::File::from(f),
+        Err(e) => return fail(e),
+    };
+    let meta = file.metadata().map_err(|e| format!("{}: {e}", shown()))?;
+    if !meta.is_file() || meta.nlink() != 1 || meta.len() > max {
+        return Err(format!("{} is not a plain file of at most {max} bytes", shown()));
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", shown()))?;
+    if bytes.len() as u64 > max {
+        return Err(format!("{} grew past {max} bytes", shown()));
+    }
+    Ok(Some(bytes))
 }
 
-fn status_line_of(file: &Path) -> Option<Map<String, Value>> {
+/// What one settings file says about the status line. `Err`: it exists but could not be read
+/// safely or parsed, so what Claude Code will show is unknown.
+fn status_line_in(base: &Path, rel: &[&str]) -> Result<Option<Map<String, Value>>, String> {
     #[derive(Deserialize)]
     struct OnlyStatusLine {
         #[serde(rename = "statusLine")]
         status_line: Option<Value>,
     }
-    use std::io::Read;
-    let mut text = String::new();
-    std::fs::File::open(file).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
-    match serde_json::from_str::<OnlyStatusLine>(&text).ok()?.status_line? {
-        Value::Object(o) => Some(o),
-        _ => None,
+    let Some(bytes) = read_beneath(base, rel, MAX_SETTINGS)? else { return Ok(None) };
+    let parsed: OnlyStatusLine = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} is not valid settings JSON: {e}", base.join(rel.join("/")).display()))?;
+    match parsed.status_line {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(o)) => Ok(Some(o)),
+        Some(_) => Err(format!("{}: statusLine is not an object", base.join(rel.join("/")).display())),
     }
 }
 
-/// The status-line command for a session: Muster's reporter, which runs `inner` (the user's own
-/// command) with the same input and prints exactly its output. If the Muster binary is gone
-/// (an old run after an update), the user's command runs directly instead.
+/// Where Claude Code keeps the project's local settings for a session started in `cwd`
+/// (docs: settings, "Where Claude Code keeps the local file in a git repository", read
+/// 2026-10-26): the repository root, or for a linked worktree the main checkout's root; but
+/// `cwd` itself outside a git repository, when that root is the home folder, or when the root,
+/// its `.git` or its `.claude` is not owned by this user. Found by reading `.git` entries, never
+/// by running git (a repository's own git config could run commands). `Err`: unsure.
+fn local_settings_root(cwd: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let Some((top, git)) = cwd.ancestors().find_map(|d| std::fs::symlink_metadata(d.join(".git")).ok().map(|m| (d, m)))
+    else {
+        return Ok(cwd.to_path_buf());
+    };
+    let root = if git.is_dir() {
+        top.to_path_buf()
+    } else if git.is_file() {
+        // A linked worktree (or a submodule): "gitdir: <path>"; a worktree's git folder names
+        // the shared one in `commondir`.
+        let text = read_beneath(top, &[".git"], 4096)?.unwrap_or_default();
+        let text = String::from_utf8_lossy(&text);
+        let gitdir = text.trim().strip_prefix("gitdir:").map(str::trim).filter(|g| !g.is_empty())
+            .ok_or_else(|| format!("{} is not a gitdir file", top.join(".git").display()))?;
+        let gitdir = std::fs::canonicalize(top.join(gitdir)).map_err(|e| format!("{gitdir}: {e}"))?;
+        match read_beneath(&gitdir, &["commondir"], 4096)? {
+            None => top.to_path_buf(),
+            Some(common) => {
+                let common = String::from_utf8_lossy(&common);
+                let common = std::fs::canonicalize(gitdir.join(common.trim())).map_err(|e| format!("commondir: {e}"))?;
+                // A worktree of a bare repository has no main checkout: unsure.
+                if common.file_name() != Some(std::ffi::OsStr::new(".git")) {
+                    return Err(format!("{} belongs to a repository without a main checkout", cwd.display()));
+                }
+                common.parent().map(Path::to_path_buf).ok_or("no main checkout")?
+            }
+        }
+    } else {
+        return Err(format!("{} is neither a folder nor a file", top.join(".git").display()));
+    };
+    let root = std::fs::canonicalize(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let me = unsafe { libc::geteuid() };
+    let owned = |p: &Path, required: bool| match std::fs::symlink_metadata(p) {
+        Ok(m) => m.uid() == me,
+        Err(_) => !required,
+    };
+    if home.is_some_and(|h| h == root) || !owned(&root, true) || !owned(&root.join(".git"), true)
+        || !owned(&root.join(".claude"), false)
+    {
+        return Ok(cwd.to_path_buf());
+    }
+    Ok(root)
+}
+
+/// The `statusLine` object Claude Code would use for a session launched with `env` in `cwd`,
+/// were it not for Muster's own `--settings`, in Claude Code's precedence (docs: settings,
+/// "Settings precedence", read 2026-10-26): project local settings (at the repository root,
+/// then a file an older version left in `cwd`), shared project settings in `cwd`, then the
+/// user settings of the session's configuration folder. Managed settings outrank `--settings`
+/// and are left alone. Only the `statusLine` key is kept: the rest of each file is parsed past
+/// and dropped, never stored, logged or sent. Nothing is read through a link (see
+/// [`read_beneath`]). `Ok(None)`: no status line of the user's own. `Err`: unsure, so Muster
+/// must leave the session's status line alone.
+pub fn user_status_line(env: &BTreeMap<String, String>, cwd: &Path) -> Result<Option<Map<String, Value>>, String> {
+    let cwd = std::fs::canonicalize(cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
+    let home = crate::account_profiles::launch_home(env).and_then(|h| std::fs::canonicalize(h).ok());
+    let local_root = local_settings_root(&cwd, home.as_deref())?;
+    let mut files: Vec<(PathBuf, [&str; 2])> = vec![(local_root.clone(), [".claude", "settings.local.json"])];
+    if local_root != cwd {
+        files.push((cwd.clone(), [".claude", "settings.local.json"]));
+    }
+    files.push((cwd.clone(), [".claude", "settings.json"]));
+    for (base, rel) in &files {
+        if let Some(line) = status_line_in(base, rel)? {
+            return Ok(Some(line));
+        }
+    }
+    // A configuration folder that doesn't exist has no settings for Claude Code either.
+    match effective_config_dir(env) {
+        Some(dir) => status_line_in(&dir, &["settings.json"]),
+        None => Ok(None),
+    }
+}
+
+/// The status-line command for a session. The shell runs the user's own command itself, with
+/// the same input, as the last step (`exec`, so its output and exit code are Claude Code's), and
+/// hands a copy of the input to Muster's reporter in the background with its output discarded.
+/// Whatever happens to the reporter (an older Muster binary that has no `statusline`, a missing
+/// binary, a crash, a slow backend), the user's line is unaffected. Without a user command
+/// only the reporter runs, and the line is empty.
 pub fn reporter_command(muster_bin: &Path, inner: Option<&str>) -> String {
     use crate::adapters::claude::sh_quote;
     let bin = sh_quote(&muster_bin.to_string_lossy());
     match inner.filter(|c| !c.trim().is_empty()) {
-        Some(cmd) => {
-            let cmd = sh_quote(cmd);
-            format!("if [ -x {bin} ]; then exec {bin} statusline claude {cmd}; else exec /bin/sh -c {cmd}; fi")
-        }
-        None => format!("[ -x {bin} ] && exec {bin} statusline claude; exit 0"),
+        // The here-document's body is the literal `$input`, expanded once: a payload line can't
+        // end it early or be run.
+        Some(cmd) => format!(
+            "input=$(cat)\nprintf '%s\\n' \"$input\" | {bin} statusline claude >/dev/null 2>&1 &\n\
+             exec /bin/sh -c {} <<MUSTER_STATUS_INPUT\n$input\nMUSTER_STATUS_INPUT\n",
+            sh_quote(cmd)
+        ),
+        None => format!("{bin} statusline claude >/dev/null 2>&1; exit 0"),
     }
 }
 
 /// Add the reporter to the session's own Claude settings file (written by the adapter), keeping
-/// every option of the user's status line (padding, refresh interval, ...) as it was. Never fails
-/// a launch: usage reporting is optional, so an error is only logged.
+/// every option of the user's status line (padding, refresh interval, ...) as it was. When the
+/// user's status line can't be determined safely, or is not a command, the session's status
+/// line is left entirely to Claude Code (no usage from it). Never fails a launch: an error is
+/// only logged.
 pub fn install_reporter(settings: &Path, muster_bin: &Path, env: &BTreeMap<String, String>, cwd: &Path) {
     if std::env::var("MUSTER_USAGE_REPORTER").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")) {
         return;
     }
     let result = (|| -> anyhow::Result<()> {
-        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(settings)?)?;
-        let user = user_status_line(env, cwd);
+        let user = match user_status_line(env, cwd) {
+            Ok(user) => user,
+            Err(why) => {
+                tracing::info!("leaving the status line to Claude Code: {why}");
+                return Ok(());
+            }
+        };
         let inner = user.as_ref()
             .filter(|o| o.get("type").and_then(Value::as_str).is_none_or(|t| t == "command"))
             .and_then(|o| o.get("command")).and_then(Value::as_str).map(str::to_string);
@@ -460,6 +636,7 @@ pub fn install_reporter(settings: &Path, muster_bin: &Path, env: &BTreeMap<Strin
             // A kind of status line Muster can't run itself: leave it showing, report nothing.
             return Ok(());
         }
+        let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(settings)?)?;
         let mut line = user.unwrap_or_default();
         line.insert("type".into(), json!("command"));
         line.insert("command".into(), json!(reporter_command(muster_bin, inner.as_deref())));
@@ -478,24 +655,30 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
     const RESET: i64 = NOW / 1000 + 4 * 3600;
+    const HOUR: i64 = 60 * 60 * 1000;
 
-    fn report(five: Option<f64>, seven: Option<f64>, api: Option<f64>) -> Report {
+    fn report(five: Option<f64>, seven: Option<f64>, api: Option<f64>, data_at: Option<i64>) -> Report {
         let mut windows = BTreeMap::new();
         if let Some(v) = five { windows.insert(Window::FiveHour, Reading { used_percentage: v, resets_at: RESET }); }
         if let Some(v) = seven { windows.insert(Window::SevenDay, Reading { used_percentage: v, resets_at: RESET + 86_400 }); }
-        Report { windows, api_ms: api }
+        Report { windows, api_ms: api, data_at }
     }
 
-    /// Feed reports through `apply` like the store does.
+    /// Feed reports through `apply` like the store does (each run's launch record first).
     struct Account { stored: BTreeMap<Window, Observation>, runs: BTreeMap<SessionId, RunMemory> }
     impl Account {
         fn new() -> Self { Account { stored: BTreeMap::new(), runs: BTreeMap::new() } }
         fn feed(&mut self, run: RunKey, r: &Report, now: i64) -> bool {
-            let a = apply(self.runs.get(&run.0), &self.stored, run, r, now);
+            let memory = self.runs.entry(run.0).or_default();
+            if memory.generation != run.1 {
+                *memory = RunMemory { generation: run.1, config_dir: Some("/c".into()), ..Default::default() };
+            }
+            let a = apply(memory, &self.stored, run, r, now);
             if let Some(m) = a.run { self.runs.insert(run.0, m); }
             for (w, o) in a.updates { self.stored.insert(w, o); }
             a.notify
         }
+        fn five(&self) -> &Observation { &self.stored[&Window::FiveHour] }
     }
 
     #[test]
@@ -503,84 +686,108 @@ mod tests {
         let body = json!({"rate_limits": {
             "five_hour": {"used_percentage": 23.5, "resets_at": RESET},
             "seven_day": {"used_percentage": 141.0, "resets_at": RESET},
-            "spend_limit": {"used_percentage": 10, "resets_at": RESET}}, "api_duration_ms": 1200});
+            "spend_limit": {"used_percentage": 10, "resets_at": RESET}}, "api_duration_ms": 1200, "data_at": NOW - 5});
         let r = parse_report(&body, NOW);
         assert_eq!(r.windows.len(), 1);
         assert_eq!(r.windows[&Window::FiveHour], Reading { used_percentage: 23.5, resets_at: RESET });
-        assert_eq!(r.api_ms, Some(1200.0));
+        assert_eq!((r.api_ms, r.data_at), (Some(1200.0), Some(NOW - 5)));
         for bad in [json!({}), json!("x"), json!({"rate_limits": {"five_hour": {"used_percentage": 5}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": "5", "resets_at": RESET}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 12}}}),
             json!({"rate_limits": {"five_hour": {"used_percentage": -1, "resets_at": RESET}}})] {
             assert!(parse_report(&bad, NOW).windows.is_empty(), "{bad}");
         }
+        // A data time from the future (beyond skew) or long ago is no evidence; slight skew is clamped.
+        for (at, want) in [(NOW + 60_000, None), (NOW - 9 * 24 * HOUR, None), (NOW + 2000, Some(NOW))] {
+            assert_eq!(parse_report(&json!({"data_at": at}), NOW).data_at, want, "{at}");
+        }
     }
 
     #[test]
-    fn a_runs_first_report_is_fresh_and_redraws_do_not_renew_it() {
+    fn fresh_reports_are_dated_by_their_data_and_redraws_do_not_renew_them() {
         let mut a = Account::new();
-        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), NOW));
-        assert_eq!(a.stored[&Window::FiveHour].observed_at, Some(NOW));
-        // A timer redraw an hour later: same numbers, no new API time.
-        let later = NOW + 60 * 60 * 1000;
-        assert!(!a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0)), later));
-        let o = &a.stored[&Window::FiveHour];
-        assert_eq!(o.observed_at, Some(NOW), "a redraw must not renew freshness");
-        assert_eq!(o.reported_at, later);
-        assert_eq!(status(o, later), Status::Stale);
+        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(NOW - 2000)), NOW));
+        assert_eq!(a.five().observed_at, Some(NOW - 2000), "dated by the data, not by arrival");
+        // A timer redraw an hour later: same numbers, no new API time, though the transcript moved.
+        let later = NOW + HOUR;
+        assert!(!a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(later)), later));
+        assert_eq!(a.five().observed_at, Some(NOW - 2000), "a redraw must not renew freshness");
+        assert_eq!(a.five().reported_at, later);
+        assert_eq!(status(a.five(), later), Status::Stale);
         // New API time: newly fetched, even though the numbers are unchanged.
-        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(900.0)), later + 1));
-        assert_eq!(a.stored[&Window::FiveHour].observed_at, Some(later + 1));
+        assert!(a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(900.0), Some(later + 1)), later + 1));
+        assert_eq!(a.five().observed_at, Some(later + 1));
+    }
+
+    /// A run's first report lost (a backend reload), then a redraw an hour later: its numbers are
+    /// an hour old and must read as such, never as current.
+    #[test]
+    fn a_first_report_delivered_late_is_as_old_as_its_data() {
+        let mut a = Account::new();
+        a.feed((1, 1), &report(Some(20.0), Some(40.0), Some(500.0), Some(NOW)), NOW + HOUR);
+        assert_eq!(a.five().observed_at, Some(NOW));
+        assert_eq!(status(a.five(), NOW + HOUR), Status::Stale);
+        // Without any date, a first report is kept but never current.
+        let mut b = Account::new();
+        assert!(b.feed((1, 1), &report(Some(20.0), None, Some(500.0), None), NOW));
+        assert_eq!(status(b.five(), NOW), Status::Unconfirmed);
+        // A later dated report from the same run confirms it.
+        b.feed((1, 1), &report(Some(21.0), None, Some(600.0), Some(NOW + 10)), NOW + 10);
+        assert_eq!(status(b.five(), NOW + 10), Status::Current);
     }
 
     #[test]
-    fn an_idle_sessions_redraw_never_replaces_a_newer_observation() {
+    fn an_idle_sessions_report_never_replaces_a_newer_observation() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW);
-        a.feed((2, 1), &report(Some(60.0), Some(50.0), Some(100.0)), NOW + 1000);
-        assert_eq!(a.stored[&Window::FiveHour].session_id, 2);
+        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
+        a.feed((2, 1), &report(Some(60.0), Some(50.0), Some(100.0), Some(NOW + 1000)), NOW + 1000);
+        assert_eq!(a.five().session_id, 2);
         // Session 1 redraws its old numbers: they stay ignored.
-        assert!(!a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW + 5000));
-        assert_eq!(a.stored[&Window::FiveHour].reading.used_percentage, 60.0);
-        assert_eq!(a.stored[&Window::FiveHour].reported_at, NOW + 1000);
+        assert!(!a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW + 5000)), NOW + 5000));
+        assert_eq!(a.five().reading.used_percentage, 60.0);
+        assert_eq!(a.five().reported_at, NOW + 1000);
+        // Session 3's first report arrives now but its data is older than session 2's: kept out.
+        assert!(!a.feed((3, 1), &report(Some(5.0), Some(5.0), Some(1.0), Some(NOW + 500)), NOW + 6000));
+        assert_eq!(a.five().session_id, 2);
         // Session 1 gets a reply: its newer numbers win.
-        assert!(a.feed((1, 1), &report(Some(65.0), Some(51.0), Some(400.0)), NOW + 9000));
-        assert_eq!(a.stored[&Window::FiveHour].session_id, 1);
+        assert!(a.feed((1, 1), &report(Some(65.0), Some(51.0), Some(400.0), Some(NOW + 9000)), NOW + 9000));
+        assert_eq!(a.five().session_id, 1);
     }
 
     #[test]
     fn partial_reports_keep_each_windows_own_time() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW);
-        a.feed((1, 1), &report(Some(15.0), None, Some(200.0)), NOW + 60_000);
-        assert_eq!(a.stored[&Window::FiveHour].observed_at, Some(NOW + 60_000));
+        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
+        a.feed((1, 1), &report(Some(15.0), None, Some(200.0), Some(NOW + 60_000)), NOW + 60_000);
+        assert_eq!(a.five().observed_at, Some(NOW + 60_000));
         assert_eq!(a.stored[&Window::SevenDay].observed_at, Some(NOW), "an absent window keeps its own time");
         assert_eq!(a.stored[&Window::SevenDay].reading.used_percentage, 30.0);
     }
 
     #[test]
-    fn a_new_run_starts_fresh_and_a_seen_redraw_is_unconfirmed_without_evidence() {
+    fn a_seen_redraw_is_unconfirmed_and_a_new_run_starts_over() {
         let mut a = Account::new();
-        a.runs.insert(1, RunMemory { generation: 1, api_ms: Some(5.0),
+        a.runs.insert(1, RunMemory { generation: 1, config_dir: Some("/c".into()), api_ms: Some(5.0),
             last: BTreeMap::from([(Window::FiveHour, Reading { used_percentage: 70.0, resets_at: RESET })]) });
-        // Same run, same numbers, but nothing stored yet (e.g. cleared by a login change).
-        assert!(a.feed((1, 1), &report(Some(70.0), None, Some(5.0)), NOW));
-        assert_eq!(a.stored[&Window::FiveHour].observed_at, None);
-        assert_eq!(status(&a.stored[&Window::FiveHour], NOW), Status::Unconfirmed);
-        // The session's next run (a restart) counts as new.
-        assert!(a.feed((1, 2), &report(Some(70.0), None, Some(5.0)), NOW + 10));
-        assert_eq!(a.stored[&Window::FiveHour].observed_at, Some(NOW + 10));
+        // Same run, same numbers, but nothing stored (e.g. cleared by a login change).
+        assert!(a.feed((1, 1), &report(Some(70.0), None, Some(5.0), Some(NOW)), NOW));
+        assert_eq!(a.five().observed_at, None);
+        assert_eq!(status(a.five(), NOW), Status::Unconfirmed);
+        // The session's next run (a restart) has its own first report.
+        assert!(a.feed((1, 2), &report(Some(70.0), None, Some(5.0), Some(NOW + 10)), NOW + 10));
+        assert_eq!(a.five().observed_at, Some(NOW + 10));
     }
 
     #[test]
     fn duplicates_are_coalesced() {
         let mut a = Account::new();
-        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW);
+        a.feed((1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW);
+        let memory = a.runs[&1].clone();
         // A fresh report with the same numbers within the renew interval writes nothing.
-        let r = apply(a.runs.get(&1), &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(150.0)), NOW + 1000);
+        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(150.0), Some(NOW + 1000)), NOW + 1000);
         assert!(r.updates.is_empty() && !r.notify);
         assert_eq!(r.run.unwrap().api_ms, Some(150.0));
-        let r = apply(a.runs.get(&1), &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(100.0)), NOW + 1000);
+        let r = apply(&memory, &a.stored, (1, 1), &report(Some(10.0), Some(30.0), Some(100.0), Some(NOW)), NOW + 1000);
         assert_eq!(r, Applied::default());
     }
 
@@ -605,17 +812,17 @@ mod tests {
         [(Window::FiveHour, o(five, RESET)), (Window::SevenDay, o(seven, RESET + 86_400))]
     }
 
-    fn with_key(key: &str, list: [(Window, Observation); 2]) -> Vec<(String, Window, Observation)> {
-        list.into_iter().map(|(w, o)| (key.to_string(), w, o)).collect()
+    fn filed(dir: &str, list: [(Window, Observation); 2]) -> Vec<(String, Window, Observation)> {
+        list.into_iter().map(|(w, o)| (folder_key(dir), w, o)).collect()
     }
 
     #[test]
     fn suggestion_needs_current_usage_and_never_counts_unknown_as_room() {
         let profiles = [profile(1, "Personal", "/p", None), profile(2, "Work", "/w", None)];
         let ok = |_: Option<ProfileId>| Ok(());
-        let mut o = with_key("profile:1", obs(92.0, 70.0, NOW - 60_000, 1));
-        o.extend(with_key("profile:2", obs(25.0, 40.0, NOW - 240_000, 2)));
-        let s = snapshot(&profiles, &o, ok, None, NOW);
+        let mut o = filed("/p", obs(92.0, 70.0, NOW - 60_000, 1));
+        o.extend(filed("/w", obs(25.0, 40.0, NOW - 240_000, 2)));
+        let s = snapshot(&profiles, &o, ok, Some(Path::new("/d")), NOW);
         assert_eq!(s.rows[0].name, "Default");
         assert_eq!(s.rows[0].five_hour.status, Status::Unknown);
         let sug = s.suggestion.unwrap();
@@ -630,7 +837,7 @@ mod tests {
         assert!(s.suggestion.is_none());
         assert!(s.no_suggestion.unwrap().contains("90%"));
         // Only one window known for Work: no claim of more room.
-        let partial: Vec<_> = o.iter().filter(|(k, w, _)| k != "profile:2" || *w == Window::FiveHour).cloned().collect();
+        let partial: Vec<_> = o.iter().filter(|(k, w, _)| k != "dir:/w" || *w == Window::FiveHour).cloned().collect();
         let s = snapshot(&profiles, &partial, ok, None, NOW);
         assert!(s.suggestion.is_none(), "{:?}", s.suggestion);
         // Nothing known at all.
@@ -640,90 +847,240 @@ mod tests {
 
     #[test]
     fn shared_accounts_count_once_and_ineligible_rows_are_skipped() {
-        let dir = std::env::temp_dir().join(format!("muster-usage-{}", crate::paths::random_token()));
-        std::fs::create_dir(&dir).unwrap();
-        let canonical = std::fs::canonicalize(&dir).unwrap();
-        let profiles = [profile(1, "Main", canonical.to_str().unwrap(), None), profile(2, "Work", "/w", Some("g")),
+        let profiles = [profile(1, "Main", "/home/u/.claude", None), profile(2, "Work", "/w", Some("g")),
             profile(3, "Work laptop", "/w2", Some("g"))];
         // Default and Main share a folder; Work and Work laptop were declared one account.
-        let mut o = with_key("default", obs(50.0, 50.0, NOW - 1000, 1));
-        o.extend(with_key("profile:3", obs(10.0, 20.0, NOW - 2000, 3)));
-        let s = snapshot(&profiles, &o, |_| Ok(()), Some(&canonical), NOW);
+        let mut o = filed("/home/u/.claude", obs(50.0, 50.0, NOW - 1000, 1));
+        o.extend(filed("/w2", obs(10.0, 20.0, NOW - 2000, 3)));
+        let default = Some(Path::new("/home/u/.claude"));
+        let s = snapshot(&profiles, &o, |_| Ok(()), default, NOW);
         assert_eq!(s.rows[1].account, s.rows[0].account);
-        assert_eq!(s.rows[1].five_hour.used_percentage, Some(50.0));
-        assert_eq!(s.rows[1].five_hour.reported_by.as_deref(), Some("Default"));
+        assert_eq!((s.rows[0].five_hour.used_percentage, s.rows[1].five_hour.used_percentage), (Some(50.0), Some(50.0)));
+        assert_eq!(s.rows[1].five_hour.reported_by, None, "the same folder: its own figure");
         assert_eq!(s.rows[2].five_hour.used_percentage, Some(10.0));
+        assert_eq!(s.rows[2].five_hour.reported_by.as_deref(), Some("Work laptop"));
         assert_eq!(s.rows[2].same_account_as, vec!["Work laptop".to_string()]);
         let sug = s.suggestion.unwrap();
         assert_eq!(sug.choice, ProfileChoice::Id(2));
         assert_eq!(sug.choices, vec![ProfileChoice::Id(2), ProfileChoice::Id(3)]);
         // Work's account can't start tasks: the shared Default/Main account is the only one left.
         let s = snapshot(&profiles, &o, |id| if matches!(id, Some(2 | 3)) { Err("disabled".into()) } else { Ok(()) },
-            Some(&canonical), NOW);
+            default, NOW);
         assert!(s.no_suggestion.unwrap().contains("Only one Claude account"));
         assert_eq!(s.rows[2].ineligible_reason.as_deref(), Some("disabled"));
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Default's figures belong to the folder its sessions ran with: after the backend restarts
+    /// with another CLAUDE_CONFIG_DIR, Default shows the new folder's (unknown), not the old one's.
+    #[test]
+    fn default_shows_only_the_folder_it_uses_now() {
+        let o = filed("/old", obs(50.0, 50.0, NOW - 1000, 1));
+        let s = snapshot(&[], &o, |_| Ok(()), Some(Path::new("/old")), NOW);
+        assert_eq!(s.rows[0].five_hour.used_percentage, Some(50.0));
+        let s = snapshot(&[], &o, |_| Ok(()), Some(Path::new("/new")), NOW);
+        assert_eq!(s.rows[0].five_hour.status, Status::Unknown);
+        let s = snapshot(&[], &o, |_| Ok(()), None, NOW);
+        assert_eq!(s.rows[0].five_hour.status, Status::Unknown);
+    }
+
+    // ----- reading the user's status line -----
+
+    struct Tree(PathBuf);
+    impl Tree {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("muster-usage-sl-{}", crate::paths::random_token()));
+            std::fs::create_dir_all(&p).unwrap();
+            Tree(std::fs::canonicalize(p).unwrap())
+        }
+        fn write(&self, rel: &str, text: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+            p
+        }
+        fn dir(&self, rel: &str) -> PathBuf {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn line(cmd: &str) -> String {
+        format!(r#"{{"statusLine": {{"type": "command", "command": "{cmd}"}}}}"#)
+    }
+
+    fn cmd_of(r: Result<Option<Map<String, Value>>, String>) -> Option<String> {
+        r.unwrap().map(|o| o["command"].as_str().unwrap().to_string())
     }
 
     #[test]
-    fn reporter_composes_with_the_users_status_line() {
-        let base = std::env::temp_dir().join(format!("muster-usage-sl-{}", crate::paths::random_token()));
-        let (home, proj) = (base.join("home"), base.join("proj"));
-        std::fs::create_dir_all(home.join(".claude")).unwrap();
-        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+    fn the_users_status_line_is_found_where_claude_code_looks() {
+        let t = Tree::new();
+        let home = t.dir("home");
         let env = BTreeMap::from([("HOME".to_string(), home.to_string_lossy().to_string())]);
-        assert_eq!(user_status_line(&env, &proj), None);
-        std::fs::write(home.join(".claude/settings.json"),
-            r#"{"env": {"SECRET": "x"}, "statusLine": {"type": "command", "command": "bash ~/sl.sh", "padding": 2, "refreshInterval": 5}}"#).unwrap();
-        let user = user_status_line(&env, &proj).unwrap();
-        assert_eq!(user["command"], "bash ~/sl.sh");
-        // A profile folder replaces ~/.claude; project settings outrank both.
-        let profile = base.join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::write(profile.join("settings.json"), r#"{"statusLine": {"type": "command", "command": "work-line"}}"#).unwrap();
+        let proj = t.dir("proj");
+        assert_eq!(cmd_of(user_status_line(&env, &proj)), None);
+        t.write("home/.claude/settings.json",
+            r#"{"env": {"SECRET": "x"}, "statusLine": {"type": "command", "command": "user-line", "padding": 2}}"#);
+        assert_eq!(cmd_of(user_status_line(&env, &proj)).as_deref(), Some("user-line"));
+        // A profile folder replaces ~/.claude.
+        let profile = t.dir("profile");
+        t.write("profile/settings.json", &line("work-line"));
         let mut penv = env.clone();
         penv.insert("CLAUDE_CONFIG_DIR".into(), profile.to_string_lossy().to_string());
-        assert_eq!(user_status_line(&penv, &proj).unwrap()["command"], "work-line");
-        std::fs::write(proj.join(".claude/settings.json"), r#"{"statusLine": {"type": "command", "command": "proj-line"}}"#).unwrap();
-        std::fs::write(proj.join(".claude/settings.local.json"), "not json").unwrap();
-        assert_eq!(user_status_line(&penv, &proj).unwrap()["command"], "proj-line");
-        std::fs::remove_file(proj.join(".claude/settings.json")).unwrap();
+        assert_eq!(cmd_of(user_status_line(&penv, &proj)).as_deref(), Some("work-line"));
+        // Outside git, both project files are in cwd; local outranks shared, which outranks user.
+        t.write("proj/.claude/settings.json", &line("proj-line"));
+        assert_eq!(cmd_of(user_status_line(&penv, &proj)).as_deref(), Some("proj-line"));
+        t.write("proj/.claude/settings.local.json", &line("local-line"));
+        assert_eq!(cmd_of(user_status_line(&penv, &proj)).as_deref(), Some("local-line"));
+        // A local file Claude Code would reject: unsure, so Muster stays out of it.
+        t.write("proj/.claude/settings.local.json", "not json");
+        assert!(user_status_line(&penv, &proj).is_err());
+    }
 
-        let settings = base.join("claude-settings.json");
-        std::fs::write(&settings, r#"{"hooks": {}}"#).unwrap();
+    #[test]
+    fn local_settings_live_at_the_repository_root_or_the_main_checkout() {
+        let t = Tree::new();
+        let env = BTreeMap::from([("HOME".to_string(), t.dir("home").to_string_lossy().to_string())]);
+        t.dir("repo/.git");
+        let sub = t.dir("repo/src/deep");
+        t.write("repo/src/deep/.claude/settings.json", &line("shared-in-cwd"));
+        t.write("repo/.claude/settings.json", &line("shared-at-root"));
+        // The shared file comes from cwd, never the root.
+        assert_eq!(cmd_of(user_status_line(&env, &sub)).as_deref(), Some("shared-in-cwd"));
+        // A local file an older version left in cwd still applies, below the root's.
+        t.write("repo/src/deep/.claude/settings.local.json", &line("old-local"));
+        assert_eq!(cmd_of(user_status_line(&env, &sub)).as_deref(), Some("old-local"));
+        t.write("repo/.claude/settings.local.json", &line("root-local"));
+        assert_eq!(cmd_of(user_status_line(&env, &sub)).as_deref(), Some("root-local"));
+        // A linked worktree reads the main checkout's local file.
+        let main = t.0.join("repo");
+        t.write("repo/.git/worktrees/wt/commondir", "../..\n");
+        t.write("wt/.git", &format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()));
+        let wt = t.0.join("wt");
+        assert_eq!(cmd_of(user_status_line(&env, &wt)).as_deref(), Some("root-local"));
+        t.write("wt/.claude/settings.local.json", &line("wt-local"));
+        assert_eq!(cmd_of(user_status_line(&env, &wt)).as_deref(), Some("root-local"), "the main checkout's wins");
+        // A worktree of a bare repository: Claude Code's choice is unknown, so unsure.
+        t.write("bare.git/worktrees/b/commondir", "../..\n");
+        t.write("b/.git", &format!("gitdir: {}\n", t.0.join("bare.git/worktrees/b").display()));
+        assert!(user_status_line(&env, &t.0.join("b")).is_err());
+        // A repository whose root is the home folder keeps the local file in cwd.
+        let henv = BTreeMap::from([("HOME".to_string(), main.to_string_lossy().to_string())]);
+        assert_eq!(cmd_of(user_status_line(&henv, &sub)).as_deref(), Some("old-local"));
+    }
+
+    /// A repository can't make Muster read through a link: not a linked settings file (say, to a
+    /// credentials file), not a linked `.claude` folder, not a FIFO, nothing oversized.
+    #[test]
+    fn settings_are_never_read_through_links() {
+        use std::os::unix::fs::symlink;
+        let t = Tree::new();
+        let env = BTreeMap::from([("HOME".to_string(), t.dir("home").to_string_lossy().to_string())]);
+        let secret = t.write("secrets/.credentials.json", r#"{"statusLine": {"type": "command", "command": "leaked"}}"#);
+        let proj = t.dir("proj");
+        symlink(&secret, t.dir("proj/.claude").join("settings.json")).unwrap();
+        let err = user_status_line(&env, &proj).unwrap_err();
+        assert!(err.contains("link") && !err.contains("leaked"), "{err}");
+        // A linked .claude folder.
+        let proj2 = t.dir("proj2");
+        symlink(t.0.join("secrets"), proj2.join(".claude")).unwrap();
+        assert!(user_status_line(&env, &proj2).unwrap_err().contains("link"));
+        // A FIFO under the name doesn't hang, a hard link or a huge file is refused.
+        let proj3 = t.dir("proj3/.claude");
+        let fifo = std::ffi::CString::new(proj3.join("settings.json").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(user_status_line(&env, &t.0.join("proj3")).is_err());
+        std::fs::remove_file(proj3.join("settings.json")).unwrap();
+        std::fs::hard_link(&secret, proj3.join("settings.json")).unwrap();
+        assert!(user_status_line(&env, &t.0.join("proj3")).is_err());
+        std::fs::remove_file(proj3.join("settings.json")).unwrap();
+        std::fs::write(proj3.join("settings.json"), " ".repeat(MAX_SETTINGS as usize + 1)).unwrap();
+        assert!(user_status_line(&env, &t.0.join("proj3")).is_err());
+        // Names that look like credentials are refused outright.
+        assert!(read_beneath(&t.0, &["secrets", ".credentials.json"], 1024).is_err());
+        assert!(read_beneath(&t.0, &["..", "x"], 1024).is_err());
+
+        // Unsure means the session's status line is left to Claude Code entirely.
+        let settings = t.write("claude-settings.json", r#"{"hooks": {}}"#);
+        install_reporter(&settings, Path::new("/opt/muster"), &env, &proj);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), r#"{"hooks": {}}"#);
+    }
+
+    #[test]
+    fn the_reporter_keeps_every_option_of_the_users_line() {
+        let t = Tree::new();
+        let home = t.dir("home");
+        let env = BTreeMap::from([("HOME".to_string(), home.to_string_lossy().to_string())]);
+        let proj = t.dir("proj");
+        t.write("home/.claude/settings.json",
+            r#"{"env": {"SECRET": "x"}, "statusLine": {"type": "command", "command": "bash ~/sl.sh", "padding": 2, "refreshInterval": 5}}"#);
+        let settings = t.write("claude-settings.json", r#"{"hooks": {}}"#);
         let bin = Path::new("/opt/my muster/muster");
         install_reporter(&settings, bin, &env, &proj);
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(doc["hooks"], json!({}));
-        assert_eq!(doc["statusLine"]["padding"], 2);
-        assert_eq!(doc["statusLine"]["refreshInterval"], 5);
-        assert_eq!(doc["statusLine"]["command"],
-            "if [ -x '/opt/my muster/muster' ]; then exec '/opt/my muster/muster' statusline claude 'bash ~/sl.sh'; else exec /bin/sh -c 'bash ~/sl.sh'; fi");
+        assert_eq!((&doc["statusLine"]["padding"], &doc["statusLine"]["refreshInterval"]), (&json!(2), &json!(5)));
+        assert_eq!(doc["statusLine"]["command"], reporter_command(bin, Some("bash ~/sl.sh")));
         assert!(!std::fs::read_to_string(&settings).unwrap().contains("SECRET"));
         // No status line of the user's own: the reporter alone, which prints nothing.
         std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
         install_reporter(&settings, bin, &env, &proj);
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(doc["statusLine"], json!({"type": "command",
-            "command": "[ -x '/opt/my muster/muster' ] && exec '/opt/my muster/muster' statusline claude; exit 0"}));
-        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(doc["statusLine"], json!({"type": "command", "command": reporter_command(bin, None)}));
+        // A status line that isn't a command is left showing as it is.
+        t.write("home/.claude/settings.json", r#"{"statusLine": {"type": "something-else"}}"#);
+        std::fs::write(&settings, r#"{"hooks": {}}"#).unwrap();
+        install_reporter(&settings, bin, &env, &proj);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), r#"{"hooks": {}}"#);
     }
 
-    /// The composed command runs the user's line even when the Muster binary is missing.
+    /// Run the composed command like Claude Code: `/bin/sh -c`, the payload on stdin.
+    fn run_line(cmd: &str, input: &str) -> std::process::Output {
+        use std::io::Write;
+        let mut c = std::process::Command::new("/bin/sh").arg("-c").arg(cmd)
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        c.wait_with_output().unwrap()
+    }
+
+    /// Whatever the reporter binary does (missing, an older Muster that rejects `statusline`, a
+    /// crash), the user's line shows exactly as it would without Muster, exit code included.
     #[test]
-    fn a_missing_reporter_binary_falls_back_to_the_users_command() {
-        let cmd = reporter_command(Path::new("/nonexistent/muster"), Some("cat; echo ' line'"));
-        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&cmd)
-            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-            .spawn().and_then(|mut c| {
-                use std::io::Write;
-                c.stdin.take().unwrap().write_all(b"input")?;
-                c.wait_with_output()
-            }).unwrap();
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "input line\n");
-        let none = reporter_command(Path::new("/nonexistent/muster"), None);
-        let out = std::process::Command::new("/bin/sh").arg("-c").arg(&none).output().unwrap();
-        assert!(out.status.success() && out.stdout.is_empty());
+    fn the_users_line_never_depends_on_the_reporter() {
+        let t = Tree::new();
+        let got = t.0.join("reporter-got");
+        let older = t.write("older-muster", "#!/bin/sh\necho \"error: unrecognized subcommand 'statusline'\" >&2\nexit 2\n");
+        let working = t.write("muster", &format!("#!/bin/sh\ncat > {}\n", got.display()));
+        for p in [&older, &working] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let user = "cat; echo ' line'; exit 3";
+        // A payload that tries to end the here-document early or run something.
+        let input = "{\"a\": \"MUSTER_STATUS_INPUT\\n$(touch pwned) `touch pwned2` \\\\ \"}";
+        for bin in [Path::new("/nonexistent/muster"), older.as_path(), working.as_path()] {
+            let out = run_line(&reporter_command(bin, Some(user)), input);
+            assert_eq!(out.status.code(), Some(3), "{bin:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{input}\n line\n"), "{bin:?}");
+            assert!(out.stderr.is_empty(), "{bin:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        assert!(!Path::new("pwned").exists() && !Path::new("pwned2").exists());
+        // The working reporter got the same payload.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&got).map_or(true, |s| s.is_empty()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), format!("{input}\n"));
+        // Without a user command: an empty line that never fails.
+        for bin in [Path::new("/nonexistent/muster"), older.as_path()] {
+            let out = run_line(&reporter_command(bin, None), input);
+            assert!(out.status.success() && out.stdout.is_empty(), "{bin:?}");
+        }
     }
 }

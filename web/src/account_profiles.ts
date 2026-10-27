@@ -106,6 +106,41 @@ export function lastObserved(row: UsageRow, now: number): string {
 export const sameChoice = (a: ProfileChoice | undefined, b: ProfileChoice | undefined) =>
   (a ?? "default") === (b ?? "default");
 
+/** A suggestion older than this is dropped: the window refreshes every minute, so an older one
+ * means the backend could not be reached. */
+export const SUGGESTION_TTL_MS = 150_000;
+
+/** The snapshot as it stands at `now`, judged from its own timestamps: a window whose reset
+ * passed reads as reset, a current one past the stale age as stale, and a suggestion that is
+ * too old, or whose account is no longer current, is dropped. So a window that can't refresh
+ * never keeps showing an expired figure as current, or a suggestion built on one. */
+export function asOf(usage: AccountUsage, now: number): AccountUsage {
+  const age = (w: UsageWindow): UsageWindow => {
+    if (w.status === "unknown" || w.status === "reset") return w;
+    if (w.resets_at != null && w.resets_at * 1000 <= now) return { ...w, status: "reset" };
+    if (w.status === "current" && w.observed_at != null && now - w.observed_at > usage.stale_after_ms) {
+      return { ...w, status: "stale" };
+    }
+    return w;
+  };
+  const rows = usage.rows.map((r) => ({ ...r, five_hour: age(r.five_hour), seven_day: age(r.seven_day) }));
+  const s = usage.suggestion;
+  if (!s) return { ...usage, rows };
+  if (now - usage.evaluated_at > SUGGESTION_TTL_MS) {
+    return {
+      ...usage,
+      rows,
+      suggestion: null,
+      no_suggestion: "Usage could not be refreshed from Muster, so nothing is suggested.",
+    };
+  }
+  const basis = rows.find((r) => sameChoice(r.choice, s.choice));
+  if (!basis || basis.five_hour.status !== "current" || basis.seven_day.status !== "current") {
+    return { ...usage, rows, suggestion: null, no_suggestion: `${s.name}'s usage is no longer current.` };
+  }
+  return { ...usage, rows };
+}
+
 export type SuggestionView =
   | { kind: "keep"; name: string; reason: string }
   | { kind: "switch"; name: string; reason: string; choice: ProfileChoice }

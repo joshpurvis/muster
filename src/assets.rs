@@ -274,9 +274,12 @@ fn index(source: &Source, req: &HeaderMap) -> Response {
 }
 
 /// The phone UI (docs/ANDROID.md) is its own app under `/m/`, served with a strict CSP (the
-/// desktop page keeps an inline theme script, so it doesn't get one).
-const MOBILE_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; \
-     img-src 'self' data:; manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'";
+/// desktop page keeps an inline theme script, so it doesn't get one). `'wasm-unsafe-eval'` lets
+/// the terminal's image add-on compile its bundled WebAssembly decoder (Sixel); it allows no
+/// JavaScript eval and no script from anywhere but this origin.
+const MOBILE_CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+     style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; \
+     worker-src 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 fn mobile(source: &Source, path: &str, req: &HeaderMap) -> Response {
     let last = path.rsplit('/').next().unwrap_or("");

@@ -6,6 +6,14 @@
 //! [-- <initial prompt>]`. The sandbox flags come from the channel's permission profile
 //! (`sandbox_args`). All settings are `-c` overrides for this process only;
 //! `~/.codex/config.toml` is never touched.
+//! - Resume: a run the hub gives a thread (`SpawnCtx::resume`; saved outside the stored
+//!   arguments, which older backends must keep accepting) launches `codex resume <the same
+//!   flags> -- <thread id> [<initial prompt>]`. Checked against `codex resume --help` of
+//!   codex-cli 0.164.0: the subcommand takes every flag Muster passes (`-c`, `--sandbox`, `-m`,
+//!   `-i`, `--no-alt-screen`) after it, then `[SESSION_ID] [PROMPT]`. A thread Codex no longer
+//!   has makes it print "No saved session found with ID <id>. …" (that string is in the 0.164.0
+//!   binary) and exit; only that message makes Muster forget the thread
+//!   (`adapters::says_conversation_missing`).
 //! - approvals: `approval_policy="on-request"` and `approvals_reviewer="auto_review"` give
 //!   new sessions the approval behavior of `--approve-for-me`. That shorthand conflicts with
 //!   `--sandbox`, so use its settings directly to preserve the channel's selected sandbox.
@@ -120,6 +128,11 @@ fn first_line(v: Option<&Value>, max: usize) -> Option<String> {
     }
     Some(clip(s.lines().next().unwrap_or(s), max))
 }
+
+/// The subcommand that reopens a saved conversation (`codex resume [OPTIONS] [SESSION_ID]
+/// [PROMPT]`). It comes first, so anything Muster adds to a launch goes after it.
+pub const RESUME: &str = "resume";
+
 
 /// Codex fires notify for its internal "generate a title" request too.
 pub(crate) fn is_title_generation(payload: &Value) -> bool {
@@ -260,19 +273,26 @@ impl Adapter for CodexAdapter {
 
     fn command(&self, ctx: &SpawnCtx) -> anyhow::Result<CommandSpec> {
         let bin = ctx.muster_bin.to_string_lossy();
+        let resume = ctx.resume.clone();
+        anyhow::ensure!(resume.as_deref().is_none_or(crate::agents::valid_resume_id), "not a Codex thread id: {resume:?}");
+        let extra = ctx.extra_args.iter().cloned();
         let mut args = Vec::new();
+        if resume.is_some() {
+            args.push(RESUME.to_string());
+        }
         for o in config_overrides(&bin, &ctx.daemon_url, hooks_enabled()) {
             args.push("-c".to_string());
             args.push(o);
         }
         args.extend(sandbox_args(ctx.permissions.codex_sandbox));
-        args.extend(ctx.extra_args.iter().cloned());
-        let mut consumed = false;
-        if let Some(p) = ctx.initial_prompt.as_ref().filter(|p| !p.trim().is_empty()) {
+        args.extend(extra);
+        let prompt = ctx.initial_prompt.as_ref().filter(|p| !p.trim().is_empty());
+        if resume.is_some() || prompt.is_some() {
             args.push("--".to_string());
-            args.push(p.clone());
-            consumed = true;
         }
+        args.extend(resume);
+        let consumed = prompt.is_some();
+        args.extend(prompt.cloned());
         Ok(CommandSpec {
             program: "codex".to_string(),
             args,
@@ -612,6 +632,7 @@ mod tests {
                 codex_sandbox: sandbox,
                 claude_mode: ClaudeMode::Bypass,
             },
+            resume: None,
         }
     }
 
@@ -676,6 +697,50 @@ mod tests {
                 .any(|w| w[0] == "-c" && w[1] == "sandbox_workspace_write.network_access=true")
         );
         assert!(!spec.consumed_initial_prompt);
+    }
+
+    #[test]
+    fn resume_builds_the_resume_subcommand_with_every_flag_after_it() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let id = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let launch_from = |extra: &[&str], resume: Option<&str>, prompt: Option<&str>| {
+            let mut c = ctx(CodexSandbox::WorkspaceWrite, prompt);
+            c.extra_args = s(extra);
+            c.resume = resume.map(str::to_string);
+            CodexAdapter.command(&c).unwrap()
+        };
+        let launch = |extra: &[&str], prompt: Option<&str>| launch_from(extra, Some(id), prompt);
+        let spec = launch(&["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"], None);
+        let a = &spec.args;
+        assert_eq!(a[0], "resume", "the subcommand comes first: {a:?}");
+        assert_eq!(&a[a.len() - 2..], &["--", id]);
+        // Muster's own flags, the sandbox profile and the model/effort all still apply.
+        assert!(a.windows(2).any(|w| w[0] == "-c" && w[1].starts_with("notify=")));
+        assert!(a.windows(2).any(|w| w[0] == "-c" && w[1].starts_with("mcp_servers.muster.url=")));
+        assert!(a.windows(2).any(|w| w == ["--sandbox", "workspace-write"]));
+        assert!(a.windows(2).any(|w| w == ["-c", "sandbox_workspace_write.network_access=false"]));
+        assert!(a.windows(2).any(|w| w == ["-m", "gpt-6-sol"]) && a.windows(2).any(|w| w == ["-c", "model_reasoning_effort=xhigh"]));
+        assert!(a.windows(2).any(|w| w == ["-c", "approval_policy=\"on-request\""]));
+        assert!(!a.iter().any(|x| x.starts_with("--resume")), "never passed to Codex as a flag");
+        assert!(!spec.consumed_initial_prompt);
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, a), Some(Some(id.to_string())));
+        // An initial prompt follows the thread id.
+        let spec = launch(&["-i", "a.png", "b.png"], Some("go on"));
+        assert_eq!(spec.args[0], "resume");
+        assert_eq!(&spec.args[spec.args.len() - 6..], &["-i", "a.png", "b.png", "--", id, "go on"]);
+        assert!(spec.consumed_initial_prompt);
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, &spec.args), Some(Some(id.to_string())));
+        // Without a thread nothing changes.
+        let spec = launch_from(&["--model", "x"], None, Some("hi"));
+        assert_ne!(spec.args[0], "resume");
+        assert_eq!(&spec.args[spec.args.len() - 4..], &["--model", "x", "--", "hi"]);
+        assert_eq!(crate::adapters::resumed_in_launch(SessionKind::Codex, &spec.args), None);
+        let spec = launch_from(&[], None, None);
+        assert!(!spec.args.iter().any(|x| x == "resume" || x == "--"));
+        // A bad id never reaches a command line.
+        let mut c = ctx(CodexSandbox::ReadOnly, None);
+        c.resume = Some("--sandbox".into());
+        assert!(CodexAdapter.command(&c).is_err());
     }
 
     #[test]

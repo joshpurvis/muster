@@ -3,7 +3,7 @@ import { needsHuman, type SessionInfo, STATE_LABEL } from "../types.ts";
 import { relativeTime, sessionOrder } from "./logic.ts";
 import { channels, openSession, ready, sessions } from "./store.ts";
 import { NewTabButton, NewTabLayer } from "./NewTab.tsx";
-import { Approval, ConnectionDot, Settings, StateDot } from "./ui.tsx";
+import { AlertBanner, Approval, ConnectionDot, Settings, StateDot } from "./ui.tsx";
 
 function SessionRow({ session: s, now }: { session: SessionInfo; now: number }) {
   return (
@@ -44,6 +44,7 @@ export function Sessions() {
         <Settings />
       </header>
       <div class="session-list">
+        <AlertBanner />
         <div class="list-heading">
           <h2>
             Sessions <span>{live.length}</span>

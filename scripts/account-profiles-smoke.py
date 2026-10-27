@@ -29,28 +29,49 @@ ENV = {
     "PATH": f"{FAKEBIN}:/usr/bin:/bin", "HOME": str(FIXTURE_HOME), "SHELL": "/bin/bash", "LANG": "C.UTF-8",
     "MUSTER_RUNTIME_DIR": str(RUNTIME), "MUSTER_DATA_DIR": str(DATA), "MUSTER_PORT": str(PORT),
     "CLAUDE_CONFIG_DIR": str(BASE / "default"), "PROFILE_LAUNCH_LOG": str(BASE / "launches.jsonl"),
+    "STATUSLINE_DIR": str(BASE / "statusline"),
 }
+(BASE / "statusline").mkdir(mode=0o700)
 if "--browser" in sys.argv:
     assert (PROJECT / "web/dist/app.js").is_file(), "deno task web first"
     ENV["MUSTER_WEB_DIR"] = str(PROJECT / "web/dist")
 
-# The stand-in logs only known fixture values, never a real environment or credential.
+# The stand-in logs only known fixture values, never a real environment or credential. Like
+# Claude Code, it runs the status-line command from its --settings file through /bin/sh with a
+# JSON payload on stdin: here whenever the test drops <STATUSLINE_DIR>/<session>.json.
 (FAKEBIN / "claude").write_text('''#!/usr/bin/python3
-import json, os, sys, time
+import json, os, subprocess, sys, time
 row = {"id": int(os.environ["MUSTER_SESSION_ID"]), "pid": os.getpid(),
        "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"), "args": sys.argv[1:]}
 fd = os.open(os.environ["PROFILE_LAUNCH_LOG"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
 os.write(fd, (json.dumps(row) + "\\n").encode())
 os.close(fd)
 print("FAKE_CLAUDE " + json.dumps(row), flush=True)
-while True: time.sleep(60)
+args = sys.argv[1:]
+settings = args[args.index("--settings") + 1] if "--settings" in args else None
+trigger = os.path.join(os.environ["STATUSLINE_DIR"], f"{row['id']}.json")
+while True:
+    if settings and os.path.exists(trigger):
+        data = open(trigger, "rb").read()
+        os.unlink(trigger)
+        command = json.load(open(settings))["statusLine"]["command"]
+        p = subprocess.run(["/bin/sh", "-c", command], input=data, capture_output=True, timeout=10)
+        with open(trigger[:-5] + ".out", "a") as out:
+            out.write(json.dumps({"stdout": p.stdout.decode(), "code": p.returncode}) + "\\n")
+    time.sleep(0.05)
 ''')
 (FAKEBIN / "claude").chmod(0o700)
 for name in ("personal", "work", "default", "ui"):
     (BASE / name).mkdir(mode=0o700)
     # Deliberately not an authentication document. Registering and launching must leave it alone.
     (BASE / name / ".credentials.json").write_text("fixture: this is not a credential\n")
-sentinels = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in BASE.glob("*/.credentials.json")}
+# Each profile's own status line, which Muster's reporter must keep showing (exit code included).
+(BASE / "personal" / "settings.json").write_text(json.dumps(
+    {"statusLine": {"type": "command", "command": "cat > /dev/null; echo HOME-USER-LINE; exit 3"}}))
+(BASE / "work" / "settings.json").write_text(json.dumps(
+    {"env": {"FIXTURE": "not read"}, "statusLine": {"type": "command", "command": "cat > /dev/null; echo WORK-USER-LINE", "padding": 1}}))
+sentinels = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+             for p in [*BASE.glob("*/.credentials.json"), *BASE.glob("*/settings.json")]}
 current, token = None, None
 logs = []
 checks = 0
@@ -135,6 +156,24 @@ def launched(sid, pid=None):
     return until(f"fake Claude launch {sid}", find)
 
 
+def status_line(sid, payload):
+    """Have session `sid`'s fake Claude run its status line once with `payload`."""
+    out = BASE / "statusline" / f"{sid}.out"
+    before = len(out.read_text().splitlines()) if out.exists() else 0
+    tmp = BASE / "statusline" / f"{sid}.tmp"
+    tmp.write_text(json.dumps(payload))
+    tmp.rename(BASE / "statusline" / f"{sid}.json")
+
+    def done():
+        lines = out.read_text().splitlines() if out.exists() else []
+        return json.loads(lines[-1]) if len(lines) > before else None
+    return until(f"status line of session {sid}", done)
+
+
+def usage_row(name):
+    return next(r for r in rpc("account_usage.get")["rows"] if r["name"] == name)
+
+
 def spawn(channel, **params):
     result = rpc("session.spawn", {"channel_id": channel, "kind": "claude", **params})
     launched(result["id"], result["pid"])
@@ -189,8 +228,10 @@ try:
     # Feed only the existing Muster hook protocol; this is not a provider authentication file.
     mcp = json.loads((DATA / "sessions" / str(named["id"]) / "claude-mcp.json").read_text())
     run_token = mcp["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
-    status, _ = http("/hook/SessionStart", {"session_id": "fixture-conversation"}, run_token)
-    assert status == 200
+    # Claude resumes a conversation only once a turn ended in it (Stop), not on SessionStart alone.
+    for event in ("SessionStart", "Stop"):
+        status, _ = http(f"/hook/{event}", {"session_id": "fixture-conversation"}, run_token)
+        assert status == 200, event
     resumed = rpc("session.restart", {"id": named["id"]})
     named_run = launched(named["id"], resumed["pid"])
     check(named_run["config_dir"] == str(BASE / "personal") and "fixture-conversation" in named_run["args"],
@@ -210,6 +251,82 @@ try:
     replacement = rpc("agent.start", {"name": "reviewer"})["session"]
     check(replacement["account_profile_id"] == personal and "fixture-conversation" in launched(replacement["id"])["args"],
           "named-agent replacement session retains profile and resume ID")
+
+    # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
+    now = int(time.time())
+
+    def run_start(api=0):
+        # Before a run's first API response: no rate limits yet, only its API time.
+        return {"session_id": "fixture-conversation", "cwd": str(REPO),
+                "cost": {"total_api_duration_ms": api, "total_cost_usd": 0}}
+
+    def limits(five, seven, api, five_reset=None):
+        return {**run_start(api), "account": "Work",
+                "rate_limits": {"five_hour": {"used_percentage": five, "resets_at": five_reset or now + 3 * 3600},
+                                "seven_day": {"used_percentage": seven, "resets_at": now + 4 * 86400}}}
+
+    def settled():
+        # The reporter runs beside the user's line and posts within 600 ms.
+        time.sleep(1)
+    work_line = json.loads((DATA / "sessions" / str(b["id"]) / "claude-settings.json").read_text())["statusLine"]
+    check(work_line["padding"] == 1 and "statusline claude" in work_line["command"]
+          and "WORK-USER-LINE" in work_line["command"] and "FIXTURE" not in json.dumps(work_line),
+          "a session's status line wraps its profile's own one, options kept, nothing else copied")
+    check(rpc("account_usage.get")["no_suggestion"] and usage_row("Work")["five_hour"]["status"] == "unknown",
+          "before any report every account is unknown and nothing is suggested")
+    # A run's first numbers are only confirmed fresh against an earlier report's API time.
+    for sid in (a["id"], b["id"], legacy["id"]):
+        status_line(sid, run_start())
+    settled()
+    check(usage_row("Work")["five_hour"]["status"] == "unknown", "a report without numbers shows nothing")
+    check(status_line(b["id"], limits(25, 40, 100)) == {"stdout": "WORK-USER-LINE\n", "code": 0},
+          "the user's status line output is shown unchanged")
+    check(status_line(a["id"], limits(92, 70, 100)) == {"stdout": "HOME-USER-LINE\n", "code": 3},
+          "the user's status line exit code passes through")
+    check(status_line(legacy["id"], limits(50, 50, 10, five_reset=now + 3)) == {"stdout": "", "code": 0},
+          "without a status line of its own a session shows an empty one")
+    until("the three reports", lambda: usage_row("Work")["five_hour"]["status"] == "current"
+          and usage_row("Home")["seven_day"]["status"] == "current"
+          and usage_row("Default")["seven_day"]["status"] == "current")
+    work_row, home_row = usage_row("Work"), usage_row("Home")
+    check(work_row["five_hour"]["used_percentage"] == 25 and home_row["seven_day"]["used_percentage"] == 70
+          and usage_row("Default")["seven_day"]["used_percentage"] == 50,
+          "reports are filed under each run's own folder, not a label in the payload")
+    usage = rpc("account_usage.get")
+    check(usage["suggestion"]["name"] == "Work" and "Work used 25%" in usage["suggestion"]["reason"],
+          "the suggestion names the account with the most known room and why")
+    seen = home_row["five_hour"]["observed_at"]
+    status_line(a["id"], limits(92, 70, 100))
+    settled()
+    check(usage_row("Home")["five_hour"]["observed_at"] == seen,
+          "a redraw of the same numbers does not renew freshness")
+    check(http("/usage/claude", limits(1, 1, 1))[0] == 401 and http("/usage/claude", limits(1, 1, 1), "forged")[0] == 401,
+          "only a session token can report usage")
+    cli("profile", "login-changed", "Home")
+    check(usage_row("Home")["five_hour"]["status"] == "unknown", "a login change forgets the profile's usage")
+    status_line(a["id"], limits(92, 70, 100))
+    until("Home's redraw", lambda: usage_row("Home")["five_hour"]["status"] == "unconfirmed")
+    check(True, "an old redraw seen afterwards is kept as unconfirmed, not as fresh")
+    until("Default's 5-hour window to reset", lambda: usage_row("Default")["five_hour"]["status"] == "reset")
+    check(True, "a passed reset reads as unknown, not as zero")
+    text = cli("profile", "usage")
+    check("Suggested for a new task: Work" in text and "unknown (reset" in text and "not confirmed fresh" in text,
+          "muster profile usage prints the table and the suggestion")
+    cli("profile", "same-account", "Home", "Work")
+    home_row = usage_row("Home")
+    check(home_row["same_account_as"] == ["Work"] and home_row["five_hour"]["reported_by"] == "Work"
+          and rpc("account_usage.get")["suggestion"]["choices"] == [personal, work],
+          "profiles declared to be one account share one set of numbers")
+    cli("profile", "same-account", "Home")
+    check(usage_row("Home")["same_account_as"] == [], "a profile can be its own account again")
+    # A repository whose settings file links to a credentials file: never read, and the
+    # session's status line is left to Claude Code.
+    (REPO / ".claude").mkdir(exist_ok=True)
+    (REPO / ".claude" / "settings.json").symlink_to(BASE / "personal" / ".credentials.json")
+    linked = spawn(ch, account_profile=work)
+    check("statusLine" not in json.loads((DATA / "sessions" / str(linked["id"]) / "claude-settings.json").read_text()),
+          "a linked project settings file is not followed; the status line is left alone")
+    (REPO / ".claude" / "settings.json").unlink()
     if "--browser" in sys.argv:
         with socket.socket() as reserve:
             reserve.bind(("127.0.0.1", 0))

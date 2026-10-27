@@ -32,6 +32,8 @@
   --st-starting: #8a8a96;
   --st-working: #4ea1ff;
   --st-attn: #f0a020;
+  /* Warning-coloured text (>= 4.5:1 on every surface). */
+  --warn-text: #f0a020;
   --st-idle: #3fb950;
   --st-error: #f85149;
   /* Filled destructive buttons: white 13px labels need 4.5:1 (#f85149 gives 3.35:1). */
@@ -101,6 +103,8 @@
   --st-starting: #8a8a96;
   --st-working: #1f7ae0;
   --st-attn: #c77a00;
+  /* Warning-coloured text (>= 4.5:1 on every surface; --st-attn is 3.4:1 on white). */
+  --warn-text: #8a5400;
   --st-idle: #1f9d3a;
   --st-error: #d92d20;
   --danger-fill: #d92d20;
@@ -3498,6 +3502,143 @@ textarea {
   overflow-wrap: anywhere;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* Claude usage (src/usage.rs): only a current figure reads as a plain number. */
+.profile-field,
+.usage-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.profile-row .profile-account-row.field-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.usage-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+.usage-table thead th {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-2);
+  white-space: nowrap;
+}
+
+.usage-table tbody th {
+  font-weight: 500;
+  /* A long profile name wraps instead of squeezing the figures. */
+  max-width: 11rem;
+}
+
+.usage-table tr.on {
+  background: var(--accent-softer);
+}
+
+.usage-table tr.on .usage-name {
+  color: var(--accent-strong);
+}
+
+.usage-main {
+  display: block;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-detail,
+.usage-note {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.usage-uncertain .usage-main {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.usage-high .usage-main {
+  color: var(--warn-text);
+}
+
+.usage-name {
+  overflow-wrap: anywhere;
+}
+
+.usage-seen {
+  color: var(--text-muted);
+}
+
+.usage-off .usage-name {
+  color: var(--text-muted);
+}
+
+/* Stays mounted (a live region); only its content changes. Empty when there is nothing to say. */
+.usage-suggestion:empty {
+  display: none;
+}
+
+/* The text takes the room; the button wraps below it on narrow dialogs or with long names. */
+.usage-suggestion {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 10px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--accent-softer);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.usage-suggestion.usage-none {
+  padding: 0;
+  background: none;
+  color: var(--text-muted);
+}
+
+.usage-suggestion > span {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.usage-suggestion .btn {
+  flex: 0 1 auto;
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .field-row {

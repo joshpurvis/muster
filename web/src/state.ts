@@ -5,6 +5,7 @@
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AccountProfile,
+  AccountUsage,
   Agent,
   AgentMessage,
   AgentState,
@@ -69,6 +70,8 @@ export const meta = signal({ version: "", home: "", default_shell: "", login_she
 export const workspaces = signal<Workspace[]>([]);
 export const accountProfiles = signal<AccountProfile[]>([]);
 export const accountProfilesSupported = signal(false);
+/** `hello.account_usage`, then `account_usage_changed` (and refreshes while it is on screen). */
+export const accountUsage = signal<AccountUsage | null>(null);
 /** `hello.openrouter`: null when the backend has no OpenRouter support. */
 export const openRouter = signal<{ key_present: boolean } | null>(null);
 export const channels = signal<Channel[]>([]);
@@ -793,6 +796,7 @@ export function applyHello(h: HelloResult) {
     workspaces.value = [...h.workspaces].sort((a, b) => a.created_at - b.created_at || a.id - b.id);
     accountProfiles.value = h.account_profiles ?? [];
     accountProfilesSupported.value = Array.isArray(h.account_profiles);
+    accountUsage.value = h.account_usage ?? null;
     openRouter.value = h.openrouter ?? null;
     channels.value = h.channels.filter((c) => !c.archived);
     windowsSupported.value = Array.isArray(h.windows);
@@ -847,6 +851,9 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "account_profiles_changed":
       accountProfiles.value = ev.data;
+      break;
+    case "account_usage_changed":
+      accountUsage.value = ev.data;
       break;
     case "workspace_upserted":
       workspaces.value = upsertBy(workspaces.value, ev.data);

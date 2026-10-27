@@ -1,20 +1,23 @@
-//! OS notifications when a session needs the human (and schedule alerts, `alert`). OWNER: agents implementer.
+//! Alerts when a session needs the human: desktop notifications, phone alerts (src/push.rs),
+//! and schedule alerts (`alert`). OWNER: agents implementer.
 //!
 //! Listens to `SessionUpserted` events; when a session enters a `needs_human()` state (or the
-//! detail of such a state changes, e.g. a second approval), shows "#channel · session" with the
-//! detail. Deduped per session: the same (state, detail) never repeats within 60s, and any
-//! session notifies at most once per 5s. Notifications are shown from one worker thread so a
-//! slow or missing notification daemon can't stall the runtime. Set MUSTER_NO_NOTIFY=1 to
-//! disable.
+//! detail of such a state changes, e.g. a second approval), [`decide`] makes one [`Note`]
+//! "#channel · session" with the detail and hands it to every sink. Deduped per session: the
+//! same (state, detail) never repeats within 60s, and any session alerts at most once per 5s.
+//! Sinks never block the loop: the desktop sink shows notifications from one worker thread (a
+//! slow or missing notification daemon can't stall the runtime), the push sink sends from its
+//! own tasks. MUSTER_NO_NOTIFY=1 turns off the desktop sink only; phones get alerts as long as
+//! they have them on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::SyncSender;
 
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::hub::{Hub, ServerEvent};
-use crate::model::{AgentState, SessionId, SessionInfo, now_ms};
+use crate::model::{AgentState, ChannelId, SessionId, SessionInfo, now_ms};
 
 const SAME_ALERT_MS: i64 = 60_000;
 const MIN_GAP_MS: i64 = 5_000;
@@ -26,40 +29,96 @@ struct Seen {
     last_alert: Option<(AgentState, Option<String>, i64)>,
 }
 
-struct Note {
-    summary: String,
-    body: String,
+/// One alert, for every sink.
+#[derive(Debug, Clone)]
+pub struct Note {
+    pub summary: String,
+    pub body: String,
+    /// None for alerts that aren't about a session (`alert`).
+    pub session_id: Option<SessionId>,
+    pub channel_id: Option<ChannelId>,
+    pub state: Option<AgentState>,
+    pub state_since: i64,
+    pub state_seq: u64,
 }
 
-/// The worker, for alerts that aren't about a session's state (`alert`).
+impl Note {
+    fn to_alert(&self) -> crate::push::Alert {
+        crate::push::Alert {
+            session_id: self.session_id,
+            channel_id: self.channel_id,
+            state: self.state,
+            state_since: self.state_since,
+            state_seq: self.state_seq,
+            title: self.summary.clone(),
+            body: self.body.clone(),
+        }
+    }
+}
+
+/// Somewhere alerts go. `send` must return at once.
+pub trait Sink: Send + Sync {
+    fn send(&self, note: &Note);
+}
+
+/// Desktop notifications, through the worker thread (dropped while it is busy).
+struct Desktop(SyncSender<Note>);
+
+impl Sink for Desktop {
+    fn send(&self, note: &Note) {
+        let _ = self.0.try_send(note.clone());
+    }
+}
+
+impl Sink for crate::push::Sink {
+    fn send(&self, note: &Note) {
+        crate::push::Sink::send(self, note.to_alert());
+    }
+}
+
+/// The desktop worker, for alerts that aren't about a session's state (`alert`).
 static WORKER: std::sync::OnceLock<SyncSender<Note>> = std::sync::OnceLock::new();
 
 /// A desktop notification from elsewhere in the daemon (a schedule run's outcome). Dropped when
-/// notifications are off (MUSTER_NO_NOTIFY) or the worker is busy.
+/// desktop notifications are off (MUSTER_NO_NOTIFY) or the worker is busy. Not sent to phones:
+/// a phone alert opens a session, and these are about none.
 pub fn alert(summary: &str, body: &str) {
     if let Some(tx) = WORKER.get() {
-        let _ = tx.try_send(Note { summary: summary.to_string(), body: body.to_string() });
+        let _ = tx.try_send(Note {
+            summary: summary.to_string(),
+            body: body.to_string(),
+            session_id: None,
+            channel_id: None,
+            state: None,
+            state_since: now_ms(),
+            state_seq: 0,
+        });
     }
+}
+
+/// Whether the desktop sink runs, from `MUSTER_NO_NOTIFY` (set and not "0": off).
+fn desktop_enabled(no_notify: Option<&std::ffi::OsStr>) -> bool {
+    !no_notify.is_some_and(|v| v != "0")
 }
 
 /// Called once at daemon start.
 pub fn spawn(hub: Arc<Hub>) {
-    if std::env::var_os("MUSTER_NO_NOTIFY").is_some_and(|v| v != "0") {
-        return;
+    let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
+    if desktop_enabled(std::env::var_os("MUSTER_NO_NOTIFY").as_deref()) {
+        let tx = start_worker();
+        let _ = WORKER.set(tx.clone());
+        sinks.push(Box::new(Desktop(tx)));
     }
-    let tx = start_worker();
-    let _ = WORKER.set(tx.clone());
+    sinks.push(Box::new(crate::push::Sink::new(hub.clone())));
     let mut rx = hub.subscribe();
     tokio::spawn(async move {
         let mut seen: HashMap<SessionId, Seen> = HashMap::new();
+        let channel = |id: ChannelId| hub.channel(id).map(|c| c.name);
         loop {
             match rx.recv().await {
                 Ok(ServerEvent::SessionUpserted(info)) => {
-                    if let Some(note) = decide(&hub, &mut seen, &info, now_ms()) {
-                        match tx.try_send(note) {
-                            Ok(()) | Err(TrySendError::Full(_)) => {}
-                            Err(TrySendError::Disconnected(_)) => break,
-                        }
+                    if let Some(note) = decide(&channel, &mut seen, &info, now_ms()) {
+                        fan_out(&sinks, &note);
                     }
                 }
                 Ok(ServerEvent::SessionRemoved { id }) => {
@@ -72,8 +131,14 @@ pub fn spawn(hub: Arc<Hub>) {
     });
 }
 
+fn fan_out(sinks: &[Box<dyn Sink>], note: &Note) {
+    for s in sinks {
+        s.send(note);
+    }
+}
+
 fn decide(
-    hub: &Hub,
+    channel: &dyn Fn(ChannelId) -> Option<String>,
     seen: &mut HashMap<SessionId, Seen>,
     info: &SessionInfo,
     now: i64,
@@ -104,16 +169,18 @@ fn decide(
         }
     }
     s.last_alert = Some((info.state, info.state_detail.clone(), now));
-    let channel = hub
-        .channel(info.channel_id)
-        .map(|c| c.name)
-        .unwrap_or_else(|| "?".into());
+    let channel = channel(info.channel_id).unwrap_or_else(|| "?".into());
     Some(Note {
         summary: format!("#{channel} · {}", info.name),
         body: info
             .state_detail
             .clone()
             .unwrap_or_else(|| describe(info.state).to_string()),
+        session_id: Some(info.id),
+        channel_id: Some(info.channel_id),
+        state: Some(info.state),
+        state_since: info.state_since,
+        state_seq: info.state_seq,
     })
 }
 
@@ -155,4 +222,67 @@ fn start_worker() -> SyncSender<Note> {
         tracing::warn!("could not start notification thread: {e}");
     }
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    fn info(state: AgentState, detail: Option<&str>) -> SessionInfo {
+        let v = serde_json::json!({
+            "id": 5, "channel_id": 2, "kind": "claude", "name": "claude", "cwd": "/",
+            "state": state, "state_detail": detail, "state_since": 1000, "title": null,
+            "parent_id": null, "pid": null, "exit_code": null, "cols": 80, "rows": 24,
+            "queued": 0, "created_at": 0, "state_seq": 3,
+        });
+        serde_json::from_value(v).expect("a SessionInfo")
+    }
+
+    fn chan(_: ChannelId) -> Option<String> {
+        Some("web".into())
+    }
+
+    #[test]
+    fn decide_alerts_on_entering_and_dedups() {
+        let mut seen = HashMap::new();
+        let n = decide(&chan, &mut seen, &info(AgentState::NeedsApproval, Some("Bash(ls)")), 10_000).unwrap();
+        assert_eq!(n.summary, "#web · claude");
+        assert_eq!(n.body, "Bash(ls)");
+        assert_eq!((n.session_id, n.channel_id, n.state_since, n.state_seq), (Some(5), Some(2), 1000, 3));
+        assert_eq!(n.state, Some(AgentState::NeedsApproval));
+        // The same upsert again: nothing.
+        assert!(decide(&chan, &mut seen, &info(AgentState::NeedsApproval, Some("Bash(ls)")), 11_000).is_none());
+        // Working is not an alert; back to approval within 5 s is held back, then alerts.
+        assert!(decide(&chan, &mut seen, &info(AgentState::Working, None), 12_000).is_none());
+        assert!(decide(&chan, &mut seen, &info(AgentState::NeedsApproval, Some("Bash(rm)")), 13_000).is_none());
+        let n = decide(&chan, &mut seen, &info(AgentState::NeedsApproval, Some("Bash(rm)")), 16_000).unwrap();
+        assert_eq!(n.body, "Bash(rm)");
+        // No detail: a description of the state.
+        let mut seen = HashMap::new();
+        assert_eq!(decide(&chan, &mut seen, &info(AgentState::AskingQuestion, None), 0).unwrap().body, "Has a question");
+    }
+
+    struct Recorder(Mutex<Vec<String>>);
+    impl Sink for Arc<Recorder> {
+        fn send(&self, note: &Note) {
+            self.0.lock().push(note.summary.clone());
+        }
+    }
+
+    #[test]
+    fn every_sink_gets_each_note_and_no_notify_only_stops_the_desktop() {
+        let (a, b) = (Arc::new(Recorder(Mutex::new(vec![]))), Arc::new(Recorder(Mutex::new(vec![]))));
+        let sinks: Vec<Box<dyn Sink>> = vec![Box::new(a.clone()), Box::new(b.clone())];
+        let mut seen = HashMap::new();
+        let note = decide(&chan, &mut seen, &info(AgentState::NeedsApproval, None), 0).unwrap();
+        fan_out(&sinks, &note);
+        assert_eq!(*a.0.lock(), vec!["#web · claude"]);
+        assert_eq!(*b.0.lock(), vec!["#web · claude"]);
+        assert!(desktop_enabled(None));
+        assert!(desktop_enabled(Some(std::ffi::OsStr::new("0"))));
+        assert!(!desktop_enabled(Some(std::ffi::OsStr::new("1"))));
+        let alert = note.to_alert();
+        assert_eq!((alert.session_id, alert.title.as_str(), alert.body.as_str()), (Some(5), "#web · claude", "Needs approval"));
+    }
 }

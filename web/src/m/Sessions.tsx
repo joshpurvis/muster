@@ -2,6 +2,7 @@ import { useEffect, useState } from "preact/hooks";
 import { needsHuman, type SessionInfo, STATE_LABEL } from "../types.ts";
 import { relativeTime, sessionOrder } from "./logic.ts";
 import { channels, openSession, ready, sessions } from "./store.ts";
+import { NewTabButton, NewTabLayer } from "./NewTab.tsx";
 import { Approval, ConnectionDot, Settings, StateDot } from "./ui.tsx";
 
 function SessionRow({ session: s, now }: { session: SessionInfo; now: number }) {
@@ -39,6 +40,7 @@ export function Sessions() {
         <img src="icon.svg" width="28" height="28" alt="" />
         <h1>Muster</h1>
         <ConnectionDot />
+        <NewTabButton />
         <Settings />
       </header>
       <div class="session-list">
@@ -62,6 +64,7 @@ export function Sessions() {
           </details>
         )}
       </div>
+      <NewTabLayer />
     </main>
   );
 }

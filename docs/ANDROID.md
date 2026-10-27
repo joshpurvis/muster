@@ -4,8 +4,11 @@ Status: phases 0 and 1 are implemented, plus part of phase 3. That covers pairin
 cookie auth, the proxied-request policy, scopes, `/m/` (sessions list, approvals, read-only
 terminal with touch scroll, pinch zoom and select/copy, floating composer, `follow`/`keep` size),
 suspend on background, and a capped replay (`session.attach` `replay_bytes`) instead of the
-`screen`/`delta` replay kinds. Not done yet: Web Push (phase 2), `attach_info`/`delta` replays,
-the `manage` UI, and WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
+`screen`/`delta` replay kinds. Of phase 4, the `manage` UI is done: a manage-scoped phone opens
+new tabs (folder, agent kind, optional first prompt and worktree, `fs.complete` for typed
+folders) and restarts, stops, renames or closes a tab and renames or archives its task, from the
+session title's sheet; stop, close and archive ask first in plain words. Not done yet: Web Push
+(phase 2), `attach_info`/`delta` replays, and WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
 device tokens are hashed with a small in-crate SHA-256. The wire contract is in docs/PROTOCOL.md
 "Remote devices"; where this plan and PROTOCOL.md differ, PROTOCOL.md wins.
 
@@ -326,7 +329,7 @@ the inbound limit, unrelated.)
 | 1 Terminal + composer | Read-only xterm, `resizePolicy`, `session.keys`, chip row, textarea via `session.send`, visualViewport bar, `attach_info` + `screen` replay, `size_owner` + `termSize` setting | 4-5 days | A dictated multi-line prompt to a busy agent is delivered once idle; Esc interrupts; output is live; in `follow` the PTY follows the phone on send and returns to the desktop on its next keypress. |
 | 2 Notifications | VAPID, `sw.js`, `push.*`, endpoint rules, notify sinks | 2-3 days | Screen-off phone shows the alert typically within ~10 s of `needs_approval`; tapping opens that session; revoke deletes the subscription. |
 | 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. |
-| 4 Polish | `manage` scope UI (new tab), install prompt, WebAuthn gate (if wanted), transport/auth seams tidy enough for the paid track | ongoing | Per item. |
+| 4 Polish | `manage` scope UI (new tab; done: web/src/m/NewTab.tsx, SessionActions.tsx), install prompt, WebAuthn gate (if wanted), transport/auth seams tidy enough for the paid track | ongoing | Per item. |
 
 ## Paid version (later)
 

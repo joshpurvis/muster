@@ -1261,6 +1261,7 @@ function stripAnsi(s: string) {
 async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> {
   if (
     ws && deviceClients.has(ws) && ![
+      "ping",
       "hello",
       "session.attach",
       "session.detach",
@@ -1414,6 +1415,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       for (let i = panelEvents.length - 1; i >= 0; i--) if (wanted(panelEvents[i])) panelEvents.splice(i, 1);
       return { events: found, timed_out: !found.length };
     }
+    case "ping":
+      return {};
     case "hello":
       return {
         version: "0.0.0-mock",

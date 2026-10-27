@@ -88,7 +88,7 @@ Text frames carry JSON. Binary frames carry terminal bytes.
 |---|---|---|
 | `0x01` | daemon → client | Live output bytes. |
 | `0x02` | client → daemon | Keyboard input bytes (from xterm `onData`, UTF-8). Queued to the terminal in order without waiting for it. If any input for a run is lost, refused or dropped, that run's input is paused: later frames for it are discarded (never delivered after the gap) and the session gets `input_interrupted: true` until `session.continue_input`. |
-| `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. |
+| `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. Exception: a replay announced by `attach_info` with `kind: "delta"` is appended without a reset ("Remote devices", "Replay kinds"). |
 
 Terminal queries: the daemon is the **only** responder for DA1 (`CSI c` → `CSI ? 1 ; 2 c`),
 DA2 (`CSI > c` → `CSI > 0 ; 276 ; 0 c`), DSR status (`CSI 5 n` → `CSI 0 n`) and cursor position
@@ -116,7 +116,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], agent_sessions[], agent_names, panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`agent_sessions`: the ids of named agents' sessions, and `agent_names`: `{"<session id>": "<agent name>"}` for the same sessions, which `session.remove` hides instead of stopping, so a paired phone, which has no `agent.list`, can say so before closing one; `updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -131,7 +131,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
 | `channel.diff` | `{id}` | `{diff: string}` |
 | `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?, from_session?, account_profile?}` | `SessionInfo`. `from_session` (as for `channel.create`): the new session starts with that session's provenance; a Claude session from a non-human chain is refused. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
-| `session.attach` | `{id, replay_bytes?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start (the phone asks for 256 KiB instead of the whole 2 MiB buffer); the replays that follow a restart or a lagging client use the same limit. |
+| `session.attach` | `{id, replay_bytes?, replay?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start; the replays that follow a restart or a lagging client use the same limit. `replay` (`"full"`, `"screen"` or `{since}`, for phones) adds an `attach_info` message before every replay frame and can make the replay a `delta`: see "Remote devices", "Replay kinds". |
+| `ping` | `{}` | `{}`. A liveness check (the phone calls it every 25 s while visible). |
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
@@ -1182,21 +1183,69 @@ Max-Age=2592000`, stored hashed (SHA-256). Honoured only without `?token=`/`Auth
 (on `/ws`, `POST /api/rpc`, `pair`, `logout`) only with an `Origin` that is in `remote_origins` or
 this daemon's local origin; cookie `POST`s also need `X-Muster: 1`. Devices expire after 30 days
 without use (the expiry slides, renewed at most daily by `/api/device/me`, which re-sends the
-cookie). A device's WebSocket closes at once on revoke, and within 30 s of expiry. A device
-paired through a trusted proxy with a `Tailscale-User-Login` is refused when a later request
-carries a different login.
+cookie). A device's WebSocket closes at once on revoke, within 30 s of expiry, within 10 s after
+90 s without any frame from the phone (the daemon sends a WebSocket ping every 30 s, which
+browsers answer on their own, so only a phone that is gone stays that silent), and when one frame
+to it takes over 30 s to send (a link that swallows everything, or a client that stopped
+reading). Either way its queued output and attachments go with it. A device paired through a
+trusted proxy with a `Tailscale-User-Login` is refused when a later request carries a different
+login.
 
 **Scopes.** Checked on every call (so a revoked or expired device fails on its next call, and
 its sockets close at once on revoke):
 
 | Scope | Methods |
 |---|---|
-| `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
+| `view` | `ping`, `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
 | never | `device.*`, `agent.*`, `window.*`, `daemon.*`, `prefs.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
 Prompts a device sends are logged with `from: "device:<id>"`.
+
+**Replay kinds.** `session.attach` takes `replay`:
+
+- `"full"` (the default without `replay`): as for any client.
+- `"screen"`: a rendered replay bounded by `replay_bytes` (default 64 KiB): the screen as the
+  terminal emulator holds it plus as much recent history as fits, oldest lines dropped first
+  (on the normal screen that history is what fills the phone's own xterm scrollback). Not just
+  rows×cols as docs/ANDROID.md first planned: the phone's normal-screen scrollback comes from it.
+- `{since: {offset, generation, epoch, size_rev}}`: where the client's terminal stands, copied
+  from the `attach_info` of its last replay. The daemon answers `delta`, the raw output bytes
+  from `offset` to now, when it still holds all of them (see below), `generation` and `epoch`
+  are this run's, `size_rev` is the terminal's current size revision (no resize since, nor while
+  this attach is taken), the run is still running as the terminal host itself answers (an ended run's replay moves a full-screen
+  view into history, which appending can't do), the range is at most 64 KiB, and it is no
+  bigger than the `screen` it would send instead; otherwise that `screen`.
+
+With `replay` given, every replay frame of the attachment (the first, and those after a
+restart, a lagging client or a terminal host stream reset) is preceded, on the same ordered
+connection, by `{"event":"attach_info","data":{id, kind: "full"|"screen"|"delta", offset,
+generation, epoch, size_rev}}`. It is connection-scoped, never broadcast, and describes only the
+replay frame that follows it: the client applies it when that frame arrives, and drops it if the
+connection ends first. `offset` is the raw output offset (bytes the run has written, as the
+terminal host counts them) right after the replay: the client adds the length of every `0x01`
+payload it receives to it, and sends the sum as `since` when it reattaches. `generation` is the
+run's (null for a session from an earlier daemon run, which cannot be resumed); `epoch` is
+random per daemon start; `size_rev` is the session's size revision this daemon run, read before
+the replay is taken. A resize moves it before the terminal host is asked and again after it
+answered, and while one is on its way the revision reads as unknown, so an attach that overlaps
+a resize never gets a `delta`. `size_rev` is null when the daemon can't tell which size the
+replay was drawn at (a resize during the attach, or a replay after a terminal host stream
+reset); such a replay can't be resumed, and neither can a `since` without `size_rev` (sent by a
+phone page loaded before the field existed: it gets a screen). A client attached
+across a resize keeps its earlier `size_rev`, so its next return gets a screen. A `full` or `screen` replay
+replaces the terminal; a `delta` is appended without a reset, so the client's terminal (and
+its normal-screen scrollback) stays as it was. Replays after the first are `screen` for a
+`screen`/`since` attachment and `full` otherwise.
+
+The bytes for a `delta` come from a tail the daemon keeps per session (src/replay_tail.rs): an
+attachment with `replay: "screen"` or `{since}` starts it (one more output stream from the
+terminal host, the last 64 KiB of raw output in memory), and it runs while such a client is
+attached and up to 30 minutes after the last one left, ending sooner once it has rolled past
+the furthest offset a departed client reached. At most 8 tails exist at a time (the one left
+longest ago makes room; when all 8 have a client attached, a new client gets only screens). A
+daemon restart or `muster reload` drops the tails, so the first return after one is a `screen`.
 
 | Method (client token only) | Params | Result |
 |---|---|---|

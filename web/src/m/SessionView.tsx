@@ -3,7 +3,6 @@ import type { SessionInfo } from "../types.ts";
 import { Composer } from "./Composer.tsx";
 import {
   bindTerminal,
-  channels,
   closeSession,
   markOpened,
   notify,
@@ -11,6 +10,7 @@ import {
   scrollProgram,
   setPrefs,
 } from "./store.ts";
+import { SessionTitle } from "./SessionActions.tsx";
 import { PhoneTerminal } from "./term.ts";
 import { Icon, Settings, StateDot } from "./ui.tsx";
 
@@ -91,10 +91,7 @@ export function SessionView({ session: s }: { session: SessionInfo }) {
           <Icon name="back" />
         </button>
         <StateDot state={s.state} />
-        <div class="session-title">
-          <h1>{s.name}</h1>
-          <span>{channels.value.get(s.channel_id)?.name ?? "Session"}</span>
-        </div>
+        <SessionTitle session={s} />
         <button
           type="button"
           class={`select-toggle ${snapshot ? "active" : ""}`}

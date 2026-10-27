@@ -1141,9 +1141,11 @@ Max-Age=2592000`, stored hashed (SHA-256). Honoured only without `?token=`/`Auth
 (on `/ws`, `POST /api/rpc`, `pair`, `logout`) only with an `Origin` that is in `remote_origins` or
 this daemon's local origin; cookie `POST`s also need `X-Muster: 1`. Devices expire after 30 days
 without use (the expiry slides, renewed at most daily by `/api/device/me`, which re-sends the
-cookie). A device's WebSocket closes at once on revoke, within 30 s of expiry, and after 90 s
-without any frame from the phone (the daemon sends a WebSocket ping every 30 s, which browsers
-answer on their own, so only a phone that is gone stays that silent). A device paired through a
+cookie). A device's WebSocket closes at once on revoke, within 30 s of expiry, within 10 s after
+90 s without any frame from the phone (the daemon sends a WebSocket ping every 30 s, which
+browsers answer on their own, so only a phone that is gone stays that silent), and when one frame
+to it takes over 30 s to send (a link that swallows everything, or a client that stopped
+reading). Either way its queued output and attachments go with it. A device paired through a
 trusted proxy with a `Tailscale-User-Login` is refused when a later request carries a different
 login.
 
@@ -1166,20 +1168,28 @@ Prompts a device sends are logged with `from: "device:<id>"`.
   terminal emulator holds it plus as much recent history as fits, oldest lines dropped first
   (on the normal screen that history is what fills the phone's own xterm scrollback). Not just
   rows×cols as docs/ANDROID.md first planned: the phone's normal-screen scrollback comes from it.
-- `{since: {offset, generation, epoch}}`: where the client's terminal stands. The daemon
-  answers `delta`, the raw output bytes from `offset` to now, when it still holds all of them
-  (see below), `generation` and `epoch` are this run's, the terminal was not resized since
-  `offset`, the range is at most 64 KiB, and it is no bigger than the `screen` it would send
-  instead; otherwise that `screen`.
+- `{since: {offset, generation, epoch, size_rev}}`: where the client's terminal stands, copied
+  from the `attach_info` of its last replay. The daemon answers `delta`, the raw output bytes
+  from `offset` to now, when it still holds all of them (see below), `generation` and `epoch`
+  are this run's, `size_rev` is the terminal's current size revision (no resize since, nor while
+  this attach is taken), the run is still running (an ended run's replay moves a full-screen
+  view into history, which appending can't do), the range is at most 64 KiB, and it is no
+  bigger than the `screen` it would send instead; otherwise that `screen`.
 
 With `replay` given, every replay frame of the attachment (the first, and those after a
 restart, a lagging client or a terminal host stream reset) is preceded, on the same ordered
 connection, by `{"event":"attach_info","data":{id, kind: "full"|"screen"|"delta", offset,
-generation, epoch}}`. It is connection-scoped, never broadcast. `offset` is the raw output
-offset (bytes the run has written, as the terminal host counts them) right after the replay:
-the client adds the length of every `0x01` payload it receives to it, and sends the sum as
-`since` when it reattaches. `generation` is the run's (null for a session from an earlier daemon
-run, which cannot be resumed); `epoch` is random per daemon start. A `full` or `screen` replay
+generation, epoch, size_rev}}`. It is connection-scoped, never broadcast, and describes only the
+replay frame that follows it: the client applies it when that frame arrives, and drops it if the
+connection ends first. `offset` is the raw output offset (bytes the run has written, as the
+terminal host counts them) right after the replay: the client adds the length of every `0x01`
+payload it receives to it, and sends the sum as `since` when it reattaches. `generation` is the
+run's (null for a session from an earlier daemon run, which cannot be resumed); `epoch` is
+random per daemon start; `size_rev` counts the session's resizes this daemon run, read before
+the replay is taken (a resize counts only once the terminal host has the new size), and is null
+when the daemon can't tell which size the replay was drawn at (a resize during the attach, or a
+replay after a terminal host stream reset); such a replay can't be resumed. A client attached
+across a resize keeps its earlier `size_rev`, so its next return gets a screen. A `full` or `screen` replay
 replaces the terminal; a `delta` is appended without a reset, so the client's terminal (and
 its normal-screen scrollback) stays as it was. Replays after the first are `screen` for a
 `screen`/`since` attachment and `full` otherwise.

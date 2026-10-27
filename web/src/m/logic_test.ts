@@ -188,13 +188,23 @@ Deno.test("saved scroll state follows the session's run and its unseen activity"
 
 Deno.test("the replay cursor counts live bytes on from the replay and appends only deltas", () => {
   const c = new ReplayCursor();
+  const info = (kind: "full" | "screen" | "delta", offset: number, more = {}) => ({
+    id: 1,
+    kind,
+    offset,
+    generation: 2,
+    epoch: "e",
+    size_rev: 0,
+    ...more,
+  });
   equal(c.since(), null);
-  c.info({ id: 1, kind: "screen", offset: 100, generation: 2, epoch: "e" });
+  c.info(info("screen", 100));
+  equal(c.since(), null);
   equal(c.replay(), false);
   c.output(5);
   c.output(7);
-  equal(c.since(), { offset: 112, generation: 2, epoch: "e" });
-  c.info({ id: 1, kind: "delta", offset: 150, generation: 2, epoch: "e" });
+  equal(c.since(), { offset: 112, generation: 2, epoch: "e", size_rev: 0 });
+  c.info(info("delta", 150));
   equal(c.replay(), true);
   c.output(1);
   equal(c.since()?.offset, 151);
@@ -203,8 +213,28 @@ Deno.test("the replay cursor counts live bytes on from the replay and appends on
   equal(c.since(), null);
   c.output(3);
   equal(c.since(), null);
-  // A session from an earlier daemon run can't be resumed.
-  c.info({ id: 1, kind: "full", offset: 0, generation: null, epoch: "e" });
+  // A session from an earlier daemon run, or a replay of unknown size, can't be resumed.
+  c.info(info("full", 0, { generation: null }));
   c.replay();
+  equal(c.since(), null);
+  c.info(info("screen", 10, { size_rev: null }));
+  c.replay();
+  equal(c.since(), null);
+});
+
+Deno.test("an attach_info takes effect only with its replay, never across a disconnect", () => {
+  const c = new ReplayCursor();
+  c.info({ id: 1, kind: "screen", offset: 100, generation: 2, epoch: "e", size_rev: 0 });
+  c.replay();
+  c.output(10);
+  // Announced, then the connection drops before the replay frame arrives.
+  c.info({ id: 1, kind: "delta", offset: 500, generation: 2, epoch: "e", size_rev: 0 });
+  equal(c.since()?.offset, 110);
+  c.output(1);
+  equal(c.since()?.offset, 111);
+  c.disconnected();
+  equal(c.since()?.offset, 111);
+  // An older daemon's unannounced replay after that is never taken for the delta.
+  equal(c.replay(), false);
   equal(c.since(), null);
 });

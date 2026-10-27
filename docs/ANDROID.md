@@ -313,8 +313,10 @@ frozen, so nothing can be "done after 30 s". Policy: on `visibilitychange` → h
 visible (and on the page lifecycle's `resume`), `resume()` reconnects (`hello`,
 `/api/device/me`) and reattaches with `replay: {since}` from the last `attach_info` offset plus
 counted `0x01` bytes; the daemon answers `delta` when that is ≤ 64 KiB, in the same
-generation/epoch, without a resize since, and no bigger than the `screen` it would send
-instead; else that `screen` (64 KiB at most). So a quick app switch costs a `hello` and a
+generation/epoch, without a resize since, while the run is still going, and no bigger than the
+`screen` it would send instead; else that `screen` (64 KiB at most). A resize while the phone
+is attached (its own `follow` resize on send, or the desktop taking the size back) also makes
+its next return a screen. So a quick app switch costs a `hello` and a
 small delta; a long absence costs a screen. Only the session on screen is ever attached. Push
 covers alerts while hidden. The 2 MiB `full` replay is never requested by the phone. Wire
 details: docs/PROTOCOL.md "Remote devices", "Replay kinds".
@@ -335,9 +337,10 @@ Implemented (web/src/m/store.ts, web/src/m/term.ts, src/replay_tail.rs, src/rpc.
   agent (Claude Code) keeps its conversation itself and is scrolled with wheel reports, so for
   it the two kinds look the same.
 - Ping: while visible the phone calls `ping` every 25 s and replaces a connection that does
-  not answer within 10 s (a network change can leave a socket looking open). The daemon pings
-  device sockets every 30 s and closes one silent for 90 s, which also ends its attachment so
-  the 30-minute tail clock starts.
+  not answer within 10 s (a network change can leave a socket looking open); while visible it
+  keeps retrying (1, 2, 4… up to 10 s apart) until Muster answers again. The daemon pings
+  device sockets every 30 s and closes one silent for 90 s or one that stops taking frames for
+  30 s, which also ends its attachment so the 30-minute tail clock starts.
 
 ## Milestones
 
@@ -346,7 +349,7 @@ Implemented (web/src/m/store.ts, web/src/m/term.ts, src/replay_tail.rs, src/rpc.
 | 0 Approve from phone | `remote_origins`, proxied-request policy and proxy-uid header trust, cookie auth, `Principal` + scope checks on all three paths, `devices` table, `device.*`, `/api/device/me`, `muster pair/devices`, `/m/` sessions screen with Approve/Deny (+`state_since`), CSP, ts_login pinning | 4-5 days | Phone on the tailnet approves a Claude Code permission prompt; a stale approve is refused; `muster devices revoke` disconnects it within a second and the PWA shows "unpaired". |
 | 1 Terminal + composer | Read-only xterm, `resizePolicy`, `session.keys`, chip row, textarea via `session.send`, visualViewport bar, `attach_info` + `screen` replay, `size_owner` + `termSize` setting | 4-5 days | A dictated multi-line prompt to a busy agent is delivered once idle; Esc interrupts; output is live; in `follow` the PTY follows the phone on send and returns to the desktop on its next keypress. |
 | 2 Notifications | VAPID, `sw.js`, `push.*`, endpoint rules, notify sinks | 2-3 days | Screen-off phone shows the alert typically within ~10 s of `needs_approval`; tapping opens that session; revoke deletes the subscription. |
-| 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. **Done** (measured 2026-10-26 against a throwaway daemon, phone grid 59×40, page WebSocket bytes in up to and including the replay): busy normal-screen log (~1 KiB/s), back after 10 min: 258.5 KiB before (capped replay) → 66.6 KiB after (`screen`); after 15 s: 55.7 KiB → 16.9 KiB (`delta`, byte-exact against a reference client). Busy full-screen agent (alternate screen, spinner and repaints): 5.0 → 5.2 KiB either way (its screen is smaller than any delta, so it gets the screen). Both include a 2.6 KiB `hello` (it grows with the number of sessions). |
+| 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. **Done** (measured 2026-10-26 against a throwaway daemon, phone grid 59×40, page WebSocket bytes in up to and including the replay): busy normal-screen log (~1 KiB/s), back after 10 min: 258.5 KiB before (capped replay) → 66.6 KiB after (`screen`); after 15 s: 55.5 KiB → 16.8 KiB (`delta`, byte-exact against a reference client). Busy full-screen agent (alternate screen, spinner and repaints): 5.0 → 5.2 KiB either way (its screen is smaller than any delta, so it gets the screen). Both include a 2.6 KiB `hello` (it grows with the number of sessions). |
 | 4 Polish | `manage` scope UI (new tab), install prompt, WebAuthn gate (if wanted), transport/auth seams tidy enough for the paid track | ongoing | Per item. |
 
 ## Paid version (later)

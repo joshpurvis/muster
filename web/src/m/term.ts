@@ -282,6 +282,10 @@ export class PhoneTerminal {
   attachInfo(info: AttachInfo) {
     this.cursor.info(info);
   }
+  /** The connection ended (see `ReplayCursor.disconnected`). */
+  disconnected() {
+    this.cursor.disconnected();
+  }
   /** Where this terminal stands, for reattaching with only the bytes it missed. */
   since(): Since | null {
     return this.cursor.since();

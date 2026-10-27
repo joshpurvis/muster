@@ -480,6 +480,9 @@ pub struct Hub {
     replay_cache: Mutex<HashMap<SessionId, (u64, std::time::SystemTime, Bytes)>>,
     /// Raw output tails for phones' `delta` replays (src/replay_tail.rs).
     tails: Arc<crate::replay_tail::Tails>,
+    /// Per session, how many times its terminal was resized this daemon run: a client's offset
+    /// from an earlier size revision is never resumed with a `delta` (docs/PROTOCOL.md).
+    size_revs: Mutex<HashMap<SessionId, u64>>,
     /// Paired remote devices (docs/ANDROID.md).
     devices: crate::devices::Registry,
     /// Agents (PLAN.md §10): records, and every session's provenance and active agent message.
@@ -920,6 +923,7 @@ impl Hub {
             shutting_down: AtomicBool::new(false),
             replay_cache: Mutex::new(HashMap::new()),
             tails: Arc::default(),
+            size_revs: Mutex::new(HashMap::new()),
             branch_lock: tokio::sync::Mutex::new(()),
             rt: tokio::runtime::Handle::try_current().ok(),
             updates: Default::default(),
@@ -1520,6 +1524,17 @@ impl Hub {
     /// This daemon run's replay epoch (docs/PROTOCOL.md `attach_info`).
     pub fn replay_epoch(&self) -> &str {
         self.tails.epoch()
+    }
+
+    /// Session `id`'s terminal size revision (see `size_revs`).
+    pub fn size_rev(&self, id: SessionId) -> u64 {
+        self.size_revs.lock().get(&id).copied().unwrap_or(0)
+    }
+
+    /// Whether session `id`'s current run is still running. A run that ended replays
+    /// differently (an ended full-screen view moves into history), so it never gets a `delta`.
+    pub fn pty_alive(&self, id: SessionId) -> bool {
+        self.pty(id).is_some_and(|p| p.is_alive())
     }
 
     /// Keep a raw output tail of session `id`'s current run for a `delta` replay later, and
@@ -3884,10 +3899,12 @@ impl Hub {
             .session(id)
             .ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         if let Some(p) = self.pty(id) {
-            p.resize(cols, rows)?;
-        }
-        if cur.cols != cols || cur.rows != rows {
-            self.tails.resized(id);
+            // Bumped once the host has the new size (never before, so a replay labelled with
+            // the new revision is drawn at the new size) and on every call: comparing with
+            // `cur` could miss a concurrent resize.
+            let resized = p.resize(cols, rows);
+            *self.size_revs.lock().entry(id).or_default() += 1;
+            resized?;
         }
         if cur.cols != cols || cur.rows != rows || cur.size_owner.as_deref() != Some(owner) {
             self.update_session_info(id, |i| {

@@ -42,6 +42,10 @@ const SCREEN_REPLAY_BYTES: usize = 64 * 1024;
 /// every 30 s (browsers answer on their own) and the phone pings too, so only a phone that is
 /// gone (out of coverage, killed) stays silent this long.
 const DEVICE_SILENCE: Duration = Duration::from_secs(90);
+/// A device's socket closes when one frame to it takes longer than this to send: a link that
+/// swallows everything (out of coverage) or a client that stopped reading would otherwise hold
+/// the connection, its queue and its session tails until TCP gives up.
+const DEVICE_WRITE_STALL: Duration = Duration::from_secs(30);
 /// `session.output` limits.
 const OUTPUT_DEFAULT_LINES: usize = 200;
 const OUTPUT_MAX_LINES: usize = 10_000;
@@ -1492,15 +1496,29 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
+    let is_device = matches!(who, Principal::Device { .. });
+    // Ends the reader loop: the writer stopped, or the watchdog closed the connection.
+    let closed = Arc::new(tokio::sync::Notify::new());
 
-    let writer = tokio::spawn(async move {
-        while let Some(m) = out_rx.recv().await {
-            if sink.send(m).await.is_err() {
-                break;
+    let writer = {
+        let closed = closed.clone();
+        // Local windows keep today's unbounded sends; a device's are bounded (DEVICE_WRITE_STALL).
+        let stall = if is_device { DEVICE_WRITE_STALL } else { Duration::MAX };
+        tokio::spawn(async move {
+            while let Some(m) = out_rx.recv().await {
+                match tokio::time::timeout(stall, sink.send(m)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::debug!("device connection stopped taking frames; closing");
+                        break;
+                    }
+                }
             }
-        }
-        let _ = sink.close().await;
-    });
+            let _ = tokio::time::timeout(Duration::from_secs(5), sink.close()).await;
+            closed.notify_one();
+        })
+    };
 
     // Server events -> client. If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
@@ -1509,7 +1527,6 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
     // `workspace.add` result). If this client falls too far behind the event bus, close the
     // connection: the client reconnects and re-syncs with `hello`.
     let (resp_tx, mut resp_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
-    let is_device = matches!(who, Principal::Device { .. });
     let events = {
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
@@ -1579,30 +1596,43 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
         Principal::Device { id } => Some(id),
         Principal::Local => None,
     };
-    // A device's socket closes the moment it is revoked or expires, even while idle or while
-    // its reader has stopped reading (the watchdog kills the writer, which unblocks any send
-    // stuck on a full outbox). Subscribed before the first check, so a revocation between the
-    // cookie check and this point is not missed.
-    let closed = Arc::new(tokio::sync::Notify::new());
+    // A device's socket closes the moment it is revoked or expires, and after DEVICE_SILENCE
+    // without a frame from it, even while idle, while its reader has stopped reading, or while
+    // a request is stuck on a full outbox (the watchdog kills the writer, which fails every
+    // pending send). Subscribed before the first check, so a revocation between the cookie
+    // check and this point is not missed.
+    let started = std::time::Instant::now();
+    // Milliseconds after `started` of the last frame received.
+    let heard = Arc::new(AtomicU64::new(0));
     let watchdog = device_id.map(|id| {
-        let (hub, closed) = (hub.clone(), closed.clone());
+        let (hub, closed, heard) = (hub.clone(), closed.clone(), heard.clone());
         let writer = writer.abort_handle();
         let events = events.abort_handle();
         let mut revoked = hub.devices().subscribe_revoked();
         let pinger = out_tx.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            let mut ticks = 0u64;
             loop {
                 if hub.devices().scope(id).is_none() {
+                    break;
+                }
+                let silent = started.elapsed().saturating_sub(Duration::from_millis(heard.load(Ordering::Relaxed)));
+                if silent > DEVICE_SILENCE {
+                    tracing::debug!("device connection silent for {silent:?}; closing");
                     break;
                 }
                 tokio::select! {
                     r = revoked.recv() => if matches!(r, Err(broadcast::error::RecvError::Closed)) {
                         break;
                     },
-                    // The browser's pong (or any frame) keeps the socket within DEVICE_SILENCE.
-                    // Skipped while the outbox is full: that client isn't reading anyway.
-                    _ = tick.tick() => { let _ = pinger.try_send(Message::Ping(Bytes::new())); }
+                    // Every 30 s. The browser's pong (or any frame) keeps the socket within
+                    // DEVICE_SILENCE. Skipped while the outbox is full: that client isn't
+                    // reading anyway, and the write stall closes it.
+                    _ = tick.tick() => {
+                        if ticks % 3 == 0 { let _ = pinger.try_send(Message::Ping(Bytes::new())); }
+                        ticks += 1;
+                    }
                 }
             }
             writer.abort();
@@ -1615,11 +1645,8 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
         let msg = tokio::select! {
             m = stream.next() => m,
             _ = closed.notified() => break,
-            _ = tokio::time::sleep(DEVICE_SILENCE), if device_id.is_some() => {
-                tracing::debug!("device connection silent for {DEVICE_SILENCE:?}; closing");
-                break;
-            }
         };
+        heard.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         let Some(Ok(msg)) = msg else { break };
         if let Some(id) = device_id
             && hub.devices().scope(id).is_none()
@@ -1737,17 +1764,32 @@ async fn handle_request(
             let bus = hub.subscribe();
             // The tail starts before the replay is taken, so it covers the client's offset.
             let mut tail = if mode.screen { hub.join_tail(id) } else { None };
+            // Read before the replay is taken: a resize bumps it only once the host has the new
+            // size, so the replay is drawn at this revision's size or a later one.
+            let mut size_rev = Some(hub.size_rev(id));
             match hub.attach(id, limit).await {
                 Ok(att) => {
                     let (kind, replay, rx, generation, offset) = match att {
                         Attach::Live { replay, rx, generation, offset } => {
                             tail.take_if(|t| t.generation() != generation);
+                            // Only while the bytes still draw the same way: same daemon run,
+                            // run and terminal size (no resize since, nor during this attach),
+                            // and the run still going (an ended run's replay moves a
+                            // full-screen view into history, which appending can't do).
                             let delta = match (&since, &tail) {
-                                (Some(s), Some(t)) if s.epoch == hub.replay_epoch() && s.generation == generation => {
+                                (Some(s), Some(t))
+                                    if s.epoch == hub.replay_epoch() && s.generation == generation
+                                        && Some(s.size_rev) == size_rev && hub.pty_alive(id) =>
+                                {
                                     t.delta(s.offset, offset).await
                                 }
                                 _ => None,
-                            };
+                            }
+                            .filter(|_| Some(hub.size_rev(id)) == size_rev && hub.pty_alive(id));
+                            if Some(hub.size_rev(id)) != size_rev {
+                                // Resized while the replay was taken: unknown which size it has.
+                                size_rev = None;
+                            }
                             // Whichever is smaller. A full-screen program's screen is often a
                             // few KiB while its repaints add up fast; a screen under its cap
                             // already holds all the history the daemon still has.
@@ -1766,7 +1808,7 @@ async fn handle_request(
                         .send(Message::Text(response(&req.id, Ok(json!({}))).to_string().into()))
                         .await;
                     if mode.info {
-                        let _ = out.send(attach_info(hub, id, kind, offset, generation)).await;
+                        let _ = out.send(attach_info(hub, id, kind, offset, generation, size_rev)).await;
                     }
                     let _ = out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay))).await;
                     let mut state = Forward { limit, mode, generation, offset, tail };
@@ -1847,6 +1889,7 @@ struct Since {
     offset: u64,
     generation: u64,
     epoch: String,
+    size_rev: u64,
 }
 
 /// How an attachment's replays are sent.
@@ -1866,10 +1909,12 @@ impl ReplayMode {
 
 /// The connection-scoped message before a replay frame: what it is and the offset it ends
 /// at (the client counts live bytes on from there). Never a hub broadcast, so it can't reach
-/// another client or overtake the frame.
-fn attach_info(hub: &Hub, id: SessionId, kind: &str, offset: u64, generation: Option<u64>) -> Message {
+/// another client or overtake the frame. `size_rev`: the terminal size revision the replay was
+/// drawn at; None when unknown (the client then can't resume from it).
+fn attach_info(hub: &Hub, id: SessionId, kind: &str, offset: u64, generation: Option<u64>, size_rev: Option<u64>) -> Message {
     let info = json!({"event": "attach_info", "data": {
         "id": id, "kind": kind, "offset": offset, "generation": generation, "epoch": hub.replay_epoch(),
+        "size_rev": size_rev,
     }});
     Message::Text(info.to_string().into())
 }
@@ -1920,8 +1965,10 @@ async fn forward_output(
                     state.sent(state.offset + bytes.len() as u64);
                 }
                 Ok(crate::terminal::Output::Replay(bytes, offset)) => {
+                    // The host took this replay at some earlier moment: its size revision is
+                    // unknown, so the client is told it can't resume from it.
                     if state.mode.info
-                        && out.send(attach_info(&hub, id, state.mode.kind(), offset, state.generation)).await.is_err()
+                        && out.send(attach_info(&hub, id, state.mode.kind(), offset, state.generation, None)).await.is_err()
                     {
                         return;
                     }
@@ -1967,6 +2014,7 @@ async fn resend_replay(
     if state.mode.screen && state.tail.as_ref().map(|t| t.generation()) != hub.pty_generation(id) {
         state.tail = hub.join_tail(id);
     }
+    let size_rev = hub.size_rev(id);
     let (replay, new_rx, new_gen, offset) = match hub.attach(id, state.limit).await {
         Ok(Attach::Live { replay, rx, generation, offset }) => (replay, Some(rx), Some(generation), offset),
         Ok(Attach::Replay(r)) => (r, None, None, 0),
@@ -1975,7 +2023,8 @@ async fn resend_replay(
     state.tail.take_if(|t| Some(t.generation()) != new_gen);
     state.generation = new_gen;
     *rx = new_rx;
-    if state.mode.info && out.send(attach_info(hub, id, state.mode.kind(), offset, new_gen)).await.is_err() {
+    let size_rev = Some(size_rev).filter(|r| *r == hub.size_rev(id));
+    if state.mode.info && out.send(attach_info(hub, id, state.mode.kind(), offset, new_gen, size_rev)).await.is_err() {
         return false;
     }
     let sent = out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay))).await.is_ok();

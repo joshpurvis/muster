@@ -36,7 +36,14 @@ const SWEEP: Duration = Duration::from_secs(30);
 pub struct Tails {
     /// Random per daemon start: offsets and generations are only comparable within it.
     epoch: String,
-    map: Mutex<HashMap<SessionId, Arc<Tail>>>,
+    slots: Mutex<Slots>,
+}
+
+#[derive(Default)]
+struct Slots {
+    map: HashMap<SessionId, Arc<Tail>>,
+    /// Tails being started (room taken, stream not open yet): counted against `MAX_TAILS`.
+    reserved: usize,
 }
 
 impl std::fmt::Debug for Tails {
@@ -47,7 +54,7 @@ impl std::fmt::Debug for Tails {
 
 impl Default for Tails {
     fn default() -> Self {
-        Tails { epoch: format!("{:016x}", rand::random::<u64>()), map: Mutex::default() }
+        Tails { epoch: format!("{:016x}", rand::random::<u64>()), slots: Mutex::default() }
     }
 }
 
@@ -66,9 +73,6 @@ struct State {
     /// Offset of `buf[0]`.
     start: u64,
     buf: VecDeque<u8>,
-    /// No delta may start before this: the terminal was resized at this offset (bytes drawn
-    /// for the old size, appended to a terminal already at the new one, would garble it).
-    floor: u64,
     /// Clients attached through this tail now.
     users: usize,
     /// When the last client left (None while one is attached, or none ever left).
@@ -81,7 +85,7 @@ struct State {
 
 impl State {
     fn new(start: u64) -> State {
-        State { start, buf: VecDeque::new(), floor: start, users: 0, left_at: None, left_end: start, dead: false }
+        State { start, buf: VecDeque::new(), users: 0, left_at: None, left_end: start, dead: false }
     }
     fn end(&self) -> u64 {
         self.start + self.buf.len() as u64
@@ -102,11 +106,11 @@ impl State {
     fn reset(&mut self, offset: u64) {
         self.buf.clear();
         self.start = offset;
-        self.floor = offset;
     }
     /// The bytes `[since, upto)`, if this tail holds all of them and they are few enough.
+    /// Whether the terminal still draws them the same way (size, run alive) is the caller's.
     fn delta(&self, since: u64, upto: u64) -> Option<Vec<u8>> {
-        if self.dead || since < self.start.max(self.floor) || upto > self.end() || since > upto
+        if self.dead || since < self.start || upto > self.end() || since > upto
             || upto - since > DELTA_MAX as u64
         {
             return None;
@@ -167,14 +171,19 @@ impl Tails {
         at: u64,
         subscribe: impl FnOnce() -> anyhow::Result<(u64, broadcast::Receiver<Output>)>,
     ) -> Option<TailUse> {
-        let existing = self.map.lock().get(&id).cloned();
+        let existing = self.slots.lock().map.get(&id).cloned();
         let tail = match existing {
             Some(t) if t.generation == generation && !t.state.lock().dead => t,
             _ => {
-                if !self.make_room(id) {
+                // Room is taken before the (blocking) subscription, so concurrent attaches
+                // can't start more than MAX_TAILS between them.
+                if !self.reserve(id) {
                     return None;
                 }
-                let (start, rx) = match subscribe() {
+                let subscribed = subscribe();
+                let mut slots = self.slots.lock();
+                slots.reserved -= 1;
+                let (start, rx) = match subscribed {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::debug!(session = id, "replay tail: {e:#}");
@@ -187,9 +196,10 @@ impl Tails {
                     end: watch::channel(start).0,
                     stop: Notify::new(),
                 });
-                if let Some(old) = self.map.lock().insert(id, tail.clone()) {
+                if let Some(old) = slots.map.insert(id, tail.clone()) {
                     old.stop.notify_one();
                 }
+                drop(slots);
                 tokio::spawn(keep(Arc::downgrade(self), id, tail.clone(), rx));
                 tail
             }
@@ -198,44 +208,35 @@ impl Tails {
         Some(TailUse { tail, reached: at })
     }
 
-    /// Room for a tail for `id`: evict `id`'s own (another run) or, at the cap, the unused
-    /// tail left longest ago. False when every tail has a client attached.
-    fn make_room(&self, id: SessionId) -> bool {
-        let mut map = self.map.lock();
-        if let Some(old) = map.remove(&id) {
+    /// Take room for a tail for `id`: evict `id`'s own (another run) or, at the cap, the unused
+    /// tail left longest ago. False when every tail (and every one being started) is in use.
+    fn reserve(&self, id: SessionId) -> bool {
+        let mut slots = self.slots.lock();
+        if let Some(old) = slots.map.remove(&id) {
             old.stop.notify_one();
         }
-        if map.len() < MAX_TAILS {
-            return true;
-        }
-        let victim = map
-            .iter()
-            .filter_map(|(k, t)| {
-                let s = t.state.lock();
-                (s.users == 0).then_some((*k, s.left_at))
-            })
-            .min_by_key(|(_, left)| *left)
-            .map(|(k, _)| k);
-        match victim.and_then(|k| map.remove(&k)) {
-            Some(t) => {
-                t.stop.notify_one();
-                true
+        if slots.map.len() + slots.reserved >= MAX_TAILS {
+            let victim = slots
+                .map
+                .iter()
+                .filter_map(|(k, t)| {
+                    let s = t.state.lock();
+                    (s.users == 0).then_some((*k, s.left_at))
+                })
+                .min_by_key(|(_, left)| *left)
+                .map(|(k, _)| k);
+            match victim.and_then(|k| slots.map.remove(&k)) {
+                Some(t) => t.stop.notify_one(),
+                None => return false,
             }
-            None => false,
         }
-    }
-
-    /// Session `id`'s terminal changed size: earlier offsets can't be resumed with a delta.
-    pub fn resized(&self, id: SessionId) {
-        if let Some(t) = self.map.lock().get(&id) {
-            let mut s = t.state.lock();
-            s.floor = s.end();
-        }
+        slots.reserved += 1;
+        true
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.map.lock().len()
+        self.slots.lock().map.len()
     }
 }
 
@@ -267,9 +268,9 @@ async fn keep(tails: Weak<Tails>, id: SessionId, tail: Arc<Tail>, mut rx: broadc
     }
     tail.state.lock().dead = true;
     if let Some(tails) = tails.upgrade() {
-        let mut map = tails.map.lock();
-        if map.get(&id).is_some_and(|t| Arc::ptr_eq(t, &tail)) {
-            map.remove(&id);
+        let mut slots = tails.slots.lock();
+        if slots.map.get(&id).is_some_and(|t| Arc::ptr_eq(t, &tail)) {
+            slots.map.remove(&id);
         }
     }
 }
@@ -305,12 +306,9 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_or_reset_floors_the_offsets_a_delta_may_start_from() {
+    fn a_stream_reset_drops_what_came_before() {
         let mut s = State::new(0);
-        s.push(b"0123456789");
-        s.floor = s.end();
-        assert_eq!(s.delta(5, 10), None, "drawn at the old size");
-        s.push(b"ab");
+        s.push(b"0123456789ab");
         assert_eq!(s.delta(10, 12).as_deref(), Some(&b"ab"[..]));
         s.reset(500);
         assert_eq!(s.delta(10, 12), None);
@@ -361,8 +359,6 @@ mod tests {
         assert_eq!(back.delta(999, 1011).await, None, "before the tail's stream began");
         // Not caught up within CATCH_UP: no delta (the caller sends a screen).
         assert_eq!(back.delta(1005, 1020).await, None);
-        tails.resized(7);
-        assert_eq!(back.delta(1005, 1011).await, None, "resized meanwhile");
         // Another run of the session replaces the tail.
         let (_tx2, subscribe2) = feed();
         let next = tails.join(7, 4, 1000, subscribe2).expect("tail");
@@ -370,6 +366,22 @@ mod tests {
         assert_eq!(tails.len(), 1);
         drop((back, next));
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn tails_being_started_count_against_the_cap() {
+        let tails = Arc::new(Tails::default());
+        for id in 0..MAX_TAILS as u32 {
+            assert!(tails.reserve(id));
+        }
+        let (_tx, subscribe) = feed();
+        assert!(tails.join(99, 0, 1000, subscribe).is_none(), "all room taken by starts in progress");
+        tails.slots.lock().reserved -= 1;
+        let failing = || -> anyhow::Result<(u64, broadcast::Receiver<Output>)> { anyhow::bail!("host busy") };
+        assert!(tails.join(99, 0, 1000, failing).is_none());
+        assert_eq!(tails.slots.lock().reserved, MAX_TAILS - 1, "a failed subscription gives its room back");
+        let (_tx2, subscribe) = feed();
+        assert!(tails.join(99, 0, 1000, subscribe).is_some());
     }
 
     #[tokio::test]
@@ -400,7 +412,7 @@ mod tests {
         let (tx, subscribe) = feed();
         assert!(tails.join(999, 0, 1000, subscribe).is_some(), "the unused tail made room");
         assert_eq!(tails.len(), MAX_TAILS);
-        assert!(!tails.map.lock().contains_key(&100));
+        assert!(!tails.slots.lock().map.contains_key(&100));
         drop((tx, senders, uses));
     }
 }

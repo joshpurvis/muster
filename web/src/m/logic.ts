@@ -193,42 +193,50 @@ export function relativeTime(since: number, now = Date.now()): string {
 }
 
 /** `attach_info` (docs/PROTOCOL.md "Remote devices"): what the next replay frame is and the raw
- * output offset it ends at. `generation` is null for a session from an earlier daemon run. */
+ * output offset it ends at. `generation` is null for a session from an earlier daemon run;
+ * `size_rev` (the terminal size revision it was drawn at) is null when the daemon can't tell. */
 export interface AttachInfo {
   id: number;
   kind: "full" | "screen" | "delta";
   offset: number;
   generation: number | null;
   epoch: string;
+  size_rev: number | null;
 }
 export interface Since {
   offset: number;
   generation: number;
   epoch: string;
+  size_rev: number;
 }
 
 /** Where the phone's terminal stands in its session's raw output, so a reattach can ask for
  * only what it missed (`replay: {since}`): the offset of the last replay plus every live byte
- * received after it. A `delta` replay appends; any other replay replaces the terminal. */
+ * received after it. An `attach_info` only describes the replay frame that follows it, so it
+ * takes effect when that frame arrives, and is void if the connection ends first. A `delta`
+ * replay appends; any other replay replaces the terminal. */
 export class ReplayCursor {
   private at: Since | null = null;
-  private next: AttachInfo["kind"] | null = null;
+  private pending: AttachInfo | null = null;
   info(info: AttachInfo) {
-    this.at = info.generation === null
-      ? null
-      : { offset: info.offset, generation: info.generation, epoch: info.epoch };
-    this.next = info.kind;
+    this.pending = info;
   }
   /** A replay frame arrived. True: it is a delta, to append to the terminal as it is. A replay
    * without `attach_info` (an older daemon) leaves the offset unknown. */
   replay(): boolean {
-    const delta = this.next === "delta";
-    if (this.next === null) this.at = null;
-    this.next = null;
-    return delta;
+    const info = this.pending;
+    this.pending = null;
+    this.at = info && info.generation !== null && info.size_rev !== null
+      ? { offset: info.offset, generation: info.generation, epoch: info.epoch, size_rev: info.size_rev }
+      : null;
+    return info?.kind === "delta";
   }
   output(bytes: number) {
     if (this.at) this.at.offset += bytes;
+  }
+  /** The connection ended: an `attach_info` whose replay never came describes nothing. */
+  disconnected() {
+    this.pending = null;
   }
   since(): Since | null {
     return this.at && { ...this.at };

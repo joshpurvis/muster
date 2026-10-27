@@ -28,6 +28,7 @@ interface Viewer {
   receive(type: number, payload: Uint8Array): void;
   attachInfo(info: AttachInfo): void;
   since(): Since | null;
+  disconnected(): void;
   update(info: SessionInfo): void;
   grid(): Grid;
 }
@@ -119,9 +120,26 @@ async function checkDevice(): Promise<boolean> {
   }
 }
 
+let retryTimer = 0;
+let retryDelay = 1000;
+function stopRetrying() {
+  clearTimeout(retryTimer);
+  retryTimer = 0;
+}
+/** Check the device, then connect. While the page is visible and Muster can't be reached (the
+ * device check fails without saying "unpaired"), it tries again, waiting 1, 2, 4… up to 10 s:
+ * neither `online` nor `visibilitychange` may fire again to restart it. */
 export async function reconnect() {
+  stopRetrying();
   if (document.visibilityState !== "visible" || pairBusy.peek()) return;
-  if (await checkDevice() && document.visibilityState === "visible") rpc.resume();
+  if (await checkDevice()) {
+    retryDelay = 1000;
+    if (document.visibilityState === "visible") rpc.resume();
+    return;
+  }
+  if (auth.peek() === "unpaired" || document.visibilityState !== "visible" || retryTimer) return;
+  retryTimer = setTimeout(reconnect, retryDelay);
+  retryDelay = Math.min(10000, retryDelay * 2);
 }
 
 export async function pair(code: string) {
@@ -322,6 +340,7 @@ export function start() {
   });
   rpc.onHello = (hello) => {
     helloCount++;
+    viewer?.disconnected();
     batch(() => {
       sessions.value = new Map(hello.sessions.map((s) => [s.id, s]));
       channels.value = new Map(hello.channels.map((c) => [c.id, c]));
@@ -369,11 +388,14 @@ export function start() {
   };
   rpc.onClosed = async () => {
     attached = null;
+    viewer?.disconnected();
     if (auth.peek() !== "unpaired") await checkDevice();
   };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") rpc.suspend();
-    else reconnect();
+    if (document.visibilityState === "hidden") {
+      stopRetrying();
+      rpc.suspend();
+    } else reconnect();
   });
   document.addEventListener("freeze", () => rpc.suspend());
   // Chrome's page lifecycle: a frozen page that comes back fires `resume`.

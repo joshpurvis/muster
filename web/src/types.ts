@@ -490,6 +490,7 @@ export type ServerEvent =
       offset: number;
       generation: number | null;
       epoch: string;
+      size_rev: number | null;
     };
   };
 

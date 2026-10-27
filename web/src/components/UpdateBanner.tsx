@@ -2,9 +2,9 @@
 // Backend first (restart it; terminals keep running), then the UI (reload), then the terminal
 // host (only a full restart installs it, which ends every session). Dismissing hides that
 // update until a different one arrives. Hidden while a dialog is open (nothing behind a modal
-// may be clicked), and announced once per update by its own live region, apart from the
-// toasts' status region.
-import { daemonStopped, dismissedUpdates, loadedRelease, overlay, updateStatus } from "../state.ts";
+// may be clicked) and while Muster stops or restarts, and announced once per update by its own
+// live region, apart from the toasts' status region.
+import { daemonRestarting, daemonStopped, dismissedUpdates, loadedRelease, overlay, updateStatus } from "../state.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { pickUpdate } from "../updates.ts";
@@ -16,12 +16,12 @@ import { cx } from "../util.ts";
 const ANNOUNCE = {
   backend: "Backend update ready. Restarting the backend keeps every terminal running.",
   ui: "UI update ready. Reload this window to use it.",
-  host: "Terminal host update. Installing it needs a full restart, which ends all sessions.",
+  host: "Terminal host update. Installing it needs a restart of Muster, which ends all sessions.",
 } as const;
 
 export function UpdateBanner() {
   const pending = pickUpdate(updateStatus.value, loadedRelease, dismissedUpdates.value);
-  const u = daemonStopped.value ? null : pending;
+  const u = daemonStopped.value || daemonRestarting.value ? null : pending;
   return (
     <>
       <div class="sr-only" aria-live="polite">{u ? ANNOUNCE[u.kind] : ""}</div>
@@ -61,10 +61,15 @@ function Banner({ u }: { u: NonNullable<ReturnType<typeof pickUpdate>> }) {
     );
   } else {
     title = "Terminal host update";
-    text = "Installing it needs a full restart, which ends all sessions.";
+    text = "Installing it needs a restart of Muster, which ends all sessions.";
     action = (
-      <button type="button" class="link-btn" onClick={() => (overlay.value = { kind: "shutdown" })}>
-        Shut down Muster…
+      <button
+        type="button"
+        class="btn btn-sm"
+        disabled={offline}
+        onClick={() => (overlay.value = { kind: "restart" })}
+      >
+        Restart Muster…
       </button>
     );
   }

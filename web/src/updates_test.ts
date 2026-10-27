@@ -1,4 +1,14 @@
-import { pickUpdate, releaseOfScript, type UpdateStatus, waitingUpdates } from "./updates.ts";
+import {
+  pickUpdate,
+  releaseOfScript,
+  restartAnswered,
+  restartExpect,
+  restartOutcome,
+  restartWait,
+  runningText,
+  type UpdateStatus,
+  waitingUpdates,
+} from "./updates.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual);
@@ -42,4 +52,52 @@ Deno.test("dismissing hides that update until a different one arrives", () => {
   // A dismissed update lets the next one through.
   assertEquals(pickUpdate({ ...s, host: "h1" }, null, { backend: "abc" }), { kind: "host", key: "h1" });
   assertEquals(pickUpdate({ ...s, ui_release: "2-b" }, "1-a", { backend: "abc", ui: "2-b" }), null);
+});
+
+Deno.test("a restart expects the builds the window was shown", () => {
+  assertEquals(restartExpect(null), { backend: null, host: null });
+  assertEquals(restartExpect(none), { backend: null, host: null });
+  assertEquals(restartExpect({ ui_release: "1-a", backend: "abc", host: "def" }), { backend: "abc", host: "def" });
+});
+
+Deno.test("only another backend on a new terminal host ends the restart wait", () => {
+  const old = { pid: 5, host: "h1", build: null };
+  const on = (pid: number | undefined, host: string | null) => ({ pid, terminal_host: host ? { instance: host } : null });
+  assertEquals(restartAnswered(null, on(6, "h2")), false, "not restarting");
+  assertEquals(restartAnswered(old, on(5, "h1")), false, "the old backend, still stopping");
+  assertEquals(restartAnswered(old, on(6, "h2")), true);
+  // A shell's `muster reload` meanwhile: a new backend on the old host is not the restart.
+  assertEquals(restartAnswered(old, on(6, "h1")), false, "a new backend on the old host");
+  assertEquals(restartAnswered(old, on(6, null)), false, "a backend without a host");
+  assertEquals(restartAnswered(old, { pid: 6 }), false, "a hello that names no host");
+  assertEquals(restartAnswered({ pid: null, host: null, build: null }, on(6, "h2")), true, "the old backend said neither");
+  assertEquals(restartAnswered(old, on(undefined, "h2")), true, "the new backend doesn't say its pid");
+});
+
+Deno.test("a restart expects the build it starts, and tells another one apart", () => {
+  const last = { pid: 5, host: "h1", build: "aaaaaaaaaaaa" };
+  // No backend update shown: the same build again; one shown: that one.
+  assertEquals(restartWait(last, none), last);
+  assertEquals(restartWait(last, { ui_release: null, backend: "bbbbbbbbbbbb", host: null }).build, "bbbbbbbbbbbb");
+  const wait = restartWait(last, { ui_release: null, backend: "bbbbbbbbbbbb", host: "cccccccccccc" });
+  const hello = (build?: string | null) => ({ pid: 6, build, terminal_host: { instance: "h2" } });
+  assertEquals(restartOutcome(wait, { pid: 5, build: "aaaaaaaaaaaa", terminal_host: { instance: "h1" } }), "waiting");
+  assertEquals(restartOutcome(wait, hello("bbbbbbbbbbbb")), "restarted");
+  // Something else started Muster meanwhile (an older build, say): the restart is over, but not as asked.
+  assertEquals(restartOutcome(wait, hello("aaaaaaaaaaaa")), "other_build");
+  // A backend that doesn't say, or a wait that didn't know the build: not compared.
+  assertEquals(restartOutcome(wait, hello(undefined)), "restarted");
+  assertEquals(restartOutcome({ ...wait, build: null }, hello("dddddddddddd")), "restarted");
+  assertEquals(restartOutcome(null, hello("bbbbbbbbbbbb")), "waiting");
+});
+
+Deno.test("the dialogs count running sessions and agents", () => {
+  const sh = { kind: "shell" };
+  const cl = { kind: "claude" };
+  assertEquals(runningText([]), "No sessions are running.");
+  assertEquals(runningText([sh]), "1 session is running.");
+  assertEquals(runningText([cl]), "1 session is running (an agent).");
+  assertEquals(runningText([cl, cl]), "2 sessions are running (all agents).");
+  assertEquals(runningText([cl, sh, sh]), "3 sessions are running (1 agent).");
+  assertEquals(runningText([cl, cl, sh]), "3 sessions are running (2 agents).");
 });

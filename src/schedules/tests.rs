@@ -551,3 +551,7 @@ fn migration_v19_adds_the_tables_and_a_slot_is_unique() {
 // Phase 2: triggers, chains and the spend caps.
 #[path = "tests_phase2.rs"]
 mod phase2;
+
+// Phase 3: agents' proposals and reminders, the file-change trigger.
+#[path = "tests_phase3.rs"]
+mod phase3;

@@ -4,7 +4,7 @@
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from "./Schedules.tsx";
+import { AgentSchedules, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   schedulesSupported,
   scheduleSettings,
@@ -125,6 +125,7 @@ export function AgentsPanel() {
         </button>
       </div>
       {agentsSupported.value && <SchedulesPausedNotice />}
+      {agentsSupported.value && <ProposalsNotice />}
       {!agentsSupported.value
         ? <div class="ap-empty">This daemon has no agents. Update muster to use them.</div>
         : (

@@ -242,7 +242,12 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
          your final message for that turn goes back to the sender. To ask other agents, use the muster \
-         MCP tools `list_agents` and `ask_agent`.\n",
+         MCP tools `list_agents` and `ask_agent`.\n\n\
+         ## Schedules\n\n\
+         To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
+         one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
+         `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
+         shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         resume = if kind == SessionKind::Claude { " and resumes your conversation when you restart" } else { "" },
         persona = if persona.is_empty() { "(none given)" } else { persona },

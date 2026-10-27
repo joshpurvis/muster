@@ -51,7 +51,7 @@ fn a_note_fires_only_when_the_human_allows_triggers() {
     crate::notes::set_triggers(&f.hub, id, false).unwrap();
     let after = f.hub.schedules.get(s.id).unwrap();
     assert!(after.event.is_none() && after.next_run.is_none());
-    assert!(matches!(triggers::note_flag(&f.hub, &after), Some(Action::Skip(w)) if w.contains("triggers are off")));
+    assert!(matches!(triggers::event_flag(&f.hub, &after), Some(Action::Skip(w)) if w.contains("triggers are off")));
     // No write of the text, an agent's included, can switch it.
     let n = crate::notes::get(&f.hub, id).unwrap();
     let bot = NoteAuthor { kind: "agent".into(), name: Some("bot".into()), session_id: Some(5) };

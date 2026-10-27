@@ -782,13 +782,16 @@ pub enum ScheduleCmd {
         /// Create it paused.
         #[arg(long)] paused: bool,
         /// A trigger instead of a time (runs are origin webhook, "Triggered"): `note:<note>`,
-        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`
-        /// or `url:<name>`.
+        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`,
+        /// `url:<name>`, or `files:<folder>[/<pattern>]` (e.g. `files:~/inbox/*.pdf`; only inside a
+        /// folder you allow under Scheduling settings → Watched folders).
         #[arg(long, value_name = "EVENT")] on: Option<String>,
         /// A note trigger waits this many minutes of quiet after the last edit (default 2).
         #[arg(long, value_name = "N")] quiet_min: Option<u32>,
         /// A GitHub trigger checks every N minutes (2 to 60, default 5).
         #[arg(long, value_name = "N")] poll_min: Option<u32>,
+        /// A files trigger also looks in subfolders (up to 3 levels).
+        #[arg(long)] subfolders: bool,
         /// Then, when a run replies: `AGENT: prompt` (the prompt may quote the reply as {reply}).
         #[arg(long, value_name = "AGENT: PROMPT")] then: Option<String>,
         /// When a run fails: `notify`, or `AGENT: prompt` ({reply}, {outcome}).
@@ -821,6 +824,42 @@ pub enum ScheduleCmd {
     },
     /// Renew a Claude subscription agent's schedule for 7 more days.
     Renew { id: i64 },
+    /// Approve an agent's proposed schedule (only you can): it then runs like any schedule.
+    /// `muster schedule rm` dismisses one.
+    Approve { id: i64 },
+    /// Inside an agent's session: propose a schedule; it runs only once the human approves it in
+    /// the Agents panel. Give one timing as for `add`, and --reason.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule propose --weekly fri@16:00 --reason \"You asked for a weekly summary\" Summarise the Ideas note")]
+    Propose {
+        prompt: Vec<String>,
+        /// Why (the human reads it before approving).
+        #[arg(long)] reason: String,
+        /// The agent it runs on (default: the one proposing).
+        #[arg(long)] agent: Option<String>,
+        #[arg(long)] every: Option<String>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0")] hourly: Option<String>,
+        #[arg(long)] daily: Option<String>,
+        #[arg(long)] weekdays: Option<String>,
+        #[arg(long)] weekly: Option<String>,
+        #[arg(long)] cron: Option<String>,
+        #[arg(long)] at: Option<String>,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+        #[arg(long)] fresh: bool,
+        #[arg(long, value_parser = ["on", "off"])] quiet_hours: Option<String>,
+        #[arg(long)] max_per_day: Option<u32>,
+        /// Also add each reply to this note (its id).
+        #[arg(long)] note: Option<i64>,
+    },
+    /// Inside an agent's session: have Muster send you PROMPT once, 5 minutes to 24 hours from
+    /// now, without approval. `--at +20m`, `--at 15:30` or `--at "YYYY-MM-DD HH:MM"`.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule remind --at +20m Check whether CI on master passed")]
+    Remind {
+        prompt: Vec<String>,
+        #[arg(long)] at: String,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+    },
     /// A schedule's runs, newest first: RUN  TIME  KIND  OUTCOME  REASON.
     History {
         id: i64,
@@ -830,9 +869,9 @@ pub enum ScheduleCmd {
 }
 
 /// `--on EVENT` as a trigger `when`.
-fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>) -> anyhow::Result<Value> {
+fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>, subfolders: bool) -> anyhow::Result<Value> {
     let bad = |why: &str| exit(2, format!("--on {on}: {why}"));
-    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed or url:<name>"))?;
+    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed, url:<name> or files:<folder>"))?;
     let v = match kind {
         "note" => json!({"kind": "note", "note_id": note_target(d, rest)?, "quiet_min": quiet_min}),
         "git" => {
@@ -857,7 +896,19 @@ fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Optio
             json!({"kind": "github", "repo": repo, "event": event, "branch": branch, "every_min": poll_min})
         }
         "url" => json!({"kind": "url", "name": rest}),
-        _ => return Err(bad("the kind is note, git, gh or url")),
+        "files" => {
+            // A last part with * or ? is the file pattern: files:~/inbox/*.pdf.
+            let (folder, pattern) = match rest.rsplit_once('/') {
+                Some((f, p)) if p.contains(['*', '?']) => (f, Some(p)),
+                _ => (rest, None),
+            };
+            let folder = match folder.strip_prefix("~/") {
+                Some(r) => crate::paths::home_dir().join(r),
+                None => std::path::absolute(folder).map_err(|e| bad(&e.to_string()))?,
+            };
+            json!({"kind": "files", "folder": folder, "pattern": pattern, "recursive": subfolders, "quiet_min": quiet_min})
+        }
+        _ => return Err(bad("the kind is note, git, gh, url or files")),
     };
     let mut v = v;
     v.as_object_mut().unwrap().retain(|_, x| !x.is_null());
@@ -999,13 +1050,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
     };
     match cmd {
         ScheduleCmd::Add { agent, prompt, every, hourly, daily, weekdays, weekly, cron, at, name, tz, if_missed, fresh,
-            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, then, on_failure } => {
+            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, subfolders, then, on_failure } => {
             let when = match &on {
                 Some(on) => {
                     if [&every, &hourly, &daily, &weekdays, &weekly, &cron, &at].iter().any(|o| o.is_some()) {
                         return Err(exit(2, "give a timing or --on EVENT, not both"));
                     }
-                    trigger_when(d, on, quiet_min, poll_min)?
+                    trigger_when(d, on, quiet_min, poll_min, subfolders)?
                 }
                 None => schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?,
             };
@@ -1101,6 +1152,40 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 Some(e) => println!("schedule {id}: runs until {}", local_time(e)),
                 None => println!("schedule {id}: doesn't expire"),
             }
+            Ok(())
+        }
+        ScheduleCmd::Approve { id } => {
+            let s = one("schedule.approve", json!({"id": id}))?;
+            let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
+            println!("schedule {id} approved: {} on {}; next {next}", s["reading"].as_str().unwrap_or(""), s["agent"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,
+            quiet_hours, max_per_day, note } => {
+            let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({
+                "prompt": text, "reason": reason, "agent": agent, "name": name, "tz": tz,
+                "cron": when.get("cron"), "at": when.get("at"),
+                "conversation": fresh.then_some("fresh"), "quiet_hours": quiet_hours.map(|q| q == "on"),
+                "daily_cap": max_per_day, "note_id": note,
+            });
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.propose", p)?;
+            println!("schedule {}: proposed ({}{}). It runs once the human approves it in the Agents panel.",
+                r["schedule_id"], r["when"].as_str().unwrap_or(""), r["agent"].as_str().map(|a| format!(", on {a}")).unwrap_or_default());
+            if let Some(e) = r["estimate"].as_str() {
+                println!("  {e}");
+            }
+            Ok(())
+        }
+        ScheduleCmd::Remind { prompt, at, name, tz } => {
+            let at = once_at(&at, tz.as_deref())?;
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({"prompt": text, "at": at, "name": name, "tz": tz});
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.remind", p)?;
+            println!("schedule {}: reminder at {}", r["schedule_id"], r["runs_at"].as_str().unwrap_or("?"));
             Ok(())
         }
         ScheduleCmd::History { id, limit, json } => {

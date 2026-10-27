@@ -30,6 +30,7 @@ pub const JUMP_MS: i64 = 2 * MINUTE_MS;
 
 pub const PAUSED: &str = "paused";
 pub const PAUSED_ALL: &str = "all schedules paused";
+pub const WAITING: &str = "an agent's proposal that you haven't approved";
 
 /// What the rules need to know about a schedule's agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,7 +41,8 @@ pub struct Facts {
 
 /// When a Claude subscription agent's recurring schedule stops (None: it doesn't).
 pub fn expires_at(s: &Schedule, f: &Facts) -> Option<i64> {
-    (f.subscription_claude && s.when.recurs()).then_some(s.renewed_at + EXPIRY_MS)
+    // A proposal's 7 days start when it is approved.
+    (f.subscription_claude && s.when.recurs() && !s.waiting_approval()).then_some(s.renewed_at + EXPIRY_MS)
 }
 
 /// The quiet hours, in this machine's time zone.
@@ -82,7 +84,7 @@ pub fn effective_missed(s: &Schedule, now: i64) -> MissedPolicy {
         Missed::Skip => MissedPolicy::Skip,
         Missed::Auto => match &s.when {
             // An event waiting while Muster was off still runs, once.
-            When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } => {
+            When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } | When::Files { .. } => {
                 MissedPolicy::RunOnce
             }
             When::Cron { cron } => {
@@ -125,12 +127,13 @@ pub struct Due {
 /// in the last 24 hours; `last_reason`: the reason on its newest run.
 pub fn due(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32, last_reason: Option<&str>) -> Option<Due> {
     let first = s.next_run?;
-    if first > now {
+    // An agent's proposal never runs before the human approves it (it keeps no next run either).
+    if first > now || s.waiting_approval() {
         return None;
     }
     let trigger = s.when.is_trigger();
     let (slot, count, next_run) = match &s.when {
-        When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } => (first, 1, None),
+        When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } | When::Files { .. } => (first, 1, None),
         When::Cron { cron } => {
             let parsed = cron::Cron::parse(cron).ok().zip(cron::zone(&s.tz).ok());
             let Some((c, tz)) = parsed else {
@@ -216,6 +219,9 @@ fn cap_reason(cap: u32) -> String {
 /// meanwhile. `since_sent`: how long ago this schedule's previous message was submitted.
 /// `Some(Action::Skip | Action::Refuse)`: don't send.
 pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32, since_sent: Option<i64>) -> Option<Action> {
+    if s.waiting_approval() {
+        return Some(Action::Skip(WAITING.into()));
+    }
     if expires_at(s, f).is_some_and(|e| now >= e) {
         return Some(Action::Skip(EXPIRED.into()));
     }

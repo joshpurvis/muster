@@ -23,7 +23,14 @@
 //! "Then…" steps (`Schedule::then`: after a run, ask another agent one hop further down the same
 //! chain, or just notify), and the OpenRouter spend caps (src/spend.rs, checked with every other
 //! delivery rule in `agents::precheck`).
+//!
+//! Phase 3 lets agents propose schedules (`agent.rs`, the MCP tools): a proposal never runs
+//! until the human approves it (`Schedule::made_by`), except a one-off reminder an agent sets for
+//! itself up to 24 hours ahead. Once made, both are ordinary schedules, so every rule above
+//! applies to them. It also adds the file-change trigger (`When::Files`), for folders the human
+//! chose in the settings (`Settings::watch_folders`, empty by default).
 
+pub mod agent;
 pub mod cron;
 pub mod plan;
 mod run;
@@ -123,6 +130,18 @@ pub enum When {
     },
     /// A loopback URL (`POST /api/trigger/<name>` with its secret) or `muster trigger <name>`.
     Url { name: String },
+    /// Files appeared or changed in a folder (polled), inside a folder the human allows to be
+    /// watched (`Settings::watch_folders`); `pattern` matches file names (`*.pdf`), `recursive`
+    /// looks a few levels down. Runs after `quiet_min` minutes without further changes.
+    Files {
+        folder: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default = "default_note_quiet")]
+        quiet_min: u32,
+    },
 }
 
 fn default_note_quiet() -> u32 {
@@ -209,6 +228,43 @@ pub struct WatchState {
     /// (a slow `gh` call) whose answer comes back after is thrown away, not saved.
     #[serde(default)]
     pub generation: u64,
+    /// Files: the newest change time (ctime, ns since the epoch) seen in the folder. A file
+    /// changed after it is new or changed (None: not looked yet; the first look only records it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<u64>,
+}
+
+/// Who made a schedule when it wasn't the human (Phase 3): an agent's proposal, which never runs
+/// until the human approves it, or a one-off reminder an agent set for itself (no approval).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MadeBy {
+    /// The agent that made it, and its name then.
+    pub agent_id: i64,
+    pub agent: String,
+    pub session_id: Option<SessionId>,
+    pub kind: MadeKind,
+    /// Why, in the agent's own words (shown to the human as the agent's).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    pub at: i64,
+    /// When the human approved it (a proposal); None: waiting for approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MadeKind {
+    /// Needs the human's approval before it runs.
+    Proposal,
+    /// A one-off for the agent itself, at most 24 hours ahead: runs without approval.
+    Reminder,
+}
+
+impl MadeBy {
+    pub fn waiting(&self) -> bool {
+        self.kind == MadeKind::Proposal && self.approved_at.is_none()
+    }
 }
 
 /// "If missed": what a slot missed while Muster was off or asleep does.
@@ -290,6 +346,9 @@ pub struct Schedule {
     /// A URL trigger's secret (never in `schedule.list`: `trigger.secret` gives it to the human).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// Made by an agent (a proposal or its reminder); None: the human made it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub made_by: Option<MadeBy>,
 }
 
 impl Default for Schedule {
@@ -321,6 +380,7 @@ impl Default for Schedule {
             event: None,
             watch: WatchState::default(),
             secret: None,
+            made_by: None,
         }
     }
 }
@@ -333,6 +393,10 @@ impl Schedule {
     /// The envelope's sender for its own runs.
     pub fn sender(&self) -> String {
         run::sender_of(self.id, self.when.is_trigger())
+    }
+    /// An agent's proposal the human hasn't approved: it never runs (no next run is kept).
+    pub fn waiting_approval(&self) -> bool {
+        self.made_by.as_ref().is_some_and(MadeBy::waiting)
     }
 }
 
@@ -501,6 +565,9 @@ pub struct Settings {
     pub spend_cap_cents: u32,
     /// OpenRouter: optional per-agent daily caps, in cents, by agent id.
     pub agent_spend_caps: BTreeMap<i64, u32>,
+    /// Folders a file trigger may watch (canonical paths): empty by default, so no file trigger
+    /// can be made, and so none can waste usage, until the human adds one.
+    pub watch_folders: Vec<String>,
 }
 
 impl Default for Settings {
@@ -512,6 +579,7 @@ impl Default for Settings {
             unattended_cap: crate::mcp::guard::UNATTENDED_DAILY_CAP_DEFAULT,
             spend_cap_cents: crate::spend::DEFAULT_CAP_CENTS,
             agent_spend_caps: BTreeMap::new(),
+            watch_folders: Vec::new(),
         }
     }
 }
@@ -563,6 +631,8 @@ pub struct Schedules {
     /// Runs waiting for their reply, woken when the run is ended elsewhere (its prompt was
     /// taken back before it was submitted).
     pub(crate) waiters: Mutex<HashMap<i64, Arc<tokio::sync::Notify>>>,
+    /// What each agent proposed or set lately (the per-day limits of `agent.rs`).
+    pub(crate) made: agent::MadeLog,
 }
 
 impl Schedules {
@@ -580,6 +650,7 @@ impl Schedules {
             started_at: started_at.into(),
             expired_seen: Default::default(),
             waiters: Default::default(),
+            made: Default::default(),
         })
     }
 
@@ -619,6 +690,12 @@ impl Schedules {
         let mut g = self.inner.lock();
         let mut s = g.list.get(&id).cloned().with_context(|| format!("no schedule {id} (see `muster schedule ls`)"))?;
         f(&mut s)?;
+        // A proposal waiting for approval keeps no time to run and no event, whatever changed.
+        if s.waiting_approval() {
+            s.next_run = None;
+            s.skip_slot = None;
+            s.event = None;
+        }
         s.updated_at = self.now();
         self.store.save_schedule(&s)?;
         g.list.insert(id, s.clone());
@@ -718,7 +795,9 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
     let expires_at = plan::expires_at(s, &f);
     let expired = expires_at.is_some_and(|e| now >= e);
     let trigger = s.when.is_trigger();
-    let status = if expired {
+    let status = if s.waiting_approval() {
+        "proposed"
+    } else if expired {
         "expired"
     } else if s.next_run.is_none() && !trigger {
         "done"
@@ -752,6 +831,16 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
         _ => None,
     };
     json!({
+        "made_by": s.made_by.as_ref().map(|m| json!({
+            "agent_id": m.agent_id,
+            "agent": hub.agents().by_id(m.agent_id).map(|a| a.name).unwrap_or_else(|| m.agent.clone()),
+            "kind": m.kind,
+            "reason": m.reason,
+            "at": m.at,
+            "approved_at": m.approved_at,
+        })),
+        // What it would cost in runs and money: shown with every proposal.
+        "estimate": agent.as_ref().filter(|_| s.made_by.is_some()).map(|a| agent::estimate(hub, a, s, now)),
         "trigger": trigger,
         "origin": s.origin(),
         "then": s.then.as_ref().map(|t| then_json(hub, t)),
@@ -821,6 +910,7 @@ pub fn settings_json(hub: &Hub, s: &Settings) -> Value {
         "quiet_start": s.quiet_start,
         "quiet_end": s.quiet_end,
         "unattended_cap": s.unattended_cap,
+        "watch_folders": s.watch_folders,
         "tz": cron::local_zone_name(),
         "spend": hub.spend.json(hub, s),
     })
@@ -875,6 +965,15 @@ pub enum WhenInput {
         every_min: Option<u32>,
     },
     Url { name: String },
+    Files {
+        folder: String,
+        #[serde(default)]
+        pattern: Option<String>,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        quiet_min: Option<u32>,
+    },
 }
 
 impl WhenInput {
@@ -918,6 +1017,12 @@ impl WhenInput {
                 every_min: every_min.unwrap_or(triggers::GH_EVERY_DEFAULT_MIN),
             },
             WhenInput::Url { name } => When::Url { name: name.clone() },
+            WhenInput::Files { folder, pattern, recursive, quiet_min } => When::Files {
+                folder: folder.clone(),
+                pattern: pattern.clone(),
+                recursive: *recursive,
+                quiet_min: quiet_min.unwrap_or(triggers::NOTE_QUIET_DEFAULT_MIN),
+            },
         };
         triggers::check_when(hub, &mut w, own)?;
         Ok(w)
@@ -1155,6 +1260,14 @@ fn resolve_note(hub: &Hub, choice: &NoteChoice) -> anyhow::Result<NoteId> {
 }
 
 pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
+    let s = create_as(hub, req, None)?;
+    Ok(schedule_json(hub, &s))
+}
+
+/// Make a schedule: the human's (`made_by` None), or an agent's proposal or reminder
+/// (`agent.rs`, which checks the agent's limits first). A proposal is checked like any schedule
+/// but keeps no time to run until it is approved.
+pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>) -> anyhow::Result<Schedule> {
     let name = req.agent.as_deref().context("agent is required")?;
     let agent = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
     let when = req.when.context("when is required: {\"kind\":\"cron\",\"cron\":\"0 9 * * 1-5\"} or {\"kind\":\"once\",\"at\":<unix ms>}")?;
@@ -1214,7 +1327,11 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         event: None,
         watch: WatchState::default(),
         secret,
+        made_by,
     };
+    if s.waiting_approval() {
+        s.next_run = None;
+    }
     {
         let mut g = hub.schedules.inner.lock();
         s.id = hub.store().insert_schedule(&s)?;
@@ -1225,7 +1342,7 @@ pub fn create(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
         triggers::changed(hub, s.id);
     }
     publish(hub, &s);
-    Ok(schedule_json(hub, &s))
+    Ok(s)
 }
 
 pub fn update(hub: &Hub, req: ScheduleInput) -> anyhow::Result<Value> {
@@ -1373,6 +1490,7 @@ pub fn set_paused(hub: &Hub, id: i64, paused: bool) -> anyhow::Result<Value> {
 /// "Skip next" (skip the coming slot) or undo it.
 pub fn set_skip(hub: &Hub, id: i64, skip: bool) -> anyhow::Result<Value> {
     let s = hub.schedules.edit(id, |s| {
+        ensure!(!s.waiting_approval(), "this schedule is an agent's proposal: approve it first");
         ensure!(!s.when.is_trigger(), "a trigger has no next time to skip: pause it instead");
         if skip {
             s.skip_slot = Some(s.next_run.context("this schedule has no next run to skip")?);
@@ -1381,6 +1499,39 @@ pub fn set_skip(hub: &Hub, id: i64, skip: bool) -> anyhow::Result<Value> {
         }
         Ok(())
     })?;
+    publish(hub, &s);
+    Ok(schedule_json(hub, &s))
+}
+
+/// `schedule.approve`: the human approves an agent's proposal. It is checked again as if made
+/// now (its agent still takes the work, its time still comes), and then runs like any schedule:
+/// a Claude subscription agent's 7 days start now.
+pub fn approve(hub: &Hub, id: i64) -> anyhow::Result<Value> {
+    let before = hub.schedules.get(id).with_context(|| format!("no schedule {id} (see `muster schedule ls`)"))?;
+    ensure!(before.waiting_approval(), "schedule {id} isn't waiting for approval");
+    let agent = hub.agents().by_id(before.agent_id).context("this schedule's agent was removed")?;
+    check_agent(hub, &agent, before.origin())?;
+    for a in step_agents(before.then.as_ref()).into_iter().filter_map(|a| hub.agents().by_id(a)) {
+        check_agent(hub, &a, before.origin())?;
+    }
+    let now = hub.schedules.now();
+    let next = first_slot(&before.when, &before.tz, now)
+        .map_err(|e| anyhow::anyhow!("can't approve it as it is: {e:#}. Edit its time, or dismiss it"))?;
+    let s = hub.schedules.edit(id, |s| {
+        ensure!(s.waiting_approval(), "schedule {id} isn't waiting for approval");
+        ensure!(s.when == before.when && s.tz == before.tz, "it was changed meanwhile: look at it again");
+        if let Some(m) = s.made_by.as_mut() {
+            m.approved_at = Some(now);
+        }
+        s.next_run = next;
+        s.renewed_at = now;
+        s.expiry_warned = false;
+        Ok(())
+    })?;
+    hub.schedules.expired_seen.lock().remove(&id);
+    if s.when.is_trigger() {
+        triggers::changed(hub, s.id);
+    }
     publish(hub, &s);
     Ok(schedule_json(hub, &s))
 }
@@ -1518,6 +1669,8 @@ pub struct SettingsChange {
     pub spend_cap: Option<f64>,
     /// OpenRouter: per-agent daily caps in dollars by agent name, `null` to clear one.
     pub agent_spend_caps: Option<BTreeMap<String, Option<f64>>>,
+    /// The folders file triggers may watch (the whole list; `[]` for none).
+    pub watch_folders: Option<Vec<String>>,
     #[serde(default)]
     #[allow(dead_code)]
     pub from_session: Option<SessionId>,
@@ -1572,11 +1725,19 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
         }
         // Caps of agents that are gone go too.
         next.agent_spend_caps.retain(|id, _| hub.agents().by_id(*id).is_some());
+        if let Some(folders) = &c.watch_folders {
+            next.watch_folders = triggers::check_watch_folders(folders)?;
+        }
         hub.store().save_runtime(SETTINGS_KEY, &next)?;
         g.settings = next.clone();
         next
     };
     hub.schedules.wake.notify_one();
+    // A file trigger whose folder is no longer allowed stops at once (its prompts waiting in a
+    // queue are taken back; it is looked at again by the watcher).
+    if c.watch_folders.is_some() {
+        triggers::watch_folders_changed(hub);
+    }
     if next.paused {
         run::cancel_unsent(hub, None, plan::PAUSED_ALL, false);
     }
@@ -1593,6 +1754,7 @@ pub fn set_settings(hub: &Hub, c: SettingsChange) -> anyhow::Result<Value> {
 /// run: pending, or skipped when its previous run is still going.
 pub fn run_now(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Value> {
     let s = hub.schedules.get(id).with_context(|| format!("no schedule {id}"))?;
+    ensure!(!s.waiting_approval(), "this schedule is an agent's proposal: approve it before it runs");
     let agent = hub.agents().by_id(s.agent_id).context("this schedule's agent was removed")?;
     check_agent(hub, &agent, s.origin())?;
     let now = hub.schedules.now();
@@ -1649,7 +1811,7 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
         }
         // A note trigger's prompt goes only while its note still allows triggers.
         if r.kind == RunKind::Triggered
-            && let Some(a) = triggers::note_flag(hub, &s)
+            && let Some(a) = triggers::event_flag(hub, &s)
         {
             return Some(a);
         }

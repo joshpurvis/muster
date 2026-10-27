@@ -184,7 +184,7 @@ export function whenToSend(initial: WhenDraft, cur: WhenDraft, tzChanged: boolea
 
 // ---------------- triggers: "When something happens" (Phase 2) ----------------
 
-export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url";
+export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url" | "files";
 
 export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
   { id: "note", label: "A note changes" },
@@ -192,6 +192,7 @@ export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
   { id: "pr_opened", label: "GitHub: a pull request is opened" },
   { id: "ci_failed", label: "GitHub: CI fails" },
   { id: "url", label: "Its trigger URL is called (scripts, muster trigger)" },
+  { id: "files", label: "Files appear or change in a folder" },
 ];
 
 /** What the "When something happens" fields hold (each kind's fields are kept while another is
@@ -212,10 +213,27 @@ export interface TriggerDraft {
   every: string;
   /** A URL trigger's name. */
   name: string;
+  /** Files: the folder, a file-name pattern (empty: any file), and whether subfolders count. */
+  folder: string;
+  pattern: string;
+  subfolders: boolean;
 }
 
 export function blankTrigger(): TriggerDraft {
-  return { kind: "note", note: null, quiet: "2", repo: "", branch: "master", ghRepo: "", ghBranch: "", every: "5", name: "" };
+  return {
+    kind: "note",
+    note: null,
+    quiet: "2",
+    repo: "",
+    branch: "master",
+    ghRepo: "",
+    ghBranch: "",
+    every: "5",
+    name: "",
+    folder: "",
+    pattern: "",
+    subfolders: false,
+  };
 }
 
 export function isTrigger(w: When | WhenInput): boolean {
@@ -233,6 +251,8 @@ export function draftOfTrigger(w: When, base: TriggerDraft): TriggerDraft {
       return { ...base, kind: w.event, ghRepo: w.repo, ghBranch: w.branch ?? "", every: String(w.every_min) };
     case "url":
       return { ...base, kind: "url", name: w.name };
+    case "files":
+      return { ...base, kind: "files", folder: w.folder, pattern: w.pattern ?? "", subfolders: w.recursive, quiet: String(w.quiet_min) };
     default:
       return base;
   }
@@ -293,6 +313,15 @@ export function whenOfTrigger(d: TriggerDraft, notes: { id: number; title: strin
       const n = d.name.trim().toLowerCase();
       if (!NAME_RE.test(n)) return { error: "A name of a-z, 0-9, - and _ (it goes in the URL)" };
       return { when: { kind: "url", name: n } };
+    }
+    case "files": {
+      const folder = d.folder.trim();
+      if (!folder) return { error: "The folder to watch, like ~/inbox" };
+      const pattern = d.pattern.trim();
+      if (pattern.includes("/")) return { error: "The pattern is a file name, like *.pdf (no /)" };
+      const quiet = int(d.quiet, 1, 120);
+      if (quiet === null) return { error: "Wait 1 to 120 minutes of quiet" };
+      return { when: { kind: "files", folder, pattern: pattern || null, recursive: d.subfolders, quiet_min: quiet } };
     }
   }
 }
@@ -474,6 +503,7 @@ export function isExpired(s: Schedule, now: number): boolean {
 }
 
 export function nextLabel(s: Schedule, now: number): { text: string; tone: "next" | "paused" | "expired" | "done" } {
+  if (s.status === "proposed") return { text: "waiting for your approval", tone: "paused" };
   if (s.status === "done" || (s.next_run === null && s.when.kind === "once")) return { text: "done", tone: "done" };
   if (isExpired(s, now)) return { text: "expired", tone: "expired" };
   if (s.paused) return { text: "paused", tone: "paused" };
@@ -582,10 +612,49 @@ export function withSteps(runs: ScheduleRun[]): { run: ScheduleRun; depth: numbe
   return out;
 }
 
-/** The panel's order under an agent: soonest next run first, finished ones last, then by name. */
+/** The panel's order under an agent: proposals waiting for you first, then soonest next run,
+ * finished ones last, then by name. */
 export function sortSchedules(list: Schedule[]): Schedule[] {
-  const key = (s: Schedule) => s.next_run ?? Number.MAX_SAFE_INTEGER;
+  const key = (s: Schedule) => isProposal(s) ? -1 : s.next_run ?? Number.MAX_SAFE_INTEGER;
   return [...list].sort((a, b) => key(a) - key(b) || a.name.localeCompare(b.name) || a.id - b.id);
+}
+
+// ---------------- what agents made (Phase 3) ----------------
+
+/** An agent's proposal that waits for your approval. */
+export function isProposal(s: Schedule): boolean {
+  return s.status === "proposed" || (!!s.made_by && s.made_by.kind === "proposal" && s.made_by.approved_at === null);
+}
+
+/** Every proposal waiting, oldest first (the panel's notice, and its count). */
+export function waitingProposals(list: Schedule[]): Schedule[] {
+  return list.filter(isProposal).sort((a, b) => (a.made_by?.at ?? 0) - (b.made_by?.at ?? 0) || a.id - b.id);
+}
+
+/** The chip on a row an agent made: "reminder" (it set it for itself) or "from reviewer" (its
+ * approved proposal); null for yours and for proposals still waiting (their card says it). */
+export function madeByLabel(s: Schedule): { text: string; tip: string } | null {
+  const m = s.made_by;
+  if (!m || isProposal(s)) return null;
+  if (m.kind === "reminder") {
+    return { text: "reminder", tip: `${m.agent} set this one-off reminder for itself (no approval is needed up to 24 hours ahead)` };
+  }
+  return { text: `from ${m.agent}`, tip: `Proposed by ${m.agent}${m.approved_at ? `, approved ${shortWhen(m.approved_at, Date.now())}` : ""}` };
+}
+
+/** A proposal card's facts, as plain lines: what runs, when, on which agent. */
+export function proposalFacts(s: Schedule): { label: string; value: string }[] {
+  const out = [
+    { label: "When", value: s.reading },
+    { label: "Agent", value: s.agent ?? "(removed)" },
+  ];
+  const extras: string[] = [];
+  if (s.conversation === "fresh") extras.push("a fresh conversation each run");
+  if (s.quiet_hours) extras.push("skips quiet hours");
+  if (s.daily_cap !== null) extras.push(`at most ${s.daily_cap} a day`);
+  if (s.note_title) extras.push(`replies also go to the note ${s.note_title}`);
+  if (extras.length) out.push({ label: "Also", value: extras.join(", ") });
+  return out;
 }
 
 // ---------------- the dialog's other fields ----------------

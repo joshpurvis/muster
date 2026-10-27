@@ -39,6 +39,10 @@ import {
   withSteps,
   nestedSteps,
   noteOptions,
+  isProposal,
+  madeByLabel,
+  proposalFacts,
+  waitingProposals,
 } from "./schedules.ts";
 import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
 
@@ -446,4 +450,40 @@ Deno.test("a trigger's row and its runs", () => {
   eq(runKindLabel({ ...r, kind: "triggered" }), "triggered");
   const subs = scheduleAgents([agent("a", "codex", ["human", "schedule"]), agent("b", "codex", ["human", "webhook"])], "webhook");
   eq(subs.map((c) => [c.agent.name, c.group]), [["b", "unattended"], ["a", "off"]], "triggers need the webhook origin");
+});
+
+// ---------------- Phase 3: what agents made, the files trigger ----------------
+
+Deno.test("an agent's proposal: waits first, reads plainly, and its chip after approval", () => {
+  const made = { agent_id: 2, agent: "reviewer", kind: "proposal" as const, reason: "You asked", at: NOW - 60_000, approved_at: null };
+  const p = sched({ id: 7, status: "proposed", next_run: null, made_by: made, quiet_hours: true, daily_cap: 2 });
+  eq(isProposal(p), true);
+  eq(nextLabel(p, NOW), { text: "waiting for your approval", tone: "paused" });
+  eq(madeByLabel(p), null, "the card says who proposed it");
+  eq(sortSchedules([sched({ id: 1, next_run: 10 }), p]).map((s) => s.id), [7, 1], "proposals first");
+  eq(waitingProposals([sched({ id: 1 }), p]).map((s) => s.id), [7]);
+  const facts = proposalFacts(p);
+  eq(facts.map((f) => f.label), ["When", "Agent", "Also"]);
+  eq(facts[2].value, "skips quiet hours, at most 2 a day");
+  const approved = sched({ made_by: { ...made, approved_at: NOW } });
+  eq(isProposal(approved), false);
+  eq(madeByLabel(approved)?.text, "from reviewer");
+  eq(madeByLabel(sched({ made_by: { ...made, kind: "reminder" } }))?.text, "reminder");
+  eq(madeByLabel(sched({})), null, "yours have no chip");
+});
+
+Deno.test("files trigger fields", () => {
+  const t = { ...blankTrigger(), kind: "files" as const };
+  eq("error" in whenOfTrigger(t, []), true, "a folder is needed");
+  eq(whenOfTrigger({ ...t, folder: " ~/inbox ", pattern: "*.pdf", quiet: "3" }, []), {
+    when: { kind: "files", folder: "~/inbox", pattern: "*.pdf", recursive: false, quiet_min: 3 },
+  });
+  eq(whenOfTrigger({ ...t, folder: "~/inbox", subfolders: true }, []), {
+    when: { kind: "files", folder: "~/inbox", pattern: null, recursive: true, quiet_min: 2 },
+  });
+  eq("error" in whenOfTrigger({ ...t, folder: "~/inbox", pattern: "a/*.pdf" }, []), true);
+  eq("error" in whenOfTrigger({ ...t, folder: "~/inbox", quiet: "0" }, []), true);
+  const d = draftOfTrigger({ kind: "files", folder: "/home/u/inbox", pattern: "*.pdf", recursive: true, quiet_min: 5 }, blankTrigger());
+  eq([d.kind, d.folder, d.pattern, d.subfolders, d.quiet], ["files", "/home/u/inbox", "*.pdf", true, "5"]);
+  eq(isTrigger({ kind: "files", folder: "/x", recursive: false, quiet_min: 2 }), true);
 });

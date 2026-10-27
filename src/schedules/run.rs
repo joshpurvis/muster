@@ -83,6 +83,8 @@ pub async fn scheduler_loop(hub: Arc<Hub>) {
 /// Handle every due slot, the expiry notices, and tell clients when a schedule expires (no slot
 /// may be due then). Returns the runs to start.
 pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
+    // Proposals nobody approved within 7 days, and reminders a day after they ran, go.
+    super::agent::tidy(hub, now);
     let settings = hub.schedules.settings();
     let quiet = quiet_of(&settings);
     let mut start = Vec::new();
@@ -165,7 +167,7 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
     // Read before the lock (they read the schedule list too): a note trigger's note and its
     // "Allow triggers" switch, and the triggers that share the note's daily cap.
     let snapshot = sched.get(id);
-    let note_block = snapshot.as_ref().and_then(|s| super::triggers::note_flag(hub, s));
+    let note_block = snapshot.as_ref().and_then(|s| super::triggers::event_flag(hub, s));
     let note_cap = snapshot.as_ref().and_then(|s| match s.when {
         When::Note { note_id, .. } => Some((
             hub.store().load_note(note_id).ok().flatten().map(|n| n.title).unwrap_or_default(),
@@ -381,7 +383,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         };
         // A note trigger's run: its note must still allow triggers (switched off while it waited).
         if run.kind == RunKind::Triggered
-            && let Some(Action::Skip(why) | Action::Refuse(why)) = super::triggers::note_flag(hub, &s)
+            && let Some(Action::Skip(why) | Action::Refuse(why)) = super::triggers::event_flag(hub, &s)
         {
             return finish(hub, &s, &mut run, Outcome::Skipped, Some(why));
         }
@@ -767,8 +769,10 @@ fn notify_outcome(hub: &Hub, s: &Schedule, agent: &str, run: &Run, force: bool) 
     alert(hub, level, &summary, &body);
 }
 
-/// An in-app notice and a desktop notification.
-fn alert(hub: &Hub, level: &str, summary: &str, body: &str) {
+/// An in-app notice and a desktop notification: every schedule alert (a run's outcome, an
+/// expiry warning, an agent's proposal) goes through here, so a phone push sink for schedules
+/// (feature/phone-push reworks `notify::alert` into sinks) needs only this one place.
+pub(super) fn alert(hub: &Hub, level: &str, summary: &str, body: &str) {
     hub.notice(level, if body.is_empty() { summary.to_string() } else { format!("{summary}: {body}") });
     crate::notify::alert(summary, body);
 }

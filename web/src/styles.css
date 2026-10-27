@@ -5051,3 +5051,168 @@ fieldset.sch-then > legend {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* ---------- Phase 3: agents' proposals, the files trigger ---------- */
+
+.field .sch-trig-folder {
+  flex: 1 1 180px;
+  min-width: 150px;
+  width: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field .sch-trig-pattern {
+  width: 110px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.sch-trig-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sch-trig-none {
+  margin-top: -4px;
+}
+
+.sch-watch-folders {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* A chip on a row an agent made: "reminder", "from reviewer". */
+.sch-made {
+  flex: none;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--accent-strong);
+  background: var(--accent-softer);
+  cursor: help;
+}
+
+/* An agent's proposal, waiting for approval: a card under its agent, never a plain row. */
+.sch-prop {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 3px 2px 6px 4px;
+  padding: 8px 9px 9px;
+  border-radius: var(--r);
+  border: 1px solid var(--attn-border);
+  background: var(--attn-bg);
+  outline: none;
+}
+
+.sch-prop:focus-visible {
+  box-shadow: 0 0 0 1.5px var(--pane-focus-ring);
+}
+
+.sch-prop-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--st-attn);
+}
+
+.sch-prop-icon {
+  flex: none;
+}
+
+.sch-prop-by b {
+  font-weight: 650;
+}
+
+.sch-prop-at {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.sch-prop-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+}
+
+.sch-prop-fact {
+  display: grid;
+  grid-template-columns: 50px 1fr;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.sch-prop-fact dt {
+  color: var(--text-faint);
+}
+
+.sch-prop-fact dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-prompt {
+  margin: 0;
+  max-height: 8.5em;
+  overflow: auto;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-reason {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.sch-prop-use {
+  display: flex;
+  gap: 5px;
+  align-items: flex-start;
+  color: var(--text-muted);
+}
+
+.sch-prop-use.sub {
+  color: var(--st-attn);
+}
+
+.sch-prop-use .icon {
+  flex: none;
+  margin-top: 2px;
+}
+
+.sch-prop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.sch-prop-note {
+  color: var(--st-attn);
+}

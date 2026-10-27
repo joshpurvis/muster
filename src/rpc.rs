@@ -1062,12 +1062,17 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             }
         }
 
-        // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes or changes them: a call
-        // on an agent session's behalf is refused (agents proposing schedules is a later phase).
+        // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes, approves or changes them:
+        // a call on an agent session's behalf is refused, except what an agent may do through its
+        // MCP schedule tools (propose, set a reminder, pause, delete its own), which `muster
+        // schedule propose/remind/pause/rm` inside an agent's session run as that agent.
         m if m.starts_with("schedule.") || m.starts_with("trigger.") || m == "note.set_triggers" => {
             require_local(who, method)?;
             let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
             let reads = matches!(method, "schedule.list" | "schedule.runs" | "schedule.preview" | "schedule.settings.get");
+            if let Some(r) = agent_schedule_call(hub, method, &params, from).await {
+                return r;
+            }
             // An agent's session, or a shell tab an agent has typed into (its provenance is an
             // agent's chain): only a shell the human drives may make or change schedules, so
             // unattended work can't set up more of itself.
@@ -1126,6 +1131,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     })
                 }
                 "schedule.renew" => Ok(crate::schedules::renew(hub, parse::<Id>(params)?.id)?),
+                "schedule.approve" => Ok(crate::schedules::approve(hub, parse::<Id>(params)?.id)?),
                 "schedule.run" => Ok(crate::schedules::run_now(hub, parse::<Id>(params)?.id)?),
                 "schedule.runs" => {
                     #[derive(Deserialize)]
@@ -1229,6 +1235,43 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
     }
+}
+
+/// `muster schedule propose/remind` (`schedule.propose`, `schedule.remind`: an agent's only), and
+/// `pause` and `rm` inside an agent's session: run as that agent's MCP schedule tool, so the
+/// CLI and MCP share one set of rules. None: an ordinary schedule call (the human's, or refused).
+async fn agent_schedule_call(hub: &Arc<Hub>, method: &str, params: &Value, from: Option<SessionId>) -> Option<RpcResult> {
+    let agent_only = matches!(method, "schedule.propose" | "schedule.remind");
+    let session = match caller(hub, from) {
+        Ok(Caller::Agent(s)) => s,
+        Err(e) => return agent_only.then_some(Err(e)),
+        Ok(_) if agent_only => {
+            return Some(Err(RpcError(format!(
+                "{method} is for agents (it runs as the agent whose session calls it): make a schedule with `muster schedule add`"
+            ))));
+        }
+        Ok(_) => return None,
+    };
+    let mut args = params.clone();
+    let o = args.as_object_mut()?;
+    o.remove("from_session");
+    let tool = match method {
+        "schedule.propose" => "propose_schedule",
+        "schedule.remind" => "set_reminder",
+        // Pausing is the agent's (its own or one that runs on it); resuming stays the human's.
+        "schedule.pause" if o.get("on").is_none_or(|v| v.as_bool() == Some(true)) => {
+            let id = o.get("id").cloned().unwrap_or(Value::Null);
+            args = json!({"schedule_id": id});
+            "pause_schedule"
+        }
+        "schedule.remove" => {
+            let id = o.get("id").cloned().unwrap_or(Value::Null);
+            args = json!({"schedule_id": id});
+            "delete_schedule"
+        }
+        _ => return None,
+    };
+    Some(mcp_json(crate::mcp::call_as(hub, session, tool, args).await))
 }
 
 /// Agent writes (create, update, remove, memory) are for the client token only: never a paired
@@ -2248,5 +2291,54 @@ mod tests {
         // A program the backend runs: never chosen from a paired device.
         let e = dispatch(&hub, &Principal::Device { id: 1 }, "prefs.set", json!({"shell": "sh"})).await.unwrap_err();
         assert!(e.0.contains("only available on this computer"), "{}", e.0);
+    }
+
+    #[tokio::test]
+    async fn agents_propose_from_their_session_but_only_the_human_approves() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-sam"); // Claude: takes human work only
+        crate::agents::create(&hub, NewAgent {
+            account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false,
+        }).unwrap();
+        let sam = hub.agents().get("rpc-sam").unwrap();
+        let wk = hub.agents().get("rpc-wk").unwrap();
+        hub.agents().link_session(hub.store(), sam.id, Some(2)).unwrap();
+        hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
+        // `muster schedule remind` in an agent's session is its set_reminder (its rules, audited).
+        let e = call(&hub, "schedule.remind", json!({"prompt": "p", "in_minutes": 20, "from_session": 2})).await.unwrap_err();
+        assert!(e.contains("doesn't take scheduled work"), "{e}");
+        let r = call(&hub, "schedule.propose", json!({"prompt": "p", "cron": "0 9 * * 1-5", "reason": "weekday check", "from_session": 3})).await.unwrap();
+        let id = r["schedule_id"].as_i64().unwrap();
+        assert_eq!(r["status"], "proposed");
+        let tl = hub.timeline(1, None, 100);
+        assert!(tl.iter().any(|e| e.kind == EventKind::McpCall && e.data["tool"] == "propose_schedule"), "audited like MCP");
+        // The human has no agent-only methods.
+        let e = call(&hub, "schedule.propose", json!({"prompt": "p", "cron": "0 9 * * *", "reason": "r"})).await.unwrap_err();
+        assert!(e.contains("is for agents"), "{e}");
+        // Approving, resuming, making or changing a schedule: never from an agent's session, nor
+        // from a shell an agent has typed into.
+        hub.agents().set_prov(1, Some(SCHED)).unwrap();
+        for from in [3, 2, 1] {
+            for (m, p) in [
+                ("schedule.approve", json!({"id": id})),
+                ("schedule.pause", json!({"id": id, "on": false})),
+                ("schedule.update", json!({"id": id, "prompt": "wider"})),
+                ("schedule.create", json!({"agent": "rpc-wk", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})),
+                ("schedule.settings.set", json!({"watch_folders": ["/tmp"]})),
+            ] {
+                let mut p = p;
+                p["from_session"] = json!(from);
+                let e = call(&hub, m, p).await.unwrap_err();
+                assert!(e.contains("can't be called from an agent's session"), "{m} from {from}: {e}");
+            }
+        }
+        assert!(hub.schedules.get(id).unwrap().waiting_approval());
+        // Pausing its own is the agent's (the MCP pause_schedule); the human approves.
+        let r = call(&hub, "schedule.pause", json!({"id": id, "from_session": 3})).await.unwrap();
+        assert_eq!(r["status"], "proposed", "still waiting, now also paused");
+        let r = call(&hub, "schedule.approve", json!({"id": id})).await.unwrap();
+        assert_eq!(r["status"], "paused");
+        assert!(r["made_by"]["approved_at"].is_i64());
     }
 }

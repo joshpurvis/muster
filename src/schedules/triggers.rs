@@ -22,6 +22,14 @@
 //! - A trigger URL (`POST /api/trigger/<name>` on the loopback listener, with the trigger's
 //!   secret) or `muster trigger <name>`: data sent with it is cut to `PAYLOAD_MAX` and handed to
 //!   the agent quoted as untrusted data.
+//! - Files (Phase 3, feature 11): a folder is listed every 15 s, and a file whose change time
+//!   (ctime: set by the system on every write, rename or move in) is newer than the newest one
+//!   seen is new or changed. Only inside folders the human chose in the scheduling settings
+//!   (none by default), at most `FILES_SCAN_MAX` entries and `FILES_DEPTH` levels, hidden and
+//!   temporary files skipped, symbolic links never followed. Changes seen while its agent is
+//!   working, or any scheduled or triggered work is, and for `ABSORB_GRACE_MS` after, are taken
+//!   as an agent's own and don't count (a file trigger can't feed itself or another), and
+//!   changes close together are merged as a note's edits are (the quiet minutes).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +60,15 @@ pub const EVENT_TEXT_MAX: usize = 8 * 1024;
 /// Commits or items listed per event.
 const LIST_MAX: usize = 10;
 const GIT_EVERY: Duration = Duration::from_secs(15);
+/// A file trigger lists at most this many entries (files and folders) per look: a bigger tree
+/// is refused (shown as an error on the trigger) rather than read.
+pub const FILES_SCAN_MAX: usize = 5000;
+/// With subfolders, at most this many levels below the watched folder.
+pub const FILES_DEPTH: usize = 3;
+/// Folders the human may allow file triggers to watch, at most.
+pub const WATCH_FOLDERS_MAX: usize = 20;
+/// Changes seen within this long after an agent stopped working count as its own.
+pub const ABSORB_GRACE_MS: i64 = 30_000;
 const GH_BACKOFF_MAX_MS: i64 = 60 * plan::MINUTE_MS;
 
 /// Debug builds only (the smoke test): `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet
@@ -88,6 +105,8 @@ pub struct Live {
     /// GitHub: the next poll (backing off after errors).
     pub next_at: i64,
     pub errors: u32,
+    /// Files: changes seen before this are an agent's own (it was working).
+    pub absorb_until: i64,
 }
 
 #[derive(Default)]
@@ -116,7 +135,7 @@ impl Watchers {
 
 /// `watch` in a schedule's JSON: a git or GitHub watcher's state (None for others).
 pub fn watch_json(hub: &Hub, s: &Schedule) -> Value {
-    if !matches!(s.when, When::Git { .. } | When::Github { .. }) {
+    if !matches!(s.when, When::Git { .. } | When::Github { .. } | When::Files { .. }) {
         return Value::Null;
     }
     let l = hub.triggers.live(s.id).unwrap_or_default();
@@ -277,9 +296,91 @@ pub fn check_when(hub: &Hub, when: &mut When, own_id: Option<i64>) -> anyhow::Re
             ensure!(!taken, "there is already a trigger named {n}");
             *name = n;
         }
+        When::Files { folder, pattern, quiet_min, .. } => {
+            let allowed = hub.schedules.settings().watch_folders;
+            ensure!(
+                !allowed.is_empty(),
+                "no folder may be watched yet: add the folder under Scheduling settings → Watched folders first \
+                 (file triggers are off until you choose a folder)"
+            );
+            let p = expand_home(folder.trim());
+            ensure!(p.is_absolute(), "give the folder as a full path (or ~/…)");
+            let p = std::fs::canonicalize(&p).with_context(|| format!("no folder {}", p.display()))?;
+            ensure!(p.is_dir(), "{} isn't a folder", p.display());
+            ensure!(
+                folder_allowed(&allowed, &p),
+                "{} isn't inside a folder you allow to be watched (Scheduling settings → Watched folders: {})",
+                tilde(&p.to_string_lossy()),
+                allowed.iter().map(|f| tilde(f)).collect::<Vec<_>>().join(", ")
+            );
+            *folder = p.to_string_lossy().into_owned();
+            if let Some(pat) = pattern {
+                let t = pat.trim().to_string();
+                if t.is_empty() || t == "*" {
+                    *pattern = None;
+                } else {
+                    ensure!(
+                        t.len() <= 100 && !t.contains('/') && !t.chars().any(char::is_control),
+                        "a file pattern is a file name with * and ?, like *.pdf (at most 100 characters, no /)"
+                    );
+                    *pattern = Some(t);
+                }
+            }
+            ensure!((1..=NOTE_QUIET_MAX_MIN).contains(quiet_min), "wait 1 to {NOTE_QUIET_MAX_MIN} minutes of quiet after the files change");
+        }
     }
     Ok(())
 }
+
+/// Is `path` (canonical) inside one of the `allowed` folders (canonical)?
+pub fn folder_allowed(allowed: &[String], path: &Path) -> bool {
+    allowed.iter().any(|a| path.starts_with(a))
+}
+
+/// The scheduling settings' watched folders, checked: existing folders, made absolute and
+/// canonical (symbolic links resolved), not `/`, no repeats, at most `WATCH_FOLDERS_MAX`.
+pub fn check_watch_folders(folders: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for f in folders.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
+        let p = expand_home(f);
+        ensure!(p.is_absolute(), "`{f}`: give a watched folder as a full path (or ~/…)");
+        let p = std::fs::canonicalize(&p).with_context(|| format!("no folder {}", p.display()))?;
+        ensure!(p.is_dir(), "{} isn't a folder", p.display());
+        ensure!(p.parent().is_some(), "the whole disk (/) can't be watched: pick a folder");
+        let s = p.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    ensure!(out.len() <= WATCH_FOLDERS_MAX, "at most {WATCH_FOLDERS_MAX} watched folders");
+    Ok(out)
+}
+
+/// The watched folders changed: a file trigger whose folder is no longer allowed stops (its
+/// waiting event goes, and its prompts still in an agent's queue are taken back).
+pub fn watch_folders_changed(hub: &Hub) {
+    let allowed = hub.schedules.settings().watch_folders;
+    for s in hub.schedules.list() {
+        let When::Files { folder, .. } = &s.when else { continue };
+        if folder_allowed(&allowed, Path::new(folder)) {
+            continue;
+        }
+        super::run::cancel_unsent(hub, Some(s.id), FOLDER_NOT_WATCHED, false);
+        if s.event.is_some() || s.next_run.is_some() {
+            match hub.schedules.edit(s.id, |x| {
+                x.event = None;
+                x.next_run = None;
+                Ok(())
+            }) {
+                Ok(x) => super::publish(hub, &x),
+                Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
+            }
+        }
+    }
+    hub.triggers.wake.notify_one();
+}
+
+const FOLDER_NOT_WATCHED: &str = "its folder is no longer one you allow to be watched (Scheduling settings → Watched folders)";
 
 /// How a trigger reads: "When the note “Ideas” changes (after 2 minutes of quiet)".
 pub fn describe(hub: &Hub, when: &When) -> String {
@@ -299,6 +400,12 @@ pub fn describe(hub: &Hub, when: &When) -> String {
             None => format!("When CI fails on {repo} (checked every {every_min} minutes)"),
         },
         When::Url { name } => format!("When its trigger URL is called (muster trigger {name})"),
+        When::Files { folder, pattern, recursive, quiet_min } => {
+            let what = pattern.as_deref().map_or("files".to_string(), |p| format!("files named {p}"));
+            let sub = if *recursive { " or its subfolders" } else { "" };
+            let m = if *quiet_min == 1 { "1 minute".to_string() } else { format!("{quiet_min} minutes") };
+            format!("When {what} appear or change in {}{sub} (after {m} of quiet)", tilde(folder))
+        }
     }
 }
 
@@ -437,10 +544,15 @@ pub fn note_cap(title: &str, taken: u32) -> Option<plan::Action> {
     })
 }
 
-/// May a note trigger's run go, as far as its note goes: the note exists and the human allows
-/// triggers on it. Checked when the run is claimed, before it is sent and right before its
-/// prompt is submitted (the switch may go off meanwhile). None: yes, or not a note trigger.
-pub fn note_flag(hub: &Hub, s: &Schedule) -> Option<plan::Action> {
+/// May a note or file trigger's run go, as far as its note or folder goes: the note exists and
+/// the human allows triggers on it; the folder is still one the human allows to be watched.
+/// Checked when the run is claimed, before it is sent and right before its prompt is submitted
+/// (the switch may go off meanwhile). None: yes, or another kind of trigger.
+pub fn event_flag(hub: &Hub, s: &Schedule) -> Option<plan::Action> {
+    if let When::Files { folder, .. } = &s.when {
+        let allowed = hub.schedules.settings().watch_folders;
+        return (!folder_allowed(&allowed, Path::new(folder))).then(|| plan::Action::Skip(FOLDER_NOT_WATCHED.into()));
+    }
     let When::Note { note_id, .. } = s.when else { return None };
     let Some(n) = hub.store().load_note(note_id).ok().flatten() else {
         return Some(plan::Action::Skip("its note was deleted".into()));
@@ -612,6 +724,182 @@ fn git_moved_text(repo: &Path, branch: &str, old: &str, new: &str) -> String {
             format!("{head}\n{}{more}", lines.iter().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n"))
         }
         _ => format!("{head} (history rewritten)"),
+    }
+}
+
+// ----- files -----
+
+/// `*` (any run of characters) and `?` (one character) against a file name.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni, mut star, mut mark) = (0usize, 0usize, None::<usize>, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(st) = star {
+            pi = st + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// Hidden, temporary and partial files never count (an editor's swap file, a download still
+/// coming in), nor do the usual build and dependency folders.
+fn skipped_name(name: &str, dir: bool) -> bool {
+    name.starts_with('.')
+        || (dir && matches!(name, "node_modules" | "target" | "__pycache__"))
+        || (!dir
+            && (name.ends_with('~')
+                || [".swp", ".swx", ".tmp", ".part", ".crdownload", ".download", ".partial"].iter().any(|e| name.ends_with(e))))
+}
+
+/// One look at a watched folder: the newest change time of a counted file, and the files
+/// changed after `since` (their paths below the folder).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FolderLook {
+    pub newest: u64,
+    pub changed: Vec<String>,
+}
+
+/// List `folder` (and, `recursive`, up to `FILES_DEPTH` levels below), without following
+/// symbolic links: an error past `FILES_SCAN_MAX` entries.
+pub fn look_at_folder(folder: &Path, pattern: Option<&str>, recursive: bool, since: Option<u64>) -> anyhow::Result<FolderLook> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = FolderLook::default();
+    let mut seen = 0usize;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(folder.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let rd = std::fs::read_dir(&dir).with_context(|| format!("reading {}", tilde(&dir.to_string_lossy())))?;
+        for e in rd {
+            let Ok(e) = e else { continue };
+            seen += 1;
+            ensure!(
+                seen <= FILES_SCAN_MAX,
+                "{} has more than {FILES_SCAN_MAX} entries: watch a smaller folder{}",
+                tilde(&folder.to_string_lossy()),
+                if recursive { ", or leave out subfolders" } else { "" }
+            );
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(md) = std::fs::symlink_metadata(e.path()) else { continue };
+            let ft = md.file_type();
+            if ft.is_symlink() || skipped_name(&name, ft.is_dir()) {
+                continue;
+            }
+            if ft.is_dir() {
+                if recursive && depth < FILES_DEPTH {
+                    stack.push((e.path(), depth + 1));
+                }
+                continue;
+            }
+            if !ft.is_file() || pattern.is_some_and(|p| !glob_match(p, &name)) {
+                continue;
+            }
+            let stamp = (md.ctime().max(0) as u64).saturating_mul(1_000_000_000).saturating_add(md.ctime_nsec().max(0) as u64);
+            out.newest = out.newest.max(stamp);
+            if since.is_some_and(|c| stamp > c) {
+                let rel = e.path().strip_prefix(folder).map(|r| r.to_string_lossy().into_owned()).unwrap_or(name);
+                out.changed.push(rel.chars().map(|c| if c.is_control() { '?' } else { c }).collect());
+            }
+        }
+    }
+    out.changed.sort();
+    Ok(out)
+}
+
+/// "New or changed in ~/inbox: a.pdf, b.pdf (+3 more)".
+fn files_text(folder: &str, changed: &[String]) -> String {
+    let shown: Vec<&str> = changed.iter().take(LIST_MAX).map(String::as_str).collect();
+    let more = if changed.len() > LIST_MAX { format!(" (+{} more)", changed.len() - LIST_MAX) } else { String::new() };
+    format!("New or changed in {}: {}{more}", tilde(folder), shown.join(", "))
+}
+
+/// Working now, as far as a file trigger goes: in a turn, starting, or stopped on a prompt.
+fn working(s: &SessionInfo) -> bool {
+    matches!(s.state, AgentState::Starting | AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck)
+}
+
+/// Would a change seen now be an agent's own? Its agent is working, or any session is working
+/// on unattended (scheduled or triggered) work.
+fn agents_at_work(hub: &Hub, agent_id: i64) -> bool {
+    let own = hub.agents().by_id(agent_id).and_then(|a| a.session_id);
+    hub.sessions().into_iter().filter(working).any(|s| {
+        Some(s.id) == own || hub.agents().prov(s.id).is_some_and(|p| p.origin != crate::agents::Origin::Human)
+    })
+}
+
+/// Look at every file trigger's folder once.
+pub fn check_files(hub: &Hub) {
+    let settings = hub.schedules.settings();
+    for s in hub.schedules.list() {
+        let When::Files { folder, pattern, recursive, quiet_min } = &s.when else { continue };
+        if !watching(hub, &s, &settings) {
+            continue;
+        }
+        let now = hub.schedules.now();
+        let path = Path::new(folder);
+        let got = if folder_allowed(&settings.watch_folders, path) {
+            look_at_folder(path, pattern.as_deref(), *recursive, s.watch.stamp)
+        } else {
+            Err(anyhow::anyhow!("{FOLDER_NOT_WATCHED}"))
+        };
+        let busy = agents_at_work(hub, s.agent_id);
+        let mut absorb = false;
+        let changed = hub.triggers.set(s.id, |l| {
+            l.checked_at = Some(now);
+            if busy {
+                l.absorb_until = now + ABSORB_GRACE_MS;
+            }
+            absorb = busy || now < l.absorb_until;
+            match &got {
+                Ok(_) => {
+                    l.state = "ok";
+                    l.detail = None;
+                }
+                Err(e) => {
+                    l.state = "error";
+                    l.detail = Some(format!("{e:#}"));
+                }
+            }
+        });
+        let Ok(look) = got else {
+            if changed {
+                super::publish(hub, &s);
+            }
+            continue;
+        };
+        if s.watch.stamp.is_some_and(|c| look.newest <= c) && look.changed.is_empty() {
+            if changed {
+                super::publish(hub, &s);
+            }
+            continue;
+        }
+        // The first look only records the newest change; later ones hold an event for what
+        // changed (unless it was an agent's own), saved with the new cursor in one write.
+        let first = s.watch.stamp.is_none();
+        let text = (!first && !absorb && !look.changed.is_empty()).then(|| files_text(folder, &look.changed));
+        let at = now + test_ms("MUSTER_TEST_TRIGGER_DELAY_MS").unwrap_or(*quiet_min as i64 * plan::MINUTE_MS);
+        let r = hub.schedules.edit(s.id, |x| {
+            ensure!(x.when == s.when && x.watch.generation == s.watch.generation && x.watch.stamp == s.watch.stamp, Obsolete);
+            x.watch.stamp = Some(look.newest.max(s.watch.stamp.unwrap_or(0)));
+            match &text {
+                Some(t) => hold_on(x, t, None, at, true, now),
+                None => Ok(()),
+            }
+        });
+        match r {
+            Ok(x) => super::publish(hub, &x),
+            Err(e) if e.is::<Obsolete>() => tracing::debug!(schedule = s.id, "an obsolete folder look was dropped"),
+            Err(e) => tracing::warn!(schedule = s.id, "holding a file change: {e:#}"),
+        }
     }
 }
 
@@ -833,8 +1121,13 @@ pub fn spawn(hub: Arc<Hub>) {
         loop {
             {
                 let h = hub.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || check_git(&h)).await {
-                    tracing::warn!("git triggers: {e}");
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    check_git(&h);
+                    check_files(&h);
+                })
+                .await
+                {
+                    tracing::warn!("git and file triggers: {e}");
                 }
             }
             check_github(&hub);
@@ -848,6 +1141,11 @@ pub fn spawn(hub: Arc<Hub>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+pub(super) fn absorb_for_test(hub: &Hub, id: i64, until: i64) {
+    hub.triggers.set(id, |l| l.absorb_until = until);
 }
 
 #[cfg(test)]

@@ -1450,6 +1450,22 @@ export function setNoteTriggers(id: number, on: boolean) {
   }).catch(fail("Couldn't change it")).catch(() => {});
 }
 
+/** Approve an agent's proposal: from now on it runs like any schedule. */
+export function approveSchedule(s: Schedule) {
+  scheduleCall("schedule.approve", { id: s.id }, "Couldn't approve it", (r) => {
+    const next = r.next_run !== null ? `: next ${nextWhen(r.next_run, Date.now())}` : "";
+    toast("success", `Approved ${r.name} for ${r.agent ?? "its agent"}${next}.`, 3500);
+  });
+}
+
+/** Dismiss an agent's proposal: it is removed (it never ran). */
+export function dismissProposal(s: Schedule) {
+  rpc.call("schedule.remove", { id: s.id }).then(() => {
+    schedules.value = schedules.value.filter((x) => x.id !== s.id);
+    toast("info", `Dismissed ${s.made_by?.agent ?? "the agent"}'s proposal ${s.name}.`, 3000);
+  }).catch(fail("Couldn't dismiss it")).catch(() => {});
+}
+
 export function removeSchedule(s: Schedule) {
   overlay.value = {
     kind: "confirm",

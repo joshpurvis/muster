@@ -61,6 +61,54 @@ export function bufferText(buffer: TextBuffer, start = 0, end = buffer.length) {
   return { text, offsets };
 }
 
+/** The daemon's view of this phone's alerts (`push.status`). */
+export interface PushInfo {
+  endpoint: string;
+  endpoint_host: string;
+  created_at: number;
+  last_ok_at: number | null;
+  last_error: string | null;
+  last_error_at: number | null;
+}
+export type AlertState =
+  | { kind: "checking" }
+  | { kind: "unsupported" }
+  | { kind: "denied" }
+  | { kind: "off" }
+  | { kind: "on"; info: PushInfo; failing: boolean };
+
+/**
+ * What the alerts setting shows. Alerts are on only when the daemon holds a subscription and it is
+ * the one this browser has: after site data was cleared, or once the push service said the old one
+ * is gone, they are off, and turning them on again fixes it.
+ */
+export function alertState(
+  supported: boolean,
+  permission: string,
+  server: PushInfo | null,
+  browserEndpoint: string | null,
+): AlertState {
+  if (!supported) return { kind: "unsupported" };
+  if (permission === "denied") return { kind: "denied" };
+  if (!server || !browserEndpoint || server.endpoint !== browserEndpoint) return { kind: "off" };
+  const failing = server.last_error_at !== null &&
+    (server.last_ok_at === null || server.last_error_at > server.last_ok_at);
+  return { kind: "on", info: server, failing };
+}
+
+/** Base64url (padding optional) to bytes, as `applicationServerKey` wants it. */
+export function fromB64url(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - b64.length % 4) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+export function sameBytes(a: ArrayBuffer | Uint8Array | null | undefined, b: Uint8Array): boolean {
+  if (!a) return false;
+  const x = a instanceof Uint8Array ? a : new Uint8Array(a);
+  return x.length === b.length && x.every((v, i) => v === b[i]);
+}
+
 export function relativeTime(since: number, now = Date.now()): string {
   const seconds = Math.max(0, Math.floor((now - since) / 1000));
   if (seconds < 60) return "just now";

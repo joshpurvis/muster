@@ -6,6 +6,9 @@ set -euo pipefail
 # same key as ANTHROPIC_AUTH_TOKEN), any other Claude credential, or settings inherited from an
 # OpenRouter session. The fake CLIs record their environment in files kept on failure.
 unset OPENROUTER_API_KEY MUSTER_PROVIDER ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_OAUTH_TOKEN
+# Nor the owner's phone-alert settings: the test daemon's alerts go only to its own fake push
+# service (with its own CA, for curl).
+unset MUSTER_NTFY_URL MUSTER_PUSH_HOSTS MUSTER_PUSH_SUBJECT CURL_CA_BUNDLE
 cd "$(dirname "$0")/.."
 CARGO_TARGET_DIR="$PWD/target" cargo build --workspace --quiet
 BIN="$PWD/target/debug/muster"
@@ -23,5 +26,5 @@ deno run \
   --allow-net=127.0.0.1 \
   --allow-read="$TMP,$BIN" \
   --allow-write="$TMP" \
-  --allow-run="$BIN,git,python3,unshare" \
+  --allow-run="$BIN,git,python3,unshare,openssl" \
   scripts/smoke.ts "$TMP" "$BIN" "${MUSTER_SMOKE_PORT:-17433}"

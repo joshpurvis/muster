@@ -924,7 +924,22 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                     .ok_or_else(|| RpcError(format!("no such pairing: {}", p.pairing_id)))?,
             )
         }
-        "device.list" => to_value(hub.devices().list()),
+        "device.list" => {
+            let devices = hub.devices();
+            let list: Vec<Value> = devices
+                .list()
+                .into_iter()
+                .map(|d| {
+                    let mut v = json!(d);
+                    v["push"] = devices.push_subscription(d.id).map_or(Value::Null, |s| s.summary());
+                    v
+                })
+                .collect();
+            Ok(json!(list))
+        }
+        "push.key" | "push.status" | "push.subscribe" | "push.unsubscribe" | "push.test" => {
+            push_method(hub, who, method, params).await
+        }
         "device.revoke" => {
             #[derive(Deserialize)]
             struct P {
@@ -1237,6 +1252,81 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
     }
+}
+
+/// `push.status` and what the other `push.*` methods answer: the daemon's public key and this
+/// device's own subscription (its endpoint too, so the phone can tell whether its browser's
+/// subscription is the one the daemon has), never the keys.
+fn push_status(hub: &Hub, device: i64) -> RpcResult {
+    let sub = hub.devices().push_subscription(device).map(|s| {
+        let mut v = s.summary();
+        v["endpoint"] = json!(s.endpoint);
+        v
+    });
+    Ok(json!({ "public_key": crate::push::vapid()?.public_key, "subscription": sub }))
+}
+
+/// Phone alerts (docs/PROTOCOL.md "Phone alerts"): a paired device manages its own Web Push
+/// subscription, one per device. Never for the client token: there is no phone to alert.
+async fn push_method(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value) -> RpcResult {
+    let Principal::Device { id } = *who else {
+        return Err(RpcError(format!("{method} is for a paired phone's own alerts")));
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+    match method {
+        "push.subscribe" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P {
+                endpoint: String,
+                p256dh: String,
+                auth: String,
+            }
+            let p: P = parse(params)?;
+            let endpoint = crate::push::check_endpoint(&p.endpoint, &crate::push::allowed_hosts()).map_err(RpcError)?;
+            crate::push::check_keys(&p.p256dh, &p.auth).map_err(RpcError)?;
+            hub.devices().set_push(
+                hub.store(),
+                id,
+                crate::push::Subscription {
+                    endpoint: p.endpoint,
+                    p256dh: p.p256dh.trim().to_string(),
+                    auth: p.auth.trim().to_string(),
+                    created_at: now_ms(),
+                    last_ok_at: None,
+                    last_error: None,
+                    last_error_at: None,
+                },
+            )?;
+            tracing::info!("device {id}: phone alerts on (via {})", endpoint.host);
+        }
+        "push.unsubscribe" => {
+            parse::<Empty>(params)?;
+            if hub.devices().remove_push(hub.store(), id)? {
+                tracing::info!("device {id}: phone alerts off");
+            }
+        }
+        "push.test" => {
+            parse::<Empty>(params)?;
+            let outcome = crate::push::test(hub, id).await.map_err(RpcError)?;
+            let mut v = push_status(hub, id)?;
+            v["delivered"] = json!(outcome == crate::push::Outcome::Delivered);
+            v["error"] = match outcome {
+                crate::push::Outcome::Delivered => Value::Null,
+                crate::push::Outcome::Gone(code) => {
+                    json!(format!("the push service says this phone's subscription is gone ({code}); turn alerts on again"))
+                }
+                crate::push::Outcome::Failed(e) => json!(e),
+            };
+            return Ok(v);
+        }
+        _ => {
+            parse::<Empty>(params)?;
+        }
+    }
+    push_status(hub, id)
 }
 
 /// Agent writes (create, update, remove, memory) are for the client token only: never a paired

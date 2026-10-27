@@ -1,4 +1,14 @@
-import { bufferText, normalizeCode, phoneGrid, relativeTime, scrollPosition, sessionOrder } from "./logic.ts";
+import {
+  alertState,
+  bufferText,
+  fromB64url,
+  normalizeCode,
+  phoneGrid,
+  relativeTime,
+  sameBytes,
+  scrollPosition,
+  sessionOrder,
+} from "./logic.ts";
 import type { SessionInfo } from "../types.ts";
 
 function equal(actual: unknown, expected: unknown) {
@@ -56,6 +66,37 @@ Deno.test("session list prioritizes human attention, then most recent state chan
     { id: 4, state: "idle", state_since: 700 },
   ] as SessionInfo[];
   equal(list.sort(sessionOrder).map((s) => s.id), [3, 2, 4, 1]);
+});
+
+Deno.test("alerts are on only when the daemon has this browser's subscription", () => {
+  const info = {
+    endpoint: "https://fcm.googleapis.com/fcm/send/a",
+    endpoint_host: "fcm.googleapis.com",
+    created_at: 1,
+    last_ok_at: null,
+    last_error: null,
+    last_error_at: null,
+  };
+  equal(alertState(false, "granted", info, info.endpoint).kind, "unsupported");
+  equal(alertState(true, "denied", info, info.endpoint).kind, "denied");
+  equal(alertState(true, "default", null, null).kind, "off");
+  equal(alertState(true, "granted", info, null).kind, "off");
+  equal(alertState(true, "granted", info, "https://fcm.googleapis.com/fcm/send/b").kind, "off");
+  equal(alertState(true, "granted", info, info.endpoint), { kind: "on", info, failing: false });
+  const failed = { ...info, last_ok_at: 5, last_error: "x", last_error_at: 9 };
+  equal(alertState(true, "granted", failed, info.endpoint), { kind: "on", info: failed, failing: true });
+  const recovered = { ...failed, last_ok_at: 10 };
+  equal(alertState(true, "granted", recovered, info.endpoint), { kind: "on", info: recovered, failing: false });
+});
+
+Deno.test("application server keys decode from base64url and compare by bytes", () => {
+  const key = fromB64url("BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8");
+  equal(key.length, 65);
+  equal(key[0], 4);
+  equal(sameBytes(key.slice().buffer, key), true);
+  equal(sameBytes(null, key), false);
+  equal(sameBytes(new Uint8Array(65), key), false);
+  equal(Array.from(fromB64url("-_8")), [251, 255]);
 });
 
 Deno.test("relative times tolerate future timestamps and use daemon milliseconds", () => {

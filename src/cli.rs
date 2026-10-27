@@ -1239,6 +1239,15 @@ struct DeviceRow {
     last_source: Option<String>,
     expires_at: i64,
     revoked_at: Option<i64>,
+    /// Phone alerts: None when they are off.
+    #[serde(default)]
+    push: Option<PushRow>,
+}
+
+#[derive(Deserialize)]
+struct PushRow {
+    last_ok_at: Option<i64>,
+    last_error_at: Option<i64>,
 }
 
 /// `muster devices`.
@@ -1270,10 +1279,19 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 None if x.expires_at <= now => "expired".to_string(),
                 None => x.scopes.last().cloned().unwrap_or_default(),
             };
+            let alerts = match &x.push {
+                None => "off".to_string(),
+                Some(p) if p.last_error_at.is_some_and(|e| p.last_ok_at.is_none_or(|ok| e > ok)) => "failing".to_string(),
+                Some(p) => match p.last_ok_at {
+                    Some(t) => format!("on (sent {})", ago(t)),
+                    None => "on".to_string(),
+                },
+            };
             vec![
                 Cell::plain(x.id.to_string()),
                 Cell::plain(x.name.clone()),
                 Cell::plain(status),
+                Cell::plain(alerts),
                 Cell::plain(format!(
                     "seen {}{}",
                     ago(x.last_seen_at),
@@ -1282,7 +1300,7 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "LAST"]), &rows, None, false));
+    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "ALERTS", "LAST"]), &rows, None, false));
     Ok(())
 }
 

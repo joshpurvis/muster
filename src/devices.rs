@@ -114,7 +114,9 @@ impl Principal {
 pub fn method_scope(method: &str) -> Option<Scope> {
     Some(match method {
         "hello" | "session.attach" | "session.detach" | "session.screen" | "session.output" | "session.wait"
-        | "channel.timeline" | "channel.diff" | "session.queue" => Scope::View,
+        | "channel.timeline" | "channel.diff" | "session.queue"
+        // Phone alerts: a device's own subscription (src/push.rs); any paired device may get them.
+        | "push.key" | "push.status" | "push.subscribe" | "push.unsubscribe" | "push.test" => Scope::View,
         "session.send" | "session.input" | "session.approve" | "session.interrupt" | "session.clear_queue"
         | "session.resume_queue" | "session.continue_input"
         | "session.resize" | "channel.mark_read" | "channel.post" => Scope::Interact,
@@ -214,6 +216,8 @@ struct Inner {
     outcomes: VecDeque<(u64, PairOutcome)>,
     attempts: HashMap<String, VecDeque<Instant>>,
     origins: HashSet<String>,
+    /// Phone alerts (src/push.rs): each device's Web Push subscription, at most one.
+    push: HashMap<i64, crate::push::Subscription>,
 }
 
 pub struct Registry {
@@ -226,10 +230,12 @@ impl Registry {
     pub fn load(store: &Store) -> anyhow::Result<Registry> {
         let devices = store.load_devices()?.into_iter().map(|d| (d.id, d)).collect();
         let origins = store.load_remote_origins()?.into_iter().collect();
+        let push = store.load_push_subscriptions()?.into_iter().collect();
         Ok(Registry {
             inner: Mutex::new(Inner {
                 devices,
                 origins,
+                push,
                 next_pairing: 1,
                 ..Default::default()
             }),
@@ -253,6 +259,105 @@ impl Registry {
             store.insert_remote_origin(origin, now_ms())?;
         }
         Ok(())
+    }
+
+    /// One phone page origin (for the ntfy fallback's tap link), the same one each time.
+    pub fn any_origin(&self) -> Option<String> {
+        self.inner.lock().origins.iter().min().cloned()
+    }
+
+    // ----- phone alerts (src/push.rs) -----
+
+    pub fn push_subscription(&self, id: i64) -> Option<crate::push::Subscription> {
+        self.inner.lock().push.get(&id).cloned()
+    }
+
+    /// Replace a live device's subscription. A new endpoint starts with a clean status; the same
+    /// endpoint sent again (the phone re-checking) keeps its history.
+    pub fn set_push(&self, store: &Store, id: i64, mut sub: crate::push::Subscription) -> anyhow::Result<()> {
+        let mut g = self.inner.lock();
+        if !g.devices.get(&id).is_some_and(|d| d.live(now_ms())) {
+            anyhow::bail!("device revoked or expired");
+        }
+        if let Some(old) = g.push.get(&id)
+            && old.endpoint == sub.endpoint
+        {
+            sub.created_at = old.created_at;
+            sub.last_ok_at = old.last_ok_at;
+            sub.last_error = old.last_error.clone();
+            sub.last_error_at = old.last_error_at;
+        }
+        store.put_push_subscription(id, &sub)?;
+        g.push.insert(id, sub);
+        Ok(())
+    }
+
+    /// Turn a device's alerts off. True when it had a subscription.
+    pub fn remove_push(&self, store: &Store, id: i64) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock();
+        store.delete_push_subscription(id)?;
+        Ok(g.push.remove(&id).is_some())
+    }
+
+    /// Subscriptions to send an alert to: live devices only. A revoked or expired device's row
+    /// is deleted here (revocation deletes it already; expiry is noticed on the next alert).
+    pub fn push_targets(&self, store: &Store) -> Vec<(i64, crate::push::Subscription)> {
+        let now = now_ms();
+        let mut g = self.inner.lock();
+        let dead: Vec<i64> = g
+            .push
+            .keys()
+            .copied()
+            .filter(|id| !g.devices.get(id).is_some_and(|d| d.live(now)))
+            .collect();
+        for id in dead {
+            if let Err(e) = store.delete_push_subscription(id) {
+                tracing::warn!("deleting device {id}'s push subscription: {e:#}");
+                continue;
+            }
+            g.push.remove(&id);
+            tracing::info!("device {id} is no longer live; its push subscription was deleted");
+        }
+        let mut v: Vec<_> = g.push.iter().map(|(id, s)| (*id, s.clone())).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// A delivery's result, kept only if `endpoint` is still the device's subscription (the
+    /// phone may have subscribed again meanwhile). Gone (404/410) deletes the row.
+    pub fn record_push(&self, store: &Store, id: i64, endpoint: &str, outcome: &crate::push::Outcome) {
+        use crate::push::Outcome;
+        let now = now_ms();
+        let mut g = self.inner.lock();
+        if !g.push.get(&id).is_some_and(|s| s.endpoint == endpoint) {
+            return;
+        }
+        if matches!(outcome, Outcome::Gone(_)) {
+            match store.delete_push_subscription(id) {
+                Ok(()) => {
+                    g.push.remove(&id);
+                }
+                Err(e) => tracing::warn!("deleting device {id}'s push subscription: {e:#}"),
+            }
+            return;
+        }
+        let sub = g.push.get_mut(&id).expect("checked above");
+        let result = match outcome {
+            Outcome::Gone(_) => Ok(()),
+            Outcome::Delivered => {
+                sub.last_ok_at = Some(now);
+                sub.last_error = None;
+                store.put_push_subscription(id, sub)
+            }
+            Outcome::Failed(e) => {
+                sub.last_error = Some(e.clone());
+                sub.last_error_at = Some(now);
+                store.put_push_subscription(id, sub)
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!("saving device {id}'s push status: {e:#}");
+        }
     }
 
     // ----- pairing -----
@@ -434,6 +539,11 @@ impl Registry {
                 d.revoked_at = Some(now);
                 store.update_device(d)?;
                 out.push(d.id);
+            }
+            // A revoked device gets no more alerts: its subscription goes with it.
+            for id in &out {
+                store.delete_push_subscription(*id)?;
+                g.push.remove(id);
             }
         }
         for id in &out {
@@ -660,5 +770,65 @@ mod tests {
         assert!(r.revoke(&s, Some(999)).is_err());
         let r2 = Registry::load(&s).unwrap();
         assert!(r2.authenticate(&tok).is_none());
+    }
+
+    fn sub(endpoint: &str) -> crate::push::Subscription {
+        crate::push::Subscription {
+            endpoint: endpoint.into(),
+            p256dh: "k".into(),
+            auth: "a".into(),
+            created_at: 1,
+            last_ok_at: None,
+            last_error: None,
+            last_error_at: None,
+        }
+    }
+
+    #[test]
+    fn push_subscriptions_follow_the_device() {
+        use crate::push::Outcome;
+        let (r, s) = reg();
+        let pair = |r: &Registry| {
+            let p = r.begin_pairing(120, None, vec![Scope::View]);
+            r.redeem(&s, &p.code, None, "s", None).unwrap().0
+        };
+        let (a, b, c) = (pair(&r), pair(&r), pair(&r));
+        for d in [&a, &b, &c] {
+            r.set_push(&s, d.id, sub(&format!("https://fcm.googleapis.com/{}", d.id))).unwrap();
+        }
+        assert_eq!(r.push_targets(&s).len(), 3);
+        // Persisted.
+        assert_eq!(Registry::load(&s).unwrap().push_targets(&s).len(), 3);
+
+        // Delivery status sticks to the endpoint it was for.
+        let ea = format!("https://fcm.googleapis.com/{}", a.id);
+        r.record_push(&s, a.id, &ea, &Outcome::Failed("boom".into()));
+        assert_eq!(r.push_subscription(a.id).unwrap().last_error.as_deref(), Some("boom"));
+        r.record_push(&s, a.id, &ea, &Outcome::Delivered);
+        let now = r.push_subscription(a.id).unwrap();
+        assert!(now.last_ok_at.is_some() && now.last_error.is_none());
+        // Same endpoint again keeps its history; a new one starts clean.
+        r.set_push(&s, a.id, sub(&ea)).unwrap();
+        assert!(r.push_subscription(a.id).unwrap().last_ok_at.is_some());
+        r.set_push(&s, a.id, sub("https://fcm.googleapis.com/new")).unwrap();
+        assert!(r.push_subscription(a.id).unwrap().last_ok_at.is_none());
+        // A result for the old endpoint no longer touches it, not even a 410.
+        r.record_push(&s, a.id, &ea, &Outcome::Gone(410));
+        assert!(r.push_subscription(a.id).is_some());
+        r.record_push(&s, a.id, "https://fcm.googleapis.com/new", &Outcome::Gone(410));
+        assert!(r.push_subscription(a.id).is_none(), "404/410 delete the row");
+
+        // Revoke deletes it, in the store too.
+        r.revoke(&s, Some(b.id)).unwrap();
+        assert!(r.push_subscription(b.id).is_none());
+        assert!(Registry::load(&s).unwrap().push_subscription(b.id).is_none());
+        assert!(r.set_push(&s, b.id, sub("https://fcm.googleapis.com/b")).is_err(), "a revoked device can't subscribe");
+
+        // Expiry: noticed on the next alert.
+        r.inner.lock().devices.get_mut(&c.id).unwrap().expires_at = now_ms() - 1;
+        assert!(r.push_targets(&s).is_empty());
+        assert!(Registry::load(&s).unwrap().push_subscription(c.id).is_none());
+
+        assert!(!r.remove_push(&s, a.id).unwrap());
     }
 }

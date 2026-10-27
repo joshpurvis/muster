@@ -191,8 +191,13 @@ export function markOpened(s: SessionInfo) {
   if (canInteract.peek()) rpc.call("channel.mark_read", { id: s.channel_id }).catch(() => {});
 }
 export function openSession(s: SessionInfo) {
-  history.pushState({ musterSession: true }, "", `#s=${s.id}`);
-  selected.value = s.id;
+  openSessionId(s.id);
+}
+/** Also from a tapped alert while the app is open (the service worker's message). */
+export function openSessionId(id: number) {
+  if (selected.peek() === id) return;
+  history.pushState({ musterSession: true }, "", `#s=${id}`);
+  selected.value = id;
 }
 export function closeSession() {
   if (history.state?.musterSession) history.back();

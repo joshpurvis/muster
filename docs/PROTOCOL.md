@@ -1144,7 +1144,7 @@ its sockets close at once on revoke):
 
 | Scope | Methods |
 |---|---|
-| `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
+| `view` | `hello`, `session.attach/detach/screen/output/wait/queue`, `channel.timeline/diff`, `push.*` (the device's own alerts) |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
 | never | `device.*`, `agent.*`, `window.*`, `daemon.*`, `prefs.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
@@ -1155,8 +1155,70 @@ Prompts a device sends are logged with `from: "device:<id>"`.
 |---|---|---|
 | `device.pair_code` | `{ttl_s?, name?, scopes? = ["view","interact"], url?}` | `{pairing_id, code, short_code, url, origin, expires_at, port}`. `url` defaults to `https://<Self.DNSName from tailscale status --json>`. |
 | `device.pair_status` | `{pairing_id}` | `{state: "pending"}`, `{state: "paired", device}`, or `{state: "burnt"\|"expired"\|"replaced"}` |
-| `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at}` |
-| `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}` |
+| `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at, push}`; `push` is null while the device's alerts are off, else `{endpoint_host, created_at, last_ok_at, last_error, last_error_at}` |
+| `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}`. Also deletes each revoked device's push subscription. |
+
+### Phone alerts
+
+A paired phone can get an alert, screen off, when a session needs the human: the same moments
+and the same dedup as the desktop notification (src/notify.rs: entering `needs_approval`,
+`asking_question`, `error` or `stuck`; the same state and detail never twice within 60 s; one
+alert per session per 5 s). Delivery is Web Push (RFC 8030) to the push service of the phone's
+browser (FCM for Chrome on Android), with the message encrypted to the phone (RFC 8291) and the
+daemon identified by its VAPID key (RFC 8292). `MUSTER_NO_NOTIFY=1` turns off desktop
+notifications only. Schedule alerts stay on the desktop.
+
+Methods, for a device cookie only (the client token gets an error: the desktop has no phone of
+its own); any scope may call them. The result of each, `PushStatus`, is
+`{public_key, subscription}`: `public_key` is the daemon's VAPID key (base64url, an uncompressed
+P-256 point, the browser's `applicationServerKey`), `subscription` is null or
+`{endpoint, endpoint_host, created_at, last_ok_at, last_error, last_error_at}` (the keys stay in
+the daemon).
+
+| Method (device only) | Params | Result |
+|---|---|---|
+| `push.key` | `{}` | `PushStatus` |
+| `push.status` | `{}` | `PushStatus` |
+| `push.subscribe` | `{endpoint, p256dh, auth}` (from `PushSubscription.toJSON()`) | `PushStatus`. One subscription per device: replaces the device's earlier one. The same endpoint again keeps its delivery history. |
+| `push.unsubscribe` | `{}` | `PushStatus` (subscription null) |
+| `push.test` | `{}` | `PushStatus` plus `{delivered, error}`: one test alert to this device, sent before the call returns. At most one per 5 s per device. |
+
+**Endpoint rules** (checked on subscribe and again before every delivery): `https://` only,
+lowercase; a plain DNS host name (no IP literals, no user info, no fragment, no trailing dot, at
+most 2048 characters, only URL characters); the host on the allowlist `fcm.googleapis.com`,
+`*.push.services.mozilla.com`, `*.notify.windows.com` (`*.` = any subdomain, not the domain
+itself), on port 443. `MUSTER_PUSH_HOSTS` (comma-separated `host`, `*.domain` or `host:port`;
+an entry with a port allows only that port) extends it; it is the owner's configuration, never
+something a device can set. `p256dh` must be a valid uncompressed P-256 point, `auth` 16 bytes
+(base64url or base64, padding optional).
+
+**Delivery.** `POST` to the endpoint with `TTL: 300`, `Urgency: high`, `Topic: muster-s<session
+id>` (a newer alert for a session replaces one still waiting at the push service),
+`Content-Encoding: aes128gcm` and `Authorization: vapid t=<JWT>, k=<public_key>`; the JWT is
+ES256 with `aud` = the endpoint's origin, `exp` = now + 12 h, and `sub` = `MUSTER_PUSH_SUBJECT`
+(an `https:` or `mailto:` URI), default `https://muster.invalid/web-push`, a neutral value that
+says nothing about the owner. Redirects are never followed, the whole request is limited to 5 s,
+and at most 4 deliveries run at once. 2xx records `last_ok_at`; 404 and 410 delete the
+subscription; anything else (a redirect, 4xx, 5xx, no answer) records `last_error` and
+`last_error_at`. A revoked device's subscription is deleted at once, an expired device's at the
+next alert. The request goes through `curl` (`--proto =https`, `-q`); the endpoint and the token
+reach it on stdin, never on its command line.
+
+**Payload** (the plaintext, padded with the RFC 8291 delimiter and zeros to exactly 1024 bytes, so
+every alert is 1126 bytes on the wire): `{v: 1, kind: "session" | "test", session_id,
+channel_id, state, state_since, state_seq, at, title, body}`; `title` is `#channel · session`
+(at most 120 characters), `body` the state detail (at most 400; both are shortened until the
+JSON fits). The service worker (web/m/sw.js) shows it with `tag = "s<session_id>"`, so a newer
+alert replaces an older one, and keeps an already shown alert whose `state_since` (then `at`) is
+newer than an arriving one. Tapping it opens `/m/#s=<session_id>`.
+
+**ntfy fallback.** With `MUSTER_NTFY_URL` set (an `http(s)` ntfy topic URL), every phone alert is
+also posted there as plain text: `Title` (RFC 2047 encoded), `Priority: high`, `Click:
+<phone origin>/m/#s=<id>` once a phone was paired. The text is not encrypted, so this is for a
+self-hosted ntfy.
+
+The VAPID private key is generated on first use into `<data>/push_vapid_key` (0600) and kept:
+replacing it makes every phone's subscription fail (403) until alerts are turned on again there.
 
 ### Backend lifetime and compatibility
 

@@ -1,10 +1,10 @@
 # Android remote support: implementation plan
 
-Status: phases 0 and 1 are implemented, plus part of phase 3. That covers pairing, device
-cookie auth, the proxied-request policy, scopes, `/m/` (sessions list, approvals, read-only
-terminal with touch scroll, pinch zoom and select/copy, floating composer, `follow`/`keep` size),
-suspend on background, and a capped replay (`session.attach` `replay_bytes`) instead of the
-`screen`/`delta` replay kinds. Not done yet: Web Push (phase 2), `attach_info`/`delta` replays,
+Status: phases 0, 1 and 3 are implemented. That covers pairing, device cookie auth, the
+proxied-request policy, scopes, `/m/` (sessions list, approvals, read-only terminal with touch
+scroll, pinch zoom and select/copy, floating composer, `follow`/`keep` size), suspend on
+background, and the replay economy: `attach_info`, `screen` and `delta` replays (a phone coming
+back gets only the output it missed), and pings both ways. Not done yet: Web Push (phase 2),
 the `manage` UI, and WebAuthn. The QR code comes from the `qrencode` CLI when installed, and
 device tokens are hashed with a small in-crate SHA-256. The wire contract is in docs/PROTOCOL.md
 "Remote devices"; where this plan and PROTOCOL.md differ, PROTOCOL.md wins.
@@ -138,7 +138,7 @@ revoked_at?}`.
 | `device.revoke` | `{id}` or `{all: true}` | `{revoked, queued_prompts}`. Closes that device's sockets, deletes its push subscriptions. Local only. |
 | `session.keys` | `{id, keys: string[]}` | `{}`. Names from docs/CLI.md:35 (`muster keys` is specified there but not yet implemented; the key table lives in the daemon and both use it), encoded using the session's current application-cursor mode. `session.input` stays for raw bytes. |
 | `session.approve` | `{id, decision, state_since?}` | As today; with `state_since`, `{error}` unless it equals the session's current `state_since` (src/model.rs:229). |
-| `session.attach` | `{id, replay?: "full" \| "screen" \| {since: {offset, generation, epoch}}}` | Default `full` (unchanged for existing clients). Right before the `0x03` frame, on the same per-connection outbox (src/rpc.rs:481-490), the daemon sends a connection-scoped message `{"event":"attach_info","data":{id, kind: "full"\|"screen"\|"delta", offset, generation, epoch}}`; it is not a hub broadcast, so it cannot reach other clients or race the frame. `full`/`screen` replace the terminal (client resets, web/src/terms.ts:295-303); `delta` appends and the client skips the reset. `screen` = the mode prefix every replay already gets (`replay_prefix`, src/pty.rs:862-873) plus the vt100 parser's formatted screen; bounded by rows×cols. `offset` = raw bytes ingested at the moment of the snapshot (`OutBuf.total`, src/pty.rs:97-98), taken under the same lock as the snapshot and the subscription (src/pty.rs:8-10); it excludes the prefix and the up-to-64 KiB the ring drops after wrapping (src/pty.rs:397-404). The client advances it by the `0x01` payload bytes it receives, which are raw. `since` yields `delta` only when `generation` and `epoch` match and `offset ≥ total − ring.len()` and the range is ≤ 64 KiB; otherwise `screen`. `epoch` is random per daemon start (generations restart at zero, src/hub.rs:260). The attachment remembers its requested mode: the restart- and lag-triggered replays in `resend_replay` (src/rpc.rs:573) send `screen` instead of `full` for such attachments and carry `attach_info` too. |
+| `session.attach` | `{id, replay?: "full" \| "screen" \| {since: {offset, generation, epoch}}}` | As built, see docs/PROTOCOL.md "Replay kinds" (it differs: `screen` also carries recent history, a `delta` is sent only when no bigger than that screen, and the tail lives in the daemon). The plan: default `full` (unchanged for existing clients). Right before the `0x03` frame, on the same per-connection outbox (src/rpc.rs:481-490), the daemon sends a connection-scoped message `{"event":"attach_info","data":{id, kind: "full"\|"screen"\|"delta", offset, generation, epoch}}`; it is not a hub broadcast, so it cannot reach other clients or race the frame. `full`/`screen` replace the terminal (client resets, web/src/terms.ts:295-303); `delta` appends and the client skips the reset. `screen` = the mode prefix every replay already gets (`replay_prefix`, src/pty.rs:862-873) plus the vt100 parser's formatted screen; bounded by rows×cols. `offset` = raw bytes ingested at the moment of the snapshot (`OutBuf.total`, src/pty.rs:97-98), taken under the same lock as the snapshot and the subscription (src/pty.rs:8-10); it excludes the prefix and the up-to-64 KiB the ring drops after wrapping (src/pty.rs:397-404). The client advances it by the `0x01` payload bytes it receives, which are raw. `since` yields `delta` only when `generation` and `epoch` match and `offset ≥ total − ring.len()` and the range is ≤ 64 KiB; otherwise `screen`. `epoch` is random per daemon start (generations restart at zero, src/hub.rs:260). The attachment remembers its requested mode: the restart- and lag-triggered replays in `resend_replay` (src/rpc.rs:573) send `screen` instead of `full` for such attachments and carry `attach_info` too. |
 
 **Scopes.** Default deny; `manage` ⊃ `interact` ⊃ `view`. Enforced for text requests in
 `dispatch` (src/rpc.rs:84), for `session.attach/detach` in `handle_request` (src/rpc.rs:459-
@@ -310,13 +310,37 @@ one-function fallback (`MUSTER_NTFY_URL`) for people who self-host it.
 Android Chrome may freeze or discard a background tab at any time; timers do not run while
 frozen, so nothing can be "done after 30 s". Policy: on `visibilitychange` → hidden (and
 `freeze`), `rpc.suspend()` closes the socket at once and the shown session is detached; on
-visible, `resume()` reconnects (`hello`, `/api/device/me`) and reattaches with
-`replay: {since}` from the last `attach_info` offset plus counted `0x01` bytes; the daemon
-answers `delta` when that is ≤ 64 KiB and in the same generation/epoch, else `screen`. So a
-quick app switch costs a `hello` and a small delta; a long absence costs a screen. Only the
-session on screen is ever attached. Push covers alerts while hidden. The 2 MiB `full` replay
-(src/pty.rs:29) is never requested by the phone. (`max_message_size` at src/server.rs:87 is
-the inbound limit, unrelated.)
+visible (and on the page lifecycle's `resume`), `resume()` reconnects (`hello`,
+`/api/device/me`) and reattaches with `replay: {since}` from the last `attach_info` offset plus
+counted `0x01` bytes; the daemon answers `delta` when that is ≤ 64 KiB, in the same
+generation/epoch, without a resize since, while the run is still going, and no bigger than the
+`screen` it would send instead; else that `screen` (64 KiB at most). A resize while the phone
+is attached (its own `follow` resize on send, or the desktop taking the size back) also makes
+its next return a screen. So a quick app switch costs a `hello` and a
+small delta; a long absence costs a screen. Only the session on screen is ever attached. Push
+covers alerts while hidden. The 2 MiB `full` replay is never requested by the phone. Wire
+details: docs/PROTOCOL.md "Remote devices", "Replay kinds".
+
+Implemented (web/src/m/store.ts, web/src/m/term.ts, src/replay_tail.rs, src/rpc.rs):
+
+- Opening a session asks for a `screen` of up to 256 KiB (as much history as before); every
+  reattach of the same view asks with `since` and a 64 KiB cap. A page Android discarded
+  starts over, so its first attach is an open (256 KiB).
+- The daemon keeps the last 64 KiB of raw output of a session a phone has open, from its own
+  host output stream, while the phone is attached and for up to 30 minutes after (src/replay_tail.rs).
+  It is all in the daemon: no terminal host change, so `muster reload` applies it.
+- Scrollback: a `delta` is appended, so the phone's xterm keeps everything it had, its 10000
+  lines of normal-screen scrollback included, and the view stays where it was. A `screen`
+  replaces the terminal with the screen plus as much recent history as fits in 64 KiB (several
+  hundred lines of a typical log), so after a long absence on a busy normal-screen session the
+  phone's scrollback is shorter than before the absence (it was up to 256 KiB). A full-screen
+  agent (Claude Code) keeps its conversation itself and is scrolled with wheel reports, so for
+  it the two kinds look the same.
+- Ping: while visible the phone calls `ping` every 25 s and replaces a connection that does
+  not answer within 10 s (a network change can leave a socket looking open); while visible it
+  keeps retrying (1, 2, 4… up to 10 s apart) until Muster answers again. The daemon pings
+  device sockets every 30 s and closes one silent for 90 s or one that stops taking frames for
+  30 s, which also ends its attachment so the 30-minute tail clock starts.
 
 ## Milestones
 
@@ -325,7 +349,7 @@ the inbound limit, unrelated.)
 | 0 Approve from phone | `remote_origins`, proxied-request policy and proxy-uid header trust, cookie auth, `Principal` + scope checks on all three paths, `devices` table, `device.*`, `/api/device/me`, `muster pair/devices`, `/m/` sessions screen with Approve/Deny (+`state_since`), CSP, ts_login pinning | 4-5 days | Phone on the tailnet approves a Claude Code permission prompt; a stale approve is refused; `muster devices revoke` disconnects it within a second and the PWA shows "unpaired". |
 | 1 Terminal + composer | Read-only xterm, `resizePolicy`, `session.keys`, chip row, textarea via `session.send`, visualViewport bar, `attach_info` + `screen` replay, `size_owner` + `termSize` setting | 4-5 days | A dictated multi-line prompt to a busy agent is delivered once idle; Esc interrupts; output is live; in `follow` the PTY follows the phone on send and returns to the desktop on its next keypress. |
 | 2 Notifications | VAPID, `sw.js`, `push.*`, endpoint rules, notify sinks | 2-3 days | Screen-off phone shows the alert typically within ~10 s of `needs_approval`; tapping opens that session; revoke deletes the subscription. |
-| 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. |
+| 3 Replay economy | `delta` replay, suspend/resume, ping | 2 days | Return after 10 min background on a busy session transfers < 100 KiB (`delta` ≤ 64 KiB or a `screen`), measured in devtools. **Done** (measured 2026-10-26 against a throwaway daemon, phone grid 59×40, page WebSocket bytes in up to and including the replay): busy normal-screen log (~1 KiB/s), back after 10 min: 258.5 KiB before (capped replay) → 66.6 KiB after (`screen`); after 15 s: 55.5 KiB → 16.8 KiB (`delta`, byte-exact against a reference client). Busy full-screen agent (alternate screen, spinner and repaints): 5.0 → 5.2 KiB either way (its screen is smaller than any delta, so it gets the screen). Both include a 2.6 KiB `hello` (it grows with the number of sessions). |
 | 4 Polish | `manage` scope UI (new tab), install prompt, WebAuthn gate (if wanted), transport/auth seams tidy enough for the paid track | ongoing | Per item. |
 
 ## Paid version (later)

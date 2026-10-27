@@ -513,7 +513,19 @@ export type ServerEvent =
   | { event: "schedule_settings"; data: ScheduleSettings }
   | { event: "updates_changed"; data: UpdateStatus }
   | { event: "prefs_changed"; data: WindowPrefs }
-  | { event: "daemon_stopping"; data: { reason: string } };
+  | { event: "daemon_stopping"; data: { reason: string } }
+  // Connection-scoped, only to a client that asked `session.attach` for a `replay` kind.
+  | {
+    event: "attach_info";
+    data: {
+      id: SessionId;
+      kind: "full" | "screen" | "delta";
+      offset: number;
+      generation: number | null;
+      epoch: string;
+      size_rev: number | null;
+    };
+  };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
 /** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */

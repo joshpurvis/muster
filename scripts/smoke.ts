@@ -718,6 +718,93 @@ exec cat > /dev/null
   await c2.call("session.detach", { id: sid });
   c2.close();
 
+  // Phone replays (docs/PROTOCOL.md `attach_info`): a screen, then only the bytes it missed.
+  const infos = (cl: Client) => cl.events.filter((e) => e.event === "attach_info").map((e) => e.data);
+  const phone = new Client(d.token);
+  await phone.open();
+  await phone.call("session.attach", { id: sid, replay: "screen", replay_bytes: 65536 });
+  await phone.waitFor("screen replay", () => phone.frames.some((f) => f.id === sid && f.type === 0x03));
+  const shown = infos(phone)[0];
+  ok(shown?.id === sid && shown.kind === "screen" && Number.isInteger(shown.offset) &&
+    Number.isInteger(shown.generation) && typeof shown.epoch === "string", "a screen attach is announced by attach_info");
+  c.input(sid, "echo third$((1+2))\r");
+  await phone.waitFor("live output on the phone", () => phone.terminal(sid).includes("third3"));
+  const reached = shown.offset +
+    phone.frames.filter((f) => f.id === sid && f.type === 0x01).reduce((n, f) => n + f.data.length, 0);
+  phone.close();
+  c.input(sid, "echo missed$((2+2))\r");
+  await c.waitFor("output while the phone is away", () => c.terminal(sid).includes("missed4"));
+  await sleep(300);
+  const back = new Client(d.token);
+  await back.open();
+  ok(Number.isInteger(shown.size_rev), "attach_info carries the terminal size revision");
+  const since = { offset: reached, generation: shown.generation, epoch: shown.epoch, size_rev: shown.size_rev };
+  await back.call("session.attach", { id: sid, replay: { since } });
+  await back.waitFor("delta replay", () => back.frames.some((f) => f.id === sid && f.type === 0x03));
+  const delta = back.frames.find((f) => f.id === sid && f.type === 0x03)!.data;
+  const resumed = infos(back)[0];
+  ok(resumed?.kind === "delta" && dec.decode(delta).includes("missed4") && !dec.decode(delta).includes("third3") &&
+    resumed.offset === reached + delta.length, "a returning phone gets only the bytes it missed (delta)");
+  await back.call("session.attach", { id: sid, replay: { since: { ...since, epoch: "another-daemon-run" } } });
+  await back.waitFor("second attach_info", () => infos(back).length === 2);
+  ok(infos(back)[1].kind === "screen", "an offset from another daemon run gets a screen");
+  // A resize while away (here shrunk and restored, with nothing printed) can't be caught up by
+  // appending: the host clipped what the narrower terminal couldn't hold.
+  const position = (cl: Client) => {
+    const i = infos(cl).at(-1);
+    const last = cl.frames.findLastIndex((g) => g.id === sid && g.type === 0x03);
+    const live = cl.frames.slice(last + 1).filter((f) => f.id === sid && f.type === 0x01);
+    return { offset: i.offset + live.reduce((n, f) => n + f.data.length, 0), generation: i.generation, epoch: i.epoch,
+      size_rev: i.size_rev };
+  };
+  const away = async (since: Json, n: number) => {
+    await back.call("session.detach", { id: sid });
+    await sleep(200);
+    await back.call("session.attach", { id: sid, replay: { since } });
+    await back.waitFor(`attach_info ${n}`, () => infos(back).length === n);
+    return infos(back)[n - 1];
+  };
+  ok((await away(position(back), 3)).kind === "delta", "a phone that was away without a resize gets a delta");
+  // A phone still on the bundle from before size_rev existed: attaches, gets a screen.
+  const { size_rev: _unknown, ...oldShape } = position(back);
+  ok((await away(oldShape, 4)).kind === "screen", "an old phone's since without size_rev gets a screen");
+  const preResize = position(back);
+  await c.call("session.resize", { id: sid, cols: 60, rows: 30 });
+  await c.call("session.resize", { id: sid, cols: 100, rows: 30 });
+  const afterResize = await away(preResize, 5);
+  ok(afterResize.kind === "screen" && afterResize.size_rev === preResize.size_rev + 4,
+    "a phone that was away during a resize gets a screen");
+  // A run that ended while the phone was away replays as ended (a full-screen view moves into
+  // history): never a delta, even with nothing printed since.
+  const exitCh = await c.call("channel.create", { workspace_id: ws.id, name: "replay exit", agent: "shell" });
+  await c.waitFor("exit-test shell", () => c.events.some((e) => e.event === "session_upserted" &&
+    e.data.channel_id === exitCh.id && e.data.pid > 0));
+  const exitSid = c.events.find((e) => e.event === "session_upserted" && e.data.channel_id === exitCh.id)!.data.id;
+  const leaver = new Client(d.token);
+  await leaver.open();
+  await leaver.call("session.attach", { id: exitSid, replay: "screen" });
+  await leaver.waitFor("exit-test screen", () => infos(leaver).length === 1 &&
+    leaver.frames.some((f) => f.id === exitSid && f.type === 0x03));
+  await sleep(500);
+  const gone = infos(leaver)[0];
+  const lastReplay = leaver.frames.findLastIndex((g) => g.id === exitSid && g.type === 0x03);
+  const exitSince = { offset: gone.offset + leaver.frames.slice(lastReplay + 1).filter((f) => f.id === exitSid &&
+    f.type === 0x01).reduce((n, f) => n + f.data.length, 0), generation: gone.generation, epoch: gone.epoch,
+    size_rev: gone.size_rev };
+  leaver.close();
+  await c.call("session.kill", { id: exitSid });
+  await c.waitFor("exit-test exit", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === exitSid &&
+    e.data.state === "exited"));
+  const returner = new Client(d.token);
+  await returner.open();
+  await returner.call("session.attach", { id: exitSid, replay: { since: exitSince } });
+  await returner.waitFor("exit-test attach_info", () => infos(returner).length === 1);
+  ok(infos(returner)[0].kind === "screen", "a phone that was away while the run ended gets a screen");
+  returner.close();
+  await c.call("channel.archive", { id: exitCh.id, remove_worktree: false });
+  ok(JSON.stringify(await back.call("ping")) === "{}", "ping answers");
+  back.close();
+
   // ----- windows, tabs, auto naming -----
   const httpRpc = async (method: string, params: Json = {}) =>
     await (

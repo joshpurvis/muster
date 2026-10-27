@@ -26,10 +26,10 @@ import {
   windowsSupported,
   workspaceById,
 } from "../state.ts";
-import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText } from "../cache.ts";
+import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText, wakeCold } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
-import { OPENROUTER_BADGE, sessionOnOpenRouter } from "../agents.ts";
+import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter, wakeFailedText } from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -253,8 +253,10 @@ export function Group(
   const find = A.findOpen.value;
   const dragging = drag.value;
 
+  // An asleep agent's tab: keys go to the daemon, which wakes it and types them once it is ready.
+  const asleep = !!active && isAsleep(agentBySession.value.get(active.id), active);
   const onBodyKey = (e: KeyboardEvent) => {
-    if (!active || active.state !== "exited") return;
+    if (!active || active.state !== "exited" || asleep) return;
     if (!(e.target as HTMLElement).closest?.(".term-host") || e.isComposing) return;
     if (e.key === "Enter" && !e.altKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
@@ -316,7 +318,7 @@ export function Group(
         {active && isCold(active, cacheNow()) && !coldDismissed.value.includes(coldKey(active)) && (
           <CacheBar s={active} />
         )}
-        {active && active.state === "exited" && <ExitedBar s={active} />}
+        {active && active.state === "exited" && (asleep ? <AsleepBar s={active} /> : <ExitedBar s={active} />)}
         {active && connStatus.value !== "open" && (
           <div class="term-veil" role="status">
             <span>
@@ -691,6 +693,7 @@ function GroupTab(
 
   const home = meta.value.home;
   const onOpenRouter = sessionOnOpenRouter(s);
+  const asleep = isAsleep(agentBySession.value.get(s.id), s);
   const cold = isCold(s, cacheNow());
   const tip = [
     tabText(label),
@@ -777,6 +780,9 @@ function GroupTab(
       )}
       {onOpenRouter && <span class="tab-or" aria-label={OPENROUTER_BADGE}>OpenRouter</span>}
       {cold && <span class="tab-cold" aria-label="Prompt cache likely expired">cold</span>}
+      {asleep && (
+        <span class="tab-asleep" data-tip="Asleep: the next message, or typing here, wakes it">asleep</span>
+      )}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}
       <button
@@ -928,6 +934,64 @@ function CacheBar({ s }: { s: SessionInfo }) {
       >
         <IconX size={12} />
       </button>
+    </div>
+  );
+}
+
+/** Announced once per sleep in this page (the agent and since when), again when its prompt cache
+ * expires while it sleeps (the wake then costs more), and once per failed wake. */
+const announcedAsleep = new Set<string>();
+
+/** A named agent asleep (src/sleep.rs): not exited for good. Typing here or a message wakes it;
+ * when its prompt cache has likely expired, the bar says the wake re-reads the whole
+ * conversation at full cost, as the cold-cache bar does. Never takes the keyboard: its button
+ * doesn't take focus on press, so typing goes on into the terminal (and wakes it). */
+function AsleepBar({ s }: { s: SessionInfo }) {
+  const agent = agentBySession.value.get(s.id);
+  const now = cacheNow();
+  const cold = wakeCold(s, now);
+  const name = agent?.name ?? s.name;
+  const failed = agent?.wake_error;
+  const key = `${agent?.id}:${agent?.asleep_at ?? 0}:${cold ? "cold" : "warm"}:${failed ?? ""}`;
+  const [say, setSay] = useState("");
+  useEffect(() => {
+    if (announcedAsleep.has(key)) return;
+    const t = setTimeout(() => {
+      announcedAsleep.add(key);
+      setSay(failed ? wakeFailedText(name, failed, cold) : asleepText(name, null, cold, now));
+    }, 150);
+    return () => clearTimeout(t);
+  }, [key]);
+  const keepFocus = (e: MouseEvent) => e.preventDefault();
+  return (
+    <div class={cx("asleep-bar", cold && "cold")} role="note" aria-label="Agent asleep">
+      <span class="sr-only" role="status" aria-live="polite">{say}</span>
+      <span class="asleep-dot" aria-hidden="true" />
+      <span class="asleep-text">
+        {failed ? wakeFailedText(name, failed, cold) : asleepText(name, agent?.asleep_at, cold, now)}
+      </span>
+      {agent && (
+        <button
+          type="button"
+          class="link-btn"
+          data-tip={cold ? "Restart it into its conversation now (it re-reads all of it)" : "Restart it into its conversation now"}
+          onMouseDown={keepFocus}
+          onClick={() => A.wakeAgent(agent)}
+        >
+          Wake
+        </button>
+      )}
+      {agent && cold && (
+        <button
+          type="button"
+          class="link-btn"
+          data-tip="A new conversation, when the old context isn't needed"
+          onMouseDown={keepFocus}
+          onClick={() => A.openAgent(agent.name, true)}
+        >
+          Start fresh
+        </button>
+      )}
     </div>
   );
 }

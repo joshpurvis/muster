@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 24] = [
+pub const TOOL_NAMES: [&str; 29] = [
     "whoami",
     "list_channels",
     "list_sessions",
@@ -37,6 +37,7 @@ pub const TOOL_NAMES: [&str; 24] = [
     "reply",
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
     "note_list", "note_read", "note_write", "note_append", "note_open",
+    "list_schedules", "propose_schedule", "set_reminder", "pause_schedule", "delete_schedule",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -222,14 +223,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state. Also returns your_origin: the origin and hop a message you send now would carry.",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
             empty_schema(),
             true,
         ),
         tool(
             "ask_agent",
             "Ask agent",
-            "Ask an agent something and wait for its answer. Starts the agent if it isn't running, delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
+            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
@@ -289,6 +290,41 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({"type":"object","properties":{"note_id":note_id,"text":{"type":"string"}},"required":["note_id","text"],"additionalProperties":false}), false),
         tool("note_open", "Show note", "Show a note to the human as a tab beside your terminal (moving it from another window).",
             json!({"type":"object","properties":{"note_id":note_id},"required":["note_id"],"additionalProperties":false}), false),
+    ]);
+    let schedule_id = json!({"type":"integer","minimum":1,"description":"The schedule's id (see list_schedules)."});
+    let when_props = |p: &mut Map<String, Value>| {
+        p.insert("cron".into(), json!({"type":"string","description":"A recurring time: a 5-field cron line (minute hour day-of-month month day-of-week) read in tz, e.g. \"0 16 * * 5\" for Fridays at 16:00. At most every 15 minutes."}));
+        p.insert("at".into(), json!({"type":["string","integer"],"description":"A one-off time: \"YYYY-MM-DDTHH:MM\" read in tz, or unix milliseconds."}));
+        p.insert("in_minutes".into(), json!({"type":"integer","minimum":1,"description":"A one-off this many minutes from now."}));
+        p.insert("tz".into(), json!({"type":"string","description":"IANA time zone for cron and at (default: this computer's)."}));
+    };
+    let mut propose = Map::new();
+    propose.insert("prompt".into(), json!({"type":"string","description":"The message Muster sends the agent at each run (it may use {date}, {last_run} and {last_reply})."}));
+    propose.insert("reason".into(), json!({"type":"string","maxLength":1000,"description":"Why, in a sentence or two: the human reads it before approving."}));
+    propose.insert("agent".into(), json!({"type":"string","description":"The agent it runs on (default: you). It must take scheduled work."}));
+    propose.insert("name".into(), json!({"type":"string","maxLength":80}));
+    when_props(&mut propose);
+    propose.insert("conversation".into(), json!({"type":"string","enum":["continue","fresh"],"description":"continue (default): each run joins the agent's conversation; fresh: a new conversation each run."}));
+    propose.insert("quiet_hours".into(), json!({"type":"boolean","description":"Skip runs in the human's quiet hours (default: on for Claude subscription agents)."}));
+    propose.insert("daily_cap".into(), json!({"type":"integer","minimum":1,"maximum":200,"description":"At most this many runs a day."}));
+    propose.insert("note_id".into(), json!({"type":"integer","minimum":1,"description":"Also add each reply to this existing note."}));
+    let mut remind = Map::new();
+    remind.insert("prompt".into(), json!({"type":"string","description":"What Muster sends you then, e.g. \"Check whether CI on master passed and report to the human.\""}));
+    remind.insert("in_minutes".into(), json!({"type":"integer","minimum":5,"maximum":1440,"description":"Minutes from now (5 to 1440)."}));
+    remind.insert("at".into(), json!({"type":["string","integer"],"description":"Or a time: \"YYYY-MM-DDTHH:MM\" read in tz, or unix milliseconds (5 minutes to 24 hours ahead)."}));
+    remind.insert("tz".into(), json!({"type":"string"}));
+    remind.insert("name".into(), json!({"type":"string","maxLength":80}));
+    tools.extend([
+        tool("list_schedules", "List schedules", "List the schedules that run on you or that you made (proposals, reminders): id, agent, name, prompt, when, status (proposed: waiting for the human's approval; active, paused, expired, done), next run, who made it, and the last run's outcome. Also whether you take scheduled work at all (the human sets that).",
+            empty_schema(), true),
+        tool("propose_schedule", "Propose schedule", "Propose a schedule (recurring with cron, or a one-off with at or in_minutes) for you or another agent that takes scheduled work. It does NOT run until the human approves it with a click in Muster's Agents panel, where they see the prompt, the timing, the agent, your reason and the estimated use; they may edit or dismiss it. Each run is a message marked as scheduled, under every limit the human set (per-agent daily caps, spend caps, quiet hours, a Claude subscription agent's 7-day expiry). Refused while you handle scheduled or triggered work. Limits: 3 proposals waiting, 10 a day, 5 live schedules you made. Triggers and \"Then\" steps are the human's to set up.",
+            json!({"type":"object","properties":Value::Object(propose),"required":["prompt","reason"],"additionalProperties":false}), false),
+        tool("set_reminder", "Set reminder", "Have Muster send you a prompt once, 5 minutes to 24 hours from now (\"check CI again in 20 minutes\"), without asking the human: a one-off for yourself only, delivered as scheduled work into your current conversation. You must take scheduled work (the human sets that). Refused while you handle scheduled or triggered work, so a reminder can't set the next one. At most 3 waiting, 15 minutes apart, 10 a day. For anything recurring, later or for another agent, use propose_schedule.",
+            json!({"type":"object","properties":Value::Object(remind),"required":["prompt"],"additionalProperties":false}), false),
+        tool("pause_schedule", "Pause schedule", "Pause a schedule that runs on you or that you made, so it skips its runs. Only the human can resume it.",
+            json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
+        tool("delete_schedule", "Delete schedule", "Delete a schedule you made (a proposal, a reminder, or a proposal the human approved) and its history. Schedules the human made can only be paused (pause_schedule).",
+            json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
     ]);
     tools
 }
@@ -481,6 +517,7 @@ pub async fn call_tool<B: Backend>(
         "reply" => reply(st, caller, &a).await,
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
         "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
+        "list_schedules" | "propose_schedule" | "set_reminder" | "pause_schedule" | "delete_schedule" => schedule_tool(st, caller, name, map),
         _ => return Err(()),
     };
     Ok(match res {
@@ -527,6 +564,21 @@ fn note_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: 
         }
     }
     st.backend.note_tool(caller, name, Value::Object(args.clone()))
+        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+}
+
+/// Schedules for the calling agent (src/schedules/agent.rs has the rules). Proposals and
+/// reminders share the post rate limit, so a loop can't flood the human with proposals.
+fn schedule_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: &Map<String, Value>) -> TResult {
+    caller_session(st, caller)?;
+    if matches!(name, "propose_schedule" | "set_reminder") {
+        if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+            caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+        ))? {
+            return Err(format!("rate limit: at most {} proposals, reminders, note writes or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
+        }
+    }
+    st.backend.schedule_tool(caller, name, Value::Object(args.clone()))
         .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 

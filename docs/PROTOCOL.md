@@ -15,6 +15,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /api/device/logout` | device cookie | Revokes the calling device, clears the cookie. |
 | `GET /m/…` | none | The phone UI (`web/dist/m`), with a strict CSP. `/m` redirects to `/m/`. |
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
+| `POST /usage/claude` | `Authorization: Bearer <session token>` | A Claude session's status-line usage report (`muster statusline`): `{rate_limits: {five_hour?, seven_day?: {used_percentage, resets_at}}, api_duration_ms?}` (`api_duration_ms`: the run's `cost.total_api_duration_ms`; more than the run's previous report is the evidence that the numbers are newly fetched; a report may carry it alone, as the baseline before the run's first response; other fields are ignored), at most 16 KiB. Attributed by the token to its session and run, and filed under the configuration folder recorded at that run's launch; a run without one is ignored. See "Claude account profiles". |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
 | `POST /api/trigger/<name>` | `Authorization: Bearer <the trigger's secret>` | Fire a URL trigger (body: up to 16 KiB of data, handed to its agent as quoted untrusted text). This machine only; see "Schedules", Phase 2. |
@@ -88,7 +89,7 @@ Text frames carry JSON. Binary frames carry terminal bytes.
 |---|---|---|
 | `0x01` | daemon → client | Live output bytes. |
 | `0x02` | client → daemon | Keyboard input bytes (from xterm `onData`, UTF-8). Queued to the terminal in order without waiting for it. If any input for a run is lost, refused or dropped, that run's input is paused: later frames for it are discarded (never delivered after the gap) and the session gets `input_interrupted: true` until `session.continue_input`. |
-| `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. |
+| `0x03` | daemon → client | Replay: scrollback bytes. Client must `reset()` the terminal, then write. Always precedes live `0x01` frames for that attach. Exception: a replay announced by `attach_info` with `kind: "delta"` is appended without a reset ("Remote devices", "Replay kinds"). |
 
 Terminal queries: the daemon is the **only** responder for DA1 (`CSI c` → `CSI ? 1 ; 2 c`),
 DA2 (`CSI > c` → `CSI > 0 ; 276 ; 0 c`), DSR status (`CSI 5 n` → `CSI 0 n`) and cursor position
@@ -116,7 +117,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 
 | Method | Params | Result |
 |---|---|---|
-| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], home, default_shell, login_shell, updates, prefs, pid, openrouter: {key_present}}` (`updates`, `prefs`: see "Updates and window preferences"; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
+| `hello` | `{}` | `{version, workspaces[], channels[], sessions[], agent_sessions[], agent_names, panels[], panel_origin, notes[] (summaries, see "Notes"), windows[], account_profiles[], account_usage, home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`agent_sessions`: the ids of named agents' sessions, and `agent_names`: `{"<session id>": "<agent name>"}` for the same sessions, which `session.remove` hides instead of stopping, so a paired phone, which has no `agent.list`, can say so before closing one; `updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
 | `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
@@ -131,7 +132,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.timeline` | `{id, before?, limit?}` | `Event[]` (oldest first) |
 | `channel.diff` | `{id}` | `{diff: string}` |
 | `session.spawn` | `SpawnSession` (src/hub.rs): `{channel_id, kind, name?, cwd?, prompt?, extra_args?, cols?, rows?, parent_id?, window_id?, from_session?, account_profile?}` | `SessionInfo`. `from_session` (as for `channel.create`): the new session starts with that session's provenance; a Claude session from a non-human chain is refused. `window_id` must name an existing window (else an error); without it, see "Groups layout (v2)". |
-| `session.attach` | `{id, replay_bytes?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start (the phone asks for 256 KiB instead of the whole 2 MiB buffer); the replays that follow a restart or a lagging client use the same limit. |
+| `session.attach` | `{id, replay_bytes?, replay?}` | `{}` then a `0x03` replay frame, then live `0x01` frames. `replay_bytes` (at least 4096) replays only the last that many bytes of output, from a line start; the replays that follow a restart or a lagging client use the same limit. `replay` (`"full"`, `"screen"` or `{since}`, for phones) adds an `attach_info` message before every replay frame and can make the replay a `delta`: see "Remote devices", "Replay kinds". |
+| `ping` | `{}` | `{}`. A liveness check (the phone calls it every 25 s while visible). |
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
@@ -161,8 +163,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
-| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?}` | `Agent`. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. Emits `agent_upserted`. |
+| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?}` | `Agent`. `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -174,7 +176,8 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.memory.delete` | `{name, path}` | `{path}`. Removes one regular file under `memory/` (same path rules and walk as a read); a folder or a link is refused. |
 | `agent.list` | `{}` | `Agent[]` |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
-| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, provider_pending}` (`provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, woke, provider_pending}` (`woke`: the agent was asleep and this start woke it; `provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`. `window_id` (must exist): where a new tab goes (the agents panel passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.sleep` | `{name}` | `Agent`. Puts an idle agent to sleep now (see "Sleep and wake"): refused, with the reason, while it isn't running, is working, waiting for approval or a question, in a turn, has prompts waiting or a message on its way, has text in its input box, or before its conversation id is known. Already asleep: returns it unchanged. Client token only. Emits `agent_upserted`. |
 | `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedule runs go through the same daemon-internal path with origin `schedule` (see "Schedules"). Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
 | `agent.reply` | `{msg_id, text, from_session}` | The MCP `reply` result (docs/MCP.md "Late replies"). `from_session` (`muster reply` passes `$MUSTER_SESSION_ID`) must be an agent session: the call runs MCP `reply` as that session (same checks, rate limit, audit). Without it, or from a shell session, it is refused: only the agent a message was delivered to answers it. |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
@@ -186,7 +189,9 @@ type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "su
              persona: string; permissions: Permissions /* its tab's, when muster creates it */;
              accepts_origins: Origin[]; autostart: boolean; home_dir: string; session_id: number | null;
              channel_id: number | null /* its own tab */; state: AgentState | null /* its session's */; detail: string | null;
-             resumable: boolean; created_at: number };
+             resumable: boolean; created_at: number;
+             sleep_after_min: number | null /* sleeps after this many idle minutes; null: never */;
+             asleep: boolean; asleep_at: number | null /* unix ms */ };
 type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "human" */; from_session: number | null;
              to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
              origin: Origin; hop: number; reply_to: number | null; created_at: number;
@@ -218,6 +223,78 @@ reply, or gets or delivers a late reply (the same id again). An agent's state ch
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.
+
+### Sleep and wake
+
+An asleep agent's CLI process was stopped while it sat idle; its record, tab, scrollback and
+conversation stay (`src/sleep.rs`). Its session is `exited` with detail `asleep`, and its record
+says `asleep: true` with `asleep_at`; both are saved, so it stays asleep across a backend reload
+and a full restart (recovery keeps the `asleep` detail, and autostart leaves it asleep). A
+per-agent setting, off by default: `sleep_after_min` (5 to 10080) puts it to sleep once it has
+been idle that long, measured from the latest of: when it came to rest, its last model request
+(`last_turn_at`), and the human's last keystroke in its tab (never within 2 minutes of one). The
+check runs every 30 s. `agent.sleep` (`muster agent sleep`, Sleep in the agents panel) does it
+now. Never while it is working, starting, waiting for approval or a question, shows an error or
+looks stuck, has running sub-agents, has background work running (`SessionInfo.background`: a
+sub-agent or command started with `run_in_background`, or moved to the background while it ran
+(a command past its timeout, Ctrl+B: its tool result has a `backgroundTaskId`), that hasn't
+reported back, from its hooks and its notices in the run's transcript, applied to the work as it
+is then; the CLI's exit would end it), has prompts queued or being typed, has a message on its
+way (`agents::deliver`, the human's `session.send` from before the start lock until the prompt
+is queued, and a panel batch until it is queued; a batch is never queued for an agent asleep or
+being put to sleep, its events wait for its wake), is waking, is in a turn (an agent message was
+typed in since it last came to rest), has text in its input box, or before its conversation id
+is known (it couldn't be resumed). The check and the stop run under the agent start lock, which
+every wake, `session.send` to an agent's session, `session.restart` of one and autostart take
+too. The last check and the switch to asleep are one step against raw input (keys admitted
+since the check, or still on their way to the terminal host, refuse it: a write counts as on its
+way until the host has answered it, not only until it is queued; from then on the human's keys
+are held), and
+the stop is fenced to the run that was checked (a restart's new run is never stopped). The sleep
+waits for the process to exit before releasing the lock; if it doesn't exit, the agent is awake
+and keys held meanwhile go to it. Keys from an agent or a shell (`session.input` with
+`from_session`) to an asleep or waking agent are refused: a message wakes it, keys don't.
+
+The saved record keeps an older backend from undoing a sleep: while asleep, the `agents.autostart`
+column reads 0 (the setting is kept in `asleep_autostart`, migration v24), so a backend from
+before sleep never starts it at its own start. `asleep_generation` is the run the sleep was
+stopping: a backend that starts while that very run still runs (a reload cut the stop off)
+finishes the stop; another run means it was woken meanwhile, so it is awake.
+
+What wakes it, through `agent.start` (so two messages arriving together wake it once, and each
+keeps its one durable path through the prompt queue): `agent.ask` / MCP `ask_agent` (its result
+has `woke: true` and a `woke_note`), a schedule run (after every schedule guard rail and the
+delivery checks: a skipped or refused run never wakes it), the human's `session.send`
+(`muster send`), `agent.start` (Start / Wake in the panel), `session.restart`, a real action in
+one of its panels (not a notice: a panel closing never wakes it; see docs/AGENT_PANELS.md), and
+the human typing into its tab: keys from a client or phone (`FRAME_INPUT`, `session.input`
+without `from_session`) for an asleep agent's session are held by the daemon (at most 64 KB) and
+typed once into the resumed run when it is ready and no prompt is being typed (given up after 10
+minutes, with a notice). Typing held for it is the human's input (the turn it starts is the
+human's, whatever woke the agent). Over 64 KB none of it is kept, with a notice (a paste cut
+short is worse than none). While the resumed CLI shows a question or an approval of its own (a
+startup dialog), keys go straight to it. A backend that stops while typing is held says in the
+tab's timeline how much was lost (the size only, never the text). The terminal's own reports
+(focus, mouse, cursor position, OSC answers), cursor and function keys never wake it and are
+dropped; bracketed-paste markers are kept. Nothing else wakes it: `hello`, `agent.list`,
+`session.output`, list and read tools, `wait_for_state`, showing its tab. A paired phone with
+`interact` scope sends a message to an asleep agent like any other (`session.send`), which wakes
+it; its key buttons stay off until it is awake.
+
+A wake that fails (its account profile is disabled, the CLI can't start, or the woken CLI stops
+before it is ready) leaves it asleep, not stopped: its record has `wake_error` (why) until it
+wakes or sleeps again, the asleep bar says so, keys held for it are dropped (with a notice), and
+the next message, Wake, or typing into its tab tries again at once (a panel click at most once a
+minute). A launch whose answer from the terminal host was lost is not a failure (the CLI may be
+running): the agent stays awake, keys stay held, and the wake goes on until recovery adopts the
+launch (it is ready: the keys are typed) or retires it (a failed wake, as above).
+
+The wake re-reads the whole conversation; once its prompt cache has likely expired
+(`cache_cold_at`, which an exited session keeps), uncached at full cost. The tab's asleep bar says
+so before a wake, a wake is logged on the agent's timeline (`system` event with `woke: {agent,
+asleep_ms, cold_idle_ms, cause}`), and a message Muster types into the woken agent gets the
+cold-start mark (`cold_idle_ms`) as any message to a cold agent does. A sleep is logged too
+(`asleep: {agent, idle_ms, manual}`).
 Agent writes (`agent.create`, `agent.update`, `agent.remove`, `agent.memory.write`,
 `agent.memory.add`, `agent.memory.delete`) need the client token; no `agent.*` method has a
 device scope.
@@ -340,7 +417,7 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
 | `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
 | `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
-| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. |
+| `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. `on: true` only from a click in Muster's window (see "Schedules", Phase 3, "Held"); `off` from anywhere. |
 
 `from_session` (the CLI passes `$MUSTER_SESSION_ID`) says who wrote: a shell tab, or no
 `from_session`, is the human. An agent's session (Claude or Codex) makes `updated_by` that agent
@@ -388,9 +465,10 @@ Phase 1). Each run is an ordinary agent message with origin `schedule` at hop 0 
 sent through the same path as `agent.ask`, so the agent's accepted origins, the hop limit, the
 200-a-day cap and the unattended cap all apply, and a refusal is recorded like any other
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
-events. Only the human makes or changes schedules: a mutating call whose `from_session` is an
-agent's session, or a shell tab with an agent's provenance (one an agent spawned or typed into),
-is refused (agents proposing schedules is Phase 3).
+events. Only the human makes, approves or changes schedules: a mutating call whose
+`from_session` is an agent's session, or a shell tab with an agent's provenance (one an agent
+spawned or typed into), is refused. Agents propose schedules and set one-off reminders through
+their MCP tools (Phase 3, below; docs/MCP.md "Schedules").
 
 ```ts
 type When = { kind: "cron"; cron: string /* 5 fields, or @hourly/@daily/@weekly/@monthly/@yearly */ }
@@ -434,7 +512,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
 | `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
-| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. |
+| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. A change that loosens a limit is taken only from a click in Muster's window (Phase 3, "Held"). |
 
 Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next run moves,
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
@@ -547,6 +625,8 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 `trigger.*`, `note.set_triggers` and every schedule change are the human's: refused from an
 agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
 an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
+Since Phase 3's second fix round, what makes or widens unattended work also needs a click in
+Muster's window; elsewhere it is held or refused (Phase 3, "Held").
 
 **Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
 daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
@@ -670,6 +750,111 @@ only: `MUSTER_TEST_TRIGGER_DELAY_MS` replaces a note's quiet minutes, `MUSTER_TE
 the git and GitHub intervals, `MUSTER_TEST_GH` the `gh` program and
 `MUSTER_TEST_OPENROUTER_KEY_URL` the key endpoint (http allowed there).
 
+### Agents' proposals and reminders, the file trigger (Phase 3)
+
+Code: `src/schedules/agent.rs` (the agent tools and the estimate), `src/schedules/triggers.rs`
+(files). The agent side is MCP (docs/MCP.md "Schedules"); this is the client side.
+
+```ts
+// Added to Schedule:
+//   made_by: { agent_id, agent, kind: "proposal" | "reminder", reason, at, approved_at: number | null } | null
+//            // null: the human made it. A proposal with approved_at null waits for approval.
+//   estimate: { runs_per_week: number | null, max_per_day: number | null,
+//               billing: "claude_subscription" | "openrouter" | "codex" | "other",
+//               recent_unattended_7d: number, lines: string[], text: string } | null   // agent-made only
+//   status: also "proposed" (waiting for approval: it has no next_run and never runs)
+//           and "held" (made or widened outside Muster's window: waits the same way)
+//   held: { what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[], at: number,
+//           why: string } | null   // what was done outside the window, waiting for the owner's click
+//   estimate is also set on a held schedule
+// Another kind of When / WhenInput (origin webhook, like every trigger):
+type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */; pattern: string | null /* "*.pdf": * and ? on file names */;
+                   recursive: boolean /* up to 3 levels down */; quiet_min: number /* 1..120, default 2 */ };
+// WhenInput also takes folder as "~/…"; pattern "" or "*" is none.
+// Added to ScheduleSettings: watch_folders: string[]  // folders file triggers may watch; [] (the default): none
+```
+
+| Method | Params | Result |
+|---|---|---|
+| `schedule.approve` | `{id, seen?}` | `Schedule`. The owner approves an agent's proposal or a held schedule: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule from its next time. A Claude subscription agent's 7 days start now for a proposal, a held new schedule or a held renewal, and stay as they were for a held change. `seen`: the `updated_at` the owner looked at (the UI sends it); a schedule changed since is refused. **Only a click in Muster's window** (below). Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session, a connection whose program can't be told. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove`. |
+| `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
+| `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
+| `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
+| `schedule.settings.set` | also `watch_folders: string[]` (the whole list; existing folders, `~/` allowed, made absolute with links resolved; not `/`; at most 20) | `ScheduleSettings`. Removing a folder stops the file triggers inside it: their waiting events go, their prompts still in an agent's queue are taken back, and a run due is `skipped`. |
+
+**Held** (fix round 2). A click in Muster's window is a call over a WebSocket that came in with the
+client token and an `Origin` of the UI (`http://127.0.0.1:<port>`, `localhost`, `tauri://`,
+`wry://`), that holds a window (`window.claim`), names no `from_session`, and whose program is
+known and outside every session: the socket's holders found in `/proc`, none of them descended
+from a session's process. Only the processes seen holding the socket decide; when none is seen, the
+owner's processes whose descriptors can't be read count as possible holders, judged by their
+parents (fix round 3: a hidden program that doesn't hold the connection no longer decides for one
+a process is seen holding). A program that can't be told (no `/proc`, as on macOS; the
+connection not listed; no holder found; a lookup error) is not the window. Anything else is
+outside the window, and there:
+
+| Call | From outside the window |
+|---|---|
+| `schedule.create` | Made, but held: `status: "held"`, `held.what: ["made"]`, no `next_run`. At most 10 new held schedules wait at once (counted with the insert, so calls at once can't pass it); one nobody approves is removed after 7 days (decided again as it is removed: one approved meanwhile stays). |
+| `schedule.update` | A change that only narrows (name, notify, quiet hours on, a lower or new daily cap, pausing) applies; any other (prompt, timing, time zone, steps, note, missed rule, conversation, quiet hours off, a higher or no cap) is made but held (`changed`), and its prompts still in an agent's queue are taken back, Run now's included. |
+| `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
+| `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
+| `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
+| `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
+| `note.set_triggers` | `on: true` refused; `off` applies. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+
+A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
+or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
+sent and its prompt isn't submitted) until `schedule.approve`. Edits from the window keep it held; `schedule.remove` drops it.
+`schedule.run` and `trigger.fire` stay as they were for an approved schedule: they run work already
+approved, once, under the agent's caps.
+
+A proposal is stored like any schedule with `made_by` and no `next_run`; every write to it keeps
+`next_run` empty while it waits (the human may edit it before approving), and the scheduler,
+Run now and Skip next refuse it. A proposal nobody approves is removed after 7 days, and a reminder
+one day after it ran. Every schedule an agent made carries `estimate`: its runs in the coming 7
+days after quiet hours and the caps (its own daily cap and the agent's unattended cap), what pays
+(the agent's provider), and the caps that bound it, with the agent's unattended messages of the
+last 7 days. Making a proposal sends a notice (and a desktop notification) that it waits.
+
+**Files.** Only inside a folder in `watch_folders`, and only while the folder is still the one
+the trigger was made on: it is resolved again when the trigger is made, at every look, when a run
+is claimed, before it is sent and before its prompt is submitted, and a folder that is gone, was
+swapped for a symbolic link (anywhere along its path, wherever the link leads) or is no longer
+allowed is not read; its waiting event is dropped and its prompts still in a queue are taken back
+(`watch.state` `error` with the reason). The folder is listed every 15 s while the trigger is
+active (not paused, not expired): at most 5000 entries per look (more: `watch.state` `error`,
+nothing read), `recursive` up to 3 levels, hidden names (`.…`), `node_modules`, `target`,
+`__pycache__` and partial files (`~`, `.swp`, `.tmp`, `.part`, `.crdownload`, `.download`,
+`.partial`) skipped. Symbolic links are never followed: the folder is opened with
+`O_NOFOLLOW | O_DIRECTORY` and where the open handle really is must be the saved path, every
+subfolder is opened through its parent's handle the same way, and every entry is looked at with
+`AT_SYMLINK_NOFOLLOW`, so swapping a folder for a link while a look runs leads nowhere. A file
+whose change time (ctime: set by the system on every write, rename or move into the folder) is
+after the last saved look's boundary (`watch.stamp`: 2 s before that look began, not the newest
+change seen, so a file changed during a look is not skipped), and that the overlap hasn't
+reported already (`watch.recent`), is new or changed; with subfolders, so is every file in a
+subfolder the last look didn't see (`watch.dirs`, device and inode: one made or moved in, whose
+files keep their old change times). A change while Muster was off fires once after it starts, and
+the first look only records. Removing a file starts nothing. An event names the folder and up to
+10 changed files (`New or changed in ~/inbox: a.pdf, b.pdf (+3 more)`), quoted to the agent as
+data, and is debounced like a note's (`quiet_min` after the last change). A change made while
+the trigger's own agent was working, or any session handling scheduled or triggered work was,
+or within 30 s after, is taken as an agent's own: recorded as seen, never an event (so a file
+trigger can't feed itself or another). Who worked when is recorded from every session's state
+changes (a span from entering a working state to leaving it), not seen at the looks, so a turn
+that starts, writes and ends between two looks still counts; the spans are kept for an hour and
+saved with the runtime state, so a backend reload keeps them (a session that worked in between
+has a span to its last turn). guess: ctime is the system's clock, so a clock set back (or a
+network file system's clock behind this one's) can hide changes until it catches up. What it
+costs while idle: one directory listing (and a stat per entry) per 15 s. Debug builds:
+`MUSTER_TEST_WATCH_EVERY_MS`, `MUSTER_TEST_TRIGGER_DELAY_MS` and `MUSTER_TEST_ABSORB_GRACE_MS`
+(the 30 s) apply.
+
+No store migration: schedule records and the settings are JSON (an older backend ignores a
+`files` schedule it can't read, and keeps a proposal waiting).
+
 ## Windows, tabs and naming
 
 A **window** is a client window; a channel is shown as a **tab** in exactly one window.
@@ -754,7 +939,8 @@ for a Claude or Codex session. Only real model activity moves it, and never back
 It is null before the conversation's first turn and for shells. Claude's `SessionStart` with
 `source: "clear"` (`/clear`) clears it, and so does any new run that doesn't continue its
 conversation: only Claude's `--resume`/`--continue`, in any spelling the argument check accepts
-(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), keep it. Stored with the session (migration v20),
+(`-r<id>`, `-r <id>`, `--resume=<id>`, `-c`), and a Codex run that reopens its saved thread
+(`codex resume … -- <id>`), keep it. Stored with the session (migration v20),
 so it survives a backend reload and restart. A session saved before v20 has none; at the next
 backend start, one that is resting (not `working`, `starting` or `exited`) and has had a turn (its
 CLI has set a task title, which Claude Code and Codex do after the first prompt) gets its
@@ -889,14 +1075,28 @@ restart), for every agent in the channel, including agents spawned through MCP:
 Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
 `network_access` in the user's own config) decides how a Codex session starts. Claude's
 `default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
-there; the other Claude profiles pass `--permission-mode`. Approval policies are not touched.
+there; the other Claude profiles pass `--permission-mode`.
+New and restarted Codex sessions also receive `-c approval_policy="on-request"` and
+`-c approvals_reviewer="auto_review"`: the automatic approval-review behavior of
+`--approve-for-me`, while preserving the channel's sandbox and network settings. The shorthand
+itself conflicts with `--sandbox`, so Muster passes the equivalent settings separately.
+These are per-process overrides; the user's Codex config is not changed, and already-running
+sessions keep their current approval settings. Because Codex fires its `PermissionRequest` hook
+before the automatic reviewer decides, a Codex session reports `needs_approval` only when the
+approval dialog is on its screen, never from that hook. See the
+[Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and
+[sandbox configuration](https://learn.chatgpt.com/docs/sandboxing).
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
 MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
 later flag win they are checked against an **allowlist** (also again on every restart):
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
 with the keys `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
-`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. Values
+`hide_agent_reasoning`, `show_raw_agent_reasoning`, `-i/--image`, `--no-alt-screen`. (A Codex
+run that reopens its conversation launches as `codex resume <the same flags> -- <thread id>`;
+the thread is kept outside `extra_args`, so the stored arguments stay valid for older
+backends: `runtime_state` `codex-thread:<session>` for a tab, the agent's record for an
+agent.) Values
 may be attached (`--model=x`, `-mx`, `-cmodel=x`). Anything else (sandbox, approval policy,
 allowed tools, extra dirs, settings, profiles, positional arguments) is refused. Shells are
 not affected.
@@ -914,7 +1114,7 @@ the discovery file with the client token, so with network access (`workspace_wri
 and in any unsandboxed mode (`full_access`, `bypass`, or commands the human approves), an agent
 can call this API as the user, e.g. `channel.set_permissions` on its own channel. Pick those
 modes only for work you would let run with your own access. Sources: `codex
---help` (0.155.1), the Codex config reference and "agent approvals & security" docs
+--help` (0.164.0), the Codex config reference and "agent approvals & security" docs
 (`sandbox_workspace_write.network_access`, off by default), `claude --help` (2.1.280) and
 code.claude.com/docs/en/permissions (`default` is labelled "Manual", `manual` is an alias).
 
@@ -947,6 +1147,25 @@ may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nul
 | `account_profile.create` | `{name, config_dir}` | `AccountProfile`; requires an existing directory, rejects duplicate canonical paths and case-insensitive duplicate names |
 | `account_profile.update` | `{id, name?, enabled?}` | `AccountProfile`; the directory is immutable; disabling leaves running processes alone |
 | `workspace.set_account_profile` | `{id, account_profile}` | `Workspace`; profile ID or `"default"`; affects only future selection |
+| `account_usage.get` | `{}` | `UsageSnapshot` (below) |
+| `account_profile.same_account` | `{id, with: number \| null}` | `AccountProfile`; `with`: the profile it signs in to the same account as, `null`: its own account |
+| `account_profile.login_changed` | `{account_profile: number \| "default"}` | `UsageSnapshot`; forgets that profile's (or Default's) usage and its same-account declaration |
+
+`AccountProfile` also has `account_group: string | null` (opaque; equal values were declared
+one account; migration v22). `UsageSnapshot` is `{evaluated_at, stale_after_ms, rows[],
+suggestion, no_suggestion}`: one row for Default, then one per profile, each `{choice, name,
+enabled, eligible, ineligible_reason, account, same_account_as[], five_hour, seven_day}`.
+`account` is equal for rows on one account (a declared group, or Default and a profile on its
+folder). A window is `{status, used_percentage, resets_at (Unix s), observed_at (Unix ms of the
+newest newly fetched report, or null), reported_at, reported_by}`, where `status` is `current`,
+`stale` (observed more than `stale_after_ms` ago), `unconfirmed` (never shown to be newly
+fetched), `reset` (its reset time passed) or `unknown`; `reported_by` names another profile on the
+same account when its session reported the figure. `suggestion` is `{choice, name, choices[],
+reason}` or null with `no_suggestion` saying why; it is advice only (docs/ACCOUNT_PROFILES.md
+"Usage display and suggestions"). `hello.account_usage` carries the snapshot (null if unreadable)
+and `account_usage_changed` sends a new one when an observation, a profile or a declaration
+changes. Statuses age with time, so a client showing them re-reads `account_usage.get`
+periodically.
 
 These management methods are local-client-only (not available to paired devices or MCP).
 There is no login, token, configuration-file copy, or directory deletion API.
@@ -1132,28 +1351,162 @@ Max-Age=2592000`, stored hashed (SHA-256). Honoured only without `?token=`/`Auth
 (on `/ws`, `POST /api/rpc`, `pair`, `logout`) only with an `Origin` that is in `remote_origins` or
 this daemon's local origin; cookie `POST`s also need `X-Muster: 1`. Devices expire after 30 days
 without use (the expiry slides, renewed at most daily by `/api/device/me`, which re-sends the
-cookie). A device's WebSocket closes at once on revoke, and within 30 s of expiry. A device
-paired through a trusted proxy with a `Tailscale-User-Login` is refused when a later request
-carries a different login.
+cookie). A device's WebSocket closes at once on revoke, within 30 s of expiry, within 10 s after
+90 s without any frame from the phone (the daemon sends a WebSocket ping every 30 s, which
+browsers answer on their own, so only a phone that is gone stays that silent), and when one frame
+to it takes over 30 s to send (a link that swallows everything, or a client that stopped
+reading). Either way its queued output and attachments go with it. A device paired through a
+trusted proxy with a `Tailscale-User-Login` is refused when a later request carries a different
+login.
 
 **Scopes.** Checked on every call (so a revoked or expired device fails on its next call, and
 its sockets close at once on revoke):
 
 | Scope | Methods |
 |---|---|
-| `view` | `hello`, `session.attach/detach/screen/output/wait`, `channel.timeline/diff` |
+| `view` | `ping`, `hello`, `session.attach/detach/screen/output/wait/queue`, `channel.timeline/diff`, `push.*` (the device's own alerts) |
 | `interact` | `view` + `session.send/input/approve/interrupt/clear_queue/resume_queue/continue_input/resize`, `channel.mark_read/post`, binary `0x02` input frames |
 | `manage` | `interact` + `channel.create/archive/rename`, `session.spawn/kill/restart/remove/rename`, `workspace.add`, `fs.complete`; never with a `permissions` or non-empty `extra_args` param |
 | never | `device.*`, `agent.*`, `window.*`, `daemon.*`, `prefs.*`, `channel.set_permissions/set_layout/reorder/move`, `session.move/set_window`, `workspace.remove`, `channel.close_if_empty` |
 
 Prompts a device sends are logged with `from: "device:<id>"`.
 
+**Replay kinds.** `session.attach` takes `replay`:
+
+- `"full"` (the default without `replay`): as for any client.
+- `"screen"`: a rendered replay bounded by `replay_bytes` (default 64 KiB): the screen as the
+  terminal emulator holds it plus as much recent history as fits, oldest lines dropped first
+  (on the normal screen that history is what fills the phone's own xterm scrollback). Not just
+  rows×cols as docs/ANDROID.md first planned: the phone's normal-screen scrollback comes from it.
+- `{since: {offset, generation, epoch, size_rev}}`: where the client's terminal stands, copied
+  from the `attach_info` of its last replay. The daemon answers `delta`, the raw output bytes
+  from `offset` to now, when it still holds all of them (see below), `generation` and `epoch`
+  are this run's, `size_rev` is the terminal's current size revision (no resize since, nor while
+  this attach is taken), the run is still running as the terminal host itself answers (an ended run's replay moves a full-screen
+  view into history, which appending can't do), the range is at most 64 KiB, and it is no
+  bigger than the `screen` it would send instead; otherwise that `screen`.
+
+With `replay` given, every replay frame of the attachment (the first, and those after a
+restart, a lagging client or a terminal host stream reset) is preceded, on the same ordered
+connection, by `{"event":"attach_info","data":{id, kind: "full"|"screen"|"delta", offset,
+generation, epoch, size_rev}}`. It is connection-scoped, never broadcast, and describes only the
+replay frame that follows it: the client applies it when that frame arrives, and drops it if the
+connection ends first. `offset` is the raw output offset (bytes the run has written, as the
+terminal host counts them) right after the replay: the client adds the length of every `0x01`
+payload it receives to it, and sends the sum as `since` when it reattaches. `generation` is the
+run's (null for a session from an earlier daemon run, which cannot be resumed); `epoch` is
+random per daemon start; `size_rev` is the session's size revision this daemon run, read before
+the replay is taken. A resize moves it before the terminal host is asked and again after it
+answered, and while one is on its way the revision reads as unknown, so an attach that overlaps
+a resize never gets a `delta`. `size_rev` is null when the daemon can't tell which size the
+replay was drawn at (a resize during the attach, or a replay after a terminal host stream
+reset); such a replay can't be resumed, and neither can a `since` without `size_rev` (sent by a
+phone page loaded before the field existed: it gets a screen). A client attached
+across a resize keeps its earlier `size_rev`, so its next return gets a screen. A `full` or `screen` replay
+replaces the terminal; a `delta` is appended without a reset, so the client's terminal (and
+its normal-screen scrollback) stays as it was. Replays after the first are `screen` for a
+`screen`/`since` attachment and `full` otherwise.
+
+The bytes for a `delta` come from a tail the daemon keeps per session (src/replay_tail.rs): an
+attachment with `replay: "screen"` or `{since}` starts it (one more output stream from the
+terminal host, the last 64 KiB of raw output in memory), and it runs while such a client is
+attached and up to 30 minutes after the last one left, ending sooner once it has rolled past
+the furthest offset a departed client reached. At most 8 tails exist at a time (the one left
+longest ago makes room; when all 8 have a client attached, a new client gets only screens). A
+daemon restart or `muster reload` drops the tails, so the first return after one is a `screen`.
+
 | Method (client token only) | Params | Result |
 |---|---|---|
 | `device.pair_code` | `{ttl_s?, name?, scopes? = ["view","interact"], url?}` | `{pairing_id, code, short_code, url, origin, expires_at, port}`. `url` defaults to `https://<Self.DNSName from tailscale status --json>`. |
 | `device.pair_status` | `{pairing_id}` | `{state: "pending"}`, `{state: "paired", device}`, or `{state: "burnt"\|"expired"\|"replaced"}` |
-| `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at}` |
-| `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}` |
+| `device.list` | `{}` | `Device[]`: `{id, name, scopes, ts_login, created_at, last_seen_at, last_source, expires_at, revoked_at, push}`; `push` is null while the device's alerts are off, else `{endpoint_host, created_at, last_ok_at, last_error, last_error_at}` |
+| `device.revoke` | `{id}` or `{all: true}` | `{revoked: id[]}`. Also deletes each revoked device's push subscription. |
+
+### Phone alerts
+
+A paired phone can get an alert, screen off, when a session needs the human: the same moments
+and the same dedup as the desktop notification (src/notify.rs: entering `needs_approval`,
+`asking_question`, `error` or `stuck`; the same state and detail never twice within 60 s; one
+alert per session per 5 s). Delivery is Web Push (RFC 8030) to the push service of the phone's
+browser (FCM for Chrome on Android), with the message encrypted to the phone (RFC 8291) and the
+daemon identified by its VAPID key (RFC 8292). `MUSTER_NO_NOTIFY=1` turns off desktop
+notifications only. Schedule alerts stay on the desktop.
+
+Methods, for a device cookie only (the client token gets an error: the desktop has no phone of
+its own); any scope may call them. The result of each, `PushStatus`, is
+`{public_key, subscription}`: `public_key` is the daemon's VAPID key (base64url, an uncompressed
+P-256 point, the browser's `applicationServerKey`), `subscription` is null or
+`{endpoint, endpoint_host, created_at, last_ok_at, last_error, last_error_at}` (the keys stay in
+the daemon).
+
+| Method (device only) | Params | Result |
+|---|---|---|
+| `push.key` | `{}` | `PushStatus` |
+| `push.status` | `{}` | `PushStatus` |
+| `push.subscribe` | `{endpoint, p256dh, auth}` (from `PushSubscription.toJSON()`) | `PushStatus`. One subscription per device: replaces the device's earlier one. The same endpoint again keeps its delivery history. An error that refuses the subscription itself (endpoint or keys break the rules below, the device is revoked) begins `subscription refused: `; any other error may pass on a retry. |
+| `push.unsubscribe` | `{}` | `PushStatus` (subscription null) |
+| `push.test` | `{}` | `PushStatus` plus `{delivered, error}`: one test alert to this device, sent before the call returns. At most one per 5 s per device; it waits its turn like any alert and is refused at once when 64 alert requests already wait. |
+
+Event, to that device's own connections only (never another device or the desktop):
+`push_changed` `{device_id}`, after its subscription changed (subscribe, unsubscribe, a 404/410
+deleting it) or a delivery's result was recorded. The phone asks `push.status` again.
+
+**Endpoint rules** (checked on subscribe and again before every delivery): `https://` only,
+lowercase; a plain DNS host name (no IP literals, no user info, no fragment, no trailing dot, at
+most 2048 characters, only URL characters, and none of `[ ] { }`, curl's URL globbing); the host on the allowlist `fcm.googleapis.com`,
+`*.push.services.mozilla.com`, `*.notify.windows.com` (`*.` = any subdomain, not the domain
+itself), on port 443. `MUSTER_PUSH_HOSTS` (comma-separated `host`, `*.domain` or `host:port`;
+an entry with a port allows only that port) extends it; it is the owner's configuration, never
+something a device can set. `p256dh` must be a valid uncompressed P-256 point, `auth` 16 bytes
+(base64url or base64, padding optional).
+
+**Delivery.** `POST` to the endpoint with `TTL: 300`, `Urgency: high`, `Topic: muster-s<session
+id>` (a newer alert for a session replaces one still waiting at the push service),
+`Content-Encoding: aes128gcm` and `Authorization: vapid t=<JWT>, k=<public_key>`; the JWT is
+ES256 with `aud` = the endpoint's origin, `exp` = now + 12 h, and `sub` = `MUSTER_PUSH_SUBJECT`
+(an `https:` or `mailto:` URI), default `https://muster.invalid/web-push`, a neutral value that
+says nothing about the owner. Redirects are never followed and the whole request is limited to
+5 s. Every request made for alerts (each delivery, `push.test`, the ntfy post) goes through one
+admission control, all devices and sessions together: at most 4 run at once and at most 64 wait
+or run, past which new ones are dropped (`push.test` refused). A waiting delivery is checked
+again when its turn comes: if the device was revoked or expired, or its subscription is no longer
+the one it was queued for (same endpoint and keys; turned off, subscribed again, deleted by a
+404/410), nothing is sent. 2xx records `last_ok_at`; 404 and 410 delete the
+subscription; anything else (a redirect, 4xx, 5xx, no answer) records `last_error` and
+`last_error_at`. A revoked device's subscription is deleted at once, an expired device's at the
+next alert. The request goes through `curl` (`--proto =https`, `-q`, `--globoff`, and `globoff`
+in its config: a URL is always one request); the endpoint and the token reach it on stdin, never
+on its command line. The encrypted body is a 0600 file `<runtime>/push-<hex>.bin`, deleted when
+the delivery ends however it ends; a start deletes such files older than 60 s that a killed
+backend left.
+
+**Payload** (the plaintext, padded with the RFC 8291 delimiter and zeros to exactly 1024 bytes, so
+every alert is 1126 bytes on the wire): `{v: 1, kind: "session" | "test", session_id,
+channel_id, state, state_since, state_seq, at, title, body}`; `title` is `#channel · session`
+(at most 120 characters), `body` the state detail (at most 400; both are shortened until the
+JSON fits). The service worker (web/m/sw.js) shows it with `tag = "s<session_id>"`, so a newer
+alert replaces an older one. The worker keeps the newest `(state_since, at)` it has shown per tag
+(Cache Storage `muster-push`) and drops an arriving alert that is not newer, whether or not the
+newer one is still on screen (one check at a time per tag, so two pushes handled at once can't
+swap); a dropped one re-shows what is on screen silently, or shows and closes a silent one. Tapping it opens `/m/#s=<session_id>`. The worker answers the page's
+`{type: "muster-sw-hello"}` (on a `MessageChannel` port) with `{alerts: 1}`; the page turns
+alerts on, or shows them as on, only when the active worker answers that, and otherwise lets a
+waiting newer worker take over (`muster-skip-waiting`) or asks for a reload. When the browser
+renews the subscription (`pushsubscriptionchange`) the worker keeps it (Cache Storage
+`muster-push`) until the daemon took it (a `result`) or refused it for good (HTTP 401/403, or an
+error beginning `subscription refused: `); a network error, a 5xx, an unreadable answer or any
+other error keeps it, and it is retried on later pushes and sent by the page on its next
+connection. Turning alerts on reuses the browser's subscription only when the daemon holds that
+very one; otherwise (it was deleted on 404/410, but the browser still hands it out) the page
+unsubscribes and makes a fresh one.
+
+**ntfy fallback.** With `MUSTER_NTFY_URL` set (an `http(s)` ntfy topic URL), every phone alert is
+also posted there as plain text: `Title` (RFC 2047 encoded), `Priority: high`, `Click:
+<phone origin>/m/#s=<id>` once a phone was paired. The text is not encrypted, so this is for a
+self-hosted ntfy.
+
+The VAPID private key is generated on first use into `<data>/push_vapid_key` (0600) and kept:
+replacing it makes every phone's subscription fail (403) until alerts are turned on again there.
 
 ### Backend lifetime and compatibility
 
@@ -1205,10 +1558,15 @@ watcher and no polling by clients.
 | `daemon.reload_handoff` | `{exe}` | `{exe}`. The backend restarts itself: it runs `<its launch path> reload` detached with its own environment plus its OpenRouter key (if any), as `daemon.reload` does. `muster reload` asks for it when run without `OPENROUTER_API_KEY` while the backend has a key (so the key carries over), and always from a command that can't see the backend's process (a sandboxed command in its own PID namespace, which couldn't signal it). Refused (an error starting `handoff refused:`; the CLI then reloads the usual way where it can) without a known launch path, or when `exe` (the calling binary) isn't the launch path (canonical paths). Human only. |
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
+| `daemon.restart` | `{backend, host}` | `{exe}`. What `muster stop` then `muster` do, in one step: every session ends, then a new backend and terminal host start from the launch path `exe`, picked as a normal start picks them (so a waiting terminal host update is installed, and a waiting backend build too). `backend`, `host`: the `updates.backend` and `updates.host` ids the window was shown (null: none waiting). The backend hashes the launch file and the host beside it again and refuses unless they are still those builds (refused: still being written, or replaced since). It runs `<exe> restart-all --report-fd 3 --launch <exe> --app <sha256> [--host <sha256>]` detached (the full hashes it just read), with its own environment plus its OpenRouter key (if any), as `daemon.reload` runs `reload`. Before anything stops, that command takes the lifecycle lock (`<runtime>/lifecycle.lock`, which `muster stop` and `muster reload` also take, so one from a shell meanwhile is refused), checks that it can signal the backend and stop the terminal host (one of another protocol version too: identified by its `terminal.json` and the peer credentials of its socket, then sent SIGTERM), and prepares the release the new daemon will run (the snapshot a daemon start makes, under `<data>/application-releases/`), refusing unless its files have exactly those hashes and are executable. It reports on a socket pair (descriptor 3): `refused: <why>` (the call fails with that reason), or `ready`; then this backend emits `daemon_stopping` `{reason: "restart"}` and answers `go`, and only then does the command stop anything: this backend (waiting up to 120 s until it has really exited), then the host (30 s), then it starts the daemon from the release snapshot (`daemon --foreground --launch <exe>`: it runs that release and looks for updates at `exe`), without opening a window, and checks that the backend answering is the one it started (its `hello.build` that release's), on a new host started from the release's host. Before `ready` it also runs the snapshot once: its backend answers `--version` as this build, and its host starts on scratch directories and answers this build's protocol hello holding the fence it was given; a truncated host or one of another protocol version is refused there. If a step doesn't finish, it stops there and nothing is started over it. A command that exits without a word (an older build without `restart-all`) or says nothing for 20 s is ended and the call fails: nothing was stopped. A failure after `go` comes back as an error `notice` if this backend still runs, and is written to `<runtime>/restart-failed` for the next `muster` to print. Clients keep reconnecting after `{reason: "restart"}` and take only a `hello` from a backend with another `pid`, on a terminal host with another `instance`, as the restarted one; one whose `build` isn't the backend build the window was shown (or, with none shown, its previous build) is taken as restarted by something else, and says so. Never queued for a later connection. |
 | `prefs.get` | `{}` | `{decorations, shell?, cache_warn, cache_ttl, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
 | `prefs.set` | `{decorations?, shell?, cache_warn?, cache_ttl?}` | The new preferences; fields left out stay, unknown fields are refused. `cache_warn`, `cache_ttl`: see "Cold prompt cache". `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
 
-What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.shutdown` (and `prefs.set`, which needs
+`daemon.reload`, `daemon.reload_handoff`, `daemon.restart` and `daemon.shutdown` run one at a time: while one
+this backend started may still happen (until it fails, or this backend stops), the others are refused with
+"Muster is already restarting or shutting down" (`muster reload` reports that instead of waiting).
+
+What "human only" means for `daemon.reload`, `daemon.reload_handoff`, `daemon.restart`, `daemon.shutdown` (and `prefs.set`, which needs
 the client token too): they are refused to paired devices (no device scope), to MCP (no tool)
 and hooks (session tokens can't reach this API), and `daemon.*` to calls carrying a
 `from_session` param (the CLI inside a session sends one). That is all. Any process running as

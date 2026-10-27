@@ -2,7 +2,7 @@
 // update local state (the window's layout of groups, prefs, windows).
 
 import { signal } from "@preact/signals";
-import { rpc } from "./rpc.ts";
+import { connStatus, rpc } from "./rpc.ts";
 import {
   agentBySession,
   agentMessages,
@@ -45,7 +45,12 @@ import {
   sessions,
   sessionsByChannel,
   setPref,
+  lastBackend,
+  daemonRestarting,
   daemonStopped,
+  lifecycleChecking,
+  stoppedReason,
+  updateStatus,
   dismissToastKey,
   saveLayoutNow,
   toast,
@@ -58,13 +63,15 @@ import {
   workspaceById,
   workspaces,
 } from "./state.ts";
+import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
-import type { Note } from "./types.ts";
+import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { providerPendingNote, upsertMessage } from "./agents.ts";
+import { isAsleep, providerPendingNote, upsertMessage } from "./agents.ts";
 import { nextWhen } from "./schedules.ts";
+import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
   Schedule,
@@ -179,6 +186,7 @@ async function doClaim(): Promise<void> {
     knowWindow(w);
     windowId.value = w.id;
     rememberWindow(w.id);
+    native.tellNativeWindow(w.id);
     if (document.hasFocus()) windowFocused();
   } catch (e) {
     // The socket dropped: the next hello claims again.
@@ -840,10 +848,9 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
   overlay.value = {
     kind: "confirm",
     title: `${KIND_LABEL[s.kind]} is working`,
+    // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
     body: what === "restart"
-      ? s.kind === "claude"
-        ? "Restart it? Its current turn is lost; it reopens the same conversation."
-        : "Restart it? Its current turn is lost and the program starts fresh."
+      ? "Restart it? Its current turn is lost; it reopens the same conversation."
       : "Stop its current turn?",
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
@@ -1265,6 +1272,7 @@ export function backendRestarted() {
  * taken as a shutdown (the window keeps reconnecting). */
 export async function shutDown() {
   if (!connectedFor("shut down")) return;
+  lifecycleChecking.value = "shutdown";
   try {
     await rpc.call("daemon.shutdown");
     daemonStopped.value = true;
@@ -1277,7 +1285,67 @@ export async function shutDown() {
         ? "The connection dropped before Muster answered; it may not have shut down."
         : `Couldn't shut down Muster: ${errText(e)}`,
     );
+  } finally {
+    lifecycleChecking.value = null;
   }
+}
+
+/** "Restart Muster": stop the backend and the terminal host, ending every session, then start
+ * them again from the installed build (`daemon.restart`, with the builds this window was shown).
+ * Every window hears `daemon_stopping {reason: "restart"}` before anything stops, shows
+ * "Restarting Muster…" and reconnects to the new backend by itself. A refusal comes back before
+ * anything stopped. */
+export async function restartMuster() {
+  if (!connectedFor("restart Muster")) return;
+  const wait = restartWait(lastBackend.value, updateStatus.value);
+  lifecycleChecking.value = "restart";
+  try {
+    await rpc.call("daemon.restart", restartExpect(updateStatus.value));
+    // The event comes first, unless this connection missed it.
+    if (!daemonRestarting.value) daemonRestarting.value = wait;
+  } catch (e) {
+    // The old backend may go away before it answers: that is the restart working.
+    if (daemonRestarting.value) return;
+    const why = errText(e);
+    // Lost or slow: the restart may still go ahead (this window then shows it).
+    if (/connection lost/i.test(why)) toast("warn", "The connection dropped before Muster answered; it may be restarting.");
+    else if (/timed out/i.test(why)) toast("warn", "Muster hasn't answered yet; it may still restart.");
+    else toast("error", `Couldn't restart Muster: ${why}`);
+  } finally {
+    lifecycleChecking.value = null;
+  }
+}
+
+/** A hello arrived while restarting: from the new backend on a new host, the restart is done. */
+export function restartHello(hello: HelloResult) {
+  const outcome = restartOutcome(daemonRestarting.value, hello);
+  if (outcome === "waiting") return;
+  daemonRestarting.value = null;
+  if (outcome === "other_build") {
+    toast(
+      "warn",
+      "Muster started again, but from another build than the one this restart was for: something else started it meanwhile. Every session ended.",
+      12000,
+    );
+    return;
+  }
+  toast("success", "Muster restarted. Restart a Claude tab to reopen its conversation.", 8000);
+}
+
+/** No new backend answered in time. Still connected (the old one never stopped): say so and
+ * carry on. Otherwise the stopped screen says to start it with `muster`. */
+export function restartTimedOut() {
+  if (!daemonRestarting.value) return;
+  // A new backend answered but speaks another UI protocol: the restart happened, and that
+  // screen says so (it keeps the restart's context).
+  if (connStatus.value === "incompatible") return;
+  daemonRestarting.value = null;
+  if (rpc.isOpen) {
+    toast("error", "Muster didn't restart. To restart it by hand, run muster stop, then muster.");
+    return;
+  }
+  stoppedReason.value = "restart_failed";
+  daemonStopped.value = true;
 }
 
 // ---------- named agents (docs/UI.md "Agents panel") ----------
@@ -1302,12 +1370,16 @@ export function agentLive(a: Agent): boolean {
  * Click an agent (panel row, Jump): start it if no process runs (a new tab opens in this
  * window), then show its tab here exactly as Jump does (pulled into the focused group when it
  * is in another window, or hidden because its tab was closed). `fresh`: a new conversation,
- * restarting a running one.
+ * restarting a running one. An asleep agent's tab is only shown: looking never wakes it (that
+ * re-reads its whole conversation); `wake` does, as do its Wake button and typing into it.
  */
-export async function openAgent(name: string, fresh = false) {
+export async function openAgent(name: string, fresh = false, wake = false) {
   const a = agents.value.find((x) => x.name === name);
   if (!a) return;
   pushRecent("a:" + a.id);
+  if (!fresh && !wake && a.session_id !== null && isAsleep(a, sessions.value.get(a.session_id))) {
+    return gotoSession(a.session_id);
+  }
   if (!fresh && a.session_id !== null && agentLive(a)) {
     // A provider change applies only when it restarts: say so, as `agent.start` does.
     const pending = providerPendingNote(a, sessions.value.get(a.session_id));
@@ -1334,6 +1406,20 @@ export async function openAgent(name: string, fresh = false) {
 
 export function stopAgent(a: Agent) {
   if (a.session_id !== null) killSession(a.session_id);
+}
+
+/** Wake an asleep agent (Wake in its menu or its tab): it restarts into its conversation. */
+export function wakeAgent(a: Agent) {
+  return openAgent(a.name, false, true);
+}
+
+/** Put an idle agent to sleep now (`agent.sleep`): its process stops, its tab stays. The daemon
+ * says why when it can't (working, a draft in its input box, no saved conversation yet). */
+export function sleepAgent(a: Agent) {
+  rpc.call<Agent>("agent.sleep", { name: a.name }).then((r) => {
+    knowAgent(r);
+    toast("info", `${a.name} is asleep. The next message wakes it.`, 3000);
+  }).catch(fail("Couldn't put it to sleep")).catch(() => {});
 }
 
 export function setAgentAutostart(a: Agent, on: boolean) {
@@ -1379,14 +1465,26 @@ export function editSchedule(id: number) {
   overlay.value = { kind: "schedule", id };
 }
 
-export function scheduleSettingsDialog() {
-  overlay.value = { kind: "schedule_settings" };
+/** `back`: the schedule dialog it was opened from, shown again (as it was) when it closes. */
+export function scheduleSettingsDialog(back?: ScheduleOverlay) {
+  overlay.value = { kind: "schedule_settings", back };
+}
+
+/** A change from this window came back held: Muster couldn't confirm the window is yours (it
+ * can't tell which program the connection comes from, or it comes from one started in a
+ * session), so it waits for a click on Approve like a change from the command line. True when
+ * it said so. */
+export function heldToast(s: Schedule): boolean {
+  if (s.status !== "held") return false;
+  toast("warn", `${s.name} waits for your approval: Muster couldn't confirm this change came from its own window. Click Approve on its card.`, 6000);
+  return true;
 }
 
 /** A `schedule.*` call that answers with the schedule: recorded at once, errors toasted. */
 function scheduleCall(method: string, params: Record<string, unknown>, what: string, done?: (s: Schedule) => void) {
   rpc.call<Schedule>(method, params).then((s) => {
     knowSchedule(s);
+    if (method !== "schedule.approve" && heldToast(s)) return;
     done?.(s);
   }).catch(fail(what)).catch(() => {});
 }
@@ -1448,6 +1546,25 @@ export function setNoteTriggers(id: number, on: boolean) {
     knowNote(n);
     toast("info", on ? `Triggers allowed on ${n.title}: its changes can now start runs` : `Triggers off for ${n.title}`, 3000);
   }).catch(fail("Couldn't change it")).catch(() => {});
+}
+
+/** Approve an agent's proposal, or a schedule made or changed outside the window: from now on
+ * it runs like any schedule. `seen`: what the card showed (one changed since is refused). */
+export function approveSchedule(s: Schedule) {
+  scheduleCall("schedule.approve", { id: s.id, seen: s.updated_at }, "Couldn't approve it", (r) => {
+    const next = r.next_run !== null ? `: next ${nextWhen(r.next_run, Date.now())}` : "";
+    toast("success", `Approved ${r.name} for ${r.agent ?? "its agent"}${next}.`, 3500);
+  });
+}
+
+/** Dismiss an agent's proposal, or a schedule made outside the window: it is removed (it never
+ * ran). */
+export function dismissProposal(s: Schedule) {
+  rpc.call("schedule.remove", { id: s.id }).then(() => {
+    schedules.value = schedules.value.filter((x) => x.id !== s.id);
+    const whose = s.made_by && s.made_by.approved_at === null ? `${s.made_by.agent}'s proposal` : "the schedule";
+    toast("info", `Dismissed ${whose} ${s.name}.`, 3000);
+  }).catch(fail("Couldn't dismiss it")).catch(() => {});
 }
 
 export function removeSchedule(s: Schedule) {

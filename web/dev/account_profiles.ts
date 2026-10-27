@@ -52,6 +52,15 @@ try {
   );
   await b.sleep(200);
   await b.shot(`${base}/profiles-desktop.png`);
+  // Usage: the smoke left Work current, Home unconfirmed and Default's 5-hour window reset.
+  await b.wait(`!!document.querySelector('[aria-label="Claude profiles"] .usage-table')`);
+  const table = await b.eval(`document.querySelector('[aria-label="Claude profiles"] .usage-table').innerText`);
+  check(
+    table.includes("not confirmed fresh") && table.includes("Unknown") && /Work\s+25%/.test(table),
+    `Usage table does not show the fixture's states honestly: ${table}`,
+  );
+  await b.eval(`document.querySelector('[aria-label="Claude profiles"] .usage-section').scrollIntoView()`);
+  await b.shot(`${base}/usage-profiles.png`);
   await fill('input[placeholder="Personal or Work"]', "UI profile");
   await fill('input[placeholder="~/.claude-work"]', `${base}/ui`);
   await clickText('button[type="submit"]', "Register profile");
@@ -93,6 +102,35 @@ try {
   await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
   await fill('[aria-label="New tab"] input', `${base}/repo`);
   await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
+  // The capacity table and a suggestion the human may take or ignore: Default stays selected.
+  await b.wait(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion')`);
+  check(
+    await b.eval(
+      `document.querySelector('[aria-label="New tab"] .usage-suggestion').textContent.includes('Suggested: Work')`,
+    ),
+    "New Tab does not suggest the account with known room",
+  );
+  check(
+    await b.eval(`document.querySelector('[aria-label="New tab"] select').value === 'default'`),
+    "A suggestion must never change the selection by itself",
+  );
+  await b.sleep(150);
+  await b.shot(`${base}/usage-new-tab.png`);
+  await clickText('[aria-label="New tab"] button', "Use Work");
+  const workId = await b.eval(
+    `${M}.rpc.call('account_profile.list', {}).then(profiles => profiles.find(p => p.name === 'Work').id)`,
+  );
+  await b.wait(`document.querySelector('[aria-label="New tab"] select').value === ${JSON.stringify(String(workId))}`);
+  check(
+    await b.eval(`document.activeElement === document.querySelector('[aria-label="New tab"] select')`),
+    "Taking the suggestion must leave focus on the profile picker",
+  );
+  check(
+    await b.eval(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion[role="status"]')`),
+    "The suggestion's status region must stay mounted",
+  );
+  await b.sleep(150);
+  await b.shot(`${base}/usage-new-tab-chosen.png`);
   await b.eval(`(() => {
     const label = [...document.querySelectorAll('[aria-label="New tab"] label')].find(e => e.querySelector('.field-label')?.textContent === 'Claude profile');
     const select = label.querySelector('select');
@@ -113,6 +151,39 @@ try {
     await b.eval(`${M}.focusedSession.value.kind === 'claude'`),
     "Selected profile was not applied to a Claude session",
   );
+  // A long profile name in a narrow dialog: the suggestion wraps instead of pushing "Use" out.
+  const longName = "Work account for the very long client engagement name that fills eighty chars";
+  await b.eval(`${M}.rpc.call('account_profile.update', {id: ${workId}, name: ${JSON.stringify(longName)}})`);
+  await b.size(400, 800);
+  await b.key("Alt+Shift+N");
+  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
+  await fill('[aria-label="New tab"] input', `${base}/repo`);
+  await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
+  await b.wait(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion button')`);
+  check(
+    await b.eval(`(() => {
+    const d = document.querySelector('[role="dialog"]').getBoundingClientRect();
+    const r = document.querySelector('[aria-label="New tab"] .usage-suggestion button').getBoundingClientRect();
+    return r.left >= d.left && r.right <= d.right && document.documentElement.scrollWidth <= innerWidth;
+  })()`),
+    "The Use button must stay inside a narrow dialog with a long profile name",
+  );
+  await b.eval(`document.querySelector('[aria-label="New tab"] .usage-suggestion').scrollIntoView()`);
+  await b.sleep(150);
+  await b.shot(`${base}/usage-new-tab-narrow-long-name.png`);
+  // Light theme, through the app's own preference.
+  await b.eval(`${M}.prefs.value = {...${M}.prefs.value, theme: 'light'}`);
+  await b.wait(`document.documentElement.dataset.theme === 'light'`);
+  await b.size(1440, 1000);
+  await b.sleep(250);
+  await b.shot(`${base}/usage-new-tab-light.png`);
+  await b.key("Escape");
+  await b.click('[aria-label="Settings and more"]');
+  await clickText('[role="menuitem"]', "Claude profiles…");
+  await b.wait(`!!document.querySelector('[aria-label="Claude profiles"] .usage-table')`);
+  await b.sleep(250);
+  await b.shot(`${base}/usage-profiles-light.png`);
+  await b.eval(`${M}.prefs.value = {...${M}.prefs.value, theme: 'dark'}`);
   check(!b.console.some((line) => line.startsWith("exception:")), b.console.join("\n"));
   console.log("Profile UI checks passed; screenshots:", base);
 } finally {

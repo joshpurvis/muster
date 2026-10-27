@@ -51,7 +51,8 @@ key press away, and the terminals keep running when the window closes.
   start a helper, send it a prompt, wait for it to finish and read its screen. The `muster` CLI
   does the same from any shell.
 - **A phone view.** Pair a phone over Tailscale with `muster pair` to see which agents need you,
-  approve or deny, send a prompt and watch a terminal.
+  approve or deny, send a prompt and watch a terminal. Turn on alerts there and the phone shows
+  one, screen off, when an agent needs you; tapping it opens that session.
 
   <img src="docs/screenshots/phone.png" width="300" alt="The phone view: a list of sessions with the two that need you at the top, the Codex agent with Approve and Deny buttons and the Claude agent showing its question">
 
@@ -261,6 +262,31 @@ The window that crashed is not reopened for you; open a new one.
 Setting either variable yourself always wins (`env WEBKIT_DISABLE_DMABUF_RENDERER=0 muster`
 forces the fast renderer on, `=1` off). `muster status` shows what the next window would use,
 and each window logs its choice and any fallback to the daemon log.
+
+### Native window watchdog (Linux)
+
+Every 2 seconds the native window asks WebKit whether its page could run an editing command
+(no script runs in the page). WebKit answers that on the page's main thread, so a page stuck in
+a script stops answering, while a hidden, minimised or backgrounded window, a page on the
+shut-down or reconnect screen, and a page that is loading do not count (and a suspended
+laptop's sleep isn't counted as silence). After 10 seconds without an answer the window writes
+a line to the daemon log (when it stopped, for how long, and the WebKit web process's pid) and
+asks in a small native dialog: **Keep waiting** (the default, so Enter typed into the frozen
+window doesn't reload it) or **Reload window**. Reload ends the stuck web process and loads the
+UI again with the same tabs; sessions keep running, as they live in the daemon. If the page
+answers again first, the dialog goes away and the log says how long it was stuck. Each freeze
+is offered once.
+
+When the window process exits (closed, or killed with SIGTERM, SIGHUP or SIGINT), it ends its
+web process too, which a page stuck in a script would otherwise keep running. A window process
+killed with SIGKILL (`kill -9`) can't: kill its `WebKitWebProcess` too.
+
+To find out what froze a page, open the window with WebKit's inspector allowed (release builds
+have it off): `env MUSTER_WEB_INSPECTOR=1 muster`. Right-click the page (somewhere without its
+own menu, such as the sidebar) and choose Inspect Element, then leave the inspector open; a
+frozen page can't open it. When the page freezes, the pause button in its Sources tab stops the
+running script and shows where it was. Windows the daemon opens itself (`window.show`) use the
+daemon's environment.
 
 ### Downgrading
 

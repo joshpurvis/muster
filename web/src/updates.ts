@@ -50,3 +50,69 @@ export function waitingUpdates(s: UpdateStatus | null, loaded: string | null): P
 export function pickUpdate(s: UpdateStatus | null, loaded: string | null, dismissed: Dismissed): PendingUpdate | null {
   return waitingUpdates(s, loaded).find((u) => dismissed[u.kind] !== u.key) ?? null;
 }
+
+/** `daemon.restart`'s params: the backend and terminal host builds this window was shown (null:
+ * none of that kind waiting). The backend refuses if what it would start differs, so a build
+ * still being written, or replaced since, is never started. */
+export function restartExpect(s: UpdateStatus | null): { backend: string | null; host: string | null } {
+  return { backend: s?.backend ?? null, host: s?.host ?? null };
+}
+
+/** How long a window waits for the new backend after a restart before it says to run `muster`.
+ * The restart command waits up to 120 s for the old backend to exit (saving state, ending every
+ * session), 30 s for the terminal host, and about 15 s for the new backend to answer. */
+export const RESTART_WAIT_MS = 180_000;
+
+/** The backend a window last talked to: its pid, its terminal host's instance and its build
+ * (`hello.build`) (null: the hello didn't say). While restarting, `build` is the build the
+ * restart starts instead (see `restartWait`). */
+export interface RestartWait {
+  pid: number | null;
+  host: string | null;
+  build: string | null;
+}
+
+/** What a window waits for once a restart begins: another backend than `last`, on another
+ * terminal host, running the backend build the window was shown (`status.backend`), or else the
+ * same build as before. */
+export function restartWait(last: RestartWait, status: UpdateStatus | null): RestartWait {
+  return { ...last, build: status?.backend ?? last.build };
+}
+
+/** Did a hello on reconnect come from the restarted Muster? It must run on a terminal host, a
+ * new one (the restart replaces it), and be another backend than the old one (which may answer
+ * while it is still stopping, and a shell's `muster reload` meanwhile would start a backend on
+ * the old host). What the old backend didn't say isn't compared. */
+export function restartAnswered(
+  restarting: RestartWait | null,
+  hello: { pid?: number; terminal_host?: { instance: string } | null },
+): boolean {
+  if (!restarting) return false;
+  const host = hello.terminal_host?.instance;
+  if (!host || (restarting.host !== null && host === restarting.host)) return false;
+  return restarting.pid === null || hello.pid === undefined || hello.pid !== restarting.pid;
+}
+
+/** What a hello on reconnect says of a restart: not done yet ("waiting"), done ("restarted"),
+ * or done but by a backend of another build than the restart started ("other_build":
+ * something else started Muster meanwhile). */
+export function restartOutcome(
+  restarting: RestartWait | null,
+  hello: { pid?: number; build?: string | null; terminal_host?: { instance: string } | null },
+): "waiting" | "restarted" | "other_build" {
+  if (!restartAnswered(restarting, hello)) return "waiting";
+  const build = hello.build ?? null;
+  return restarting?.build && build && build !== restarting.build ? "other_build" : "restarted";
+}
+
+/** "3 sessions are running (2 agents)." for the shutdown and restart dialogs: `running` are the
+ * sessions that haven't exited; shells aren't agents. */
+export function runningText(running: { kind: string }[]): string {
+  const n = running.length;
+  if (n === 0) return "No sessions are running.";
+  const agents = running.filter((s) => s.kind !== "shell").length;
+  const head = n === 1 ? "1 session is running" : `${n} sessions are running`;
+  if (agents === 0) return `${head}.`;
+  if (agents === n) return `${head} ${n === 1 ? "(an agent)" : "(all agents)"}.`;
+  return `${head} (${agents} ${agents === 1 ? "agent" : "agents"}).`;
+}

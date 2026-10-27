@@ -19,6 +19,9 @@ pub trait Backend: Send + Sync + 'static {
     fn note_tool(&self, _caller: SessionId, _name: &str, _args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("notes unavailable in this backend")
     }
+    fn schedule_tool(&self, _caller: SessionId, _name: &str, _args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("schedules unavailable in this backend")
+    }
     /// Persistent application guard state; absent in pure protocol fixtures.
     fn guard_store(&self) -> Option<crate::store::Store> { None }
     fn session_by_token(&self, token: &str) -> Option<SessionId>;
@@ -102,6 +105,9 @@ impl Backend for HubBackend {
     }
     fn note_tool(&self, caller: SessionId, name: &str, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         crate::notes::tool(&self.0, caller, name, args)
+    }
+    fn schedule_tool(&self, caller: SessionId, name: &str, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        crate::schedules::agent::tool(&self.0, caller, name, args)
     }
     fn guard_store(&self) -> Option<crate::store::Store> { Some(self.0.store().clone()) }
     fn session_by_token(&self, token: &str) -> Option<SessionId> {

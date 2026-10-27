@@ -514,8 +514,10 @@ try {
     await pickMenu("Restart");
     await a.wait(`!!document.querySelector('.confirm-dlg')`, 2000);
     check(
-      await a.eval(`document.querySelector('.confirm-dlg .dlg-body')?.textContent`) ===
-          "Restart it? Its current turn is lost and the program starts fresh." &&
+      // A Claude tab reopens its conversation; other agents start fresh.
+      /^Restart it\? Its current turn is lost(; it reopens the same conversation| and the program starts fresh)\.$/.test(
+        await a.eval(`document.querySelector('.confirm-dlg .dlg-body')?.textContent`),
+      ) &&
         await a.eval(`document.querySelector('.confirm-dlg .btn-danger')?.textContent`) === "Restart",
       "Restart warns the turn is lost",
     );
@@ -1279,25 +1281,32 @@ try {
     await R(a, "mock.updates", { host: "0123456789ab" });
     await banner("host");
     await shot(a, "12c-update-host");
-    await a.click(".update-host .link-btn");
-    await a.wait(`!!document.querySelector('.modal[aria-label="Shut down Muster"]')`, 2000);
+    await a.click(".update-host .update-actions .btn");
+    await a.wait(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`, 2000);
     check(await a.eval(`!document.querySelector('.update-banner')`), "no banner above an open dialog");
     check(
       await a.eval(`document.activeElement?.textContent === 'Cancel'`),
-      "Cancel is the default in the shutdown dialog",
+      "Cancel is the default in the restart dialog",
     );
     const text: string = await a.eval(`document.querySelector('.modal .dlg-body').textContent`);
     check(/sessions? (is|are) running|No sessions/.test(text), `the dialog counts sessions: ${text}`);
-    await shot(a, "13-shutdown-dialog");
+    check(/reopen their conversation/.test(text), `the dialog says Claude tabs can be restarted: ${text}`);
+    check(await a.eval(`!!document.querySelector('.modal .dlg-foot .btn-danger')`), "Restart is the red button");
+    await shot(a, "13-restart-dialog");
     await a.key("Escape");
     await a.wait(`!document.querySelector('.modal')`, 2000);
+    // A build the window wasn't shown is refused before anything stops.
+    check(
+      /nothing was stopped/.test(await a.eval(`${M}.rpc.call("daemon.restart", { backend: null, host: null }).then(() => "", (e) => e.message)`)),
+      "daemon.restart refuses builds other than the ones shown",
+    );
     await a.click(".update-banner .toast-x");
-    ok("the terminal host banner opens the shutdown dialog (Cancel focused); nothing was stopped");
+    ok("the terminal host banner opens the restart dialog (Cancel focused, Restart red); nothing was stopped");
     // The ⋯ menu carries the window items.
     await a.click(".win-more");
     await a.wait(`!!document.querySelector('.menu')`, 2000);
     const items: string = await a.eval(`[...document.querySelectorAll('.menu .menu-label')].map((e) => e.textContent).join("|")`);
-    for (const want of ["Reload window", "Shut down Muster…"]) {
+    for (const want of ["Reload window", "Restart Muster…", "Shut down Muster…"]) {
       check(items.includes(want), `⋯ has ${want}: ${items}`);
     }
     // A browser lets a page close its window only when a script opened it or it has one history
@@ -1307,7 +1316,7 @@ try {
     check(!items.includes("System title bar"), "no title bar switch in a browser");
     await shot(a, "14-more-menu");
     await a.key("Escape");
-    ok("⋯ has Reload window and Shut down Muster… (Close window when allowed), no title bar switch in a browser");
+    ok("⋯ has Reload window, Restart Muster… and Shut down Muster… (Close window when allowed), no title bar switch in a browser");
     // Ctrl+Shift+R reloads the page (a marker set now is gone afterwards).
     await a.eval(`globalThis.__beforeReload = true`);
     await a.click(".pane .xterm");
@@ -1338,6 +1347,49 @@ try {
   await shot(a, "08-shortcuts");
   await a.key("Escape");
   ok("light theme and shortcuts sheet");
+
+  // ---- Restart Muster (mock only; last, since it ends every session): every window shows
+  // "Restarting Muster…", reconnects by itself, and the terminal host update is gone.
+  if (!real) {
+    await R(a, "mock.updates", { host: "0123456789ac" });
+    await a.wait(`!!document.querySelector('.update-banner.update-host')`, 4000);
+    await a.click(".update-host .update-actions .btn");
+    await a.wait(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`, 2000);
+    // Its checks take a while: once confirmed, the dialog says so and can't be dismissed.
+    await R(a, "mock.restart_delay", { ms: 2500 });
+    await a.click(".modal .dlg-foot .btn-danger");
+    await a.wait(`/Checking that Muster can restart/.test(document.querySelector('.modal .dlg-body')?.textContent ?? "")`, 2000);
+    check(await a.eval(`!document.querySelector('.modal .dlg-foot')`), "no Cancel once confirmed");
+    await shot(a, "13b-restart-checking");
+    await a.key("Escape");
+    await a.sleep(200);
+    check(await a.eval(`!!document.querySelector('.modal[aria-label="Restart Muster"]')`), "Escape doesn't dismiss a confirmed restart");
+    // Nor does a shortcut that opens another overlay (Escape would then return to normal work).
+    await a.key("Ctrl+Shift+P");
+    await a.sleep(200);
+    check(
+      await a.eval(`!!document.querySelector('.modal[aria-label="Restart Muster"]') && !document.querySelector('.switcher')`),
+      "the command palette shortcut doesn't replace a confirmed restart's dialog",
+    );
+    await a.wait(`!!document.querySelector('#restarting-title')`, 5000);
+    check(await a.eval(`document.activeElement?.getAttribute('aria-labelledby') === 'restarting-title'`), "the restarting screen takes the focus");
+    await shot(a, "15-restarting");
+    // Shortcuts do nothing while restarting (Alt+T would open a tab on the new backend).
+    const tabsBefore = await a.eval(`${M}.sessions.value.size`);
+    check(await a.eval(`!!document.querySelector('#restarting-title')`), "still restarting when the shortcut is pressed");
+    await a.key("Alt+T");
+    await a.wait(`!!document.querySelector('.app') && !document.querySelector('#restarting-title')`, 10000);
+    await a.sleep(500);
+    check((await a.eval(`${M}.sessions.value.size`)) === tabsBefore && (await a.eval(`!document.querySelector('.modal')`)),
+      "a shortcut pressed while restarting did nothing, also after the reconnect");
+    check(await a.eval(`!document.querySelector('.update-host')`), "no terminal host banner after the restart");
+    check(
+      await a.eval(`[...document.querySelectorAll('.toast-text')].some((t) => /Muster restarted/.test(t.textContent))`),
+      "a toast says Muster restarted",
+    );
+    if (b2) await b2.wait(`!!document.querySelector('.app') && !document.querySelector('#restarting-title')`, 10000);
+    ok("Restart Muster: Restarting Muster…, then every window reconnected by itself; the host update is gone");
+  }
 
   const errors = [...a.console, ...(b2?.console ?? [])].filter((l) => /^(error|exception)/.test(l));
   if (errors.length) throw new Error("console errors:\n  " + errors.join("\n  "));

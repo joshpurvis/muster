@@ -24,8 +24,11 @@ impl std::error::Error for SpawnUncertain {}
 
 #[derive(Clone, Debug)]
 pub enum Output {
+    /// Live bytes, in order and without gaps since the last replay.
     Bytes(Bytes),
-    Replay(Bytes),
+    /// A fresh replay after the host stream was reset (the renderer starts over), and the
+    /// raw output offset it ends at: the next live bytes start there.
+    Replay(Bytes, u64),
 }
 
 #[derive(Debug)]
@@ -42,7 +45,13 @@ struct InputJob {
     seq: u64,
     data: Vec<u8>,
     done: Option<std::sync::mpsc::SyncSender<anyhow::Result<()>>>,
+    /// Held until this job is settled (delivered, refused or dropped): the caller's proof that
+    /// its input is still on its way (src/sleep.rs `Admitted`). On the last chunk of an input.
+    hold: Option<Hold>,
 }
+
+/// Something a caller keeps alive until its input has been settled (`Terminal::send_keys_holding`).
+pub type Hold = Box<dyn std::any::Any + Send>;
 
 /// A run whose input may have a gap: some earlier input was lost, refused, dropped or its
 /// outcome is unknown. Every later input for that run is refused (never sent after the gap)
@@ -190,6 +199,7 @@ impl InputLink {
             while let Ok(job) = rx.recv() {
                 let length = job.data.len();
                 let run = job.run;
+                let hold = job.hold;
                 let gap = shared.state.lock().interrupted.get(&run)
                     .filter(|(_, before_gap)| job.seq > *before_gap).map(|(reason, _)| reason.clone());
                 let result = match gap {
@@ -222,6 +232,7 @@ impl InputLink {
                     if *count == 0 { state.pending.remove(&run); }
                 }
                 drop(state);
+                drop(hold);
                 shared.finished.notify_all();
             }
         })?;
@@ -314,13 +325,15 @@ impl InputLink {
     /// (keystrokes), never blocking on the host or the budget. Input that is refused after
     /// part of it was admitted, or keystrokes that are refused at all (nobody waits for their
     /// outcome), interrupt the run.
-    fn send(&self, run: RunId, data: &[u8], wait: bool) -> anyhow::Result<()> {
+    /// `hold` is kept until the last chunk has been settled (dropped at once if nothing is admitted).
+    fn send(&self, run: RunId, data: &[u8], wait: bool, mut hold: Option<Hold>) -> anyhow::Result<()> {
         let deadline = Instant::now() + INPUT_WAIT;
         let mut results = Vec::new();
         let mut state = self.shared.state.lock();
         if let Some((reason, _)) = state.interrupted.get(&run) {
             return Err(InputInterrupted { reason: reason.clone() }.into());
         }
+        let chunks = data.len().div_ceil(muster_terminal_protocol::MAX_INPUT);
         for (index, chunk) in data.chunks(muster_terminal_protocol::MAX_INPUT).enumerate() {
             let gap = !wait || index > 0;
             // A chunk always fits an empty queue, so input of any size can make progress.
@@ -342,7 +355,8 @@ impl InputLink {
                 return Err(self.refuse(state, run, gap, "the application backend is stopping"));
             }
             let seq = state.admitted + 1;
-            let job = InputJob { run, seq, data: chunk.to_vec(), done };
+            let job = InputJob { run, seq, data: chunk.to_vec(), done,
+                hold: if index + 1 == chunks { hold.take() } else { None } };
             if !state.tx.as_ref().is_some_and(|tx| tx.send(job).is_ok()) {
                 return Err(self.refuse(state, run, gap, "the terminal input thread stopped"));
             }
@@ -519,12 +533,21 @@ impl Terminal {
 
     /// Deliver input and wait for the host to accept it (prompt delivery, RPC input).
     pub fn write(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.input.send(self.run(), bytes, true)
+        self.input.send(self.run(), bytes, true, None)
+    }
+    /// `write`, keeping `hold` until the input has been settled (even past a timeout).
+    pub fn write_holding(&self, bytes: &[u8], hold: Hold) -> anyhow::Result<()> {
+        self.input.send(self.run(), bytes, true, Some(hold))
     }
     /// Queue keystrokes behind any earlier input without waiting for the host. Byte order
     /// across `write` and `send_keys` is the order of the calls.
+    #[cfg(test)]
     pub fn send_keys(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.input.send(self.run(), bytes, false)
+        self.input.send(self.run(), bytes, false, None)
+    }
+    /// `send_keys`, keeping `hold` until the keys have been settled with the host.
+    pub fn send_keys_holding(&self, bytes: &[u8], hold: Hold) -> anyhow::Result<()> {
+        self.input.send(self.run(), bytes, false, Some(hold))
     }
     /// Why this run's input is paused, if it is (see `InputInterrupted`).
     pub fn input_interrupted(&self) -> Option<String> {
@@ -545,6 +568,11 @@ impl Terminal {
             Response::Text(text) => Some(text),
             _ => None,
         }
+    }
+    /// The host's own answer whether the run is still running (not the cached status). False
+    /// when the host can't be asked.
+    pub fn alive_now(&self) -> bool {
+        matches!(self.client.call(Command::Status { run: self.run() }), Ok(Response::Status(status)) if status.alive)
     }
     pub fn has_processes(&self) -> bool {
         match self.client.call(Command::Status { run: self.run() }) {
@@ -568,12 +596,15 @@ impl Terminal {
         Ok(())
     }
 
-    pub fn attach(&self, max_body: Option<usize>) -> anyhow::Result<(Vec<u8>, broadcast::Receiver<Output>)> {
+    /// The replay, the raw output offset it ends at (the host's count of bytes the run has
+    /// written: the live bytes that follow start there), and the live output.
+    pub fn attach(&self, max_body: Option<usize>) -> anyhow::Result<(Vec<u8>, u64, broadcast::Receiver<Output>)> {
         let mut stream = self.client.subscribe(Command::Attach { run: self.run(), replay_bytes: max_body })?;
         let (replay, mut offset) = match wire::read(&mut stream)? {
             Frame::Replay { next_offset, data } => (data, next_offset),
             _ => anyhow::bail!("terminal host omitted initial replay"),
         };
+        let start = offset;
         let (tx, rx) = broadcast::channel(1024);
         let client = self.client.clone();
         let run = self.run();
@@ -586,7 +617,7 @@ impl Terminal {
                     }
                     Ok(Frame::Replay { next_offset, data }) => {
                         offset = next_offset;
-                        Output::Replay(Bytes::from(data))
+                        Output::Replay(Bytes::from(data), next_offset)
                     }
                     Ok(Frame::Ping) => continue,
                     _ => {
@@ -602,7 +633,7 @@ impl Terminal {
                                 if let Ok(Frame::Replay { next_offset, data }) = wire::read(&mut next) {
                                     stream = next;
                                     offset = next_offset;
-                                    break Output::Replay(Bytes::from(data));
+                                    break Output::Replay(Bytes::from(data), next_offset);
                                 }
                             }
                             delay = (delay * 2).min(Duration::from_secs(2));
@@ -612,7 +643,7 @@ impl Terminal {
                 if tx.send(output).is_err() { break }
             }
         })?;
-        Ok((replay, rx))
+        Ok((replay, start, rx))
     }
 }
 
@@ -627,7 +658,76 @@ pub fn ensure_host(executable: &Path) -> anyhow::Result<Arc<TerminalService>> {
     Ok(service)
 }
 
-const LEGACY_DAEMON: &str = "an older Muster daemon is running for this runtime directory (it holds daemon.lock); \
+/// Start `executable` as a terminal host in scratch runtime and data directories under `dir`
+/// (created here, removed afterwards), and check what a backend start will require of it: it
+/// runs, answers this build's protocol hello for that data directory, and holds the fence lock
+/// it is given. Then it is shut down. The running host and its sessions are never touched. A
+/// truncated host, or one of another protocol version, fails here, before a restart ends
+/// anything.
+pub fn probe_host(executable: &Path, dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    struct Scratch<'a>(&'a Path, Option<std::process::Child>);
+    impl Drop for Scratch<'_> {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.1
+                && child.try_wait().ok().flatten().is_none()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+    crate::paths::ensure_private_dir(dir)?;
+    let mut scratch = Scratch(dir, None);
+    let (runtime, data, fence) = (dir.join("run"), dir.join("data"), dir.join("fence.lock"));
+    crate::paths::ensure_private_dir(&data)?;
+    std::fs::write(&fence, b"")?;
+    let log_path = dir.join("host.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log_path)?;
+    let tail = || {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let last: Vec<&str> = log.lines().rev().take(3).collect();
+        last.into_iter().rev().collect::<Vec<_>>().join(" / ")
+    };
+    let mut command = std::process::Command::new(executable);
+    command.arg("--runtime-dir").arg(&runtime).arg("--data-dir").arg(&data)
+        .env("MUSTER_TERMINAL_FENCE_LOCK", &fence)
+        // A restart's command carries the OpenRouter key for the new daemon; this host gets none.
+        .env_remove(crate::openrouter::ENV_KEY)
+        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    let child = scratch.1.insert(command.spawn().with_context(|| format!("running the terminal host {}", executable.display()))?);
+    let socket = runtime.join("terminal.sock");
+    let end = Instant::now() + Duration::from_secs(10);
+    let client = loop {
+        match Client::connect(&socket) {
+            Ok(client) => break client,
+            Err(error) => match error.downcast_ref::<std::io::Error>().map(|e| e.kind()) {
+                // Not listening yet.
+                Some(std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {}
+                Some(_) => return Err(error.context(format!("reaching the checked terminal host {}", executable.display()))),
+                None => anyhow::bail!("the terminal host {} doesn't speak this build's protocol: {error:#}", executable.display()),
+            },
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("the terminal host {} exited when started ({status}): {}", executable.display(), tail());
+        }
+        anyhow::ensure!(Instant::now() < end, "the terminal host {} did not answer within 10 s", executable.display());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    anyhow::ensure!(client.hello.data_dir == std::fs::canonicalize(&data)?,
+        "the terminal host {} reports another data directory than the one it was given", executable.display());
+    verify_fence(&client.hello, &fence)
+        .with_context(|| format!("the terminal host {} would be refused by this build", executable.display()))?;
+    client.call(Command::Shutdown).context("stopping the checked terminal host")?;
+    let end = Instant::now() + Duration::from_secs(5);
+    while child.try_wait()?.is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+const LEGACY_DAEMON: &str ="an older Muster daemon is running for this runtime directory (it holds daemon.lock); \
     stop it with that build's `muster stop` before starting this one";
 
 /// The answering host must hold `lock` (the file at that path now, by device and inode).
@@ -1036,6 +1136,50 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A keystroke's hold (a sleep's admission, src/sleep.rs) lasts until the host has answered
+    /// it, not only until it is queued; a refused one lets go at once.
+    #[test]
+    fn a_hold_lasts_until_the_host_answered_its_input() {
+        let (release_tx, release) = std::sync::mpsc::channel::<()>();
+        let (service, directory, server) = fake_host("input-hold", move |listener| {
+            let mut stream = listener.accept().unwrap().0;
+            let _: Request = wire::read(&mut stream).unwrap().decode().unwrap();
+            wire::write(&mut stream, &Frame::json(&Response::Attached).unwrap()).unwrap();
+            let mut seen = vec![];
+            while let Ok(frame) = wire::read(&mut stream) {
+                // A slow host: answered only when the test says so.
+                let _ = release.recv();
+                seen.push(input_of(frame).1);
+                wire::write(&mut stream, &Frame::json(&Response::Ok).unwrap()).unwrap();
+            }
+            seen
+        });
+        struct Held(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::SeqCst) }
+        }
+        let on_way = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let one = live(&service, 1, 1, &directory);
+        one.send_keys_holding(b"hi", Box::new(Held(on_way.clone()))).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(on_way.load(std::sync::atomic::Ordering::SeqCst), "queued, not yet delivered: still held");
+        release_tx.send(()).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while on_way.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(Instant::now() < until, "the hold is let go once the host answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let link = service.input().clone();
+        link.close();
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(one.send_keys_holding(b"x", Box::new(Held(refused.clone()))).is_err());
+        assert!(!refused.load(std::sync::atomic::Ordering::SeqCst), "refused: nothing on its way");
+        assert!(link.drain(Instant::now() + Duration::from_secs(5)));
+        drop((one, service, link, release_tx));
+        assert_eq!(server.join().unwrap(), vec![b"hi".to_vec()]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn output_stream_reconnects_with_reset_replay_after_disconnect_or_gap() {
         for offset_gap in [false, true] {
@@ -1083,11 +1227,14 @@ mod tests {
                 pid: Some(1), alive: true, drained: false, has_processes: true, exit_code: None,
                 title: None, cols: 80, rows: 24, output_seq: 0, last_output_at: 0,
                 application_cursor: false, log_persisted: true, cwd: directory.clone() });
-            let (replay, mut rx) = terminal.attach(None).unwrap();
-            assert_eq!(replay, b"A");
+            let (replay, start, mut rx) = terminal.attach(None).unwrap();
+            assert_eq!((&replay[..], start), (&b"A"[..], 1));
             for (reset, expected) in [(false, "B"), (true, "AB"), (false, "C")] {
                 let output = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
-                let (actual_reset, bytes) = match output { Output::Bytes(bytes) => (false, bytes), Output::Replay(bytes) => (true, bytes) };
+                let (actual_reset, bytes) = match output {
+                    Output::Bytes(bytes) => (false, bytes),
+                    Output::Replay(bytes, next) => { assert_eq!(next, 2, "a reset replay says where it ends"); (true, bytes) }
+                };
                 assert_eq!(actual_reset, reset);
                 assert_eq!(&bytes[..], expected.as_bytes());
             }

@@ -475,6 +475,7 @@ mod tests {
             accepts: None,
             permissions: None,
             autostart: false,
+            sleep_after_min: None,
         })
         .unwrap();
         hub.agents().link_session(hub.store(), a.id, Some(sid)).unwrap();

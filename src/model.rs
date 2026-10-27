@@ -401,6 +401,11 @@ pub struct SessionInfo {
     /// its hooks. Runtime only: not persisted, 0 after a restart.
     #[serde(default)]
     pub subagents: u32,
+    /// Background sub-agents and commands the run started (`run_in_background`) that haven't
+    /// reported back, from its hooks (src/sleep.rs `Background`). An agent never sleeps while one
+    /// runs: stopping the CLI would end it.
+    #[serde(default)]
+    pub background: u32,
     pub created_at: i64,
     /// Client window this session is a tab in (None: adopted by the next `window.claim`).
     #[serde(default)]

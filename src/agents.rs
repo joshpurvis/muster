@@ -4,8 +4,9 @@
 //! An agent is a stored record (`agents` table) plus at most one muster session at a time: a claude
 //! or codex agent whose cwd is the agent's home dir (`<data>/agents/<name>/`, with a CLAUDE.md or
 //! AGENTS.md written from its persona and a `memory/` dir), in the agent's own tab (channel,
-//! stored on the record) in the "agents" workspace (`<data>/agents`). Claude agents resume their
-//! conversation (`--resume <id>`, the id captured from the SessionStart hook).
+//! stored on the record) in the "agents" workspace (`<data>/agents`). Agents resume their
+//! conversation: Claude with `--resume <id>` (the id from the SessionStart hook), Codex with
+//! `codex resume … <id>` (the thread id from its turn-complete notify).
 //!
 //! Provenance: every session has the origin (`human`, `schedule`, `webhook`) and hop of the
 //! message it is handling ("prov", runtime only). It is set when muster actually types an
@@ -121,6 +122,11 @@ pub struct Agent {
     pub created_at: i64,
     /// Started when the daemon starts.
     pub autostart: bool,
+    /// Put to sleep after this many idle minutes (src/sleep.rs). None: never (the default).
+    pub sleep_after_min: Option<u32>,
+    /// Asleep since (Unix ms): its process was stopped while idle, its tab and conversation
+    /// kept; the next message wakes it. None: awake (running or stopped).
+    pub asleep_at: Option<i64>,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -247,9 +253,14 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          your final message for that turn goes back to the sender. If the answer needs longer (a long \
          job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
          (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
-         agents, use the muster MCP tools `list_agents` and `ask_agent`.\n",
+         agents, use the muster MCP tools `list_agents` and `ask_agent`.\n\n\
+         ## Schedules\n\n\
+         To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
+         one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
+         `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
+         shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
-        resume = if kind == SessionKind::Claude { " and resumes your conversation when you restart" } else { "" },
+        resume = " and resumes your conversation when you restart",
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -570,8 +581,8 @@ pub fn route(agent: &Agent, prov: Option<Prov>, forced: Option<Origin>, recent: 
 pub const MODEL_MAX: usize = 128;
 
 /// `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex), plus
-/// `--resume <id>` for a Claude agent with a conversation to resume. Checked against the
-/// agent-argument allowlist.
+/// `--resume <id>` for a Claude agent with a conversation to resume (a Codex agent's thread is
+/// passed at start instead, `Hub::codex_resume`). Checked against the agent-argument allowlist.
 pub fn agent_args(
     kind: SessionKind,
     model: Option<&str>,
@@ -608,9 +619,9 @@ pub fn agent_args(
             if let Some(e) = effort {
                 out.extend(["-c".to_string(), format!("model_reasoning_effort={e}")]);
             }
-            // TODO(codex resume): Codex resumes with a subcommand (`codex resume <id>`), which
-            // the adapter doesn't build and the argument allowlist refuses; the id is captured
-            // (`resume_id_from_hook`) but not passed until that is verified against the CLI.
+            // Its thread is not an argument: the hub hands it to the adapter at start
+            // (`Hub::codex_resume`), so stored arguments stay readable by older backends.
+            let _ = resume;
         }
         SessionKind::Shell => anyhow::bail!("agents are claude or codex agents"),
     }
@@ -621,8 +632,9 @@ pub fn agent_args(
 /// `args` with any conversation flag (`--resume`/`--continue`, in every spelling the argument
 /// check accepts) replaced by `--resume <id>`, or dropped for None: how a Claude tab that isn't
 /// a named agent's restarts into the conversation it last used. Its other arguments are kept.
+/// (A Codex tab's thread is kept outside its arguments: `Hub::codex_resume`.)
 pub fn with_resume(kind: SessionKind, args: &[String], id: Option<&str>) -> anyhow::Result<Vec<String>> {
-    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume a conversation");
+    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume through their arguments");
     anyhow::ensure!(id.is_none_or(valid_resume_id), "not a Claude conversation id: {id:?}");
     let mut out = Vec::new();
     for (long, values) in crate::adapters::parse_extra_args(kind, args)? {
@@ -650,12 +662,14 @@ pub fn valid_resume_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// The agent's own conversation id from a hook payload: Claude's (and Codex's) SessionStart
-/// `session_id`, Codex notify's `thread-id`.
+/// The conversation id a hook payload reports: Claude's SessionStart `session_id`, Codex
+/// notify's `thread-id` (its turn-complete callback; never its internal title request's). For
+/// Codex that is any thread's, a sub-agent's too: which one a run resumes is the hub's call
+/// (`Hub::conversation_after_hook`), passed in `HookSession::thread`.
 pub fn resume_id_from_hook(kind: SessionKind, event: &str, payload: &Value) -> Option<String> {
     let key = match (kind, event) {
-        (SessionKind::Claude | SessionKind::Codex, "SessionStart") => "session_id",
-        (SessionKind::Codex, "notify") => "thread-id",
+        (SessionKind::Claude, "SessionStart") => "session_id",
+        (SessionKind::Codex, "notify") if !crate::adapters::codex::is_title_generation(payload) => "thread-id",
         _ => return None,
     };
     let id = payload.get(key)?.as_str()?.trim();
@@ -796,23 +810,70 @@ pub const REFUSED_KEEP: usize = 1000;
 pub struct Registry {
     store: Store,
     inner: Mutex<RegInner>,
-    /// Serializes agent starts, so two asks can't start one agent twice.
-    start_lock: tokio::sync::Mutex<()>,
+    /// Serializes agent starts, so two asks can't start one agent twice (and a sleep with them:
+    /// src/sleep.rs).
+    pub(crate) start_lock: tokio::sync::Mutex<()>,
+    /// Sleep and wake bookkeeping that the keystroke path reads (src/sleep.rs).
+    pub(crate) sleep: crate::sleep::State,
+    /// Serializes `agent.update`: the record it reads, the check that it doesn't widen unattended
+    /// work from outside the window (`widens_unattended`) and the write happen as one, so a
+    /// change made meanwhile (the owner taking back Schedule) can't be undone by an older read.
+    config_lock: Mutex<()>,
+    /// The sessions whose provenance is now unattended work (a schedule's or trigger's chain),
+    /// kept beside `inner.runtime.prov` behind a lock of its own that calls nothing: file
+    /// triggers read it on every session event (`Hub::emit`, sometimes with the hub's lock
+    /// held), so each turn is marked when it is seen, not at a later look.
+    unattended: Mutex<HashSet<SessionId>>,
+}
+
+/// The sessions `rt` says are doing unattended work.
+fn unattended_of(rt: &Attributions) -> HashSet<SessionId> {
+    rt.prov.iter().filter(|(_, p)| p.origin != Origin::Human).map(|(id, _)| *id).collect()
 }
 
 impl Registry {
+    /// Is session `id` doing unattended work now (its provenance a schedule's or a trigger's)?
+    /// A leaf lock: safe from anywhere.
+    pub fn unattended_now(&self, id: SessionId) -> bool {
+        self.unattended.lock().contains(&id)
+    }
+
+    /// Keep `unattended` in step with the provenance just saved (with `inner` held).
+    fn mark(&self, rt: &Attributions) {
+        *self.unattended.lock() = unattended_of(rt);
+    }
+
     pub fn load(store: &Store) -> anyhow::Result<Self> {
         let mut inner = RegInner {
             runtime: store.load_runtime("agent-attribution")?.unwrap_or_default(),
             ..Default::default()
         };
-        for b in store.load_agents()? {
+        for mut b in store.load_agents()? {
+            // A Codex thread this backend didn't confirm (an older backend saved every notify's,
+            // title requests and sub-agents included, and after a downgrade may have replaced
+            // it) is never resumed: the agent's next start is a new conversation.
+            if b.kind == SessionKind::Codex
+                && let Some(saved) = b.resume_id.clone()
+                && store.confirmed_codex_agent_thread(b.id)?.as_deref() != Some(saved.as_str())
+            {
+                tracing::info!(agent = b.name, "not resuming Codex thread {saved}: an older backend saved it");
+                store.update_agent_runtime(b.id, b.channel_id, b.session_id, None)?;
+                b.resume_id = None;
+            }
             inner.agents.insert(b.id, b);
+        }
+        let unattended = Mutex::new(unattended_of(&inner.runtime));
+        let sleep = crate::sleep::State::default();
+        for a in inner.agents.values() {
+            sleep.set_asleep(a.session_id, a.id, a.asleep_at.is_some());
         }
         Ok(Registry {
             store: store.clone(),
             inner: Mutex::new(inner),
             start_lock: Default::default(),
+            config_lock: Default::default(),
+            unattended,
+            sleep,
         })
     }
 
@@ -824,6 +885,7 @@ impl Registry {
         let result = edit(&mut next);
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         // Stamps describe only sessions still marked.
@@ -883,12 +945,13 @@ impl Registry {
         a.accepts_origins = next.accepts_origins.clone();
         a.autostart = next.autostart;
         a.provider = next.provider;
+        a.sleep_after_min = next.sleep_after_min;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
     }
 
-    fn update(&self, store: &Store, id: i64, f: impl FnOnce(&mut Agent)) -> anyhow::Result<()> {
+    pub(crate) fn update(&self, store: &Store, id: i64, f: impl FnOnce(&mut Agent)) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
         let mut next = b.clone();
@@ -896,6 +959,32 @@ impl Registry {
         store.update_agent_runtime(next.id, next.channel_id, next.session_id, next.resume_id.as_deref())?;
         *b = next;
         Ok(())
+    }
+
+    /// Agent `id` fell asleep at `at`, or woke (None). Saved first; the keystroke path's set
+    /// follows. Returns the record as it was.
+    /// `generation`: the run a sleep is stopping (a restart that cuts the stop off finishes it).
+    pub(crate) fn set_asleep(&self, store: &Store, id: i64, at: Option<i64>, generation: Option<u64>) -> anyhow::Result<Agent> {
+        let (before, session) = {
+            let mut g = self.inner.lock();
+            let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+            let before = b.clone();
+            if b.asleep_at != at {
+                store.set_agent_asleep(id, at, generation)?;
+                b.asleep_at = at;
+            }
+            (before, b.session_id)
+        };
+        self.sleep.set_asleep(session, id, at.is_some());
+        Ok(before)
+    }
+
+    /// When the message session `id` is running now was typed into it (None: no agent message
+    /// is active there).
+    pub(crate) fn active_delivered_at(&self, id: SessionId) -> Option<i64> {
+        let g = self.inner.lock();
+        let msg = g.runtime.active.get(&id)?;
+        g.runtime.delivered.get(msg).filter(|(s, _)| *s == id).map(|(_, at)| *at)
     }
 
     /// Link a named agent to the session being started for it. spawn_session saves this
@@ -985,6 +1074,7 @@ impl Registry {
         }
         if next != inner.runtime {
             self.store.save_runtime("agent-attribution", &next)?;
+            self.mark(&next);
             inner.runtime = next;
         }
         for (id, (first, last)) in marks {
@@ -1079,7 +1169,9 @@ impl Registry {
                 _ => {},
             }
         }
-        let reply = reply_from_hook(info.kind, event, payload)
+        // A Codex sub-agent's turn ending is not the agent's reply (`HookSession::child`).
+        let child = session.is_some_and(|(_, runtime)| runtime.child);
+        let reply = reply_from_hook(info.kind, event, payload).filter(|_| !child)
             .and_then(|reply| next.active.get(&info.id).copied().map(|msg| (msg, reply)));
         if let Some((msg, _)) = &reply {
             next.active.remove(&info.id);
@@ -1088,16 +1180,25 @@ impl Registry {
         }
         let mut agent = g.agents.values().find(|agent| agent.session_id == Some(info.id)).cloned();
         if let Some(agent) = &mut agent {
-            if let Some(resume_id) = resume_id_from_hook(info.kind, event, payload) {
-                if agent.resume_id.as_deref() != Some(resume_id.as_str()) {
-                    agent.resume_id = Some(resume_id);
-                    fx.agent = Some(agent.id);
-                }
+            // What the hook changes about the conversation the agent resumes, as the hub reads
+            // it (`Hub::conversation_after_hook`: Claude's once it has a prompt, Codex's
+            // top-level thread). Nothing from a run Start fresh is replacing (`fenced`).
+            let fenced = session.is_some_and(|(_, runtime)| runtime.fenced);
+            let change = match session {
+                Some((_, runtime)) => runtime.thread.clone(),
+                None => resume_id_from_hook(info.kind, event, payload).map(Some),
+            };
+            if let Some(resume_id) = change.filter(|_| !fenced)
+                && agent.resume_id != resume_id
+            {
+                agent.resume_id = resume_id;
+                fx.agent = Some(agent.id);
             }
         }
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
         if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some() {
             store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
+            self.mark(&next);
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
         }
@@ -1115,8 +1216,18 @@ impl Registry {
 
 /// Tell clients an agent's record changed (`agent_upserted`).
 pub fn publish(hub: &Hub, a: &Agent) {
+    hub.emit(ServerEvent::AgentUpserted(agent_view(hub, a)));
+}
+
+/// `agent_json` with its session, and why its last wake failed while that still applies
+/// (`wake_error`, src/sleep.rs).
+pub fn agent_view(hub: &Hub, a: &Agent) -> Value {
     let s = a.session_id.and_then(|s| hub.session(s));
-    hub.emit(ServerEvent::AgentUpserted(agent_json(a, s.as_ref())));
+    let mut v = agent_json(a, s.as_ref());
+    if let Some(e) = hub.agents().sleep.wake_failed(a.id).filter(|_| a.asleep_at.is_some()) {
+        v["wake_error"] = json!(e);
+    }
+    v
 }
 
 /// Tell clients about a message to an agent: new, refused, or just replied to (`agent_message`).
@@ -1189,6 +1300,9 @@ pub struct NewAgent {
     pub permissions: Option<PermissionsInput>,
     #[serde(default)]
     pub autostart: bool,
+    /// Sleep after this many idle minutes (src/sleep.rs). Absent or 0: never.
+    #[serde(default)]
+    pub sleep_after_min: Option<u32>,
 }
 
 pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
@@ -1210,6 +1324,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     if hub.agents().get(&name).is_some() {
         anyhow::bail!("an agent named {name} already exists");
     }
+    let sleep_after_min = crate::sleep::check_after(req.sleep_after_min)?;
     let persona = req.persona.unwrap_or_default();
     let home = home_dir_for(&name);
     ensure_home(&home)?;
@@ -1234,6 +1349,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             resume_id: None,
             created_at: now_ms(),
             autostart: req.autostart,
+            sleep_after_min,
+            asleep_at: None,
         },
     )?;
     publish(hub, &a);
@@ -1260,12 +1377,18 @@ pub struct AgentUpdate {
     pub autostart: Option<bool>,
     #[serde(default)]
     pub permissions: Option<PermissionsInput>,
+    /// Sleep after this many idle minutes; 0 turns sleeping off (src/sleep.rs).
+    #[serde(default)]
+    pub sleep_after_min: Option<u32>,
 }
 
 /// Model, effort and permissions apply from the agent's next start; the persona file is
 /// rewritten now (the CLI reads it when a conversation starts). Its own tab gets the new
-/// profile, so a restart runs with it.
-pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
+/// profile, so a restart runs with it. `outside`: not a click in Muster's window
+/// (`rpc::Via::Outside`): a change that widens unattended work (`widens_unattended`) is refused.
+/// Read, checked and written under `Registry::config_lock`, one update at a time.
+pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agent> {
+    let _one = hub.agents().config_lock.lock();
     let cur = hub.agents().get(&req.name).ok_or_else(|| no_agent(hub, &req.name))?;
     let mut next = cur.clone();
     if let Some(m) = req.model {
@@ -1292,6 +1415,12 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
     if let Some(p) = req.permissions {
         next.permissions = p.into();
     }
+    if let Some(m) = req.sleep_after_min {
+        next.sleep_after_min = crate::sleep::check_after(Some(m))?;
+    }
+    if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
+        anyhow::bail!("{why}");
+    }
     if next.persona != cur.persona {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
@@ -1310,6 +1439,37 @@ pub fn update(hub: &Hub, req: AgentUpdate) -> anyhow::Result<Agent> {
     Ok(next)
 }
 
+/// Does changing `cur` to `next` widen unattended work, which takes a click in Muster's window?
+/// `Some(what to do instead)` when it lets the agent take scheduled or triggered work it didn't,
+/// or changes the provider of a Claude agent that takes such work or is named in a schedule (its
+/// own or a "Then…" step): leaving the subscription drops its schedules' 7-day expiry (an
+/// expired one would run again) and their quiet-hours default; joining it puts that work on the
+/// subscription, which the Schedule opt-in's warning is about. Model, effort, persona,
+/// permissions and autostart don't change whether or when unattended work runs (the tab's
+/// permissions are the owner's to set from anywhere: `channel.set_permissions`).
+pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String> {
+    let unattended = |o: &Origin| matches!(o, Origin::Schedule | Origin::Webhook);
+    if next.accepts_origins.iter().any(|o| unattended(o) && !cur.accepts_origins.contains(o)) {
+        return Some(format!(
+            "letting {} take scheduled or triggered work takes a click in Muster's window: tick it under \
+             \"Takes messages started by\" in Edit agent (Agents panel). From here an agent's accepted work can only shrink",
+            cur.name
+        ));
+    }
+    if next.provider != cur.provider
+        && cur.kind == SessionKind::Claude
+        && (next.accepts_origins.iter().any(unattended) || crate::schedules::names_agent(hub, cur.id))
+    {
+        return Some(format!(
+            "changing the provider of {}, which takes scheduled or triggered work or is named in a schedule, takes a click in \
+             Muster's window (Edit agent, in the Agents panel): it changes whether its schedules stop after 7 days and what \
+             pays for them. From here, first take away its Schedule and Webhook and remove the schedules that name it",
+            cur.name
+        ));
+    }
+    None
+}
+
 /// `agent.remove`: removes the agent's session (if any) and its record. The home dir (persona,
 /// memory) stays on disk.
 pub fn remove(hub: &Hub, name: &str) -> anyhow::Result<Agent> {
@@ -1321,6 +1481,7 @@ pub fn remove(hub: &Hub, name: &str) -> anyhow::Result<Agent> {
         tracing::warn!(agent = agent.name, "removing its session: {e:#}");
     }
     hub.agents().remove(hub.store(), agent.id)?;
+    hub.agents().sleep.set_asleep(agent.session_id, agent.id, false);
     crate::schedules::remove_for_agent(hub, agent.id);
     hub.emit(ServerEvent::AgentRemoved { id: agent.id, name: agent.name.clone() });
     Ok(agent)
@@ -1359,6 +1520,8 @@ pub struct AgentSession {
     pub session: SessionInfo,
     /// A process was started (or restarted) for this call.
     pub started: bool,
+    /// The agent was asleep since then (Unix ms), and this call woke it (src/sleep.rs).
+    pub woke: Option<i64>,
 }
 
 /// `agent.start`: the agent's live session, else restart its exited one, else a new session in
@@ -1402,6 +1565,23 @@ pub async fn start_fresh_if(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInf
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
     fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
     let _one = hub.agents().start_lock.lock().await;
+    start_locked(hub, name, fresh, window, fresh_if).await
+}
+
+/// `start_guarded` with the start lock held. A start of an asleep agent that fails, at any
+/// step, leaves it asleep and records why (src/sleep.rs `wake_failed`), for its asleep bar.
+async fn start_locked(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
+    fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
+    let asleep = hub.agents().get(name).filter(|a| a.asleep_at.is_some()).map(|a| a.id);
+    let r = start_once(hub, name, fresh, window, fresh_if).await;
+    if let (Err(e), Some(id)) = (&r, asleep) {
+        crate::sleep::wake_failed(hub, id, e);
+    }
+    r
+}
+
+async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
+    fresh_if: Option<&(dyn Fn(&SessionInfo) -> bool + Sync)>) -> anyhow::Result<AgentSession> {
     let mut agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
     if let Some(ok) = fresh_if
         && let Some(sid) = agent.session_id
@@ -1420,12 +1600,17 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         && session.state != AgentState::Exited
         && hub.live_session_ids().contains(&sid)
     {
-        return Ok(AgentSession { agent, session, started: false });
+        return Ok(AgentSession { agent, session, started: false, woke: None });
     }
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
     check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     if fresh {
+        // First stop the old run's hooks from saving a conversation again (a turn-complete
+        // still queued would otherwise undo the fresh start before the restart replaces it).
+        if let Some(sid) = agent.session_id {
+            hub.fence_conversation(sid);
+        }
         hub.agents().update(hub.store(), agent.id, |b| b.resume_id = None)?;
         agent.resume_id = None;
     }
@@ -1439,17 +1624,35 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         Ok(Some(_)) => refuse_symlink(&persona)?,
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
+    // Awake from here on; a start below that fails puts an agent it was waking back to sleep
+    // (src/sleep.rs `start_failed`), so its next message tries again.
+    let woke = crate::sleep::on_start(hub, &agent)?;
+    agent.asleep_at = None;
+    let id = agent.id;
+    let r = run_agent(hub, agent, fresh, window, args, woke).await;
+    if let Some(at) = woke {
+        match &r {
+            Ok(_) => crate::sleep::launched(hub, id),
+            Err(e) => crate::sleep::start_failed(hub, id, at, e),
+        }
+    }
+    r
+}
+
+/// The run part of `start_locked`: restart the agent's exited session, else a new one in its tab.
+async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option<WindowId>, args: Vec<String>,
+    woke: Option<i64>) -> anyhow::Result<AgentSession> {
     if let Some(sid) = agent.session_id
         && let Some(info) = hub.session(sid)
         && hub.channel(info.channel_id).is_some_and(|c| !c.archived)
     {
         let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&sid);
         if live && !fresh {
-            return Ok(AgentSession { agent, session: info, started: false });
+            return Ok(AgentSession { agent, session: info, started: false, woke });
         }
         hub.set_session_extra_args(sid, args)?;
         let session = hub.restart_session(sid).await?;
-        return Ok(AgentSession { agent, session, started: true });
+        return Ok(AgentSession { agent, session, started: true, woke });
     }
     let window = window.filter(|w| hub.window(*w).is_some());
     // The agent's own tab, never one found by name (it could have wider permissions).
@@ -1503,7 +1706,7 @@ async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<W
         })
         .await?;
     agent.session_id = Some(session.id);
-    Ok(AgentSession { agent, session, started: true })
+    Ok(AgentSession { agent, session, started: true, woke })
 }
 
 /// The CLI arguments a restart of session `sid` must use when it is a named agent's: rebuilt
@@ -1514,11 +1717,66 @@ pub fn restart_args(reg: &Registry, sid: SessionId) -> Option<anyhow::Result<Vec
     Some(agent_args(a.kind, a.model.as_deref(), a.effort.as_deref(), a.resume_id.as_deref()))
 }
 
+/// Session `sid`'s run couldn't reopen its agent's conversation (the CLI no longer has it), so
+/// the agent forgets it and its next start is a new conversation instead of failing the same
+/// way. `failed`: the id that run was given (None: unknown, forget whatever is saved). Ok(false):
+/// `sid` is no agent's session, or the agent has since saved another conversation.
+pub fn forget_conversation(hub: &Hub, sid: SessionId, failed: Option<&str>) -> anyhow::Result<bool> {
+    let Some(a) = hub.agents().by_session(sid) else { return Ok(false) };
+    if a.resume_id.is_none() || failed.is_some_and(|f| a.resume_id.as_deref() != Some(f)) {
+        return Ok(false);
+    }
+    hub.agents().update(hub.store(), a.id, |b| b.resume_id = None)?;
+    tracing::info!(agent = a.name, "its conversation couldn't be reopened; the next start begins a new one");
+    if let Some(a) = hub.agents().by_id(a.id) {
+        publish(hub, &a);
+    }
+    Ok(true)
+}
+
+/// Agent `id` if it is asleep: woken under the start lock (`for_send`), so a sleep can't slip
+/// between this check and the send. None: awake (running or not), or removed.
+pub async fn wake_if_asleep(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Option<AgentSession>> {
+    let _one = hub.agents().start_lock.lock().await;
+    let Some(a) = hub.agents().by_id(id).filter(|a| a.asleep_at.is_some()) else { return Ok(None) };
+    let s = start_locked(hub, &a.name, false, None, None).await?;
+    publish(hub, &s.agent);
+    Ok(Some(s))
+}
+
+/// `session.restart` of session `id`: a named agent's tab restarts under the start lock, like
+/// any start of it, so a sleep that checked the old run can't stop the new one (src/sleep.rs).
+pub async fn restart_session(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<SessionInfo> {
+    if hub.agents().by_session(id).is_none() {
+        return hub.restart_session(id).await;
+    }
+    let _one = hub.agents().start_lock.lock().await;
+    let asleep = hub.agents().by_session(id).filter(|a| a.asleep_at.is_some()).map(|a| a.id);
+    let r = hub.restart_session(id).await;
+    if let (Err(e), Some(agent)) = (&r, asleep) {
+        crate::sleep::wake_failed(hub, agent, e);
+    }
+    r
+}
+
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
 pub async fn autostart(hub: &Arc<Hub>) {
-    for a in hub.agents().list().into_iter().filter(|a| a.autostart) {
-        match start(hub, &a.name, false, None).await {
-            Ok(s) => tracing::info!(agent = a.name, "autostarted (session {})", s.session.id),
+    for a in hub.agents().list().into_iter().filter(|a| a.autostart && a.asleep_at.is_none()) {
+        // Checked again under the start lock: a sleep since the list was read (the idle sweep
+        // runs from daemon start too) keeps it asleep; its next message wakes it (src/sleep.rs).
+        let r = {
+            let _one = hub.agents().start_lock.lock().await;
+            match hub.agents().by_id(a.id).filter(|b| b.autostart && b.asleep_at.is_none()) {
+                Some(b) => start_locked(hub, &b.name, false, None, None).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        match r {
+            Ok(None) => tracing::info!(agent = a.name, "not autostarted: it is asleep (or autostart was turned off)"),
+            Ok(Some(s)) => {
+                publish(hub, &s.agent);
+                tracing::info!(agent = a.name, "autostarted (session {})", s.session.id)
+            }
             Err(e) => {
                 tracing::warn!(agent = a.name, "autostart failed: {e:#}");
                 hub.notice("warn", format!("Agent {} didn't start: {e:#}", a.name));
@@ -1546,6 +1804,8 @@ pub struct Delivery {
     pub delivered: bool,
     pub queued: u32,
     pub started: bool,
+    /// The agent was asleep and this message woke it (src/sleep.rs).
+    pub woke: bool,
 }
 
 /// The record of a message to `agent` (not yet stored).
@@ -1641,7 +1901,12 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
             return Err(Refused(why).into());
         }
     }
+    // A sleep waits for this delivery to reach the queue (src/sleep.rs).
+    let _delivering = hub.agents().get(&out.agent).map(|a| crate::sleep::delivering(hub, a.id));
     let bs = start(hub, &out.agent, false, None).await?;
+    if let Some(at) = bs.woke {
+        crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, &format!("a message from {} arrived", out.from), false);
+    }
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);
     msg.to_session = Some(sid);
@@ -1683,6 +1948,7 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
                 delivered: o.delivered,
                 queued: o.queued,
                 started: bs.started,
+                woke: bs.woke.is_some(),
             })
         }
         Err(e) => {
@@ -1841,8 +2107,14 @@ pub fn ask_result(
         "hop": route.hop,
         "sent_at_ms": d.sent_at_ms,
         "started": d.started,
+        "woke": d.woke,
         "waited_ms": waited_ms,
     });
+    if d.woke {
+        out["woke_note"] = json!(format!(
+            "{agent} was asleep: this message woke it, so it re-read its conversation before answering"
+        ));
+    }
     match verdict {
         AskVerdict::Unattributed => {
             out["unattributed_output"] = json!(unattributed_tail);
@@ -1887,6 +2159,9 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "detail": session.and_then(|s| s.state_detail.clone()),
         "resumable": b.resume_id.is_some(),
         "created_at": b.created_at,
+        "sleep_after_min": b.sleep_after_min,
+        "asleep": b.asleep_at.is_some(),
+        "asleep_at": b.asleep_at,
     })
 }
 
@@ -2559,7 +2834,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         }
     }
 
@@ -2795,7 +3070,9 @@ mod tests {
             a(&["--model=opus", "--verbose", "--debug", "--resume", "x"])
         );
         assert!(with_resume(c, &[], Some("--evil")).is_err());
-        assert!(with_resume(SessionKind::Codex, &[], Some("x")).is_err());
+        assert!(with_resume(SessionKind::Shell, &[], Some("x")).is_err());
+        // A Codex tab's thread is kept outside its arguments (`Hub::codex_resume`).
+        assert!(with_resume(SessionKind::Codex, &[], Some("t-1")).is_err());
     }
 
     #[test]
@@ -2811,14 +3088,21 @@ mod tests {
             resume_id_from_hook(SessionKind::Codex, "notify", &json!({"thread-id": "t-1"})).as_deref(),
             Some("t-1")
         );
-        // And it goes back as --resume for Claude only.
+        // Codex: only a finished turn's thread (one Codex can resume), never its title request's
+        // nor SessionStart's (a thread without a turn yet).
+        let title = json!({"thread-id": "t-2", "input-messages": ["Generate a concise, single-line task title of at most 36 characters"]});
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "notify", &title), None);
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "SessionStart", &p), None);
+        assert_eq!(resume_id_from_hook(SessionKind::Codex, "notify", &json!({"thread-id": "-x"})), None);
+        // And it goes back as --resume for Claude; a Codex agent's thread is passed at start
+        // (`Hub::codex_resume`), so its arguments stay valid for older backends.
         assert_eq!(
             agent_args(SessionKind::Claude, Some("opus"), None, Some("abc-1")).unwrap(),
             vec!["--model", "opus", "--resume", "abc-1"]
         );
         assert_eq!(
-            agent_args(SessionKind::Codex, None, Some("xhigh"), Some("abc-1")).unwrap(),
-            vec!["-c", "model_reasoning_effort=xhigh"]
+            agent_args(SessionKind::Codex, Some("gpt-6-sol"), Some("xhigh"), Some("abc-1")).unwrap(),
+            vec!["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]
         );
         assert!(agent_args(SessionKind::Shell, None, None, None).is_err());
         // Through the registry, into the store.

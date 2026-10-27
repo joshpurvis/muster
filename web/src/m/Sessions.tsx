@@ -1,8 +1,9 @@
 import { useEffect, useState } from "preact/hooks";
 import { needsHuman, type SessionInfo, STATE_LABEL } from "../types.ts";
-import { relativeTime, sessionOrder } from "./logic.ts";
+import { relativeTime, sessionAsleep, sessionOrder } from "./logic.ts";
 import { channels, openSession, ready, sessions } from "./store.ts";
-import { Approval, ConnectionDot, Settings, StateDot } from "./ui.tsx";
+import { NewTabButton, NewTabLayer } from "./NewTab.tsx";
+import { AlertBanner, Approval, ConnectionDot, Settings, StateDot } from "./ui.tsx";
 
 function SessionRow({ session: s, now }: { session: SessionInfo; now: number }) {
   return (
@@ -30,8 +31,9 @@ export function Sessions() {
     return () => clearInterval(timer);
   }, []);
   const ordered = [...sessions.value.values()].sort(sessionOrder);
-  const live = ordered.filter((s) => s.state !== "exited");
-  const exited = ordered.filter((s) => s.state === "exited");
+  // An asleep agent is no exited session: a message wakes it (src/sleep.rs).
+  const live = ordered.filter((s) => s.state !== "exited" || sessionAsleep(s));
+  const exited = ordered.filter((s) => s.state === "exited" && !sessionAsleep(s));
   const attention = live.filter((s) => needsHuman(s.state)).length;
   return (
     <main class="sessions-screen">
@@ -39,9 +41,11 @@ export function Sessions() {
         <img src="icon.svg" width="28" height="28" alt="" />
         <h1>Muster</h1>
         <ConnectionDot />
+        <NewTabButton />
         <Settings />
       </header>
       <div class="session-list">
+        <AlertBanner />
         <div class="list-heading">
           <h2>
             Sessions <span>{live.length}</span>
@@ -62,6 +66,7 @@ export function Sessions() {
           </details>
         )}
       </div>
+      <NewTabLayer />
     </main>
   );
 }

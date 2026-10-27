@@ -32,6 +32,8 @@
   --st-starting: #8a8a96;
   --st-working: #4ea1ff;
   --st-attn: #f0a020;
+  /* Warning-coloured text (>= 4.5:1 on every surface). */
+  --warn-text: #f0a020;
   --st-idle: #3fb950;
   --st-error: #f85149;
   /* Filled destructive buttons: white 13px labels need 4.5:1 (#f85149 gives 3.35:1). */
@@ -101,6 +103,8 @@
   --st-starting: #8a8a96;
   --st-working: #1f7ae0;
   --st-attn: #c77a00;
+  /* Warning-coloured text (>= 4.5:1 on every surface; --st-attn is 3.4:1 on white). */
+  --warn-text: #8a5400;
   --st-idle: #1f9d3a;
   --st-error: #d92d20;
   --danger-fill: #d92d20;
@@ -1073,15 +1077,9 @@ button.sl-item:hover {
   min-width: 0;
 }
 
-/* Crowded strips: drop the kind icon and idle close buttons so names stay readable. */
-.tabstrip.overflowing .tab > .icon {
-  display: none;
-}
-
-.tabstrip.overflowing .tab:not(.active):not(:hover) .tab-close {
-  display: none;
-}
-
+/* Overflow controls may take space, but must not shrink the tabs being measured.
+   Hiding their icons/buttons here made overflow alternate on every layout effect,
+   starving the event loop when a moved tab or resized window crossed that boundary. */
 .tab-more {
   display: flex;
   align-items: center;
@@ -1489,6 +1487,93 @@ button.sl-item:hover {
 
 .exited-bar .sep {
   color: var(--text-faint);
+}
+
+/* A named agent asleep (see AsleepBar): resting, not ended. In the exited bar's family; tinted
+   like the cold-cache bar when waking would re-read the conversation at full cost. */
+.asleep-bar {
+  flex: none;
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+}
+
+.asleep-bar.cold {
+  background: color-mix(in srgb, var(--cold) 9%, var(--bg-1));
+  border-top-color: color-mix(in srgb, var(--cold) 30%, var(--border));
+}
+
+.asleep-bar .asleep-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.asleep-bar .link-btn {
+  flex: none;
+}
+
+.asleep-dot,
+.dot.dot-asleep {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--st-exited) 35%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--st-exited);
+}
+
+.asleep-bar.cold .asleep-dot {
+  box-shadow: inset 0 0 0 1.5px var(--cold);
+  background: color-mix(in srgb, var(--cold) 30%, transparent);
+}
+
+.tab-asleep {
+  flex: none;
+  align-self: center;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+/* The agent dialog's "Sleep when idle" and its minutes. */
+.sleep-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sleep-after {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 40px;
+}
+
+.sleep-after-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.sleep-after-input .sleep-min {
+  width: 72px;
+  height: 28px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .link-btn {
@@ -3510,6 +3595,143 @@ textarea {
   color: var(--text-muted);
 }
 
+/* Claude usage (src/usage.rs): only a current figure reads as a plain number. */
+.profile-field,
+.usage-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.profile-row .profile-account-row.field-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.usage-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-table tbody tr:last-child > * {
+  border-bottom: 0;
+}
+
+.usage-table thead th {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-2);
+  white-space: nowrap;
+}
+
+.usage-table tbody th {
+  font-weight: 500;
+  /* A long profile name wraps instead of squeezing the figures. */
+  max-width: 11rem;
+}
+
+.usage-table tr.on {
+  background: var(--accent-softer);
+}
+
+.usage-table tr.on .usage-name {
+  color: var(--accent-strong);
+}
+
+.usage-main {
+  display: block;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-detail,
+.usage-note {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.usage-uncertain .usage-main {
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.usage-high .usage-main {
+  color: var(--warn-text);
+}
+
+.usage-name {
+  overflow-wrap: anywhere;
+}
+
+.usage-seen {
+  color: var(--text-muted);
+}
+
+.usage-off .usage-name {
+  color: var(--text-muted);
+}
+
+/* Stays mounted (a live region); only its content changes. Empty when there is nothing to say. */
+.usage-suggestion:empty {
+  display: none;
+}
+
+/* The text takes the room; the button wraps below it on narrow dialogs or with long names. */
+.usage-suggestion {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 10px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--accent-softer);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.usage-suggestion.usage-none {
+  padding: 0;
+  background: none;
+  color: var(--text-muted);
+}
+
+.usage-suggestion > span {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.usage-suggestion .btn {
+  flex: 0 1 auto;
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
 .field-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -5060,4 +5282,224 @@ fieldset.sch-then > legend {
   width: 72px;
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+/* ---------- Phase 3: agents' proposals, the files trigger ---------- */
+
+.field .sch-trig-folder {
+  flex: 1 1 180px;
+  min-width: 150px;
+  width: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.field .sch-trig-pattern {
+  width: 110px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.toggle.sch-trig-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sch-trig-sub-limit {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.sch-trig-none {
+  margin-top: -4px;
+}
+
+.sch-watch-folders {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* A chip on a row an agent made: "reminder", "from reviewer". */
+.sch-made {
+  flex: none;
+  font-size: 10px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: var(--accent-strong);
+  background: var(--accent-softer);
+  cursor: help;
+}
+
+/* An agent's proposal, waiting for approval: a card under its agent, never a plain row. */
+.sch-prop {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 3px 2px 6px 4px;
+  padding: 8px 9px 9px;
+  border-radius: var(--r);
+  border: 1px solid var(--attn-border);
+  background: var(--attn-bg);
+  outline: none;
+}
+
+.sch-prop:focus-visible {
+  box-shadow: 0 0 0 1.5px var(--pane-focus-ring);
+}
+
+.sch-prop-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--st-attn);
+}
+
+.sch-prop-icon {
+  flex: none;
+  margin-top: 1px;
+}
+
+.sch-prop-by b {
+  font-weight: 650;
+}
+
+.sch-prop-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+
+/* A label and its value as one run of text, so a narrow panel wraps it under the label. */
+.sch-prop-fact {
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.sch-prop-fact dt {
+  display: inline;
+  margin-right: 3px;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.sch-prop-fact dd {
+  display: inline;
+  margin: 0;
+  color: var(--text);
+}
+
+/* The prompt and the use estimate take the card's whole width, under their label. */
+.sch-prop-fact-block dt {
+  display: block;
+  margin: 0 0 2px;
+}
+
+.sch-prop-fact-block dd {
+  display: block;
+}
+
+.sch-prop-prompt {
+  margin: 0;
+  max-height: 9em;
+  overflow: auto;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The "Then…" steps: each with what starts it and its agent, its prompt under it; a nested
+   step is indented under the step it follows. */
+.sch-prop-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sch-prop-step-when {
+  color: var(--text-muted);
+}
+
+.sch-prop-step-prompt {
+  margin-top: 2px;
+}
+
+/* "Show all": the whole prompt, so it can be read in full before approving. */
+.sch-prop-prompt.whole {
+  max-height: none;
+}
+
+.sch-prop-more {
+  display: inline-block;
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.sch-prop-reason {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.sch-prop-use {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sch-prop-use-line {
+  display: block;
+  color: var(--text);
+}
+
+.sch-prop-use-line + .sch-prop-use-line {
+  margin-top: 2px;
+}
+
+.sch-prop-use-line.sub {
+  color: var(--st-attn);
+}
+
+.sch-prop-use-line.cap {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.sch-prop-use-line .icon {
+  display: inline-block;
+  margin-right: 3px;
+  vertical-align: -1px;
+}
+
+.sch-prop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.sch-prop-note {
+  color: var(--st-attn);
 }

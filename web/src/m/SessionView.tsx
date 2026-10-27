@@ -1,9 +1,19 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { SessionInfo } from "../types.ts";
 import { Composer } from "./Composer.tsx";
-import { bindTerminal, channels, closeSession, markOpened, notify, prefs, setPrefs } from "./store.ts";
+import {
+  bindTerminal,
+  closeSession,
+  markOpened,
+  notify,
+  prefs,
+  scrollProgram,
+  setPrefs,
+} from "./store.ts";
+import { SessionTitle } from "./SessionActions.tsx";
 import { PhoneTerminal } from "./term.ts";
 import { Icon, Settings, StateDot } from "./ui.tsx";
+import { clearAlert } from "./alerts.ts";
 
 export function SessionView({ session: s }: { session: SessionInfo }) {
   const stage = useRef<HTMLDivElement>(null);
@@ -40,10 +50,12 @@ export function SessionView({ session: s }: { session: SessionInfo }) {
         parseFloat(getComputedStyle(el.querySelector(".composer-wrap")!).paddingBottom),
       setBottom,
       (size) => setPrefs({ fontSize: size }),
+      (data) => scrollProgram(s.id, data),
     );
     terminal.current = term;
     bindTerminal(term);
     markOpened(s);
+    clearAlert(s.id);
     return () => {
       ro.disconnect();
       bindTerminal(null);
@@ -81,10 +93,7 @@ export function SessionView({ session: s }: { session: SessionInfo }) {
           <Icon name="back" />
         </button>
         <StateDot state={s.state} />
-        <div class="session-title">
-          <h1>{s.name}</h1>
-          <span>{channels.value.get(s.channel_id)?.name ?? "Session"}</span>
-        </div>
+        <SessionTitle session={s} />
         <button
           type="button"
           class={`select-toggle ${snapshot ? "active" : ""}`}

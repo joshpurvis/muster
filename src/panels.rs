@@ -624,6 +624,11 @@ pub(crate) fn wakes(panel: &Panel, event: &PanelEvent) -> bool {
     }
 }
 
+/// Event `event` of `panel` wakes an asleep opener: a real action only, never the panel closing.
+fn wakes_asleep(panel: &Panel, event: &PanelEvent) -> bool {
+    event.kind != "closed" && wakes(panel, event)
+}
+
 /// How long a closed panel whose queue holds only notices (see [`wakes`]) is kept for a wait or
 /// a later panel prompt; the startup sweep forgets it after that.
 const NOTICE_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -635,6 +640,25 @@ const NOTICE_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub fn deliver_pending(hub: &Arc<Hub>) -> anyhow::Result<()> {
     let _op = hub.panels.operations.lock();
     for (session, panels) in due(hub)? { crate::inject::enqueue_panels(hub, session, &panels)?; }
+    wake_asleep_openers(hub)
+}
+
+/// An asleep agent (src/sleep.rs) wakes for a real action in one of its panels, never for a
+/// notice ([`wakes`]) and never for a panel closing, even one whose opener asked to hear of it
+/// (`notify_on_close`): that notice waits for its next wake. Its events wait queued and come
+/// with the panel prompt once it is ready, as for any idle opener.
+fn wake_asleep_openers(hub: &Arc<Hub>) -> anyhow::Result<()> {
+    if !hub.agents().sleep.any_asleep() { return Ok(()) }
+    for p in list(hub)? {
+        if !hub.agents().sleep.is_asleep(p.session_id) { continue }
+        let Some(s) = hub.session(p.session_id) else { continue };
+        if s.channel_id != p.channel_id || hub.channel(p.channel_id).is_none_or(|c| c.archived) { continue }
+        if hub.store().panel_events(&p)?.iter().any(|e| wakes_asleep(&p, e))
+            && let Some(a) = hub.agents().by_session(s.id)
+        {
+            crate::sleep::wake_soon(hub, a.id, None, crate::sleep::Cause::Panel);
+        }
+    }
     Ok(())
 }
 
@@ -1202,6 +1226,13 @@ mod tests {
         assert!(get(&hub, id).unwrap().notify_on_close);
         close(&hub, None, id, true).unwrap();
         assert_eq!(kinds(&due(&hub).unwrap(), 1), [(id, "closed".to_string())]);
+        // An awake opener hears of it at once; an asleep one is never woken for it (only a real
+        // action in a panel wakes an agent, src/sleep.rs).
+        let p = get(&hub, id).unwrap();
+        let closed = hub.store().panel_events(&p).unwrap().remove(0);
+        assert!(wakes(&p, &closed) && !wakes_asleep(&p, &closed));
+        let click = PanelEvent { id: 99, panel_id: id, kind: "approve".into(), payload: json!({}), at: 0, context: None };
+        assert!(wakes_asleep(&p, &click));
         // The agent closing its own panel queues nothing, as before.
         let own = markdown(&hub);
         close(&hub, Some(1), own, false).unwrap();

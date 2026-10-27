@@ -44,23 +44,26 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster kill <target>` / `muster restart <target>` | Kill or restart the session. `muster kill` also stops a named agent whose tab was closed (hidden). |
 | `muster events [--json] [--session TARGET] [--tab NAME]` | Stream daemon events (`GET /api/events`) until Ctrl-C, so scripts don't poll. Default: one line per session state change, `HH:MM:SS  ID  TAB/NAME  FROM -> TO  DETAIL` (local time of the change; `FROM` is `new` for a new session, `TO` is `removed` for a removed one). Each message to a named agent adds a line `HH:MM:SS  msg ID  FROM -> TO  origin=O hop=N  FIRST LINE` (with `refused: WHY` or `replied`). `--json`: every `session_upserted`, `session_removed`, `channel_upserted`, `channel_removed`, `window_upserted`, `window_removed`, `agent_upserted`, `agent_removed` and `agent_message` event, one JSON object per line exactly as the daemon sent it, flushed per line (plus `lagged`, below). `--session` keeps one session's events (and its tab's, its tab's window's and its own window's); `--tab` (exact tab name, else unique prefix) keeps that tab's, including a session moving out of it. Both are resolved once, at the start. Never starts the daemon: exit 1 when none runs. When the daemon stops, it prints `muster: the daemon stopped` to stderr and exits 0. After `lagged` (the reader fell behind) it re-reads the state and says so on stderr. |
 | `muster pair [--name N] [--scope view\|interact\|manage] [--ttl SECS] [--url URL]` | Pair a phone (docs/ANDROID.md). Prints the `tailscale serve` commands when tailscale doesn't already proxy to this daemon's port, a QR code of `https://<host>/m/#pair=<code>` (needs `qrencode`), and the short code, then waits: `paired: <name> (device N)` and exit 0, or exit 1 when the code is burnt (three wrong codes), replaced or expired. Default scope `interact` (approve, prompt, keys); `manage` also opens and closes tabs. `--url` overrides the tailscale name. |
-| `muster devices [--json]` | Paired devices: `ID  NAME  ACCESS  LAST`. Never starts the daemon. |
-| `muster devices revoke <id\|name>` / `--all` | Revoke: the device's connections close at once and it must pair again. |
-| `muster agent new <name> [--profile PROFILE] [--kind claude\|codex] [--provider subscription\|openrouter] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Create an agent (PLAN.md §10, `agent.create`): its home dir `<data>/agents/<name>/` with `CLAUDE.md` / `AGENTS.md` from the persona and `memory/`. Default kind claude. `--accepts` is a comma list of `human`, `schedule`, `webhook` (default: `human` for claude, all three for codex). `--autostart`: start it whenever the daemon starts. `--claude-mode plan\|default\|accept_edits\|bypass` / `--codex-sandbox read_only\|workspace_write\|workspace_write_network\|full_access`: its tab's profile (the other half keeps its default). `--provider openrouter`: run it on OpenRouter, billed per token to the backend's `OPENROUTER_API_KEY` (refused without that key; a Codex agent there needs `--model` with its vendor, e.g. `openai/gpt-6.1-sol`; see docs/PROTOCOL.md "OpenRouter"). Prints `agent NAME (KIND, accepts …): home DIR` (`KIND on OpenRouter, pay per use` for one there). |
-| `muster agent edit <name> [--provider subscription\|openrouter] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart on\|off] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Change an agent (`agent.update`): only the given fields change; an empty `--model ""` / `--effort ""` clears it. A new persona rewrites its persona file (memory/ untouched). One permission flag keeps the other half as it is. Provider, model, effort and permissions apply from its next start (switching to OpenRouter needs the key). Prints `updated NAME (…)`. |
+| `muster devices [--json]` | Paired devices: `ID  NAME  ACCESS  ALERTS  LAST`. ALERTS is `off`, `on`, `on (sent 2m ago)` or `failing` (phone alerts, docs/PROTOCOL.md "Phone alerts"). Never starts the daemon. |
+| `muster devices revoke <id\|name>` / `--all` | Revoke: the device's connections close at once, its phone alerts stop (its push subscription is deleted) and it must pair again. |
+| `muster agent new <name> [--profile PROFILE] [--kind claude\|codex] [--provider subscription\|openrouter] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart] [--sleep-after TIME] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Create an agent (PLAN.md §10, `agent.create`): its home dir `<data>/agents/<name>/` with `CLAUDE.md` / `AGENTS.md` from the persona and `memory/`. Default kind claude. `--accepts` is a comma list of `human`, `schedule`, `webhook` (default: `human` for claude, all three for codex). `--autostart`: start it whenever the daemon starts. `--sleep-after 90m` (minutes, `Nm`, `Nh`; 5 minutes to 7 days): stop its process once it has been idle that long; the next message wakes it into the same conversation (docs/PROTOCOL.md "Sleep and wake"). `--claude-mode plan\|default\|accept_edits\|bypass` / `--codex-sandbox read_only\|workspace_write\|workspace_write_network\|full_access`: its tab's profile (the other half keeps its default). `--provider openrouter`: run it on OpenRouter, billed per token to the backend's `OPENROUTER_API_KEY` (refused without that key; a Codex agent there needs `--model` with its vendor, e.g. `openai/gpt-6.1-sol`; see docs/PROTOCOL.md "OpenRouter"). Prints `agent NAME (KIND, accepts …): home DIR` (`KIND on OpenRouter, pay per use` for one there). |
+| `muster agent edit <name> [--provider subscription\|openrouter] [--model M] [--effort E] [--persona TEXT \| --persona-file F] [--accepts ORIGINS] [--autostart on\|off] [--sleep-after TIME\|off] [--claude-mode MODE] [--codex-sandbox SANDBOX]` | Change an agent (`agent.update`): only the given fields change; an empty `--model ""` / `--effort ""` clears it. A new persona rewrites its persona file (memory/ untouched). One permission flag keeps the other half as it is. Provider, model, effort and permissions apply from its next start (switching to OpenRouter needs the key). Adding `schedule` or `webhook` to `--accepts`, or a new `--provider` for a Claude agent that takes scheduled or triggered work or is named in a schedule, is refused here: do it in Edit agent in Muster's window. Prints `updated NAME (…)`. |
 | `muster agent ls [--json]` (alias `list`) | `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE` (KIND reads `claude·openrouter` for an agent on OpenRouter). `--json` prints `agent.list`. |
+| `muster agent sleep <name>` | Put an idle agent to sleep now (`agent.sleep`): its process stops, its tab and conversation stay, and the next message, schedule run, `muster send` or typing into its tab wakes it. Refused, with the reason, while it works, waits for you, has sub-agents or background commands still running, has prompts waiting or unsent text in its input box, or before its conversation is saved. `muster agent ls` shows it as `asleep`. |
 | `muster agent rm <name>` | Remove the agent and its session; the home dir (persona, memory) stays. |
-| `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one. Claude agents resume their last conversation; `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
+| `muster agent start <name> [--fresh]` | Start the agent's session (cwd = its home dir, in the agent's own tab in the "agents" workspace), restart it if it exited, or report the running one; an asleep agent wakes (`… (woke it: it re-reads its conversation)`). Claude and Codex agents resume their last conversation (Codex: `codex resume`, once it has a finished turn); `--fresh` starts a new one (restarting a running agent). Prints the session id (`… (already running)`). An agent whose tab was closed keeps running hidden; this doesn't show it (the agents panel does). |
 | `muster ask <agent> [TEXT...] [--timeout SECS] [--json]` | Ask an agent and print its reply (`agent.ask`): starts it if needed, delivers with an envelope, waits for this message's turn to end (default 600 s, max 1800). TEXT as for `send` (none or `-`: stdin). Inside a muster session (`$MUSTER_SESSION_ID`) the ask is that session's: an agent's runs MCP `ask_agent` (its origin and hop, permission check, rate limit); outside one it is the human's (`human`, hop 0). There is no flag to set the origin. Exit 0 with a reply, 124 on timeout (the message stays delivered; if the agent answers later with `reply`, it shows in the agents panel's message log, with a desktop notification), 1 when refused or the agent stopped without a reply (a prompt for the human, an error). If the agent reported no final message for this message, the end of its terminal is printed after a note on stderr that it may belong to another prompt (exit 0). `--json` prints the `agent.ask` reply. |
 | `muster reply <msg_id> [TEXT...] [--json]` | Inside an agent's session only: answer message `msg_id` (from its `[muster msg <id> …]` line) after the turn that received it (`agent.reply`, which runs the session's MCP `reply`: once per message, only for messages delivered to this agent; docs/MCP.md "Late replies"). TEXT as for `send`. Prints how it reached the asker (returned to the waiting ask, delivered as message N, shown in the agents panel). Exit 1 when it was refused before being stored, or stored but not delivered (a guard refused it, the asker is gone). Outside an agent's session it is refused: the human never replies to agent messages. |
 | `muster note ls/new/read/write/append/rename/open/close/rm/triggers` | Plain-text notes shared with agents. See "Notes" below. |
-| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:`). See "Schedules" below. |
+| `muster schedule add/ls/rm/pause/resume/run/skip/renew/history/approve` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:/files:`); `approve` an agent's proposal. Inside an agent's session, `propose` and `remind`. See "Schedules" below. |
 | `muster trigger <name> [DATA...]` / `--url <name>` | Fire a URL trigger now, or print its URL and secret. See "Triggers and Then" under "Schedules" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
 | `muster queue TARGET [--clear\|--resume]` | Inspect waiting prompts and interrupted delivery records as JSON. After inspecting the terminal, `--resume` forgets only the interrupted record and lets the waiting prompts continue (the interrupted prompt is not resent); `--clear` discards all the queue records. Neither undoes commands or erases terminal input. |
 | `muster ui-install PATH` | Stage and activate a complete built UI directory, without restarting either service. Refresh the window to load it (open windows offer a "Reload" banner within a few seconds). Previous release directories are retained for rollback and existing pages. Refuses incompatible manifests and symlinked content. `MUSTER_WEB_DIR` on the backend overrides installed releases. |
 | `muster reload` | Replace the application backend while its terminal host and terminal processes keep running. Clients reconnect to the same endpoint. A window's "Restart backend" banner runs this from the path the backend was started from (`daemon.reload`). The new backend gets the environment of the process that runs `reload`: typed in a shell, that shell's; from the banner, the running backend's (its OpenRouter key included). One exception: run without `OPENROUTER_API_KEY` in its environment while the backend has a key (an agent applying a build from its session), it asks the backend to restart itself (`daemon.reload_handoff`), so the new backend keeps the old one's environment and key, and says so; that needs this binary to be the one the backend was started from, else it reloads the usual way and notes the key is dropped. Run where the backend's process isn't visible (a sandboxed command in its own PID namespace, e.g. Claude Code's Bash in an OpenRouter session), it always has the backend restart itself; `muster ls` and the other commands find the backend there by its discovery file and token. `env OPENROUTER_API_KEY=… muster reload` sets or changes the key and `env OPENROUTER_API_KEY= muster reload` clears it, without ending any session. |
-| `muster stop` | Explicitly stop both backend and terminal host, terminating sessions. A window's "Shut down Muster…" does the same (`daemon.shutdown`). |
+| `muster stop` | Explicitly stop both backend and terminal host, terminating sessions. A window's "Shut down Muster…" does the same (`daemon.shutdown`). A terminal host of another protocol version (started by an older build) is stopped too, by signal, once its identity is confirmed. Refused, with nothing stopped, while a restart or reload holds the lifecycle lock (`<runtime>/lifecycle.lock`); `muster reload` is refused the same way. |
+| `muster restart-all` | `muster stop`, then start the daemon again, without opening a window: every session ends, open windows reconnect. Before anything stops it holds the lifecycle lock, checks that it can stop both (taking a handle on the backend's process, a pidfd, so a pid reused meanwhile is never signalled), and snapshots and checks the release it will start (this build and the terminal host beside it, as a daemon start does): the snapshot's backend must answer `--version` as this build, its host must start on scratch directories and answer this build's protocol (a truncated host, or one of another protocol version, is refused), and the data directory needs 64 MB free. It then starts the daemon from that snapshot, so a rebuild meanwhile changes nothing, and checks that the backend that answers is the one it started, running that snapshot on a new host started from it. It refuses before stopping anything when a check fails, and once something has stopped it goes on only when that step has finished (the backend exited, waiting up to 120 s; the host gone). A failure after that point is written to `<runtime>/restart-failed`; the next start (`muster`) prints it once, and `muster status` shows it. A window's "Restart Muster…" runs it (`daemon.restart`). Hidden from `--help`. |
+| (any start) | `muster`, `muster daemon` and every command that starts the daemon wait while a restart, reload or stop holds the lifecycle lock (up to 4 minutes, saying so once), then use the backend it left, instead of starting one in the middle of it. |
 | `muster status` / `url` / `daemon` / `hook` | As before. With the native window on Linux, `status` also prints a `next native window:` line: the WebKitGTK renderer a window opened from this shell would use and why, and the fallback marker's path when there is one (README.md, "Native window renderer"). |
 
 New sessions receive `$MUSTER_BIN` pointing to `<data>/bin/muster`; agent hooks use the
@@ -137,20 +140,30 @@ muster note read release --json | jq .rev     # then: muster note write release 
 
 Recurring or one-off messages to a named agent (docs/PROTOCOL.md "Schedules", docs/UI.md "Agents
 panel"). Each run is an ordinary message with origin `schedule` at hop 0, so the agent must accept
-scheduled work (`muster agent edit <name> --accepts human,schedule`; a Codex agent does by
-default) and its caps apply. Only you make or change schedules: these commands are refused from an
+scheduled work (tick Schedule in Edit agent, in Muster's window; a Codex agent does by default)
+and its caps apply. Only you make or change schedules: these commands are refused from an
 agent's session, or from a shell tab an agent spawned or typed into (any other shell tab counts as
 you). Times print in this machine's zone.
 
+**From the command line, new or wider schedules wait for your click.** An agent can run
+`muster` as you, so what the command line makes can't run unattended on its word alone: a
+schedule you `add`, `resume`, un-skip (`skip --undo`) or `renew` here is made but **held**. It
+prints `Waiting for your approval: … click Approve on its card in Muster's Agents panel`, shows as
+`held` in `muster schedule ls`, and runs only once you click **Approve** on its card (or goes with
+`muster schedule rm <id>`; one nobody approves goes after 7 days). Pausing and removing apply at
+once. Settings that loosen a limit (`resume --all`, a higher cap, another watched folder), allowing
+triggers on a note and letting an agent take scheduled work are only in Muster's window: here they
+are refused with where to do it (docs/SCHEDULING_PLAN.md "Approval and its limits").
+
 | Command | What it does |
 |---|---|
-| `muster schedule add <agent> TIMING [options] [PROMPT...]` | Create one (`schedule.create`). TIMING is one of `--every 15m\|30m\|1h\|2h\|3h\|4h\|6h\|8h\|12h`, `--hourly` (or `--hourly=:MM`), `--daily HH:MM`, `--weekdays HH:MM`, `--weekly DAYS@HH:MM` (`mon@09:00`, `mon,thu@17:30`), `--cron "M H DOM MON DOW"` (at most every 15 minutes) or `--at WHEN` (once: `HH:MM` for the next one, `"YYYY-MM-DD HH:MM"`, or `+20m` / `+2h`). PROMPT as for `send` (none or `-`: stdin); it may use `{date}`, `{last_run}` and `{last_reply}`. Options: `--name`, `--tz ZONE` (default: this machine's), `--if-missed auto\|run\|skip`, `--fresh` (a new conversation each run), `--notify failure\|always\|never`, `--note <id\|title>` (append each reply there; a new title makes the note), `--quiet-hours on\|off` (default on for a Claude subscription agent), `--max-per-day N`, `--paused`. Prints `schedule ID: <reading> (<zone>); next <time>`, plus the 7-day expiry for a Claude subscription agent. |
+| `muster schedule add <agent> TIMING [options] [PROMPT...]` | Create one (`schedule.create`). TIMING is one of `--every 15m\|30m\|1h\|2h\|3h\|4h\|6h\|8h\|12h`, `--hourly` (or `--hourly=:MM`), `--daily HH:MM`, `--weekdays HH:MM`, `--weekly DAYS@HH:MM` (`mon@09:00`, `mon,thu@17:30`), `--cron "M H DOM MON DOW"` (at most every 15 minutes) or `--at WHEN` (once: `HH:MM` for the next one, `"YYYY-MM-DD HH:MM"`, or `+20m` / `+2h`). PROMPT as for `send` (none or `-`: stdin); it may use `{date}`, `{last_run}` and `{last_reply}`. Options: `--name`, `--tz ZONE` (default: this machine's), `--if-missed auto\|run\|skip`, `--fresh` (a new conversation each run), `--notify failure\|always\|never`, `--note <id\|title>` (append each reply there; a new title makes the note), `--quiet-hours on\|off` (default on for a Claude subscription agent), `--max-per-day N`, `--paused`. Prints `schedule ID: <reading> (<zone>)` and that it waits for your approval (above); made in Muster's window instead, it prints its next time and, for a Claude subscription agent, the 7-day expiry. |
 | `muster schedule ls [agent] [--json]` (alias `list`) | `ID  AGENT  STATUS  NEXT  LAST  NAME  (WHEN)`; says so first when all schedules are paused. `--json` prints `schedule.list`. |
 | `muster schedule rm <id>` | Remove it and its history. |
-| `muster schedule pause <id>` / `resume <id>` | Pause or resume one. `--all` instead: "Pause all schedules" on or off (each schedule's own pause stays). |
+| `muster schedule pause <id>` / `resume <id>` | Pause one; resume one (held for your click: above). `pause --all`: "Pause all schedules" on (each schedule's own pause stays); `resume --all` is refused here: resume all in the Agents panel. |
 | `muster schedule run <id>` | Run it now (origin `schedule`, outside its timing and quiet hours). Prints `run N: started`, or `skipped` when its previous run is still going. |
-| `muster schedule skip <id> [--undo]` | Skip its next run, or stop skipping it. |
-| `muster schedule renew <id>` | Renew a Claude subscription agent's recurring schedule for 7 days from now. |
+| `muster schedule skip <id> [--undo]` | Skip its next run, or stop skipping it (`--undo` is held for your click). |
+| `muster schedule renew <id>` | Ask to renew a Claude subscription agent's recurring schedule for 7 days: held, and your click on Approve renews it from then. |
 | `muster schedule history <id> [--limit N] [--json]` | Its runs, newest first: `RUN  TIME  KIND  OUTCOME  REASON` (with how long a run took). `--json` prints `schedule.runs`. |
 
 ```sh
@@ -163,8 +176,8 @@ muster schedule history 3
 ### Triggers and Then (Phase 2)
 
 `muster schedule add` takes `--on EVENT` instead of a timing: a **trigger**, whose runs have
-origin `webhook` ("Triggered"), so its agent must accept it (`--accepts human,webhook`; a Codex
-agent does by default). Triggers run at most every 15 minutes and 10 times a day unless
+origin `webhook` ("Triggered"), so its agent must accept it (tick Webhook in Edit agent; a Codex
+agent does by default). Like any schedule made here, it waits for your click on Approve. Triggers run at most every 15 minutes and 10 times a day unless
 `--max-per-day` says otherwise (docs/PROTOCOL.md "Schedules", Phase 2).
 
 | EVENT | Fires when | Options |
@@ -174,6 +187,7 @@ agent does by default). Triggers run at most every 15 minutes and 10 times a day
 | `gh:<owner/repo>:pr-opened` | a pull request is opened (polled with your own `gh` login) | `--poll-min N` (2-60, default 5) |
 | `gh:<owner/repo>:ci-failed[@branch]` | a GitHub Actions run fails (on that branch only, if given) | `--poll-min N` |
 | `url:<name>` | its trigger URL is called with its secret, or `muster trigger <name>` | |
+| `files:<folder>[/<pattern>]` | files appear or change in that folder (`files:~/inbox/*.pdf`; listed every 15 s). **Only inside a folder you allow under Scheduling settings → Watched folders** (none by default); a folder later swapped for a link stops it. Changes made while its agent, or any scheduled or triggered work, is working (or within 30 s after) don't count. | `--subfolders` (up to 3 levels down; a folder moved in counts as new), `--quiet-min N` (1-120, default 2) |
 
 The prompt may use `{event}` (what happened) and, for a URL trigger, `{payload}` (the data sent),
 both quoted as untrusted data; a prompt that uses neither gets them added at its end.
@@ -187,18 +201,44 @@ chain. (Deeper chains: `schedule.create` with nested `then`, at most 4 levels.)
 |---|---|
 | `muster trigger <name> [DATA...]` | Fire URL trigger `<name>` now, with DATA (words joined by spaces; `-` reads stdin) handed to its agent as quoted untrusted data. Prints when it runs (`at most every 15 minutes`). |
 | `muster trigger --url <name> [--rotate]` | Print the trigger's loopback URL, its secret and a ready `curl` line (`--rotate`: a new secret; the old one stops working). |
-| `muster note triggers <note> [on\|off]` | Allow triggers on a note, or not (no argument: say which). |
+| `muster note triggers <note> [on\|off]` | Say whether triggers are allowed on a note, or switch them `off`. `on` is refused here: allow them in Muster's window (the note's status line). |
 
 Like schedule changes, these are refused from an agent's session or a shell an agent drives.
 
 ```sh
-muster note triggers Ideas on
+muster note triggers Ideas          # allowed? (switch them on in the note's status line)
 muster schedule add researcher --on note:Ideas Expand the new items into a short plan each.
 muster schedule add worker --on git:~/projects/muster@master Update the changelog note with: {event}
 muster schedule add reviewer --on gh:octo/repo:pr-opened --poll-min 10 Review the new pull request.
 muster schedule add worker --on url:deploy-done "The deploy finished: {payload}. Check the site."
 muster trigger --url deploy-done        # then, from a script: curl … --data-binary @- <url>
 muster schedule add worker --daily 02:00 --then "reviewer: Last night's failures: {reply}" --on-failure notify Run the test suite.
+muster schedule add worker --on "files:~/inbox/*.pdf" File each new PDF in the right folder: {event}
+```
+
+### Agents' proposals and reminders (Phase 3)
+
+An agent proposes a schedule and you approve it with a click on **Approve** in the Agents panel;
+the one exception is a one-off reminder an agent sets for itself up to 24 hours ahead (docs/MCP.md
+"Schedules"). `muster schedule ls` shows a proposal as `proposed`, and `muster schedule rm <id>`
+dismisses one. There is no command to approve one: the command line is what an agent has, so
+`muster schedule approve` only says to click Approve (docs/SCHEDULING_PLAN.md "Approval and its
+limits"). Schedules you make or widen from the command line wait the same way (above).
+
+| Command | What it does |
+|---|---|
+| `muster schedule propose TIMING --reason "…" [--agent NAME] [options] [PROMPT...]` | **Inside an agent's session only**: propose a schedule as that agent (its MCP `propose_schedule`). TIMING as for `add`; options `--name`, `--tz`, `--fresh`, `--quiet-hours on\|off`, `--max-per-day N`, `--note <id>`. Prints `schedule ID: proposed (…)` and its estimated use. |
+| `muster schedule remind --at WHEN [PROMPT...]` | **Inside an agent's session only**: a one-off reminder for itself, 5 minutes to 24 hours ahead (`+20m`, `15:30`, `"YYYY-MM-DD HH:MM"`), no approval (its MCP `set_reminder`). A relative time is sent as minutes (`in_minutes`), counted by the daemon, so `--at +5m` is exactly 5 minutes ahead. |
+
+Inside an agent's session, `muster schedule pause <id>` and `muster schedule rm <id>` run its
+`pause_schedule` and `delete_schedule`: it may pause a schedule that runs on it or that it made,
+and delete one it made; resuming, editing and approving stay yours.
+
+```sh
+# run by an agent, in its session:
+muster schedule remind --at +20m Check whether CI on master passed and tell the human.
+muster schedule propose --weekly fri@16:00 --reason "You asked for a weekly summary" Summarise the Ideas note
+# then you click Approve on its card in the Agents panel
 ```
 
 ## Agent skills
@@ -395,6 +435,16 @@ one fixed profile for their lifetime, including fresh conversations and replacem
 | `muster profile disable PROFILE` | Prevent new launches and restarts; running sessions remain usable. |
 | `muster profile enable PROFILE` | Allow new launches again. |
 | `muster profile default PATH PROFILE` | Set a workspace default for future Claude tasks; `default` clears it. |
+| `muster profile usage [--json]` | Each account's last reported 5-hour and weekly usage, reset times and when it was last observed, then a suggestion for where a new task has the most known room (or why there is none). Unknown, stale, unconfirmed and reset figures say so. |
+| `muster profile same-account PROFILE [OTHER]` | Declare that PROFILE signs in to the same Claude account as OTHER: one set of limits, shown on both, never added. Without OTHER it is its own account again. |
+| `muster profile login-changed PROFILE` | You signed in to another account in PROFILE (or `default`): forget its usage and its same-account declaration. |
+
+Usage comes from Claude Code's own status line in the Claude sessions Muster starts: Muster
+keeps running your status line unchanged (your `statusLine` setting, found the way Claude Code finds it, never through a link; if unsure, Muster leaves that session's status line alone)
+and forwards only the 5-hour and weekly figures. An account no session used here stays unknown;
+Muster never sends a request to find out. `MUSTER_USAGE_REPORTER=off` in the backend's
+environment turns the reporter off for sessions started afterwards. Details:
+[ACCOUNT_PROFILES.md](ACCOUNT_PROFILES.md#usage-display-and-suggestions-implemented).
 
 Use `/status` inside Claude Code to verify the actual account. A profile label identifies a
 directory, not a checked identity. Known authentication or endpoint environment overrides

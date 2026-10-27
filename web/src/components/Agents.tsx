@@ -4,7 +4,7 @@
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { AgentSchedules, agentsHeaderMenu, moveRow, SchedulesPausedNotice } from "./Schedules.tsx";
+import { AgentSchedules, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   schedulesSupported,
   scheduleSettings,
@@ -43,7 +43,11 @@ import {
   OPENROUTER_BADGE,
   PREFERRED_VENDOR,
   priceLabel,
+  parseSleepAfter,
   readMemoryFile,
+  SLEEP_AFTER_DEFAULT,
+  SLEEP_AFTER_MAX,
+  SLEEP_AFTER_MIN,
   UNATTENDED_WARNING,
   unattendedWarning,
   upsertMessage,
@@ -79,7 +83,7 @@ import {
   IconX,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
-import { idleText, isCold } from "../cache.ts";
+import { idleText, isCold, wakeCold } from "../cache.ts";
 
 /** Re-render every `ms` (the "time in state" column). */
 function useNow(ms = 30_000): number {
@@ -127,6 +131,7 @@ export function AgentsPanel() {
         </button>
       </div>
       {agentsSupported.value && <SchedulesPausedNotice />}
+      {agentsSupported.value && <ProposalsNotice />}
       {!agentsSupported.value
         ? <div class="ap-empty">This daemon has no agents. Update muster to use them.</div>
         : (
@@ -154,6 +159,9 @@ export function AgentsPanel() {
 
 function agentMenu(a: Agent, x: number, y: number) {
   const live = A.agentLive(a);
+  const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
+  const asleep = agentStatus(a, s).asleep;
+  const cold = asleep && wakeCold(s, cacheNow());
   openMenu({
     x,
     y,
@@ -164,12 +172,19 @@ function agentMenu(a: Agent, x: number, y: number) {
       { label: "Memory…", run: () => A.editAgent(a.name, "memory") },
       ...(schedulesSupported.value ? [{ label: "New schedule…", run: () => A.newScheduleDialog(a.name) }] : []),
       "sep",
-      { label: live ? "Show" : "Start", run: () => A.openAgent(a.name) },
+      ...(asleep
+        ? [
+          { label: "Show", run: () => A.openAgent(a.name) },
+          { label: "Wake", hint: cold ? "re-reads it all" : undefined, run: () => A.wakeAgent(a) },
+        ]
+        : [{ label: live ? "Show" : "Start", run: () => A.openAgent(a.name) }]),
       {
         label: "Start fresh",
         hint: a.kind === "claude" ? "new conversation" : undefined,
         run: () => A.openAgent(a.name, true),
       },
+      // Sleep needs a saved conversation to wake into; the daemon says why otherwise.
+      ...(asleep ? [] : [{ label: "Sleep", disabled: !live || !a.resumable, run: () => A.sleepAgent(a) }]),
       { label: "Stop", disabled: !live, run: () => A.stopAgent(a) },
       { label: "Autostart", checked: a.autostart, run: () => A.setAgentAutostart(a, !a.autostart) },
       "sep",
@@ -184,7 +199,8 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const billing = agentBilling(a, s);
   // What it billed to OpenRouter today (UTC day), once read (src/spend.rs).
   const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
-  const cold = !!s && isCold(s, cacheNow());
+  // Asleep: its next message re-reads the conversation uncached once the cache has expired.
+  const cold = !!s && (st.asleep ? wakeCold(s, cacheNow()) : isCold(s, cacheNow()));
   const persona = firstLine(a.persona);
   const open = () => {
     agentFilter.value = a.id;
@@ -193,7 +209,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   return (
     <div
       role="listitem"
-      class={cx("ap-row", selected && "sel", !st.live && "stopped")}
+      class={cx("ap-row", selected && "sel", !st.live && "stopped", st.asleep && "asleep")}
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
@@ -218,7 +234,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
         agentMenu(a, e.clientX, e.clientY);
       }}
     >
-      <StateDot state={st.state} />
+      <StateDot state={st.state} class={st.asleep ? "dot-asleep" : undefined} />
       <span class="ap-row-text">
         <span class="ap-row-top">
           <span class="ap-name">{a.name}</span>
@@ -228,8 +244,18 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.label}
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
+          {a.sleep_after_min != null && !st.asleep && (
+            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message wakes it`}>
+              sleeps
+            </span>
+          )}
           {cold && (
-            <span class="ap-cold" data-tip="Its prompt cache has likely expired: the next message re-reads the whole conversation">
+            <span
+              class="ap-cold"
+              data-tip={st.asleep
+                ? "Its prompt cache has likely expired: waking it re-reads the whole conversation at full cost"
+                : "Its prompt cache has likely expired: the next message re-reads the whole conversation"}
+            >
               cold
             </span>
           )}
@@ -649,6 +675,9 @@ interface Draft {
   permissions: Permissions;
   accepts: Origin[];
   autostart: boolean;
+  /** Minutes as typed; "" with `sleep` off. */
+  sleepAfter: string;
+  sleep: boolean;
 }
 
 function fromTemplate(t: AgentTemplate): Draft {
@@ -663,6 +692,8 @@ function fromTemplate(t: AgentTemplate): Draft {
     permissions: { ...DEFAULT_PERMISSIONS, ...t.permissions },
     accepts: [...t.accepts],
     autostart: t.autostart,
+    sleep: false,
+    sleepAfter: String(SLEEP_AFTER_DEFAULT),
   };
 }
 
@@ -678,6 +709,8 @@ function fromAgent(a: Agent): Draft {
     permissions: { ...DEFAULT_PERMISSIONS, ...a.permissions },
     accepts: [...a.accepts_origins],
     autostart: a.autostart,
+    sleep: a.sleep_after_min != null,
+    sleepAfter: String(a.sleep_after_min ?? SLEEP_AFTER_DEFAULT),
   };
 }
 
@@ -692,6 +725,8 @@ const BLANK: Draft = {
   permissions: { ...DEFAULT_PERMISSIONS },
   accepts: ["human"],
   autostart: false,
+  sleep: false,
+  sleepAfter: String(SLEEP_AFTER_DEFAULT),
 };
 
 let templateCache: AgentTemplate[] | null = null;
@@ -807,7 +842,8 @@ export function AgentDialog(
   const nErr = editing ? null : nameError(d.name, taken);
   const warn = unattendedWarning(d.kind, d.accepts);
   const orBlocked = needsModel(d.provider, d.kind, d.model);
-  const canSave = !busy && !nErr && d.accepts.length > 0 && !orBlocked;
+  const sleepMin = d.sleep ? parseSleepAfter(d.sleepAfter) : 0;
+  const canSave = !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
   const toggleOrigin = (o: Origin, on: boolean) =>
     set({ accepts: ORIGINS.map((x) => x.o).filter((x) => (x === o ? on : d.accepts.includes(x))) });
 
@@ -829,6 +865,8 @@ export function AgentDialog(
           accepts: d.accepts,
           permissions: d.permissions,
           autostart: d.autostart,
+          // Older backends don't know the field: sent only when sleep is on.
+          sleep_after_min: sleepMin || undefined,
         });
         knowAgent(a);
         overlay.value = null;
@@ -844,6 +882,7 @@ export function AgentDialog(
       if (d.effort.trim() !== before.effort) patch.effort = d.effort.trim();
       if (d.persona !== before.persona) patch.persona = d.persona;
       if (d.autostart !== before.autostart) patch.autostart = d.autostart;
+      if ((agent.sleep_after_min ?? 0) !== sleepMin) patch.sleep_after_min = sleepMin;
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
       if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
         patch.permissions = d.permissions;
@@ -1138,6 +1177,43 @@ export function AgentDialog(
                 Autostart <span class="muted">(start it whenever the daemon starts)</span>
               </span>
             </label>
+            <div class="sleep-field">
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  checked={d.sleep}
+                  onChange={(e) => set({ sleep: (e.target as HTMLInputElement).checked })}
+                />
+                <span class="toggle-track">
+                  <span class="toggle-thumb" />
+                </span>
+                <span>
+                  Sleep when idle <span class="muted">(stop its process; the next message wakes it)</span>
+                </span>
+              </label>
+              {d.sleep && (
+                <div class="sleep-after">
+                  <label class="sleep-after-input">
+                    <span>After</span>
+                    <input
+                      class="sleep-min"
+                      inputMode="numeric"
+                      aria-label="Minutes idle before it sleeps"
+                      aria-invalid={sleepMin === null}
+                      aria-describedby="sleep-after-hint"
+                      value={d.sleepAfter}
+                      onInput={(e) => set({ sleepAfter: (e.target as HTMLInputElement).value })}
+                    />
+                    <span class="muted">minutes idle</span>
+                  </label>
+                  <span id="sleep-after-hint" class={cx("field-hint", sleepMin === null && "field-bad")}>
+                    {sleepMin === null
+                      ? `${SLEEP_AFTER_MIN} to ${SLEEP_AFTER_MAX} minutes.`
+                      : "Waking re-reads its whole conversation, at full cost once the prompt cache has expired (about an hour on a Claude subscription), so a wake after that costs no more than any late message."}
+                  </span>
+                </div>
+              )}
+            </div>
             {err && <div class="form-error">{err}</div>}
           </div>
         }

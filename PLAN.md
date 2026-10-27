@@ -127,7 +127,7 @@ Design requirements:
 Phase 0 → 1 → 2 → 3 → 4, but build the Phase 3 adapter trait early (Phase 1) since injection and state detection share it. Dogfood from Phase 1 onward: use the tool to build the tool.
 
 ## 8. Parked ideas (from brainstorming)
-- **Quota-aware scheduler:** track subscription usage windows, queue work for resets, fall back between providers. Revisit against provider terms first.
+- **Quota-aware scheduler:** track subscription usage windows, queue work for resets, fall back between providers. Revisit against provider terms first. Usage display and a manual placement suggestion exist (docs/ACCOUNT_PROFILES.md "Usage display and suggestions"); queuing, automatic choice and fallback do not.
 - **Tournament mode:** same task to multiple agents in separate worktrees, compare/rank results.
 - **File leases / collision detection:** agents declare files they're touching; warn on overlap.
 - **Agent-to-agent review:** reviewer agent watches an implementer's channel (largely enabled by the MCP server).
@@ -156,10 +156,10 @@ panel".
 | Record | `agents` table: name (unique, case-insensitive), kind (`claude` \| `codex`), model, effort, persona, home dir, permission profile, accepted origins, autostart, its tab, current session, conversation id. |
 | Home | `<data>/agents/<name>/` with `CLAUDE.md` (Claude) or `AGENTS.md` (Codex) written from the persona, and `memory/` for durable notes the persona tells the agent to keep. |
 | Session | At most one at a time: the agent runs in its home dir, in its own tab (named after it, stored on the agent) in the "agents" workspace (`<data>/agents`). `muster agent start`, a click in the panel, or any message starts it, restarts it if it exited, or reuses it. Autostart agents start with the daemon. Closing its tab hides it (`session.hide`: no window, still running, messages still delivered); only Stop, Start fresh or Remove stop it. |
-| Continuity | Claude: the SessionStart hook's `session_id` is saved, and every (re)start passes `--resume <id>` (`--fresh` forgets it). Codex: the notify `thread-id` is saved but not used yet (Codex resumes with a `codex resume <id>` subcommand the adapter doesn't build; TODO). |
+| Continuity | Claude: the conversation id is saved once it has a prompt, and every (re)start passes `--resume <id>`. Codex: the run's top-level thread (the one it resumed, else the one its SessionStart hook names, else the first to finish a turn; never a sub-agent's or Codex's title request's) is saved at its first finished turn, and every (re)start launches `codex resume <Muster's flags, sandbox, model, effort> -- <id>` (checked against codex-cli 0.164.0's `codex resume --help`). The thread is kept on the agent's record (only ids this backend confirmed, `runtime_state` `codex-agent-thread:<agent>`; older backends saved any notify's) or a tab's `runtime_state` `codex-thread:<session>`, never in the stored arguments, so older backends keep accepting them. `/new` or `/clear` forgets the old one at once; `--fresh` / Start fresh forgets either and fences the old run's late hooks. Only the CLI saying it no longer has the conversation ("No conversation found" / "No saved session found with ID …", matched across wrapped rows) before the run sent any hook forgets it after a failed start, also for a run that ended during a backend reload (checked at startup); the tab's status then says the next start begins a new conversation. Plain Claude and Codex tabs work the same way (docs/UI.md "Group tab strips"). |
 | Asking | MCP `ask_agent` / `muster ask`: deliver through the injection queue, wait for the turn to end, return the Stop hook's final message (Codex: notify's), else the end of the terminal. |
 | Messages | Each delivery gets an `agent_messages` row (from, to, origin, hop, reply_to, text, reply) and a one-line envelope before the text: `[muster msg <id> from <sender> origin=<origin> hop=<n>]`. A message the agent's policy refuses is kept too, with the reason (never delivered, not counted toward the cap). |
-| Late replies | MCP `reply {msg_id, text}` / `muster reply` in the agent's session: the agent a message was typed into answers it after that turn (a long job), once. Stored on the message's row first (`answer`, store migration v24), then: a waiting ask returns it; an asking agent gets it as a new message (`reply_to` = the message, every delivery guard); another Claude or Codex session gets it typed in (`[muster reply to msg <id> …]`, the Claude origin rule); the human or a schedule sees it in the agents panel's log. Route: the stricter of the message's chain and the replier's, one hop on. `src/agent_reply.rs`, docs/MCP.md "Late replies". |
+| Late replies | MCP `reply {msg_id, text}` / `muster reply` in the agent's session: the agent a message was typed into answers it after that turn (a long job), once. Stored on the message's row first (`answer`, store migration v25), then: a waiting ask returns it; an asking agent gets it as a new message (`reply_to` = the message, every delivery guard); another Claude or Codex session gets it typed in (`[muster reply to msg <id> …]`, the Claude origin rule); the human or a schedule sees it in the agents panel's log. Route: the stricter of the message's chain and the replier's, one hop on. `src/agent_reply.rs`, docs/MCP.md "Late replies". |
 | Editing | `agent.update` / `muster agent edit` / the panel's Edit dialog: persona (rewrites the persona file), provider, model, effort, accepted origins, autostart, permissions (also set on its tab). Provider, model, effort and permissions apply from the next start. |
 | Provider | `subscription` (the CLI's own login) or `openrouter`: pay per token with the owner's `OPENROUTER_API_KEY` from the backend's environment, held in memory only and passed only into that agent's sessions (§3: it is the owner's key, not a CLI credential; still never stored, logged or sent to clients). `src/openrouter.rs`, docs/PROTOCOL.md "OpenRouter". |
 
@@ -218,15 +218,40 @@ failure (desktop and in-app) and replies into a note; quiet hours, a per-schedul
 per-agent unattended cap (24 a day by default). Claude subscription agents: only with the
 Schedule opt-in, recurring schedules expire after 7 days unless renewed (a notice the day
 before), quiet hours on by default; Claude on OpenRouter doesn't expire. `muster schedule`,
-`schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (spend caps, chaining,
-triggers) and Phase 3 (agents proposing schedules) are not built.
+`schedule.*` RPCs, store migration v19 (src/schedules/). Phase 2 (built): triggers (a note
+the human allows, a git branch, GitHub PRs and CI by polling, a loopback trigger URL),
+"Then…" steps and the OpenRouter spend caps. Phase 3 (built): agents propose schedules over MCP
+and only the human approves them (a click in the Agents panel), except a one-off reminder an
+agent sets for itself up to 24 hours ahead; none while handling scheduled or triggered work, so
+schedules can't breed schedules; every cap and rule above applies once one runs. And a
+file-change trigger, only inside folders the human lists in the settings (none by default).
+Phone push alerts for schedules wait for Android Web Push (feature/phone-push).
+
+**Sleep and wake (built; src/sleep.rs, docs/PROTOCOL.md "Sleep and wake").** A per-agent
+setting, off by default (`sleep_after_min`, 5 minutes to a week), plus a manual Sleep: an idle
+agent's process stops, its record, tab and conversation stay, shown as asleep (saved: it stays
+asleep across a reload and a restart, and autostart leaves it, also an older backend's). Never
+while it works, waits for approval or a question, is in a turn, has background sub-agents or
+commands running (also one moved to the background while it ran), has prompts queued or a
+message (or a panel batch) on its way, has keys on their way to its terminal, has text in its input box, or
+before its conversation id is known; the last check and the stop are one step against keys,
+sends and restarts, and only the run that was checked is stopped. Whatever would deliver to it wakes it
+through `agent.start` under the start lock (so two messages wake it once, and each keeps its
+durable queue path): `ask_agent` / `muster ask`, schedule runs (after every guard rail),
+`muster send` (a phone's message too), Start / Wake, a real panel action, and the human typing
+into its tab (keys held and typed once it is ready, as the human's). A failed wake (also a woken CLI
+that stops before it is ready) leaves it asleep and says why; the next message or typing tries
+again. A launch that is only unconfirmed is no failure: the wake waits for it. Panel notices (a panel closing), list and read tools, status checks and
+showing its tab never wake it. The wake's cost is shown as the cold-cache warning's is: the
+asleep bar, a `cold` marker, a timeline note, and the cold-start mark on the message. Store
+migration v24 (`agents.sleep_after_min`, `agents.asleep_at`, `agents.asleep_autostart`,
+`agents.asleep_generation`).
 
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no
   `agent.*` method and no agent events).
-- Sleep and wake: stop an idle agent's process, resume it on the next message.
-- Webhooks and other triggers (docs/SCHEDULING_PLAN.md Phases 2 and 3): the `webhook` origin and
-  its policy exist; nothing fires it yet. Webhook triggers are never exposed to anyone but the
-  user. (Schedules are built: above.)
-- Codex resume (`codex resume <id>`; the thread id is already captured).
+- Phone push alerts for schedule runs (docs/SCHEDULING_PLAN.md Phase 3): they go through
+  `schedules::run::alert`, the one place a push sink plugs in once Android Web Push lands.
+  Triggers stay loopback-only, never exposed to anyone but the user. (Schedules and triggers are
+  built: above.)

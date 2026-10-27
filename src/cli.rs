@@ -782,13 +782,16 @@ pub enum ScheduleCmd {
         /// Create it paused.
         #[arg(long)] paused: bool,
         /// A trigger instead of a time (runs are origin webhook, "Triggered"): `note:<note>`,
-        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`
-        /// or `url:<name>`.
+        /// `git:<repo>@<branch>`, `gh:<owner/repo>:pr-opened`, `gh:<owner/repo>:ci-failed[@branch]`,
+        /// `url:<name>`, or `files:<folder>[/<pattern>]` (e.g. `files:~/inbox/*.pdf`; only inside a
+        /// folder you allow under Scheduling settings → Watched folders).
         #[arg(long, value_name = "EVENT")] on: Option<String>,
         /// A note trigger waits this many minutes of quiet after the last edit (default 2).
         #[arg(long, value_name = "N")] quiet_min: Option<u32>,
         /// A GitHub trigger checks every N minutes (2 to 60, default 5).
         #[arg(long, value_name = "N")] poll_min: Option<u32>,
+        /// A files trigger also looks in subfolders (up to 3 levels).
+        #[arg(long)] subfolders: bool,
         /// Then, when a run replies: `AGENT: prompt` (the prompt may quote the reply as {reply}).
         #[arg(long, value_name = "AGENT: PROMPT")] then: Option<String>,
         /// When a run fails: `notify`, or `AGENT: prompt` ({reply}, {outcome}).
@@ -821,6 +824,43 @@ pub enum ScheduleCmd {
     },
     /// Renew a Claude subscription agent's schedule for 7 more days.
     Renew { id: i64 },
+    /// Not here: an agent's proposal is approved only with a click on Approve in Muster's window
+    /// (so an agent can't approve its own from a shell). `muster schedule rm` dismisses one.
+    #[command(hide = true)]
+    Approve { id: i64 },
+    /// Inside an agent's session: propose a schedule; it runs only once the human approves it in
+    /// the Agents panel. Give one timing as for `add`, and --reason.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule propose --weekly fri@16:00 --reason \"You asked for a weekly summary\" Summarise the Ideas note")]
+    Propose {
+        prompt: Vec<String>,
+        /// Why (the human reads it before approving).
+        #[arg(long)] reason: String,
+        /// The agent it runs on (default: the one proposing).
+        #[arg(long)] agent: Option<String>,
+        #[arg(long)] every: Option<String>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "0")] hourly: Option<String>,
+        #[arg(long)] daily: Option<String>,
+        #[arg(long)] weekdays: Option<String>,
+        #[arg(long)] weekly: Option<String>,
+        #[arg(long)] cron: Option<String>,
+        #[arg(long)] at: Option<String>,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+        #[arg(long)] fresh: bool,
+        #[arg(long, value_parser = ["on", "off"])] quiet_hours: Option<String>,
+        #[arg(long)] max_per_day: Option<u32>,
+        /// Also add each reply to this note (its id).
+        #[arg(long)] note: Option<i64>,
+    },
+    /// Inside an agent's session: have Muster send you PROMPT once, 5 minutes to 24 hours from
+    /// now, without approval. `--at +20m`, `--at 15:30` or `--at "YYYY-MM-DD HH:MM"`.
+    #[command(after_help = "Example (run by an agent):\n  muster schedule remind --at +20m Check whether CI on master passed")]
+    Remind {
+        prompt: Vec<String>,
+        #[arg(long)] at: String,
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] tz: Option<String>,
+    },
     /// A schedule's runs, newest first: RUN  TIME  KIND  OUTCOME  REASON.
     History {
         id: i64,
@@ -830,9 +870,9 @@ pub enum ScheduleCmd {
 }
 
 /// `--on EVENT` as a trigger `when`.
-fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>) -> anyhow::Result<Value> {
+fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Option<u32>, subfolders: bool) -> anyhow::Result<Value> {
     let bad = |why: &str| exit(2, format!("--on {on}: {why}"));
-    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed or url:<name>"))?;
+    let (kind, rest) = on.split_once(':').ok_or_else(|| bad("use note:<note>, git:<repo>@<branch>, gh:<owner/repo>:pr-opened, gh:<owner/repo>:ci-failed, url:<name> or files:<folder>"))?;
     let v = match kind {
         "note" => json!({"kind": "note", "note_id": note_target(d, rest)?, "quiet_min": quiet_min}),
         "git" => {
@@ -857,7 +897,19 @@ fn trigger_when(d: &Discovery, on: &str, quiet_min: Option<u32>, poll_min: Optio
             json!({"kind": "github", "repo": repo, "event": event, "branch": branch, "every_min": poll_min})
         }
         "url" => json!({"kind": "url", "name": rest}),
-        _ => return Err(bad("the kind is note, git, gh or url")),
+        "files" => {
+            // A last part with * or ? is the file pattern: files:~/inbox/*.pdf.
+            let (folder, pattern) = match rest.rsplit_once('/') {
+                Some((f, p)) if p.contains(['*', '?']) => (f, Some(p)),
+                _ => (rest, None),
+            };
+            let folder = match folder.strip_prefix("~/") {
+                Some(r) => crate::paths::home_dir().join(r),
+                None => std::path::absolute(folder).map_err(|e| bad(&e.to_string()))?,
+            };
+            json!({"kind": "files", "folder": folder, "pattern": pattern, "recursive": subfolders, "quiet_min": quiet_min})
+        }
+        _ => return Err(bad("the kind is note, git, gh, url or files")),
     };
     let mut v = v;
     v.as_object_mut().unwrap().retain(|_, x| !x.is_null());
@@ -925,20 +977,28 @@ fn schedule_when(every: Option<String>, hourly: Option<String>, daily: Option<St
 }
 
 /// `--at`: `+20m`/`+2h`, `HH:MM` (the next one), or `YYYY-MM-DD HH:MM`, in `tz` (else local).
+/// `--at +20m` / `+2h` / `+1d` (or `in 20m`): whole minutes from now. None: not a relative time.
+fn relative_minutes(s: &str) -> anyhow::Result<Option<i64>> {
+    let s = s.trim();
+    let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
+    let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) else { return Ok(None) };
+    let rel = rel.trim();
+    let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let per = match unit.trim() {
+        "m" | "min" | "mins" | "minutes" => 1,
+        "h" | "hour" | "hours" => 60,
+        "d" | "day" | "days" => 24 * 60,
+        _ => return Err(bad()),
+    };
+    Ok(Some(n.checked_mul(per).ok_or_else(bad)?))
+}
+
 fn once_at(s: &str, tz: Option<&str>) -> anyhow::Result<i64> {
     let s = s.trim();
     let bad = || exit(2, format!("--at {s}: use HH:MM, \"YYYY-MM-DD HH:MM\", or +20m / +2h"));
-    if let Some(rel) = s.strip_prefix('+').or_else(|| s.strip_prefix("in ")) {
-        let rel = rel.trim();
-        let (n, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
-        let n: i64 = n.parse().map_err(|_| bad())?;
-        let ms = match unit.trim() {
-            "m" | "min" | "mins" | "minutes" => n * 60_000,
-            "h" | "hour" | "hours" => n * 3_600_000,
-            "d" | "day" | "days" => n * 86_400_000,
-            _ => return Err(bad()),
-        };
-        return Ok(now_ms() + ms);
+    if let Some(m) = relative_minutes(s)? {
+        return Ok(now_ms() + m * 60_000);
     }
     let zone = match tz {
         Some(t) => crate::schedules::cron::zone(t).map_err(|e| exit(2, e))?,
@@ -978,6 +1038,18 @@ fn schedule_line(s: &Value) -> String {
         s["status"].as_str().unwrap_or("?"), next, last, s["name"].as_str().unwrap_or(""), s["reading"].as_str().unwrap_or(""))
 }
 
+/// A schedule made or changed here waits for the owner's click in Muster's window: say so in
+/// plain words (nothing else on the line says it won't run).
+fn held_note(s: &Value) {
+    if s["status"].as_str() == Some("held") {
+        println!(
+            "  Waiting for your approval: made or changed from the command line, it doesn't run until you click \
+             Approve on its card in Muster's Agents panel (`muster schedule rm {}` drops it).",
+            s["id"]
+        );
+    }
+}
+
 fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option<i64>, all: bool, pause: bool) -> anyhow::Result<()> {
     if all {
         one("schedule.settings.set", json!({"paused": pause}))?;
@@ -987,6 +1059,7 @@ fn schedule_pause(one: &dyn Fn(&str, Value) -> anyhow::Result<Value>, id: Option
     let id = id.ok_or_else(|| exit(2, "give a schedule id, or --all"))?;
     let s = one("schedule.pause", json!({"id": id, "on": pause}))?;
     println!("schedule {id}: {}", s["status"].as_str().unwrap_or("?"));
+    held_note(&s);
     Ok(())
 }
 
@@ -999,13 +1072,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
     };
     match cmd {
         ScheduleCmd::Add { agent, prompt, every, hourly, daily, weekdays, weekly, cron, at, name, tz, if_missed, fresh,
-            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, then, on_failure } => {
+            notify, note, quiet_hours, max_per_day, paused, on, quiet_min, poll_min, subfolders, then, on_failure } => {
             let when = match &on {
                 Some(on) => {
                     if [&every, &hourly, &daily, &weekdays, &weekly, &cron, &at].iter().any(|o| o.is_some()) {
                         return Err(exit(2, "give a timing or --on EVENT, not both"));
                     }
-                    trigger_when(d, on, quiet_min, poll_min)?
+                    trigger_when(d, on, quiet_min, poll_min, subfolders)?
                 }
                 None => schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?,
             };
@@ -1044,10 +1117,13 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 if let Some(u) = s["url"].as_str() {
                     println!("  URL: {u} (POST, with its secret: `muster trigger --url {}`)", s["when"]["name"].as_str().unwrap_or(""));
                 }
+            } else if s["status"].as_str() == Some("held") {
+                println!("schedule {}: {} ({})", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             } else {
                 let next = s["next_run"].as_i64().map(local_time).unwrap_or_else(|| "-".into());
                 println!("schedule {}: {} ({}); next {next}", s["id"], s["reading"].as_str().unwrap_or(""), s["tz"].as_str().unwrap_or(""));
             }
+            held_note(&s);
             if s["expires_at"].is_i64() {
                 println!("  {} is a Claude subscription agent: this schedule stops after 7 days unless you renew it \
                     (`muster schedule renew {}`). Quiet hours: {}.", s["agent"].as_str().unwrap_or("it"), s["id"],
@@ -1093,14 +1169,58 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
                 (false, Some(t)) => println!("schedule {id}: skipping the run at {}", local_time(t)),
                 _ => println!("schedule {id}: not skipping"),
             }
+            held_note(&s);
             Ok(())
         }
         ScheduleCmd::Renew { id } => {
             let s = one("schedule.renew", json!({"id": id}))?;
-            match s["expires_at"].as_i64() {
-                Some(e) => println!("schedule {id}: runs until {}", local_time(e)),
-                None => println!("schedule {id}: doesn't expire"),
+            match (s["status"].as_str(), s["expires_at"].as_i64()) {
+                (Some("held"), _) => println!("schedule {id}: renewal asked for (7 more days once you approve it)"),
+                (_, Some(e)) => println!("schedule {id}: runs until {}", local_time(e)),
+                (_, None) => println!("schedule {id}: doesn't expire"),
             }
+            held_note(&s);
+            Ok(())
+        }
+        ScheduleCmd::Approve { id } => Err(exit(
+            2,
+            format!(
+                "schedule {id}: {}. Open Muster's Agents panel and click Approve on its card (`muster schedule rm {id}` dismisses it).",
+                crate::rpc::APPROVE_BY_CLICK
+            ),
+        )),
+        ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,
+            quiet_hours, max_per_day, note } => {
+            let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({
+                "prompt": text, "reason": reason, "agent": agent, "name": name, "tz": tz,
+                "cron": when.get("cron"), "at": when.get("at"),
+                "conversation": fresh.then_some("fresh"), "quiet_hours": quiet_hours.map(|q| q == "on"),
+                "daily_cap": max_per_day, "note_id": note,
+            });
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.propose", p)?;
+            println!("schedule {}: proposed ({}{}). It runs once the human approves it in the Agents panel.",
+                r["schedule_id"], r["when"].as_str().unwrap_or(""), r["agent"].as_str().map(|a| format!(", on {a}")).unwrap_or_default());
+            if let Some(e) = r["estimate"].as_str() {
+                println!("  {e}");
+            }
+            Ok(())
+        }
+        ScheduleCmd::Remind { prompt, at, name, tz } => {
+            // `+20m` goes as minutes from now, counted by the daemon when it sets the reminder
+            // (a time worked out here would already be a moment short of `+5m`).
+            let when = match relative_minutes(&at)? {
+                Some(m) => json!({"in_minutes": m}),
+                None => json!({"at": once_at(&at, tz.as_deref())?}),
+            };
+            let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
+            let mut p = json!({"prompt": text, "name": name, "tz": tz});
+            p.as_object_mut().unwrap().extend(when.as_object().unwrap().clone());
+            p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+            let r = one("schedule.remind", p)?;
+            println!("schedule {}: reminder at {}", r["schedule_id"], r["runs_at"].as_str().unwrap_or("?"));
             Ok(())
         }
         ScheduleCmd::History { id, limit, json } => {
@@ -1239,6 +1359,15 @@ struct DeviceRow {
     last_source: Option<String>,
     expires_at: i64,
     revoked_at: Option<i64>,
+    /// Phone alerts: None when they are off.
+    #[serde(default)]
+    push: Option<PushRow>,
+}
+
+#[derive(Deserialize)]
+struct PushRow {
+    last_ok_at: Option<i64>,
+    last_error_at: Option<i64>,
 }
 
 /// `muster devices`.
@@ -1270,10 +1399,19 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 None if x.expires_at <= now => "expired".to_string(),
                 None => x.scopes.last().cloned().unwrap_or_default(),
             };
+            let alerts = match &x.push {
+                None => "off".to_string(),
+                Some(p) if p.last_error_at.is_some_and(|e| p.last_ok_at.is_none_or(|ok| e > ok)) => "failing".to_string(),
+                Some(p) => match p.last_ok_at {
+                    Some(t) => format!("on (sent {})", ago(t)),
+                    None => "on".to_string(),
+                },
+            };
             vec![
                 Cell::plain(x.id.to_string()),
                 Cell::plain(x.name.clone()),
                 Cell::plain(status),
+                Cell::plain(alerts),
                 Cell::plain(format!(
                     "seen {}{}",
                     ago(x.last_seen_at),
@@ -1282,7 +1420,7 @@ pub fn devices(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "LAST"]), &rows, None, false));
+    print!("{}", render_table(Some(&["ID", "NAME", "ACCESS", "ALERTS", "LAST"]), &rows, None, false));
     Ok(())
 }
 
@@ -2215,6 +2353,85 @@ pub fn profile_default(d: &Discovery, path: &std::path::Path, profile: &str) -> 
     Ok(())
 }
 
+fn usage_age(ms: i64, now: i64) -> String {
+    let m = (now - ms).max(0) / 60_000;
+    match m {
+        0 => "just now".into(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 48 * 60 => format!("{} h ago", m / 60),
+        m => format!("{} days ago", m / (24 * 60)),
+    }
+}
+
+fn usage_cell(w: &Value) -> String {
+    let at = |s: i64| jiff::Timestamp::from_second(s).map(|t| t.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%a %H:%M").to_string()).unwrap_or_default();
+    let pct = w["used_percentage"].as_f64().map(|v| format!("{}%", v.round() as i64)).unwrap_or_default();
+    let resets = w["resets_at"].as_i64().map(at).unwrap_or_default();
+    match w["status"].as_str().unwrap_or("unknown") {
+        "current" => format!("{pct}, resets {resets}"),
+        "stale" => format!("{pct} (stale), resets {resets}"),
+        "unconfirmed" => format!("{pct} (not confirmed fresh)"),
+        "reset" => format!("unknown (reset {resets})"),
+        _ => "unknown".into(),
+    }
+}
+
+pub fn profile_usage(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
+    let u = client::rpc(d, "account_usage.get", json!({}))?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&u)?);
+        return Ok(());
+    }
+    let now = crate::model::now_ms();
+    let empty = Vec::new();
+    let rows = u["rows"].as_array().unwrap_or(&empty);
+    let mut table = vec![["Profile".to_string(), "5-hour".into(), "Weekly".into(), "Last observed".into()]];
+    for r in rows {
+        let mut name = r["name"].as_str().unwrap_or("?").to_string();
+        if let Some(why) = r["ineligible_reason"].as_str() { name.push_str(&format!(" (can't start: {why})")); }
+        let shared: Vec<&str> = r["same_account_as"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+        if !shared.is_empty() { name.push_str(&format!(" [same account as {}]", shared.join(", "))); }
+        let seen = ["five_hour", "seven_day"].iter().filter_map(|w| r[*w]["observed_at"].as_i64()).max()
+            .map(|t| usage_age(t, now))
+            .or_else(|| ["five_hour", "seven_day"].iter().filter_map(|w| r[*w]["reported_at"].as_i64()).max()
+                .map(|t| format!("reported {}, freshness unknown", usage_age(t, now))))
+            .unwrap_or_else(|| "never".into());
+        table.push([name, usage_cell(&r["five_hour"]), usage_cell(&r["seven_day"]), seen]);
+    }
+    let width = |i: usize| table.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    for r in &table {
+        println!("{:w0$}  {:w1$}  {:w2$}  {}", r[0], r[1], r[2], r[3]);
+    }
+    match (u["suggestion"].as_object(), u["no_suggestion"].as_str()) {
+        (Some(s), _) => println!("\nSuggested for a new task: {}. {}", s["name"].as_str().unwrap_or("?"), s["reason"].as_str().unwrap_or("")),
+        (None, Some(why)) => println!("\nNo suggestion: {why}"),
+        _ => {}
+    }
+    println!("Usage comes from Claude Code's status line in sessions Muster started; an account nobody used here stays unknown.");
+    Ok(())
+}
+
+pub fn profile_same_account(d: &Discovery, profile: &str, other: Option<&str>) -> anyhow::Result<()> {
+    let id = profile_choice(d, profile)?.as_i64().context("Default joins an account by registering its folder (~/.claude) as a profile")?;
+    let with = other.map(|o| profile_choice(d, o)?.as_i64()
+        .context("Default joins an account by registering its folder (~/.claude) as a profile")).transpose()?;
+    let p = client::rpc(d, "account_profile.same_account", json!({"id": id, "with": with}))?;
+    match other {
+        Some(o) => println!("{} and {o} now count as one Claude account: one set of limits.", p["name"].as_str().unwrap_or(profile)),
+        None => println!("{} is its own Claude account again.", p["name"].as_str().unwrap_or(profile)),
+    }
+    Ok(())
+}
+
+pub fn profile_login_changed(d: &Discovery, profile: &str) -> anyhow::Result<()> {
+    let choice = profile_choice(d, profile)?;
+    client::rpc(d, "account_profile.login_changed", json!({"account_profile": choice}))?;
+    println!("Forgot {profile}'s usage and same-account setting. New usage appears after its next session gets a reply.");
+    Ok(())
+}
+
 pub struct AgentOpts {
     pub profile: Option<String>,
     pub provider: Option<String>,
@@ -2225,8 +2442,26 @@ pub struct AgentOpts {
     pub persona: Option<String>,
     pub accepts: Option<String>,
     pub autostart: Option<bool>,
+    /// `--sleep-after`: minutes, a duration (`90m`, `2h`), or `off`.
+    pub sleep_after: Option<String>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
+}
+
+/// `--sleep-after`: `off`, minutes (`45`), or a duration in minutes or hours (`90m`, `2h`).
+pub fn parse_sleep_after(s: &str) -> anyhow::Result<u32> {
+    let t = s.trim().to_ascii_lowercase();
+    if matches!(t.as_str(), "off" | "never" | "0") {
+        return Ok(0);
+    }
+    let (num, mult) = match t.strip_suffix('h') {
+        Some(n) => (n, 60),
+        None => (t.strip_suffix("min").or_else(|| t.strip_suffix('m')).unwrap_or(&t), 1),
+    };
+    let n: u32 = num.trim().parse().map_err(|_| anyhow::anyhow!("--sleep-after: minutes (45), 90m, 2h or off, not `{s}`"))?;
+    let m = n.checked_mul(mult).ok_or_else(|| anyhow::anyhow!("--sleep-after: too long"))?;
+    crate::sleep::check_after(Some(m))?;
+    Ok(m)
 }
 
 impl AgentOpts {
@@ -2258,6 +2493,9 @@ impl AgentOpts {
         if let Some(a) = self.autostart {
             set("autostart", json!(a));
         }
+        if let Some(a) = &self.sleep_after {
+            set("sleep_after_min", json!(parse_sleep_after(a)?));
+        }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(
                 "permissions",
@@ -2284,6 +2522,9 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         if b["autostart"] == true { ", autostart" } else { "" },
         b["home_dir"].as_str().unwrap_or("?")
     );
+    if let Some(m) = b["sleep_after_min"].as_u64() {
+        println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
+    }
 }
 
 /// `muster agent new`.
@@ -2331,7 +2572,8 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
                 .unwrap_or_default();
-            let state = s(b, "state");
+            // An asleep agent's session has exited: say asleep, not stopped.
+            let state = if b["asleep"] == true { "asleep".to_string() } else { s(b, "state") };
             vec![
                 Cell::plain(s(b, "name")),
                 Cell::plain(match b["provider"].as_str() {
@@ -2360,6 +2602,13 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `muster agent sleep`: stop an idle agent's process now; its next message wakes it.
+pub fn agent_sleep(d: &Discovery, name: &str) -> anyhow::Result<()> {
+    let a = client::rpc_with_timeout(d, "agent.sleep", json!({ "name": name }), Duration::from_secs(30))?;
+    println!("{} is asleep; the next message wakes it", a["name"].as_str().unwrap_or(name));
+    Ok(())
+}
+
 pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
     let r = client::rpc(d, "agent.remove", json!({ "name": name }))?;
     println!(
@@ -2374,7 +2623,9 @@ pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
 pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
     let r = client::rpc_with_timeout(d, "agent.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
     let id = r["session"]["id"].as_u64().unwrap_or(0);
-    if r["started"] == true {
+    if r["woke"] == true {
+        println!("{id} (woke it: it re-reads its conversation)");
+    } else if r["started"] == true {
         println!("{id}");
     } else {
         println!("{id} (already running)");
@@ -2775,6 +3026,34 @@ mod tests {
         let next = once_at("2030-01-02 03:04", Some("UTC")).unwrap();
         assert_eq!(next, 1893553440000);
         assert!(once_at("tomorrow-ish", None).is_err());
+    }
+
+    #[test]
+    fn remind_sends_a_relative_time_as_minutes_and_approve_is_a_click() {
+        use std::sync::{Arc, Mutex};
+        assert_eq!(relative_minutes("+5m").unwrap(), Some(5));
+        assert_eq!(relative_minutes("in 2h").unwrap(), Some(120));
+        assert_eq!(relative_minutes("+1d").unwrap(), Some(1440));
+        assert_eq!(relative_minutes("15:30").unwrap(), None);
+        assert!(relative_minutes("+5x").is_err());
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let log = calls.clone();
+        let d = mock_daemon(move |method, params| {
+            log.lock().unwrap().push((method.to_string(), params.clone()));
+            json!({"schedule_id": 9, "runs_at": "Mon 10:05"})
+        });
+        let remind = |at: &str| ScheduleCmd::Remind { prompt: vec!["check CI".into()], at: at.into(), name: None, tz: None };
+        schedule(&d, remind("+5m")).unwrap();
+        schedule(&d, remind("2030-01-02 03:04")).unwrap();
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got[0].0, "schedule.remind");
+        // Minutes from now, counted by the daemon: `+5m` is exactly 5 minutes ahead there.
+        assert_eq!((got[0].1["in_minutes"].as_i64(), got[0].1.get("at")), (Some(5), None), "{:?}", got[0].1);
+        assert!(got[1].1["at"].is_i64() && got[1].1.get("in_minutes").is_none());
+        // Approving isn't the command line's: nothing is sent.
+        let e = schedule(&d, ScheduleCmd::Approve { id: 3 }).unwrap_err().to_string();
+        assert!(e.contains("click on Approve"), "{e}");
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]

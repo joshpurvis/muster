@@ -2,7 +2,15 @@ import { batch, computed, signal } from "@preact/signals";
 import { connStatus, rpc } from "../rpc.ts";
 import type { Channel, Decision, SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
-import { type Grid, normalizeCode } from "./logic.ts";
+import {
+  type AttachInfo,
+  type Grid,
+  normalizeCode,
+  noteSession,
+  type ProgramScroll,
+  sessionAsleep,
+  type Since,
+} from "./logic.ts";
 
 export interface Device {
   id: number;
@@ -19,9 +27,22 @@ interface Prefs {
 interface Viewer {
   sid: number;
   receive(type: number, payload: Uint8Array): void;
+  attachInfo(info: AttachInfo): void;
+  since(): Since | null;
+  disconnected(): void;
   update(info: SessionInfo): void;
   grid(): Grid;
 }
+/** Replay sizes (docs/ANDROID.md "Reconnect and battery"). Opening a session brings up to 256 KiB
+ * of its history; coming back to it (the app was in the background, or the connection dropped)
+ * brings only the output it missed when that is at most 64 KiB, else a 64 KiB screen with as
+ * much recent history as fits. */
+const OPEN_REPLAY_BYTES = 262144;
+const RESUME_REPLAY_BYTES = 65536;
+/** While visible, the phone checks every so often that its connection still answers; a dead one
+ * (a network change can leave it looking open) is replaced at once. */
+const PING_EVERY_MS = 25000;
+const PING_TIMEOUT_MS = 10000;
 
 const stored = load<Prefs>("m.prefs", { fontSize: 11, termSize: "follow" });
 export const prefs = signal<Prefs>({
@@ -37,10 +58,15 @@ export const online = signal(navigator.onLine);
 export const pairError = signal("");
 export const pairBusy = signal(false);
 export const toast = signal("");
+/** Counts `push_changed` events (this phone's alert status changed in the daemon). */
+export const pushChanged = signal(0);
 export const ready = computed(() => auth.value === "paired" && connStatus.value === "open");
 export const canInteract = computed(() =>
   ready.value && !!device.value?.scopes.some((s) => s === "interact" || s === "manage")
 );
+/** How far the phone scrolled each session's full-screen program back (web/src/m/term.ts), kept
+ * while its view is closed and updated from every session's events, viewed or not. */
+export const programScroll = new Map<number, ProgramScroll>();
 let viewer: Viewer | null = null;
 let attached: number | null = null;
 let toastTimer = 0;
@@ -97,9 +123,26 @@ async function checkDevice(): Promise<boolean> {
   }
 }
 
+let retryTimer = 0;
+let retryDelay = 1000;
+function stopRetrying() {
+  clearTimeout(retryTimer);
+  retryTimer = 0;
+}
+/** Check the device, then connect. While the page is visible and Muster can't be reached (the
+ * device check fails without saying "unpaired"), it tries again, waiting 1, 2, 4… up to 10 s:
+ * neither `online` nor `visibilitychange` may fire again to restart it. */
 export async function reconnect() {
+  stopRetrying();
   if (document.visibilityState !== "visible" || pairBusy.peek()) return;
-  if (await checkDevice() && document.visibilityState === "visible") rpc.resume();
+  if (await checkDevice()) {
+    retryDelay = 1000;
+    if (document.visibilityState === "visible") rpc.resume();
+    return;
+  }
+  if (auth.peek() === "unpaired" || document.visibilityState !== "visible" || retryTimer) return;
+  retryTimer = setTimeout(reconnect, retryDelay);
+  retryDelay = Math.min(10000, retryDelay * 2);
 }
 
 export async function pair(code: string) {
@@ -171,19 +214,52 @@ export async function logout() {
   }
 }
 
+/** Whether the current viewer was attached before (a reattach after a reconnect). */
+let viewerAttached = false;
 function attach() {
   if (!viewer || !ready.peek() || attached === viewer.sid) return;
   const current = viewer;
   attached = current.sid;
-  rpc.call("session.attach", { id: current.sid, replay_bytes: 262144 }).catch((e) => {
+  const since = current.since();
+  const params = since ? { id: current.sid, replay: { since }, replay_bytes: RESUME_REPLAY_BYTES } : {
+    id: current.sid,
+    replay: "screen",
+    replay_bytes: viewerAttached ? RESUME_REPLAY_BYTES : OPEN_REPLAY_BYTES,
+  };
+  viewerAttached = true;
+  rpc.call("session.attach", params).catch((e) => {
     if (viewer === current && rpc.isOpen) notify(errorText(e));
   });
+}
+
+let helloCount = 0;
+let pinging = false;
+/** A connection that doesn't answer a ping within PING_TIMEOUT_MS is dropped and replaced. */
+async function heartbeat() {
+  if (pinging || document.visibilityState !== "visible" || !rpc.isOpen) return;
+  pinging = true;
+  const connection = helloCount;
+  let timer = 0;
+  const timedOut = new Promise<"timeout">((resolve) =>
+    timer = setTimeout(() => resolve("timeout"), PING_TIMEOUT_MS)
+  );
+  try {
+    const answer = await Promise.race([rpc.call("ping").then(() => "ok", () => "error"), timedOut]);
+    if (answer === "timeout" && connection === helloCount && rpc.isOpen) {
+      rpc.suspend();
+      reconnect();
+    }
+  } finally {
+    clearTimeout(timer);
+    pinging = false;
+  }
 }
 
 export function bindTerminal(next: Viewer | null) {
   if (attached !== null && rpc.isOpen) rpc.call("session.detach", { id: attached }).catch(() => {});
   attached = null;
   viewer = next;
+  viewerAttached = false;
   attach();
 }
 
@@ -191,8 +267,13 @@ export function markOpened(s: SessionInfo) {
   if (canInteract.peek()) rpc.call("channel.mark_read", { id: s.channel_id }).catch(() => {});
 }
 export function openSession(s: SessionInfo) {
-  history.pushState({ musterSession: true }, "", `#s=${s.id}`);
-  selected.value = s.id;
+  openSessionId(s.id);
+}
+/** Also from a tapped alert while the app is open (the service worker's message). */
+export function openSessionId(id: number) {
+  if (selected.peek() === id) return;
+  history.pushState({ musterSession: true }, "", `#s=${id}`);
+  selected.value = id;
 }
 export function closeSession() {
   if (history.state?.musterSession) history.back();
@@ -202,12 +283,38 @@ export function closeSession() {
   }
 }
 
+let viewOnlyScrollNoted = false;
+/** Wheel reports that scroll a full-screen program (Claude Code) back through its own history,
+ * sent like a desktop terminal's mouse wheel: raw input, without the resize `act` does in
+ * `follow`. False when this device can't send input (view access only, or disconnected). */
+export function scrollProgram(sid: number, data: Uint8Array): boolean {
+  if (!canInteract.peek()) {
+    if (ready.peek() && !viewOnlyScrollNoted) {
+      viewOnlyScrollNoted = true;
+      notify(
+        "View-only device: it can't scroll back in a full-screen agent. To allow it, run muster pair " +
+          "on your computer and pair this phone again.",
+      );
+    }
+    return false;
+  }
+  const s = sessions.peek().get(sid);
+  // An asleep agent's tab takes typing: the daemon holds it and wakes the agent (src/sleep.rs).
+  if (!s || (s.state === "exited" && !sessionAsleep(s)) || !rpc.isOpen) return false;
+  // Raw bytes: a legacy mouse report is one byte per value, never UTF-8.
+  rpc.sendInput(sid, data);
+  return true;
+}
+
 /** Resize only on an explicit action; approval uses the version rendered by its caller. */
 export async function act<T = unknown>(s: SessionInfo, method: string, params: object = {}, grid?: Grid) {
   if (!canInteract.peek()) {
     throw new Error(ready.peek() ? "This device has view access only" : "Disconnected");
   }
-  if (s.state === "exited") throw new Error("Session exited");
+  // A message to an asleep agent wakes it (src/sleep.rs); nothing else reaches a stopped run.
+  if (s.state === "exited" && !(sessionAsleep(s) && method === "session.send")) {
+    throw new Error(sessionAsleep(s) ? `${s.name} is asleep: send it a message to wake it` : "Session exited");
+  }
   if (prefs.peek().termSize === "follow" && method !== "session.interrupt") {
     const target = viewer?.sid === s.id ? viewer.grid() : grid;
     if (!target) throw new Error("Open the session to measure the terminal");
@@ -244,10 +351,14 @@ export function start() {
     else readLocation();
   });
   rpc.onHello = (hello) => {
+    helloCount++;
+    viewer?.disconnected();
     batch(() => {
       sessions.value = new Map(hello.sessions.map((s) => [s.id, s]));
       channels.value = new Map(hello.channels.map((c) => [c.id, c]));
     });
+    for (const id of programScroll.keys()) if (!sessions.peek().has(id)) programScroll.delete(id);
+    for (const s of hello.sessions) noteSession(programScroll, s);
     const info = viewer && sessions.peek().get(viewer.sid);
     if (info) viewer!.update(info);
     attached = null;
@@ -257,12 +368,14 @@ export function start() {
     switch (event.event) {
       case "session_upserted":
         sessions.value = new Map(sessions.peek()).set(event.data.id, event.data);
+        noteSession(programScroll, event.data);
         if (viewer?.sid === event.data.id) viewer.update(event.data);
         break;
       case "session_removed": {
         const next = new Map(sessions.peek());
         next.delete(event.data.id);
         sessions.value = next;
+        programScroll.delete(event.data.id);
         break;
       }
       case "channel_upserted":
@@ -277,6 +390,12 @@ export function start() {
       case "notice":
         notify(event.data.text);
         break;
+      case "attach_info":
+        if (viewer?.sid === event.data.id) viewer.attachInfo(event.data);
+        break;
+      case "push_changed":
+        pushChanged.value++;
+        break;
     }
   };
   rpc.onBinary = (type, sid, payload) => {
@@ -284,13 +403,19 @@ export function start() {
   };
   rpc.onClosed = async () => {
     attached = null;
+    viewer?.disconnected();
     if (auth.peek() !== "unpaired") await checkDevice();
   };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") rpc.suspend();
-    else reconnect();
+    if (document.visibilityState === "hidden") {
+      stopRetrying();
+      rpc.suspend();
+    } else reconnect();
   });
   document.addEventListener("freeze", () => rpc.suspend());
+  // Chrome's page lifecycle: a frozen page that comes back fires `resume`.
+  document.addEventListener("resume", () => reconnect());
+  setInterval(heartbeat, PING_EVERY_MS);
   addEventListener("offline", () => {
     online.value = false;
     rpc.suspend();

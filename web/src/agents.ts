@@ -14,6 +14,7 @@ import type {
   SessionInfo,
 } from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
+import { idleText } from "./cache.ts";
 
 /** What a row shows: the dot's state, whether a process runs, and the state's label and start. */
 export interface AgentStatus {
@@ -21,15 +22,58 @@ export interface AgentStatus {
   state: AgentState | null;
   /** Its session is running (clicking it only pulls the tab). */
   live: boolean;
+  /** Asleep: stopped while idle, the next message wakes it (src/sleep.rs). */
+  asleep: boolean;
   label: string;
   /** Unix ms the state began (null: never started). */
   since: number | null;
 }
 
 export function agentStatus(a: Agent, s: SessionInfo | undefined): AgentStatus {
-  if (!s || a.session_id === null) return { state: null, live: false, label: "stopped", since: null };
-  if (s.state === "exited") return { state: "exited", live: false, label: "stopped", since: s.state_since };
-  return { state: s.state, live: true, label: STATE_LABEL[s.state], since: s.state_since };
+  // Asleep is the agent's own state: its session is exited (or gone), and it is not "stopped".
+  if (isAsleep(a, s)) return { state: "exited", live: false, asleep: true, label: "asleep", since: a.asleep_at ?? null };
+  if (!s || a.session_id === null) return { state: null, live: false, asleep: false, label: "stopped", since: null };
+  if (s.state === "exited") return { state: "exited", live: false, asleep: false, label: "stopped", since: s.state_since };
+  return { state: s.state, live: true, asleep: false, label: STATE_LABEL[s.state], since: s.state_since };
+}
+
+/** The agent is asleep (its record says so and no run of its session is going). */
+export function isAsleep(a: Agent | undefined, s: SessionInfo | undefined): boolean {
+  return !!a?.asleep && (!s || s.state === "exited");
+}
+
+/** The shortest and longest idle time an agent sleeps after (src/sleep.rs `AFTER_MIN`/`AFTER_MAX`). */
+export const SLEEP_AFTER_MIN = 5;
+export const SLEEP_AFTER_MAX = 7 * 24 * 60;
+/** What the dialog suggests when sleep is switched on: about when a Claude subscription's cache
+ * expires anyway, so sleeping then costs nothing extra on the next message. */
+export const SLEEP_AFTER_DEFAULT = 60;
+
+/** Parse the dialog's minutes field: a whole number in range, else null. */
+export function parseSleepAfter(v: string): number | null {
+  const t = v.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return n >= SLEEP_AFTER_MIN && n <= SLEEP_AFTER_MAX ? n : null;
+}
+
+/** The asleep bar's sentence: how long it has slept, that the next message wakes it, and when
+ * its prompt cache has likely expired, what that wake costs (`cold`). */
+export function asleepText(name: string, asleepAt: number | null | undefined, cold: boolean, now: number): string {
+  const lead = asleepAt != null && now - asleepAt >= 60_000
+    ? `${name} has been asleep for ${idleText(now - asleepAt)}`
+    : `${name} is asleep`;
+  return `${lead}. The next message, or typing here, wakes it` +
+    (cold
+      ? `: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.`
+      : " into the same conversation.");
+}
+
+/** The asleep bar's line after a wake that failed (`wake_error`): still asleep, how to try again,
+ * and what a wake costs once its prompt cache has likely expired (`cold`). */
+export function wakeFailedText(name: string, error: string, cold: boolean): string {
+  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message, or typing here, tries again` +
+    (cold ? ", and re-reads the whole conversation at full cost." : ".");
 }
 
 /** "now", "45s", "12m", "3h", "2d". */

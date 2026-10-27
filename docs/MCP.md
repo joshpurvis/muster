@@ -95,8 +95,8 @@ and targets in them are refused.
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
-| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. |
-| `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session, sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message. See "Agents" below. |
+| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
+| `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message. See "Agents" below. |
 | `reply` | `msg_id`, `text` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, or starts with `!` (unless shell commands are allowed). |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
@@ -805,6 +805,60 @@ rule, hop limit, daily cap and permission check apply. Every other tool keeps th
 so agents can read each other's terminals but not reach the user's project workspaces (unless
 `MUSTER_MCP_CROSS_WORKSPACE=1`), and project agents don't drive an agent's terminal directly.
 
+### Schedules
+
+A named agent can schedule work for itself (docs/SCHEDULING_PLAN.md, Phase 3). The owner's rule:
+an agent **proposes** and the human **approves** each proposal with a click in the Agents panel
+(only there: no command, tool or script approves); the one exception is a **one-off reminder for the agent itself,
+5 minutes to 24 hours ahead**, which runs without approval. Code: `src/schedules/agent.rs`.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `list_schedules` | — | `{schedules: [{schedule_id, agent, name, prompt, when, status, next_run, made_by, last_run}], takes_scheduled_work, limits}`: the schedules that run on the caller or that it made. `status` is `proposed` (waiting for the human), `active`, `paused`, `expired` or `done`; `next_run` is a local time. |
+| `propose_schedule` | `prompt`, `reason`, exactly one of `cron` / `at` (`"YYYY-MM-DDTHH:MM"` or unix ms) / `in_minutes`; `agent?` (default: the caller), `name?`, `tz?`, `conversation?` (`continue`\|`fresh`), `quiet_hours?`, `daily_cap?`, `note_id?` | `{schedule_id, status: "proposed", agent, when, estimate, note}`. A schedule that **doesn't run** until the human approves it. The human sees its prompt, timing, agent, the caller's `reason` and an estimate of its use (runs in the coming week after quiet hours and caps, what pays for them, the caps that bound them), and may edit or dismiss it. The agent it runs on must take scheduled work. Times only: no triggers, no "Then…" steps (those are the human's). A notice and desktop notification tell the human it waits. |
+| `set_reminder` | `prompt`, `in_minutes` (5 to 1440) **or** `at`; `name?`, `tz?` | `{schedule_id, status: "active", runs_at, note}`. A one-off schedule for the caller only, no approval: Muster sends `prompt` then, into its current conversation, as scheduled work (origin `schedule`). The caller must take scheduled work. For a Claude subscription agent, quiet hours stay on and a time inside them is refused. |
+| `pause_schedule` | `schedule_id` | `{schedule_id, status}`. Pauses a schedule that runs on the caller or that it made. Only the human resumes. |
+| `delete_schedule` | `schedule_id` | `{deleted}`. Deletes a schedule the caller made (a proposal, a reminder, an approved proposal) and its history. A schedule the human made can only be paused. |
+
+Rules (every one is checked in the tool, whatever the client):
+
+- **Only the human approves, resumes or widens.** No tool approves, resumes, edits or makes a
+  schedule directly; `schedule.update`, `schedule.create`, resuming and the settings are refused
+  from an agent's session and from a shell an agent has typed into, and `schedule.approve` is
+  taken only from a click in Muster's window (a WebSocket of the UI's that holds a window, whose
+  program is known and isn't inside any session: never the CLI, `/api/rpc` or a script;
+  docs/PROTOCOL.md "Schedules"). A schedule made or widened anywhere else (the CLI without a
+  session id, `/api/rpc`, a script) is held for that click like a proposal, and settings that
+  loosen a limit are refused there. To change an approved schedule an agent proposes a new one.
+  (Agents run as the owner's user, so this raises the bar rather than closing it:
+  docs/SCHEDULING_PLAN.md "Approval and its limits".)
+- **Not from unattended work.** A session handling scheduled or triggered work (any chain a
+  schedule or trigger started: its provenance's origin isn't `human`) can't propose or set a
+  reminder. So a reminder can't set the next one, and a schedule can't breed more schedules; the
+  agent can again once the human writes to it. An ask from another agent on a human-rooted chain
+  is the human's work.
+- **Only named agents**, and a reminder only for the caller itself; a proposal may be for another
+  agent that takes scheduled work.
+- **Limits per agent:** reminders at most 3 waiting, at least 15 minutes apart, 10 set per rolling
+  24 hours (deleted ones count); proposals at most 3 waiting, 10 per rolling 24 hours (deleted or
+  dismissed ones count); at most 5 live schedules it made (waiting, active, paused, or a one-off
+  whose run is due but still waiting in line, which also counts as waiting and for the 15
+  minutes). Calls are checked and recorded one at a time, so calls made at once (MCP and
+  `muster schedule` together) can't overshoot a limit. The cron
+  floor (every 15 minutes at most) applies as to the human's. Proposals and reminders share the
+  post rate limit (30 per minute with note writes, panel updates and posts).
+- **Once made (a reminder) or approved (a proposal), it is an ordinary schedule:** origin
+  `schedule`, so the agent's accepted origins, the unattended cap (24 a day), the 200-a-day cap,
+  the OpenRouter spend caps, quiet hours, a Claude subscription agent's 7-day expiry (from
+  approval), the busy rule and the missed-run rule all apply when it runs.
+- A proposal nobody approves is removed after 7 days; a reminder a day after it ran (its message
+  stays in the agent's log). Every call is audited (`mcp_call`), and each schedule records who made
+  it (`made_by`).
+
+The same from an agent's shell: `muster schedule propose …` and `muster schedule remind …` inside
+its session run `propose_schedule` and `set_reminder` as that agent, and `muster schedule pause`
+and `muster schedule rm` run `pause_schedule` and `delete_schedule` (docs/CLI.md "Schedules").
+
 ### Permissions
 
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see
@@ -876,6 +930,7 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Agent daily cap | **200** messages delivered to one agent per rolling 24 hours, any origin (`guard::AGENT_DAILY_PROMPT_CAP`; counted from `agent_messages`, so it survives restarts, and re-checked in the same transaction as the insert, so concurrent asks over MCP and the CLI can't overshoot). |
 | Agent messages | Only through `ask_agent`: `send_message` to an agent's session is refused. `ask_agent` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check, against the widest of the agent session's current tab and the agent's own tab (its profile before it has one). An agent only ever runs in its own tab (stored on the agent), never a same-named one. |
 | Message size | 100 000 chars (`send_message`), 20 000 chars (`post_to_channel`) |
+| Schedules | An agent proposes; only the human approves (no tool approves, resumes or edits a schedule). One-off reminders for the caller itself, 5 minutes to 24 hours ahead, need no approval. Neither while handling scheduled or triggered work. Limits: see "Schedules" above. |
 | Permission prompts | There is **no approve tool**. `send_message` with `interrupt: true` is refused while the target is `needs_approval`. Plain sends are queued and delivered only once the agent is ready. A marked extension point (`guard::AGENTS_MAY_APPROVE`, see `src/mcp/guard.rs`) exists for a future human-enabled setting. |
 | Audit | Every `tools/call` (including refused ones, unknown tools, and calls without a name) logs an `mcp_call` event in the caller's channel: `{session_id, tool, args, ok}`, plus `cancelled: true` if the client disconnected mid-call. Strings in args over 500 bytes are shortened; args over 4 KB total are replaced by a truncated string. Protocol-level rejections (bad auth, bad headers) are not tool calls and aren't logged. |
 

@@ -1,14 +1,20 @@
 // End-to-end smoke test for the muster daemon. Run through scripts/smoke.sh, which builds the
 // binary, makes a temp dir and passes scoped Deno permissions:
 //   deno run --allow-net=127.0.0.1 --allow-read=<tmp>,<bin> --allow-write=<tmp> \
-//            --allow-run=<bin>,git,python3,unshare scripts/smoke.ts <tmp> <bin>
-// The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
+//            --allow-run=<bin>,git,python3,unshare,openssl scripts/smoke.ts <tmp> <bin>
+// The panel proxy gets an ephemeral loopback port. Python reads the fixture SQLite DB and
+// lists command lines (no push endpoint or signed token may be on one); openssl makes the
+// phone-alerts fake push service's certificate.
 // Never uses port 7433 or the default data dirs.
 
-const [BASE, BIN] = Deno.args;
-if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary>");
-const PORT = Number(Deno.env.get("MUSTER_SMOKE_PORT") || 17433);
-if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535 || PORT === 7433) throw new Error(`bad MUSTER_SMOKE_PORT ${PORT}`);
+const [BASE, BIN, PORT_ARG] = Deno.args;
+if (!BASE || !BIN) throw new Error("usage: smoke.ts <tmpdir> <muster-binary> [port]");
+// A port of its own lets two worktrees run the smoke test at once (scripts/smoke.sh passes
+// MUSTER_SMOKE_PORT).
+const PORT = Number(PORT_ARG || 17433);
+if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535 || PORT === 7433) {
+  throw new Error(`bad smoke port ${PORT_ARG}: use 1024-65535, never 7433`);
+}
 const DATA = `${BASE}/data`;
 const RUNTIME = `${BASE}/run`;
 const REPO = `${BASE}/repo`;
@@ -111,8 +117,12 @@ class Client {
   frames: { type: number; id: number; data: Uint8Array }[] = [];
   closed = false;
 
-  constructor(token: string) {
-    this.ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${token}`);
+  /** `origin`: the Origin header to send (Muster's own UI sends its origin; a script none). */
+  constructor(token: string, origin?: string) {
+    const url = `ws://127.0.0.1:${PORT}/ws?token=${token}`;
+    // Deno's WebSocket takes headers as its second argument.
+    // deno-lint-ignore no-explicit-any
+    this.ws = origin ? new (WebSocket as any)(url, { headers: { Origin: origin } }) : new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
     this.ws.onmessage = (m) => {
       if (typeof m.data === "string") {
@@ -205,12 +215,16 @@ const LAUNCH_DUMP = (cli: string) =>
   `{ printf 'ARGS'; printf ' %s' "$@"; printf '\\n'; for v in ${LAUNCH_VARS}; do if [ -n "\${!v+set}" ]; then printf '%s=%s\\n' "$v" "\${!v}"; fi; done; } > '${BASE}/launch-${cli}-'"$MUSTER_SESSION_ID"`;
 
 async function main() {
-  // Stand-in only: renders an empty Codex composer, records input, never starts an agent.
+  // Stand-in only: renders an empty Codex composer, records input, never starts an agent. Asked
+  // to resume the thread "stale-thread", it fails the way Codex does for a thread it doesn't
+  // have (guess: exit 1 before its TUI and hooks start).
   await Deno.mkdir(`${BASE}/bin`, { recursive: true });
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token-'"$MUSTER_SESSION_ID"
 ${LAUNCH_DUMP("codex")}
+if [ "$1" = resume ] && [ "\${@: -1}" = stale-thread ]; then echo 'Error: No saved session found with ID stale-thread. Run \`codex resume\` without an ID to choose from existing sessions.'; exit 1; fi
+if [ "$1" = resume ] && [ -e '${BASE}/codex-broken' ]; then echo 'Error: failed to initialize state runtime: database is locked'; exit 1; fi
 stty -echo -icanon min 1 time 0
 printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
 exec tee '${BASE}/fake-input-'"$MUSTER_SESSION_ID" > '${BASE}/fake-input'
@@ -219,6 +233,7 @@ exec tee '${BASE}/fake-input-'"$MUSTER_SESSION_ID" > '${BASE}/fake-input'
   // Stand-in Claude: records how it was launched, then idles (never starts a real agent).
   await Deno.writeTextFile(`${BASE}/bin/claude`, `#!/bin/bash
 ${LAUNCH_DUMP("claude")}
+printf '%s' "$MUSTER_TOKEN" > '${BASE}/claude-token-'"$MUSTER_SESSION_ID"
 exec cat > /dev/null
 `);
   await Deno.chmod(`${BASE}/bin/claude`, 0o700);
@@ -707,6 +722,93 @@ exec cat > /dev/null
   await c2.call("session.detach", { id: sid });
   c2.close();
 
+  // Phone replays (docs/PROTOCOL.md `attach_info`): a screen, then only the bytes it missed.
+  const infos = (cl: Client) => cl.events.filter((e) => e.event === "attach_info").map((e) => e.data);
+  const phone = new Client(d.token);
+  await phone.open();
+  await phone.call("session.attach", { id: sid, replay: "screen", replay_bytes: 65536 });
+  await phone.waitFor("screen replay", () => phone.frames.some((f) => f.id === sid && f.type === 0x03));
+  const shown = infos(phone)[0];
+  ok(shown?.id === sid && shown.kind === "screen" && Number.isInteger(shown.offset) &&
+    Number.isInteger(shown.generation) && typeof shown.epoch === "string", "a screen attach is announced by attach_info");
+  c.input(sid, "echo third$((1+2))\r");
+  await phone.waitFor("live output on the phone", () => phone.terminal(sid).includes("third3"));
+  const reached = shown.offset +
+    phone.frames.filter((f) => f.id === sid && f.type === 0x01).reduce((n, f) => n + f.data.length, 0);
+  phone.close();
+  c.input(sid, "echo missed$((2+2))\r");
+  await c.waitFor("output while the phone is away", () => c.terminal(sid).includes("missed4"));
+  await sleep(300);
+  const back = new Client(d.token);
+  await back.open();
+  ok(Number.isInteger(shown.size_rev), "attach_info carries the terminal size revision");
+  const since = { offset: reached, generation: shown.generation, epoch: shown.epoch, size_rev: shown.size_rev };
+  await back.call("session.attach", { id: sid, replay: { since } });
+  await back.waitFor("delta replay", () => back.frames.some((f) => f.id === sid && f.type === 0x03));
+  const delta = back.frames.find((f) => f.id === sid && f.type === 0x03)!.data;
+  const resumed = infos(back)[0];
+  ok(resumed?.kind === "delta" && dec.decode(delta).includes("missed4") && !dec.decode(delta).includes("third3") &&
+    resumed.offset === reached + delta.length, "a returning phone gets only the bytes it missed (delta)");
+  await back.call("session.attach", { id: sid, replay: { since: { ...since, epoch: "another-daemon-run" } } });
+  await back.waitFor("second attach_info", () => infos(back).length === 2);
+  ok(infos(back)[1].kind === "screen", "an offset from another daemon run gets a screen");
+  // A resize while away (here shrunk and restored, with nothing printed) can't be caught up by
+  // appending: the host clipped what the narrower terminal couldn't hold.
+  const position = (cl: Client) => {
+    const i = infos(cl).at(-1);
+    const last = cl.frames.findLastIndex((g) => g.id === sid && g.type === 0x03);
+    const live = cl.frames.slice(last + 1).filter((f) => f.id === sid && f.type === 0x01);
+    return { offset: i.offset + live.reduce((n, f) => n + f.data.length, 0), generation: i.generation, epoch: i.epoch,
+      size_rev: i.size_rev };
+  };
+  const away = async (since: Json, n: number) => {
+    await back.call("session.detach", { id: sid });
+    await sleep(200);
+    await back.call("session.attach", { id: sid, replay: { since } });
+    await back.waitFor(`attach_info ${n}`, () => infos(back).length === n);
+    return infos(back)[n - 1];
+  };
+  ok((await away(position(back), 3)).kind === "delta", "a phone that was away without a resize gets a delta");
+  // A phone still on the bundle from before size_rev existed: attaches, gets a screen.
+  const { size_rev: _unknown, ...oldShape } = position(back);
+  ok((await away(oldShape, 4)).kind === "screen", "an old phone's since without size_rev gets a screen");
+  const preResize = position(back);
+  await c.call("session.resize", { id: sid, cols: 60, rows: 30 });
+  await c.call("session.resize", { id: sid, cols: 100, rows: 30 });
+  const afterResize = await away(preResize, 5);
+  ok(afterResize.kind === "screen" && afterResize.size_rev === preResize.size_rev + 4,
+    "a phone that was away during a resize gets a screen");
+  // A run that ended while the phone was away replays as ended (a full-screen view moves into
+  // history): never a delta, even with nothing printed since.
+  const exitCh = await c.call("channel.create", { workspace_id: ws.id, name: "replay exit", agent: "shell" });
+  await c.waitFor("exit-test shell", () => c.events.some((e) => e.event === "session_upserted" &&
+    e.data.channel_id === exitCh.id && e.data.pid > 0));
+  const exitSid = c.events.find((e) => e.event === "session_upserted" && e.data.channel_id === exitCh.id)!.data.id;
+  const leaver = new Client(d.token);
+  await leaver.open();
+  await leaver.call("session.attach", { id: exitSid, replay: "screen" });
+  await leaver.waitFor("exit-test screen", () => infos(leaver).length === 1 &&
+    leaver.frames.some((f) => f.id === exitSid && f.type === 0x03));
+  await sleep(500);
+  const gone = infos(leaver)[0];
+  const lastReplay = leaver.frames.findLastIndex((g) => g.id === exitSid && g.type === 0x03);
+  const exitSince = { offset: gone.offset + leaver.frames.slice(lastReplay + 1).filter((f) => f.id === exitSid &&
+    f.type === 0x01).reduce((n, f) => n + f.data.length, 0), generation: gone.generation, epoch: gone.epoch,
+    size_rev: gone.size_rev };
+  leaver.close();
+  await c.call("session.kill", { id: exitSid });
+  await c.waitFor("exit-test exit", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === exitSid &&
+    e.data.state === "exited"));
+  const returner = new Client(d.token);
+  await returner.open();
+  await returner.call("session.attach", { id: exitSid, replay: { since: exitSince } });
+  await returner.waitFor("exit-test attach_info", () => infos(returner).length === 1);
+  ok(infos(returner)[0].kind === "screen", "a phone that was away while the run ended gets a screen");
+  returner.close();
+  await c.call("channel.archive", { id: exitCh.id, remove_worktree: false });
+  ok(JSON.stringify(await back.call("ping")) === "{}", "ping answers");
+  back.close();
+
   // ----- windows, tabs, auto naming -----
   const httpRpc = async (method: string, params: Json = {}) =>
     await (
@@ -1047,6 +1149,77 @@ exec cat > /dev/null
   const agentCh: number = started.session.channel_id;
   const sessOf = async (id: number) => (await c.call("hello")).sessions.find((x: Json) => x.id === id);
   await c.waitFor("fake agent idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === agentSid && e.data.state === "idle"));
+
+  // Codex resume: a finished turn's thread is reopened as `codex resume <flags> -- <thread>` on
+  // the next start, for a plain Codex tab and a named Codex agent alike; a thread Codex no
+  // longer has ends that run, says so, and the next start is a new conversation.
+  const agentToken = await Deno.readTextFile(`${BASE}/fake-token`);
+  /** The launch `act` makes of session `id`, its token, and the events from `act` on. */
+  const codexLaunch = async (id: number, act: () => Promise<unknown>) => {
+    await Deno.remove(`${BASE}/launch-codex-${id}`).catch(() => {});
+    const mark = c.events.length;
+    await act();
+    const args = (await launchOf("codex", id)).args;
+    const since = () => c.events.slice(mark).filter((e) => e.event === "session_upserted" && e.data.id === id).map((e) => e.data);
+    return { args, token: await Deno.readTextFile(`${BASE}/fake-token`), since };
+  };
+  const turnDone = async (id: number, token: string, thread: string) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ type: "agent-turn-complete", "thread-id": thread, "input-messages": ["hi"], "last-assistant-message": `done ${thread}` }),
+    });
+    ok(r.ok, `codex resume: notify for ${thread} accepted`);
+    await c.waitFor(`notify ${thread}`, () => c.events.some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state_detail === `done ${thread}`));
+  };
+  const codexTab: number = (await c.call("session.spawn", { channel_id: agentCh, kind: "codex", extra_args: ["-m", "gpt-smoke"] })).id;
+  const firstArgs = (await launchOf("codex", codexTab)).args;
+  ok(!firstArgs.startsWith("ARGS resume") && !firstArgs.includes(" -- "), `codex resume: a new tab starts a new conversation: ${firstArgs.slice(0, 80)}`);
+  await c.waitFor("codex tab idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === codexTab && e.data.state === "idle"));
+  await turnDone(codexTab, await Deno.readTextFile(`${BASE}/fake-token`), "thread-tab-1");
+  const tab = await codexLaunch(codexTab, () => c.call("session.restart", { id: codexTab }));
+  ok(
+    tab.args.startsWith("ARGS resume -c notify=") && tab.args.endsWith(" -- thread-tab-1") && tab.args.includes(" --sandbox ") &&
+      tab.args.includes(" -m gpt-smoke ") && !tab.args.includes("--resume"),
+    `codex resume: a restarted tab reopens its thread with its flags: ${tab.args.slice(0, 40)}…${tab.args.slice(-60)}`,
+  );
+  await c.call("session.remove", { id: codexTab });
+  // The agent: its thread is on its record, so a restart (and agent.start) reopens it.
+  await turnDone(agentSid, agentToken, "thread-agent-1");
+  ok((await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: the agent keeps its thread");
+  let ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.startsWith("ARGS resume ") && ag.args.endsWith(" -- thread-agent-1"), `codex resume: a restarted agent reopens its thread: ${ag.args.slice(-60)}`);
+  await c.waitFor("resumed agent idle", () => ag.since().some((s) => s.state === "idle"));
+  // A sub-agent's turn (its own thread) never replaces the agent's.
+  const child = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+    method: "POST", headers: { Authorization: `Bearer ${ag.token}` },
+    body: JSON.stringify({ type: "agent-turn-complete", "thread-id": "thread-child", "input-messages": ["sub task"], "last-assistant-message": "child done" }),
+  });
+  ok(child.ok, "codex resume: a sub-agent's notify accepted");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.endsWith(" -- thread-agent-1"), `codex resume: a sub-agent's turn didn't replace the thread: ${ag.args.slice(-40)}`);
+  // Any other failure (here: Codex's database can't open) keeps the thread.
+  await Deno.writeTextFile(`${BASE}/codex-broken`, "");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  await c.waitFor("broken run ends", () => ag.since().some((s) => s.state === "exited" && s.exit_code === 1));
+  await Deno.remove(`${BASE}/codex-broken`);
+  ok(!(await sessOf(agentSid)).state_detail?.includes("couldn't reopen"), "codex resume: an unrelated exit 1 says nothing about the conversation");
+  ok((await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: an unrelated exit 1 keeps the thread");
+  // Start fresh, then a thread Codex no longer has: that run ends, the tab says so, the next
+  // start is new.
+  ag = await codexLaunch(agentSid, () => c.call("agent.start", { name: "bg", fresh: true }));
+  ok(!ag.args.startsWith("ARGS resume"), `codex resume: Start fresh starts a new conversation: ${ag.args.slice(0, 40)}`);
+  await c.waitFor("fresh agent idle", () => ag.since().some((s) => s.state === "idle"));
+  await turnDone(agentSid, ag.token, "stale-thread");
+  ag = await codexLaunch(agentSid, () => c.call("session.restart", { id: agentSid }));
+  ok(ag.args.endsWith(" -- stale-thread"), "codex resume: the restart tries the stale thread");
+  await c.waitFor("stale resume ends", () => ag.since().some((s) => s.state === "exited" && s.exit_code === 1));
+  const failed = await sessOf(agentSid);
+  ok(failed.state_detail?.includes("couldn't reopen its conversation"), `codex resume: the tab says the conversation couldn't be reopened: ${failed.state_detail}`);
+  ok(!(await c.call("agent.list")).find((a: Json) => a.name === "bg").resumable, "codex resume: the agent forgets the stale thread");
+  ag = await codexLaunch(agentSid, () => c.call("agent.start", { name: "bg" }));
+  ok(!ag.args.startsWith("ARGS resume") && !ag.args.includes("stale-thread"), `codex resume: the next start is a new conversation: ${ag.args.slice(0, 60)}`);
+  await c.waitFor("fresh agent idle", () => ag.since().some((s) => s.state === "idle"));
+
   const plainTab = await c.call("session.spawn", { channel_id: agentCh, kind: "shell" });
   await c.call("session.hide", { id: plainTab.id }).then(
     () => ok(false, "session.hide refuses a tab that isn't an agent's"),
@@ -1086,9 +1259,12 @@ exec cat > /dev/null
   await c.call("agent.remove", { name: "bg" });
 
   await lateReplies(c, mcp);
+  ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
   ({ c, d } = await schedules(c, d));
   ({ c, d } = await triggers(c, d));
+  ({ c, d } = await agentSchedules(c, d));
+  ({ c, d } = await phoneAlerts(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
 }
@@ -1223,10 +1399,186 @@ async function filesContaining(dir: string, needle: string): Promise<string[]> {
 const cli = (args: string[], env: Record<string, string>) =>
   new Deno.Command(BIN, { args, env, stdin: "null", stdout: "piped", stderr: "piped" }).output();
 
+/** Muster's window as the owner has it: the UI's own Origin and a claimed window, from this test
+ * (a process outside every session). Schedules made or widened anywhere else (the CLI, a
+ * script's WebSocket) wait for its click on Approve; loosened settings only go through it. */
+async function ownerWindow(d: Daemon): Promise<Client> {
+  const w = new Client(d.token, `http://127.0.0.1:${PORT}`);
+  await w.open();
+  await w.call("window.claim", {});
+  return w;
+}
+
+/** The CLI's `schedule N: ...` line: held for the owner's click (it says so), then approved in
+ * the window. Returns the schedule's id. */
+async function approveHeld(w: Client, out: string, what: string): Promise<number> {
+  const id = Number(out.match(/schedule (\d+)/)![1]);
+  ok(out.includes("Waiting for your approval") && out.includes("click Approve"), `${what}: held for your click (${out.trim().slice(0, 160)})`);
+  const a = await w.call("schedule.approve", { id });
+  ok(a.status !== "held" && a.status !== "proposed", `${what}: approved in the window (${a.status})`);
+  return id;
+}
+
 /** Schedules (src/schedules/): made and listed through the CLI, a run is an agent message with
  * origin schedule, refusals, pause and skip, the busy rule, the reply in a note, and the missed-run
  * rule across a backend restart (a debug-build clock offset stands in for two days off). Returns
  * the client and backend it ends with. */
+/** Sleep and wake (src/sleep.rs), with the fake Codex standing in for the agent: an idle agent's
+ * process stops while its tab and conversation stay; whatever would deliver to it wakes it once,
+ * into the same conversation; looking at it never does; it stays asleep across a backend restart;
+ * and with a short idle time it falls asleep on its own. */
+async function sleepAndWake(
+  c: Client,
+  d: Daemon,
+  t: {
+    mcp: (token: string, name: string, args?: Json) => Promise<any>;
+  },
+): Promise<{ c: Client; d: Daemon }> {
+  const input = () => Deno.readTextFile(`${BASE}/fake-input`).catch(() => "");
+  // Through this section's client (it is replaced at the backend restart below).
+  const sessOf = async (id: number) => (await c.call("hello")).sessions.find((x: Json) => x.id === id);
+  const inputHas = async (...parts: string[]) => {
+    let got = "";
+    for (let n = 0; n < 150; n++) {
+      got = await input();
+      if (parts.every((p) => got.includes(p))) break;
+      await sleep(100);
+    }
+    return got;
+  };
+  const times = (s: string, part: string) => s.split(part).length - 1;
+  const dozy = async () => (await c.call("agent.list")).find((a: Json) => a.name === "dozy");
+  /** How many times session `id` began starting since event `mark`. */
+  const starts = (id: number, mark: number) => {
+    let last = "", n = 0;
+    for (const e of c.events.slice(mark)) {
+      if (e.event !== "session_upserted" || e.data.id !== id) continue;
+      if (e.data.state === "starting" && last !== "starting") n++;
+      last = e.data.state;
+    }
+    return n;
+  };
+  const refused = (p: Promise<unknown>, part: string, what: string) =>
+    p.then(() => ok(false, what), (e) => ok(String(e).includes(part), `${what}: ${e}`));
+  /** Sleep once Muster has finished typing (a prompt is checked for a few seconds after Enter,
+   * and nothing sleeps while one is: "it has prompts waiting to be typed"). */
+  const sleepSoon = async () => {
+    for (let n = 0; ; n++) {
+      try {
+        return await c.call("agent.sleep", { name: "dozy" });
+      } catch (e) {
+        if (n > 100 || !String(e).includes("can't sleep now")) throw e;
+        await sleep(100);
+      }
+    }
+  };
+  /** Its turn ends (Codex's notify, always the same thread): the reply, and the agent at rest. */
+  const turnEnd = async (id: number, token: string) => {
+    const mark = c.events.length;
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ type: "agent-turn-complete", "thread-id": "thread-dozy", "input-messages": ["hi"], "last-assistant-message": "done thread-dozy" }),
+    });
+    await r.body?.cancel();
+    await c.waitFor("dozy's turn end", () =>
+      c.events.slice(mark).some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state_detail === "done thread-dozy"));
+  };
+
+  const made = await c.call("agent.create", { name: "dozy", kind: "codex", sleep_after_min: 5 });
+  ok(made.sleep_after_min === 5 && made.asleep === false, "sleep: agent.create takes an idle time, off unless given");
+  await refused(c.call("agent.update", { name: "dozy", sleep_after_min: 2 }), "5 to", "sleep: less than 5 minutes is refused");
+  await refused(c.call("agent.sleep", { name: "dozy" }), "isn't running", "sleep: a stopped agent has nothing to stop");
+  const zid: number = (await c.call("agent.start", { name: "dozy" })).session.id;
+  await c.waitFor("dozy idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === zid && e.data.state === "idle"));
+  let token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await refused(c.call("agent.sleep", { name: "dozy" }), "couldn't pick it up again", "sleep: never before its conversation is saved");
+  // Two panels of its own: one the human closes while it sleeps, one they click in.
+  const closing = (await t.mcp(token, "panel_open", { title: "Dozy closing", app: "markdown" })).panel_id;
+  const clicking = (await t.mcp(token, "panel_open", { title: "Dozy clicking", app: "markdown" })).panel_id;
+  await turnEnd(zid, token);
+
+  let mark = c.events.length;
+  const slept = await c.call("agent.sleep", { name: "dozy" });
+  let z = await sessOf(zid);
+  ok(slept.asleep && slept.asleep_at > 0 && z.state === "exited" && z.state_detail === "asleep",
+    `sleep: its process stopped, its tab kept and shown asleep (${z.state}, ${z.state_detail})`);
+  ok((await c.call("agent.sleep", { name: "dozy" })).asleep, "sleep: asleep already is nothing to do");
+  // Looking never wakes it: lists (agent.list is list_agents' JSON), its output, its panel
+  // closing, the terminal's own reports (focus, a mouse click) from its tab.
+  await c.call("hello");
+  await c.call("session.output", { id: zid, lines: 20 });
+  const listed = await dozy();
+  ok(listed?.asleep === true && listed?.state === "exited" && listed?.asleep_at === slept.asleep_at, "sleep: the agent list says asleep");
+  await c.call("panel.dismiss", { id: closing });
+  c.input(zid, "\x1b[I\x1b[O\x1b[<0;3;4M\x1b[<0;3;4m");
+  await sleep(1500);
+  ok((await dozy()).asleep && starts(zid, mark) === 0,
+    "sleep: listing, reading its screen, closing its panel and focus or mouse reports never wake it");
+
+  // Typing into its tab wakes it: the keys are held, then typed once into the resumed run.
+  mark = c.events.length;
+  await Deno.remove(`${BASE}/launch-codex-${zid}`).catch(() => {});
+  c.input(zid, "hello from the keyboard");
+  c.input(zid, "\r");
+  // (The fake's terminal turns Enter's \r into \n.)
+  let got = await inputHas("hello from the keyboard\n");
+  ok(times(got, "hello from the keyboard") === 1 && got.includes("keyboard\n"),
+    `wake: typing into an asleep tab wakes it and is typed once it is ready: ${JSON.stringify(got.slice(0, 60))}`);
+  ok((await launchOf("codex", zid)).args.endsWith(" -- thread-dozy"), "wake: it resumes the same conversation");
+  ok(!(await dozy()).asleep && starts(zid, mark) === 1, "wake: awake, started once");
+
+  // Two messages at once wake it once; each is typed in exactly once.
+  await sleepSoon();
+  mark = c.events.length;
+  const asks = await Promise.all([1, 2].map((n) =>
+    c.call("agent.ask", { agent: "dozy", text: `together ${n}`, timeout_ms: 1000 })
+  ));
+  got = await inputHas("together 1", "together 2");
+  ok(asks.filter((r) => r.woke).length === 1 && asks.every((r) => r.session_id === zid) && starts(zid, mark) === 1,
+    `wake: two messages at once wake it once (woke: ${asks.map((r) => r.woke)})`);
+  ok(times(got, "together 1") === 1 && times(got, "together 2") === 1, "wake: neither message lost or typed twice");
+  // Both submitted (and checked) before the turn ends: until then it is mid-turn.
+  for (let n = 0; n < 100 && (await sessOf(zid)).queued > 0; n++) await sleep(100);
+  token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await turnEnd(zid, token);
+
+  // Asleep stays asleep across a backend restart (autostart too), not exited or crashed.
+  await c.call("agent.update", { name: "dozy", autostart: true });
+  await sleepSoon();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  // One "minute" of idle time is 100 ms from here on (debug builds only).
+  d = await startDaemon({ MUSTER_TEST_SLEEP_MINUTE_MS: "100" });
+  c = new Client(d.token);
+  await c.open();
+  await sleep(1500);
+  z = await sessOf(zid);
+  ok((await dozy()).asleep && z.state === "exited" && z.state_detail === "asleep",
+    `restart: still asleep after a backend restart, and autostart left it asleep (${z.state}, ${z.state_detail})`);
+
+  // A message wakes it (woke: true), and once idle for its 5 "minutes" it falls asleep on its own.
+  mark = c.events.length;
+  const woke = await c.call("agent.ask", { agent: "dozy", text: "after the restart", timeout_ms: 1000 });
+  ok(woke.woke === true && String(woke.woke_note).includes("was asleep"), "wake: the ask's result says it woke the agent");
+  // Never asleep mid-turn: only once its turn ends after the message was typed in.
+  for (let n = 0; n < 100 && (await sessOf(zid)).queued > 0; n++) await sleep(100);
+  await sleep(1000);
+  ok(!(await dozy()).asleep, "auto: never asleep while the message it woke for is its turn");
+  token = await Deno.readTextFile(`${BASE}/fake-token`);
+  await turnEnd(zid, token);
+  await c.waitFor("dozy asleep on its own", () =>
+    c.events.slice(mark).some((e) => e.event === "agent_upserted" && e.data.name === "dozy" && e.data.asleep), 15000);
+  ok((await sessOf(zid)).state_detail === "asleep", "auto: it falls asleep on its own after its idle time");
+
+  // A real click in its panel wakes it; the earlier close notice comes along with it.
+  c.input(zid, "\x1b[I");
+  await c.call("panel.event", { panel_id: clicking, kind: "approve", payload: { message: "clicked while asleep" } });
+  got = await inputHas("clicked while asleep");
+  ok(got.includes("clicked while asleep") && got.includes('"kind":"closed"'), "wake: a click in its panel wakes it, with the close notice");
+  await c.call("agent.remove", { name: "dozy" });
+  return { c, d };
+}
+
 async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
   const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
   const sch = async (...args: string[]) => {
@@ -1243,6 +1595,7 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
     throw new Error(`timeout waiting for ${what}`);
   };
   const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+  const w = await ownerWindow(d);
 
   // A Claude agent that doesn't take scheduled work is refused, through the CLI too.
   await c.call("agent.create", { name: "nosched", kind: "claude" });
@@ -1254,8 +1607,13 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok(!fast.ok && fast.err.includes("every 15 minutes"), "schedule: faster than every 15 minutes is refused");
   const add = await sch("add", "sched", "--weekdays", "09:00", "--tz", "Europe/London", "--note", "Sched replies",
     "Summary for {date}, since {last_run}");
-  ok(add.ok && /schedule \d+: At 09:00, Monday to Friday \(Europe\/London\); next /.test(add.out), `muster schedule add (${add.out.trim()}${add.err})`);
-  const id = Number(add.out.match(/schedule (\d+)/)![1]);
+  ok(add.ok && /schedule \d+: At 09:00, Monday to Friday \(Europe\/London\)\n/.test(add.out), `muster schedule add (${add.out.trim()}${add.err})`);
+  const heldNow = JSON.parse((await sch("ls", "--json")).out).schedules.find((s: Json) => s.id === Number(add.out.match(/schedule (\d+)/)![1]));
+  ok(heldNow.status === "held" && heldNow.next_run === null && heldNow.held.what.join() === "made",
+    "made from the command line: held, no next run until the owner's click");
+  ok((await sch("run", String(heldNow.id))).err.includes("approve it"), "a held schedule can't be run");
+  ok((await w.call("schedule.list")).schedules.some((s: Json) => s.id === heldNow.id && s.estimate?.text), "its card says what it would use");
+  const id = await approveHeld(w, add.out, "muster schedule add");
   const ls = JSON.parse((await sch("ls", "--json")).out);
   const mine = ls.schedules.find((s: Json) => s.id === id);
   ok(mine && mine.agent === "sched" && mine.status === "active" && mine.next_run > Date.now() && mine.quiet_hours === false &&
@@ -1333,13 +1691,26 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   // Pause, resume, skip next.
   ok((await sch("pause", String(id))).out.includes("paused"), "muster schedule pause");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).paused, "paused shows in schedule.list");
-  ok((await sch("resume", String(id))).out.includes("active"), "muster schedule resume");
+  const resumed = await sch("resume", String(id));
+  ok(resumed.out.includes("held"), `muster schedule resume: held (${resumed.out.trim()})`);
+  await approveHeld(w, resumed.out, "muster schedule resume");
   ok((await sch("skip", String(id))).out.includes("skipping the run at"), "muster schedule skip");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === true, "skip_next is set");
-  await sch("skip", String(id), "--undo");
+  const unskip = await sch("skip", String(id), "--undo");
   ok((await c.call("schedule.list")).schedules.find((s: Json) => s.id === id).skip_next === false, "skip --undo");
+  await approveHeld(w, unskip.out, "muster schedule skip --undo");
+  // A WebSocket that isn't the owner's window (a script's: no window claimed) is held the same way.
+  const scripted = await c.call("schedule.update", { id, prompt: "Summary for {date}, since {last_run}, and more" });
+  ok(scripted.status === "held" && scripted.held.what.join() === "changed", "a widening edit from a script's WebSocket is held");
+  ok((await c.call("schedule.approve", { id }).then(() => "approved", (e: Error) => String(e))).includes("click on Approve"),
+    "and that WebSocket can't approve it");
+  ok((await w.call("schedule.approve", { id })).status === "active", "the window approves the edit");
+  ok((await w.call("schedule.update", { id, prompt: "Summary for {date}, since {last_run}" })).status === "active", "an edit in the window applies as made");
   ok((await sch("pause", "--all")).ok && (await c.call("schedule.settings.get")).paused === true, "muster schedule pause --all");
-  await sch("resume", "--all");
+  const resumeAll = await sch("resume", "--all");
+  ok(!resumeAll.ok && resumeAll.err.includes("Resuming all schedules") && resumeAll.err.includes("Muster's window"),
+    `muster schedule resume --all: only in the window (${resumeAll.err.trim()})`);
+  await w.call("schedule.settings.set", { paused: false });
 
   // The unattended cap: two schedule messages already today; at a cap of 2 the next is refused.
   await c.call("schedule.settings.set", { unattended_cap: 2 });
@@ -1348,7 +1719,9 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok((await runs(id))[0].reason.includes("unattended"), "a run past the unattended cap is refused, with the reason");
   const refusedMsgs = (await c.call("agent.messages", { agent: "sched" })).messages.filter((m: Json) => m.refused);
   ok(refusedMsgs.some((m: Json) => m.refused.includes("unattended") && m.origin === "schedule"), "the refusal is in the agent's message log");
-  await c.call("schedule.settings.set", { unattended_cap: 24 });
+  const raise = await c.call("schedule.settings.set", { unattended_cap: 24 }).then(() => "raised", (e: Error) => String(e));
+  ok(raise.includes("higher unattended cap"), `a script can lower a cap but not raise it (${raise})`);
+  await w.call("schedule.settings.set", { unattended_cap: 24 });
   await c.call("agent.remove", { name: "nosched" });
 
   // Missed runs across a restart: Muster is "off" for two days (a test clock offset), landing at
@@ -1357,12 +1730,13 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   const made = async (...args: string[]) => {
     const o = await sch("add", "sched", ...args);
     ok(o.ok, `muster schedule add ${args[0]} (${o.out.trim()}${o.err.trim()})`);
-    return Number(o.out.match(/schedule (\d+)/)![1]);
+    return await approveHeld(w, o.out, `muster schedule add ${args[0]}`);
   };
   const daily = await made("--daily", "09:00", "daily catch-up check");
   const hourly = await made("--hourly", "hourly check");
   const minute = new Date().getMinutes();
   const offset = 2 * 86_400_000 + ((90 - minute) % 60) * 60_000;
+  w.close();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon({ MUSTER_TEST_CLOCK_OFFSET_MS: String(offset), MUSTER_TEST_CATCHUP_GAP_MS: "300" });
@@ -1439,6 +1813,7 @@ cat '${BASE}/gh-body.json'
   });
   c = new Client(d.token);
   await c.open();
+  const w = await ownerWindow(d);
 
   // Two Codex agents (they take triggered work by default); their tokens answer the Stop hook.
   await c.call("agent.create", { name: "trig", kind: "codex" });
@@ -1466,15 +1841,17 @@ cat '${BASE}/gh-body.json'
   const add = await run(["schedule", "add", "trig", "--on", "note:Ideas", "Expand the new items: {event}"]);
   ok(add.ok && add.out.includes("When the note “Ideas” changes") && add.out.includes("Triggers are off for the note"),
     `muster schedule add --on note: (${add.out.trim()}${add.err})`);
-  const noteTrig = idOf(add.out);
+  const noteTrig = await approveHeld(w, add.out, "muster schedule add --on note:");
   ok((await sched(noteTrig)).origin === "webhook" && (await sched(noteTrig)).daily_cap === 10, "origin webhook, 10 runs a day by default");
   ok((await run(["note", "append", "Ideas", "second idea"])).ok, "you edit the note");
   await sleep(2500);
   ok((await sched(noteTrig)).pending === null && (await runs(noteTrig)).length === 0, "triggers off (the default): no event, no run");
   const fromAgent = await run(["note", "triggers", "Ideas", "on"], { MUSTER_SESSION_ID: String(sTrig) });
   ok(!fromAgent.ok && fromAgent.err.includes("only the human allows triggers"), `an agent's session can't allow triggers (${fromAgent.err.trim()})`);
-  const allow = await run(["note", "triggers", "Ideas", "on"]);
-  ok(allow.ok && allow.out.includes("triggers allowed"), `muster note triggers Ideas on (${allow.out.trim()})`);
+  const fromCli = await run(["note", "triggers", "Ideas", "on"]);
+  ok(!fromCli.ok && fromCli.err.includes("takes a click in Muster's window"), `muster note triggers Ideas on: only in the window (${fromCli.err.trim()})`);
+  const ideas = (await c.call("note.list")).find((n: Json) => n.title === "Ideas").id;
+  ok((await w.call("note.set_triggers", { id: ideas, on: true })).triggers === true, "triggers allowed on the note in the window");
   // The trigger's own agent editing the note doesn't count.
   const noteId = (await c.call("note.list")).find((n: Json) => n.title === "Ideas").id;
   await c.call("note.append", { id: noteId, text: "- from trig itself", from_session: sTrig });
@@ -1492,7 +1869,7 @@ cat '${BASE}/gh-body.json'
   // ---- A branch moving in a local repo
   const gAdd = await run(["schedule", "add", "trig", "--on", `git:${GREPO}@master`, "Update the changelog."]);
   ok(gAdd.ok && gAdd.out.includes(`When master moves in`), `muster schedule add --on git: (${gAdd.out.trim()}${gAdd.err})`);
-  const gitTrig = idOf(gAdd.out);
+  const gitTrig = await approveHeld(w, gAdd.out, "muster schedule add --on git:");
   await until("the git watcher's first look", async () => (await sched(gitTrig)).watch?.state === "ok");
   await sleep(1000);
   ok((await runs(gitTrig)).length === 0, "the first look only records where master is");
@@ -1506,7 +1883,7 @@ cat '${BASE}/gh-body.json'
   // ---- GitHub: a PR opened (a fake gh); then gh not signed in
   const hAdd = await run(["schedule", "add", "trig", "--on", "gh:octo/repo:pr-opened", "Review the new PR."]);
   ok(hAdd.ok && hAdd.out.includes("When a pull request is opened on octo/repo"), `muster schedule add --on gh: (${hAdd.out.trim()}${hAdd.err})`);
-  const ghTrig = idOf(hAdd.out);
+  const ghTrig = await approveHeld(w, hAdd.out, "muster schedule add --on gh:");
   await until("the first GitHub poll", async () => (await sched(ghTrig)).watch?.state === "ok");
   ok((await Deno.readTextFile(`${BASE}/gh-args`)).includes("repos/octo/repo/pulls?state=all"), "polled with gh api");
   ok((await runs(ghTrig)).length === 0, "the first poll is a baseline");
@@ -1527,7 +1904,7 @@ cat '${BASE}/gh-body.json'
   // ---- A trigger URL: loopback, its secret, a size cap; `muster trigger`
   const uAdd = await run(["schedule", "add", "trig", "--on", "url:deploy-done", "The deploy finished: {payload}"]);
   ok(uAdd.ok && uAdd.out.includes("/api/trigger/deploy-done"), `muster schedule add --on url: (${uAdd.out.trim()}${uAdd.err})`);
-  const urlTrig = idOf(uAdd.out);
+  const urlTrig = await approveHeld(w, uAdd.out, "muster schedule add --on url:");
   ok(!JSON.stringify(await c.call("schedule.list")).includes("Bearer"), "schedule.list has no secret");
   const shown = await run(["trigger", "--url", "deploy-done"]);
   const secret = shown.out.match(/Secret: (\w+)/)?.[1] ?? "";
@@ -1560,7 +1937,7 @@ cat '${BASE}/gh-body.json'
   const cAdd = await run(["schedule", "add", "trig", "--daily", "09:00", "--then", "trig2: The tests said: {reply} ({outcome})",
     "--on-failure", "notify", "Run the tests."]);
   ok(cAdd.ok, `muster schedule add --then (${cAdd.out.trim()}${cAdd.err})`);
-  const chained = idOf(cAdd.out);
+  const chained = await approveHeld(w, cAdd.out, "muster schedule add --then");
   const st = await sched(chained);
   ok(st.then.on_success.agent === "trig2" && st.then.on_failure.notify, "its steps");
   await c.call("schedule.run", { id: chained });
@@ -1580,7 +1957,7 @@ cat '${BASE}/gh-body.json'
   // ---- OpenRouter budget: $6 spent today, over the $5 default: unattended work is refused
   await c.call("agent.create", { name: "orw", kind: "codex", provider: "openrouter", model: "openai/gpt-6.1-sol" });
   const oAdd = await run(["schedule", "add", "orw", "--daily", "09:00", "Nightly check."]);
-  const orSched = idOf(oAdd.out);
+  const orSched = await approveHeld(w, oAdd.out, "muster schedule add (OpenRouter)");
   await c.call("schedule.run", { id: orSched });
   await until("the budget refusal", async () => (await runs(orSched))[0]?.outcome === "refused");
   r = (await runs(orSched))[0];
@@ -1595,8 +1972,8 @@ cat '${BASE}/gh-body.json'
   // What the human types is never blocked (the ask goes through; the fake agent never answers).
   const asked = await c.call("agent.ask", { agent: "orw", text: "hello", timeout_ms: 1000 }).then((x: Json) => JSON.stringify(x), (e: Error) => String(e));
   ok(!asked.includes("budget"), `a message from you is not refused by the budget (${asked.slice(0, 120)})`);
-  // Raised cap: it goes.
-  await c.call("schedule.settings.set", { spend_cap: 10 });
+  // Raised cap (in the window): it goes.
+  await w.call("schedule.settings.set", { spend_cap: 10 });
   ok(Math.abs((await c.call("schedule.settings.get")).spend.cap - 10) < 1e-9, "the cap can be raised");
   ok(!d.log.join("").includes(KEY), "the daemon log never shows the key");
   // Raw keys from unattended work into the OpenRouter agent go through the caps too: back at $5,
@@ -1605,9 +1982,10 @@ cat '${BASE}/gh-body.json'
   const orwSid: number = (await c.call("agent.list")).find((a: Json) => a.name === "orw").session_id;
   const keys = await run(["keys", String(orwSid), "text:hello", "enter"], { MUSTER_SESSION_ID: String(sTrig) });
   ok(!keys.ok && keys.err.includes("budget:"), `unattended raw keys to an OpenRouter session are refused at the cap (${keys.err.trim()})`);
-  await c.call("schedule.settings.set", { spend_cap: 10 });
+  await w.call("schedule.settings.set", { spend_cap: 10 });
   // A reload with another key: orw still runs (billing the first key), so its spend can't be
   // read and unattended work for it is refused until it restarts.
+  w.close();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon({
@@ -1624,6 +2002,495 @@ cat '${BASE}/gh-body.json'
 
   for (const a of ["trig", "trig2", "orw"]) await c.call("agent.remove", { name: a });
   await keyServer.shutdown();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
+  return { c, d };
+}
+
+/** Scheduling Phase 3: an agent proposes a schedule over MCP and it waits for the human's
+ * approval (never from the agent's own session); a reminder for itself runs without approval,
+ * through `muster schedule remind` in its session; handling scheduled work it can't set another;
+ * a file trigger only inside a folder the human chose, firing on a new file. */
+async function agentSchedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  const env = { ...ENV, MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "" };
+  const run = async (args: string[], extra: Record<string, string> = {}) => {
+    const o = await cli(args, { ...env, ...extra });
+    return { ok: o.success, out: dec.decode(o.stdout), err: dec.decode(o.stderr) };
+  };
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await cond()) return;
+      await sleep(150);
+    }
+    throw new Error(`timeout waiting for ${what}`);
+  };
+  const runs = async (id: number) => (await c.call("schedule.runs", { id, limit: 50 })).runs as Json[];
+  const sched = async (id: number) => (await c.call("schedule.list")).schedules.find((s: Json) => s.id === id);
+  let mcpId = 0;
+  const mcp = async (token: string, name: string, args: Json = {}): Promise<{ ok: boolean; text: string }> => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpId, method: "tools/call", params: { name, arguments: args } }),
+    });
+    const j = await r.json();
+    return { ok: r.ok && !j.error && !j.result?.isError, text: j.result?.content?.[0]?.text ?? JSON.stringify(j) };
+  };
+
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  // A file change within the grace after the planner's last turn would be its own: shortened.
+  d = await startDaemon({ MUSTER_TEST_TRIGGER_DELAY_MS: "1000", MUSTER_TEST_WATCH_EVERY_MS: "700", MUSTER_TEST_ABSORB_GRACE_MS: "300" });
+  c = new Client(d.token);
+  await c.open();
+  await c.call("agent.create", { name: "planner", kind: "codex" });
+  await Deno.remove(`${BASE}/fake-token`).catch(() => {});
+  const sPlan = (await c.call("agent.start", { name: "planner" })).session.id;
+  await until("planner's token", async () => (await exists(`${BASE}/fake-token`)) && (await Deno.readTextFile(`${BASE}/fake-token`)).length > 10);
+  const tPlan = await Deno.readTextFile(`${BASE}/fake-token`);
+  await c.waitFor("planner idle", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === sPlan && e.data.state === "idle"));
+  const reply = async (text: string) => {
+    await sleep(1500);
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/Stop`, {
+      method: "POST", headers: { Authorization: `Bearer ${tPlan}` }, body: JSON.stringify({ last_assistant_message: text }),
+    });
+    await r.body?.cancel();
+    ok(r.ok, `Stop hook: ${text}`);
+  };
+
+  // ---- A proposal over MCP: shown with what, when, why and its use; it waits for the human
+  const prop = await mcp(tPlan, "propose_schedule", {
+    prompt: "Summarise the Ideas note", cron: "0 16 * * 5", tz: "Europe/London", reason: "You asked for a weekly summary",
+  });
+  ok(prop.ok && JSON.parse(prop.text).status === "proposed", `MCP propose_schedule (${prop.text.slice(0, 200)})`);
+  const pid = JSON.parse(prop.text).schedule_id;
+  let s = await sched(pid);
+  ok(s.status === "proposed" && s.next_run === null && s.made_by.agent === "planner" && s.made_by.reason === "You asked for a weekly summary" &&
+    s.estimate.text.includes("About 1 run in the coming week") && s.estimate.billing === "codex",
+    `schedule.list: a proposal with who, why and its use (${JSON.stringify([s.status, s.estimate?.text])})`);
+  ok(c.events.some((e) => e.event === "notice" && String(e.data.text).includes("planner proposes a schedule")), "a notice says it waits for you");
+  ok((await run(["schedule", "ls"])).out.includes("proposed"), "muster schedule ls shows it as proposed");
+  const selfApprove = await run(["schedule", "approve", String(pid)], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(!selfApprove.ok && selfApprove.err.includes("click on Approve"), `the agent can't approve its own proposal (${selfApprove.err.trim()})`);
+  const unsetApprove = await run(["schedule", "approve", String(pid)]);
+  ok(!unsetApprove.ok && unsetApprove.err.includes("click on Approve"), "nor without its session id (the CLI never approves)");
+  const scripted = await c.call("schedule.approve", { id: pid }).then(() => "approved", (e: Error) => String(e));
+  ok(scripted.includes("click on Approve"), `nor a WebSocket of a script's that holds no window (${scripted})`);
+  const viaHttp = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+    method: "POST", headers: { Authorization: `Bearer ${d.token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id: 1, method: "schedule.approve", params: { id: pid } }),
+  }).then((r) => r.json());
+  ok(String(viaHttp.error?.message).includes("click on Approve"), "nor /api/rpc");
+  const widen = await run(["schedule", "add", "planner", "--every", "15m", "more"], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(!widen.ok && widen.err.includes("agent's session"), "nor make a schedule directly");
+  // The window: Muster's own origin and a claimed window, the connection's process outside every
+  // session (this test isn't one of the daemon's sessions).
+  const win = new Client(d.token, `http://127.0.0.1:${PORT}`);
+  await win.open();
+  await win.call("window.claim", {});
+  const approved = await win.call("schedule.approve", { id: pid });
+  ok(approved.status === "active", `approved with a click in the window (${approved.status})`);
+  win.close();
+  s = await sched(pid);
+  ok(s.status === "active" && s.next_run > Date.now() && s.made_by.approved_at > 0, "approved: active, with a next run");
+
+  // ---- A reminder from the agent's session: no approval, a one-off for itself
+  const rem = await run(["schedule", "remind", "--at", "+10m", "Check whether CI on master passed"], { MUSTER_SESSION_ID: String(sPlan) });
+  ok(rem.ok && rem.out.includes("reminder at"), `muster schedule remind in the agent's session (${rem.out.trim()}${rem.err})`);
+  const rid = Number(rem.out.match(/schedule (\d+)/)![1]);
+  s = await sched(rid);
+  ok(s.status === "active" && s.made_by.kind === "reminder" && Math.abs(s.next_run - (Date.now() + 10 * 60_000)) < 60_000,
+    "the reminder: active, in 10 minutes, made by the agent");
+  const tooFar = await mcp(tPlan, "set_reminder", { prompt: "x", in_minutes: 25 * 60 });
+  ok(!tooFar.ok && tooFar.text.includes("propose_schedule"), "a reminder past 24 hours is refused");
+  // It runs as scheduled work (Run now stands in for its time); while the agent handles it, it
+  // can't set another.
+  await c.call("schedule.run", { id: rid });
+  await until("the reminder's message", async () => (await runs(rid)).some((x) => x.msg_id));
+  await until("the reminder typed in", async () =>
+    (await Deno.readTextFile(`${BASE}/fake-input`).catch(() => "")).includes(`from schedule:${rid} origin=schedule`));
+  await sleep(1000); // submitted (Enter): the session now handles scheduled work
+  const chained = await mcp(tPlan, "set_reminder", { prompt: "and again", in_minutes: 30 });
+  ok(!chained.ok && chained.text.includes("nothing started by a schedule or trigger"), `no reminder from a reminder's run (${chained.text.slice(0, 160)})`);
+  await reply("CI passed");
+  await until("the reminder's reply", async () => (await runs(rid))[0].outcome === "replied");
+
+  // ---- A file trigger: off until the human chooses the folder
+  const INBOX = `${BASE}/inbox`;
+  await Deno.mkdir(INBOX, { recursive: true });
+  const refusedF = await run(["schedule", "add", "planner", "--on", `files:${INBOX}/*.pdf`, "File the new PDFs: {event}"]);
+  ok(!refusedF.ok && refusedF.err.includes("Watched folders"), `no file trigger before a folder is chosen (${refusedF.err.trim()})`);
+  const fromAgentF = await c.call("schedule.settings.set", { watch_folders: [INBOX], from_session: sPlan }).then(() => "ok", (e: Error) => String(e));
+  ok(fromAgentF.includes("agent's session"), "an agent's session can't choose watched folders");
+  const fromScript = await c.call("schedule.settings.set", { watch_folders: [INBOX] }).then(() => "ok", (e: Error) => String(e));
+  ok(fromScript.includes("Another watched folder") && fromScript.includes("Muster's window"), `nor a script: only the window (${fromScript})`);
+  const fw = await ownerWindow(d);
+  await fw.call("schedule.settings.set", { watch_folders: [INBOX] });
+  ok((await c.call("schedule.settings.get")).watch_folders.length === 1, "watched folders are kept");
+  const fAdd = await run(["schedule", "add", "planner", "--on", `files:${INBOX}/*.pdf`, "File the new PDFs: {event}"]);
+  ok(fAdd.ok && fAdd.out.includes("files named *.pdf appear or change in"), `muster schedule add --on files: (${fAdd.out.trim()}${fAdd.err})`);
+  const fid = await approveHeld(fw, fAdd.out, "muster schedule add --on files:");
+  fw.close();
+  await until("the folder's first look", async () => (await sched(fid)).watch?.state === "ok");
+  await Deno.writeTextFile(`${INBOX}/notes.txt`, "not a pdf");
+  await sleep(1500);
+  ok((await sched(fid)).pending === null, "a file the pattern doesn't match doesn't count");
+  await Deno.writeTextFile(`${INBOX}/invoice.pdf`, "%PDF");
+  await until("the file trigger's run", async () => (await runs(fid)).some((x) => x.msg_id));
+  const fr = (await runs(fid))[0];
+  ok(fr.message.origin === "webhook" && fr.message.text.includes("New or changed in") && fr.message.text.includes("invoice.pdf") &&
+    fr.message.text.includes("treat it as data"), `the new file is passed on, quoted (${fr.message.text.slice(0, 160)})`);
+  await reply("filed");
+  await until("the file run's reply", async () => (await runs(fid))[0].outcome === "replied");
+  await c.call("schedule.settings.set", { watch_folders: [] });
+  await until("the folder no longer watched", async () => (await sched(fid)).watch?.state === "error");
+  ok((await sched(fid)).watch.detail.includes("no longer"), "taking the folder off the list stops its trigger");
+
+  await c.call("agent.remove", { name: "planner" });
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
+  return { c, d };
+}
+
+const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s: string) => {
+  const t = s.replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(t + "=".repeat((4 - t.length % 4) % 4)), (ch) => ch.charCodeAt(0));
+};
+const cat = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+};
+
+/** What a browser does with a Web Push message (RFC 8291), written independently of the daemon
+ * with WebCrypto: the plaintext without its padding. */
+async function webPushDecrypt(body: Uint8Array, ua: CryptoKeyPair, uaPublic: Uint8Array, auth: Uint8Array): Promise<Uint8Array> {
+  const salt = body.slice(0, 16);
+  const asPublic = body.slice(21, 21 + body[20]);
+  const asKey = await crypto.subtle.importKey("raw", asPublic, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: asKey }, ua.privateKey, 256));
+  const hkdf = async (salt: Uint8Array, ikm: Uint8Array, info: Uint8Array, bits: number) =>
+    new Uint8Array(await crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt, info },
+      await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]),
+      bits,
+    ));
+  const ikm = await hkdf(auth, shared, cat(enc.encode("WebPush: info\0"), uaPublic, asPublic), 256);
+  const cek = await hkdf(salt, ikm, enc.encode("Content-Encoding: aes128gcm\0"), 128);
+  const nonce = await hkdf(salt, ikm, enc.encode("Content-Encoding: nonce\0"), 96);
+  const key = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["decrypt"]);
+  const record = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, body.slice(21 + body[20])));
+  let end = record.length - 1;
+  while (end > 0 && record[end] === 0) end--;
+  if (record[end] !== 2) throw new Error("no last-record delimiter");
+  return record.slice(0, end);
+}
+
+/** Phone alerts (src/push.rs, docs/ANDROID.md "Notifications"): a paired phone subscribes, an
+ * agent asks for approval, and a local fake push service (https, trusted only by the test
+ * daemon's curl, allowed only through MUSTER_PUSH_HOSTS) gets an encrypted, padded, VAPID-signed
+ * alert that decrypts to that session. Then redirects, timeouts, 410 and revocation. */
+async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  console.log("phone alerts");
+  const tls = `${BASE}/push-tls`;
+  await Deno.mkdir(tls, { recursive: true });
+  const made = await new Deno.Command("openssl", {
+    args: ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+      "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+      "-keyout", `${tls}/key.pem`, "-out", `${tls}/cert.pem`],
+    stdout: "null", stderr: "piped",
+  }).output();
+  if (!made.success) throw new Error(`openssl: ${dec.decode(made.stderr)}`);
+  interface Got { path: string; headers: Headers; body: Uint8Array; at: number; end?: number }
+  const got: Got[] = [];
+  let reply: (path: string) => Promise<Response> = async () => new Response(null, { status: 201 });
+  const pushServer = Deno.serve({
+    port: 0, hostname: "127.0.0.1", onListen() {},
+    cert: await Deno.readTextFile(`${tls}/cert.pem`), key: await Deno.readTextFile(`${tls}/key.pem`),
+  }, async (req) => {
+    const path = new URL(req.url).pathname;
+    const g: Got = { path, headers: new Headers(req.headers), body: new Uint8Array(await req.arrayBuffer()), at: Date.now() };
+    got.push(g);
+    try {
+      return await reply(path);
+    } finally {
+      g.end = Date.now();
+    }
+  });
+  const pushPort = pushServer.addr.port;
+  const pushOrigin = `https://localhost:${pushPort}`;
+  // A curl URL glob in the owner's ntfy URL: with globbing off it is one request to that very path.
+  const NTFY_PATH = "/ntfy/muster[1-3]";
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({
+    MUSTER_PUSH_HOSTS: `localhost:${pushPort}`,
+    CURL_CA_BUNDLE: `${tls}/cert.pem`,
+    MUSTER_NTFY_URL: `${pushOrigin}${NTFY_PATH}`,
+  });
+  c = new Client(d.token);
+  await c.open();
+
+  // Pair a phone (as the page at the tailnet origin would) and talk to the daemon as it.
+  const ORIGIN = "https://box.tail1.ts.net";
+  const pairing = await c.call("device.pair_code", { url: ORIGIN, name: "smoke phone" });
+  const paired = await fetch(`http://127.0.0.1:${PORT}/api/device/pair`, {
+    method: "POST",
+    headers: { Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+    body: JSON.stringify({ code: pairing.code }),
+  });
+  ok(paired.ok, "push: a phone pairs");
+  const phoneId = (await paired.json()).device.id;
+  const cookie = paired.headers.get("set-cookie")!.split(";")[0];
+  const phone = async (method: string, params: Json = {}) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+      method: "POST",
+      headers: { Cookie: cookie, Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ id: 1, method, params }),
+    });
+    const v = await r.json();
+    if (v.error) throw new Error(v.error.message);
+    return v.result;
+  };
+  const refused = async (what: string, p: Promise<unknown>, needle: string) =>
+    await p.then(() => ok(false, what), (e) => ok(String(e).includes(needle), `${what}: ${e}`));
+
+  // The browser's side: a P-256 key and an auth secret, as PushManager.subscribe makes them.
+  const ua = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]) as CryptoKeyPair;
+  const uaPublic = new Uint8Array(await crypto.subtle.exportKey("raw", ua.publicKey));
+  const auth = crypto.getRandomValues(new Uint8Array(16));
+  const keys = { p256dh: b64u(uaPublic), auth: b64u(auth) };
+  const vapidKey = (await phone("push.key")).public_key;
+  ok(unb64u(vapidKey).length === 65 && unb64u(vapidKey)[0] === 4, "push: push.key gives the daemon's P-256 public key");
+  ok(((await Deno.stat(`${DATA}/push_vapid_key`)).mode! & 0o777) === 0o600, "push: the VAPID key is in the data dir, 0600");
+  await refused("push: http endpoint refused", phone("push.subscribe", { endpoint: `http://localhost:${pushPort}/push/a`, ...keys }), "https");
+  await refused("push: host off the allowlist refused", phone("push.subscribe", { endpoint: "https://push.example.com/push/a", ...keys }), "not a known push service");
+  await refused("push: allowlisted host on another port refused", phone("push.subscribe", { endpoint: "https://localhost/push/a", ...keys }), "not a known push service");
+  await refused("push: a curl glob pattern in the endpoint refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/x[1-10000]`, ...keys }), "subscription refused: push endpoint has characters");
+  await refused("push: bad keys refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/a`, p256dh: b64u(new Uint8Array(65)), auth: keys.auth }), "p256dh");
+  await refused("push: the desktop client has no alerts of its own", c.call("push.status"), "paired phone");
+  const endpoint = `${pushOrigin}/push/phone-1`;
+  let st = await phone("push.subscribe", { endpoint, ...keys });
+  ok(st.subscription.endpoint === endpoint && st.subscription.last_ok_at === null, "push: the phone subscribes");
+  const listed = (await c.call("device.list")).find((x: Json) => x.id === phoneId);
+  ok(listed.push?.endpoint_host === `localhost:${pushPort}` && !JSON.stringify(listed).includes(keys.auth), "push: device.list shows alerts on, no keys");
+
+  // An agent asks for approval: the phone's alert arrives, encrypted to it.
+  const ws = (await c.call("hello")).workspaces[0];
+  const ch = await c.call("channel.create", { workspace_id: ws.id, name: "alerts", agent: "shell" });
+  const claude = await c.call("session.spawn", { channel_id: ch.id, kind: "claude" });
+  let token = "";
+  for (let n = 0; n < 100 && !token; n++) {
+    token = await Deno.readTextFile(`${BASE}/claude-token-${claude.id}`).catch(() => "");
+    if (!token) await sleep(100);
+  }
+  const asked = Date.now();
+  const hook = await fetch(`http://127.0.0.1:${PORT}/hook/PermissionRequest`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf build" } }),
+  });
+  ok(hook.ok, "push: the permission request hook is accepted");
+  const waitFor = async (what: string, cond: () => boolean, ms = 10000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !cond()) await sleep(50);
+    ok(cond(), what);
+  };
+  await waitFor("push: the alert reaches the push service within 10 s", () => got.some((g) => g.path === "/push/phone-1"));
+  const first = got.find((g) => g.path === "/push/phone-1")!;
+  console.log(`      (alert took ${first.at - asked} ms)`);
+  const h = first.headers;
+  ok(h.get("ttl") === "300" && h.get("urgency") === "high" && h.get("content-encoding") === "aes128gcm", "push: TTL 300, Urgency high, aes128gcm");
+  ok(h.get("topic") === `muster-s${claude.id}`, "push: the session is the Topic (a newer alert replaces a waiting one)");
+  const authz = h.get("authorization") ?? "";
+  const m = authz.match(/^vapid t=([^.]+)\.([^.]+)\.([^,]+), k=(\S+)$/);
+  ok(m && m[4] === vapidKey, "push: Authorization is vapid t=<JWT>, k=<the daemon's key>");
+  const claims = JSON.parse(dec.decode(unb64u(m![2])));
+  const verifyKey = await crypto.subtle.importKey("raw", unb64u(vapidKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  const signed = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, verifyKey, unb64u(m![3]), enc.encode(`${m![1]}.${m![2]}`));
+  ok(signed && JSON.parse(dec.decode(unb64u(m![1]))).alg === "ES256", "push: the VAPID JWT is ES256 and verifies");
+  ok(claims.aud === pushOrigin && claims.exp * 1000 > Date.now() && claims.exp * 1000 <= Date.now() + 24 * 3600_000,
+    `push: JWT audience is the push service, expiry within 24 h: ${JSON.stringify(claims)}`);
+  ok(claims.sub === "https://muster.invalid/web-push", "push: the VAPID subject is the neutral tool URL, nothing about the owner");
+  ok(first.body.length === 86 + 1024 + 16, `push: padded to the fixed size (${first.body.length} bytes)`);
+  const alert = JSON.parse(dec.decode(await webPushDecrypt(first.body, ua, uaPublic, auth)));
+  ok(alert.v === 1 && alert.kind === "session" && alert.session_id === claude.id && alert.channel_id === ch.id &&
+    alert.state === "needs_approval", `push: it decrypts (WebCrypto) to that session's approval: ${JSON.stringify(alert)}`);
+  ok(alert.title.includes(claude.name) && alert.body.includes("rm -rf build"), "push: title names the session, body the request");
+  for (let n = 0; n < 50 && !(st = await phone("push.status")).subscription.last_ok_at; n++) await sleep(100);
+  ok(st.subscription.last_ok_at > 0 && st.subscription.last_error === null, "push: push.status shows the last delivery");
+  // The ntfy fallback got the same alert, as plain text with a tap link to the phone page.
+  await waitFor("push: the ntfy fallback is posted too", () => got.some((g) => g.path === NTFY_PATH));
+  const nt = got.find((g) => g.path === NTFY_PATH)!;
+  await sleep(300);
+  ok(got.filter((g) => g.path.startsWith("/ntfy/")).length === 1, `push: curl globbing is off (one ntfy request, not three): ${got.map((g) => g.path)}`);
+  ok(nt.headers.get("click") === `${ORIGIN}/m/#s=${claude.id}` && dec.decode(nt.body).includes("rm -rf build") &&
+    (nt.headers.get("title") ?? "").startsWith("=?UTF-8?B?"), "push: ntfy gets title, text and the tap link");
+
+  // A test alert: same size on the wire, and at most one per 5 s.
+  let t = await phone("push.test");
+  ok(t.delivered === true && t.error === null, "push: push.test delivers");
+  const testMsg = got.filter((g) => g.path === "/push/phone-1").at(-1)!;
+  ok(testMsg.body.length === first.body.length, "push: a test alert has the same length as any alert");
+  ok(JSON.parse(dec.decode(await webPushDecrypt(testMsg.body, ua, uaPublic, auth))).kind === "test", "push: it decrypts to a test alert");
+  await refused("push: test alerts are rate limited", phone("push.test"), "wait 5 seconds");
+  let lastTest = Date.now();
+  const nextTest = async () => {
+    await sleep(Math.max(0, lastTest + 5100 - Date.now()));
+    const started = Date.now();
+    const r = await phone("push.test");
+    lastTest = Date.now();
+    return { r, took: lastTest - started };
+  };
+
+  // Redirects are not followed.
+  reply = async (path) =>
+    path === "/push/phone-1" ? new Response(null, { status: 302, headers: { location: `${pushOrigin}/elsewhere` } }) : new Response(null, { status: 201 });
+  ({ r: t } = await nextTest());
+  ok(t.delivered === false && String(t.error).includes("redirect") && !got.some((g) => g.path === "/elsewhere"), "push: a redirect is refused, not followed");
+  st = await phone("push.status");
+  ok(String(st.subscription.last_error).includes("redirect") && st.subscription.last_error_at >= st.subscription.last_ok_at, "push: push.status shows the failure");
+
+  // A push service that never answers is given up on after 5 s; curl never sees the endpoint or
+  // the signed token on its command line.
+  reply = async () => {
+    await sleep(9000);
+    return new Response(null, { status: 201 });
+  };
+  const before = got.length;
+  const slow = nextTest();
+  // Scan while curl waits for the answer (the request has arrived, the reply is held back).
+  for (let n = 0; n < 150 && got.length === before; n++) await sleep(50);
+  await sleep(300);
+  // Deno reads /proc only with every permission, so python lists the command lines.
+  const scan = await new Deno.Command("python3", {
+    args: ["-I", "-c", `import glob, os
+seen = []
+for p in glob.glob("/proc/[0-9]*/cmdline"):
+    if p == "/proc/%d/cmdline" % os.getpid():
+        continue  # this script names what it looks for
+    try:
+        c = open(p, "rb").read().replace(b"\\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        continue
+    seen.append(c)
+print(sum(1 for c in seen if "curl" in c and "-K" in c))
+print(sum(1 for c in seen if "vapid" in c or "/push/phone-1" in c))`],
+    stdout: "piped", stderr: "null",
+  }).output();
+  const [curls, leaks] = dec.decode(scan.stdout).trim().split("\n").map(Number);
+  ok(curls >= 1 && leaks === 0, `push: curl is running (${curls}) and no command line holds the endpoint or the VAPID token`);
+  const { r: timedOut, took } = await slow;
+  ok(timedOut.delivered === false && String(timedOut.error).includes("within 5 s") && took < 8500,
+    `push: an unanswered push gives up after about 5 s (${took} ms)`);
+
+  // 410: the subscription is gone and its row is deleted.
+  reply = async (path) => new Response(null, { status: path === "/push/phone-1" ? 410 : 201 });
+  ({ r: t } = await nextTest());
+  ok(t.delivered === false && t.subscription === null, "push: 410 deletes the subscription");
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push === null, "push: device.list shows alerts off after 410");
+
+  // Revoking the phone deletes its subscription.
+  reply = async () => new Response(null, { status: 201 });
+  await phone("push.subscribe", { endpoint, ...keys });
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push !== null, "push: subscribed again");
+
+  // One admission control for every alert request (deliveries, push.test, ntfy): at most 4 at
+  // once. And a delivery queued behind slow ones is checked again when its turn comes: a phone
+  // revoked, turned off or subscribed elsewhere meanwhile gets nothing.
+  const pairPhone = async (name: string, path: string) => {
+    const code = (await c.call("device.pair_code", { url: ORIGIN, name })).code;
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/device/pair`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    ok(r.ok, `push: ${name} pairs`);
+    const id = (await r.json()).device.id;
+    const ck = r.headers.get("set-cookie")!.split(";")[0];
+    const call = async (method: string, params: Json = {}) => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+        method: "POST",
+        headers: { Cookie: ck, Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+        body: JSON.stringify({ id: 1, method, params }),
+      });
+      const v = await res.json();
+      if (v.error) throw new Error(v.error.message);
+      return v.result;
+    };
+    await call("push.subscribe", { endpoint: `${pushOrigin}${path}`, ...keys });
+    return { id, call };
+  };
+  const [slowA, slowB, slowC, victim] = [
+    await pairPhone("slow phone a", "/push/slow-a"),
+    await pairPhone("slow phone b", "/push/slow-b"),
+    await pairPhone("slow phone c", "/push/slow-c"),
+    await pairPhone("revoked phone", "/push/victim"),
+  ];
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const section = Date.now();
+  const since = () => got.filter((g) => g.at >= section);
+  const count = (path: string) => since().filter((g) => g.path === path).length;
+  reply = async (path) => {
+    if (path.startsWith("/push/slow-") || path === "/push/phone-1") await held;
+    return new Response(null, { status: 201 });
+  };
+  // Four test alerts hold the four slots (the first phone's after its 5 s gap).
+  const tests: Promise<Json>[] = [nextTest().then((x) => x.r)];
+  await waitFor("push: the first slow test alert is waiting on the push service", () => count("/push/phone-1") === 1, 8000);
+  tests.push(slowA.call("push.test"), slowB.call("push.test"), slowC.call("push.test"));
+  await waitFor("push: four test alerts run at once", () => since().filter((g) => g.path.startsWith("/push/")).length === 4);
+  // An agent asks again (after working a while: a new approval, so a new alert): its alerts (and
+  // ntfy's) have to queue behind the four.
+  await fetch(`http://127.0.0.1:${PORT}/hook/PostToolUse`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: {} }),
+  }).then((r) => r.text());
+  await sleep(200);
+  const asked2 = await fetch(`http://127.0.0.1:${PORT}/hook/PermissionRequest`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf dist" } }),
+  });
+  ok(asked2.ok, "push: a second permission request is accepted");
+  await sleep(700);
+  ok(since().length === 4, `push: nothing beyond the 4 slots went out while they were busy (ntfy included): ${since().map((g) => g.path)}`);
+  // While those alerts wait: one phone is revoked, one turns alerts off, one subscribes elsewhere.
+  await c.call("device.revoke", { id: victim.id });
+  await slowA.call("push.unsubscribe");
+  await slowB.call("push.subscribe", { endpoint: `${pushOrigin}/push/slow-b2`, ...keys });
+  release();
+  const results = await Promise.all(tests);
+  ok(results.every((x) => x.delivered === true), `push: the held test alerts were delivered: ${JSON.stringify(results.map((x) => x.error))}`);
+  await waitFor("push: the queued alert reaches the phones still subscribed", () =>
+    count("/push/slow-c") === 2 && count("/push/phone-1") === 2 && count(NTFY_PATH) === 1);
+  await sleep(500);
+  ok(count("/push/victim") === 0, "push: a phone revoked while its alert waited got nothing");
+  ok(count("/push/slow-a") === 1, "push: a phone that turned alerts off while its alert waited got nothing more");
+  ok(count("/push/slow-b") === 1 && count("/push/slow-b2") === 0, "push: an alert queued for an old subscription is not sent (to either)");
+  const ends = since().map((g) => [g.at, g.end ?? Date.now()]);
+  const most = Math.max(...ends.map(([at]) => ends.filter(([a, e]) => a <= at && at < e).length));
+  ok(most === 4, `push: at most 4 alert requests at once, tests and ntfy included (${most})`);
+  reply = async () => new Response(null, { status: 201 });
+  await c.call("device.revoke", { id: phoneId });
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push === null, "push: revoking the phone deletes its subscription");
+  await refused("push: a revoked phone can't subscribe", phone("push.subscribe", { endpoint, ...keys }), "unauthorized");
+  await c.call("session.kill", { id: claude.id });
+
+  await pushServer.shutdown();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon();
@@ -1846,6 +2713,75 @@ async function openRouter(c: Client, d: Daemon): Promise<void> {
     (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
     "openrouter: still in no file after the reloads (the detached backend's log included)",
   );
+
+  // "Restart Muster" (`daemon.restart`): every session ends, then a new backend and a new
+  // terminal host start by themselves from the launch path, and the API answers again.
+  c = await connect();
+  const h0 = await c.call("hello");
+  const live = await c.call("channel.create", { workspace_id: h0.workspaces[0].id, agent: "shell" });
+  let liveSess: Json | undefined;
+  for (let n = 0; n < 100 && !(liveSess?.pid > 0); n++) {
+    liveSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === live.id);
+    if (!(liveSess?.pid > 0)) await sleep(50);
+  }
+  ok(liveSess?.pid > 0 && liveSess.state !== "exited", "restart: a shell runs before it");
+  const stale = await c.call("daemon.restart", { backend: "0123456789ab", host: h0.updates.host })
+    .then(() => "", (e: Error) => e.message);
+  ok(stale.includes("nothing was stopped"), `restart: builds other than the ones shown are refused: ${stale}`);
+  const still = await c.call("hello");
+  ok(still.pid === h0.pid && still.sessions.find((s: Json) => s.id === liveSess!.id)?.state !== "exited",
+    "restart: ...and nothing stopped");
+  const restarted = await c.call("daemon.restart", { backend: h0.updates.backend, host: h0.updates.host });
+  ok(String(restarted.exe).endsWith("/muster"), `restart: started from the launch path (${restarted.exe})`);
+  for (let n = 0; n < 100 && !c.closed && !c.events.some((e) => e.event === "daemon_stopping"); n++) await sleep(20);
+  ok(c.events.some((e) => e.event === "daemon_stopping" && e.data.reason === "restart"),
+    "restart: windows hear daemon_stopping {reason: restart}");
+  let h1: Json | null = null;
+  for (const end = Date.now() + 60000; !h1 && Date.now() < end; await sleep(200)) {
+    try {
+      const disc = JSON.parse(await Deno.readTextFile(`${RUNTIME}/daemon.json`));
+      if (disc.pid === h0.pid) continue;
+      const k = new Client(disc.token);
+      await k.open();
+      h1 = await k.call("hello");
+      c.close();
+      c = k;
+    } catch { /* not up yet */ }
+  }
+  ok(h1 && h1.pid !== h0.pid, `restart: a new backend answers (pid ${h0.pid} -> ${h1?.pid})`);
+  ok(
+    h1!.terminal_host.instance !== h0.terminal_host.instance && h1!.terminal_host.pid !== h0.terminal_host.pid,
+    `restart: ...with a new terminal host (pid ${h0.terminal_host.pid} -> ${h1!.terminal_host.pid})`,
+  );
+  ok(h1!.sessions.find((s: Json) => s.id === liveSess!.id)?.state === "exited", "restart: the running shell ended");
+  ok(typeof h1!.build === "string" && h1!.build === (h0.updates.backend ?? h0.build),
+    `restart: the new backend runs the build the restart was for (${h0.build} -> ${h1!.build})`);
+  ok(!(await Deno.stat(`${RUNTIME}/restart-failed`).then(() => true, () => false)), "restart: no failure is recorded");
+  ok(h1!.updates.host === null && h1!.updates.backend === null, "restart: no update is left waiting at the launch path");
+  // It runs the release checked before anything stopped (its read-only snapshot), not the build output.
+  // (python3 reads the link: the smoke has no read permission for /proc.)
+  const exeOf = async (pid: number) =>
+    dec.decode((await new Deno.Command("python3", {
+      args: ["-I", "-c", "import os, sys; print(os.readlink(sys.argv[1]))", `/proc/${pid}/exe`],
+      stdout: "piped", stderr: "null",
+    }).output()).stdout).trim();
+  const [appExe, hostExe] = [await exeOf(h1!.pid), await exeOf(h1!.terminal_host.pid)];
+  ok(appExe.includes("/application-releases/") && hostExe.includes("/application-releases/") &&
+    appExe.split("/").slice(0, -1).join("/") === hostExe.split("/").slice(0, -1).join("/"),
+    `restart: the new backend and host run from one checked release (${appExe}, ${hostExe})`);
+  ok(h1!.openrouter.key_present === true, "restart: the restarted backend keeps the OpenRouter key");
+  const after = await c.call("channel.create", { workspace_id: h1!.workspaces[0].id, agent: "shell" });
+  let afterSess: Json | undefined;
+  for (let n = 0; n < 100 && !(afterSess?.pid > 0); n++) {
+    afterSess = (await c.call("hello")).sessions.find((s: Json) => s.channel_id === after.id);
+    if (!(afterSess?.pid > 0)) await sleep(50);
+  }
+  ok(afterSess?.pid > 0, "restart: the API answers again and a new shell starts on the new host");
+  ok(
+    (await filesContaining(RUNTIME, KEY)).length === 0 && (await filesContaining(DATA, KEY)).length === 0,
+    "restart: the key is still in no file",
+  );
+  c.close();
   const stop = await cli(["stop"], ENV);
   ok(stop.success, "openrouter: the reloaded backend stops");
   // `current` (the first backend) has exited; the cleanup below finds nothing left to stop.

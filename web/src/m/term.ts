@@ -4,7 +4,29 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
 import type { SessionInfo } from "../types.ts";
-import { bufferText, type Cell, FONT_FAMILY, phoneGrid, scrollPosition } from "./logic.ts";
+import {
+  type AttachInfo,
+  bufferText,
+  type Cell,
+  FONT_FAMILY,
+  noteBusy,
+  noteWheel,
+  phoneGrid,
+  programAtLatest,
+  type ProgramScroll,
+  programScrollFor,
+  programScrolls,
+  repeatBytes,
+  ReplayCursor,
+  returnNotches,
+  scrollPosition,
+  sessionBusy,
+  type Since,
+  splitPan,
+  wheelReport,
+  wheelSteps,
+} from "./logic.ts";
+import { programScroll } from "./store.ts";
 
 export function cellSize(fontSize: number, term?: Terminal): Cell {
   const cell = (term as any)?._core?._renderService?.dimensions?.css?.cell;
@@ -48,6 +70,7 @@ function theme() {
 export class PhoneTerminal {
   readonly term: Terminal;
   private queue: Uint8Array[] = [];
+  private cursor = new ReplayCursor();
   private raf = 0;
   private momentum = 0;
   private panX = 0;
@@ -56,6 +79,11 @@ export class PhoneTerminal {
   private disposed = false;
   private selecting = false;
   private pinned = true;
+  private program: ProgramScroll;
+  private wheelRemainder = 0;
+  /** Until the first replay is parsed the buffer isn't the program's yet: keep `program`. */
+  private replaying = true;
+  private info: SessionInfo;
   private observer: ResizeObserver;
   private media = matchMedia("(prefers-color-scheme: light)");
   private events = new AbortController();
@@ -70,7 +98,11 @@ export class PhoneTerminal {
     private closedHeight: () => number,
     private onBottom: (bottom: boolean) => void,
     private onFont: (size: number) => void,
+    /** Sends input bytes to the session; false when this device may not or it's offline. */
+    private scrollProgram: (data: Uint8Array) => boolean,
   ) {
+    this.info = info;
+    this.program = programScrollFor(programScroll, info);
     this.term = new Terminal({
       cols: info.cols,
       rows: info.rows,
@@ -102,7 +134,7 @@ export class PhoneTerminal {
     this.observer = new ResizeObserver(() => {
       if (this.selecting) return;
       if (this.pinned) {
-        this.bottom();
+        this.end();
         return;
       }
       this.panY = Math.min(this.panY, this.maxPan());
@@ -122,7 +154,44 @@ export class PhoneTerminal {
   }
   private atBottom() {
     const b = this.term.buffer.active;
-    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1;
+    return b.viewportY >= b.baseY && this.panY >= this.maxPan() - 1 && programAtLatest(this.program);
+  }
+  private programScrolls() {
+    return programScrolls(this.term.buffer.active.type, this.term.modes.mouseTrackingMode);
+  }
+  /** Scroll by `delta` px (negative = older). The normal screen scrolls its own scrollback; a
+   * full-screen program that tracks the mouse (Claude Code) has none, so past the edge of the
+   * screen the drag becomes mouse-wheel reports at `at`, and the program scrolls its history. */
+  private scrollBy(delta: number, at: { x: number; y: number }) {
+    if (!this.programScrolls()) {
+      this.scrollTo(this.position() + delta);
+      return;
+    }
+    const split = splitPan(delta, this.panY, this.maxPan());
+    this.panY = split.pan;
+    this.scrollRemainder = 0;
+    const steps = wheelSteps(split.rest, this.wheelRemainder, this.cell().height);
+    this.wheelRemainder = steps.remainder;
+    if (steps.count && !this.wheel(steps.count, this.cellAt(at))) this.wheelRemainder = 0;
+    this.render();
+  }
+  /** The 1-based terminal cell under client point `at`. */
+  private cellAt(at: { x: number; y: number }) {
+    const cell = this.cell();
+    const rect = this.surface.getBoundingClientRect();
+    const clamp = (n: number, max: number) => Math.max(1, Math.min(max, n));
+    return {
+      col: clamp(Math.floor((at.x - rect.left + this.panX) / cell.width) + 1, this.term.cols),
+      row: clamp(Math.floor((at.y - rect.top + this.panY) / cell.height) + 1, this.term.rows),
+    };
+  }
+  /** Send |count| wheel notches, up when negative, at `at`. True when sent. */
+  private wheel(count: number, at: { col: number; row: number }) {
+    const encoding = (this.term as any)._core?.coreMouseService?.activeEncoding ?? "SGR";
+    const report = wheelReport(count < 0, at.col, at.row, encoding, this.cell());
+    if (!report || !this.scrollProgram(repeatBytes(report, Math.abs(count)))) return false;
+    noteWheel(this.program, count, at, sessionBusy(this.info));
+    return true;
   }
   private position() {
     return this.term.buffer.active.viewportY * this.cell().height + this.panY + this.scrollRemainder;
@@ -142,27 +211,55 @@ export class PhoneTerminal {
     this.panX = Math.max(0, Math.min(this.panX, this.term.cols * cell.width - this.surface.clientWidth));
     this.host.style.width = `${Math.ceil(this.term.cols * cell.width)}px`;
     this.host.style.transform = `translate(${-this.panX}px, ${-this.panY}px)`;
+    if (!this.replaying && !this.programScrolls()) this.forgetProgram();
     this.pinned = this.atBottom();
     this.onBottom(this.pinned);
   }
+  private forgetProgram() {
+    Object.assign(this.program, { back: 0, behind: false, at: null });
+    this.wheelRemainder = 0;
+  }
+  /** "Latest output": also brings a full-screen program this view scrolled back to its newest
+   * line, where the scroll happened (a tmux pane, say): the notches sent up, more if the agent
+   * was busy meanwhile (a program stops at its bottom). If that can't be sent (offline), or the
+   * replay that says what's on screen hasn't arrived yet, the program stays marked. */
   bottom() {
+    const p = this.program;
+    if (this.replaying) {
+      // Not yet known whether the program is in front: send nothing, forget nothing.
+    } else if (!programAtLatest(p) && this.programScrolls()) {
+      const rect = this.surface.getBoundingClientRect();
+      const at = p.at ?? this.cellAt({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+      if (this.wheel(Math.max(1, returnNotches(p, this.term.rows, this.info.kind)), at)) {
+        this.forgetProgram();
+      }
+    } else {
+      this.forgetProgram();
+    }
+    this.end();
+  }
+  private end() {
     this.scrollTo(Infinity);
   }
   grid() {
     return phoneGrid(this.surface.clientWidth, this.closedHeight(), this.cell());
   }
   update(info: SessionInfo) {
+    this.info = info;
+    // A restarted session's new process starts with no saved scroll.
+    this.program = programScrollFor(programScroll, info);
+    noteBusy(this.program, sessionBusy(info));
     if (info.cols === this.term.cols && info.rows === this.term.rows) return;
     const pinned = this.atBottom();
     this.term.resize(info.cols, info.rows);
-    if (pinned) this.bottom();
+    if (pinned) this.end();
     else this.render();
   }
   fontSize(size: number) {
     if (size === this.term.options.fontSize) return;
     const pinned = this.atBottom();
     this.term.options.fontSize = size;
-    if (pinned) this.bottom();
+    if (pinned) this.end();
     else this.render();
   }
   select(active: boolean) {
@@ -181,18 +278,37 @@ export class PhoneTerminal {
       cell: this.cell(),
     };
   }
+  /** `attach_info` for this session: says what the next replay frame is. */
+  attachInfo(info: AttachInfo) {
+    this.cursor.info(info);
+  }
+  /** The connection ended (see `ReplayCursor.disconnected`). */
+  disconnected() {
+    this.cursor.disconnected();
+  }
+  /** Where this terminal stands, for reattaching with only the bytes it missed. */
+  since(): Since | null {
+    return this.cursor.since();
+  }
   receive(type: number, payload: Uint8Array) {
-    if (type === FRAME_REPLAY) {
+    // Live output, or a delta replay: the live output this terminal missed while detached,
+    // appended so the terminal (and a normal screen's scrollback) stays as it was.
+    const append = type === FRAME_OUTPUT || (type === FRAME_REPLAY && this.cursor.replay());
+    if (type === FRAME_OUTPUT) this.cursor.output(payload.length);
+    if (append) {
+      this.queue.push(payload.slice());
+      if (!this.raf) this.raf = requestAnimationFrame(() => this.flush());
+    } else if (type === FRAME_REPLAY) {
       cancelAnimationFrame(this.raf);
       this.raf = 0;
       this.queue = [];
+      // A program scrolled back stays so across a reattach: keep `program` until it's parsed.
+      this.replaying = true;
       this.term.write("\x1bc");
       this.term.write(payload.slice(), () => {
-        if (!this.disposed) this.bottom();
+        this.replaying = false;
+        if (!this.disposed) this.end();
       });
-    } else if (type === FRAME_OUTPUT) {
-      this.queue.push(payload.slice());
-      if (!this.raf) this.raf = requestAnimationFrame(() => this.flush());
     }
   }
   private flush() {
@@ -248,7 +364,7 @@ export class PhoneTerminal {
           this.panX += dx;
           this.render();
         } else if (axis === "y") {
-          this.scrollTo(this.position() + dy);
+          this.scrollBy(dy, point);
           velocity = dy / Math.max(8, e.timeStamp - time);
         }
       }
@@ -268,7 +384,7 @@ export class PhoneTerminal {
       const step = (now: number) => {
         const dt = Math.min(32, now - previous);
         previous = now;
-        this.scrollTo(this.position() + velocity * dt);
+        this.scrollBy(velocity * dt, last);
         velocity *= Math.pow(0.94, dt / 16);
         if (Math.abs(velocity) > 0.02) this.momentum = requestAnimationFrame(step);
       };
@@ -278,7 +394,7 @@ export class PhoneTerminal {
     this.surface.addEventListener("pointercancel", end, options);
     this.surface.addEventListener("wheel", (e) => {
       e.preventDefault();
-      this.scrollTo(this.position() + e.deltaY);
+      this.scrollBy(e.deltaY, { x: e.clientX, y: e.clientY });
     }, { ...options, passive: false });
   }
   dispose() {

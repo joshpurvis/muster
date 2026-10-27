@@ -83,7 +83,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
   Alt keys, Jump focuses the other window, System title bar (native window only), Command
-  palette, Keyboard shortcuts, then Reload window, Close window, Shut down Muster…), plus a
+  palette, Keyboard shortcuts, then Reload window, Close window, Restart Muster…, Shut down Muster…), plus a
   "Reconnecting…" pill when disconnected. The top-right group is the one touching the window's
   right edge highest up; a zoomed group carries the controls; narrow strips keep only Jump and
   `⋯`.
@@ -96,13 +96,23 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
   the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
   "Claude is working" / "Codex is working", "Stop its current turn?" or "Restart it? Its
-  current turn is lost; it reopens the same conversation." (Codex: "…and the program starts
-  fresh."), with Cancel focused. Shells and idle agents don't ask, nor do the palette commands
+  current turn is lost; it reopens the same conversation." (Claude and Codex alike), with
+  Cancel focused. Shells and idle agents don't ask, nor do the palette commands
   and shortcuts. Restarting a Claude tab, also one that ended when Muster shut down, reopens the
   conversation it last used (`--resume`), once a prompt was sent in it; after a `/clear` it
-  starts empty until the new conversation has a prompt. If Claude can't open that conversation
-  any more ("No conversation found"), the next restart starts empty. For an empty conversation
-  any time, open a new Claude tab.
+  starts empty until the new conversation has a prompt. A Codex tab does the same with
+  `codex resume … <thread>` once the conversation has a finished turn. Only the tab's own
+  conversation counts, never a sub-agent's; after `/new` a restart starts empty until the new
+  conversation has finished a turn. (Both need Codex's hooks; with them off or not yet
+  trusted, the first conversation to finish a turn is kept, `/new` isn't noticed, and a
+  sub-agent finishing its turn can make the tab read idle while its own turn goes on, and
+  answer an agent's `ask` with the sub-agent's message.) If the CLI says it no longer has that
+  conversation (Claude: "No conversation found"; Codex: "No saved session found with ID …",
+  also when a narrow pane wraps it) before the run sent any hook, the run ends, its status
+  reads "couldn't reopen its conversation, so the next start begins a new one", and the next
+  restart starts empty; any other failure keeps the conversation for the next try, as does a
+  run that got as far as a hook (it opened the conversation, whatever its output quotes later). For an empty conversation any time,
+  open a new tab.
 
 ### Agent panel tabs
 
@@ -194,8 +204,24 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   the window save first. A status line under it: Saved / Edited / Saving… / the reason a save
   failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
   with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
-  its editor (hidden behind the visible tab), so switching tabs keeps the undo history (Ctrl+Z);
-  moving the tab to another group or window, or someone else's change, starts it afresh.
+  its editor (hidden behind the visible tab), so switching tabs keeps its scroll.
+- **Undo**: Ctrl+Z undoes the human's own edits in the note, Ctrl+Shift+Z or Ctrl+Y redoes them
+  (⌘Z, ⇧⌘Z or ⌘Y on a Mac; on other keyboard layouts the keys in those places). Undo and redo
+  are keyboard only: the browser's context menu greys its Undo and Redo by its own history, so
+  they may be unavailable; when it does offer them they act on the note's history. It is the
+  editor's own history (`web/src/note_undo.ts`), not the browser's: WebKitGTK, the native
+  window's engine, has no key for its own, and a browser drops its own whenever an agent's
+  change replaces the text. Typing undoes a word or a burst at a time (a pause of a second ends
+  one), runs of Backspace or Delete likewise; a paste, a cut, a drop or each input method
+  composition is one step. Control characters typed or pasted (an ESC) are dropped at once, as
+  the daemon would drop them. An undo saves like typing, so the daemon and other windows get it,
+  and scrolls what it changed into view. Someone else's change never gets undone: Ctrl+Z steps
+  over it, taking back only the human's text around it. A step the change touched can't be
+  taken back without rewriting theirs, so the history ends there (Ctrl+Z then does nothing).
+  That includes a step the change may have touched where repeated text makes its place
+  ambiguous (removing one of two identical lines), and a step where an agent made the very
+  same change before it was saved. The history lives with the note in this window: moving the
+  tab to another group keeps it; another window, or a reload, starts afresh.
 - **Never lost**: typing not yet saved is kept in this browser until the daemon has it. After a
   reload, a closed window or a crash, the window's next page brings it back (a bar says so),
   merged onto the note as it is by then, and saves it. Reload window and Close window first wait
@@ -213,7 +239,8 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
 - **Keys**: in the editor, Muster's shortcuts that work in text fields still do (Ctrl+Space,
   Ctrl+K, Ctrl+Shift+P, Ctrl+Tab, Alt+Shift+…); Alt+letters and Alt+arrows stay with the text, as
   in any field; Esc stays too (fullscreen ends with Alt+Shift+Z or the Exit fullscreen button in
-  the corner, as for a terminal). The notes list is a combobox: the field keeps focus and the
+  the corner, as for a terminal). Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y stay with the note ("Undo"),
+  never reaching a terminal or another shortcut. The notes list is a combobox: the field keeps focus and the
   arrow keys move the selected row, which screen readers announce.
 - **Allow triggers**: a small switch in the status line (a lightning icon, `triggers off` /
   `triggers on · N` with the number of triggers watching the note; role switch; the tooltip says
@@ -350,9 +377,10 @@ docs/PROTOCOL.md "Updates and window preferences"), in this order:
    reconnects.
 2. **UI update ready**: the installed UI release differs from the one this page loaded (after
    `muster ui-install`). "Reload" (Ctrl+Shift+R).
-3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. No button:
-   installing it needs a full restart, which ends all sessions; a "Shut down Muster…" link opens
-   the shutdown dialog.
+3. **Terminal host update**: a new `muster-terminal-host` is beside that executable. Installing
+   it needs a restart of Muster, which ends all sessions: "Restart Muster…" (disabled while
+   disconnected) opens the restart dialog (see "Window and shutdown"), so the update is one
+   confirmed click.
 
 When the backend and the UI both changed, the backend banner comes first and the UI banner shows
 after the restart. The banner is hidden while a dialog is open, and has its own polite live
@@ -369,9 +397,34 @@ of the same kind arrives; the next waiting update shows meanwhile.
 - **System title bar** (`⋯`, palette; native windows only): shows or hides the window
   decorations of every native window. Kept by the backend (`prefs.set`), so new windows are built
   with it; open windows switch at once. Windows opened by an older build don't have the switch.
-- **Shut down Muster…** (`⋯`, palette, the terminal host banner): a dialog warning that it stops
+- **Restart Muster…** (`⋯`, palette, the terminal host banner): what `muster stop` then `muster`
+  do, without a terminal. A dialog warning that it stops the backend and the terminal host and
+  starts them again, ending every session and agent, with how many sessions are running, and that
+  windows reconnect by themselves and Claude tabs can be restarted afterwards to reopen their
+  conversation. Cancel is focused; "Restart" (red) calls `daemon.restart` with the builds this
+  window was shown (never queued). The dialog then says "Checking that Muster can restart…" and
+  that nothing has stopped yet, with no Cancel; Escape, the backdrop and shortcuts (the command
+  palette, Jump) no longer close or replace it, and nothing else takes the screen from it (the
+  request can't be withdrawn). A refusal (a build still being written or changed since, another
+  restart, reload or shutdown under way, a check of the restart command) comes back as a toast
+  before anything stopped. Otherwise every window shows "Restarting Muster…" (an alert dialog
+  that takes the focus; no shortcut works meanwhile, nor on the shut-down screen) and keeps
+  reconnecting; when a new backend on a new terminal host answers, the window carries on (the
+  terminal host banner is gone) and a toast says Muster restarted (or, when the backend that
+  answers runs another build than the restart was for, that something else started Muster
+  meanwhile and every session ended). If that backend needs another
+  UI, the screen says Muster restarted with a new interface, every session ended, and offers
+  Reload window. If none answers within 3 minutes, the window shows the stopped screen, "Muster
+  didn't come back": the restart didn't finish, sessions may have ended or some may still run, and
+  to run `muster stop`, then `muster` (which prints why the restart didn't finish when the restart
+  command recorded it), again after a minute if `muster stop` says the backend didn't stop or a
+  restart is under way. If the old backend still answers then (the restart never went ahead), a
+  toast says so instead. Native windows stay open and reconnect; no
+  new window opens.
+- **Shut down Muster…** (`⋯`, palette): a dialog warning that it stops
   the backend and the terminal host and ends every session and agent, with how many sessions are
-  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown`. Every window then shows
+  running. Cancel is focused; "Shut down" (red) calls `daemon.shutdown` (the dialog then says
+  "Shutting down Muster…", with no Cancel, and holds the screen as a confirmed restart's does). Every window then shows
   "Muster is shut down" (an alert dialog that takes the focus) and stops reconnecting. Only
   `daemon_stopping` or the call's reply does that; a dropped connection just reconnects. Its
   Reconnect reloads the window only once Muster answers again; until then it says "Muster isn't
@@ -432,14 +485,16 @@ terminal tab; there is no chat view.
 
 | Part | What |
 |---|---|
-| Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token), followed by an estimate of what it spent today once read (`· ~$0.42 today (est.)`, OpenRouter's UTC day; see Scheduling settings). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
-| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
+| Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. While agents' proposals wait, another amber line reads **2 schedules proposed by reviewer wait for your approval · Show** (Show scrolls to and focuses the oldest); schedules made or changed outside the window wait the same way (**1 schedule made or changed outside Muster's window waits for your approval**, or both kinds counted together). |
+| Proposal | An agent's proposed schedule (Phase 3) is an amber card under the agent it would run on, above its other schedules: **Proposed by reviewer · today 10:02**, the name, WHEN (the reading with its time zone, always: "At 08:30, Monday to Friday (America/Los Angeles time)", and for a one-off in another zone when that is here: "; 16:30 your time"), AGENT, ALSO (fresh conversation, quiet hours, a daily cap, a reply note, when set), the PROMPT (monospace, scrolls past 9 lines; the box takes the keyboard focus, so arrow keys scroll it, and a prompt over 8 lines or 600 characters has **Show all (N lines)** / **Show less** under it), THEN (every "Then…" step, nested ones indented under the step they follow: "When it replies: ask **deployer**", "When that step replies: …", "If it fails: notify you", each with its prompt in the same monospace box; **Show all** unfolds these too), WHY (the agent's reason, in italics: its words), and USE (the estimate, one sentence each: runs in the coming week and at most per day; what pays, amber with a shield for a Claude subscription agent, with its 7-day expiry and quiet hours; the agent's unattended cap and its last 7 days). Buttons **Approve** (`schedule.approve`; a toast with its next run), **Edit…** (the schedule dialog, its head saying it stays waiting until approved) and **Dismiss** (`schedule.remove`, no confirm: it never ran). Right-click, Shift+F10 or the menu key: the same three. It never shows a next run or a history: it hasn't run. A schedule made or widened outside Muster's window (the command line, a script: `held`) gets the same card, headed **Made from the command line or a script** (or **Resumed …**, **Changed and resumed …**, **Renewed for 7 days …**) with when, and WHY reading "Waits for your approval: it came from the command line or a script, not from a click in Muster's window. Until you approve it, it doesn't run."; a held change of one of yours has **Remove…** (with the usual question) instead of Dismiss. Approve sends the `updated_at` the card showed, so a schedule changed since is refused. If a change made in the window itself comes back held (Muster couldn't tell its program), a toast says so and points at the card. |
+| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents, a `sleeps` marker for one that sleeps when idle, and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An asleep agent reads `asleep · 2h` with a half-filled dot, and `cold` when waking it would re-read the whole conversation at full cost. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token), followed by an estimate of what it spent today once read (`· ~$0.42 today (est.)`, OpenRouter's UTC day; see Scheduling settings). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
+| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), except an asleep one, whose tab is only shown (looking never wakes it), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
 | Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
-| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show, Start fresh (a new conversation, restarting a running one), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
-| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name, then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git or GitHub watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`) and, under the row, a line saying what to do (also in the row's accessible name). |
+| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show (asleep: Show, and Wake with a `re-reads it all` hint when its cache has likely expired), Start fresh (a new conversation, restarting a running one), Sleep (`agent.sleep`; disabled until it runs and has a saved conversation; a toast says why the daemon refused), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
+| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name (its tooltip and spoken label give the reading, with the time zone when it isn't this browser's), then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git, GitHub or files watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`) and, under the row, a line saying what to do (also in the row's accessible name). A schedule an agent made has a violet chip: `reminder` (a one-off it set for itself) or `from reviewer` (its proposal you approved); the tooltip says which and when. |
 | Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). A trigger has no Skip next; Run now runs it without an event. A URL trigger adds **Copy trigger command** (a `curl` line with its URL and secret, `trigger.secret`; the toast says to keep it private) and **New secret…** (confirm; the old secret stops working). A note trigger whose note has triggers off adds **Allow triggers on <note>**. |
 | Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run` (also while a page loads; pages merge in). After a reconnect, histories are thrown away and the open ones load again; a failed load says so with Try again. A triggered run has a `triggered` chip and the first line of what happened (`+N more` for merged events). A "Then…" step reads right under the run it follows, indented on a guide line, with a `then: <agent>` chip; it never becomes the row's last outcome. |
+| Asleep agent's tab | An `asleep` chip on the tab, and instead of the "Exited · Restart" bar a calm bar: "<name> is asleep for 2 h 10 m. The next message, or typing here, wakes it into the same conversation." Once its prompt cache has likely expired the bar is tinted like the cold-cache bar and reads "…wakes it: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.", with **Wake** and **Start fresh**. Its buttons never take focus, so typing goes on into the terminal: the daemon holds the keys, wakes the agent and types them once it is ready (Enter alone wakes it too). Focus changes and mouse clicks in the terminal don't wake it. If a wake fails (say its account profile is disabled), it stays asleep and the bar says so: "Waking <name> failed: <why>. It is still asleep: the next message, or typing here, tries again." Screen readers hear the bar once per sleep, again when its prompt cache expires while it sleeps (the wake then costs more), and when a wake fails. |
 | + New agent | Under the list: the New agent dialog. |
 | Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, a `late reply` chip once the agent answered it later with `reply` (`late reply not delivered`, red, when a guard refused the delivery or the asker was gone), a `cold start` chip when it was typed into an agent whose cache had likely expired, and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet"), its later reply with how it reached the asker, and its route (a message that carried a late reply says "late reply to message N"). |
 
@@ -461,7 +516,7 @@ the reason), and, with a Phase 2 backend, **OpenRouter spend**: today's spend of
 (`$1.84 today of $5.00 · resets at 00:00 UTC (OpenRouter's day) · read 3 m ago`, red at the cap;
 "Not read yet today"; the last failed reading's error and, with no reading in 15 minutes, that unattended OpenRouter work is refused until one succeeds, both in amber beside the last amount; "No OpenRouter key", with the refusal it means, when the backend has none),
 the daily cap for all OpenRouter agents in dollars (always on), and one row per OpenRouter agent
-with an estimate of what it spent today (`~$0.60 today (estimated)`) and its own optional cap ("no own cap"). Opening it asks the backend
+with an estimate of what it spent today (`~$0.60 today (estimated)`) and its own optional cap ("no own cap"). With a Phase 3 backend, **Watched folders**: one folder per line that file triggers may watch (or folders inside them); empty, the default, means file triggers are off, and removing a folder stops the triggers inside it. Opening it asks the backend
 again (it re-reads the key when its reading is over a minute old; the numbers update live). Save
 sends only what changed (`schedule.settings.set`). The dialog scrolls in a short window.
 
@@ -518,6 +573,14 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   click switches it on). A hint per kind says how it watches (the note rules and why it can't
   loop, git read every 15 seconds with no hooks, your own gh login, a URL on this computer only
   with a secret). If missed is hidden; the prompt hint adds `{event}` (and `{payload}` for a URL).
+  With a Phase 3 backend the picker also has *Files appear or change in a folder*: the folder
+  (suggested from your watched folders), "files named" a pattern (empty: any file; `*.pdf`),
+  "after N min of quiet", and an **and subfolders (up to 3 levels down)** switch; the preview reads it ("When files
+  named *.pdf appear or change in ~/inbox (after 2 minutes of quiet)") or says the folder isn't
+  inside one you allow. With no watched folder yet, a note says file triggers are off until you
+  choose folders, with **Scheduling settings…**, and Create stays off. That button opens the
+  settings over the dialog, and their Save, Cancel (labelled **Back to the schedule**) and
+  Escape all return to it with everything typed so far kept.
 - In that mode the Agent list is of agents that accept triggered work (the Webhook origin), with
   the same grouping and hints ("tick Webhook (triggered) in Edit agent").
 - **Then…** (after "Also put the reply in"): "When it replies, ask [nobody · an agent]" with a
@@ -590,6 +653,11 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
     Edit dialog and lose its unsaved Settings.
   - Files are named exactly as listed (an agent's `notes.md ` is not `notes.md`); a new note's
     name can't have invisible characters or spaces around a folder name.
+- **Sleep when idle** (off by default; under Autostart): after N minutes idle (5 to 10080, 60
+  suggested) its process stops; its tab, scrollback and conversation stay, and the next message,
+  schedule run, panel click or typing into its tab wakes it. The hint says a wake re-reads the
+  whole conversation, at full cost once the prompt cache has expired, so sleeping after about the
+  cache's lifetime costs nothing extra.
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
   from the agent's next start, which the toast says when it runs. Edit's title shows the
   OpenRouter badge for an agent on it.
@@ -661,6 +729,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
+| Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y (in a note) | Undo / redo the human's own edits in the note (see "Notes") |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy / paste in terminal |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Terminal font size |
 | Alt+/ or F1 | Shortcuts sheet |

@@ -12,6 +12,7 @@ import {
   layoutOrder,
   meta,
   myWindow,
+  lifecycleChecking,
   overlay,
   panels,
   prefs,
@@ -39,11 +40,12 @@ import { AgentDialog, MessageDialog } from "./Agents.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfileSelect } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
+import { runningText } from "../updates.ts";
 import { agentStatus } from "../agents.ts";
 import { FolderInput } from "./FolderInput.tsx";
 import { labelOf } from "../layout/Pane.tsx";
 import { basename, type JumpCandidate, jumpOrder, rankJump, tabText, windowLabel } from "../model.ts";
-import { cx, fuzzy, tildify } from "../util.ts";
+import { cx, fuzzy, isMac, tildify } from "../util.ts";
 
 const FOCUSABLE =
   'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
@@ -135,6 +137,10 @@ function Modal(
 }
 
 export function Overlays() {
+  // A confirmed Restart or Shut down keeps its dialog until it is refused or under way, whatever
+  // else asked for the screen meanwhile.
+  const checking = lifecycleChecking.value;
+  if (checking) return <Lifecycle restart={checking === "restart"} />;
   const o = overlay.value;
   if (!o) return null;
   switch (o.kind) {
@@ -153,7 +159,9 @@ export function Overlays() {
     case "cache_settings":
       return <CacheSettingsDialog />;
     case "shutdown":
-      return <Shutdown />;
+      return <Lifecycle restart={false} />;
+    case "restart":
+      return <Lifecycle restart />;
     case "shortcuts":
       return <Shortcuts />;
     case "confirm":
@@ -174,9 +182,12 @@ export function Overlays() {
     case "agent_message":
       return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
     case "schedule":
-      return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} Modal={Modal} close={close} />;
-    case "schedule_settings":
-      return <ScheduleSettingsDialog Modal={Modal} close={close} />;
+      return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} keep={o.draft} Modal={Modal} close={close} />;
+    case "schedule_settings": {
+      // Opened from the schedule dialog: closing goes back to it, draft and all.
+      const back = o.back;
+      return <ScheduleSettingsDialog Modal={Modal} close={back ? () => (overlay.value = back) : close} back={!!back} />;
+    }
   }
 }
 
@@ -1058,6 +1069,8 @@ const EXTRA: { title: string; keys: string[]; group: string }[] = [
   { title: "Reorder, move to a group, split or window", keys: ["Drag tab"], group: "Tab" },
   { title: "Group menu", keys: ["Right-click"], group: "Groups" },
   { title: "Equalize splits", keys: ["Double-click gutter"], group: "Groups" },
+  { title: "Undo in a note", keys: [isMac ? "Cmd+Z" : "Ctrl+Z"], group: "Notes" },
+  { title: "Redo in a note", keys: isMac ? ["Cmd+Shift+Z", "Cmd+Y"] : ["Ctrl+Shift+Z", "Ctrl+Y"], group: "Notes" },
 ];
 
 type ScGroup = [string, { title: string; keys: string[] }[]];
@@ -1193,55 +1206,72 @@ function Confirm(
   );
 }
 
-// ---------------- shut down ----------------
+// ---------------- shut down, restart ----------------
 
-/** "Shut down Muster…": what `muster stop` does, from the window. Cancel is the default. */
-function Shutdown() {
+/** "Shut down Muster…" (what `muster stop` does) and "Restart Muster…" (that, then `muster`
+ * again by itself), from the window. Both end every session; Cancel is the default. Once
+ * confirmed there is no way back (the request can't be withdrawn, and a restart's checks may
+ * take a while before every session ends), so the dialog then only says it is under way, with
+ * no Cancel; Escape, the backdrop and shortcuts no longer close or replace it
+ * (`lifecycleChecking`, shared with the keys). */
+function Lifecycle({ restart }: { restart: boolean }) {
   const cancel = useRef<HTMLButtonElement>(null);
-  const [busy, setBusy] = useState(false);
+  const busy = lifecycleChecking.value !== null;
   useLayoutEffect(() => cancel.current?.focus(), []);
   const running = [...sessions.value.values()].filter((s) => s.state !== "exited");
-  const agentCount = running.filter((s) => s.kind !== "shell").length;
-  const n = running.length;
+  const label = restart ? "Restart Muster" : "Shut down Muster";
+  const go = () => {
+    (restart ? A.restartMuster() : A.shutDown()).finally(() => (overlay.value = null));
+  };
   return (
-    <Modal class="dialog confirm-dlg" label="Shut down Muster" describedBy="shutdown-body">
+    <Modal
+      class="dialog confirm-dlg"
+      label={label}
+      describedBy="lifecycle-body"
+      onClose={() => {
+        if (!lifecycleChecking.peek()) close();
+      }}
+    >
       <div class="dlg-head">
-        <h2>Shut down Muster?</h2>
+        <h2>{busy ? label : `${label}?`}</h2>
       </div>
-      <div class="dlg-body" id="shutdown-body">
-        <p>
-          This stops the Muster backend and its terminal host, in every window. Every terminal closes and every
-          agent in them stops.
-        </p>
-        <p>
-          {n === 0 ? "No sessions are running." : (
-            <>
-              <strong>{n === 1 ? "1 session is running" : `${n} sessions are running`}</strong>
-              {agentCount === 0
-                ? "."
-                : agentCount === n
-                ? (n === 1 ? " (an agent)." : " (all agents).")
-                : ` (${agentCount} ${agentCount === 1 ? "agent" : "agents"}).`}
-            </>
-          )}
-        </p>
-        <p class="muted">Run <code>muster</code> to start it again.</p>
-      </div>
-      <div class="dlg-foot">
-        <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
-        <button
-          type="button"
-          class="btn btn-danger"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            A.shutDown().finally(() => (overlay.value = null));
-          }}
-        >
-          {busy && <Spinner size={12} />}
-          Shut down
-        </button>
-      </div>
+      {busy
+        ? (
+          <div class="dlg-body" id="lifecycle-body">
+            <p role="status">
+              <Spinner size={12} />{" "}
+              {restart ? "Checking that Muster can restart…" : "Shutting down Muster…"}
+            </p>
+            <p class="muted">
+              {restart
+                ? "Nothing has stopped yet. If the check passes, every session ends and Muster starts again; if not, this window says why."
+                : "Every session is ending."}
+            </p>
+          </div>
+        )
+        : (
+          <>
+            <div class="dlg-body" id="lifecycle-body">
+              <p>
+                {restart
+                  ? "This stops the Muster backend and its terminal host, in every window, then starts them again. Every terminal closes and every agent in them stops."
+                  : "This stops the Muster backend and its terminal host, in every window. Every terminal closes and every agent in them stops."}
+              </p>
+              <p>{running.length ? <strong>{runningText(running)}</strong> : runningText(running)}</p>
+              <p class="muted">
+                {restart
+                  ? "Windows reconnect by themselves. Claude tabs can be restarted afterwards and reopen their conversation."
+                  : <>Run <code>muster</code> to start it again.</>}
+              </p>
+            </div>
+            <div class="dlg-foot">
+              <button ref={cancel} type="button" class="btn" onClick={close}>Cancel</button>
+              <button type="button" class="btn btn-danger" onClick={go}>
+                {restart ? "Restart" : "Shut down"}
+              </button>
+            </div>
+          </>
+        )}
     </Modal>
   );
 }

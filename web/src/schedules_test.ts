@@ -39,8 +39,18 @@ import {
   withSteps,
   nestedSteps,
   noteOptions,
+  isProposal,
+  isHeld,
+  heldHeadline,
+  waitingNotice,
+  madeByLabel,
+  proposalFacts,
+  promptIsLong,
+  readingWithZone,
+  waitingProposals,
+  thenSteps,
 } from "./schedules.ts";
-import type { Agent, Schedule, ScheduleRun, WhenInput } from "./types.ts";
+import type { Agent, Schedule, ScheduleRun, Then, WhenInput } from "./types.ts";
 
 function eq<T>(a: T, b: T, msg = "") {
   const x = JSON.stringify(a), y = JSON.stringify(b);
@@ -446,4 +456,104 @@ Deno.test("a trigger's row and its runs", () => {
   eq(runKindLabel({ ...r, kind: "triggered" }), "triggered");
   const subs = scheduleAgents([agent("a", "codex", ["human", "schedule"]), agent("b", "codex", ["human", "webhook"])], "webhook");
   eq(subs.map((c) => [c.agent.name, c.group]), [["b", "unattended"], ["a", "off"]], "triggers need the webhook origin");
+});
+
+// ---------------- Phase 3: what agents made, the files trigger ----------------
+
+Deno.test("an agent's proposal: waits first, reads plainly, and its chip after approval", () => {
+  const made = { agent_id: 2, agent: "reviewer", kind: "proposal" as const, reason: "You asked", at: NOW - 60_000, approved_at: null };
+  const p = sched({ id: 7, status: "proposed", next_run: null, made_by: made, quiet_hours: true, daily_cap: 2 });
+  eq(isProposal(p), true);
+  eq(nextLabel(p, NOW), { text: "waiting for your approval", tone: "paused" });
+  eq(madeByLabel(p), null, "the card says who proposed it");
+  eq(sortSchedules([sched({ id: 1, next_run: 10 }), p]).map((s) => s.id), [7, 1], "proposals first");
+  eq(waitingProposals([sched({ id: 1 }), p]).map((s) => s.id), [7]);
+  const facts = proposalFacts(p);
+  eq(facts.map((f) => f.label), ["When", "Agent", "Also"]);
+  eq(facts[2].value, "skips quiet hours, at most 2 a day");
+  const approved = sched({ made_by: { ...made, approved_at: NOW } });
+  eq(isProposal(approved), false);
+  eq(madeByLabel(approved)?.text, "from reviewer");
+  eq(madeByLabel(sched({ made_by: { ...made, kind: "reminder" } }))?.text, "reminder");
+  eq(madeByLabel(sched({})), null, "yours have no chip");
+});
+
+Deno.test("files trigger fields", () => {
+  const t = { ...blankTrigger(), kind: "files" as const };
+  eq("error" in whenOfTrigger(t, []), true, "a folder is needed");
+  eq(whenOfTrigger({ ...t, folder: " ~/inbox ", pattern: "*.pdf", quiet: "3" }, []), {
+    when: { kind: "files", folder: "~/inbox", pattern: "*.pdf", recursive: false, quiet_min: 3 },
+  });
+  eq(whenOfTrigger({ ...t, folder: "~/inbox", subfolders: true }, []), {
+    when: { kind: "files", folder: "~/inbox", pattern: null, recursive: true, quiet_min: 2 },
+  });
+  eq("error" in whenOfTrigger({ ...t, folder: "~/inbox", pattern: "a/*.pdf" }, []), true);
+  eq("error" in whenOfTrigger({ ...t, folder: "~/inbox", quiet: "0" }, []), true);
+  const d = draftOfTrigger({ kind: "files", folder: "/home/u/inbox", pattern: "*.pdf", recursive: true, quiet_min: 5 }, blankTrigger());
+  eq([d.kind, d.folder, d.pattern, d.subfolders, d.quiet], ["files", "/home/u/inbox", "*.pdf", true, "5"]);
+  eq(isTrigger({ kind: "files", folder: "/x", recursive: false, quiet_min: 2 }), true);
+});
+
+Deno.test("a proposal's timing says its time zone; a row says it only when it isn't yours", () => {
+  const la = sched({ tz: "America/Los_Angeles", reading: "At 08:30, Monday to Friday", when: { kind: "cron", cron: "30 8 * * 1-5" } });
+  eq(readingWithZone(la, "Europe/London", true), "At 08:30, Monday to Friday (America/Los Angeles time)");
+  eq(readingWithZone(la, "Europe/London"), "At 08:30, Monday to Friday (America/Los Angeles time)", "not yours: said on a row too");
+  const home = { ...la, tz: "Europe/London" };
+  eq(readingWithZone(home, "Europe/London"), "At 08:30, Monday to Friday", "yours: a row reads as before");
+  eq(readingWithZone(home, "Europe/London", true), "At 08:30, Monday to Friday (Europe/London time)", "a proposal always says it");
+  // A one-off elsewhere also says when that is here: 08:30 in Los Angeles is 16:30 in London.
+  const once = sched({
+    tz: "America/Los_Angeles",
+    reading: "Once, Tue 27 Oct 2026 at 08:30",
+    when: { kind: "once", at: Date.UTC(2026, 9, 27, 15, 30) },
+  });
+  eq(readingWithZone(once, "Europe/London", true), "Once, Tue 27 Oct 2026 at 08:30 (America/Los Angeles time; 15:30 your time)");
+  // ...and the day when it differs (23:30 in Los Angeles is the next morning in London).
+  const late = sched({ tz: "America/Los_Angeles", reading: "Once, Tue 27 Oct 2026 at 23:30", when: { kind: "once", at: Date.UTC(2026, 9, 28, 6, 30) } });
+  eq(readingWithZone(late, "Europe/London", true), "Once, Tue 27 Oct 2026 at 23:30 (America/Los Angeles time; Wed 06:30 your time)");
+  // Triggers have no time.
+  const trig = sched({ tz: "America/Los_Angeles", reading: "When its trigger URL is called", when: { kind: "url", name: "x" } });
+  eq(readingWithZone(trig, "Europe/London", true), "When its trigger URL is called");
+  // The card's When line carries it.
+  const made = { agent_id: 2, agent: "reviewer", kind: "proposal" as const, reason: "r", at: NOW, approved_at: null };
+  eq(proposalFacts({ ...la, status: "proposed", made_by: made }, "Europe/London")[0].value, "At 08:30, Monday to Friday (America/Los Angeles time)");
+});
+
+Deno.test("a long proposal prompt folds, with the rest a click away", () => {
+  eq(promptIsLong("Summarise the Ideas note"), false);
+  eq(promptIsLong(Array.from({ length: 9 }, (_, i) => `line ${i}`).join("\n")), true, "more than 8 lines");
+  eq(promptIsLong("x".repeat(601)), true, "more than 600 characters");
+  eq(promptIsLong(Array.from({ length: 8 }, (_, i) => `line ${i}`).join("\n")), false);
+});
+
+Deno.test("a schedule made or changed outside the window waits like a proposal, and says why", () => {
+  const made = sched({ id: 9, status: "held", next_run: null, updated_at: NOW - 5_000, held: { what: ["made"], at: NOW - 5_000, why: "it came from the command line" } });
+  eq([isHeld(made), isProposal(made)], [true, true]);
+  eq(nextLabel(made, NOW), { text: "waiting for your approval", tone: "paused" });
+  eq(heldHeadline(made), "Made from the command line or a script");
+  const changed = { ...made, id: 10, held: { what: ["changed" as const, "resumed" as const], at: NOW - 1_000, why: "x" } };
+  eq(heldHeadline(changed), "Changed and resumed from the command line or a script");
+  eq(heldHeadline({ ...made, held: { what: ["renewed"], at: 0, why: "x" } }), "Renewed for 7 days from the command line or a script");
+  eq(waitingNotice([made]), "1 schedule made or changed outside Muster's window waits for your approval");
+  const p = sched({ id: 7, status: "proposed", next_run: null, made_by: { agent_id: 2, agent: "reviewer", kind: "proposal", reason: "r", at: NOW - 60_000, approved_at: null } });
+  eq(waitingNotice([p]), "1 schedule proposed by reviewer waits for your approval");
+  eq(waitingNotice([p, made, changed]), "3 schedules wait for your approval (1 proposed by agents, 2 from the command line)");
+  eq(waitingProposals([changed, sched({ id: 1 }), made, p]).map((s) => s.id), [7, 9, 10], "oldest first");
+  eq(isHeld(sched({})), false);
+});
+
+Deno.test("the approval card lists every \"Then…\" step, nested ones included", () => {
+  const step = (agent: string, prompt: string, then: Then | null = null) => ({ notify: false, agent, agent_id: 1, prompt, then });
+  const t: Then = {
+    on_success: step("reviewer", "Check {reply}", { on_success: step("deployer", "Ship it", null), on_failure: { notify: true, agent: null, agent_id: null, prompt: "", then: null } }),
+    on_failure: step("fixer", "Fix it"),
+  };
+  eq(thenSteps(t), [
+    { depth: 0, when: "When it replies", agent: "reviewer", prompt: "Check {reply}" },
+    { depth: 1, when: "When that step replies", agent: "deployer", prompt: "Ship it" },
+    { depth: 1, when: "If that step fails", agent: null, prompt: "" },
+    { depth: 0, when: "If it fails", agent: "fixer", prompt: "Fix it" },
+  ]);
+  eq(thenSteps(null), []);
+  eq(thenSteps({ on_success: { ...step("x", "p"), agent: null }, on_failure: null })[0].agent, "(a removed agent)");
 });

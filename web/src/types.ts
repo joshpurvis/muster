@@ -15,10 +15,58 @@ export interface AccountProfile {
   config_dir: string;
   enabled: boolean;
   created_at: number;
+  /** Profiles with the same value were declared to sign in to one account. */
+  account_group?: string | null;
 }
 
 /** Omitted: inherit. "default": explicitly use the ordinary inherited Claude environment. */
 export type ProfileChoice = number | "default";
+
+/** src/usage.rs `Status`: only "current" counts as known room. */
+export type UsageStatus = "unknown" | "current" | "stale" | "unconfirmed" | "reset";
+
+/** One usage window of one account as last reported to Claude Code's status line. */
+export interface UsageWindow {
+  status: UsageStatus;
+  used_percentage: number | null;
+  /** Unix seconds. */
+  resets_at: number | null;
+  /** Unix ms of the newest report that carried newly fetched data; null: never confirmed. */
+  observed_at: number | null;
+  reported_at: number | null;
+  /** Another profile on the same account whose session reported it. */
+  reported_by: string | null;
+}
+
+export interface UsageRow {
+  choice: ProfileChoice;
+  name: string;
+  enabled: boolean;
+  eligible: boolean;
+  ineligible_reason: string | null;
+  /** Rows with the same value are one account. */
+  account: string;
+  same_account_as: string[];
+  five_hour: UsageWindow;
+  seven_day: UsageWindow;
+}
+
+export interface UsageSuggestion {
+  choice: ProfileChoice;
+  name: string;
+  /** Every eligible choice on the suggested account. */
+  choices: ProfileChoice[];
+  reason: string;
+}
+
+/** `account_usage.get` / `hello.account_usage`. */
+export interface AccountUsage {
+  evaluated_at: number;
+  stale_after_ms: number;
+  rows: UsageRow[];
+  suggestion: UsageSuggestion | null;
+  no_suggestion: string | null;
+}
 
 export type AgentState =
   | "starting"
@@ -119,6 +167,9 @@ export interface SessionInfo {
   queued: number;
   /** Built-in subagents the agent is running right now (runtime only). */
   subagents?: number;
+  /** Sub-agents and commands it started in the background that haven't reported back; a named
+   * agent never sleeps while one runs (src/sleep.rs). Missing from older daemons. */
+  background?: number;
   created_at: number;
   /** The window showing this session as a tab. Missing before v2: then its channel's window. */
   window_id?: WindowId | null;
@@ -188,6 +239,15 @@ export interface Agent {
   session_id: SessionId | null;
   resumable: boolean;
   created_at: number;
+  /** Sleeps after this many idle minutes (null: never; older daemons: absent). */
+  sleep_after_min?: number | null;
+  /** Its process was stopped while idle; the next message wakes it (src/sleep.rs). */
+  asleep?: boolean;
+  /** Asleep since (Unix ms). */
+  asleep_at?: number | null;
+  /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
+   * typing tries again). */
+  wake_error?: string;
 }
 
 /** A message muster delivered to an agent, or refused to (`agent.messages`, `agent_message`). */
@@ -302,7 +362,8 @@ export type TriggerWhen =
   | { kind: "note"; note_id: number; quiet_min: number }
   | { kind: "git"; repo: string; branch: string }
   | { kind: "github"; repo: string; event: GhEvent; branch: string | null; every_min: number }
-  | { kind: "url"; name: string };
+  | { kind: "url"; name: string }
+  | { kind: "files"; folder: string; pattern?: string | null; recursive: boolean; quiet_min: number };
 /** When a schedule runs: a 5-field cron line (or `@daily` and friends), once at a time, or when
  * something happens (a trigger). */
 export type When = { kind: "cron"; cron: string } | { kind: "once"; at: number } | TriggerWhen;
@@ -315,7 +376,8 @@ export type WhenInput =
   | { kind: "note"; note_id: number; quiet_min?: number }
   | { kind: "git"; repo: string; branch: string }
   | { kind: "github"; repo: string; event: GhEvent; branch?: string | null; every_min?: number }
-  | { kind: "url"; name: string };
+  | { kind: "url"; name: string }
+  | { kind: "files"; folder: string; pattern?: string | null; recursive?: boolean; quiet_min?: number };
 
 /** A "Then…" step: ask an agent (the prompt may quote `{reply}`), or on failure just notify. */
 export interface ThenStep {
@@ -381,7 +443,7 @@ export interface ScheduleRun {
   event?: TriggerEvent | null;
 }
 
-/** A git or GitHub trigger's watcher. */
+/** A git, GitHub or files trigger's watcher. */
 export interface TriggerWatch {
   state: "ok" | "waiting" | "gh_not_signed_in" | "gh_missing" | "error";
   detail: string | null;
@@ -415,7 +477,10 @@ export interface Schedule {
   /** Null: a one-off that ran. */
   next_run: number | null;
   last_slot: number | null;
-  status: "active" | "paused" | "expired" | "done";
+  /** "proposed": an agent's proposal waiting for the human's approval (it never runs before).
+   * "held": made or changed outside Muster's window (the command line, a script), waiting for
+   * the owner's click the same way (`held`). */
+  status: "active" | "paused" | "expired" | "done" | "proposed" | "held";
   /** Claude subscription agents' recurring schedules only. */
   expires_at: number | null;
   expires_soon: boolean;
@@ -433,6 +498,45 @@ export interface Schedule {
   note?: { id: number; title: string; triggers: boolean } | null;
   /** A URL trigger's address (its secret: `trigger.secret`). */
   url?: string | null;
+  /** Phase 3: made by an agent (a proposal, or a reminder it set for itself); null: by you. */
+  made_by?: MadeBy | null;
+  /** What it would use (only for schedules an agent made, and held ones). */
+  estimate?: ScheduleEstimate | null;
+  /** Made or changed outside Muster's window: it waits for your click on Approve. */
+  held?: ScheduleHeld | null;
+}
+
+/** Why a schedule waits for your approval when no agent proposed it. */
+export interface ScheduleHeld {
+  /** What was done outside the window, in order. */
+  what: ("made" | "changed" | "resumed" | "unskipped" | "renewed")[];
+  at: number;
+  /** Where it came from, in words. */
+  why: string;
+}
+
+/** Who made a schedule when it wasn't you. */
+export interface MadeBy {
+  agent_id: number;
+  agent: string;
+  kind: "proposal" | "reminder";
+  /** Why, in the agent's own words. */
+  reason: string;
+  at: number;
+  /** When you approved it (a proposal); null: waiting. */
+  approved_at: number | null;
+}
+
+/** A proposal's estimated use. */
+export interface ScheduleEstimate {
+  runs_per_week: number | null;
+  max_per_day: number | null;
+  billing: "claude_subscription" | "openrouter" | "codex" | "other";
+  recent_unattended_7d: number;
+  /** In words: runs, what pays for them, the caps that bound them. */
+  text: string;
+  /** The same, one sentence each (how often, what pays, the caps). */
+  lines?: string[];
 }
 
 /** OpenRouter spend today (UTC day) and the daily caps (`ScheduleSettings.spend`). */
@@ -463,6 +567,8 @@ export interface ScheduleSettings {
   tz: string;
   /** OpenRouter spend and caps (Phase 2 backends). */
   spend?: SpendInfo;
+  /** Folders file triggers may watch (Phase 3 backends; empty: none, the default). */
+  watch_folders?: string[];
 }
 
 /** `schedule.preview`: what a timing means, before saving it. */
@@ -489,6 +595,7 @@ export type ServerEvent =
   | { event: "note_upserted"; data: Note }
   | { event: "note_removed"; data: { id: number } }
   | { event: "account_profiles_changed"; data: AccountProfile[] }
+  | { event: "account_usage_changed"; data: AccountUsage }
   | { event: "workspace_upserted"; data: Workspace }
   | { event: "workspace_removed"; data: { id: WorkspaceId } }
   | { event: "channel_upserted"; data: Channel }
@@ -508,7 +615,21 @@ export type ServerEvent =
   | { event: "schedule_settings"; data: ScheduleSettings }
   | { event: "updates_changed"; data: UpdateStatus }
   | { event: "prefs_changed"; data: WindowPrefs }
-  | { event: "daemon_stopping"; data: { reason: string } };
+  | { event: "daemon_stopping"; data: { reason: string } }
+  // Connection-scoped, only to a client that asked `session.attach` for a `replay` kind.
+  | {
+    event: "attach_info";
+    data: {
+      id: SessionId;
+      kind: "full" | "screen" | "delta";
+      offset: number;
+      generation: number | null;
+      epoch: string;
+      size_rev: number | null;
+    };
+  }
+  /** Phone only: this device's alert subscription or its delivery status changed. */
+  | { event: "push_changed"; data: { device_id: number } };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
 /** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */
@@ -538,6 +659,8 @@ export interface HelloResult {
   /** Missing from backends without notes. */
   notes?: NoteSummary[];
   account_profiles?: AccountProfile[];
+  /** Missing from backends without usage reporting; null if it could not be read. */
+  account_usage?: AccountUsage | null;
   ui_protocol?: number;
   paused_deliveries?: SessionId[];
   version: string;
@@ -556,6 +679,13 @@ export interface HelloResult {
   prefs?: WindowPrefs;
   /** Whether the backend has an OpenRouter key (never the key). Missing: no OpenRouter support. */
   openrouter?: { key_present: boolean };
+  /** The backend's own pid (missing from older backends): tells a restarted backend apart. */
+  pid?: number;
+  /** The backend's build: its content id, as `updates.backend` names a waiting one (missing from
+   * older backends). */
+  build?: string | null;
+  /** The terminal host this backend runs on (null or missing: none, or an older backend). */
+  terminal_host?: { instance: string; pid: number } | null;
 }
 
 export interface PanelCsp {

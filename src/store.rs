@@ -54,19 +54,80 @@ pub struct HookCursor {
 }
 
 /// Hook-derived runtime facts, committed with the inbox cursor and session state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HookSession {
     pub generation: u64,
     pub subagents: u32,
     pub last_hook_at: i64,
-    /// The run's latest Claude conversation id (SessionStart), for a tab that isn't a named
-    /// agent's (`Hub::resume_after_hook`).
+    /// Work the run started in the background that hasn't reported back (src/sleep.rs).
+    #[serde(default, skip_serializing_if = "crate::sleep::Background::is_empty")]
+    pub background: crate::sleep::Background,
+    /// The run's conversation (Claude: the latest reported id; Codex: its top-level thread),
+    /// `Hub::conversation_after_hook`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// Codex: `conversation` is known to be the top-level thread (the run resumed it, or its
+    /// SessionStart hook named it), not only the first thread that finished a turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_sure: bool,
     /// Not part of the record: the session's new stored arguments, saved in the same
     /// transaction as the hook that changed them.
     #[serde(skip)]
     pub extra_args: Option<Vec<String>>,
+    /// Not part of the record: a Codex tab's new saved thread (Some(None): forget it), saved
+    /// in the same transaction (`CodexThread`).
+    #[serde(skip)]
+    pub tab_thread: Option<Option<CodexThread>>,
+    /// Not part of the record: a Codex agent's new conversation (Some(None): forget it).
+    #[serde(skip)]
+    pub thread: Option<Option<String>>,
+    /// Not part of the record: the hook came from a run Start fresh is replacing, so it changes
+    /// no conversation an agent resumes.
+    #[serde(skip)]
+    pub fenced: bool,
+    /// Not part of the record: a Codex notify from a thread that isn't the run's top-level
+    /// one (a sub-agent's turn): no reply, no state.
+    #[serde(skip)]
+    pub child: bool,
+}
+
+/// The Codex thread a tab's next start reopens (`runtime_state` key `codex-thread:<session>`),
+/// kept out of `sessions.extra_args` so older backends, whose argument check has no such flag,
+/// can still restart the tab. `generation`: the run that last carried it; a start resumes it
+/// only from that run, so a run an older backend started in between (a new conversation) wins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodexThread {
+    pub thread: String,
+    pub generation: u64,
+}
+
+fn save_codex_thread(conn: &Connection, session: SessionId, thread: Option<&CodexThread>) -> anyhow::Result<()> {
+    match thread {
+        Some(t) => conn.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", params![codex_thread_key(session), serde_json::to_string(t)?])?,
+        None => conn.execute("DELETE FROM runtime_state WHERE key=?1", [codex_thread_key(session)])?,
+    };
+    Ok(())
+}
+
+fn confirm_codex_agent_thread(conn: &Connection, agent: i64, thread: Option<&str>) -> anyhow::Result<()> {
+    match thread {
+        Some(t) => conn.execute("INSERT INTO runtime_state(key,record) VALUES (?1,?2)
+            ON CONFLICT(key) DO UPDATE SET record=excluded.record", params![codex_agent_thread_key(agent), serde_json::to_string(t)?])?,
+        None => conn.execute("DELETE FROM runtime_state WHERE key=?1", [codex_agent_thread_key(agent)])?,
+    };
+    Ok(())
+}
+
+pub fn codex_thread_key(session: SessionId) -> String {
+    format!("codex-thread:{session}")
+}
+
+/// A Codex agent's `resume_id` as this backend saved it (`runtime_state` key
+/// `codex-agent-thread:<agent>`). Older backends saved every notify's thread (Codex's title
+/// requests and sub-agents' included) without it: a record that doesn't match is not resumed.
+pub fn codex_agent_thread_key(agent: i64) -> String {
+    format!("codex-agent-thread:{agent}")
 }
 
 /// Which daily cap refused a message (`insert_agent_message_capped`), with the count.
@@ -426,11 +487,50 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX schedule_runs_slot ON schedule_runs(schedule_id, slot) WHERE kind IN ('scheduled', 'catch_up');
     ALTER TABLE notes ADD COLUMN triggers INTEGER NOT NULL DEFAULT 0;
     "#,
-    // v22, v23: reserved for two unmerged branches (their migrations replace these when they
-    // merge; this branch's own is v24).
-    "-- v22 reserved",
-    "-- v23 reserved",
-    // v24: late replies (src/agent_reply.rs). `delivered_at`: when Muster typed the message into
+    // v22: Claude usage windows reported to the status line (src/usage.rs). One row per window
+    // per profile key the reporting session was pinned to ('default' or 'profile:<id>'); what
+    // each session's latest run last reported (to tell fresh data from a redraw); and which
+    // profiles the human declared to be one account. Numbers and times only, never credentials.
+    r#"
+    CREATE TABLE usage_observations (
+        account TEXT NOT NULL,
+        window TEXT NOT NULL,
+        record TEXT NOT NULL,
+        PRIMARY KEY (account, window)
+    );
+    CREATE TABLE usage_runs (
+        session_id INTEGER PRIMARY KEY,
+        record TEXT NOT NULL
+    );
+    ALTER TABLE account_profiles ADD COLUMN account_group TEXT;
+    "#,
+    // v23: phone alerts (src/push.rs): one Web Push subscription per paired device, with how its
+    // last delivery went. Foreign keys are off, so revoking a device deletes its row explicitly.
+    r#"
+    CREATE TABLE push_subscriptions (
+        device_id INTEGER PRIMARY KEY,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_ok_at INTEGER,
+        last_error TEXT,
+        last_error_at INTEGER
+    );
+    "#,
+    // v24: sleep and wake for named agents (src/sleep.rs): how long an agent may sit idle before
+    // Muster stops its process (NULL: never), and since when it is asleep (NULL: awake). An
+    // asleep agent keeps its tab and record; the next message resumes its conversation. While
+    // asleep, `autostart` reads 0 and `asleep_autostart` holds the setting, so an older backend
+    // (which knows nothing of sleep) never starts it at its own start; `asleep_generation` is
+    // the run the sleep was stopping, so a restart that cut the stop off finishes it.
+    r#"
+    ALTER TABLE agents ADD COLUMN sleep_after_min INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_at INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_autostart INTEGER;
+    ALTER TABLE agents ADD COLUMN asleep_generation INTEGER;
+    "#,
+    // v25: late replies (src/agent_reply.rs). `delivered_at`: when Muster typed the message into
     // the agent (an agent may reply only to a message it received). `answer`: the agent's later
     // reply as JSON (`agent_reply::Answer`: text, time, route, how it reached the asker), stored
     // before it is delivered so a backend restart can't lose it.
@@ -865,13 +965,54 @@ impl Store {
         Ok(())
     }
 
+    pub fn load_push_subscriptions(&self) -> anyhow::Result<Vec<(i64, crate::push::Subscription)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at
+             FROM push_subscriptions",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                crate::push::Subscription {
+                    endpoint: r.get(1)?,
+                    p256dh: r.get(2)?,
+                    auth: r.get(3)?,
+                    created_at: r.get(4)?,
+                    last_ok_at: r.get(5)?,
+                    last_error: r.get(6)?,
+                    last_error_at: r.get(7)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Insert or replace a device's subscription (with its delivery status).
+    pub fn put_push_subscription(&self, device_id: i64, s: &crate::push::Subscription) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO push_subscriptions
+                 (device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![device_id, s.endpoint, s.p256dh, s.auth, s.created_at, s.last_ok_at, s.last_error, s.last_error_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_push_subscription(&self, device_id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [device_id])?;
+        Ok(())
+    }
+
     // ----- agents -----
 
     pub fn load_agents(&self) -> anyhow::Result<Vec<crate::agents::Agent>> {
         let conn = self.conn.lock();
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
-                    resume_id, created_at, channel_id, autostart, account_profile_id, provider FROM agents ORDER BY id",
+                    resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
+                    asleep_autostart
+             FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -892,9 +1033,15 @@ impl Store {
                 resume_id: r.get(10)?,
                 created_at: r.get(11)?,
                 channel_id: r.get(12)?,
-                autostart: r.get::<_, i64>(13)? != 0,
+                // While asleep the setting is kept aside (migration v24); an older backend may have
+                // turned it on meanwhile.
+                autostart: r.get::<_, i64>(13)? != 0
+                    || r.get::<_, Option<i64>>(17)?.is_some() && r.get::<_, Option<i64>>(18)?.is_some_and(|v| v != 0),
                 account_profile_id: r.get(14)?,
                 provider: crate::openrouter::Provider::parse(&r.get::<_, String>(15)?),
+                // Out of range (written by hand): the nearest allowed value.
+                sleep_after_min: r.get::<_, Option<i64>>(16)?.map(crate::sleep::clamp_after),
+                asleep_at: r.get(17)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -906,8 +1053,9 @@ impl Store {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
-                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                               session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
+                               sleep_after_min, asleep_at, asleep_autostart)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -921,9 +1069,12 @@ impl Store {
                 b.resume_id,
                 b.created_at,
                 b.channel_id,
-                b.autostart as i64,
+                (b.autostart && b.asleep_at.is_none()) as i64,
                 b.account_profile_id,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min,
+                b.asleep_at,
+                b.asleep_at.map(|_| b.autostart as i64)
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -937,18 +1088,35 @@ impl Store {
         session_id: Option<SessionId>,
         resume_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.conn.lock().execute(
+        let conn = self.conn.lock();
+        conn.execute(
             "UPDATE agents SET channel_id = ?2, session_id = ?3, resume_id = ?4 WHERE id = ?1",
             params![id, channel_id, session_id, resume_id],
         )?;
+        // Only a hook (`commit_hook`) sets a Codex agent's thread; anything else forgets it.
+        if resume_id.is_none() {
+            confirm_codex_agent_thread(&conn, id, None)?;
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn confirm_codex_agent_thread_for_test(&self, agent: i64, thread: &str) {
+        confirm_codex_agent_thread(&self.conn.lock(), agent, Some(thread)).unwrap();
+    }
+
+    /// The Codex agent thread this backend confirmed (`codex_agent_thread_key`).
+    pub fn confirmed_codex_agent_thread(&self, agent: i64) -> anyhow::Result<Option<String>> {
+        self.load_runtime(&codex_agent_thread_key(agent))
     }
 
     /// The fields `agent.update` changes (`agents::update`).
     pub fn update_agent_config(&self, b: &crate::agents::Agent) -> anyhow::Result<()> {
         self.conn.lock().execute(
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
-                    autostart = ?7, provider = ?8 WHERE id = ?1",
+                    autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
+                    asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
+                    provider = ?8, sleep_after_min = ?9 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -957,10 +1125,41 @@ impl Store {
                 perms_json(&b.permissions),
                 serde_json::to_string(&b.accepts_origins)?,
                 b.autostart as i64,
-                b.provider.as_str()
+                b.provider.as_str(),
+                b.sleep_after_min
             ],
         )?;
         Ok(())
+    }
+
+    /// Agent `id` fell asleep at `at` (src/sleep.rs), stopping run `generation`, or woke (None).
+    /// While asleep its `autostart` column reads 0, the setting kept in `asleep_autostart`
+    /// (migration v24); an older backend that turned autostart on meanwhile keeps it on.
+    pub fn set_agent_asleep(&self, id: i64, at: Option<i64>, generation: Option<u64>) -> anyhow::Result<()> {
+        let kept = "MAX(autostart, COALESCE(asleep_autostart, 0))";
+        let conn = self.conn.lock();
+        match at {
+            Some(at) => conn.execute(
+                &format!("UPDATE agents SET asleep_autostart = CASE WHEN asleep_at IS NULL THEN autostart ELSE {kept} END,
+                    autostart = 0, asleep_at = ?2, asleep_generation = ?3 WHERE id = ?1"),
+                params![id, at, generation.map(|g| g as i64)],
+            )?,
+            None => conn.execute(
+                &format!("UPDATE agents SET autostart = CASE WHEN asleep_at IS NULL THEN autostart ELSE {kept} END,
+                    asleep_autostart = NULL, asleep_at = NULL, asleep_generation = NULL WHERE id = ?1"),
+                params![id],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// The run agent `id`'s sleep was stopping (`set_agent_asleep`), when it is asleep.
+    pub fn agent_asleep_generation(&self, id: i64) -> anyhow::Result<Option<u64>> {
+        Ok(self.conn.lock()
+            .query_row("SELECT asleep_generation FROM agents WHERE id = ?1", [id], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten()
+            .map(|g| g as u64))
     }
 
     /// The bots -> agents move (`agents::relocate_homes`): agent `id`'s home moved from one of
@@ -1025,7 +1224,9 @@ impl Store {
     }
 
     pub fn delete_agent(&self, id: i64) -> anyhow::Result<()> {
-        self.conn.lock().execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM agents WHERE id = ?1", [id])?;
+        confirm_codex_agent_thread(&conn, id, None)?;
         Ok(())
     }
 
@@ -1184,6 +1385,9 @@ impl Store {
         if let Some(agent) = agent {
             tx.execute("UPDATE agents SET channel_id=?2, session_id=?3, resume_id=?4 WHERE id=?1",
                 params![agent.id, agent.channel_id, agent.session_id, agent.resume_id])?;
+            if agent.kind == SessionKind::Codex {
+                confirm_codex_agent_thread(&tx, agent.id, agent.resume_id.as_deref())?;
+            }
         }
         tx.execute("INSERT INTO runtime_state(key,record) VALUES ('agent-attribution',?1)
             ON CONFLICT(key) DO UPDATE SET record=excluded.record", [serde_json::to_string(attribution)?])?;
@@ -1201,9 +1405,22 @@ impl Store {
                 tx.execute("UPDATE sessions SET extra_args = ?2 WHERE id = ?1",
                     params![info.id, serde_json::to_string(args)?])?;
             }
+            if let Some(thread) = &runtime.tab_thread {
+                save_codex_thread(&tx, info.id, thread.as_ref())?;
+            }
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// A Codex tab's saved thread (`CodexThread`), if any.
+    pub fn codex_thread(&self, session: SessionId) -> anyhow::Result<Option<CodexThread>> {
+        self.load_runtime(&codex_thread_key(session))
+    }
+
+    /// Save (None: forget) a Codex tab's thread.
+    pub fn set_codex_thread(&self, session: SessionId, thread: Option<&CodexThread>) -> anyhow::Result<()> {
+        save_codex_thread(&self.conn.lock(), session, thread)
     }
 
     pub fn load_hook_session(&self, id: SessionId, generation: u64) -> anyhow::Result<Option<HookSession>> {
@@ -1621,10 +1838,10 @@ impl Store {
 
     pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
         let conn = self.conn.lock();
-        let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
+        let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at, account_group FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
         let rows = statement.query_map([], |r| Ok(crate::account_profiles::AccountProfile {
             id: r.get(0)?, name: r.get(1)?, config_dir: r.get(2)?,
-            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?,
+            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?, account_group: r.get(5)?,
         }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1643,6 +1860,108 @@ impl Store {
             params![id, name, enabled.map(i64::from)],
         )?;
         anyhow::ensure!(changed == 1, "no such account profile: {id}");
+        Ok(())
+    }
+
+    /// Declare `id` to be on the same account as `with` (None: its own account). Joins `with`'s
+    /// group, creating one for both when it has none.
+    pub fn set_same_account(&self, id: i64, with: Option<i64>) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let group_of = |tx: &rusqlite::Transaction, p: i64| -> anyhow::Result<Option<String>> {
+            tx.query_row("SELECT account_group FROM account_profiles WHERE id=?1", [p], |r| r.get(0))
+                .optional()?.with_context(|| format!("no such account profile: {p}"))
+        };
+        group_of(&tx, id)?;
+        let group = match with {
+            None => None,
+            Some(other) => {
+                anyhow::ensure!(other != id, "a profile is always on its own account");
+                Some(match group_of(&tx, other)? {
+                    Some(g) => g,
+                    None => {
+                        let g = crate::paths::random_token()[..16].to_string();
+                        tx.execute("UPDATE account_profiles SET account_group=?2 WHERE id=?1", params![other, g])?;
+                        g
+                    }
+                })
+            }
+        };
+        tx.execute("UPDATE account_profiles SET account_group=?2 WHERE id=?1", params![id, group])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ----- Claude usage observations (src/usage.rs) -----
+
+    pub fn usage_observations(&self) -> anyhow::Result<Vec<(String, crate::usage::Window, crate::usage::Observation)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT account, window, record FROM usage_observations")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (account, window, record) = row?;
+            // An unreadable row is dropped (unknown), never guessed.
+            if let (Some(w), Ok(o)) = (crate::usage::Window::from_key(&window), serde_json::from_str(&record)) {
+                out.push((account, w, o));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record a Claude run's launch: the configuration folder its reports are filed under.
+    /// Replaces the session's previous run.
+    pub fn start_usage_run(&self, session: SessionId, generation: u64, config_dir: Option<String>) -> anyhow::Result<()> {
+        let run = crate::usage::RunMemory { generation, config_dir, ..Default::default() };
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // Forget the runs of sessions that no longer exist.
+        tx.execute("DELETE FROM usage_runs WHERE session_id NOT IN (SELECT id FROM sessions)", [])?;
+        tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
+            ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(&run)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Apply one report from run (`session`, `generation`) to the observations of the folder
+    /// that run was launched with, in one transaction. A run with no launch record (or another
+    /// generation's) is ignored. Returns whether a client-visible observation changed.
+    pub fn apply_usage(&self, session: SessionId, generation: u64, report: &crate::usage::Report, now: i64)
+        -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let run: Option<crate::usage::RunMemory> = tx.query_row("SELECT record FROM usage_runs WHERE session_id=?1", [session],
+            |r| r.get::<_, String>(0)).optional()?.and_then(|j| serde_json::from_str(&j).ok());
+        let Some(run) = run.filter(|r| r.generation == generation) else { return Ok(false) };
+        let Some(account) = run.config_dir.as_deref().map(crate::usage::folder_key) else { return Ok(false) };
+        let mut stored = std::collections::BTreeMap::new();
+        {
+            let mut st = tx.prepare("SELECT window, record FROM usage_observations WHERE account=?1")?;
+            let rows = st.query_map([&account], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (w, record) = row?;
+                if let (Some(w), Ok(o)) = (crate::usage::Window::from_key(&w), serde_json::from_str(&record)) {
+                    stored.insert(w, o);
+                }
+            }
+        }
+        let applied = crate::usage::apply(&run, &stored, (session, generation), report, now);
+        for (w, o) in &applied.updates {
+            tx.execute("INSERT INTO usage_observations(account, window, record) VALUES (?1, ?2, ?3)
+                ON CONFLICT(account, window) DO UPDATE SET record=excluded.record",
+                params![account, w.key(), serde_json::to_string(o)?])?;
+        }
+        if let Some(m) = &applied.run {
+            tx.execute("INSERT INTO usage_runs(session_id, record) VALUES (?1, ?2)
+                ON CONFLICT(session_id) DO UPDATE SET record=excluded.record", params![session, serde_json::to_string(m)?])?;
+        }
+        tx.commit()?;
+        Ok(applied.notify)
+    }
+
+    /// Forget `account`'s observations (the human reported a login change there).
+    pub fn clear_usage(&self, account: &str) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM usage_observations WHERE account=?1", [account])?;
         Ok(())
     }
 
@@ -1909,6 +2228,7 @@ impl Store {
                     rows: r.get::<_, i64>(13)?.clamp(1, u16::MAX as i64) as u16,
                     queued: r.get::<_, i64>(14)?.max(0) as u32,
                     subagents: 0,
+                    background: 0,
                     size_owner: None,
                     input_interrupted: false,
                     live_cwd: None,
@@ -2010,6 +2330,7 @@ impl Store {
         tx.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")])?;
         tx.execute("DELETE FROM runtime_state WHERE key=?1", [format!("cold-send:{id}")])?;
+        tx.execute("DELETE FROM runtime_state WHERE key=?1", [codex_thread_key(id)])?;
         tx.commit()?;
         Ok(())
     }
@@ -2329,7 +2650,7 @@ mod tests {
         info.state = AgentState::Idle;
         info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
         let cursor = HookCursor { instance: "fixture".into(), sequence: 4 };
-        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234, conversation: None, extra_args: None };
+        let runtime = HookSession { generation: 42, subagents: 1, last_hook_at: 1234, ..Default::default() };
         info.state = AgentState::Working;
         info.state_detail = Some("Agent".into());
         info.state_since = 1234;
@@ -2513,7 +2834,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.
@@ -2533,6 +2854,46 @@ mod tests {
         // Rows from before v17 (and anything unreadable) are the subscription.
         s.conn.lock().execute("UPDATE agents SET provider = 'bogus'", []).unwrap();
         assert_eq!(s.load_agents().unwrap()[0].provider, crate::openrouter::Provider::Subscription);
+        // Sleep (v24): off by default; the setting is config, asleep is its own write.
+        assert_eq!((back.sleep_after_min, back.asleep_at), (None, None));
+        s.update_agent_config(&crate::agents::Agent { sleep_after_min: Some(45), ..sub.clone() }).unwrap();
+        s.set_agent_asleep(b.id, Some(7_000), Some(3)).unwrap();
+        let slept = &s.load_agents().unwrap()[0];
+        assert_eq!((slept.sleep_after_min, slept.asleep_at), (Some(45), Some(7_000)));
+        assert_eq!(s.agent_asleep_generation(b.id).unwrap(), Some(3));
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(s.agent_asleep_generation(b.id).unwrap(), None);
+        // An older backend reads only `autostart`: while asleep it reads 0, so a rollback never
+        // starts an asleep agent at its own start; this backend still sees the setting.
+        let col = |s: &Store| count(s, "SELECT autostart FROM agents");
+        s.update_agent_config(&crate::agents::Agent { autostart: true, ..sub.clone() }).unwrap();
+        assert_eq!(col(&s), 1);
+        s.set_agent_asleep(b.id, Some(8_000), None).unwrap();
+        assert_eq!(col(&s), 0);
+        let asleep = s.load_agents().unwrap()[0].clone();
+        assert!(asleep.autostart);
+        // A config change while asleep keeps the column at 0 (and the setting).
+        s.update_agent_config(&crate::agents::Agent { persona: "Asleep.".into(), ..asleep.clone() }).unwrap();
+        assert_eq!(col(&s), 0);
+        assert!(s.load_agents().unwrap()[0].autostart);
+        s.update_agent_config(&crate::agents::Agent { autostart: false, ..asleep.clone() }).unwrap();
+        assert!(!s.load_agents().unwrap()[0].autostart);
+        s.update_agent_config(&crate::agents::Agent { autostart: true, ..asleep.clone() }).unwrap();
+        // Awake: the column holds the setting again.
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(col(&s), 1);
+        assert!(s.load_agents().unwrap()[0].autostart);
+        // An older backend that turned autostart on while it was asleep keeps it on.
+        s.update_agent_config(&crate::agents::Agent { autostart: false, ..asleep.clone() }).unwrap();
+        s.set_agent_asleep(b.id, Some(9_000), None).unwrap();
+        s.conn.lock().execute("UPDATE agents SET autostart = 1", []).unwrap();
+        assert!(s.load_agents().unwrap()[0].autostart);
+        s.set_agent_asleep(b.id, None, None).unwrap();
+        assert_eq!(col(&s), 1);
+        s.update_agent_config(&crate::agents::Agent { autostart: false, asleep_at: None, ..asleep.clone() }).unwrap();
+        s.conn.lock().execute("UPDATE agents SET sleep_after_min = 1", []).unwrap();
+        let back2 = &s.load_agents().unwrap()[0];
+        assert_eq!((back2.sleep_after_min, back2.asleep_at), (Some(crate::sleep::AFTER_MIN), None));
 
         let m = AgentMessage {
             id: 0,

@@ -307,6 +307,24 @@ pub fn holds_message(hub: &Hub, msg: i64) -> bool {
         .any(|q| q.items.iter().any(is) || q.active.as_ref().is_some_and(|a| is(&a.item)))
 }
 
+/// Session `id` has no prompt waiting, being typed, or paused for review (src/sleep.rs).
+pub(crate) fn queue_idle(hub: &Hub, id: SessionId) -> bool {
+    hub.injection.inner.lock().get(&id).is_none_or(|q| q.items.is_empty() && q.active.is_none() && !q.busy && !q.blocked)
+}
+
+/// Run `f` only while session `id`'s queue is idle, under the queue lock: no delivery can
+/// start typing in between (a delivery picks its prompt under the same lock). Never call it
+/// with the queue lock held, or take it inside `f`.
+pub(crate) fn while_queue_idle<T>(hub: &Hub, id: SessionId, f: impl FnOnce() -> T) -> Option<T> {
+    let guard = hub.injection.inner.lock();
+    guard.get(&id).is_none_or(|q| q.items.is_empty() && q.active.is_none() && !q.busy && !q.blocked).then(f)
+}
+
+/// Text sits in session `id`'s input box (a draft of the human's, as far as Muster can tell).
+pub(crate) fn has_draft(hub: &Hub, id: SessionId) -> bool {
+    hub.session(id).is_some_and(|s| composer(hub, id, adapter_for(s.kind)).is_some_and(|c| !c.trim().is_empty()))
+}
+
 pub fn paused(hub: &Hub) -> Vec<SessionId> {
     hub.injection.inner.lock().iter().filter(|(_, queue)| queue.blocked)
         .map(|(id, _)| *id).collect()
@@ -563,6 +581,15 @@ pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[(crate::model::Pa
     let Some((first, _)) = panels.first() else { return Ok(()) };
     anyhow::ensure!(panels.iter().all(|(p, _)| p.channel_id == info.channel_id && p.session_id == id),
         "panel batch does not belong to session {id}'s task");
+    // A named agent's batch is a message on its way until it is queued (src/sleep.rs), and none
+    // goes to one asleep or being put to sleep: its events wait for its wake (`panels::deliver_pending`).
+    let _delivering = match hub.agents().by_session(id) {
+        Some(a) => match crate::sleep::delivering_awake(hub, a.id, id) {
+            Some(d) => Some(d),
+            None => return Ok(()),
+        },
+        None => None,
+    };
     let (text, events, fetch) = panel_prompt(panels, MAX_PANEL_PROMPT)?;
     if events.is_empty() { return Ok(()) }
     let generation = hub.pty_generation(id);

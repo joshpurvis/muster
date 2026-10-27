@@ -184,7 +184,11 @@ export function whenToSend(initial: WhenDraft, cur: WhenDraft, tzChanged: boolea
 
 // ---------------- triggers: "When something happens" (Phase 2) ----------------
 
-export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url";
+export type TriggerKind = "note" | "git" | "pr_opened" | "ci_failed" | "url" | "files";
+
+/** A file trigger with subfolders looks this many levels below its folder, no deeper (the
+ * backend's `FILES_DEPTH`). */
+export const FILES_DEPTH = 3;
 
 export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
   { id: "note", label: "A note changes" },
@@ -192,6 +196,7 @@ export const TRIGGER_KINDS: { id: TriggerKind; label: string }[] = [
   { id: "pr_opened", label: "GitHub: a pull request is opened" },
   { id: "ci_failed", label: "GitHub: CI fails" },
   { id: "url", label: "Its trigger URL is called (scripts, muster trigger)" },
+  { id: "files", label: "Files appear or change in a folder" },
 ];
 
 /** What the "When something happens" fields hold (each kind's fields are kept while another is
@@ -212,10 +217,27 @@ export interface TriggerDraft {
   every: string;
   /** A URL trigger's name. */
   name: string;
+  /** Files: the folder, a file-name pattern (empty: any file), and whether subfolders count. */
+  folder: string;
+  pattern: string;
+  subfolders: boolean;
 }
 
 export function blankTrigger(): TriggerDraft {
-  return { kind: "note", note: null, quiet: "2", repo: "", branch: "master", ghRepo: "", ghBranch: "", every: "5", name: "" };
+  return {
+    kind: "note",
+    note: null,
+    quiet: "2",
+    repo: "",
+    branch: "master",
+    ghRepo: "",
+    ghBranch: "",
+    every: "5",
+    name: "",
+    folder: "",
+    pattern: "",
+    subfolders: false,
+  };
 }
 
 export function isTrigger(w: When | WhenInput): boolean {
@@ -233,6 +255,8 @@ export function draftOfTrigger(w: When, base: TriggerDraft): TriggerDraft {
       return { ...base, kind: w.event, ghRepo: w.repo, ghBranch: w.branch ?? "", every: String(w.every_min) };
     case "url":
       return { ...base, kind: "url", name: w.name };
+    case "files":
+      return { ...base, kind: "files", folder: w.folder, pattern: w.pattern ?? "", subfolders: w.recursive, quiet: String(w.quiet_min) };
     default:
       return base;
   }
@@ -293,6 +317,15 @@ export function whenOfTrigger(d: TriggerDraft, notes: { id: number; title: strin
       const n = d.name.trim().toLowerCase();
       if (!NAME_RE.test(n)) return { error: "A name of a-z, 0-9, - and _ (it goes in the URL)" };
       return { when: { kind: "url", name: n } };
+    }
+    case "files": {
+      const folder = d.folder.trim();
+      if (!folder) return { error: "The folder to watch, like ~/inbox" };
+      const pattern = d.pattern.trim();
+      if (pattern.includes("/")) return { error: "The pattern is a file name, like *.pdf (no /)" };
+      const quiet = int(d.quiet, 1, 120);
+      if (quiet === null) return { error: "Wait 1 to 120 minutes of quiet" };
+      return { when: { kind: "files", folder, pattern: pattern || null, recursive: d.subfolders, quiet_min: quiet } };
     }
   }
 }
@@ -375,6 +408,32 @@ export function nestedSteps(t: Then | null | undefined): number {
   const depth = (x: Then | null | undefined): number =>
     x ? 1 + Math.max(depth(x.on_success?.then), depth(x.on_failure?.then)) : 0;
   return Math.max(0, depth(t) - 1);
+}
+
+/** One "Then…" step as the approval card lists it: what starts it, the agent it asks (null: it
+ * only notifies you) and its prompt; `depth` 0 for a step after the run, 1 for one after that
+ * step, and so on. */
+export interface StepLine {
+  depth: number;
+  when: string;
+  agent: string | null;
+  prompt: string;
+}
+
+/** Every "Then…" step, nested ones included, in order (each followed by its own steps), so
+ * approving shows all the work it lets run, not only the first prompt. */
+export function thenSteps(t: Then | null | undefined, depth = 0): StepLine[] {
+  if (!t) return [];
+  const out: StepLine[] = [];
+  const whose = depth ? "that step" : "it";
+  for (const [step, when] of [[t.on_success, `When ${whose} replies`], [t.on_failure, `If ${whose} fails`]] as const) {
+    if (!step) continue;
+    out.push(step.notify
+      ? { depth, when, agent: null, prompt: "" }
+      : { depth, when, agent: step.agent ?? "(a removed agent)", prompt: step.prompt });
+    out.push(...thenSteps(step.then, depth + 1));
+  }
+  return out;
 }
 
 /** A trigger's watcher, as its row shows it: "gh isn't signed in", a git error, or null. */
@@ -474,6 +533,7 @@ export function isExpired(s: Schedule, now: number): boolean {
 }
 
 export function nextLabel(s: Schedule, now: number): { text: string; tone: "next" | "paused" | "expired" | "done" } {
+  if (s.status === "proposed" || s.status === "held") return { text: "waiting for your approval", tone: "paused" };
   if (s.status === "done" || (s.next_run === null && s.when.kind === "once")) return { text: "done", tone: "done" };
   if (isExpired(s, now)) return { text: "expired", tone: "expired" };
   if (s.paused) return { text: "paused", tone: "paused" };
@@ -582,10 +642,126 @@ export function withSteps(runs: ScheduleRun[]): { run: ScheduleRun; depth: numbe
   return out;
 }
 
-/** The panel's order under an agent: soonest next run first, finished ones last, then by name. */
+/** The panel's order under an agent: proposals waiting for you first, then soonest next run,
+ * finished ones last, then by name. */
 export function sortSchedules(list: Schedule[]): Schedule[] {
-  const key = (s: Schedule) => s.next_run ?? Number.MAX_SAFE_INTEGER;
+  const key = (s: Schedule) => isProposal(s) ? -1 : s.next_run ?? Number.MAX_SAFE_INTEGER;
   return [...list].sort((a, b) => key(a) - key(b) || a.name.localeCompare(b.name) || a.id - b.id);
+}
+
+// ---------------- what agents made (Phase 3) ----------------
+
+/** Waits for your approval: an agent's proposal, or a schedule made or changed outside
+ * Muster's window (`held`). Neither runs before you click Approve. */
+export function isProposal(s: Schedule): boolean {
+  return s.status === "proposed" || isHeld(s) || (!!s.made_by && s.made_by.kind === "proposal" && s.made_by.approved_at === null);
+}
+
+/** Made or changed outside Muster's window (the command line, a script), waiting for your click. */
+export function isHeld(s: Schedule): boolean {
+  return s.status === "held" || !!s.held;
+}
+
+/** When it started waiting: when the agent proposed it, or when it was first held. */
+function waitingSince(s: Schedule): number {
+  return s.made_by && s.made_by.approved_at === null ? s.made_by.at : s.held?.at ?? s.updated_at;
+}
+
+/** Every schedule waiting for your approval, oldest first (the panel's notice, and its count). */
+export function waitingProposals(list: Schedule[]): Schedule[] {
+  return list.filter(isProposal).sort((a, b) => waitingSince(a) - waitingSince(b) || a.id - b.id);
+}
+
+/** The panel's notice: "2 schedules proposed by reviewer wait for your approval", "1 schedule
+ * made outside Muster's window waits for your approval", or both kinds together. */
+export function waitingNotice(waiting: Schedule[]): string {
+  const proposed = waiting.filter((s) => !isHeld(s) || (s.made_by && s.made_by.approved_at === null));
+  const held = waiting.length - proposed.length;
+  const n = (k: number) => (k === 1 ? "1 schedule" : `${k} schedules`);
+  const verb = waiting.length === 1 ? "waits" : "wait";
+  if (!held) {
+    const by = [...new Set(proposed.map((s) => s.made_by?.agent ?? "an agent"))].join(", ");
+    return `${n(proposed.length)} proposed by ${by} ${verb} for your approval`;
+  }
+  if (!proposed.length) return `${n(held)} made or changed outside Muster's window ${verb} for your approval`;
+  return `${n(waiting.length)} ${verb} for your approval (${proposed.length} proposed by agents, ${held} from the command line)`;
+}
+
+/** What a held schedule's card says was done outside the window: "Made from the command line",
+ * "Changed and resumed from the command line". */
+export function heldHeadline(s: Schedule): string {
+  const what = s.held?.what ?? ["made"];
+  if (what.includes("made")) return "Made from the command line or a script";
+  const words: Record<string, string> = {
+    changed: "changed",
+    resumed: "resumed",
+    unskipped: "its skipped run put back",
+    renewed: "renewed for 7 days",
+  };
+  const parts = what.map((w) => words[w]).filter(Boolean);
+  const list = parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : parts[0] ?? "changed";
+  return `${list[0].toUpperCase()}${list.slice(1)} from the command line or a script`;
+}
+
+/** The chip on a row an agent made: "reminder" (it set it for itself) or "from reviewer" (its
+ * approved proposal); null for yours and for proposals still waiting (their card says it). */
+export function madeByLabel(s: Schedule): { text: string; tip: string } | null {
+  const m = s.made_by;
+  if (!m || isProposal(s)) return null;
+  if (m.kind === "reminder") {
+    return { text: "reminder", tip: `${m.agent} set this one-off reminder for itself (no approval is needed up to 24 hours ahead)` };
+  }
+  return { text: `from ${m.agent}`, tip: `Proposed by ${m.agent}${m.approved_at ? `, approved ${shortWhen(m.approved_at, Date.now())}` : ""}` };
+}
+
+/** "America/Los_Angeles" as people read it: "America/Los Angeles". */
+export function zoneName(tz: string): string {
+  return tz.replaceAll("_", " ");
+}
+
+/** A timed schedule's reading with its time zone: always when `always` (a proposal: you approve
+ * its times), otherwise only when it isn't `here` (this computer's or browser's zone). A one-off
+ * in another zone also says when that is here. Triggers have no time: their reading as it is. */
+export function readingWithZone(s: Schedule, here: string, always = false): string {
+  const tz = s.tz?.trim() ?? "";
+  if (isTrigger(s.when) || !tz) return s.reading;
+  const other = !!here && tz !== here;
+  if (!always && !other) return s.reading;
+  let yours = "";
+  if (other && s.when.kind === "once") {
+    const [y, mo, d, h, mi] = partsIn(s.when.at, here);
+    const [y2, mo2, d2] = partsIn(s.when.at, tz);
+    const hm = `${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}`;
+    const sameDay = y === y2 && mo === mo2 && d === d2;
+    const day = sameDay ? "" : `${new Date(Date.UTC(y, mo - 1, d, 12)).toLocaleDateString("en-GB", { weekday: "short", timeZone: "UTC" })} `;
+    yours = `; ${day}${hm} your time`;
+  }
+  return `${s.reading} (${zoneName(tz)} time${yours})`;
+}
+
+/** A proposal's prompt is shown whole on request past this many lines or characters (the card
+ * shows the start, and the rest stays one click or key away before you approve). */
+export const PROMPT_FOLD_LINES = 8;
+export const PROMPT_FOLD_CHARS = 600;
+
+export function promptIsLong(prompt: string): boolean {
+  return prompt.length > PROMPT_FOLD_CHARS || prompt.split("\n").length > PROMPT_FOLD_LINES;
+}
+
+/** A proposal card's facts, as plain lines: what runs, when (with its time zone), on which agent.
+ * `here`: this browser's zone. */
+export function proposalFacts(s: Schedule, here = ""): { label: string; value: string }[] {
+  const out = [
+    { label: "When", value: readingWithZone(s, here, true) },
+    { label: "Agent", value: s.agent ?? "(removed)" },
+  ];
+  const extras: string[] = [];
+  if (s.conversation === "fresh") extras.push("a fresh conversation each run");
+  if (s.quiet_hours) extras.push("skips quiet hours");
+  if (s.daily_cap !== null) extras.push(`at most ${s.daily_cap} a day`);
+  if (s.note_title) extras.push(`replies also go to the note ${s.note_title}`);
+  if (extras.length) out.push({ label: "Also", value: extras.join(", ") });
+  return out;
 }
 
 // ---------------- the dialog's other fields ----------------

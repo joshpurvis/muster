@@ -1,7 +1,8 @@
 # Claude account profiles and machine placement
 
-Status: local profiles implemented, 2026-10-18. Usage reporting,
-placement suggestions and handoff remain deferred. This expands the account and
+Status: local profiles implemented, 2026-10-18. Usage display and placement suggestions
+(manual choice plus a recommendation) implemented, 2026-10-26. Automatic placement and handoff
+remain deferred. This expands the account and
 quota-aware scheduling ideas in [PLAN.md](../PLAN.md). The existing terminal backend remains
 the starting point.
 
@@ -31,7 +32,10 @@ directory, not a verified account identity.
   a running process. There is no profile-directory deletion operation. The one exception
   to "never opened": `muster skills install` writes Muster's own skills into every profile's
   `skills/` folder (and only there), so profile sessions find them; see
-  [CLI.md](CLI.md#agent-skills).
+  [CLI.md](CLI.md#agent-skills). The other: at each Claude launch Muster reads the `statusLine`
+  key of the settings files that session would use, its profile's `settings.json` included, to
+  keep showing the user's own status line beside its usage reporter, never through a link (see
+  "Usage display and suggestions" below). Nothing else in those files is kept.
 - Select a profile with `muster new --profile NAME`, the New Tab dialog, or
   `muster agent new NAME --profile PROFILE`. Named-agent profile bindings are fixed at
   creation, including for replacement sessions and `--fresh`. Create another named agent
@@ -69,6 +73,139 @@ CLI/RPC and desktop controls. The terminal-host protocol is unchanged. Tests use
 or synthetic profile directories and fake Claude processes. Run
 `bash scripts/isolated.sh python3 scripts/account-profiles-smoke.py --browser` after building
 the workspace binaries and web assets; it creates its own backend, data, home and port.
+
+## Usage display and suggestions (implemented)
+
+Steps 2 and 3 of the implementation sequence below: `src/usage.rs` (observations, freshness,
+ranking, status-line composition), `src/statusline.rs` (the reporter), store migration v22.
+
+**Source.** Claude Code's documented status-line JSON, read on 2026-10-26 at
+<https://code.claude.com/docs/en/statusline>: `rate_limits.five_hour` and
+`rate_limits.seven_day`, each `used_percentage` (0 to 100) and `resets_at` (Unix epoch
+seconds). The page says `rate_limits` "appears only for claude.ai Pro and Max subscribers ... and
+only after the first API response in the session", that each window "may be independently
+absent", and that Claude Code "drops a window once its `resets_at` time passes". The status line
+runs at session start and resume, after each assistant message, on `/compact`, permission-mode
+and vim-mode changes, on an optional `refreshInterval` timer and when a window's reset passes;
+updates are debounced (300 ms) and a new update cancels a run still in flight. The command runs
+through `/bin/sh` (checked against `claude` 2.1.306 in a throwaway run: temporary HOME and
+configuration folder, a fake API key, no network namespace, no prompt sent) and its output is
+shown only after it exits 0. The same runs showed that a `statusLine` passed with `--settings`
+replaces the one in the user's and the project's settings, so Muster must run the user's own,
+and that it does not run before the folder is trusted (the trust dialog showed, the command never
+ran), the same rule Claude Code applies to a project's own status line. The composed command
+described below ran there too: the user's line showed with its input intact, both with a working
+reporter and with one that fails.
+
+**Reporter.** Every Claude session Muster starts gets a status line in its own `--settings`
+file. Muster finds your own status line the way Claude Code would without Muster (docs:
+<https://code.claude.com/docs/en/settings>, "Settings precedence" and "Where Claude Code keeps the
+local file in a git repository", read 2026-10-26), the first file with a `statusLine`:
+
+1. project local settings, `.claude/settings.local.json` at the repository root (for a linked
+   worktree, the main checkout's root), but in the session's folder outside a git repository,
+   when the root is the home folder, or when the root, its `.git` or its `.claude` is not owned
+   by you;
+2. a `.claude/settings.local.json` an older Claude Code left in the session's folder;
+3. shared project settings, `.claude/settings.json` in the session's folder;
+4. user settings, `settings.json` in the session's configuration folder (`CLAUDE_CONFIG_DIR`,
+   else `~/.claude`).
+
+A `CLAUDE_CONFIG_DIR` that is relative or empty, or (without one) a relative `HOME`, is one
+Muster can't place: Claude Code would resolve it against the session's own working directory,
+not the backend's, and an empty value's meaning isn't documented. Such a session's status line is
+left to Claude Code (even when a project file decides it), its reports are filed nowhere, and
+Default shows unknown while the backend itself runs with one. Profiles always launch with an
+absolute folder.
+
+The repository root is found by reading `.git` entries, never by running git (a repository's own
+git config can run commands). Every file is opened beneath its (canonical) folder without
+following a link at any step, must be a plain file with one link and at most 1 MiB, and a name
+that looks like a credentials file is refused outright; so a repository whose
+`.claude/settings.json` links to `~/.claude/.credentials.json` is never read through. Only the
+`statusLine` key is kept; the rest of each file is parsed past, never stored, logged or sent.
+This is the one read of a profile folder's contents, and only of `settings.json`. When a file
+exists but can't be read that way, or isn't valid JSON, or the status line is not a command, or
+a worktree belongs to a bare repository, or the configuration folder can't be placed (above),
+Muster is unsure what Claude Code will show and leaves the session's status line to Claude Code
+entirely: no usage from that session. Every other option
+of your status line (`padding`, `refreshInterval`, `hideVimModeIndicator`, ...) is copied
+unchanged. Managed settings outrank `--settings`, so a managed status line keeps running and
+Muster gets no usage from it.
+
+The composed command is a small shell script that runs your command itself, as its last step
+(`exec`, with the same input through a here-document), so its output and exit code are exactly
+Claude Code's. In the background it hands a copy of the input to `muster statusline claude`,
+with that process's output discarded. Whatever happens to the reporter (an older Muster build
+that has no `statusline` after a reload back, a missing binary, a crash, a slow backend), your
+line is unaffected. The reporter POSTs only the two windows and `cost.total_api_duration_ms`
+(before the run's first response, when there are no windows yet, the API time alone) to
+`POST /usage/claude` with the run's session token, connects only to a loopback address (the
+same check as hook callbacks: a `MUSTER_URL` naming another host is refused before it is looked
+up), gives up after 600 ms, and is never in the hook path, the event log or agent state. Without
+a status line of your own only the reporter runs: Claude Code then shows an empty status row,
+and (per its docs) a configured status line hides most footer keyboard hints.
+`MUSTER_USAGE_REPORTER=off` in the backend's environment disables the reporter for sessions
+started afterwards. A session started before this version has no reporter until it restarts.
+
+Known limit: your status line is looked up when the session starts. Editing or removing
+`statusLine` during a session keeps showing the command it started with, and adding one leaves
+the line empty, where Claude Code alone would pick the change up; restart the session to pick up
+a changed status line. (Looking it up again on every run would make your line wait on a Muster
+process each time, which the composition above is built to avoid.)
+
+**Attribution and freshness.** The daemon maps the token to its session and current run
+(generation). At launch Muster records the configuration folder that run really uses (its
+profile's, or Default's `CLAUDE_CONFIG_DIR` / `~/.claude` at the time), and observations are
+filed per folder: one folder, one login. Nothing in the payload is trusted to name an account or
+a folder (a session can still misreport its own folder's numbers); a run without a launch record
+reports nothing. Claude Code redraws the status line with its cached numbers for many reasons
+(a timer, a mode change, `/rename`, which also writes the transcript), and a callback can be lost
+(during a backend reload) so its numbers first arrive in a redraw much later. Neither the arrival
+time nor the transcript time says when the numbers were fetched. The one piece of evidence tied
+to an API response is the run's API time: a report whose `cost.total_api_duration_ms` is higher
+than the run's previous report's came with a response received after that previous report, so it
+is newly fetched data, dated by that previous report (the earliest it can be from; refreshed by
+redraws at most every 30 seconds). A report delivered late is therefore never younger than it
+can be: a lost callback followed by a redraw an hour later is dated before the hour and reads as
+stale. The reporter's API-time-only report at a run's start is the baseline that lets the run's
+first response count. Without an earlier report to compare with (a session started before this
+version, a first report whose start report was lost) a report is "not confirmed fresh". A fresh
+report replaces an observation only if not older than it. Anything else (a redraw, changed numbers
+without more API time, API time that went down, which becomes the new baseline) never replaces or
+renews a confirmed observation or another run's; it is kept, as "not confirmed fresh", only where
+nothing was stored or over the run's own unconfirmed numbers. The price of dating by the previous
+report: the first answer after a long pause reads as old as the pause until the next response (a
+`refreshInterval` narrows that). Each window keeps its own time, so partial reports never age the
+other. Display states: **current** (fetched within
+30 minutes, reset not passed), **stale** (older), **not confirmed fresh**, **reset** (its reset
+time passed: unknown, not zero) and **unknown** (nothing reported). The window re-judges its last
+snapshot by its own timestamps every 30 seconds, so a window that can't reach Muster turns
+figures stale or reset on time and drops a suggestion older than 2.5 minutes. Accounts nobody used
+in Muster stay unknown: Muster never probes.
+
+**One account, several rows.** Default and a profile on the same folder are one account
+automatically; Default shows the folder its new sessions would use now, so after the backend
+restarts with another `CLAUDE_CONFIG_DIR` it no longer shows the old folder's figures. The human
+can declare two profiles one account ("Signs in to: the same account as …",
+`muster profile same-account`); their newest observations are shared and never added together.
+"Login changed" (`muster profile login-changed`, for a profile or `default`) forgets the folder's
+observations and the same-account declaration of every profile on that folder.
+
+**Suggestion policy.** Among rows that can start a task now (enabled, folder present, no
+conflicting inherited authentication), one per account, only accounts whose 5-hour and weekly
+windows are both current are compared. The one whose fuller window is lowest is suggested, unless
+it is at 90% or more. The reason names its numbers, the other compared accounts' numbers, and the
+accounts with no current usage ("not compared"). Unknown, stale, unconfirmed or reset usage never
+counts as room. The new-session flow shows the table and the suggestion with a **Use NAME**
+button; the selection never changes by itself, and there is no automatic choice or rollover. No
+workspace restrictions on eligible profiles exist yet, so none are applied.
+
+Shown in **Settings and more → Claude profiles** (Usage table, including Default) and under the
+profile picker of New Tab and the named-agent dialog (when at least one profile is registered).
+CLI: `muster profile usage [--json]`. RPC and endpoint details: [PROTOCOL.md](PROTOCOL.md#claude-account-profiles).
+`scripts/account-profiles-smoke.py --browser` drives the reporter through a fake Claude that runs
+its status-line command like Claude Code does.
 
 The rest of this document describes the full roadmap, including deferred features.
 
@@ -258,9 +395,11 @@ has stopped. Cross-machine handoff is deferred until these mechanics are impleme
    per-session `CLAUDE_CONFIG_DIR`. Preserve selection across restarts. Keep the existing
    terminal backend and official login flow.
 2. **Usage display.** Add the authenticated status-line reporter, stored observations,
-   reset times, and freshness indicators. Show unknown data honestly.
+   reset times, and freshness indicators. Show unknown data honestly. *Done 2026-10-26.*
 3. **Placement suggestions.** Suggest among eligible local profiles. Add optional selection
    for new tasks only after defining its ranking policy and checking current provider rules.
+   *Suggestions done 2026-10-26 (manual choice plus a recommendation); the optional automatic
+   selection is not built.*
 4. **Local handoff.** Add a human-selected continuation under another profile, using the
    existing worktree and recorded task context. Ensure there is only one active writer.
 5. **Remote workers.** Add machine ownership, authenticated transport, reconciliation, and

@@ -271,6 +271,7 @@ impl Backend for Arc<Mock> {
             delivered: true,
             queued: 0,
             started: false,
+            woke: false,
         })
     }
     fn agent_refused(&self, m: crate::agents::AgentMessage, why: &str) {
@@ -1668,7 +1669,7 @@ fn with_agents(m: &Mock) {
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
-            autostart: false,
+            autostart: false, sleep_after_min: None, asleep_at: None,
         });
         d.replies.insert(id, format!("{name} says hi"));
     }

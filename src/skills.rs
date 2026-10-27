@@ -209,7 +209,7 @@ impl State {
     }
 }
 
-fn sha(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
+fn sha(bytes: &[u8]) -> String { Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect() }
 
 /// Largest SKILL.md or marker Muster reads.
 const MAX_READ: u64 = 256 * 1024;

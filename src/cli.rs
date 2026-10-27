@@ -2693,8 +2693,14 @@ pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: 
 /// called with the session's own token: never on another session's behalf. Prints how it
 /// reached the asker; exit 1 when the delivery was refused.
 pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> anyhow::Result<()> {
-    let (Some(_), Some(token)) = (env_session(), crate::hookcmd::session_token()) else {
+    if env_session().is_none() {
         anyhow::bail!("muster reply runs inside an agent's session (it answers a message Muster delivered to that agent)");
+    }
+    let Some(token) = crate::hookcmd::session_token() else {
+        // Codex hides *TOKEN* variables from the commands it runs.
+        anyhow::bail!(
+            "this shell can't see its session's token (Codex hides *TOKEN* variables from its commands): use the muster MCP tool `reply` instead"
+        );
     };
     let text = send_text(words, || {
         let mut s = String::new();

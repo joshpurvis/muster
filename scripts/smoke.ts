@@ -1373,7 +1373,7 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
   const plainCli = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: askerT }, String(id3), "hi");
   ok(!plainCli.success && dec.decode(plainCli.stderr).includes("no message"), "muster reply can't answer as another agent");
   const noToken = await cli({ MUSTER_SESSION_ID: String(helperS), MUSTER_TOKEN: "" }, String(id3), "hi");
-  ok(!noToken.success, "muster reply without the session's token is refused");
+  ok(!noToken.success && dec.decode(noToken.stderr).includes("MCP tool `reply`"), "muster reply without the session's token points to the MCP tool");
   // The helper's own `muster reply` works.
   const a5 = await mcp(askerT, "ask_agent", { agent: "helper", text: "and the docs?", timeout_seconds: 1 });
   for (let n = 0; n < 50 && !(await got(helperS, `[muster msg ${a5.msg_id} `)); n++) await sleep(100);

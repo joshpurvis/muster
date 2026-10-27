@@ -98,9 +98,7 @@ export function upsertMessage(list: AgentMessage[], m: AgentMessage, cap = 300):
   const out = list.filter((x) => x.id !== m.id);
   const i = out.findIndex((x) => x.id < m.id);
   out.splice(i < 0 ? out.length : i, 0, m);
-  // An older message that just got its late reply stays, even past the cap: it is news.
-  const fresh = m.answer && !list.some((x) => x.id === m.id && x.answer?.status === m.answer?.status);
-  return out.slice(0, fresh ? Math.max(cap, out.indexOf(m) + 1) : cap);
+  return out.slice(0, cap);
 }
 
 /** The log as the panel shows it: messages to agent `id` (or all), newest first. */

@@ -1,8 +1,10 @@
 // End-to-end smoke test for the muster daemon. Run through scripts/smoke.sh, which builds the
 // binary, makes a temp dir and passes scoped Deno permissions:
 //   deno run --allow-net=127.0.0.1 --allow-read=<tmp>,<bin> --allow-write=<tmp> \
-//            --allow-run=<bin>,git,python3,unshare scripts/smoke.ts <tmp> <bin>
-// The panel proxy gets an ephemeral loopback port. Python only reads the fixture SQLite DB.
+//            --allow-run=<bin>,git,python3,unshare,openssl scripts/smoke.ts <tmp> <bin>
+// The panel proxy gets an ephemeral loopback port. Python reads the fixture SQLite DB and
+// lists command lines (no push endpoint or signed token may be on one); openssl makes the
+// phone-alerts fake push service's certificate.
 // Never uses port 7433 or the default data dirs.
 
 const [BASE, BIN, PORT_ARG] = Deno.args;
@@ -226,6 +228,7 @@ exec cat > '${BASE}/fake-input'
   // Stand-in Claude: records how it was launched, then idles (never starts a real agent).
   await Deno.writeTextFile(`${BASE}/bin/claude`, `#!/bin/bash
 ${LAUNCH_DUMP("claude")}
+printf '%s' "$MUSTER_TOKEN" > '${BASE}/claude-token-'"$MUSTER_SESSION_ID"
 exec cat > /dev/null
 `);
   await Deno.chmod(`${BASE}/bin/claude`, 0o700);
@@ -1252,6 +1255,7 @@ exec cat > /dev/null
 
   ({ c, d } = await schedules(c, d));
   ({ c, d } = await triggers(c, d));
+  ({ c, d } = await phoneAlerts(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
 }
@@ -1690,6 +1694,347 @@ cat '${BASE}/gh-body.json'
 
   for (const a of ["trig", "trig2", "orw"]) await c.call("agent.remove", { name: a });
   await keyServer.shutdown();
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon();
+  c = new Client(d.token);
+  await c.open();
+  return { c, d };
+}
+
+const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s: string) => {
+  const t = s.replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(t + "=".repeat((4 - t.length % 4) % 4)), (ch) => ch.charCodeAt(0));
+};
+const cat = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.length;
+  }
+  return out;
+};
+
+/** What a browser does with a Web Push message (RFC 8291), written independently of the daemon
+ * with WebCrypto: the plaintext without its padding. */
+async function webPushDecrypt(body: Uint8Array, ua: CryptoKeyPair, uaPublic: Uint8Array, auth: Uint8Array): Promise<Uint8Array> {
+  const salt = body.slice(0, 16);
+  const asPublic = body.slice(21, 21 + body[20]);
+  const asKey = await crypto.subtle.importKey("raw", asPublic, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: asKey }, ua.privateKey, 256));
+  const hkdf = async (salt: Uint8Array, ikm: Uint8Array, info: Uint8Array, bits: number) =>
+    new Uint8Array(await crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt, info },
+      await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]),
+      bits,
+    ));
+  const ikm = await hkdf(auth, shared, cat(enc.encode("WebPush: info\0"), uaPublic, asPublic), 256);
+  const cek = await hkdf(salt, ikm, enc.encode("Content-Encoding: aes128gcm\0"), 128);
+  const nonce = await hkdf(salt, ikm, enc.encode("Content-Encoding: nonce\0"), 96);
+  const key = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["decrypt"]);
+  const record = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, body.slice(21 + body[20])));
+  let end = record.length - 1;
+  while (end > 0 && record[end] === 0) end--;
+  if (record[end] !== 2) throw new Error("no last-record delimiter");
+  return record.slice(0, end);
+}
+
+/** Phone alerts (src/push.rs, docs/ANDROID.md "Notifications"): a paired phone subscribes, an
+ * agent asks for approval, and a local fake push service (https, trusted only by the test
+ * daemon's curl, allowed only through MUSTER_PUSH_HOSTS) gets an encrypted, padded, VAPID-signed
+ * alert that decrypts to that session. Then redirects, timeouts, 410 and revocation. */
+async function phoneAlerts(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }> {
+  console.log("phone alerts");
+  const tls = `${BASE}/push-tls`;
+  await Deno.mkdir(tls, { recursive: true });
+  const made = await new Deno.Command("openssl", {
+    args: ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+      "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
+      "-keyout", `${tls}/key.pem`, "-out", `${tls}/cert.pem`],
+    stdout: "null", stderr: "piped",
+  }).output();
+  if (!made.success) throw new Error(`openssl: ${dec.decode(made.stderr)}`);
+  interface Got { path: string; headers: Headers; body: Uint8Array; at: number; end?: number }
+  const got: Got[] = [];
+  let reply: (path: string) => Promise<Response> = async () => new Response(null, { status: 201 });
+  const pushServer = Deno.serve({
+    port: 0, hostname: "127.0.0.1", onListen() {},
+    cert: await Deno.readTextFile(`${tls}/cert.pem`), key: await Deno.readTextFile(`${tls}/key.pem`),
+  }, async (req) => {
+    const path = new URL(req.url).pathname;
+    const g: Got = { path, headers: new Headers(req.headers), body: new Uint8Array(await req.arrayBuffer()), at: Date.now() };
+    got.push(g);
+    try {
+      return await reply(path);
+    } finally {
+      g.end = Date.now();
+    }
+  });
+  const pushPort = pushServer.addr.port;
+  const pushOrigin = `https://localhost:${pushPort}`;
+  // A curl URL glob in the owner's ntfy URL: with globbing off it is one request to that very path.
+  const NTFY_PATH = "/ntfy/muster[1-3]";
+  c.close();
+  await stopDaemon(d, "SIGTERM");
+  d = await startDaemon({
+    MUSTER_PUSH_HOSTS: `localhost:${pushPort}`,
+    CURL_CA_BUNDLE: `${tls}/cert.pem`,
+    MUSTER_NTFY_URL: `${pushOrigin}${NTFY_PATH}`,
+  });
+  c = new Client(d.token);
+  await c.open();
+
+  // Pair a phone (as the page at the tailnet origin would) and talk to the daemon as it.
+  const ORIGIN = "https://box.tail1.ts.net";
+  const pairing = await c.call("device.pair_code", { url: ORIGIN, name: "smoke phone" });
+  const paired = await fetch(`http://127.0.0.1:${PORT}/api/device/pair`, {
+    method: "POST",
+    headers: { Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+    body: JSON.stringify({ code: pairing.code }),
+  });
+  ok(paired.ok, "push: a phone pairs");
+  const phoneId = (await paired.json()).device.id;
+  const cookie = paired.headers.get("set-cookie")!.split(";")[0];
+  const phone = async (method: string, params: Json = {}) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+      method: "POST",
+      headers: { Cookie: cookie, Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ id: 1, method, params }),
+    });
+    const v = await r.json();
+    if (v.error) throw new Error(v.error.message);
+    return v.result;
+  };
+  const refused = async (what: string, p: Promise<unknown>, needle: string) =>
+    await p.then(() => ok(false, what), (e) => ok(String(e).includes(needle), `${what}: ${e}`));
+
+  // The browser's side: a P-256 key and an auth secret, as PushManager.subscribe makes them.
+  const ua = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]) as CryptoKeyPair;
+  const uaPublic = new Uint8Array(await crypto.subtle.exportKey("raw", ua.publicKey));
+  const auth = crypto.getRandomValues(new Uint8Array(16));
+  const keys = { p256dh: b64u(uaPublic), auth: b64u(auth) };
+  const vapidKey = (await phone("push.key")).public_key;
+  ok(unb64u(vapidKey).length === 65 && unb64u(vapidKey)[0] === 4, "push: push.key gives the daemon's P-256 public key");
+  ok(((await Deno.stat(`${DATA}/push_vapid_key`)).mode! & 0o777) === 0o600, "push: the VAPID key is in the data dir, 0600");
+  await refused("push: http endpoint refused", phone("push.subscribe", { endpoint: `http://localhost:${pushPort}/push/a`, ...keys }), "https");
+  await refused("push: host off the allowlist refused", phone("push.subscribe", { endpoint: "https://push.example.com/push/a", ...keys }), "not a known push service");
+  await refused("push: allowlisted host on another port refused", phone("push.subscribe", { endpoint: "https://localhost/push/a", ...keys }), "not a known push service");
+  await refused("push: a curl glob pattern in the endpoint refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/x[1-10000]`, ...keys }), "subscription refused: push endpoint has characters");
+  await refused("push: bad keys refused", phone("push.subscribe", { endpoint: `${pushOrigin}/push/a`, p256dh: b64u(new Uint8Array(65)), auth: keys.auth }), "p256dh");
+  await refused("push: the desktop client has no alerts of its own", c.call("push.status"), "paired phone");
+  const endpoint = `${pushOrigin}/push/phone-1`;
+  let st = await phone("push.subscribe", { endpoint, ...keys });
+  ok(st.subscription.endpoint === endpoint && st.subscription.last_ok_at === null, "push: the phone subscribes");
+  const listed = (await c.call("device.list")).find((x: Json) => x.id === phoneId);
+  ok(listed.push?.endpoint_host === `localhost:${pushPort}` && !JSON.stringify(listed).includes(keys.auth), "push: device.list shows alerts on, no keys");
+
+  // An agent asks for approval: the phone's alert arrives, encrypted to it.
+  const ws = (await c.call("hello")).workspaces[0];
+  const ch = await c.call("channel.create", { workspace_id: ws.id, name: "alerts", agent: "shell" });
+  const claude = await c.call("session.spawn", { channel_id: ch.id, kind: "claude" });
+  let token = "";
+  for (let n = 0; n < 100 && !token; n++) {
+    token = await Deno.readTextFile(`${BASE}/claude-token-${claude.id}`).catch(() => "");
+    if (!token) await sleep(100);
+  }
+  const asked = Date.now();
+  const hook = await fetch(`http://127.0.0.1:${PORT}/hook/PermissionRequest`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf build" } }),
+  });
+  ok(hook.ok, "push: the permission request hook is accepted");
+  const waitFor = async (what: string, cond: () => boolean, ms = 10000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !cond()) await sleep(50);
+    ok(cond(), what);
+  };
+  await waitFor("push: the alert reaches the push service within 10 s", () => got.some((g) => g.path === "/push/phone-1"));
+  const first = got.find((g) => g.path === "/push/phone-1")!;
+  console.log(`      (alert took ${first.at - asked} ms)`);
+  const h = first.headers;
+  ok(h.get("ttl") === "300" && h.get("urgency") === "high" && h.get("content-encoding") === "aes128gcm", "push: TTL 300, Urgency high, aes128gcm");
+  ok(h.get("topic") === `muster-s${claude.id}`, "push: the session is the Topic (a newer alert replaces a waiting one)");
+  const authz = h.get("authorization") ?? "";
+  const m = authz.match(/^vapid t=([^.]+)\.([^.]+)\.([^,]+), k=(\S+)$/);
+  ok(m && m[4] === vapidKey, "push: Authorization is vapid t=<JWT>, k=<the daemon's key>");
+  const claims = JSON.parse(dec.decode(unb64u(m![2])));
+  const verifyKey = await crypto.subtle.importKey("raw", unb64u(vapidKey), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+  const signed = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, verifyKey, unb64u(m![3]), enc.encode(`${m![1]}.${m![2]}`));
+  ok(signed && JSON.parse(dec.decode(unb64u(m![1]))).alg === "ES256", "push: the VAPID JWT is ES256 and verifies");
+  ok(claims.aud === pushOrigin && claims.exp * 1000 > Date.now() && claims.exp * 1000 <= Date.now() + 24 * 3600_000,
+    `push: JWT audience is the push service, expiry within 24 h: ${JSON.stringify(claims)}`);
+  ok(claims.sub === "https://muster.invalid/web-push", "push: the VAPID subject is the neutral tool URL, nothing about the owner");
+  ok(first.body.length === 86 + 1024 + 16, `push: padded to the fixed size (${first.body.length} bytes)`);
+  const alert = JSON.parse(dec.decode(await webPushDecrypt(first.body, ua, uaPublic, auth)));
+  ok(alert.v === 1 && alert.kind === "session" && alert.session_id === claude.id && alert.channel_id === ch.id &&
+    alert.state === "needs_approval", `push: it decrypts (WebCrypto) to that session's approval: ${JSON.stringify(alert)}`);
+  ok(alert.title.includes(claude.name) && alert.body.includes("rm -rf build"), "push: title names the session, body the request");
+  for (let n = 0; n < 50 && !(st = await phone("push.status")).subscription.last_ok_at; n++) await sleep(100);
+  ok(st.subscription.last_ok_at > 0 && st.subscription.last_error === null, "push: push.status shows the last delivery");
+  // The ntfy fallback got the same alert, as plain text with a tap link to the phone page.
+  await waitFor("push: the ntfy fallback is posted too", () => got.some((g) => g.path === NTFY_PATH));
+  const nt = got.find((g) => g.path === NTFY_PATH)!;
+  await sleep(300);
+  ok(got.filter((g) => g.path.startsWith("/ntfy/")).length === 1, `push: curl globbing is off (one ntfy request, not three): ${got.map((g) => g.path)}`);
+  ok(nt.headers.get("click") === `${ORIGIN}/m/#s=${claude.id}` && dec.decode(nt.body).includes("rm -rf build") &&
+    (nt.headers.get("title") ?? "").startsWith("=?UTF-8?B?"), "push: ntfy gets title, text and the tap link");
+
+  // A test alert: same size on the wire, and at most one per 5 s.
+  let t = await phone("push.test");
+  ok(t.delivered === true && t.error === null, "push: push.test delivers");
+  const testMsg = got.filter((g) => g.path === "/push/phone-1").at(-1)!;
+  ok(testMsg.body.length === first.body.length, "push: a test alert has the same length as any alert");
+  ok(JSON.parse(dec.decode(await webPushDecrypt(testMsg.body, ua, uaPublic, auth))).kind === "test", "push: it decrypts to a test alert");
+  await refused("push: test alerts are rate limited", phone("push.test"), "wait 5 seconds");
+  let lastTest = Date.now();
+  const nextTest = async () => {
+    await sleep(Math.max(0, lastTest + 5100 - Date.now()));
+    const started = Date.now();
+    const r = await phone("push.test");
+    lastTest = Date.now();
+    return { r, took: lastTest - started };
+  };
+
+  // Redirects are not followed.
+  reply = async (path) =>
+    path === "/push/phone-1" ? new Response(null, { status: 302, headers: { location: `${pushOrigin}/elsewhere` } }) : new Response(null, { status: 201 });
+  ({ r: t } = await nextTest());
+  ok(t.delivered === false && String(t.error).includes("redirect") && !got.some((g) => g.path === "/elsewhere"), "push: a redirect is refused, not followed");
+  st = await phone("push.status");
+  ok(String(st.subscription.last_error).includes("redirect") && st.subscription.last_error_at >= st.subscription.last_ok_at, "push: push.status shows the failure");
+
+  // A push service that never answers is given up on after 5 s; curl never sees the endpoint or
+  // the signed token on its command line.
+  reply = async () => {
+    await sleep(9000);
+    return new Response(null, { status: 201 });
+  };
+  const before = got.length;
+  const slow = nextTest();
+  // Scan while curl waits for the answer (the request has arrived, the reply is held back).
+  for (let n = 0; n < 150 && got.length === before; n++) await sleep(50);
+  await sleep(300);
+  // Deno reads /proc only with every permission, so python lists the command lines.
+  const scan = await new Deno.Command("python3", {
+    args: ["-I", "-c", `import glob, os
+seen = []
+for p in glob.glob("/proc/[0-9]*/cmdline"):
+    if p == "/proc/%d/cmdline" % os.getpid():
+        continue  # this script names what it looks for
+    try:
+        c = open(p, "rb").read().replace(b"\\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        continue
+    seen.append(c)
+print(sum(1 for c in seen if "curl" in c and "-K" in c))
+print(sum(1 for c in seen if "vapid" in c or "/push/phone-1" in c))`],
+    stdout: "piped", stderr: "null",
+  }).output();
+  const [curls, leaks] = dec.decode(scan.stdout).trim().split("\n").map(Number);
+  ok(curls >= 1 && leaks === 0, `push: curl is running (${curls}) and no command line holds the endpoint or the VAPID token`);
+  const { r: timedOut, took } = await slow;
+  ok(timedOut.delivered === false && String(timedOut.error).includes("within 5 s") && took < 8500,
+    `push: an unanswered push gives up after about 5 s (${took} ms)`);
+
+  // 410: the subscription is gone and its row is deleted.
+  reply = async (path) => new Response(null, { status: path === "/push/phone-1" ? 410 : 201 });
+  ({ r: t } = await nextTest());
+  ok(t.delivered === false && t.subscription === null, "push: 410 deletes the subscription");
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push === null, "push: device.list shows alerts off after 410");
+
+  // Revoking the phone deletes its subscription.
+  reply = async () => new Response(null, { status: 201 });
+  await phone("push.subscribe", { endpoint, ...keys });
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push !== null, "push: subscribed again");
+
+  // One admission control for every alert request (deliveries, push.test, ntfy): at most 4 at
+  // once. And a delivery queued behind slow ones is checked again when its turn comes: a phone
+  // revoked, turned off or subscribed elsewhere meanwhile gets nothing.
+  const pairPhone = async (name: string, path: string) => {
+    const code = (await c.call("device.pair_code", { url: ORIGIN, name })).code;
+    const r = await fetch(`http://127.0.0.1:${PORT}/api/device/pair`, {
+      method: "POST",
+      headers: { Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    ok(r.ok, `push: ${name} pairs`);
+    const id = (await r.json()).device.id;
+    const ck = r.headers.get("set-cookie")!.split(";")[0];
+    const call = async (method: string, params: Json = {}) => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+        method: "POST",
+        headers: { Cookie: ck, Origin: ORIGIN, "X-Muster": "1", "Content-Type": "application/json" },
+        body: JSON.stringify({ id: 1, method, params }),
+      });
+      const v = await res.json();
+      if (v.error) throw new Error(v.error.message);
+      return v.result;
+    };
+    await call("push.subscribe", { endpoint: `${pushOrigin}${path}`, ...keys });
+    return { id, call };
+  };
+  const [slowA, slowB, slowC, victim] = [
+    await pairPhone("slow phone a", "/push/slow-a"),
+    await pairPhone("slow phone b", "/push/slow-b"),
+    await pairPhone("slow phone c", "/push/slow-c"),
+    await pairPhone("revoked phone", "/push/victim"),
+  ];
+  let release!: () => void;
+  const held = new Promise<void>((r) => (release = r));
+  const section = Date.now();
+  const since = () => got.filter((g) => g.at >= section);
+  const count = (path: string) => since().filter((g) => g.path === path).length;
+  reply = async (path) => {
+    if (path.startsWith("/push/slow-") || path === "/push/phone-1") await held;
+    return new Response(null, { status: 201 });
+  };
+  // Four test alerts hold the four slots (the first phone's after its 5 s gap).
+  const tests: Promise<Json>[] = [nextTest().then((x) => x.r)];
+  await waitFor("push: the first slow test alert is waiting on the push service", () => count("/push/phone-1") === 1, 8000);
+  tests.push(slowA.call("push.test"), slowB.call("push.test"), slowC.call("push.test"));
+  await waitFor("push: four test alerts run at once", () => since().filter((g) => g.path.startsWith("/push/")).length === 4);
+  // An agent asks again (after working a while: a new approval, so a new alert): its alerts (and
+  // ntfy's) have to queue behind the four.
+  await fetch(`http://127.0.0.1:${PORT}/hook/PostToolUse`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: {} }),
+  }).then((r) => r.text());
+  await sleep(200);
+  const asked2 = await fetch(`http://127.0.0.1:${PORT}/hook/PermissionRequest`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf dist" } }),
+  });
+  ok(asked2.ok, "push: a second permission request is accepted");
+  await sleep(700);
+  ok(since().length === 4, `push: nothing beyond the 4 slots went out while they were busy (ntfy included): ${since().map((g) => g.path)}`);
+  // While those alerts wait: one phone is revoked, one turns alerts off, one subscribes elsewhere.
+  await c.call("device.revoke", { id: victim.id });
+  await slowA.call("push.unsubscribe");
+  await slowB.call("push.subscribe", { endpoint: `${pushOrigin}/push/slow-b2`, ...keys });
+  release();
+  const results = await Promise.all(tests);
+  ok(results.every((x) => x.delivered === true), `push: the held test alerts were delivered: ${JSON.stringify(results.map((x) => x.error))}`);
+  await waitFor("push: the queued alert reaches the phones still subscribed", () =>
+    count("/push/slow-c") === 2 && count("/push/phone-1") === 2 && count(NTFY_PATH) === 1);
+  await sleep(500);
+  ok(count("/push/victim") === 0, "push: a phone revoked while its alert waited got nothing");
+  ok(count("/push/slow-a") === 1, "push: a phone that turned alerts off while its alert waited got nothing more");
+  ok(count("/push/slow-b") === 1 && count("/push/slow-b2") === 0, "push: an alert queued for an old subscription is not sent (to either)");
+  const ends = since().map((g) => [g.at, g.end ?? Date.now()]);
+  const most = Math.max(...ends.map(([at]) => ends.filter(([a, e]) => a <= at && at < e).length));
+  ok(most === 4, `push: at most 4 alert requests at once, tests and ntfy included (${most})`);
+  reply = async () => new Response(null, { status: 201 });
+  await c.call("device.revoke", { id: phoneId });
+  ok((await c.call("device.list")).find((x: Json) => x.id === phoneId).push === null, "push: revoking the phone deletes its subscription");
+  await refused("push: a revoked phone can't subscribe", phone("push.subscribe", { endpoint, ...keys }), "unauthorized");
+  await c.call("session.kill", { id: claude.id });
+
+  await pushServer.shutdown();
   c.close();
   await stopDaemon(d, "SIGTERM");
   d = await startDaemon();

@@ -28,6 +28,7 @@ mod openrouter;
 mod paths;
 mod pidfd;
 mod pr;
+mod push;
 mod renderer;
 mod replay_tail;
 mod pty;

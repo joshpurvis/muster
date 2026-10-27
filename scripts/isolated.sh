@@ -21,6 +21,8 @@ mkdir -m 700 "$MUSTER_RUNTIME_DIR" "$MUSTER_DATA_DIR"
 # setup, any other Claude credential), nor settings inherited from an OpenRouter session.
 unset OPENROUTER_API_KEY MUSTER_PROVIDER ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_OAUTH_TOKEN
 unset MUSTER_URL MUSTER_TOKEN MUSTER_BIN MUSTER_SESSION_ID MUSTER_CHANNEL_ID MUSTER_RUN MUSTER_HOOK_DB MUSTER_WEB_DIR
+# Phone alerts never leave a test daemon for the owner's ntfy or extra push hosts.
+unset MUSTER_NTFY_URL MUSTER_PUSH_HOSTS MUSTER_PUSH_SUBJECT
 # Keep failed test artifacts for diagnosis. This wrapper deliberately never kills
 # a PID read from a discovery file: integration fixtures own their child handles.
 echo "Isolated test files: $test_root" >&2

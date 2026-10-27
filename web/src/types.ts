@@ -541,7 +541,9 @@ export type ServerEvent =
       epoch: string;
       size_rev: number | null;
     };
-  };
+  }
+  /** Phone only: this device's alert subscription or its delivery status changed. */
+  | { event: "push_changed"; data: { device_id: number } };
 
 /** Preferences every window shares, kept by the backend (`prefs.get` / `prefs.set`). */
 /** Prompt-cache lifetimes in minutes (`prefs.cache_ttl`, src/cache.rs). */

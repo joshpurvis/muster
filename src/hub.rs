@@ -95,6 +95,11 @@ pub enum ServerEvent {
     DaemonStopping {
         reason: String,
     },
+    /// A paired device's phone-alert subscription or its delivery status changed (src/push.rs).
+    /// Sent only to that device's own connections, which ask `push.status` again.
+    PushChanged {
+        device_id: i64,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]

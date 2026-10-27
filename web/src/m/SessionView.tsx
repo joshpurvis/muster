@@ -13,6 +13,7 @@ import {
 import { SessionTitle } from "./SessionActions.tsx";
 import { PhoneTerminal } from "./term.ts";
 import { Icon, Settings, StateDot } from "./ui.tsx";
+import { clearAlert } from "./alerts.ts";
 
 export function SessionView({ session: s }: { session: SessionInfo }) {
   const stage = useRef<HTMLDivElement>(null);
@@ -54,6 +55,7 @@ export function SessionView({ session: s }: { session: SessionInfo }) {
     terminal.current = term;
     bindTerminal(term);
     markOpened(s);
+    clearAlert(s.id);
     return () => {
       ro.disconnect();
       bindTerminal(null);

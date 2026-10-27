@@ -501,6 +501,20 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE account_profiles ADD COLUMN account_group TEXT;
     "#,
+    // v23: phone alerts (src/push.rs): one Web Push subscription per paired device, with how its
+    // last delivery went. Foreign keys are off, so revoking a device deletes its row explicitly.
+    r#"
+    CREATE TABLE push_subscriptions (
+        device_id INTEGER PRIMARY KEY,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_ok_at INTEGER,
+        last_error TEXT,
+        last_error_at INTEGER
+    );
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -923,6 +937,45 @@ impl Store {
             "INSERT OR IGNORE INTO remote_origins (origin, added_at) VALUES (?1, ?2)",
             params![origin, now],
         )?;
+        Ok(())
+    }
+
+    pub fn load_push_subscriptions(&self) -> anyhow::Result<Vec<(i64, crate::push::Subscription)>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "SELECT device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at
+             FROM push_subscriptions",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                crate::push::Subscription {
+                    endpoint: r.get(1)?,
+                    p256dh: r.get(2)?,
+                    auth: r.get(3)?,
+                    created_at: r.get(4)?,
+                    last_ok_at: r.get(5)?,
+                    last_error: r.get(6)?,
+                    last_error_at: r.get(7)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Insert or replace a device's subscription (with its delivery status).
+    pub fn put_push_subscription(&self, device_id: i64, s: &crate::push::Subscription) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO push_subscriptions
+                 (device_id, endpoint, p256dh, auth, created_at, last_ok_at, last_error, last_error_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![device_id, s.endpoint, s.p256dh, s.auth, s.created_at, s.last_ok_at, s.last_error, s.last_error_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_push_subscription(&self, device_id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [device_id])?;
         Ok(())
     }
 

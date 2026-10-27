@@ -51,7 +51,8 @@ key press away, and the terminals keep running when the window closes.
   start a helper, send it a prompt, wait for it to finish and read its screen. The `muster` CLI
   does the same from any shell.
 - **A phone view.** Pair a phone over Tailscale with `muster pair` to see which agents need you,
-  approve or deny, send a prompt and watch a terminal.
+  approve or deny, send a prompt and watch a terminal. Turn on alerts there and the phone shows
+  one, screen off, when an agent needs you; tapping it opens that session.
 
   <img src="docs/screenshots/phone.png" width="300" alt="The phone view: a list of sessions with the two that need you at the top, the Codex agent with Approve and Deny buttons and the Claude agent showing its question">
 

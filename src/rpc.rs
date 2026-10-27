@@ -101,6 +101,13 @@ pub fn hello(hub: &Hub) -> Value {
         "account_profiles": hub.account_profiles().unwrap_or_default(),
         "channels": hub.channels(),
         "sessions": hub.sessions(),
+        // Which sessions are named agents' (`session.remove` hides those instead of stopping
+        // them), so a client without `agent.list` (a paired phone) can say so before it closes one,
+        // and (`agent_names`, keyed by session id) under the agent's own name.
+        "agent_sessions": hub.agents().list().into_iter().filter_map(|a| a.session_id).collect::<Vec<_>>(),
+        "agent_names": hub.agents().list().into_iter()
+            .filter_map(|a| a.session_id.map(|id| (id.to_string(), json!(a.name))))
+            .collect::<serde_json::Map<_, _>>(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "notes": crate::notes::list(hub).unwrap_or_default(),
@@ -2485,6 +2492,20 @@ mod tests {
         }
         assert!(call(&hub, "agent.memory.read", json!({"name": "rpc-max", "path": "people/ada.md"})).await.is_ok());
     }
+    #[tokio::test]
+    async fn hello_lists_named_agents_sessions() {
+        let (hub, _st) = fixture();
+        let empty = call(&hub, "hello", json!({})).await.unwrap();
+        assert_eq!((empty["agent_sessions"].clone(), empty["agent_names"].clone()), (json!([]), json!({})));
+        agent(&hub, "rpc-ada");
+        let id = hub.agents().get("rpc-ada").unwrap().id;
+        hub.agents().link_session(hub.store(), id, Some(2)).unwrap();
+        // A device sees it too: it has no `agent.list`.
+        let hello = dispatch(&hub, &Principal::Device { id: 1 }, "hello", json!({})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(hello["agent_sessions"], json!([2]));
+        assert_eq!(hello["agent_names"], json!({ "2": "rpc-ada" }));
+    }
+
     #[tokio::test]
     async fn restart_and_shutdown_are_human_only() {
         let (hub, _st) = fixture();

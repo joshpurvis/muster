@@ -95,14 +95,43 @@ export function repeatBytes(report: Uint8Array, count: number): Uint8Array {
   return out;
 }
 
-/** How a phone left a full-screen program it scrolled back (per session, kept across leaving
- * and reopening it): `back` wheel notches up not yet sent back down, at cell `at`; `behind`
- * once the agent was busy meanwhile, so new lines may sit below the program's view and
- * returning the notches alone would fall short of the newest. */
+/** How a phone left a full-screen program it scrolled back (per session and run, kept across
+ * leaving and reopening it): `back` wheel notches up not yet sent back down, at cell `at`;
+ * `behind` once the agent was busy meanwhile, so new lines may sit below the program's view and
+ * returning the notches alone would fall short of the newest. `run` is the process it belongs
+ * to (its pid): a restarted session's new process never inherits it. */
 export interface ProgramScroll {
+  run: number | null;
   back: number;
   behind: boolean;
   at: { col: number; row: number } | null;
+}
+
+/** Output may be arriving: an agent not idle, or a shell (its state doesn't say). */
+export function sessionBusy(s: { kind: string; state: string }): boolean {
+  return s.kind === "shell" || s.state !== "idle";
+}
+
+/** The saved state for this run of session `s`, a fresh one for a new process. */
+export function programScrollFor(saved: Map<number, ProgramScroll>, s: { id: number; pid: number | null }) {
+  let p = saved.get(s.id);
+  if (!p || p.run !== s.pid) {
+    p = { run: s.pid, back: 0, behind: false, at: null };
+    saved.set(s.id, p);
+  }
+  return p;
+}
+
+/** Any update of session `s`, viewed or not: busy while scrolled back marks it behind; a new
+ * process drops the old run's state. */
+export function noteSession(
+  saved: Map<number, ProgramScroll>,
+  s: { id: number; pid: number | null; kind: string; state: string },
+) {
+  const p = saved.get(s.id);
+  if (!p) return;
+  if (p.run !== s.pid) saved.delete(s.id);
+  else noteBusy(p, sessionBusy(s));
 }
 
 /** `count` notches were sent (negative = up) at `at`, while the agent was `busy` or not. */
@@ -125,14 +154,13 @@ export function programAtLatest(p: ProgramScroll): boolean {
 }
 
 /** Wheel notches down that bring a program back to its newest line: the ones sent up, plus,
- * when output may have arrived meanwhile, five screens more (a program stops at its bottom). */
-export function returnNotches(p: ProgramScroll, rows: number): number {
-  return p.back + (p.behind ? 5 * rows : 0);
+ * when output may have arrived meanwhile, more screens (a program stops at its bottom). Only
+ * wheel reports, never keys: the session's kind doesn't say what runs in front (an editor
+ * opened from Claude, say), and a program only scrolls on the wheel. A Claude session gets
+ * twenty screens, since an agent can print a lot while you read; others five. */
+export function returnNotches(p: ProgramScroll, rows: number, kind: string): number {
+  return p.back + (p.behind ? (kind === "claude" ? 20 : 5) * rows : 0);
 }
-
-/** Ctrl+End as xterm.js sends it: Claude Code's fullscreen view binds it to "scroll to bottom"
- * in the same context as the wheel, so it reaches the newest line however much arrived. */
-export const CTRL_END = new TextEncoder().encode("\x1b[1;5F");
 
 export interface BufferLine {
   isWrapped: boolean;

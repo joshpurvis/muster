@@ -3,29 +3,27 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 // UMD build on purpose; see web/src/terms.ts.
 import { ImageAddon } from "@xterm/addon-image/lib/addon-image.js";
 import { FRAME_OUTPUT, FRAME_REPLAY } from "../rpc.ts";
-import type { AgentState, SessionInfo, SessionKind } from "../types.ts";
+import type { SessionInfo } from "../types.ts";
 import {
   bufferText,
   type Cell,
-  CTRL_END,
   FONT_FAMILY,
   noteBusy,
   noteWheel,
   phoneGrid,
   programAtLatest,
   type ProgramScroll,
+  programScrollFor,
   programScrolls,
   repeatBytes,
   returnNotches,
   scrollPosition,
+  sessionBusy,
   splitPan,
   wheelReport,
   wheelSteps,
 } from "./logic.ts";
-
-/** Per session, so leaving a session and opening it again still offers "Latest output" while
- * the program is scrolled back (the program keeps its place; a new view would start at 0). */
-const programScroll = new Map<number, ProgramScroll>();
+import { programScroll } from "./store.ts";
 
 export function cellSize(fontSize: number, term?: Terminal): Cell {
   const cell = (term as any)?._core?._renderService?.dimensions?.css?.cell;
@@ -81,8 +79,7 @@ export class PhoneTerminal {
   private wheelRemainder = 0;
   /** Until the first replay is parsed the buffer isn't the program's yet: keep `program`. */
   private replaying = true;
-  private kind: SessionKind;
-  private state: AgentState;
+  private info: SessionInfo;
   private observer: ResizeObserver;
   private media = matchMedia("(prefers-color-scheme: light)");
   private events = new AbortController();
@@ -100,10 +97,8 @@ export class PhoneTerminal {
     /** Sends input bytes to the session; false when this device may not or it's offline. */
     private scrollProgram: (data: Uint8Array) => boolean,
   ) {
-    this.kind = info.kind;
-    this.state = info.state;
-    this.program = programScroll.get(sid) ?? { back: 0, behind: false, at: null };
-    programScroll.set(sid, this.program);
+    this.info = info;
+    this.program = programScrollFor(programScroll, info);
     this.term = new Terminal({
       cols: info.cols,
       rows: info.rows,
@@ -186,15 +181,12 @@ export class PhoneTerminal {
       row: clamp(Math.floor((at.y - rect.top + this.panY) / cell.height) + 1, this.term.rows),
     };
   }
-  /** Send |count| wheel notches, up when negative, at `at`, then `extra` bytes. True when sent. */
-  private wheel(count: number, at: { col: number; row: number }, extra?: Uint8Array) {
+  /** Send |count| wheel notches, up when negative, at `at`. True when sent. */
+  private wheel(count: number, at: { col: number; row: number }) {
     const encoding = (this.term as any)._core?.coreMouseService?.activeEncoding ?? "SGR";
     const report = wheelReport(count < 0, at.col, at.row, encoding, this.cell());
-    if (!report) return false;
-    const notches = repeatBytes(report, Math.abs(count));
-    const data = extra ? new Uint8Array([...notches, ...extra]) : notches;
-    if (!this.scrollProgram(data)) return false;
-    noteWheel(this.program, count, at, this.busy());
+    if (!report || !this.scrollProgram(repeatBytes(report, Math.abs(count)))) return false;
+    noteWheel(this.program, count, at, sessionBusy(this.info));
     return true;
   }
   private position() {
@@ -219,25 +211,24 @@ export class PhoneTerminal {
     this.pinned = this.atBottom();
     this.onBottom(this.pinned);
   }
-  /** Output may be arriving: an agent not idle, or a shell (its state doesn't say). */
-  private busy() {
-    return this.kind === "shell" || this.state !== "idle";
-  }
   private forgetProgram() {
     Object.assign(this.program, { back: 0, behind: false, at: null });
     this.wheelRemainder = 0;
   }
   /** "Latest output": also brings a full-screen program this view scrolled back to its newest
    * line, where the scroll happened (a tmux pane, say): the notches sent up, more if the agent
-   * was busy meanwhile (a program stops at its bottom), and for Claude Code its own Ctrl+End.
-   * If that can't be sent (offline), the program stays marked as scrolled back. */
+   * was busy meanwhile (a program stops at its bottom). If that can't be sent (offline), or the
+   * replay that says what's on screen hasn't arrived yet, the program stays marked. */
   bottom() {
     const p = this.program;
-    if (!programAtLatest(p) && this.programScrolls()) {
+    if (this.replaying) {
+      // Not yet known whether the program is in front: send nothing, forget nothing.
+    } else if (!programAtLatest(p) && this.programScrolls()) {
       const rect = this.surface.getBoundingClientRect();
       const at = p.at ?? this.cellAt({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
-      const notches = Math.max(1, returnNotches(p, this.term.rows));
-      if (this.wheel(notches, at, this.kind === "claude" ? CTRL_END : undefined)) this.forgetProgram();
+      if (this.wheel(Math.max(1, returnNotches(p, this.term.rows, this.info.kind)), at)) {
+        this.forgetProgram();
+      }
     } else {
       this.forgetProgram();
     }
@@ -250,9 +241,10 @@ export class PhoneTerminal {
     return phoneGrid(this.surface.clientWidth, this.closedHeight(), this.cell());
   }
   update(info: SessionInfo) {
-    this.kind = info.kind;
-    this.state = info.state;
-    noteBusy(this.program, this.busy());
+    this.info = info;
+    // A restarted session's new process starts with no saved scroll.
+    this.program = programScrollFor(programScroll, info);
+    noteBusy(this.program, sessionBusy(info));
     if (info.cols === this.term.cols && info.rows === this.term.rows) return;
     const pinned = this.atBottom();
     this.term.resize(info.cols, info.rows);

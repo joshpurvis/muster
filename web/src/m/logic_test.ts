@@ -1,12 +1,13 @@
 import {
   bufferText,
-  CTRL_END,
   normalizeCode,
   noteBusy,
+  noteSession,
   noteWheel,
   phoneGrid,
   programAtLatest,
   type ProgramScroll,
+  programScrollFor,
   programScrolls,
   relativeTime,
   repeatBytes,
@@ -132,17 +133,16 @@ Deno.test("wheel reports are the bytes xterm.js sends in each mouse encoding", (
   equal(wheelReport(true, 5, 300, "DEFAULT", cell), null);
   equal(wheelReport(true, 5, 5, "URXVT", cell), null);
   equal(bytes(repeatBytes(Uint8Array.of(1, 2), 3)), [1, 2, 1, 2, 1, 2]);
-  equal(bytes(CTRL_END), ascii("\x1b[1;5F"));
 });
 
 Deno.test("returning to the newest line covers output that arrived while scrolled back", () => {
-  const p: ProgramScroll = { back: 0, behind: false, at: null };
+  const p: ProgramScroll = { run: 7, back: 0, behind: false, at: null };
   // Idle agent: scrolled up 10, back down 4, the rest returns exactly what was sent.
   noteWheel(p, -10, { col: 3, row: 7 }, false);
   noteWheel(p, 4, { col: 9, row: 9 }, false);
-  equal(p, { back: 6, behind: false, at: { col: 3, row: 7 } });
+  equal(p, { run: 7, back: 6, behind: false, at: { col: 3, row: 7 } });
   equal(programAtLatest(p), false);
-  equal(returnNotches(p, 40), 6);
+  equal(returnNotches(p, 40, "claude"), 6);
   noteWheel(p, 6, { col: 3, row: 7 }, false);
   equal(programAtLatest(p), true);
   // Busy agent: new lines sit below the view, so the notches alone fall short. Dragging back
@@ -152,11 +152,35 @@ Deno.test("returning to the newest line covers output that arrived while scrolle
   noteWheel(p, 5, { col: 1, row: 2 }, true);
   equal(p.back, 0);
   equal(programAtLatest(p), false);
-  equal(returnNotches(p, 40), 200);
+  // Wheel reports only, never a key (an editor opened from Claude would take it); a Claude
+  // session over-sends more, since an agent can print a lot while you read.
+  equal(returnNotches(p, 40, "shell"), 200);
+  equal(returnNotches(p, 40, "claude"), 800);
   // Busy only after the view was back at the bottom: nothing below to miss.
-  const q: ProgramScroll = { back: 0, behind: false, at: null };
+  const q: ProgramScroll = { run: 7, back: 0, behind: false, at: null };
   noteBusy(q, true);
   equal(programAtLatest(q), true);
   noteWheel(q, -1, null, true);
   equal(q.behind, true);
+});
+
+Deno.test("saved scroll state follows the session's run and its unseen activity", () => {
+  const saved = new Map<number, ProgramScroll>();
+  const claude = { id: 4, pid: 100, kind: "claude", state: "idle" };
+  const p = programScrollFor(saved, claude);
+  noteWheel(p, -8, { col: 2, row: 3 }, false);
+  // Reopening the same run gets the same state back.
+  equal(programScrollFor(saved, claude) === p, true);
+  // The agent worked while the session view was closed: dragging back by the notches alone
+  // must not pass for the newest.
+  noteSession(saved, { ...claude, state: "working" });
+  equal(p.behind, true);
+  noteSession(saved, { id: 99, pid: 1, kind: "shell", state: "working" });
+  equal(saved.has(99), false);
+  // A restart (new pid) never inherits the old run's notches.
+  noteSession(saved, { ...claude, pid: 101 });
+  equal(saved.has(4), false);
+  const fresh = programScrollFor(saved, { ...claude, pid: 101 });
+  equal(fresh, { run: 101, back: 0, behind: false, at: null });
+  equal(programScrollFor(saved, { ...claude, pid: 102 }) === fresh, false);
 });

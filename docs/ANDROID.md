@@ -228,14 +228,17 @@ maths do not double-offset):
    `follow`. The scroll is the program's, so a desktop window showing the same session scrolls
    with it.
 
-   The phone remembers, per session and until the page reloads, how far it scrolled a program
-   back, where, and whether the agent was busy meanwhile (shells always count as busy), so
-   "Latest output" shows again after leaving and reopening the session. "Latest output" sends,
-   at the cell where the scroll happened, the wheel-down notches the phone sent up, five screens
-   more if the agent was busy (new lines sit below the program's view; a program stops at its
-   bottom), and for a Claude session Ctrl+End, which Claude Code's fullscreen view binds to
-   "scroll to bottom". Dragging back down by the notches alone counts as the newest only if the
-   agent stayed idle. If the return can't be sent (offline, reconnecting), the button stays.
+   The phone remembers, per session and process (a restart starts clean) and until the page
+   reloads, how far it scrolled a program back, where, and whether the agent was busy
+   meanwhile, from every session update, also while the session's view is closed (shells always
+   count as busy). So "Latest output" shows again after leaving and reopening the session.
+   "Latest output" sends, at the cell where the scroll happened, the wheel-down notches the
+   phone sent up and, if the agent was busy, more screens' worth (twenty for a Claude session,
+   five otherwise): new lines sit below the program's view, and a program stops at its bottom.
+   It sends wheel reports only, never keys: the session's kind doesn't say what is in front (an
+   editor opened from Claude, say). Dragging back down by the notches alone counts as the
+   newest only if the agent stayed idle. If the return can't be sent (offline, reconnecting),
+   or the replay hasn't arrived yet, the button and the saved state stay.
 
 ## Terminal width
 

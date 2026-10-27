@@ -2,7 +2,7 @@ import { batch, computed, signal } from "@preact/signals";
 import { connStatus, rpc } from "../rpc.ts";
 import type { Channel, Decision, SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
-import { type Grid, normalizeCode } from "./logic.ts";
+import { type Grid, normalizeCode, noteSession, type ProgramScroll } from "./logic.ts";
 
 export interface Device {
   id: number;
@@ -41,6 +41,9 @@ export const ready = computed(() => auth.value === "paired" && connStatus.value 
 export const canInteract = computed(() =>
   ready.value && !!device.value?.scopes.some((s) => s === "interact" || s === "manage")
 );
+/** How far the phone scrolled each session's full-screen program back (web/src/m/term.ts), kept
+ * while its view is closed and updated from every session's events, viewed or not. */
+export const programScroll = new Map<number, ProgramScroll>();
 let viewer: Viewer | null = null;
 let attached: number | null = null;
 let toastTimer = 0;
@@ -270,6 +273,8 @@ export function start() {
       sessions.value = new Map(hello.sessions.map((s) => [s.id, s]));
       channels.value = new Map(hello.channels.map((c) => [c.id, c]));
     });
+    for (const id of programScroll.keys()) if (!sessions.peek().has(id)) programScroll.delete(id);
+    for (const s of hello.sessions) noteSession(programScroll, s);
     const info = viewer && sessions.peek().get(viewer.sid);
     if (info) viewer!.update(info);
     attached = null;
@@ -279,12 +284,14 @@ export function start() {
     switch (event.event) {
       case "session_upserted":
         sessions.value = new Map(sessions.peek()).set(event.data.id, event.data);
+        noteSession(programScroll, event.data);
         if (viewer?.sid === event.data.id) viewer.update(event.data);
         break;
       case "session_removed": {
         const next = new Map(sessions.peek());
         next.delete(event.data.id);
         sessions.value = next;
+        programScroll.delete(event.data.id);
         break;
       }
       case "channel_upserted":

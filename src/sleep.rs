@@ -34,6 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -124,8 +125,9 @@ struct Inner {
     /// Messages on their way to each agent (`agents::deliver`, `for_send`): a sleep waits for none.
     deliveries: HashMap<i64, u32>,
     /// Raw input to each session: how many writes were admitted so far, and how many are still
-    /// on their way to its terminal (`keys`, `admit`). A sleep checks neither moved (`claim`).
-    input: HashMap<SessionId, (u64, u32)>,
+    /// on their way to its terminal, until the terminal host has settled them (`keys`, `admit`,
+    /// `Admitted`). A sleep checks neither moved (`claim`).
+    input: HashMap<SessionId, (u64, Arc<AtomicU32>)>,
     /// Why an agent's last wake failed, until it wakes or sleeps again (its asleep bar says so).
     failed: HashMap<i64, String>,
     /// After a failed wake: no panel click wakes the agent before this.
@@ -133,10 +135,16 @@ struct Inner {
 }
 
 impl Inner {
-    fn admit(&mut self, id: SessionId) {
+    fn admit(&mut self, id: SessionId) -> Admitted {
         let e = self.input.entry(id).or_default();
         e.0 += 1;
-        e.1 += 1;
+        e.1.fetch_add(1, Ordering::SeqCst);
+        Admitted { on_way: e.1.clone() }
+    }
+
+    /// How many raw writes to session `id` were admitted so far, and how many are on their way.
+    fn input_of(&self, id: SessionId) -> (u64, u32) {
+        self.input.get(&id).map_or((0, 0), |(seq, on_way)| (*seq, on_way.load(Ordering::SeqCst)))
     }
 
     /// The wake of `agent` (tab `tab`) is over: stop holding keys for it. True when typed keys
@@ -183,9 +191,10 @@ impl State {
         g.waking.contains_key(&agent) || g.requested.contains(&agent)
     }
 
-    /// How many raw writes to session `id` were admitted so far.
-    fn input_seq(&self, id: SessionId) -> u64 {
-        self.inner.lock().input.get(&id).map_or(0, |e| e.0)
+    /// How many raw writes to session `id` were admitted so far, and how many of them haven't
+    /// been settled with the terminal host yet.
+    fn input_seq(&self, id: SessionId) -> (u64, u32) {
+        self.inner.lock().input_of(id)
     }
 
     /// The last check of a sleep, and the switch to asleep, as one step: refused when raw input
@@ -195,7 +204,7 @@ impl State {
     /// stopped. Called with the start lock held, so no message or send can register a start.
     fn claim(&self, hub: &Hub, agent: i64, sid: SessionId, seen: u64) -> Result<(), &'static str> {
         let mut g = self.inner.lock();
-        let (seq, on_way) = g.input.get(&sid).copied().unwrap_or_default();
+        let (seq, on_way) = g.input_of(sid);
         if seq != seen || on_way > 0 {
             return Err("you typed into it just now");
         }
@@ -223,11 +232,11 @@ impl State {
             let mut g = self.inner.lock();
             g.asleep.retain(|_, a| *a != agent);
             g.overflowed.remove(&sid);
-            g.keys.remove(&sid).filter(|k| !k.is_empty())
+            g.keys.remove(&sid).filter(|k| !k.is_empty()).map(|k| (k, g.admit(sid)))
         };
-        if let Some(keys) = held {
+        if let Some((keys, admitted)) = held {
             hub.note_human_input(sid);
-            if let Err(e) = hub.send_keys(sid, &keys) {
+            if let Err(e) = hub.send_keys_admitted(sid, &keys, admitted) {
                 tracing::warn!(session = sid, "typing the keys held while it was going to sleep: {e:#}");
             }
         }
@@ -246,6 +255,18 @@ pub(crate) fn delivering(hub: &Arc<Hub>, agent: i64) -> Delivering {
     Delivering { hub: hub.clone(), agent }
 }
 
+/// `delivering` for something that must not wake agent `agent` (session `sid`): None when it
+/// is asleep, or a sleep has claimed it. One step under the lock `State::claim` takes, so a
+/// sleep either sees this and refuses, or this sees the sleep (a panel batch, `inject::enqueue_panels`).
+pub(crate) fn delivering_awake(hub: &Arc<Hub>, agent: i64, sid: SessionId) -> Option<Delivering> {
+    let mut g = hub.agents().sleep.inner.lock();
+    if g.asleep.contains_key(&sid) {
+        return None;
+    }
+    *g.deliveries.entry(agent).or_default() += 1;
+    Some(Delivering { hub: hub.clone(), agent })
+}
+
 impl Drop for Delivering {
     fn drop(&mut self) {
         let mut g = self.hub.agents().sleep.inner.lock();
@@ -258,18 +279,17 @@ impl Drop for Delivering {
     }
 }
 
-/// Raw input to a session, admitted until it has been handed to the terminal (dropped after
-/// the write). A sleep refuses while one is on its way, or when one came after its check.
+/// Raw input to a session, admitted until the terminal host has settled it: handed to the
+/// terminal with it (`Hub::send_keys_admitted`, `write_input_admitted`), which drops it once
+/// the host answered (or the input was refused). A sleep refuses while one is on its way, or
+/// when one came after its check. Dropping takes no lock (the input thread drops it).
 pub struct Admitted {
-    hub: Arc<Hub>,
-    id: SessionId,
+    on_way: Arc<AtomicU32>,
 }
 
 impl Drop for Admitted {
     fn drop(&mut self) {
-        if let Some(e) = self.hub.agents().sleep.inner.lock().input.get_mut(&self.id) {
-            e.1 = e.1.saturating_sub(1);
-        }
+        self.on_way.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -292,8 +312,7 @@ pub fn admit(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<Admitted> {
     if g.waking.values().any(|t| *t == id) {
         anyhow::bail!("session {id} is an agent that is waking up; try again once it is ready");
     }
-    g.admit(id);
-    Ok(Admitted { hub: hub.clone(), id })
+    Ok(g.admit(id))
 }
 
 /// Work a Claude run started in the background (`run_in_background`: a sub-agent, a command)
@@ -353,6 +372,17 @@ fn launched_id(v: Option<&serde_json::Value>) -> Option<String> {
         }
     }
     None
+}
+
+/// A tool result whose work goes on in the background although its call didn't ask for that:
+/// moved there while it ran (a command past its timeout, or the human's Ctrl+B). Only the
+/// result says so: a `backgroundTaskId` (a command), `backgroundedByUser`, or a sub-agent's
+/// `status: "async_launched"`.
+fn moved_to_background(v: Option<&serde_json::Value>) -> bool {
+    let Some(v) = v else { return false };
+    text_of(v.get("backgroundTaskId")).is_some()
+        || v.get("backgroundedByUser").and_then(|b| b.as_bool()) == Some(true)
+        || text_of(v.get("status")) == Some("async_launched")
 }
 
 /// Every `<tag>value</tag>` in `text`.
@@ -426,8 +456,18 @@ impl Background {
             }
             // It started: its result names it.
             "PostToolUse" => {
+                let result = payload.get("tool_response");
                 if let Some(t) = self.tasks.iter_mut().find(|t| launch(t)) {
-                    t.task = launched_id(payload.get("tool_response"));
+                    t.task = launched_id(result);
+                } else if moved_to_background(result) && self.tasks.len() < TASKS_MAX {
+                    // Started in the foreground, then moved to the background: from now on it
+                    // is background work like any other.
+                    let task = launched_id(result);
+                    let known = self.tasks.iter().any(|t| (!tool_use.is_empty() && t.tool_use == tool_use) || (task.is_some() && t.task == task));
+                    if !known {
+                        let agent = matches!(text_of(payload.get("tool_name")), Some("Agent" | "Task"));
+                        self.tasks.push(BgTask { tool_use: tool_use.to_string(), task, agent });
+                    }
                 }
             }
             // It never started.
@@ -477,12 +517,10 @@ async fn refresh_background(hub: &Arc<Hub>, sid: SessionId) {
     })
     .await;
     let Ok(Ok(text)) = read else { return };
-    let mut next = bg.clone();
     // Each notice is one JSON string in the transcript: its newlines are escaped there.
-    next.notified(&text.replace("\\n", "\n"));
-    if next.tasks != bg.tasks {
-        hub.set_background(sid, generation, next);
-    }
+    let text = text.replace("\\n", "\n");
+    // To the work as it is now: a hook may have registered more while the file was read.
+    hub.edit_background(sid, generation, |bg| bg.notified(&text));
 }
 
 /// What `blocker` reads about an agent's session besides its info.
@@ -619,8 +657,13 @@ pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent
     {
         refresh_background(hub, sid).await;
     }
-    // Read before anything else: input admitted after this is caught by `claim`.
-    let seen = a.session_id.map_or(0, |s| hub.agents().sleep.input_seq(s));
+    // Read before anything else: input admitted after this is caught by `claim`. Input admitted
+    // before it must have reached the terminal already, or the checks below (its input box)
+    // could miss it.
+    let (seen, on_way) = a.session_id.map_or((0, 0), |s| hub.agents().sleep.input_seq(s));
+    if on_way > 0 {
+        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+    }
     let (info, f) = facts(hub, &a);
     if let Some(no) = blocker(&a, info.as_ref(), &f) {
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
@@ -719,8 +762,11 @@ pub(crate) fn on_start(hub: &Arc<Hub>, agent: &Agent) -> anyhow::Result<Option<i
     if let Some(a) = hub.agents().by_id(cur.id) {
         crate::agents::publish(hub, &a);
     }
-    if spawn && let Some(tab) = tab {
-        tokio::spawn(settle(hub.clone(), cur.id, tab));
+    if spawn
+        && let Some(tab) = tab
+        && let Some(at) = before.asleep_at
+    {
+        tokio::spawn(settle(hub.clone(), cur.id, tab, at));
     }
     Ok(before.asleep_at)
 }
@@ -734,17 +780,38 @@ pub(crate) fn launched(hub: &Hub, agent: i64) {
     }
 }
 
+/// A start that returned `e` may still have launched the CLI: the terminal host's answer was
+/// lost (`terminal::SpawnUncertain`), and `Hub::reconcile_pending` adopts or retires it later.
+/// Not a failed wake: never put back to sleep (the CLI may run), never said as a failure.
+pub(crate) fn unconfirmed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::terminal::SpawnUncertain>().is_some()
+}
+
 /// The start that was waking agent `agent` (asleep since `asleep_at`) failed with `e`. With no
 /// run going, it is asleep again (not "stopped"): its next message, or typing into its tab,
-/// tries again. The keys held for it are dropped (said), and its asleep bar says why.
+/// tries again. The keys held for it are dropped (said), and its asleep bar says why. A launch
+/// that is only unconfirmed (`unconfirmed`) hasn't failed: the wake goes on, and `settle`
+/// waits for the launch to be adopted (it is ready) or retired (the wake failed after all).
 pub(crate) fn start_failed(hub: &Arc<Hub>, agent: i64, asleep_at: i64, e: &anyhow::Error) {
-    let Some(a) = hub.agents().by_id(agent) else { return };
+    if unconfirmed(e) {
+        launched(hub, agent);
+        return;
+    }
+    // A wake `wake_soon` asked for says so itself.
+    let asked = hub.agents().sleep.inner.lock().requested.contains(&agent);
+    wake_lost(hub, agent, asleep_at, e, !asked);
+}
+
+/// A wake of agent `agent` (asleep since `asleep_at`) failed with `e`, and no run of it goes
+/// on: asleep again, `wake_error` says why, the held keys are dropped (`say`: and that is said).
+/// True when typed keys were dropped.
+fn wake_lost(hub: &Arc<Hub>, agent: i64, asleep_at: i64, e: &anyhow::Error, say: bool) -> bool {
+    let Some(a) = hub.agents().by_id(agent) else { return false };
     let tab = hub.agents().sleep.inner.lock().waking.get(&agent).copied().or(a.session_id);
-    let (dropped, asked) = {
+    let dropped = {
         let mut g = hub.agents().sleep.inner.lock();
         g.failed.insert(agent, format!("{e:#}"));
-        // A wake `wake_soon` asked for says so itself.
-        (tab.is_some_and(|t| g.end_wake(agent, t)), g.requested.contains(&agent))
+        tab.is_some_and(|t| g.end_wake(agent, t))
     };
     let live = a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s));
     if !live && a.asleep_at.is_none() {
@@ -760,15 +827,19 @@ pub(crate) fn start_failed(hub: &Arc<Hub>, agent: i64, asleep_at: i64, e: &anyho
     if let Some(a) = hub.agents().by_id(agent) {
         crate::agents::publish(hub, &a);
     }
-    if dropped && !asked {
+    if dropped && say {
         hub.notice("warn", format!("{} couldn't be woken, so what you typed into its tab wasn't sent: {e:#}", a.name));
     }
+    dropped
 }
 
 /// A start of agent `agent`, asleep when it began, failed with `e`: say why on its asleep bar
 /// (`wake_error`) while it is still asleep (`start_failed` has put it back when the failure came
 /// after the wake began).
 pub(crate) fn wake_failed(hub: &Hub, agent: i64, e: &anyhow::Error) {
+    if unconfirmed(e) {
+        return;
+    }
     hub.agents().sleep.inner.lock().failed.insert(agent, format!("{e:#}"));
     if let Some(a) = hub.agents().by_id(agent) {
         crate::agents::publish(hub, &a);
@@ -785,12 +856,14 @@ pub(crate) fn on_session_start(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<
     Ok(on_start(hub, &a)?.map(|at| (a.id, at)))
 }
 
-/// The wake of agent `agent` (from tab `tab`) is done once its session is ready: type the keys
-/// held for it, if any, when no prompt is being typed (else wait for that), then stop holding
-/// keys. While the woken CLI shows a question or an approval of its own, the human's keys go
-/// straight to it. Gives up after `READY_WAIT`, or when the run ends, dropping what was held
-/// (and saying so); ends when something else ended the wake (`start_failed`).
-async fn settle(hub: Arc<Hub>, agent: i64, tab: SessionId) {
+/// The wake of agent `agent` (from tab `tab`, asleep since `asleep_at`) is done once its session
+/// is ready: type the keys held for it, if any, when no prompt is being typed (else wait for
+/// that), then stop holding keys. While the woken CLI shows a question or an approval of its
+/// own, the human's keys go straight to it. A launch whose acknowledgement was lost is waited
+/// for (`Hub::reconcile_pending` adopts or retires it). A run that ends before it was ready is a
+/// failed wake (`ended_early`). Gives up after `READY_WAIT`, dropping what was held (and saying
+/// so); ends when something else ended the wake (`start_failed`).
+async fn settle(hub: Arc<Hub>, agent: i64, tab: SessionId, asleep_at: i64) {
     let deadline = tokio::time::Instant::now() + READY_WAIT;
     let mut rx = hub.subscribe();
     let mut started = false;
@@ -819,11 +892,17 @@ async fn settle(hub: Arc<Hub>, agent: i64, tab: SessionId) {
             }
         }
         let now = tokio::time::Instant::now();
-        // Its run ended (or never started though its start returned) before it was ready, or it
-        // took too long.
+        // Its run ended (or never started though its start returned) before it was ready; a
+        // launch still unconfirmed hasn't.
         let launched = hub.agents().sleep.inner.lock().launched.contains(&agent);
-        let ended = (started || launched) && !live;
-        if now >= deadline || ended || hub.is_shutting_down() || hub.agents().by_id(agent).is_none() {
+        let ended = (started || launched) && !live && !cur.is_some_and(|s| hub.may_deliver(s));
+        if ended && !hub.is_shutting_down() && hub.agents().by_id(agent).is_some() {
+            if ended_early(&hub, agent, tab, asleep_at).await {
+                return;
+            }
+            continue;
+        }
+        if now >= deadline || hub.is_shutting_down() || hub.agents().by_id(agent).is_none() {
             give_up(&hub, agent, tab);
             return;
         }
@@ -843,14 +922,44 @@ fn flush(hub: &Hub, agent: i64, tab: SessionId, to: SessionId) -> bool {
     let g = &mut *g;
     crate::inject::while_queue_idle(hub, to, || {
         let keys = g.keys.remove(&tab).unwrap_or_default();
+        let admitted = g.admit(to);
         // The human typed them: the turn they start is the human's (whatever woke it).
         hub.note_human_input(to);
-        if let Err(e) = hub.send_keys(to, &keys) {
+        if let Err(e) = hub.send_keys_admitted(to, &keys, admitted) {
             tracing::warn!(session = to, "typing the keys held while it woke: {e:#}");
         }
         g.end_wake(agent, tab);
     })
     .is_some()
+}
+
+/// The run that woke agent `agent` (from tab `tab`) ended before it was ready: a failed wake,
+/// like a start that failed (`wake_lost`): asleep again, why on its asleep bar, typing or the
+/// next message tries again. Under the start lock, checked again there: false when a start
+/// meanwhile runs it again (the wake goes on).
+async fn ended_early(hub: &Arc<Hub>, agent: i64, tab: SessionId, asleep_at: i64) -> bool {
+    let _one = hub.agents().start_lock.lock().await;
+    if hub.agents().sleep.inner.lock().waking.get(&agent) != Some(&tab) {
+        return true;
+    }
+    let cur = hub.agents().by_id(agent).and_then(|a| a.session_id);
+    if cur.is_some_and(|s| hub.live_session_ids().contains(&s) || hub.may_deliver(s)) {
+        return false;
+    }
+    let info = cur.and_then(|s| hub.session(s));
+    let why = match info.as_ref().and_then(|i| i.state_detail.clone().filter(|d| !d.is_empty() && d != ASLEEP_DETAIL)) {
+        Some(d) => format!("it stopped before it was ready ({d})"),
+        None => match info.and_then(|i| i.exit_code) {
+            Some(code) => format!("it stopped before it was ready (exit code {code})"),
+            None => "it stopped before it was ready".to_string(),
+        },
+    };
+    let e = anyhow::anyhow!(why);
+    let name = hub.agents().by_id(agent).map(|a| a.name).unwrap_or_else(|| "The agent".into());
+    tracing::warn!(agent = name, "waking: {e:#}");
+    let lost = if wake_lost(hub, agent, asleep_at, &e, false) { " What you typed into its tab meanwhile wasn't sent." } else { "" };
+    hub.notice("warn", format!("{name} couldn't be woken: {e:#}. It is asleep again; the next message, or typing into its tab, tries again.{lost}"));
+    true
 }
 
 fn give_up(hub: &Hub, agent: i64, tab: SessionId) {
@@ -921,8 +1030,7 @@ pub fn keys(hub: &Arc<Hub>, id: SessionId, bytes: &[u8]) -> Keys {
         let asleep = g.asleep.get(&id).copied();
         // Not an asleep or waking agent's, or its woken CLI is asking something: typed now.
         if (!waking && asleep.is_none() && !g.keys.contains_key(&id)) || (waking && asleep.is_none() && g.interactive.contains(&id)) {
-            g.admit(id);
-            return Keys::Pass(Admitted { hub: hub.clone(), id });
+            return Keys::Pass(g.admit(id));
         }
         let (kept, typing) = typed(bytes);
         let held = g.keys.get(&id).map_or(0, Vec::len);
@@ -1059,6 +1167,8 @@ pub(crate) fn wake_soon(hub: &Arc<Hub>, agent: i64, tab: Option<SessionId>, caus
                     note_woke(&hub, &s.agent, &s.session, at, what, say_cost);
                 }
             }
+            // The launch is unconfirmed, not failed: the wake goes on (`settle`).
+            Err(e) if unconfirmed(&e) => tracing::warn!(agent = name.as_deref().unwrap_or("?"), "waking: {e:#}"),
             Err(e) => {
                 {
                     let mut g = hub.agents().sleep.inner.lock();
@@ -1457,6 +1567,134 @@ mod tests {
         assert!(blocker(&agent(), Some(&i), &ready()).unwrap().contains("2 background tasks"));
     }
 
+    /// Work moved to the background while it ran (a command past its timeout, Ctrl+B) is only
+    /// named by its result: it counts like work started there.
+    #[test]
+    fn work_moved_to_the_background_keeps_it_awake() {
+        let mut bg = Background::default();
+        // A foreground command that finished, even one whose output quotes a task id, is none.
+        assert!(!bg.after_hook("PostToolUse", &json!({"tool_name": "Bash", "tool_use_id": "f1",
+            "tool_response": {"stdout": "{\"backgroundTaskId\":\"zz\"}", "stderr": ""}})));
+        // A foreground sub-agent's result names it too, but it ended.
+        assert!(!bg.after_hook("PostToolUse", &json!({"tool_name": "Agent", "tool_use_id": "f2",
+            "tool_response": {"status": "completed", "agentId": "a0"}})));
+        assert!(bg.after_hook("PostToolUse", &json!({"tool_name": "Bash", "tool_use_id": "t1",
+            "tool_response": {"stdout": "", "backgroundTaskId": "b7"}})));
+        assert!(bg.after_hook("PostToolUse", &json!({"tool_name": "Agent", "tool_use_id": "t2",
+            "tool_response": {"status": "async_launched", "agentId": "a9"}})));
+        assert_eq!(bg.running(), 2);
+        assert_eq!((bg.tasks[0].task.as_deref(), bg.tasks[1].task.as_deref(), bg.tasks[1].agent), (Some("b7"), Some("a9"), true));
+        // The same result again (a replayed hook) isn't counted twice.
+        assert!(!bg.after_hook("PostToolUse", &json!({"tool_name": "Bash", "tool_use_id": "t1",
+            "tool_response": {"backgroundTaskId": "b7"}})));
+        // They end as any background work does.
+        bg.notified("<task-notification>\n<task-id>b7</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>");
+        assert!(bg.after_hook("SubagentStop", &json!({"agent_id": "a9"})));
+        assert_eq!(bg.running(), 0);
+    }
+
+    /// The transcript's evidence applies to the background work as it is when it is applied, so
+    /// work a hook registered while the file was read is kept.
+    #[test]
+    fn transcript_evidence_keeps_work_registered_meanwhile() {
+        let hub = hub(false);
+        let (generation, _) = hub.background_of(1).unwrap();
+        let launch = |id: &str| json!({"tool_name": "Bash", "tool_use_id": id, "tool_input": {"run_in_background": true}});
+        hub.edit_background(1, generation, |bg| {
+            bg.after_hook("PreToolUse", &launch("t1"));
+        });
+        // What `refresh_background` read the transcript for...
+        let (_, snapshot) = hub.background_of(1).unwrap();
+        assert_eq!(snapshot.running(), 1);
+        // ... a hook registers more while it reads ...
+        hub.edit_background(1, generation, |bg| {
+            bg.after_hook("PreToolUse", &launch("t2"));
+        });
+        // ... and the notice it found ends only the task it names.
+        let text = "<task-notification>\n<tool-use-id>t1</tool-use-id>\n</task-notification>";
+        hub.edit_background(1, generation, |bg| bg.notified(text));
+        let (_, now) = hub.background_of(1).unwrap();
+        assert_eq!(now.tasks.iter().map(|t| t.tool_use.as_str()).collect::<Vec<_>>(), vec!["t2"]);
+        assert_eq!(hub.session(1).unwrap().background, 1);
+        // Another run's work is never touched.
+        hub.edit_background(1, generation + 1, |bg| bg.tasks.clear());
+        assert_eq!(hub.session(1).unwrap().background, 1);
+    }
+
+    /// Keys stay admitted until the terminal host has them (the input link drops the admission
+    /// then), and a sleep refuses while any are on their way, before it checks the input box.
+    #[tokio::test]
+    async fn keys_on_their_way_to_the_terminal_keep_it_awake() {
+        let hub = hub(false);
+        let st = &hub.agents().sleep;
+        let typing = match keys(&hub, 1, b"x") {
+            Keys::Pass(a) => a,
+            Keys::Held => panic!("an awake agent's keys are typed"),
+        };
+        // Handed to the input link, which keeps it until the host answered.
+        let queued: crate::terminal::Hold = Box::new(typing);
+        assert_eq!(st.input_seq(1), (1, 1));
+        let e = sleep(&hub, "dozy", Why::Manual).await.unwrap_err();
+        assert!(format!("{e:#}").contains("you typed into it just now"), "{e:#}");
+        drop(queued);
+        assert_eq!(st.input_seq(1), (1, 0));
+        let e = sleep(&hub, "dozy", Why::Manual).await.unwrap_err();
+        assert!(format!("{e:#}").contains("isn't running"), "{e:#}");
+    }
+
+    /// A panel batch is a message on its way until it is queued: a sleep refuses while one is,
+    /// and none is queued once a sleep has claimed the tab.
+    #[tokio::test]
+    async fn panel_batches_and_a_sleep_exclude_each_other() {
+        let hub = hub(false);
+        let _lock = hub.agents().start_lock.lock().await;
+        let st = &hub.agents().sleep;
+        let batch = delivering_awake(&hub, 1, 1).expect("awake: it may be queued");
+        assert_eq!(st.claim(&hub, 1, 1, 0), Err("a message to it is on its way"));
+        drop(batch);
+        assert_eq!(st.claim(&hub, 1, 1, 0), Ok(()));
+        assert!(delivering_awake(&hub, 1, 1).is_none(), "claimed: its events wait for its wake");
+        assert_eq!(st.deliveries(1), 0);
+    }
+
+    /// A wake whose launch is only unconfirmed (the host's answer was lost) isn't a failed one:
+    /// awake, no error, typing held for it. If that launch is then retired, or the woken CLI
+    /// stops before it is ready, the wake failed: asleep again, why on its asleep bar, said once,
+    /// and typing tries again.
+    #[tokio::test]
+    async fn an_unconfirmed_launch_waits_and_one_that_stops_early_is_a_failed_wake() {
+        let hub = hub(true);
+        let st = &hub.agents().sleep;
+        let mut rx = hub.subscribe();
+        hub.test_unconfirmed_launch(1, true, "");
+        let a = hub.agents().by_id(1).unwrap();
+        assert_eq!(on_start(&hub, &a).unwrap(), Some(5_000));
+        let lost = anyhow::Error::new(crate::terminal::SpawnUncertain("connection lost".into()));
+        start_failed(&hub, 1, 5_000, &lost);
+        wake_failed(&hub, 1, &lost);
+        assert!(hub.agents().by_id(1).unwrap().asleep_at.is_none(), "its CLI may run: awake");
+        assert_eq!(st.wake_failed(1), None);
+        assert!(!st.is_asleep(1));
+        assert!(matches!(keys(&hub, 1, b"hi"), Keys::Held), "held for the launch");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(st.waking(1), "waiting for the launch to be adopted or retired");
+        // Retired: nothing runs.
+        hub.test_unconfirmed_launch(1, false, "launch failed: no such program");
+        until("the wake ends", || !st.waking(1)).await;
+        let a = hub.agents().by_id(1).unwrap();
+        assert!(a.asleep_at.is_some(), "asleep again");
+        assert!(st.is_asleep(1));
+        assert!(st.wake_failed(1).is_some_and(|w| w.contains("no such program")), "{:?}", st.wake_failed(1));
+        assert!(st.inner.lock().keys.is_empty());
+        let said = notices(&mut rx);
+        assert_eq!(said.iter().filter(|n| n.contains("couldn't be woken")).count(), 1, "{said:?}");
+        assert!(said.iter().any(|n| n.contains("wasn't sent")), "{said:?}");
+        // Typing tries again.
+        assert!(matches!(keys(&hub, 1, b"x"), Keys::Held));
+        assert!(st.waking(1));
+        until("the retry ends", || !st.waking(1)).await;
+    }
+
     /// The last check and the switch to asleep are one step: input typed after the check, or
     /// still on its way, and a message registered meanwhile stop it; from then on the human's
     /// keys are held, never typed into the run being stopped.
@@ -1466,7 +1704,7 @@ mod tests {
         // As a sleep does: nothing may start the agent meanwhile.
         let _lock = hub.agents().start_lock.lock().await;
         let st = &hub.agents().sleep;
-        let seen = st.input_seq(1);
+        let seen = st.input_seq(1).0;
         let typing = match keys(&hub, 1, b"x") {
             Keys::Pass(a) => a,
             Keys::Held => panic!("an awake agent's keys are typed"),
@@ -1474,7 +1712,7 @@ mod tests {
         assert_eq!(st.claim(&hub, 1, 1, seen), Err("you typed into it just now"));
         drop(typing);
         assert_eq!(st.claim(&hub, 1, 1, seen), Err("you typed into it just now"), "typed since the check");
-        let seen = st.input_seq(1);
+        let seen = st.input_seq(1).0;
         let message = delivering(&hub, 1);
         assert_eq!(st.claim(&hub, 1, 1, seen), Err("a message to it is on its way"));
         drop(message);
@@ -1482,7 +1720,7 @@ mod tests {
         let other = admit(&hub, 1).unwrap();
         assert!(st.claim(&hub, 1, 1, seen).is_err());
         drop(other);
-        let seen = st.input_seq(1);
+        let seen = st.input_seq(1).0;
         assert_eq!(st.claim(&hub, 1, 1, seen), Ok(()));
         assert!(st.is_asleep(1));
         assert!(matches!(keys(&hub, 1, b"hi"), Keys::Held));

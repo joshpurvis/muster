@@ -1458,10 +1458,28 @@ impl Hub {
         }
     }
 
-    /// Keystrokes from a client: queued to the PTY in order without waiting on the host.
+    /// Keystrokes from a client: queued to the PTY in order without waiting on the host (the
+    /// application types them admitted, `send_keys_admitted`).
+    #[cfg(test)]
     pub fn send_keys(&self, id: SessionId, bytes: &[u8]) -> anyhow::Result<()> {
         match self.input_handle(id) {
             Some(p) => p.send_keys(bytes),
+            None => Err(self.not_running(id)),
+        }
+    }
+
+    /// `send_keys`, admitted for a sleep (src/sleep.rs) until the host has settled them.
+    pub fn send_keys_admitted(&self, id: SessionId, bytes: &[u8], admitted: crate::sleep::Admitted) -> anyhow::Result<()> {
+        match self.input_handle(id) {
+            Some(p) => p.send_keys_holding(bytes, Box::new(admitted)),
+            None => Err(self.not_running(id)),
+        }
+    }
+
+    /// `write_input`, admitted for a sleep (src/sleep.rs) until the host has settled it.
+    pub fn write_input_admitted(&self, id: SessionId, bytes: &[u8], admitted: crate::sleep::Admitted) -> anyhow::Result<()> {
+        match self.input_handle(id) {
+            Some(p) => p.write_holding(bytes, Box::new(admitted)),
             None => Err(self.not_running(id)),
         }
     }
@@ -3740,14 +3758,35 @@ impl Hub {
         g.sessions.get(&id).map(|e| (e.generation, e.background.clone()))
     }
 
-    /// Run `generation` of session `id` has this background work now (some reported back where
-    /// no hook said so). In memory: the saved hook state is rechecked the same way after a reload.
-    pub(crate) fn set_background(&self, id: SessionId, generation: u64, background: crate::sleep::Background) {
+    /// Tests: session `id`'s current run is a launch whose acknowledgement was lost (`pending`),
+    /// or that launch was retired (`!pending`: exited with `detail`).
+    #[cfg(test)]
+    pub(crate) fn test_unconfirmed_launch(&self, id: SessionId, pending: bool, detail: &str) {
+        let generation = self.inner.lock().sessions.get(&id).map_or(0, |e| e.generation);
+        let record = StoredTerminal { host_instance: "fixture-host".into(), token: "run-token".into(), key_refs: Default::default(),
+            key_fp: None, port_base: 20000, pending, retired: !pending,
+            spec: SpawnSpec { run: RunId { id, generation }, program: "/bin/true".into(),
+                args: vec![], env: BTreeMap::new(), cwd: std::env::temp_dir(), cols: 80, rows: 24 } };
+        self.terminal_records.lock().insert(id, record);
+        let _ = self.update_session_info(id, |i| {
+            i.state = if pending { AgentState::Starting } else { AgentState::Exited };
+            i.state_detail = (!pending).then(|| detail.to_string());
+        });
+    }
+
+    /// Apply `f` to the background work of run `generation` of session `id` as it is now, under
+    /// the hub lock (some reported back where no hook said so; a hook may have registered more
+    /// meanwhile, which `f` keeps). In memory: the saved hook state is rechecked the same way
+    /// after a reload.
+    pub(crate) fn edit_background(&self, id: SessionId, generation: u64, f: impl FnOnce(&mut crate::sleep::Background)) {
         let mut g = self.inner.lock();
         let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return };
-        e.info.background = background.running();
-        e.background = background;
-        self.publish_session(&e.info);
+        let before = e.background.running();
+        f(&mut e.background);
+        if e.background.running() != before {
+            e.info.background = e.background.running();
+            self.publish_session(&e.info);
+        }
     }
 
     /// Kill (if alive) and forget a session, including its scrollback.

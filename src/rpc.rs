@@ -864,8 +864,9 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
                 Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
-            // Admitted until written, so a sleep can't stop the run they are typed into (src/sleep.rs).
-            let _admitted = match chain {
+            // Admitted until the terminal host has them, so a sleep can't stop the run they are
+            // typed into (src/sleep.rs).
+            let admitted = match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
                     crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?;
@@ -894,7 +895,7 @@ pub async fn dispatch(hub: &Arc<Hub>, who: &Principal, method: &str, params: Val
             } else {
                 p.data
             };
-            hub.write_input(p.id, data.as_bytes())?;
+            hub.write_input_admitted(p.id, data.as_bytes(), admitted)?;
             Ok(json!({}))
         }
         "session.output" => {
@@ -1842,12 +1843,12 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal) {
                     // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
                     hub.note_human_input(id);
                     // An asleep agent's tab: held until it has woken (src/sleep.rs). Admitted
-                    // until handed to the terminal, so a sleep can't stop the run meanwhile.
-                    let _admitted = match crate::sleep::keys(&hub, id, &data[5..]) {
+                    // until the terminal host has them, so a sleep can't stop the run meanwhile.
+                    let admitted = match crate::sleep::keys(&hub, id, &data[5..]) {
                         crate::sleep::Keys::Held => continue,
                         crate::sleep::Keys::Pass(admitted) => admitted,
                     };
-                    if let Err(e) = hub.send_keys(id, &data[5..]) {
+                    if let Err(e) = hub.send_keys_admitted(id, &data[5..], admitted) {
                         // Lost or refused keystrokes interrupt their run, which the user sees
                         // on the session (`input_interrupted`) and in a notice.
                         tracing::debug!("input for session {id}: {e:#}");

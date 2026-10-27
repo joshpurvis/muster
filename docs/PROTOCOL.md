@@ -229,15 +229,20 @@ been idle that long, measured from the latest of: when it came to rest, its last
 check runs every 30 s. `agent.sleep` (`muster agent sleep`, Sleep in the agents panel) does it
 now. Never while it is working, starting, waiting for approval or a question, shows an error or
 looks stuck, has running sub-agents, has background work running (`SessionInfo.background`: a
-sub-agent or command started with `run_in_background` that hasn't reported back, from its hooks
-and its notices in the run's transcript; the CLI's exit would end it), has prompts queued or
-being typed, has a message on its way (`agents::deliver` and the human's `session.send` from
-before the start lock until the prompt is queued), is waking, is in a turn (an agent message was
+sub-agent or command started with `run_in_background`, or moved to the background while it ran
+(a command past its timeout, Ctrl+B: its tool result has a `backgroundTaskId`), that hasn't
+reported back, from its hooks and its notices in the run's transcript, applied to the work as it
+is then; the CLI's exit would end it), has prompts queued or being typed, has a message on its
+way (`agents::deliver`, the human's `session.send` from before the start lock until the prompt
+is queued, and a panel batch until it is queued; a batch is never queued for an agent asleep or
+being put to sleep, its events wait for its wake), is waking, is in a turn (an agent message was
 typed in since it last came to rest), has text in its input box, or before its conversation id
 is known (it couldn't be resumed). The check and the stop run under the agent start lock, which
 every wake, `session.send` to an agent's session, `session.restart` of one and autostart take
 too. The last check and the switch to asleep are one step against raw input (keys admitted
-since the check, or still on their way, refuse it; from then on the human's keys are held), and
+since the check, or still on their way to the terminal host, refuse it: a write counts as on its
+way until the host has answered it, not only until it is queued; from then on the human's keys
+are held), and
 the stop is fenced to the run that was checked (a restart's new run is never stopped). The sleep
 waits for the process to exit before releasing the lock; if it doesn't exit, the agent is awake
 and keys held meanwhile go to it. Keys from an agent or a shell (`session.input` with
@@ -269,10 +274,13 @@ dropped; bracketed-paste markers are kept. Nothing else wakes it: `hello`, `agen
 `interact` scope sends a message to an asleep agent like any other (`session.send`), which wakes
 it; its key buttons stay off until it is awake.
 
-A wake that fails (its account profile is disabled, the CLI can't start) leaves it asleep, not
-stopped: its record has `wake_error` (why) until it wakes or sleeps again, the asleep bar says
-so, keys held for it are dropped (with a notice), and the next message, Wake, or typing into its
-tab tries again at once (a panel click at most once a minute).
+A wake that fails (its account profile is disabled, the CLI can't start, or the woken CLI stops
+before it is ready) leaves it asleep, not stopped: its record has `wake_error` (why) until it
+wakes or sleeps again, the asleep bar says so, keys held for it are dropped (with a notice), and
+the next message, Wake, or typing into its tab tries again at once (a panel click at most once a
+minute). A launch whose answer from the terminal host was lost is not a failure (the CLI may be
+running): the agent stays awake, keys stay held, and the wake goes on until recovery adopts the
+launch (it is ready: the keys are typed) or retires it (a failed wake, as above).
 
 The wake re-reads the whole conversation; once its prompt cache has likely expired
 (`cache_cold_at`, which an exited session keeps), uncached at full cost. The tab's asleep bar says

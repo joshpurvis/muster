@@ -581,6 +581,15 @@ pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[(crate::model::Pa
     let Some((first, _)) = panels.first() else { return Ok(()) };
     anyhow::ensure!(panels.iter().all(|(p, _)| p.channel_id == info.channel_id && p.session_id == id),
         "panel batch does not belong to session {id}'s task");
+    // A named agent's batch is a message on its way until it is queued (src/sleep.rs), and none
+    // goes to one asleep or being put to sleep: its events wait for its wake (`panels::deliver_pending`).
+    let _delivering = match hub.agents().by_session(id) {
+        Some(a) => match crate::sleep::delivering_awake(hub, a.id, id) {
+            Some(d) => Some(d),
+            None => return Ok(()),
+        },
+        None => None,
+    };
     let (text, events, fetch) = panel_prompt(panels, MAX_PANEL_PROMPT)?;
     if events.is_empty() { return Ok(()) }
     let generation = hub.pty_generation(id);

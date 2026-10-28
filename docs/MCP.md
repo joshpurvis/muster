@@ -136,16 +136,19 @@ sending all of it, so marking one card of a long `pr_overview` merged is one sho
 ```
 
 - A path is field names joined by `.`, each optionally followed by `[field=value]` (the one
-  list item whose `field` is that string, number or boolean; quotes around the value are
-  optional) or `[index]` (from 0). Pick items by a unique field such as a PR's `number`.
+  list item whose `field` is that string, number or boolean) or `[index]` (from 0). Pick items
+  by a unique field such as a PR's `number`. A value may be quoted as a JSON string, and must
+  be when it holds `]` or `"`: `rows[id="a]b"]`, `rows[id="say \"hi\""]`.
 - `value` (any JSON, `null` included) replaces what the path names. Every step must exist,
   except a final field name, which may be new: the result then lists that path in `added`, so
   a misspelt field (which the app would ignore) does not pass unnoticed.
 - 1 to 50 edits, applied in order, all or none; each path at most 300 bytes and 16 steps. `set`
   and `data` cannot be combined.
-- The edits apply to the data stored when the update commits (under the panel lock), so an
-  update landing in between is kept, never overwritten. The result is checked as a whole
-  `data` would be, so `set` can never store what `data` would refuse.
+- The edits are made on the stored data and commit only if no other data update landed
+  since; otherwise they are made again on the newer data (up to 8 times, then the call is
+  refused with "try again"), so an update is never overwritten. The result is checked as a
+  whole `data` would be, so `set` can never store what `data` would refuse. Panel data is
+  nested at most about 120 levels deep, `set` or not.
 - A refusal names the edit and its path: ``set[1] `prs[number=999].status`: no item of `prs`
   has number=999``, or ``2 items of `prs` have author=dana``.
 - Not for `image`, `pr_decision` or `web_preview`: they store files read from the worktree or

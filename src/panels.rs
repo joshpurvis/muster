@@ -94,7 +94,7 @@ enum Step { Key(String), Index(usize), Match(String, String) }
 /// A `set` path: field names joined by `.`, each followed by any number of `[i]` (a list
 /// index) or `[field=value]` (the one list item whose `field` is that string, number or
 /// boolean), as in `prs[number=226].status`. A model names a card by what it knows of it,
-/// never by a position it has to count.
+/// never by a position it has to count. A value holding `]` or `"` is quoted as a JSON string.
 fn parse_path(path: &str) -> anyhow::Result<Vec<Step>> {
     ensure!(!path.is_empty() && path.len() <= MAX_PATH, "a path must be 1 to {MAX_PATH} bytes");
     let mut steps = Vec::new();
@@ -102,28 +102,59 @@ fn parse_path(path: &str) -> anyhow::Result<Vec<Step>> {
     loop {
         let end = rest.find(['.', '[']).unwrap_or(rest.len());
         let key = &rest[..end];
-        ensure!(!key.is_empty() && !key.contains([']', '=']), "expected a field name at `{rest}`");
+        ensure!(!key.is_empty() && !key.contains([']', '=', '"']), "expected a field name at `{rest}`");
         steps.push(Step::Key(key.into()));
         rest = &rest[end..];
         while let Some(inner) = rest.strip_prefix('[') {
-            let close = inner.find(']').context("a `[` is never closed")?;
-            let sel = inner[..close].trim();
-            steps.push(match sel.split_once('=') {
-                Some((field, value)) => {
-                    let (field, value) = (field.trim(), value.trim());
-                    let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
-                    ensure!(!field.is_empty() && !value.is_empty(), "`[{sel}]` needs a field and a value, as in [number=226]");
-                    Step::Match(field.into(), value.into())
-                }
-                None => Step::Index(sel.parse().with_context(|| format!("`[{sel}]` must be an index such as [0] or a match such as [number=226]"))?),
-            });
-            rest = &inner[close + 1..];
+            let (step, after) = selector(inner)?;
+            steps.push(step);
+            rest = after;
         }
         if rest.is_empty() { break }
         rest = rest.strip_prefix('.').with_context(|| format!("expected `.` or `[` at `{rest}`"))?;
     }
     ensure!(steps.len() <= MAX_STEPS, "a path has at most {MAX_STEPS} steps");
     Ok(steps)
+}
+
+/// One `[...]`, from just after its `[`: the step and the text after its `]`. A quoted value
+/// is read as a JSON string (escapes decoded), so it may hold `]`, `.` or `\"`.
+fn selector(s: &str) -> anyhow::Result<(Step, &str)> {
+    let stop = s.find([']', '=', '"']).context("a `[` is never closed")?;
+    let field = s[..stop].trim();
+    if s.as_bytes()[stop] == b']' {
+        let i = field.parse().with_context(|| format!("`[{field}]` must be an index such as [0] or a match such as [number=226]"))?;
+        return Ok((Step::Index(i), &s[stop + 1..]))
+    }
+    ensure!(s.as_bytes()[stop] == b'=' && !field.is_empty(), "a `[` needs an index such as [0] or a field and a value, as in [number=226]");
+    let rest = s[stop + 1..].trim_start();
+    let (value, rest) = if rest.starts_with('"') {
+        // Quote and backslash are ASCII, so a byte scan never splits a character.
+        let (bytes, mut i) = (rest.as_bytes(), 1);
+        loop {
+            match bytes.get(i) {
+                None => anyhow::bail!("a quoted value is never closed"),
+                Some(b'\\') => i += 2,
+                Some(b'"') => break,
+                Some(_) => i += 1,
+            }
+        }
+        let value: String = serde_json::from_str(&rest[..=i]).context("a quoted value must be a JSON string")?;
+        (value, &rest[i + 1..])
+    } else {
+        let end = rest.find([']', '"']).context("a `[` is never closed")?;
+        ensure!(rest.as_bytes()[end] == b']', "quote the whole value, as in [id=\"a]b\"]");
+        let value = rest[..end].trim();
+        ensure!(!value.is_empty(), "`[{field}=]` needs a value, as in [number=226]");
+        (value.to_string(), &rest[end..])
+    };
+    let rest = rest.trim_start().strip_prefix(']').context("expected `]` after a quoted value")?;
+    Ok((Step::Match(field.into(), value), rest))
+}
+
+/// A selector's value as a path would spell it: quoted when it holds anything but plain text.
+fn shown(value: &str) -> String {
+    if value.is_empty() || value.trim() != value || value.contains([']', '"', '\\']) { json!(value).to_string() } else { value.to_string() }
 }
 
 /// The value `step` names inside `here`, which must already exist; `at` is the path so far.
@@ -145,6 +176,7 @@ fn descend<'a>(here: &'a mut Value, step: &Step, at: &str) -> anyhow::Result<&'a
                 _ => false,
             };
             let hits: Vec<usize> = list.iter().enumerate().filter(|(_, item)| hit(item)).map(|(i, _)| i).collect();
+            let value = shown(value);
             match hits[..] {
                 [i] => Ok(&mut list[i]),
                 [] => anyhow::bail!("no item of {at} has {field}={value}"),
@@ -173,7 +205,7 @@ fn apply_set(data: &mut Value, edits: &[Edit]) -> anyhow::Result<Vec<String>> {
                     Step::Key(k) if at.is_empty() => at.push_str(k),
                     Step::Key(k) => { at.push('.'); at.push_str(k) }
                     Step::Index(n) => at.push_str(&format!("[{n}]")),
-                    Step::Match(f, v) => at.push_str(&format!("[{f}={v}]")),
+                    Step::Match(f, v) => at.push_str(&format!("[{f}={}]", shown(v))),
                 }
             }
             if let Step::Key(k) = last {
@@ -189,10 +221,18 @@ fn apply_set(data: &mut Value, edits: &[Edit]) -> anyhow::Result<Vec<String>> {
     Ok(added)
 }
 
-/// A [`commit`]'s new input: whole, checked and staged before the lock, or an edit run under
-/// it on the data as committed then (so a concurrent update is never lost), returning the
-/// checked bytes to store.
-enum NewData<'a> { Whole(Vec<u8>), Edit(Box<dyn FnOnce(Value) -> anyhow::Result<Vec<u8>> + 'a>) }
+/// Attempts at a `set` edit while other data updates keep committing in between.
+const SET_TRIES: usize = 8;
+
+/// The data a `set` edit was made on changed before it could commit (it is made again).
+#[derive(Debug)]
+struct DataMoved;
+impl std::fmt::Display for DataMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the panel's data kept changing while this set was made; try again")
+    }
+}
+impl std::error::Error for DataMoved {}
 
 /// `kit` is for custom apps: the built-ins already draw with it.
 fn check_kit(app: &str, kit: Option<bool>) -> anyhow::Result<()> {
@@ -276,9 +316,14 @@ fn input_html(cwd: &Path, inline: Option<String>, path: Option<String>) -> anyho
 pub fn own_ports(hub: &Hub) -> [u16; 2] { [hub.port(), hub.panels.port.load(Ordering::Relaxed)] }
 
 /// The stored input for `app` (a web preview's URL is checked against Muster's own ports).
+/// The bytes are read back as [`resource`] and a `set` will read them, so nothing is stored
+/// that those refuse (JSON nested past serde_json's 128 levels, which a `set` deep inside the
+/// data can build from parts that each passed).
 fn app_data(hub: &Hub, app: &str, cwd: &Path, data: Value, csp: &mut PanelCsp, opening: bool) -> anyhow::Result<Vec<u8>> {
-    if app == "web_preview" { return crate::web_preview::data(data, &own_ports(hub)) }
-    crate::panel_apps::data(app, cwd, data, csp, opening)
+    let bytes = if app == "web_preview" { crate::web_preview::data(data, &own_ports(hub))? }
+        else { crate::panel_apps::data(app, cwd, data, csp, opening)? };
+    serde_json::from_slice::<Value>(&bytes).map_err(|e| anyhow::anyhow!("panel data must be readable JSON nested at most about 120 levels deep ({e})"))?;
+    Ok(bytes)
 }
 
 pub(crate) fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
@@ -387,11 +432,12 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
 /// Returns the `set` paths that added a field (see [`apply_set`]).
 pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<Vec<String>> {
     let seen = own(hub, session, args.panel_id)?;
-    update_from(hub, session, seen, args)
+    update_from(hub, session, seen, args, &mut || {})
 }
 
-/// [`update`] given `seen`, the panel as read before the lock (a test passes a stale one).
-fn update_from(hub: &Hub, session: SessionId, seen: Panel, args: Update) -> anyhow::Result<Vec<String>> {
+/// [`update`] given `seen`, the panel as read first (a test passes a stale one). `between`
+/// runs after a `set` is staged and before it commits (a test races another update there).
+fn update_from(hub: &Hub, session: SessionId, mut seen: Panel, args: Update, between: &mut dyn FnMut()) -> anyhow::Result<Vec<String>> {
     // Read and stage everything without the lock; the lock only renames and commits.
     ensure!(!seen.closed, "panel is closed");
     let (_, ch) = caller(hub, session)?;
@@ -401,41 +447,67 @@ fn update_from(hub: &Hub, session: SessionId, seen: Panel, args: Update) -> anyh
     // Whether the kit really changes is decided under the lock, against the panel as it is then.
     let kit = args.kit;
     let title = args.title.as_deref().map(title).transpose()?;
-    let cwd = PathBuf::from(&ch.cwd);
-    let mut added = Vec::new();
-    let data = match (args.data, args.set) {
+    let cwd = Path::new(&ch.cwd);
+    let (id, channel) = (args.panel_id, ch.id);
+    // `based_on`: the data revision a `set` was made on, refused under the lock if it moved.
+    let recheck = |based_on: Option<i64>| move || {
+        let p = own(hub, session, id)?;
+        caller_in(hub, session, channel)?;
+        if based_on.is_some_and(|r| r != p.data_revision) { return Err(DataMoved.into()) }
+        Ok(p)
+    };
+    let save = |_: &Panel, p: &mut Panel| hub.store().save_panel(p);
+    let edits = match (args.data, args.set) {
         (Some(_), Some(_)) => anyhow::bail!("give data (the whole input) or set (edits to it), not both"),
-        (Some(d), None) => Some(NewData::Whole(app_data(hub, &seen.app, &cwd, d, &mut seen.csp.clone(), false)?)),
+        (Some(d), None) => {
+            let data = app_data(hub, &seen.app, cwd, d, &mut seen.csp.clone(), false)?;
+            return commit(hub, &seen, title, html, Some(data), kit, recheck(None), save).map(|()| Vec::new())
+        }
+        (None, None) => return commit(hub, &seen, title, html, None, kit, recheck(None), save).map(|()| Vec::new()),
         (None, Some(ops)) => {
             ensure!(settable(&seen.app), "{} panels take the whole data, not set", seen.app);
             ensure!(!ops.is_empty() && ops.len() <= MAX_SET, "set takes 1 to {MAX_SET} edits");
-            let edits = ops.into_iter().enumerate().map(|(i, op)| {
+            ops.into_iter().enumerate().map(|(i, op)| {
                 let steps = parse_path(&op.path).with_context(|| format!("set[{i}] `{}`", op.path))?;
                 Ok((op.path, steps, op.value))
-            }).collect::<anyhow::Result<Vec<Edit>>>()?;
-            let (app, mut csp, added) = (seen.app.clone(), seen.csp.clone(), &mut added);
-            // Checked as a whole update is, so an edit never stores what `data` would refuse.
-            // These apps read no files to check, so this costs the lock only the parse.
-            Some(NewData::Edit(Box::new(move |mut current| {
-                *added = apply_set(&mut current, &edits)?;
-                app_data(hub, &app, &cwd, current, &mut csp, false)
-            })))
+            }).collect::<anyhow::Result<Vec<Edit>>>()?
         }
-        (None, None) => None,
     };
-    let id = args.panel_id;
-    commit(hub, &seen, title, html, data, kit, || {
-        let p = own(hub, session, id)?;
-        caller_in(hub, session, ch.id)?;
-        Ok(p)
-    }, |_, p| hub.store().save_panel(p))?;
-    Ok(added)
+    // Like a whole update, the edit is made, checked and staged outside the lock, on the data
+    // committed when it was read; it commits only if no other data update landed since, and is
+    // otherwise made again on the newer data, so no update is ever lost.
+    for _ in 0..SET_TRIES {
+        let current = match std::fs::read(data_file(hub, &seen)) {
+            Ok(bytes) => bytes,
+            // A newer update replaced the file since `seen` was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                seen = own(hub, session, id)?;
+                ensure!(!seen.closed, "panel is closed");
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut current: Value = serde_json::from_slice(&current)?;
+        let added = apply_set(&mut current, &edits)?;
+        // Checked as a whole update is, so an edit never stores what `data` would refuse.
+        let data = app_data(hub, &seen.app, cwd, current, &mut seen.csp.clone(), false)?;
+        between();
+        match commit(hub, &seen, title.clone(), html.clone(), Some(data), kit, recheck(Some(seen.data_revision)), save) {
+            Ok(()) => return Ok(added),
+            Err(e) if e.is::<DataMoved>() => {
+                seen = own(hub, session, id)?;
+                ensure!(!seen.closed, "panel is closed");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(DataMoved.into())
 }
 
 /// Stage files without the lock, then rename and commit under it. `recheck` runs under the
 /// lock and returns the panel as it is now, refusing if the caller may no longer change it;
 /// `write` stores the new row (given the old one), also under the lock.
-fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, data: Option<NewData>, kit: Option<bool>,
+fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, data: Option<Vec<u8>>, kit: Option<bool>,
     recheck: impl FnOnce() -> anyhow::Result<Panel>, write: impl FnOnce(&Panel, &mut Panel) -> anyhow::Result<()>) -> anyhow::Result<()> {
     // Unchanged HTML keeps its revision (the app keeps running), if nobody changed it meanwhile.
     let same_html = html.as_ref().is_some_and(|html| std::fs::read_to_string(app_file(hub, &seen)).is_ok_and(|old| old == *html));
@@ -443,11 +515,9 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
     let staged_html = folder.join(staging_name("stage-"));
     let staged_data = folder.join(staging_name("stage-"));
     let cleanup = || { let _ = std::fs::remove_file(&staged_html); let _ = std::fs::remove_file(&staged_data); };
-    let new_data = data.is_some();
-    let (whole, edit) = match data { Some(NewData::Whole(d)) => (Some(d), None), Some(NewData::Edit(f)) => (None, Some(f)), None => (None, None) };
     let staged = (|| -> anyhow::Result<()> {
         if let Some(html) = &html { crate::paths::write_private(&staged_html, html.as_bytes())?; }
-        if let Some(data) = &whole { crate::paths::write_private(&staged_data, data)?; }
+        if let Some(data) = &data { crate::paths::write_private(&staged_data, data)?; }
         Ok(())
     })();
     if let Err(e) = staged { cleanup(); return Err(e.context("writing panel files (is the panel closed?)")) }
@@ -456,12 +526,6 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
         let mut p = recheck()?;
         ensure!(!p.closed, "panel is closed");
         let old = p.clone();
-        // An edit reads the data committed now, never a copy read before the lock, so an update
-        // landing in between is kept. Both files are Muster's own and at most a few MiB.
-        if let Some(edit) = edit {
-            let current: Value = serde_json::from_slice(&std::fs::read(data_file(hub, &old))?)?;
-            crate::paths::write_private(&staged_data, &edit(current)?)?;
-        }
         if let Some(t) = title { p.title = t; }
         p.revision += 1;
         p.updated_at = now_ms();
@@ -478,7 +542,7 @@ fn commit(hub: &Hub, seen: &Panel, title: Option<String>, html: Option<String>, 
             p.html_revision = p.revision;
             std::fs::hard_link(app_file(hub, &old), app_file(hub, &p))?;
         }
-        if new_data {
+        if data.is_some() {
             p.data_revision = p.revision;
             std::fs::rename(&staged_data, data_file(hub, &p))?;
         }
@@ -518,7 +582,7 @@ pub fn navigate(hub: &Hub, id: PanelId, typed: &str) -> anyhow::Result<(String, 
     if resource(hub, id)?["data"]["url"].as_str() == Some(url.as_str()) { return Ok((url, false)) }
     let data = crate::web_preview::data(json!({"url": url}), &own_ports(hub))?;
     let mut changed = false;
-    commit(hub, &seen, None, None, Some(NewData::Whole(data)), None, || {
+    commit(hub, &seen, None, None, Some(data), None, || {
         let p = get(hub, id)?;
         ensure!(hub.channel(p.channel_id).is_some_and(|c| !c.archived), "the panel's task is gone");
         ensure!(p.app == "web_preview", "only a web preview has an address bar");
@@ -1504,7 +1568,7 @@ mod tests {
         refuse(json!([{"path": "repo[0]", "value": "x"}]), "`repo` is not a list");
         refuse(json!([{"path": "prs.status", "value": "x"}]), "`prs` is not an object");
         for (path, says) in [("prs[number=226", "never closed"), ("prs..status", "expected a field name"), ("prs[x]", "must be an index"),
-            ("prs[=1]", "needs a field and a value"), ("prs[0]status", "expected `.` or `[`"), ("", "1 to 300 bytes")] {
+            ("prs[=1]", "a field and a value"), ("prs[0]status", "expected `.` or `[`"), ("", "1 to 300 bytes")] {
             refuse(json!([{"path": path, "value": 1}]), says);
         }
         refuse(json!([{"path": "a.".repeat(20) + "a", "value": 1}]), "at most 16 steps");
@@ -1524,24 +1588,132 @@ mod tests {
         archive(&hub, 1).unwrap();
     }
 
+    fn whole(id: PanelId, data: Value) -> Update {
+        Update { set: None, panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None }
+    }
+
+    /// The overview's data with PR #230 retitled `title`.
+    fn retitled(hub: &Hub, id: PanelId, title: &str) -> Value {
+        let mut data = resource(hub, id).unwrap()["data"].clone();
+        data["prs"][2]["title"] = json!(title);
+        data
+    }
+
     #[test]
-    fn set_edits_the_data_committed_under_the_lock_not_a_stale_read() {
+    fn set_never_loses_an_update_committed_after_its_read() {
         let hub = fixture();
         let id = overview(&hub);
+        let merged = || set(id, json!([{"path": "prs[number=226].status", "value": "merged"}]));
+        // A whole update lands after the caller read the panel: the edit is made on its data.
         let stale = get(&hub, id).unwrap();
-        // A whole update lands after the edit's caller read the panel.
-        let mut data = resource(&hub, id).unwrap()["data"].clone();
-        data["prs"][2]["title"] = json!("Docs, rewritten");
-        update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None }).unwrap();
-        update_from(&hub, 1, stale, set(id, json!([{"path": "prs[number=226].status", "value": "merged"}]))).unwrap();
+        update(&hub, 1, whole(id, retitled(&hub, id, "Docs, rewritten"))).unwrap();
+        update_from(&hub, 1, stale, merged(), &mut || {}).unwrap();
         let res = resource(&hub, id).unwrap();
         assert_eq!((&res["data"]["prs"][0]["status"], &res["data"]["prs"][2]["title"]), (&json!("merged"), &json!("Docs, rewritten")));
         assert_eq!(res["panel"]["revision"], 3);
-        // So does a card the whole update removed: the edit then names a card that is gone.
+        // One lands after the edit was made and staged, before it commits: it is made again.
+        let mut raced = 0;
+        let held = set(id, json!([{"path": "prs[number=227].status", "value": "held"}]));
+        update_from(&hub, 1, get(&hub, id).unwrap(), held, &mut || {
+            if raced == 0 { update(&hub, 1, whole(id, retitled(&hub, id, "Docs, again"))).unwrap(); }
+            raced += 1;
+        }).unwrap();
+        assert_eq!(raced, 2, "made twice");
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"]["prs"][0]["status"], &res["data"]["prs"][1]["status"], &res["data"]["prs"][2]["title"]),
+            (&json!("merged"), &json!("held"), &json!("Docs, again")));
+        assert_eq!(res["panel"]["revision"], 5);
+        // A title-only update between keeps the data revision: no need to make it again.
+        let mut raced = 0;
+        update_from(&hub, 1, get(&hub, id).unwrap(), set(id, json!([{"path": "current", "value": 230}])), &mut || {
+            if raced == 0 { update(&hub, 1, Update { set: None, panel_id: id, title: Some("Open PRs".into()), data: None, html: None, html_path: None, kit: None }).unwrap(); }
+            raced += 1;
+        }).unwrap();
+        assert_eq!(raced, 1);
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"]["current"], &res["panel"]["title"]), (&json!(230), &json!("Open PRs")));
+        // Data that keeps changing ends in a refusal after a few tries, never a lost update.
+        let mut n = 0;
+        let e = update_from(&hub, 1, get(&hub, id).unwrap(), merged(), &mut || {
+            n += 1;
+            update(&hub, 1, whole(id, retitled(&hub, id, &format!("Docs {n}")))).unwrap();
+        }).unwrap_err();
+        assert!(e.is::<DataMoved>() && n == SET_TRIES, "{e} after {n}");
+        assert_eq!(resource(&hub, id).unwrap()["data"]["prs"][2]["title"], format!("Docs {SET_TRIES}"));
+        // A card the update removed: the edit, made again, names a card that is gone.
         let stale = get(&hub, id).unwrap();
-        update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(json!({"repo": "acme/api", "prs": []})), html: None, html_path: None, kit: None }).unwrap();
-        let e = format!("{:#}", update_from(&hub, 1, stale, set(id, json!([{"path": "prs[number=226].status", "value": "held"}]))).unwrap_err());
+        update(&hub, 1, whole(id, json!({"repo": "acme/api", "prs": []}))).unwrap();
+        let e = format!("{:#}", update_from(&hub, 1, stale, merged(), &mut || {}).unwrap_err());
         assert!(e.contains("no item of `prs` has number=226"), "{e}");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn quoted_selector_values_are_json_strings() {
+        assert_eq!(parse_path(r#"rows[id="a]b"].state"#).unwrap(),
+            [Step::Key("rows".into()), Step::Match("id".into(), "a]b".into()), Step::Key("state".into())]);
+        assert_eq!(parse_path(r#"rows[ id = "a\"b.c" ][0]"#).unwrap(),
+            [Step::Key("rows".into()), Step::Match("id".into(), "a\"b.c".into()), Step::Index(0)]);
+        assert_eq!(parse_path(r#"rows[id=""]"#).unwrap()[1], Step::Match("id".into(), "".into()));
+        for (bad, says) in [(r#"rows[id="a]"#, "never closed"), (r#"rows[id="a\"]"#, "never closed"), (r#"rows[id=a"b"]"#, "quote the whole value"),
+            (r#"rows[id="a"b]"#, "expected `]`"), (r#"rows[id="\x"]"#, "JSON string"), (r#"ro"ws.x"#, "field name"), (r#"rows["id"=1]"#, "a field and a value")] {
+            let e = format!("{:#}", parse_path(bad).unwrap_err());
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        let hub = fixture();
+        let id = open(&hub, 1, Open { title: "T".into(), app: "table".into(), data: Some(json!({"columns": [{"key": "id"}, {"key": "state"}],
+            "rows": [{"id": "a]b", "state": "x"}, {"id": "a\"b", "state": "x"}, {"id": "a\\\"b", "state": "x"}]})),
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
+        update(&hub, 1, set(id, json!([{"path": r#"rows[id="a]b"].state"#, "value": "one"}, {"path": r#"rows[id="a\"b"].state"#, "value": "two"}]))).unwrap();
+        let rows = resource(&hub, id).unwrap()["data"]["rows"].clone();
+        assert_eq!([&rows[0]["state"], &rows[1]["state"], &rows[2]["state"]], [&json!("one"), &json!("two"), &json!("x")], "the escape is decoded, not matched literally");
+        let e = format!("{:#}", update(&hub, 1, set(id, json!([{"path": r#"rows[id="a]c"].state"#, "value": 1}]))).unwrap_err());
+        assert!(e.contains(r#"no item of `rows` has id="a]c""#), "{e}");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn data_nested_too_deep_to_read_back_is_refused_and_the_panel_stays_readable() {
+        let hub = fixture();
+        let id = markdown(&hub);
+        let mut deep = json!("bottom");
+        for _ in 0..130 { deep = json!([deep]); }
+        let e = format!("{:#}", update(&hub, 1, set(id, json!([{"path": "deep", "value": deep.clone()}]))).unwrap_err());
+        assert!(e.contains("nested"), "{e}");
+        assert!(update(&hub, 1, whole(id, json!({"markdown": "# x", "deep": deep.clone()}))).is_err(), "a whole update too");
+        let mut opening = Open { title: "Deep".into(), app: "markdown".into(), data: Some(json!({"deep": deep})), html: None, html_path: None, csp: None, kit: None, notify_on_close: None };
+        assert!(open(&hub, 1, opening).is_err(), "and an open");
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"], &res["panel"]["revision"]), (&json!({"markdown": "# Hello"}), &json!(1)));
+        // Below the limit it is stored, read back and edited again.
+        let mut fine = json!("bottom");
+        for _ in 0..100 { fine = json!([fine]); }
+        update(&hub, 1, set(id, json!([{"path": "deep", "value": fine.clone()}]))).unwrap();
+        update(&hub, 1, set(id, json!([{"path": "markdown", "value": "# y"}]))).unwrap();
+        assert_eq!(resource(&hub, id).unwrap()["data"]["deep"], fine);
+        opening = Open { title: "Ok".into(), app: "markdown".into(), data: Some(json!({"deep": fine.clone()})), html: None, html_path: None, csp: None, kit: None, notify_on_close: None };
+        open(&hub, 1, opening).unwrap();
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn apps_storing_more_than_the_input_refuse_set_and_keep_everything() {
+        let hub = fixture();
+        hub.panels.port.store(40001, Ordering::Relaxed);
+        let pr = json!({"repo":"acme/api","number":812,"title":"T","author":"dana","url":"https://github.com/acme/api/pull/812",
+            "base":"master","head":"dana/x","head_sha":"0123456789abcdef0123456789abcdef01234567","summary":"S",
+            "risk":{"level":"low"},"checks":{"state":"passing","items":[{"name":"t","state":"pass"}]},
+            "changes":[{"file":"a","note":"n","diff":"+x"}]});
+        for (app, data, path) in [("image", json!({"url": "https://img.example/a.png"}), "caption"), ("pr_decision", pr, "summary"),
+            ("web_preview", json!({"url": "http://localhost:5173"}), "url")] {
+            let id = open(&hub, 1, Open { title: "Before".into(), app: app.into(), data: Some(data), html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
+            let before = resource(&hub, id).unwrap();
+            let mut edit = set(id, json!([{"path": path, "value": "x"}]));
+            edit.title = Some("After".into());
+            let e = update(&hub, 1, edit).unwrap_err().to_string();
+            assert!(e.contains(&format!("{app} panels take the whole data")), "{e}");
+            assert_eq!(resource(&hub, id).unwrap(), before, "{app}: data, title and revision unchanged");
+        }
         archive(&hub, 1).unwrap();
     }
 }

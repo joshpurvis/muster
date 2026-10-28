@@ -110,7 +110,7 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 | Tool | Arguments | Result |
 |---|---|---|
 | `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)), `notify_on_close?` (see below) | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
-| `panel_update` | `panel_id`, `data?` (replaces the whole input), `html?`, `html_path?`, `title?`, `kit?` (custom only; switching it reloads the app) | `{note?}`; advances the revision |
+| `panel_update` | `panel_id`, `data?` (replaces the whole input) or `set?` (edits to it, see [Changing part of the data](#changing-part-of-the-data-set)), `html?`, `html_path?`, `title?`, `kit?` (custom only; switching it reloads the app) | `{note?, added?}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
 | `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
 | `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], remaining, timed_out}`; consumes the returned events |
@@ -124,6 +124,36 @@ closing one frees its slot and deletes its HTML and data. Open/update share the 
 limit. `csp` uses MCP Apps fields (`resourceDomains`, `connectDomains`, `frameDomains`,
 `baseUriDomains`): declared asset origins work, fetching and nested frames stay blocked.
 Only loopback HTTP frame declarations are accepted; base URI overrides are refused.
+
+### Changing part of the data (`set`)
+
+`panel_update {panel_id, set: [{path, value}, ...]}` changes part of the stored data without
+sending all of it, so marking one card of a long `pr_overview` merged is one short call:
+
+```json
+{"panel_id": 7, "set": [{"path": "prs[number=226].status", "value": "merged"},
+                        {"path": "prs[number=226].status_detail", "value": "Merged at 14:02"}]}
+```
+
+- A path is field names joined by `.`, each optionally followed by `[field=value]` (the one
+  list item whose `field` is that string, number or boolean) or `[index]` (from 0). Pick items
+  by a unique field such as a PR's `number`. A value may be quoted as a JSON string, and must
+  be when it holds `]` or `"`: `rows[id="a]b"]`, `rows[id="say \"hi\""]`.
+- `value` (any JSON, `null` included) replaces what the path names. Every step must exist,
+  except a final field name, which may be new: the result then lists that path in `added`, so
+  a misspelt field (which the app would ignore) does not pass unnoticed.
+- 1 to 50 edits, applied in order, all or none; each path at most 300 bytes and 16 steps. `set`
+  and `data` cannot be combined.
+- The edits are made on the stored data and commit only if no other data update landed
+  since; otherwise they are made again on the newer data (up to 8 times, then the call is
+  refused with "try again"), so an update is never overwritten. The result is checked as a
+  whole `data` would be, so `set` can never store what `data` would refuse. Panel data is
+  nested at most about 120 levels deep, `set` or not.
+- A refusal names the edit and its path: ``set[1] `prs[number=999].status`: no item of `prs`
+  has number=999``, or ``2 items of `prs` have author=dana``.
+- Not for `image`, `pr_decision` or `web_preview`: they store files read from the worktree or
+  a checked address, so they take the whole `data`.
+- The app receives the full new data, exactly as after a whole update.
 
 A custom app is an MCP Apps (2026-01-26) page talking JSON-RPC to its parent frame. Until it
 calls `ui/initialize` and then sends `ui/notifications/initialized`, the panel shows

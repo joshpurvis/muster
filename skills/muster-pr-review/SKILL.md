@@ -102,8 +102,8 @@ file with your file tool, never with echo or printf in the shell.
    risk: {level, reasons}, checks: {state, items: [{name, state, url}]}, reviews: {decision,
    items: [{author, state}]}, changes: [{file, note, diff}], rest_note, questions?, media?,
    actions?}` (Muster's docs/MCP.md, "Built-in apps"; Media below). A refused `panel_open` or
-   `panel_update` names the bad field: fix it and call again. `panel_update` replaces the
-   whole data, so always send every field.
+   `panel_update` names the bad field: fix it and call again. A pr_decision's `panel_update`
+   replaces the whole data, so always send every field (only the overview takes `set`).
 4. Loop on `wait_for_panel_event {panel_id}`: handle each returned event in order, call it
    again at once while `remaining > 0`, and again after a timeout. If you were not waiting,
    events arrive as a prompt headed `[panel "PR #<n>" #<panel_id>]` with one JSON event per
@@ -221,8 +221,13 @@ current checkout's `origin`):
    the title, labels, size and, only if unclear, its file paths
    (`gh pr view <n> --repo R --json files --jq '[.files[].path]'`). Keep it short.
 3. `panel_open` app `pr_overview`, title `Open PRs`, data `{repo: R, prs: [...each with risk,
-   summary, status: "new"], actions?}`. Keep this data yourself: every `panel_update` of the
-   overview sends all of it again.
+   summary, status: "new"], actions?}`. Keep this data yourself. To change cards (status,
+   `status_detail`, summary, risk, verdict, a quick win's fields) or `current`, send only the
+   change: `panel_update {panel_id, set: [{path: "prs[number=226].status", value: "merged"},
+   {path: "prs[number=226].status_detail", value: "Merged by squash"}]}`, always picking the
+   card by `[number=N]`, never by position. Send the whole `data` only when the set of PRs
+   changes (a new list from step 1). The result's `added` lists paths that created a field the
+   card did not have yet; if one is misspelt, fix it with another `set`.
 4. Loop on `wait_for_panel_event {}` with no `panel_id`, so events from the overview and from
    a decision panel all reach you; tell them apart by `panel_id`. Same rules as step 4 of the
    snapshot review. Keep a queue of PRs to review and at most one decision panel open, and

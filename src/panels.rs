@@ -68,7 +68,171 @@ pub struct Update {
     pub html_path: Option<String>,
     /// Switch the kit on or off for a custom app (the app reloads).
     pub kit: Option<bool>,
+    /// Edits to the stored data instead of a whole new `data` (see [`parse_path`]).
+    pub set: Option<Vec<SetOp>>,
 }
+
+/// One `panel_update` `set` edit: `value` replaces what `path` names in the stored data.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetOp { pub path: String, pub value: Value }
+
+/// At most this many `set` edits in one update, each path at most [`MAX_PATH`] bytes and
+/// [`MAX_STEPS`] steps; the result is bounded by the app's own 1 MiB data limit.
+pub const MAX_SET: usize = 50;
+const MAX_PATH: usize = 300;
+const MAX_STEPS: usize = 16;
+
+/// Apps whose stored data is the agent's input as given, so an edited copy can be checked
+/// again as a whole update would be. image and pr_decision store pictures read from the
+/// worktree in place of their paths, and a web preview's address is checked against live ports.
+fn settable(app: &str) -> bool { !matches!(app, "image" | "pr_decision" | "web_preview") }
+
+#[derive(Debug, PartialEq)]
+enum Step { Key(String), Index(usize), Match(String, String) }
+
+/// A `set` path: field names joined by `.`, each followed by any number of `[i]` (a list
+/// index) or `[field=value]` (the one list item whose `field` is that string, number or
+/// boolean), as in `prs[number=226].status`. A model names a card by what it knows of it,
+/// never by a position it has to count. A value holding `]` or `"` is quoted as a JSON string.
+fn parse_path(path: &str) -> anyhow::Result<Vec<Step>> {
+    ensure!(!path.is_empty() && path.len() <= MAX_PATH, "a path must be 1 to {MAX_PATH} bytes");
+    let mut steps = Vec::new();
+    let mut rest = path;
+    loop {
+        let end = rest.find(['.', '[']).unwrap_or(rest.len());
+        let key = &rest[..end];
+        ensure!(!key.is_empty() && !key.contains([']', '=', '"']), "expected a field name at `{rest}`");
+        steps.push(Step::Key(key.into()));
+        rest = &rest[end..];
+        while let Some(inner) = rest.strip_prefix('[') {
+            let (step, after) = selector(inner)?;
+            steps.push(step);
+            rest = after;
+        }
+        if rest.is_empty() { break }
+        rest = rest.strip_prefix('.').with_context(|| format!("expected `.` or `[` at `{rest}`"))?;
+    }
+    ensure!(steps.len() <= MAX_STEPS, "a path has at most {MAX_STEPS} steps");
+    Ok(steps)
+}
+
+/// One `[...]`, from just after its `[`: the step and the text after its `]`. A quoted value
+/// is read as a JSON string (escapes decoded), so it may hold `]`, `.` or `\"`.
+fn selector(s: &str) -> anyhow::Result<(Step, &str)> {
+    let stop = s.find([']', '=', '"']).context("a `[` is never closed")?;
+    let field = s[..stop].trim();
+    if s.as_bytes()[stop] == b']' {
+        let i = field.parse().with_context(|| format!("`[{field}]` must be an index such as [0] or a match such as [number=226]"))?;
+        return Ok((Step::Index(i), &s[stop + 1..]))
+    }
+    ensure!(s.as_bytes()[stop] == b'=' && !field.is_empty(), "a `[` needs an index such as [0] or a field and a value, as in [number=226]");
+    let rest = s[stop + 1..].trim_start();
+    let (value, rest) = if rest.starts_with('"') {
+        // Quote and backslash are ASCII, so a byte scan never splits a character.
+        let (bytes, mut i) = (rest.as_bytes(), 1);
+        loop {
+            match bytes.get(i) {
+                None => anyhow::bail!("a quoted value is never closed"),
+                Some(b'\\') => i += 2,
+                Some(b'"') => break,
+                Some(_) => i += 1,
+            }
+        }
+        let value: String = serde_json::from_str(&rest[..=i]).context("a quoted value must be a JSON string")?;
+        (value, &rest[i + 1..])
+    } else {
+        let end = rest.find([']', '"']).context("a `[` is never closed")?;
+        ensure!(rest.as_bytes()[end] == b']', "quote the whole value, as in [id=\"a]b\"]");
+        let value = rest[..end].trim();
+        ensure!(!value.is_empty(), "`[{field}=]` needs a value, as in [number=226]");
+        (value.to_string(), &rest[end..])
+    };
+    let rest = rest.trim_start().strip_prefix(']').context("expected `]` after a quoted value")?;
+    Ok((Step::Match(field.into(), value), rest))
+}
+
+/// A selector's value as a path would spell it: quoted when it holds anything but plain text.
+fn shown(value: &str) -> String {
+    if value.is_empty() || value.trim() != value || value.contains([']', '"', '\\']) { json!(value).to_string() } else { value.to_string() }
+}
+
+/// The value `step` names inside `here`, which must already exist; `at` is the path so far.
+fn descend<'a>(here: &'a mut Value, step: &Step, at: &str) -> anyhow::Result<&'a mut Value> {
+    let at = if at.is_empty() { "the data".to_string() } else { format!("`{at}`") };
+    match step {
+        Step::Key(k) => here.as_object_mut().with_context(|| format!("{at} is not an object"))?
+            .get_mut(k).with_context(|| format!("{at} has no field `{k}`")),
+        Step::Index(i) => {
+            let list = here.as_array_mut().with_context(|| format!("{at} is not a list"))?;
+            let len = list.len();
+            list.get_mut(*i).with_context(|| format!("{at} has {len} items, so no [{i}]"))
+        }
+        Step::Match(field, value) => {
+            let list = here.as_array_mut().with_context(|| format!("{at} is not a list"))?;
+            let hit = |item: &Value| match item.get(field) {
+                Some(Value::String(s)) => s == value,
+                Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string() == *value,
+                _ => false,
+            };
+            let hits: Vec<usize> = list.iter().enumerate().filter(|(_, item)| hit(item)).map(|(i, _)| i).collect();
+            let value = shown(value);
+            match hits[..] {
+                [i] => Ok(&mut list[i]),
+                [] => anyhow::bail!("no item of {at} has {field}={value}"),
+                _ => anyhow::bail!("{} items of {at} have {field}={value}; match on a field that is unique", hits.len()),
+            }
+        }
+    }
+}
+
+/// A parsed `set` edit: its path as given, the path's steps, and the new value.
+type Edit = (String, Vec<Step>, Value);
+
+/// Apply parsed `set` edits in order to `data`. Every step but the last must exist; a last
+/// field name may be new (a card gaining a `status_detail`), and such paths are returned so
+/// a misspelt field, which an app ignores, does not pass silently.
+fn apply_set(data: &mut Value, edits: &[Edit]) -> anyhow::Result<Vec<String>> {
+    let mut added = Vec::new();
+    for (i, (path, steps, value)) in edits.iter().enumerate() {
+        let mut edit = || -> anyhow::Result<bool> {
+            let (last, parents) = steps.split_last().context("empty path")?;
+            let mut here = &mut *data;
+            let mut at = String::new();
+            for step in parents {
+                here = descend(here, step, &at)?;
+                match step {
+                    Step::Key(k) if at.is_empty() => at.push_str(k),
+                    Step::Key(k) => { at.push('.'); at.push_str(k) }
+                    Step::Index(n) => at.push_str(&format!("[{n}]")),
+                    Step::Match(f, v) => at.push_str(&format!("[{f}={}]", shown(v))),
+                }
+            }
+            if let Step::Key(k) = last {
+                let what = if at.is_empty() { "the data".to_string() } else { format!("`{at}`") };
+                let o = here.as_object_mut().with_context(|| format!("{what} is not an object"))?;
+                return Ok(o.insert(k.clone(), value.clone()).is_none());
+            }
+            *descend(here, last, &at)? = value.clone();
+            Ok(false)
+        };
+        if edit().with_context(|| format!("set[{i}] `{path}`"))? { added.push(path.clone()); }
+    }
+    Ok(added)
+}
+
+/// Attempts at a `set` edit while other data updates keep committing in between.
+const SET_TRIES: usize = 8;
+
+/// The data a `set` edit was made on changed before it could commit (it is made again).
+#[derive(Debug)]
+struct DataMoved;
+impl std::fmt::Display for DataMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("the panel's data kept changing while this set was made; try again")
+    }
+}
+impl std::error::Error for DataMoved {}
 
 /// `kit` is for custom apps: the built-ins already draw with it.
 fn check_kit(app: &str, kit: Option<bool>) -> anyhow::Result<()> {
@@ -152,9 +316,14 @@ fn input_html(cwd: &Path, inline: Option<String>, path: Option<String>) -> anyho
 pub fn own_ports(hub: &Hub) -> [u16; 2] { [hub.port(), hub.panels.port.load(Ordering::Relaxed)] }
 
 /// The stored input for `app` (a web preview's URL is checked against Muster's own ports).
+/// The bytes are read back as [`resource`] and a `set` will read them, so nothing is stored
+/// that those refuse (JSON nested past serde_json's 128 levels, which a `set` deep inside the
+/// data can build from parts that each passed).
 fn app_data(hub: &Hub, app: &str, cwd: &Path, data: Value, csp: &mut PanelCsp, opening: bool) -> anyhow::Result<Vec<u8>> {
-    if app == "web_preview" { return crate::web_preview::data(data, &own_ports(hub)) }
-    crate::panel_apps::data(app, cwd, data, csp, opening)
+    let bytes = if app == "web_preview" { crate::web_preview::data(data, &own_ports(hub))? }
+        else { crate::panel_apps::data(app, cwd, data, csp, opening)? };
+    serde_json::from_slice::<Value>(&bytes).map_err(|e| anyhow::anyhow!("panel data must be readable JSON nested at most about 120 levels deep ({e})"))?;
+    Ok(bytes)
 }
 
 pub(crate) fn data_bytes(data: &Value) -> anyhow::Result<Vec<u8>> {
@@ -260,9 +429,16 @@ pub fn open(hub: &Hub, session: SessionId, args: Open) -> anyhow::Result<PanelId
     }
 }
 
-pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()> {
-    // Read and stage everything without the lock; the lock only renames and commits.
+/// Returns the `set` paths that added a field (see [`apply_set`]).
+pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<Vec<String>> {
     let seen = own(hub, session, args.panel_id)?;
+    update_from(hub, session, seen, args, &mut || {})
+}
+
+/// [`update`] given `seen`, the panel as read first (a test passes a stale one). `between`
+/// runs after a `set` is staged and before it commits (a test races another update there).
+fn update_from(hub: &Hub, session: SessionId, mut seen: Panel, args: Update, between: &mut dyn FnMut()) -> anyhow::Result<Vec<String>> {
+    // Read and stage everything without the lock; the lock only renames and commits.
     ensure!(!seen.closed, "panel is closed");
     let (_, ch) = caller(hub, session)?;
     let html = input_html(Path::new(&ch.cwd), args.html, args.html_path)?;
@@ -271,13 +447,61 @@ pub fn update(hub: &Hub, session: SessionId, args: Update) -> anyhow::Result<()>
     // Whether the kit really changes is decided under the lock, against the panel as it is then.
     let kit = args.kit;
     let title = args.title.as_deref().map(title).transpose()?;
-    let data = args.data.map(|d| app_data(hub, &seen.app, Path::new(&ch.cwd), d, &mut seen.csp.clone(), false)).transpose()?;
-    let id = args.panel_id;
-    commit(hub, &seen, title, html, data, kit, || {
+    let cwd = Path::new(&ch.cwd);
+    let (id, channel) = (args.panel_id, ch.id);
+    // `based_on`: the data revision a `set` was made on, refused under the lock if it moved.
+    let recheck = |based_on: Option<i64>| move || {
         let p = own(hub, session, id)?;
-        caller_in(hub, session, ch.id)?;
+        caller_in(hub, session, channel)?;
+        if based_on.is_some_and(|r| r != p.data_revision) { return Err(DataMoved.into()) }
         Ok(p)
-    }, |_, p| hub.store().save_panel(p))
+    };
+    let save = |_: &Panel, p: &mut Panel| hub.store().save_panel(p);
+    let edits = match (args.data, args.set) {
+        (Some(_), Some(_)) => anyhow::bail!("give data (the whole input) or set (edits to it), not both"),
+        (Some(d), None) => {
+            let data = app_data(hub, &seen.app, cwd, d, &mut seen.csp.clone(), false)?;
+            return commit(hub, &seen, title, html, Some(data), kit, recheck(None), save).map(|()| Vec::new())
+        }
+        (None, None) => return commit(hub, &seen, title, html, None, kit, recheck(None), save).map(|()| Vec::new()),
+        (None, Some(ops)) => {
+            ensure!(settable(&seen.app), "{} panels take the whole data, not set", seen.app);
+            ensure!(!ops.is_empty() && ops.len() <= MAX_SET, "set takes 1 to {MAX_SET} edits");
+            ops.into_iter().enumerate().map(|(i, op)| {
+                let steps = parse_path(&op.path).with_context(|| format!("set[{i}] `{}`", op.path))?;
+                Ok((op.path, steps, op.value))
+            }).collect::<anyhow::Result<Vec<Edit>>>()?
+        }
+    };
+    // Like a whole update, the edit is made, checked and staged outside the lock, on the data
+    // committed when it was read; it commits only if no other data update landed since, and is
+    // otherwise made again on the newer data, so no update is ever lost.
+    for _ in 0..SET_TRIES {
+        let current = match std::fs::read(data_file(hub, &seen)) {
+            Ok(bytes) => bytes,
+            // A newer update replaced the file since `seen` was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                seen = own(hub, session, id)?;
+                ensure!(!seen.closed, "panel is closed");
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut current: Value = serde_json::from_slice(&current)?;
+        let added = apply_set(&mut current, &edits)?;
+        // Checked as a whole update is, so an edit never stores what `data` would refuse.
+        let data = app_data(hub, &seen.app, cwd, current, &mut seen.csp.clone(), false)?;
+        between();
+        match commit(hub, &seen, title.clone(), html.clone(), Some(data), kit, recheck(Some(seen.data_revision)), save) {
+            Ok(()) => return Ok(added),
+            Err(e) if e.is::<DataMoved>() => {
+                seen = own(hub, session, id)?;
+                ensure!(!seen.closed, "panel is closed");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(DataMoved.into())
 }
 
 /// Stage files without the lock, then rename and commit under it. `recheck` runs under the
@@ -714,8 +938,11 @@ pub async fn tool(hub: &Arc<Hub>, session: SessionId, name: &str, args: Value) -
         "panel_update" => {
             let args: Update = serde_json::from_value(args)?;
             let (id, new_data) = (args.panel_id, args.data.is_some());
-            update(hub, session, args)?;
-            Ok(if new_data { with_preview_note(hub, id, json!({})).await } else { json!({}) })
+            let added = update(hub, session, args)?;
+            let result = if added.is_empty() { json!({}) } else {
+                json!({"added": added, "note": "these set paths created a field that was not there yet; a misspelt one is ignored by the app, so fix it with another set"})
+            };
+            Ok(if new_data { with_preview_note(hub, id, result).await } else { result })
         },
         "panel_close" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { panel_id: PanelId }
@@ -783,7 +1010,7 @@ mod tests {
         for file in ["app-1.html", "data-1.json"] {
             assert_eq!(std::fs::metadata(dir(&hub, id).join(file)).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# New"})), title: Some("Changed".into()), html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, data: Some(json!({"markdown":"# New"})), title: Some("Changed".into()), html: None, html_path: None, kit: None }).unwrap();
         let res = resource(&hub, id).unwrap();
         assert_eq!(res["panel"]["revision"], 2);
         assert_eq!(res["panel"]["html_revision"], 1);
@@ -801,7 +1028,7 @@ mod tests {
         let hub = fixture();
         let id = open(&hub, 1, Open { title:"Custom".into(), app:"custom".into(), data:None, html:Some("a".into()), html_path:None, csp:None, kit: None, notify_on_close: None }).unwrap();
         for (html, expected) in [("a", 1), ("b", 3)] {
-            update(&hub, 1, Update { panel_id:id, title:None, data:None, html:Some(html.into()), html_path:None, kit: None }).unwrap();
+            update(&hub, 1, Update { set: None, panel_id:id, title:None, data:None, html:Some(html.into()), html_path:None, kit: None }).unwrap();
             assert_eq!(get(&hub, id).unwrap().html_revision, expected);
         }
         archive(&hub, 1).unwrap();
@@ -826,16 +1053,16 @@ mod tests {
         assert!(resource(&hub, id).unwrap()["html"].as_str().unwrap().len() > MAX_FILE, "the kit is added after the size check");
         // Switching the kit reloads the app (a new HTML revision) with the same HTML.
         let before = get(&hub, plain).unwrap().html_revision;
-        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
         let p = get(&hub, plain).unwrap();
         assert!(p.kit && p.html_revision > before);
         assert!(resource(&hub, plain).unwrap()["html"].as_str().unwrap().starts_with("<style>"));
         // The same value again changes nothing.
-        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: plain, title: None, data: None, html: None, html_path: None, kit: Some(true) }).unwrap();
         assert_eq!(get(&hub, plain).unwrap().html_revision, p.html_revision);
         // A kit switch read before a concurrent HTML update commits keeps that newer HTML.
         let stale = get(&hub, plain).unwrap();
-        update(&hub, 1, Update { panel_id: plain, title: None, data: None, html: Some("<p>newer</p>".into()), html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: plain, title: None, data: None, html: Some("<p>newer</p>".into()), html_path: None, kit: None }).unwrap();
         commit(&hub, &stale, None, None, None, Some(false), || get(&hub, plain), |_, p| hub.store().save_panel(p)).unwrap();
         let p = get(&hub, plain).unwrap();
         assert!(!p.kit && p.html_revision == p.revision);
@@ -878,7 +1105,7 @@ mod tests {
         let id = markdown(&hub);
         assert!(close(&hub, Some(2), id, false).unwrap_err().to_string().contains("another task"));
         assert!(wait(&hub, 2, Some(id), 0).await.unwrap_err().to_string().contains("another task"));
-        assert!(update(&hub, 2, Update { panel_id:id, title:None, data:Some(json!({})), html:None, html_path:None, kit:None }).is_err());
+        assert!(update(&hub, 2, Update { set: None, panel_id:id, title:None, data:Some(json!({})), html:None, html_path:None, kit:None }).is_err());
         context(&hub, id, json!({"structuredContent":{"selected":2}})).unwrap();
         event(&hub, id, "approve".into(), json!({"hunk":2})).unwrap();
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
@@ -993,18 +1220,18 @@ mod tests {
         let mut with_html = preview("http://localhost:5173");
         with_html.html = Some("<p>x</p>".into());
         assert!(open(&hub, 1, with_html).is_err(), "a web preview takes no HTML");
-        update(&hub, 1, Update { panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, title: Some("Renamed".into()), data: None, html: None, html_path: None, kit: None }).unwrap();
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (2, 1), "a title-only update keeps the data revision (no page reload)");
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:8000/docs"})), html: None, html_path: None, kit: None }).unwrap();
         let p = get(&hub, id).unwrap();
         assert_eq!((p.revision, p.data_revision), (3, 3), "a data update advances it");
         assert_eq!(resource(&hub, id).unwrap()["data"]["url"], "http://127.0.0.1:8000/docs");
-        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None, kit: None }).is_err());
-        assert!(update(&hub, 1, Update { panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None, kit: None }).is_err());
+        assert!(update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(json!({"url": "https://example.com"})), html: None, html_path: None, kit: None }).is_err());
+        assert!(update(&hub, 1, Update { set: None, panel_id: id, title: None, data: None, html: Some("x".into()), html_path: None, kit: None }).is_err());
         // Nothing listens on the stored port (bound and released): the agent gets a note.
         let free = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": format!("http://127.0.0.1:{free}/")})), html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(json!({"url": format!("http://127.0.0.1:{free}/")})), html: None, html_path: None, kit: None }).unwrap();
         let out = with_preview_note(&hub, id, json!({"panel_id": id})).await;
         assert!(out["note"].as_str().unwrap().contains("Nothing answers"), "{out}");
         assert!(with_preview_note(&hub, markdown(&hub), json!({})).await.get("note").is_none());
@@ -1039,7 +1266,7 @@ mod tests {
         let md = markdown(&hub);
         assert!(navigate(&hub, md, "3000").unwrap_err().to_string().contains("only a web preview"));
         // `previous` is what was stored at commit time, agent updates included.
-        update(&hub, 1, Update { panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:4000/"})), html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(json!({"url": "http://127.0.0.1:4000/"})), html: None, html_path: None, kit: None }).unwrap();
         navigate(&hub, id, "4001").unwrap();
         let out = wait(&hub, 1, Some(id), 0).await.unwrap();
         assert_eq!(out["events"][0]["payload"], json!({"url": "http://localhost:4001/", "previous": "http://127.0.0.1:4000/"}));
@@ -1158,7 +1385,7 @@ mod tests {
     fn startup_sweeps_stale_files_and_spent_closed_panels() {
         let hub = fixture();
         let id = markdown(&hub);
-        update(&hub, 1, Update { panel_id: id, data: Some(json!({"markdown":"# 2"})), title: None, html: None, html_path: None, kit: None }).unwrap();
+        update(&hub, 1, Update { set: None, panel_id: id, data: Some(json!({"markdown":"# 2"})), title: None, html: None, html_path: None, kit: None }).unwrap();
         let folder = dir(&hub, id);
         for junk in ["data-1.tmp4242", "stage-0123456789abcdef", "app-9.html"] { std::fs::write(folder.join(junk), "x").unwrap(); }
         let root = hub.store().panels_root();
@@ -1270,6 +1497,223 @@ mod tests {
         assert!(get(&hub, recent).is_ok(), "a recent close notice waits for the agent");
         assert!(get(&hub, old).is_err(), "an old one nothing asked for is forgotten");
         assert!(get(&hub, old_real).is_ok(), "a closed panel with a real event stays, however old");
+        archive(&hub, 1).unwrap();
+    }
+
+    fn overview(hub: &Hub) -> PanelId {
+        open(hub, 1, Open { title: "PRs".into(), app: "pr_overview".into(), data: Some(json!({"repo": "acme/api", "prs": [
+            {"number": 226, "title": "Fix login", "author": "dana", "summary": "S", "status": "new"},
+            {"number": 227, "title": "Add export", "author": "dana", "status": "new"},
+            {"number": 230, "title": "Docs", "author": "lee", "status": "new"}]})),
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap()
+    }
+
+    fn set(id: PanelId, edits: Value) -> Update {
+        Update { set: Some(serde_json::from_value(edits).unwrap()), panel_id: id, title: None, data: None, html: None, html_path: None, kit: None }
+    }
+
+    #[test]
+    fn set_changes_one_card_by_its_number_and_reports_new_fields() {
+        let hub = fixture();
+        let id = overview(&hub);
+        let added = update(&hub, 1, set(id, json!([{"path": "prs[number=226].status", "value": "merged"},
+            {"path": "prs[number=226].status_detail", "value": "Merged by the owner"},
+            {"path": "prs[author=lee].summary", "value": "Typos only"},
+            {"path": "prs[1].status", "value": "reviewing"}, {"path": "current", "value": 227}]))).unwrap();
+        assert_eq!(added, ["prs[number=226].status_detail", "prs[author=lee].summary", "current"]);
+        let res = resource(&hub, id).unwrap();
+        let prs = &res["data"]["prs"];
+        assert_eq!((&prs[0]["status"], &prs[0]["status_detail"], &prs[0]["summary"]), (&json!("merged"), &json!("Merged by the owner"), &json!("S")));
+        assert_eq!((&prs[1]["status"], &prs[2]["summary"], &res["data"]["current"]), (&json!("reviewing"), &json!("Typos only"), &json!(227)));
+        assert_eq!(prs[2]["title"], "Docs");
+        // The app gets it as after a whole update: a new revision of the data, the same HTML.
+        assert_eq!((res["panel"]["revision"].as_i64(), res["panel"]["data_revision"].as_i64(), res["panel"]["html_revision"].as_i64()), (Some(2), Some(2), Some(1)));
+        assert!(!dir(&hub, id).join("data-1.json").exists());
+        // A quoted value and a string match on a number field work too.
+        update(&hub, 1, set(id, json!([{"path": "prs[number=\"230\"].status", "value": "held"}]))).unwrap();
+        assert_eq!(resource(&hub, id).unwrap()["data"]["prs"][2]["status"], "held");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_tool_takes_set_and_lists_paths_that_added_a_field() {
+        let hub = fixture();
+        let id = overview(&hub);
+        let call = |set: Value| tool(&hub, 1, "panel_update", json!({"panel_id": id, "set": set}));
+        assert_eq!(call(json!([{"path": "prs[number=227].status", "value": "merged"}])).await.unwrap(), json!({}));
+        let typo = call(json!([{"path": "prs[number=227].stauts", "value": "merged"}])).await.unwrap();
+        assert_eq!(typo["added"], json!(["prs[number=227].stauts"]));
+        assert!(typo["note"].as_str().unwrap().contains("misspelt"));
+        assert_eq!(resource(&hub, id).unwrap()["data"]["prs"][1]["status"], "merged");
+        assert!(call(json!([{"path": "prs[number=227].status"}])).await.is_err(), "a value is required");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn set_refuses_bad_paths_and_results_naming_the_path_and_changes_nothing() {
+        let hub = fixture();
+        let id = overview(&hub);
+        let before = resource(&hub, id).unwrap();
+        let refuse = |edits: Value, says: &str| {
+            let e = format!("{:#}", update(&hub, 1, set(id, edits)).unwrap_err());
+            assert!(e.contains(says), "{e}");
+        };
+        let ok = json!({"path": "prs[number=226].status", "value": "merged"});
+        // A good edit before a bad one is not kept: all or none.
+        refuse(json!([ok.clone(), {"path": "prs[number=999].status", "value": "merged"}]),
+            "set[1] `prs[number=999].status`: no item of `prs` has number=999");
+        refuse(json!([{"path": "prs[author=dana].status", "value": "merged"}]), "2 items of `prs` have author=dana");
+        refuse(json!([{"path": "prs[number=226].checks.state", "value": "x"}]), "`prs[number=226]` has no field `checks`");
+        refuse(json!([{"path": "prs[7].status", "value": "x"}]), "`prs` has 3 items, so no [7]");
+        refuse(json!([{"path": "repo[0]", "value": "x"}]), "`repo` is not a list");
+        refuse(json!([{"path": "prs.status", "value": "x"}]), "`prs` is not an object");
+        for (path, says) in [("prs[number=226", "never closed"), ("prs..status", "expected a field name"), ("prs[x]", "must be an index"),
+            ("prs[=1]", "a field and a value"), ("prs[0]status", "expected `.` or `[`"), ("", "1 to 300 bytes")] {
+            refuse(json!([{"path": path, "value": 1}]), says);
+        }
+        refuse(json!([{"path": "a.".repeat(20) + "a", "value": 1}]), "at most 16 steps");
+        // The result is checked as a whole update would be.
+        refuse(json!([{"path": "prs[number=226].status", "value": "done"}]), "`status` must be one of");
+        refuse(json!([{"path": "prs[number=227].number", "value": 226}]), "is listed twice");
+        refuse(json!([]), "1 to 50 edits");
+        refuse(json!(vec![ok.clone(); MAX_SET + 1]), "1 to 50 edits");
+        let mut both = set(id, json!([ok.clone()]));
+        both.data = Some(json!({"repo": "acme/api", "prs": []}));
+        assert!(update(&hub, 1, both).unwrap_err().to_string().contains("not both"));
+        assert!(serde_json::from_value::<Update>(json!({"panel_id": id, "set": [{"path": "x", "value": 1, "op": "add"}]})).is_err());
+        assert_eq!(resource(&hub, id).unwrap(), before);
+        assert!(!settable("image") && !settable("pr_decision") && !settable("web_preview") && settable("pr_overview") && settable("custom"));
+        // Another task's agent cannot edit it.
+        assert!(update(&hub, 2, set(id, json!([ok.clone()]))).unwrap_err().to_string().contains("another task"));
+        archive(&hub, 1).unwrap();
+    }
+
+    fn whole(id: PanelId, data: Value) -> Update {
+        Update { set: None, panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None }
+    }
+
+    /// The overview's data with PR #230 retitled `title`.
+    fn retitled(hub: &Hub, id: PanelId, title: &str) -> Value {
+        let mut data = resource(hub, id).unwrap()["data"].clone();
+        data["prs"][2]["title"] = json!(title);
+        data
+    }
+
+    #[test]
+    fn set_never_loses_an_update_committed_after_its_read() {
+        let hub = fixture();
+        let id = overview(&hub);
+        let merged = || set(id, json!([{"path": "prs[number=226].status", "value": "merged"}]));
+        // A whole update lands after the caller read the panel: the edit is made on its data.
+        let stale = get(&hub, id).unwrap();
+        update(&hub, 1, whole(id, retitled(&hub, id, "Docs, rewritten"))).unwrap();
+        update_from(&hub, 1, stale, merged(), &mut || {}).unwrap();
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"]["prs"][0]["status"], &res["data"]["prs"][2]["title"]), (&json!("merged"), &json!("Docs, rewritten")));
+        assert_eq!(res["panel"]["revision"], 3);
+        // One lands after the edit was made and staged, before it commits: it is made again.
+        let mut raced = 0;
+        let held = set(id, json!([{"path": "prs[number=227].status", "value": "held"}]));
+        update_from(&hub, 1, get(&hub, id).unwrap(), held, &mut || {
+            if raced == 0 { update(&hub, 1, whole(id, retitled(&hub, id, "Docs, again"))).unwrap(); }
+            raced += 1;
+        }).unwrap();
+        assert_eq!(raced, 2, "made twice");
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"]["prs"][0]["status"], &res["data"]["prs"][1]["status"], &res["data"]["prs"][2]["title"]),
+            (&json!("merged"), &json!("held"), &json!("Docs, again")));
+        assert_eq!(res["panel"]["revision"], 5);
+        // A title-only update between keeps the data revision: no need to make it again.
+        let mut raced = 0;
+        update_from(&hub, 1, get(&hub, id).unwrap(), set(id, json!([{"path": "current", "value": 230}])), &mut || {
+            if raced == 0 { update(&hub, 1, Update { set: None, panel_id: id, title: Some("Open PRs".into()), data: None, html: None, html_path: None, kit: None }).unwrap(); }
+            raced += 1;
+        }).unwrap();
+        assert_eq!(raced, 1);
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"]["current"], &res["panel"]["title"]), (&json!(230), &json!("Open PRs")));
+        // Data that keeps changing ends in a refusal after a few tries, never a lost update.
+        let mut n = 0;
+        let e = update_from(&hub, 1, get(&hub, id).unwrap(), merged(), &mut || {
+            n += 1;
+            update(&hub, 1, whole(id, retitled(&hub, id, &format!("Docs {n}")))).unwrap();
+        }).unwrap_err();
+        assert!(e.is::<DataMoved>() && n == SET_TRIES, "{e} after {n}");
+        assert_eq!(resource(&hub, id).unwrap()["data"]["prs"][2]["title"], format!("Docs {SET_TRIES}"));
+        // A card the update removed: the edit, made again, names a card that is gone.
+        let stale = get(&hub, id).unwrap();
+        update(&hub, 1, whole(id, json!({"repo": "acme/api", "prs": []}))).unwrap();
+        let e = format!("{:#}", update_from(&hub, 1, stale, merged(), &mut || {}).unwrap_err());
+        assert!(e.contains("no item of `prs` has number=226"), "{e}");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn quoted_selector_values_are_json_strings() {
+        assert_eq!(parse_path(r#"rows[id="a]b"].state"#).unwrap(),
+            [Step::Key("rows".into()), Step::Match("id".into(), "a]b".into()), Step::Key("state".into())]);
+        assert_eq!(parse_path(r#"rows[ id = "a\"b.c" ][0]"#).unwrap(),
+            [Step::Key("rows".into()), Step::Match("id".into(), "a\"b.c".into()), Step::Index(0)]);
+        assert_eq!(parse_path(r#"rows[id=""]"#).unwrap()[1], Step::Match("id".into(), "".into()));
+        for (bad, says) in [(r#"rows[id="a]"#, "never closed"), (r#"rows[id="a\"]"#, "never closed"), (r#"rows[id=a"b"]"#, "quote the whole value"),
+            (r#"rows[id="a"b]"#, "expected `]`"), (r#"rows[id="\x"]"#, "JSON string"), (r#"ro"ws.x"#, "field name"), (r#"rows["id"=1]"#, "a field and a value")] {
+            let e = format!("{:#}", parse_path(bad).unwrap_err());
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        let hub = fixture();
+        let id = open(&hub, 1, Open { title: "T".into(), app: "table".into(), data: Some(json!({"columns": [{"key": "id"}, {"key": "state"}],
+            "rows": [{"id": "a]b", "state": "x"}, {"id": "a\"b", "state": "x"}, {"id": "a\\\"b", "state": "x"}]})),
+            html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
+        update(&hub, 1, set(id, json!([{"path": r#"rows[id="a]b"].state"#, "value": "one"}, {"path": r#"rows[id="a\"b"].state"#, "value": "two"}]))).unwrap();
+        let rows = resource(&hub, id).unwrap()["data"]["rows"].clone();
+        assert_eq!([&rows[0]["state"], &rows[1]["state"], &rows[2]["state"]], [&json!("one"), &json!("two"), &json!("x")], "the escape is decoded, not matched literally");
+        let e = format!("{:#}", update(&hub, 1, set(id, json!([{"path": r#"rows[id="a]c"].state"#, "value": 1}]))).unwrap_err());
+        assert!(e.contains(r#"no item of `rows` has id="a]c""#), "{e}");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn data_nested_too_deep_to_read_back_is_refused_and_the_panel_stays_readable() {
+        let hub = fixture();
+        let id = markdown(&hub);
+        let mut deep = json!("bottom");
+        for _ in 0..130 { deep = json!([deep]); }
+        let e = format!("{:#}", update(&hub, 1, set(id, json!([{"path": "deep", "value": deep.clone()}]))).unwrap_err());
+        assert!(e.contains("nested"), "{e}");
+        assert!(update(&hub, 1, whole(id, json!({"markdown": "# x", "deep": deep.clone()}))).is_err(), "a whole update too");
+        let mut opening = Open { title: "Deep".into(), app: "markdown".into(), data: Some(json!({"deep": deep})), html: None, html_path: None, csp: None, kit: None, notify_on_close: None };
+        assert!(open(&hub, 1, opening).is_err(), "and an open");
+        let res = resource(&hub, id).unwrap();
+        assert_eq!((&res["data"], &res["panel"]["revision"]), (&json!({"markdown": "# Hello"}), &json!(1)));
+        // Below the limit it is stored, read back and edited again.
+        let mut fine = json!("bottom");
+        for _ in 0..100 { fine = json!([fine]); }
+        update(&hub, 1, set(id, json!([{"path": "deep", "value": fine.clone()}]))).unwrap();
+        update(&hub, 1, set(id, json!([{"path": "markdown", "value": "# y"}]))).unwrap();
+        assert_eq!(resource(&hub, id).unwrap()["data"]["deep"], fine);
+        opening = Open { title: "Ok".into(), app: "markdown".into(), data: Some(json!({"deep": fine.clone()})), html: None, html_path: None, csp: None, kit: None, notify_on_close: None };
+        open(&hub, 1, opening).unwrap();
+        archive(&hub, 1).unwrap();
+    }
+
+    #[test]
+    fn apps_storing_more_than_the_input_refuse_set_and_keep_everything() {
+        let hub = fixture();
+        hub.panels.port.store(40001, Ordering::Relaxed);
+        let pr = json!({"repo":"acme/api","number":812,"title":"T","author":"dana","url":"https://github.com/acme/api/pull/812",
+            "base":"master","head":"dana/x","head_sha":"0123456789abcdef0123456789abcdef01234567","summary":"S",
+            "risk":{"level":"low"},"checks":{"state":"passing","items":[{"name":"t","state":"pass"}]},
+            "changes":[{"file":"a","note":"n","diff":"+x"}]});
+        for (app, data, path) in [("image", json!({"url": "https://img.example/a.png"}), "caption"), ("pr_decision", pr, "summary"),
+            ("web_preview", json!({"url": "http://localhost:5173"}), "url")] {
+            let id = open(&hub, 1, Open { title: "Before".into(), app: app.into(), data: Some(data), html: None, html_path: None, csp: None, kit: None, notify_on_close: None }).unwrap();
+            let before = resource(&hub, id).unwrap();
+            let mut edit = set(id, json!([{"path": path, "value": "x"}]));
+            edit.title = Some("After".into());
+            let e = update(&hub, 1, edit).unwrap_err().to_string();
+            assert!(e.contains(&format!("{app} panels take the whole data")), "{e}");
+            assert_eq!(resource(&hub, id).unwrap(), before, "{app}: data, title and revision unchanged");
+        }
         archive(&hub, 1).unwrap();
     }
 }

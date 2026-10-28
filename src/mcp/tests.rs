@@ -1885,3 +1885,22 @@ async fn durably_accepted_delivery_error_is_not_refunded_after_replacement() {
     assert!(error && message.contains("rate limit"), "{message}");
     assert!(m.d.lock().sends.is_empty());
 }
+
+#[tokio::test]
+async fn panel_update_offers_set_edits_beside_whole_data() {
+    let (_, st) = state();
+    let tools = legacy(&st, "tools/list", json!({})).await;
+    let update = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "panel_update").unwrap();
+    let set = &update["inputSchema"]["properties"]["set"];
+    assert_eq!((set["type"].as_str(), set["minItems"].as_u64(), set["maxItems"].as_u64()),
+        (Some("array"), Some(1), Some(crate::panels::MAX_SET as u64)));
+    assert_eq!(set["items"]["required"], json!(["path", "value"]));
+    assert_eq!(set["items"]["additionalProperties"], false);
+    assert!(update["description"].as_str().unwrap().contains("prs[number=226].status"));
+    // A set edit is an update: it shares the post limit with opens, updates and posts.
+    let (_m, mut limited) = state();
+    limited.limits.post_per_window = 1;
+    assert!(!call(&limited, "post_to_channel", json!({"text":"first"})).await.1);
+    let (message, error) = call(&limited, "panel_update", json!({"panel_id": 1, "set": [{"path": "prs[number=226].status", "value": "merged"}]})).await;
+    assert!(error && message.contains("rate limit"), "{message}");
+}

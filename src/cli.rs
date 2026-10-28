@@ -514,6 +514,9 @@ pub enum PanelCmd {
         panel_id: i64,
         #[arg(long)] title: Option<String>,
         #[arg(long)] data: Option<String>,
+        /// Change part of the data instead of sending all of it: a JSON list of {path, value},
+        /// e.g. '[{"path":"prs[number=226].status","value":"merged"}]'.
+        #[arg(long, conflicts_with = "data")] set: Option<String>,
         #[arg(long, conflicts_with = "html_path")] html: Option<String>,
         #[arg(long)] html_path: Option<String>,
         /// Custom apps: switch the Muster Kit on (true) or off (false); the app reloads.
@@ -541,8 +544,8 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
         PanelCmd::Open { title, app, data, html, html_path, csp, kit, notify_on_close } => ("panel.open",
             json!({"title":title,"app":app,"data":parse(data)?,"html":html,"html_path":html_path,"csp":parse(csp)?,"kit":kit.then_some(true),
                 "notify_on_close":notify_on_close.then_some(true)}), 30),
-        PanelCmd::Update { panel_id, title, data, html, html_path, kit } => ("panel.update",
-            json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"html":html,"html_path":html_path,"kit":kit}), 30),
+        PanelCmd::Update { panel_id, title, data, set, html, html_path, kit } => ("panel.update",
+            json!({"panel_id":panel_id,"title":title,"data":parse(data)?,"set":parse(set)?,"html":html,"html_path":html_path,"kit":kit}), 30),
         PanelCmd::Close { panel_id } => ("panel.close", json!({"panel_id":panel_id}), 30),
         PanelCmd::List => ("panel.list", json!({}), 30),
         PanelCmd::Wait { panel_id, timeout_seconds } => {

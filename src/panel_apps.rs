@@ -1414,7 +1414,7 @@ mod tests {
         assert_eq!(res["html"], crate::panel_kit::serve("image", false, IMAGE.to_string()));
         let web = open("image", json!({"url": "https://img.example/a.png"})).unwrap();
         assert_eq!(crate::panels::get(&hub, web).unwrap().csp.resource_domains, vec!["https://img.example"]);
-        let update = |id, data| crate::panels::update(&hub, 1, Update { panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None });
+        let update = |id, data| crate::panels::update(&hub, 1, Update { set: None, panel_id: id, title: None, data: Some(data), html: None, html_path: None, kit: None });
         update(web, json!({"url": "https://img.example/b.png", "caption": "B"})).unwrap();
         assert!(update(web, json!({"url": "https://evil.example/b.png"})).is_err());
         assert!(update(id, json!({"path": "../etc/passwd"})).is_err());

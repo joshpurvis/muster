@@ -22,8 +22,12 @@ the same as the tools.)
   panel does not prompt you: its `closed` event comes with the next panel prompt or
   `wait_for_panel_event`. Pass `notify_on_close: true` only when closing it is an answer you
   must act on (closing a `pr_decision` panel is not a decision).
-- `panel_update {panel_id, data?, title?, html?, html_path?, kit?}`: `data` replaces the whole
-  input, so send every field; the app updates in place.
+- `panel_update {panel_id, data?, set?, title?, html?, html_path?, kit?}`: `data` replaces the
+  whole input, so send every field; the app updates in place. To change a few fields, pass
+  `set: [{path, value}]` instead of `data`, e.g. `{path: "rows[id=42].state", value: "done"}`:
+  pick list items by a unique field (`[field=value]`), not by position. A result with `added`
+  names paths that created a new field: check the spelling. Not for image, pr_decision or
+  web_preview.
 - `panel_close {panel_id}`, `list_panels {}`.
 - `wait_for_panel_event {panel_id?, timeout_seconds?}` → `{events, remaining, timed_out}`;
   call again while `remaining > 0`. Without a wait, events reach you later as a prompt headed

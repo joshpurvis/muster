@@ -70,7 +70,7 @@ New MCP tools (docs/MCP.md), with matching `muster panel ...` CLI commands for s
 | Tool | What it does |
 |---|---|
 | `panel_open` | `{title, app, data?, placement?}` → `{panel_id}`. `app` is a built-in (`image`, `chart`, `markdown`, `table`, `diff`, `pr_decision`, `web_preview`) or the agent's own HTML (inline, or a file path in its worktree). `data` is the app's input (an image path, a Vega-Lite spec, a diff with notes). |
-| `panel_update` | `{panel_id, data? , html?}`: new input, or a new version of the app. The panel updates in place and keeps its scroll and focus where the app allows. |
+| `panel_update` | `{panel_id, data? , set?, html?}`: new input, edits to part of it (`set`, docs/MCP.md), or a new version of the app. The panel updates in place and keeps its scroll and focus where the app allows. |
 | `panel_close` | `{panel_id}` |
 | `wait_for_panel_event` | `{panel_id?, timeout_seconds?}`: blocks until the user does something in a panel, like `wait_for_state`. Returns the events. |
 | `list_panels` | The caller's task's panels. |

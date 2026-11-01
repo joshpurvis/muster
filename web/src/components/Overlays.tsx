@@ -320,13 +320,13 @@ function jumpEntries(hits: ReadonlyMap<number, string> = new Map()): Entry[] {
     out.push({
       key: "s:" + s.id,
       label,
-      hay: `${label} ${basename(c.cwd)} ${c.branch ?? ""} ${KIND_LABEL[s.kind]}`,
+      hay: `${label} ${c.name} ${basename(c.cwd)} ${c.branch ?? ""} ${KIND_LABEL[s.kind]}`,
       needs: needsHuman(s.state),
       pri: STATE_PRIORITY.indexOf(s.state),
       since: s.state_since,
       here: isHere,
       boost: 2,
-      sub: isHere ? folder : `${winName(windowOfSession(s))} · ${folder}`,
+      sub: isHere ? `${c.name} · ${folder}` : `${winName(windowOfSession(s))} · ${c.name} · ${folder}`,
       icon: <StateDot state={s.state} />,
       right: <span class="sw-detail">{s.state_detail || STATE_LABEL[s.state]}</span>,
       run: () => {
@@ -556,7 +556,7 @@ const AGENTS: { k: SessionKind; label: string; icon: ComponentChildren }[] = [
 function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string }) {
   const home = meta.value.home;
   const [folder, setFolder] = useState(tildify(cwd ?? A.defaultFolder(), home));
-  const [agent, setAgent] = useState<SessionKind>(A.lastKind());
+  const [agent, setAgent] = useState<SessionKind | "none">(A.lastKind());
   const [profile, setProfile] = useState<ProfileChoice | undefined>("default");
   const [worktree, setWorktree] = useState(!!wtInit);
   const [base, setBase] = useState("");
@@ -597,7 +597,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   };
 
   return (
-    <Modal class="dialog dialog-scroll" label="New tab">
+    <Modal class="dialog dialog-scroll" label="New channel">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -611,9 +611,9 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
         }}
       >
         <div class="dlg-head">
-          <h2>New tab</h2>
+          <h2>New channel</h2>
           <span class="muted">
-            A folder and what to start in it, in the focused group. The tab names itself.
+            A project folder with its own tabs and tiled workspace.
           </span>
         </div>
         <div class="dlg-body">
@@ -653,6 +653,10 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
                   {a.icon} {a.label}
                 </button>
               ))}
+              <button type="button" role="radio" aria-checked={agent === "none"}
+                class={cx("seg-btn", agent === "none" && "on")} onClick={() => setAgent("none")}>
+                Empty
+              </button>
             </div>
           </div>
           {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} />}
@@ -692,7 +696,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
             </span>
             <input
               value={name}
-              placeholder="Automatic: from the agent's task or first prompt"
+              placeholder="Project folder name"
               spellcheck={false}
               onInput={(e) => setName((e.target as HTMLInputElement).value)}
             />
@@ -719,7 +723,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
           </span>
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!canCreate}>
-            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} Open tab
+            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} Create channel
           </button>
         </div>
       </form>

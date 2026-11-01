@@ -596,7 +596,7 @@ try:
     # UI installation changes only release files. Old HTML keeps loading its own bundle.
     ui_source = BASE / "ui-source"
     ui_source.mkdir()
-    (ui_source / "muster-ui.json").write_text('{"protocol":1}')
+    (ui_source / "muster-ui.json").write_text('{"protocol":2}')
     (ui_source / "index.html").write_text('<html>release-one<link href="app.css"><script src="app.js"></script></html>')
     (ui_source / "app.js").write_text("release-one")
     (ui_source / "app.css").write_text("body{}")

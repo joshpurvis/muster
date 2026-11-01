@@ -131,10 +131,9 @@ try {
   check(t3 !== null && t3 !== t2, "the split's shell is focused");
   const tsig = await layoutSig(a);
   check(/^row\(\[[\d,]+\] \[\d+\]\)$/.test(tsig), `a row split: ${tsig}`);
-  // Its task now has two sessions: both tabs show the session part ("name · shell").
-  await a.wait(`document.querySelector('[data-tab-sid="${t3}"] .tab-sub') !== null`, 3000);
-  await a.wait(`document.querySelector('[data-tab-sid="${t2}"] .tab-sub') !== null`, 3000);
-  ok(`Alt+D split with a new group (${tsig}); the task's tabs show "task · session"`);
+  // Each tab keeps its own session name as siblings are added.
+  for (const sid of [t2, t3]) await a.wait(`document.querySelector('[data-tab-sid="${sid}"] .tab-task')?.textContent === ${M}.sessions.value.get(${sid}).name`, 3000);
+  ok(`Alt+D split with a new group (${tsig}); tabs show their session names`);
   await shot(a, "02-split");
 
   // ---- the top-right strip carries the window controls; its Split down button splits
@@ -225,10 +224,10 @@ try {
   await a.wait(`${M}.windowSessions.value.some((s) => s.channel_id === ${c.id})`, 6000);
   const agent: number = await a.eval(`${M}.windowSessions.value.find((s) => s.channel_id === ${c.id}).id`);
   await a.wait(
-    `document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'Fix the flaky login redirect test'`,
+    `document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === ${M}.sessions.value.get(${agent}).name`,
     4000,
   );
-  ok("a new task's tab joined the focused group, named from its first prompt");
+  ok("a new task's tab shows its session name");
   if (!real) {
     await a.sleep(3800); // the fake agent goes idle
     await R(a, "session.send", { id: agent, text: "ask for approval" });
@@ -265,159 +264,76 @@ try {
   await a.key("Escape");
   ok("Jump found a tab and went there; the command palette opens");
 
-  // ---- rename by double-click (a one-session task's tab shows, so renames, the task)
-  const rr = await a.rect(`[data-tab-sid="${agent}"] .tab-name`);
-  await a.clickAt(rr!.x + 20, rr!.y + rr!.h / 2, { count: 2 });
-  await a.wait(`!!document.querySelector('.tab .inline-edit')`);
+  // ---- tabs always show and rename their own session, even with one session in a channel.
+  const originalChannelName = (await R(a, "hello", {})).channels.find((x: any) => x.id === c.id).name;
+  await a.click(`[data-tab-sid="${agent}"] .tab-name`, { count: 2 });
+  await a.wait(`document.querySelectorAll('.tab .inline-edit').length === 1`);
+  check(await a.eval(`document.activeElement?.getAttribute('aria-label')`) === "Tab name", "one tab-name field");
   await a.key("Ctrl+a");
-  await a.type("renamed task");
+  await a.type("renamed tab");
   await a.key("Enter");
-  await a.wait(
-    `document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'renamed task'`,
-    4000,
-  );
-  ok("double-click renamed the tab's task");
-  await a.wait(`document.querySelector('.sl-task')?.textContent === 'renamed task'`, 3000);
-  ok("the status line names the focused tab's task");
+  await a.wait(`document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'renamed tab'`);
+  check((await R(a, "hello", {})).channels.find((x: any) => x.id === c.id).name === originalChannelName, "channel unchanged");
+  ok("double-click renamed only the session");
 
-  // ---- a task with two sessions: Rename edits `[task] · [session]` from any of its tabs
   const extra: any = await R(a, "session.spawn", {
-    channel_id: c.id,
-    kind: "shell",
-    window_id: await a.eval(`${M}.windowId.value`),
-    cols: 120,
-    rows: 30,
+    channel_id: c.id, kind: "shell", window_id: await a.eval(`${M}.windowId.value`), cols: 120, rows: 30,
   });
   const sh: number = extra.id;
-  await a.wait(
-    `!!document.querySelector('[data-tab-sid="${sh}"] .tab-sub') && !!document.querySelector('[data-tab-sid="${agent}"] .tab-sub')`,
-    5000,
-  );
-  // Record the rename calls the page makes from here on.
-  await a.eval(`(() => { const r = ${M}.rpc; r.__renames = []; if (r.__countsRenames) return;
-    const call = r.call.bind(r);
-    r.call = (m, p) => { if (/\.rename$/.test(m)) r.__renames.push(m + ":" + p.name); return call(m, p); };
-    r.__countsRenames = true; })()`);
-  const renames = async () => JSON.stringify(await a.eval(`${M}.rpc.__renames`));
-  const fieldFocus = (): Promise<string | null> =>
-    a.eval(`document.activeElement?.getAttribute('aria-label') ?? null`);
-  const fields = (n: number) =>
-    a.wait(`document.querySelectorAll('.tab .inline-edit').length === ${n}`, 3000);
-  const tabFocused = async (sid: number) =>
-    await a.eval(`document.activeElement?.dataset?.tabSid ?? null`) === String(sid);
-  const sub = (sid: number): Promise<string> =>
-    a.eval(`document.querySelector('[data-tab-sid="${sid}"] .tab-sub')?.textContent ?? ''`);
+  await a.wait(`!!document.querySelector('[data-tab-sid="${sh}"] .tab-name')`);
+  check(await a.eval(`document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent`) === "renamed tab", "adding a sibling does not change the label");
+  const fields = (n: number) => a.wait(`document.querySelectorAll('.tab .inline-edit').length === ${n}`);
   const pickMenu = async (label: string) => {
-    await a.wait(`!!document.querySelector('.menu')`, 2000);
+    await a.wait(`!!document.querySelector('.menu')`);
     await a.eval(`(() => { const it = [...document.querySelectorAll('.menu .menu-item')]
       .find((e) => e.querySelector('.menu-label')?.textContent === ${JSON.stringify(label)});
       it.setAttribute('data-e2e-pick', ''); })()`);
     await a.click(`[data-e2e-pick]`);
   };
-
-  // Double-click on the task's main tab: both fields, the task's focused; Tab moves, Esc cancels.
-  const ra = await a.rect(`[data-tab-sid="${agent}"] .tab-name`);
-  await a.clickAt(ra!.x + 10, ra!.y + ra!.h / 2, { count: 2 });
-  await fields(2);
-  const tags = await a.eval(`[...document.querySelectorAll('.tab .inline-edit-tag')].map((e) => e.textContent).join()`);
-  check(tags === "Task,Tab", `each field is labelled: ${tags}`);
-  check(await fieldFocus() === "Task name", "the main tab starts in the task field");
-  await a.key("Tab");
-  check(await fieldFocus() === "Tab name", "Tab moves to the session field");
-  await a.key("Shift+Tab");
-  check(await fieldFocus() === "Task name", "Shift+Tab moves back");
+  await a.click(`[data-tab-sid="${agent}"] .tab-name`, { count: 2 });
+  await fields(1);
   await a.type("ignored");
-  await shot(a, "05b-rename-two-fields");
   await a.key("Escape");
   await fields(0);
-  check(await renames() === "[]", "moving between the fields and Esc renamed nothing");
-  check(await tabFocused(agent), "Esc gives the focus back to the tab");
-  ok("a two-session task's main tab renames `[task] · [session]`, starting in the task field");
+  check(await a.eval(`document.activeElement?.dataset?.tabSid`) === String(agent), "Esc returns focus to the tab");
 
-  // F2 on the other tab: starts in the session field; Enter renames only what changed.
   await a.click(`[data-tab-sid="${sh}"]`);
-  await a.wait(`${M}.focusedSession.value?.id === ${sh}`);
   await a.eval(`document.querySelector('[data-tab-sid="${sh}"]').focus()`);
   await a.key("F2");
-  await fields(2);
-  check(await fieldFocus() === "Tab name", "a secondary tab starts in the session field");
+  await fields(1);
   await a.key("Ctrl+a");
   await a.type("tests");
   await a.key("Enter");
-  await fields(0);
-  await a.wait(
-    `document.querySelector('[data-tab-sid="${sh}"] .tab-sub')?.textContent.includes('tests')`,
-    4000,
-  );
-  check(await renames() === `["session.rename:tests"]`, "Enter renamed only the session");
-  check(await tabFocused(sh), "Enter gives the focus back to the tab");
-  ok("F2 on a secondary tab starts in the session field; Enter renamed just the session");
+  await a.wait(`document.querySelector('[data-tab-sid="${sh}"] .tab-task')?.textContent === 'tests'`);
+  check(await a.eval(`document.activeElement?.dataset?.tabSid`) === String(sh), "Enter returns focus to the tab");
 
-  // Tab menu → Rename: a blanked task field beside a changed session renames only the session.
-  const rs = await a.rect(`[data-tab-sid="${sh}"]`);
-  await a.clickAt(rs!.x + 20, rs!.y + rs!.h / 2, { button: "right" });
+  await a.click(`[data-tab-sid="${sh}"]`, { button: "right" });
   await pickMenu("Rename");
-  await fields(2);
-  await a.key("Ctrl+a");
-  await a.type("logs");
-  await a.key("Shift+Tab");
+  await fields(1);
   await a.key("Ctrl+a");
   await a.key("Backspace");
   await a.key("Enter");
   await fields(0);
-  await a.wait(
-    `document.querySelector('[data-tab-sid="${sh}"] .tab-sub')?.textContent.includes('logs')`,
-    4000,
-  );
-  check(await renames() === `["session.rename:tests","session.rename:logs"]`, "only the session renamed");
-  check(
-    await a.eval(`document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent`) ===
-      "renamed task",
-    "the blank task field left the task alone",
-  );
-  ok("tab menu → Rename: a blank field is left alone, the changed one renamed");
+  check(await a.eval(`document.querySelector('[data-tab-sid="${sh}"] .tab-task')?.textContent`) === "tests", "blank names are ignored");
 
-  // Terminal menu → Rename: Enter renames the task (every tab of it), the terminal gets the keys.
   const bsh = await bodyOf(a, sh);
   await a.clickAt(bsh.x + bsh.w / 2, bsh.y + bsh.h / 2, { button: "right" });
   await pickMenu("Rename");
-  await fields(2);
-  await a.key("Shift+Tab");
+  await fields(1);
   await a.key("Ctrl+a");
-  await a.type("renamed task two");
+  await a.type("logs");
   await a.key("Enter");
-  await fields(0);
-  await a.wait(
-    `document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'renamed task two'`,
-    4000,
-  );
-  check(
-    await renames() === `["session.rename:tests","session.rename:logs","channel.rename:renamed task two"]`,
-    "only the task renamed",
-  );
-  check(
-    await a.eval(`!!document.activeElement?.closest('.xterm') &&
-      !!document.activeElement.closest('.pane')?.querySelector('[data-tab-sid="${sh}"]')`),
-    "Enter gives the focus back to the terminal",
-  );
-  ok("terminal menu → Rename renamed the task on every tab and returned to the terminal");
+  await a.wait(`document.querySelector('[data-tab-sid="${sh}"] .tab-task')?.textContent === 'logs'`);
+  check(await a.eval(`!!document.activeElement?.closest('.xterm')`), "terminal menu returns focus to the terminal");
 
-  // Clicking away commits.
-  const ra2 = await a.rect(`[data-tab-sid="${agent}"] .tab-name`);
-  await a.clickAt(ra2!.x + 10, ra2!.y + ra2!.h / 2, { count: 2 });
-  await fields(2);
-  await a.key("Tab");
+  await a.click(`[data-tab-sid="${agent}"] .tab-name`, { count: 2 });
+  await fields(1);
   await a.key("Ctrl+a");
   await a.type("main");
   await a.click(".pane .xterm");
-  await fields(0);
-  await a.wait(
-    `document.querySelector('[data-tab-sid="${agent}"] .tab-sub')?.textContent.includes('main')`,
-    4000,
-  );
-  check((await renames()).endsWith(`"session.rename:main"]`), "click-away renamed the session");
-  check(!(await sub(agent)).includes("ignored"), "the cancelled edit stayed cancelled");
-  ok("clicking away commits the rename");
+  await a.wait(`document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'main'`);
+  check((await R(a, "hello", {})).channels.find((x: any) => x.id === c.id).name === originalChannelName, "all tab rename paths leave the channel unchanged");
+  ok("single-field rename from double-click, F2 and both menus; cancel, blank and click-away behavior");
 
   // Right-click over a program that tracks the mouse: Muster's menu, and the program gets no
   // right-button report (left clicks still reach it).
@@ -582,11 +498,11 @@ try {
     ok("terminal menu: Interrupt and Restart on a working agent ask first; confirming sends it once");
   }
 
-  // Back to one session: the tab shows (and renames) just the task again.
+  // Back to one session: the tab keeps its own name.
   await a.click(`[data-tab-sid="${sh}"]`);
   await a.key("Alt+W");
   await a.wait(`!${M}.sessions.value.has(${sh})`, 4000);
-  await a.wait(`!document.querySelector('[data-tab-sid="${agent}"] .tab-sub')`, 3000);
+  await a.wait(`document.querySelector('[data-tab-sid="${agent}"] .tab-task')?.textContent === 'main'`, 3000);
 
   // ---- a second window; Jump there pulls a tab over
   b2 = await open(9342, "/tmp/muster-cdp-b");
@@ -639,7 +555,7 @@ try {
   ok("dragging a tab shows → Window N / → New window targets; Esc aborts");
   await b2.key("Ctrl+Shift+K");
   await b2.wait(`!!document.querySelector('.switcher')`);
-  await b2.type("renamed");
+  await b2.type("main");
   await b2.sleep(150);
   await b2.key("Enter");
   await b2.wait(`${M}.windowSessions.value.some((s) => s.id === ${agent})`, 5000);
@@ -662,7 +578,7 @@ try {
     });
     await a.wait(`${M}.windowSessions.value.some((s) => s.id === ${sib.id})`, 4000);
     await a.wait(
-      `document.querySelector('[data-tab-sid="${sib.id}"] .tab-sub')?.textContent === '· sibling'`,
+      `document.querySelector('[data-tab-sid="${sib.id}"] .tab-task')?.textContent === 'sibling'`,
       3000,
     );
     await b2.key("Ctrl+Space");

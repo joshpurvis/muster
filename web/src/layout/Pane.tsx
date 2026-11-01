@@ -25,6 +25,8 @@ import {
   windowPrefs,
   windowsSupported,
   workspaceById,
+  windowChannels,
+  tabChannel,
 } from "../state.ts";
 import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText, wakeCold } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
@@ -60,7 +62,7 @@ import {
   KindIcon,
 } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
-import { renameInputs, type TabLabel, tabLabel, tabText } from "../model.ts";
+import { type TabLabel, tabLabel, tabText } from "../model.ts";
 
 export function spawnMenuItems(onPick: (k: SessionKind) => void): MenuItem[] {
   return [
@@ -70,11 +72,9 @@ export function spawnMenuItems(onPick: (k: SessionKind) => void): MenuItem[] {
   ];
 }
 
-/** The label of tab `s` (its task's name, plus its own when the task has several sessions). */
+/** A tab shows its session name; the channel name lives in the sidebar. */
 export function labelOf(s: SessionInfo): TabLabel {
-  const c = channelById.value.get(s.channel_id);
-  const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;
-  return tabLabel(s, c, ws, (sessionsByChannel.value.get(s.channel_id) ?? []).length);
+  return tabLabel(s);
 }
 
 /** "Split right ▸" / "Split down ▸": move this tab into a new group, or a new terminal there. */
@@ -138,6 +138,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
   if (windowsSupported.value && windowId.value !== null) {
     items.push({ label: "Move to window", submenu: moveMenu(s.id) });
   }
+  items.push({ label: "Move to channel", submenu: channelMoveMenu(s.id) });
   items.push(
     "sep",
     {
@@ -343,9 +344,9 @@ function TermHost({ sid }: { sid: number }) {
 
 function newTabMenu(paneId: string): MenuItem[] {
   return [
-    { label: "New tab…", keys: "Alt+Shift+N", run: () => A.newTabDialog() },
+    { label: "New channel…", keys: "Alt+Shift+N", run: () => A.newTabDialog() },
     {
-      label: "New worktree tab",
+      label: "New worktree channel",
       icon: <IconBranch size={14} />,
       keys: "Ctrl+Shift+N",
       run: () => {
@@ -565,6 +566,15 @@ function TabStrip(
   );
 }
 
+function channelMoveMenu(tab: number): MenuItem[] {
+  const current = tabChannel(tab);
+  const items = windowChannels.value.filter((c) => c.id !== current).map((c) => ({
+    label: `${workspaceById.value.get(c.workspace_id)?.name ?? "Project"} / ${c.name}`,
+    run: () => A.moveTabToChannel(tab, c.id),
+  }));
+  return items.length ? items : [{ label: "No other channels in this window", disabled: true }];
+}
+
 function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
   panel: Panel; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
 }) {
@@ -576,6 +586,7 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
     { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
+    { label: "Move with terminal to channel", submenu: channelMoveMenu(id) },
     "sep",
     { label: "Close panel", keys: "Alt+W", run: () => A.closeTab(id) },
   ];
@@ -610,6 +621,7 @@ function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
     { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     ...(windowsSupported.value ? [{ label: "Move to window", submenu: moveMenu(id) }] : []),
+    { label: "Move to channel", submenu: channelMoveMenu(id) },
     { label: "All notes…", run: () => A.openNotesList() },
     ...(note.triggers !== undefined
       ? [{ label: "Allow triggers", checked: !!note.triggers, run: () => A.setNoteTriggers(note.id, !note.triggers) }]
@@ -697,6 +709,7 @@ function GroupTab(
   const cold = isCold(s, cacheNow());
   const tip = [
     tabText(label),
+    c?.name,
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
     cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
@@ -704,7 +717,7 @@ function GroupTab(
     c?.branch ? `⎇ ${c.branch}` : null,
     s.state_detail || STATE_LABEL[s.state],
   ].filter(Boolean).join(" · ");
-  const edit = isRenaming ? renameInputs(r!.fields) : null;
+  const edit = isRenaming ? r!.fields : null;
   return (
     <div
       class={cx(
@@ -714,7 +727,6 @@ function GroupTab(
         isUnread && "unread",
         dragging && "dragging",
         edit && "renaming",
-        edit && edit.length > 1 && "renaming-two",
         "st-" + s.state,
       )}
       role="tab"
@@ -749,23 +761,15 @@ function GroupTab(
       {edit
         ? (
           <InlineEdit
-            fields={edit.map((f) => ({
-              value: f.value,
-              // In the UI a session is a tab.
-              label: f.key === "task" ? "Task name" : "Tab name",
-              tag: f.key === "task" ? "Task" : "Tab",
-            }))}
-            focus={Math.max(0, edit.findIndex((f) => f.key === r!.fields.focus))}
+            fields={[{ value: edit.session, label: "Tab name", tag: "Tab" }]}
             class="tab-edit"
-            onCommit={(v, byKey) =>
-              A.commitRename(r!, Object.fromEntries(edit.map((f, i) => [f.key, v[i]])), byKey)}
+            onCommit={([session], byKey) => A.commitRename(r!, { session }, byKey)}
             onCancel={(byKey) => A.endRename(r!, byKey)}
           />
         )
         : (
           <span class="tab-name">
-            <span class={cx("tab-task", label.muted && "placeholder")}>{label.text}</span>
-            {label.sub && <span class="tab-sub">· {label.sub}</span>}
+            <span class="tab-task">{label.text}</span>
             {!!s.subagents && (
               <span class="tab-subagents" title={`${s.subagents} subagent${s.subagents === 1 ? "" : "s"} running`}>
                 +{s.subagents}

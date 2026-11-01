@@ -39,6 +39,9 @@ pub struct Note {
     pub updated_by: NoteAuthor,
     /// The window showing the note's tab; None while it is closed (shown nowhere).
     pub window_id: Option<WindowId>,
+    /// The channel workspace holding the note; None for old or unassigned notes.
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
     /// `note_open`: the session to show it beside when it first appears in its window.
     pub beside: Option<SessionId>,
     /// Raised by every change (text, title, window), so clients can tell a newer record from an
@@ -62,6 +65,8 @@ pub struct NoteSummary {
     pub updated_at: i64,
     pub updated_by: NoteAuthor,
     pub window_id: Option<WindowId>,
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
     pub beside: Option<SessionId>,
     pub open: bool,
     /// Size of the text in bytes of UTF-8, and its lines.

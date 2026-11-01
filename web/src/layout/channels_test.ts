@@ -1,0 +1,149 @@
+import {
+  accountSessionGroups, changeChannelLayout, loadChannelLayout, reconcileChannels, savedChannel, sidebarRatio,
+  type TabHome,
+} from "./channels.ts";
+import {
+  addTab, allPanes, allSessions, emptyLayout, findPane, noteTab, panelTab,
+  setSizes, sig, splitPane, toggleZoom,
+} from "./tree.ts";
+import type { AccountProfile, SessionInfo } from "../types.ts";
+
+function equal(a: unknown, b: unknown) {
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+}
+function assert(value: unknown, message: string) { if (!value) throw new Error(message); }
+
+Deno.test("channel migration partitions mixed tiles, preserving tab order, ratios and selection", () => {
+  let old = splitPane(emptyLayout([1, 2, 3]), "right", 4);
+  old = addTab(old, 5, old.focus);
+  old = setSizes(old, [], [0.3, 0.7]);
+  old = toggleZoom(old);
+  const tabs = [
+    { id: 1, channel: 10 }, { id: 2, channel: 20 }, { id: 3, channel: 10 },
+    { id: 4, channel: 20 }, { id: 5, channel: 10 },
+  ];
+  const migrated = loadChannelLayout(old, [10, 20], tabs);
+  equal(migrated.active, 10);
+  equal(sig(migrated.layouts[10].root), "row([1,3] [5])");
+  equal(sig(migrated.layouts[20].root), "row([2] [4])");
+  assert(migrated.layouts[10].root.type === "split", "still split");
+  if (migrated.layouts[10].root.type === "split") equal(migrated.layouts[10].root.sizes, [0.3, 0.7]);
+  equal(findPane(migrated.layouts[10].root, migrated.layouts[10].focus)?.active, 5);
+  equal(migrated.layouts[10].zoom, old.zoom);
+  equal(migrated.previous, old);
+  equal(loadChannelLayout(JSON.parse(JSON.stringify(migrated)), [10, 20], tabs), migrated);
+});
+
+Deno.test("legacy notes follow their tile or opener and stay in that channel after switching", () => {
+  let old = emptyLayout([1, noteTab(1)]);
+  old = splitPane(old, "right", 2);
+  old = addTab(old, noteTab(2));
+  const tabs: TabHome[] = [
+    { id: 1, channel: 10 }, { id: 2, channel: 20 },
+    { id: noteTab(1), channel: null }, { id: noteTab(2), channel: null },
+    { id: noteTab(3), channel: null, beside: 1 },
+  ];
+  const s = loadChannelLayout(old, [10, 20], tabs);
+  equal(savedChannel(s, noteTab(1)), 10);
+  equal(savedChannel(s, noteTab(2)), 20);
+  equal(savedChannel(s, noteTab(3)), 10);
+  equal(s.active, 20);
+  const next = reconcileChannels({ ...s, active: 20 }, [10, 20], tabs);
+  equal(savedChannel(next, noteTab(1)), 10);
+  equal(savedChannel(next, noteTab(2)), 20);
+});
+
+Deno.test("background arrivals go to their channel without changing the visible workspace", () => {
+  let tabs: TabHome[] = [{ id: 1, channel: 10 }, { id: 2, channel: 20 }];
+  const s = loadChannelLayout(null, [10, 20], tabs);
+  const before = s.layouts[10];
+  tabs = [...tabs, { id: 3, channel: 20 }, { id: panelTab(1), channel: 20, beside: 2 }];
+  const next = reconcileChannels(s, [10, 20], tabs);
+  equal(next.active, 10);
+  equal(next.layouts[10], before);
+  equal(allSessions(next.layouts[20].root).sort((a, b) => a - b), [-2, 2, 3]);
+  equal(allPanes(next.layouts[20].root).length, 2);
+});
+
+Deno.test("a late spawn result updates its captured channel after selection changed", () => {
+  const tabs = [{ id: 1, channel: 10 }, { id: 2, channel: 20 }, { id: 3, channel: 10 }];
+  let s = loadChannelLayout(null, [10, 20], tabs.slice(0, 2));
+  s = { ...s, active: 20 };
+  const before = s.layouts[20];
+  s = changeChannelLayout(s, 10, (l) => splitPane(l, "right", 3));
+  s = reconcileChannels(s, [10, 20], tabs);
+  equal(s.active, 20);
+  equal(s.layouts[20], before);
+  equal(sig(s.layouts[10].root), "row([1] [3])");
+});
+
+Deno.test("empty channels persist; archive selects a surviving channel and keeps notes accessible", () => {
+  let s = loadChannelLayout(null, [10, 20], [{ id: 1, channel: 10 }]);
+  s = reconcileChannels(s, [10, 20], []);
+  equal(s.active, 10);
+  equal(allSessions(s.layouts[10].root), []);
+  s = reconcileChannels(s, [20], [{ id: noteTab(1), channel: 0 }]);
+  equal(s.active, 20);
+  equal(s.layouts[10], undefined);
+  equal(savedChannel(s, noteTab(1)), 0);
+});
+
+Deno.test("one channel in two windows keeps independent tiles and no foreign tabs", () => {
+  const left = loadChannelLayout(splitPane(emptyLayout([1]), "right", 2), [10],
+    [{ id: 1, channel: 10 }, { id: 2, channel: 10 }]);
+  const right = loadChannelLayout(emptyLayout([3]), [10], [{ id: 3, channel: 10 }]);
+  const moved = reconcileChannels(left, [10], [{ id: 1, channel: 10 }]);
+  const received = reconcileChannels(right, [10], [{ id: 3, channel: 10 }, { id: 2, channel: 10 }]);
+  equal(allSessions(moved.layouts[10].root), [1]);
+  equal(allSessions(received.layouts[10].root), [3, 2]);
+  equal(allSessions(right.layouts[10].root), [3]);
+});
+
+Deno.test("moving tabs reconciles source and destination exactly once without erasing either layout", () => {
+  const s = loadChannelLayout(null, [10, 20], [{ id: 1, channel: 10 }, { id: 2, channel: 20 }]);
+  const next = reconcileChannels(s, [10, 20], [{ id: 1, channel: 20 }, { id: 2, channel: 20 }]);
+  equal(allSessions(next.layouts[10].root), []);
+  equal([...allSessions(next.layouts[20].root)].sort(), [1, 2]);
+  equal(next.active, 10);
+});
+
+Deno.test("a notes-only legacy window has a stable fallback, with no invented project", () => {
+  const tabs = [{ id: noteTab(7), channel: null }];
+  const s = loadChannelLayout(emptyLayout([noteTab(7)]), [], tabs);
+  equal(s.active, 0);
+  equal(savedChannel(s, noteTab(7)), 0);
+  equal(loadChannelLayout(s, [], tabs), s);
+});
+
+Deno.test("sidebar preferences are window-wide, validated and survive channel reloads", () => {
+  const s = loadChannelLayout({ v: 2, layouts: {}, active: 999,
+    sidebar: { split: 4, agents: false, channels: true, collapsedProjects: [1, "bad"],
+      groupBy: "account", collapsedAccounts: ["claude:7", 42] } }, [10], []);
+  equal(s.active, 10);
+  equal(s.sidebar, { hidden: false, channels: true, agents: false, split: 0.8, collapsedProjects: [1],
+    groupBy: "account", collapsedAccounts: ["claude:7"] });
+  equal(loadChannelLayout(s, [10], []).sidebar, s.sidebar);
+  equal(loadChannelLayout({ v: 2, sidebar: { groupBy: "invalid" } }, [], []).sidebar.groupBy, "directory");
+  equal(sidebarRatio(NaN), 0.45);
+  equal(sidebarRatio(-1), 0.2);
+});
+
+Deno.test("account groups keep profiles distinct, include unavailable profiles and honor running providers", () => {
+  const sessions = [
+    { id: 1, kind: "claude", account_profile_id: null },
+    { id: 2, kind: "claude", account_profile_id: 7 },
+    { id: 3, kind: "codex" },
+    { id: 4, kind: "claude", account_profile_id: 7 },
+    { id: 5, kind: "claude", account_profile_id: 99 },
+    { id: 6, kind: "shell" },
+    { id: 7, kind: "claude", account_profile_id: 7, provider: "openrouter" },
+  ] as SessionInfo[];
+  const profiles = [{ id: 7, name: "claude-personal", enabled: false }] as AccountProfile[];
+  const groups = accountSessionGroups(sessions, profiles);
+  equal(groups.find((g) => g.key === "claude:7")?.sessions.map((s) => s.id), [2, 4]);
+  equal(groups.find((g) => g.key === "claude:7")?.label, "claude-personal");
+  equal(groups.find((g) => g.key === "claude")?.sessions.map((s) => s.id), [1]);
+  equal(groups.find((g) => g.key === "claude:99")?.label, "claude · Unavailable profile #99");
+  equal(groups.find((g) => g.key === "claude:openrouter")?.sessions.map((s) => s.id), [7]);
+  equal(groups.flatMap((g) => g.sessions).map((s) => s.id).sort(), [1, 2, 3, 4, 5, 6, 7]);
+});

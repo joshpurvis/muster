@@ -138,10 +138,10 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
 | `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
-| `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session closes the channel (see "Groups layout (v2)"). A named agent's session is never removed this way: it is hidden instead, as `session.hide`, and the reply is `{hidden: true, session: SessionInfo}` (so no client can stop an agent by closing its tab, whatever it knows about agents); `agent.remove` removes it. |
+| `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session leaves the empty channel available (see "Groups layout (v2)"). A named agent's session is never removed this way: it is hidden instead, as `session.hide`, and the reply is `{hidden: true, session: SessionInfo}` (so no client can stop an agent by closing its tab, whatever it knows about agents); `agent.remove` removes it. |
 | `session.hide` | `{id}` | `SessionInfo`. Closes a named agent's tab without stopping it: the session keeps its process, scrollback and channel and gets `hidden: true`, `window_id: null` (see "Groups layout (v2)", hidden agent tabs). Hiding a hidden one is a no-op; a session that isn't a named agent's is refused (`session N is not a named agent's`), so ordinary tabs close only with `session.remove`. `session.set_window` shows it again. No device scope. |
 | `session.rename` | `{id, name}` | `SessionInfo` |
-| `session.move` | `{id, channel_id, from_channel_id?, close_empty_source? = false}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session whose process is being started or restarted right now (the start reads its channel), is an error; a session merely reporting the `starting` state (its process already launched) can move. With `from_channel_id`, the move is refused unless the session is still in that channel, so a client acting on a stale view can't move a session another client already moved. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to merge a tab into another (docs/UI.md); the emptied channel stays open until the client archives it. Refused while the source channel is being closed (archived), so a session can't slip out of an archive in progress. With `close_empty_source`, the source channel is then closed if this move emptied it (as `channel.close_if_empty`): the UI's tab merge uses this instead of archiving the source itself. The process keeps the port block it started with; that block stays reserved (not handed to a new channel) while the process runs. |
+| `session.move` | `{id, channel_id, from_channel_id?, close_empty_source? = false, move_panels? = false}` | `SessionInfo`. Moves the session (live or exited) to another channel: emits `session_upserted` with the new `channel_id` and re-derives both channels' auto names (`channel_upserted` on change). Moving into the session's own channel is a no-op; an unknown or archived channel, or a session whose process is being started or restarted right now (the start reads its channel), is an error; a session merely reporting the `starting` state (its process already launched) can move. With `from_channel_id`, the move is refused unless the session is still in that channel, so a client acting on a stale view can't move a session another client already moved. The process is not touched: it keeps its cwd, the permission flags it started with and its environment, so `MUSTER_CHANNEL_ID`, `PORT` and `MUSTER_PORT_BASE` still name the old channel until it restarts. **A restart applies the new channel's permission profile**, which may be more or less permissive than the one it ran with. MCP calls and hooks resolve the caller's channel from the session's current info (its token), never from the environment. The UI uses it to move tabs between channels (docs/UI.md); the emptied channel stays open until explicitly archived. With `move_panels: true`, the session and its owned panels change channel in one database transaction and emit `panel_upserted` events, preserving panel IDs and delivery state. Named agent sessions refuse this bundled move; the destination's open-panel limit is enforced. Refused while the source channel is being closed (archived), so a session can't slip out of an archive in progress. With `close_empty_source`, the source channel is then closed if this move emptied it (as `channel.close_if_empty`): desktop channel moves leave this false. The process keeps the port block it started with; that block stays reserved (not handed to a new channel) while the process runs. |
 | `session.set_window` | `{id, window_id, from_window_id?}` | `SessionInfo`. Shows the session (tab) in another window, or a hidden agent tab again; see "Groups layout (v2)". |
 | `session.send` | `{id, text, mode?: "queue"\|"interrupt", from_session?}` | `{delivered, queued}`. `from_session` (`muster send` passes `$MUSTER_SESSION_ID`): an agent session's send runs MCP `send_message` as that session (guards, provenance; the reply then also has `sent_at_ms`); a shell session's carries that shell's provenance (docs/MCP.md "Agents"). For shells the text is preceded by Ctrl-E Ctrl-U, which clears the input line (bash, zsh and fish in emacs mode; bash and zsh keep the cleared text in the kill ring, Ctrl-Y). A half-typed command is discarded rather than prepended to the delivered one. |
 | `session.approve` | `{id, decision: "approve"\|"approve_always"\|"deny", state_seq?, state_since?}` | `{}`. With `state_seq` and/or `state_since` (from the `SessionInfo` the caller rendered), refused with an error starting `stale:` when they no longer match. `state_seq` changes on every state or detail change and whenever a prompt is answered with it, so an approval never answers a prompt the caller didn't see, and a delayed duplicate never answers the next one. The `approval` event records `from` (`"human"` or `"device:<id>"`). |
@@ -153,7 +153,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.screen` | `{id}` | `{lines: string[]}` current visible screen as text (inbox previews) |
 | `fs.complete` | `{prefix}` | `{entries: string[]}` directory completions for the "add workspace" path box |
 | `channel.move` | `{id, window_id, index?}` | `Channel` (moves the task and all its sessions to another window, at `index` among the window's `channel_ids` or the end; emits `channel_upserted`, `session_upserted` for each session that changed window, and `window_upserted` for both windows, or `window_removed` for a window left unheld without tabs or tasks) |
-| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window that has tabs (sessions) and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. Claiming a window another connection holds takes it over (a reload's new connection may arrive before the old one closes). Also adopts orphaned channels and sessions (below). |
+| `window.claim` | `{id?}` | `Window`. WebSocket only. Declares which window this connection shows. With `id`: that window (created if missing, so a stale id still works). Without: the lowest-id window with sessions, open panels or non-archived channels and no connection holding it, else a new window. A connection holds at most one window; claiming again releases the previous one. Claiming a window another connection holds takes it over (a reload's new connection may arrive before the old one closes). Also adopts orphaned channels and sessions (below). |
 | `window.create` | `{name?}` | `Window` (a new window, not held; used by `muster open` to put a tab in it before the UI claims it). New windows get the lowest free id (1, 2, 3...). |
 | `window.set_layout` | `{id, layout}` | `{}`. Stores the window's split layout (opaque JSON; `null` clears it). No event echo (like `channel.set_layout`). Unknown window: error. |
 | `window.focused` | `{id}` | `{}` (records `last_focused_at`; clients call it on window focus) |
@@ -395,6 +395,7 @@ type Note = { id: number; title: string; body: string; rev: number; version: num
               created_at: number; updated_at: number;
               updated_by: { kind: "human" | "agent"; name?: string; session_id?: number };
               window_id: number | null /* its tab's window; null: closed */; beside: number | null;
+              channel_id: number | null /* channel home, including while closed */;
               triggers: boolean /* "Allow triggers": note triggers may fire on it (default false) */ };
 type NoteSummary = Omit<Note, "body"> & { open: boolean; bytes: number; lines: number; preview: string /* first non-blank line, ≤120 chars */ };
 ```
@@ -410,11 +411,12 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.list` | `{}` | `NoteSummary[]` |
 | `note.search` | `{query}` | `{id, line}[]`: at most 20 notes whose text holds `query` (2–200 bytes, ASCII case-insensitive), newest first, with the line holding it (shortened around the match). Jump and the notes list use it. |
 | `note.get` | `{id}` | `Note` |
-| `note.create` | `{title?, body? = "", window_id?, from_session?}` | `Note` (rev 1). No title: `Note <id>`. With `window_id` its tab opens there. |
+| `note.create` | `{title?, body? = "", window_id?, from_session?, channel_id?}` | `Note` (rev 1). No title: `Note <id>`. With `window_id` its tab opens there. Channel defaults to the creating session's channel, if any. |
 | `note.write` | `{id, body, base_rev, title?, from_session?}` | `Note`. Replaces the text. Refused unless `base_rev` is the current `rev`: `note N changed since revision B: it is at revision R (last edited by …)`. The same text again changes nothing. |
 | `note.append` | `{id, text, from_session?}` | `Note`. Adds `text` at the end, after a newline unless the note is empty or already ends with one. Needs no revision. |
 | `note.rename` | `{id, name}` | `Note` |
 | `note.open` | `{id, window_id?, beside?, from_session?}` | `Note`. Shows its tab in `window_id` (moving it from another window). Without `window_id`: in `from_session`'s window, beside that session. |
+| `note.set_channel` | `{id, channel_id, version?}` | `Note`. Moves its channel home without changing text revision, window or trigger permission. Refused for missing/archived channels or a stale `version`. |
 | `note.close` | `{id}` | `Note` with `window_id: null`. The note stays. |
 | `note.delete` | `{id, from_session?}` | `{}`. Refused when `from_session` is an agent's session (a guard against an agent's mistake, not a security boundary). |
 | `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. `on: true` only from a click in Muster's window (see "Schedules", Phase 3, "Held"); `off` from anywhere. |
@@ -996,10 +998,12 @@ of the same delivery (its message, else its panel batch, else its text) is recor
 
 ## Groups layout (v2)
 
-The UI's structure is window → split groups → tabs, where a tab is one session. So a session
-belongs to a window directly, and the split layout belongs to the window. A channel is a
-**task**: folder, worktree, permissions, port block, name; its `window_id` is the task's default
-window (for new sessions) and what `Window.channel_ids` lists.
+The UI's structure is window → channel → split groups → tabs. A session still belongs to a
+window directly. A channel holds folder, worktree, permissions, port block and name; its
+`window_id` is its default window for new sessions and what `Window.channel_ids` lists. A
+channel with tabs in multiple windows has a separate split layout in each window. UI protocol
+2 stores `{v:2, active, layouts, sidebar, previous?}` in `Window.layout`; `previous` preserves
+the old window tree during migration. Notes gain `channel_id` in store migration v26.
 
 - `SessionInfo.window_id: number | null`: the window the session is a tab in. Store migration
   v5: every existing session gets its channel's `window_id`; windows gain a `layout` column.
@@ -1009,7 +1013,7 @@ window (for new sessions) and what `Window.channel_ids` lists.
   channel would go ("Where new channels go", which may create window 1). `channel.create`'s
   first session gets the channel's window. MCP `spawn_session` with `new_channel` puts the new
   channel in the caller's window (its own, else its channel's).
-- `Window.layout: object | null`: opaque JSON owned by the frontend (the split tree of groups),
+- `Window.layout: object | null`: opaque JSON owned by the frontend (channel selection, per-channel split trees and sidebar state),
   in `hello` `windows[]` and every `window_upserted`. `window.set_layout {id, layout}` → `{}`
   with no event. Stored as JSON: the content round-trips, object key order may not (keys come
   back sorted), as with `channel.set_layout`.
@@ -1023,17 +1027,14 @@ window (for new sessions) and what `Window.channel_ids` lists.
   for the task's old and new windows. The window the session left, and the task's old window,
   are deleted (`window_removed`) when nobody holds them and they have no sessions and no
   non-archived channels.
-- A window "has tabs" when it has sessions: `window.claim` without an id takes the lowest-id
-  unheld window with sessions; a released window is deleted only when it has no sessions and no
+- `window.claim` without an id takes the lowest-id unheld window with sessions, open panels
+  or non-archived channels, including channels whose last terminal was closed; a released window is deleted only when it has no sessions and no
   non-archived channels (also at daemon start, for every window).
-- A channel whose last session is removed (`session.remove`) is closed by the daemon, as
-  `channel.close_if_empty` (worktree kept): `session_removed`, then `channel_removed` and the
-  window's update. The check and the close happen under one lock, and a spawn checks that its
-  channel is open and inserts its session under that same lock, so a session spawned (or moved)
-  into the channel meanwhile keeps it open. Only removals close: a channel created without an
-  agent, or emptied by `session.move`, stays until one of its sessions is removed or the client
-  closes it. When the channel stays open, its window follows its remaining tabs as above.
-  `channel.archive` still closes a channel with all its sessions.
+- Removing a channel's last session (`session.remove`) leaves the channel open, along with
+  its panels and notes. `channel.close_if_empty` remains explicit cleanup, for example after a
+  failed launch. `channel.archive` closes the channel and all sessions and removes its panels;
+  notes remain accessible through Notes. While sessions remain, the channel's default window
+  follows them as above; after the last one is removed, it retains its current default window.
 - `session.move` (between channels) doesn't change the session's window.
 - **Hidden agent tabs.** `SessionInfo.hidden: boolean` (store migration v16, default false):
   a named agent's tab the human closed (`session.hide`; the UI's tab close does this for agent

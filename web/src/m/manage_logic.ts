@@ -102,7 +102,7 @@ export function stopConfirm(s: SessionInfo, agent: string | null): Confirm {
   return { title: `Stop ${s.name}?`, body, action: "Stop", danger: true };
 }
 
-/** `last`: the only tab of its task (removing it closes the task, docs/PROTOCOL.md). */
+/** `last`: the only terminal tab of its channel (the empty workspace stays). */
 export function closeConfirm(
   s: SessionInfo,
   agent: string | null,
@@ -126,7 +126,7 @@ export function closeConfirm(
       : "Its program stops and the tab is removed with its output.",
   ];
   if (last && task) {
-    body.push(`It's the last tab of the task “${task.name}”, so the task closes too. ${keptText(task)}`);
+    body.push(`The channel “${task.name}” stays open, including its notes and panels. ${keptText(task)}`);
   }
   body.push("This can't be undone.");
   return { title: `Close ${s.name}?`, body, action: "Close tab", danger: true };

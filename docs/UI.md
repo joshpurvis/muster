@@ -1,32 +1,54 @@
-# Muster UI spec (v2: split groups, each with its own tabs)
+# Muster UI spec: channel workspaces
 
-Goal: a great tiling terminal for agents, in the spirit of VS Code editor groups, kitty and
-wezterm. A window is split into **groups**, and each group has its own **tab strip**. A tab is
-one terminal. Tabs drag freely between groups, onto a group's edge (a new split), and to other
-windows. One fuzzy Jump covers everything. There is no inbox, timeline, composer, diff panel or global
-tab bar; the only sidebar is the optional agents panel (Alt+G). Attention comes from state dots, the approval banner, desktop
-notifications and a "next that needs me" key.
+A window has a sidebar with Channels above global Agents, and a tiled workspace for the
+selected channel. Each channel has independent split groups and tab strips. A tab is a terminal,
+an agent panel or a note. Background terminals keep running when another channel is selected.
+Jump and “next that needs me” select the destination channel before showing its tab.
 
-Several windows may be open at once (one muster client each), so the window manager can tile
-them. The daemon owns every terminal. Closing a window never kills anything, and reopening
-restores that window's groups and tabs.
+Several windows may be open at once. The daemon owns every terminal: closing a window never
+kills it, and reopening restores the window's channel selection, layouts and sidebar state.
 
 ## Concepts
 
-- **Window**: one client window, numbered 1, 2, 3... It owns a **layout**: a split tree whose
-  leaves are groups (persisted by the daemon, `Window.layout`, see docs/PROTOCOL.md).
-- **Group**: a leaf of the window's split tree, with its own tab strip and one visible tab. The
-  layout JSON calls it a `pane` (`{type:"pane", id, tabs: session ids, active}`); v1's pane code
-  and drag and drop carry over, now at window level.
-- **Tab**: one **session** (a Claude, Codex or shell terminal), or an agent panel or a note (see below). Each session belongs to one
-  window (`SessionInfo.window_id`).
-- **Task**: what the API calls a **channel**, no longer shown as its own UI. It holds a
-  session's folder (`cwd`), optional git worktree and branch, permissions profile, port block
-  and the auto-derived name. A new tab starts a new task; "new terminal here" (Alt+N, splits)
-  starts another session in the focused tab's task, so a shell next to an agent shares its
-  worktree. When a task's last session closes, the daemon closes the task (its worktree is kept
-  unless removed explicitly).
-- **Workspace**: a folder the daemon knows about. Not shown as UI.
+- **Window**: one client window, numbered 1, 2, 3... Its `Window.layout` stores the selected
+  channel, a split tree for each channel, and the sidebar's collapse state and divider position.
+- **Channel**: a durable workspace holding a folder, optional worktree and branch, permissions,
+  port block and name. New tab adds a terminal to the selected channel; New channel creates a
+  separate workspace. New terminals and splits inherit the active terminal’s current directory,
+  falling back to its launch directory; an empty channel uses its own folder. Changing directory
+  does not automatically change channel membership. Closing the last terminal leaves the channel
+  available to launch again.
+- **Group**: one tile in a channel's split tree, with its own tab strip and one visible tab.
+- **Tab**: a terminal session, panel or note. Each belongs to a window and channel. The same
+  channel can have tabs in several windows, with an independent layout in each.
+- **Project**: the API's `Workspace`, a known folder. Channels are grouped under it in the sidebar.
+
+## Channels sidebar
+
+Channels sit above Agents in a 240px dock. Both sections scroll independently and can collapse.
+**Alt+G** hides or shows the entire sidebar, preserving the section states and divider.
+The window's ⋯ menu has Show/Hide sidebar, and the palette has Toggle sidebar. Visibility is
+saved per window. Alt+Shift+G or Toggle channels panel also reveals the sidebar when it is hidden.
+Drag their divider, or focus it and use Up/Down/Home/End, to resize the sections. Channel rows
+show a tab count, unread activity and an attention count when a session needs you. Project
+headings collapse; the selected channel and channels needing attention remain visible.
+The right-click menus switch grouping between Directory (the default) and Account.
+Account uses the same accordions to list this window's sessions under their running account:
+`claude`, named Claude profiles, `codex`, or `shell` (OpenRouter sessions have a separate group).
+Selecting a session reveals its channel and tab. Channels with no sessions stay available under
+No sessions. Each grouping remembers its collapsed groups, and the selected view is saved per
+window. Right-click the Channels heading, a group, a row, or empty space for Hide channels
+(collapse this section) or Hide sidebar (hide the entire dock).
+
+Select a channel to restore its tiles, tab order, active tabs, focused group and zoom. Double-click
+its name to rename it. Its menu also offers New tab, New note, Permissions, Copy folder path,
+Move up/down and Archive channel. Archiving confirms that sessions stop and panels are removed;
+notes, files and worktrees remain. Empty channels show terminal and note launch controls.
+
+A tab's “Move to channel” menu and dragging onto a channel row perform the same operation.
+Moving a terminal also moves its owned panels; moving a panel moves its owner and sibling
+panels. Notes move independently. Named agents keep their own channel. A moved terminal keeps
+its running process and cwd; restarting applies the destination channel's permissions.
 
 ## Visual language
 
@@ -41,7 +63,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 
 ```
 ┌ group ─────────────────────────────────────────┬ group ──────────────────────────────────┐
-│ ● fix auth ⎇ ×│ ◐ fix auth · shell │ +         │ ● new api 🛡 │ ● logs │ +  ◫ ⊟ 🔍 ⋯      │
+│ ● claude ⎇ ×│ ◐ shell │ +                     │ ● codex 🛡 │ ● logs │ +  ◫ ⊟ 🔍 ⋯        │
 │ [approval banner when needed]                  │ codex                                   │
 │ claude                                         │                                         │
 │                                                ├ group ──────────────────────────────────┤
@@ -58,27 +80,18 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   it starts) also has a small amber **OpenRouter** chip (its tooltip and accessible name:
   "OpenRouter · pay per use"): it bills per token. It stays until a restart applies another
   provider, and goes when the process exits. Billing text is at least 4.5:1 in both themes.
-- **Label**: the task's name (auto-derived, muted italics while it's only the folder name). When
-  the task has several sessions, a secondary muted part names the session (`fix auth · shell`);
-  the task part is truncated first.
-  Tooltip: full name, folder, branch, state detail.
+- **Label**: the session's own name, even when it is the channel's only session. Channel names
+  appear in the sidebar, not repeated on every tab. Tooltip: tab name, channel, folder, branch,
+  state detail.
 - The active tab of the focused group has an accent top bar; other groups' active tabs are
   muted. Unread activity shows a bold label.
-- Double-click renames exactly what the tab shows. A tab showing one name edits that name: the
-  task's, or the session's when its task is unknown. A tab showing `task · session` edits both,
-  as two fields `[task] · [session]`, from any of the task's tabs. Each field has a small muted
-  label before it, "Task" or "Tab" (a session is a tab), also with one field; in a very narrow
-  strip (300px or less) the labels shrink but stay. The inputs are named "Task name" and "Tab
-  name". The
-  cursor starts in the task
-  field on the task's main tab (its first agent session, else its first session), in the session
-  field otherwise. Tab / Shift+Tab move between the fields, Enter renames whatever changed, Esc
-  cancels, clicking away commits. Blank or unchanged fields are left alone. After Enter or Esc
-  the keyboard goes back to the tab, or to the terminal when the rename came from its menu or the
-  palette. While renaming, the tab keeps room for its fields; in a narrow strip it takes the whole
-  strip. Middle-click
-  closes. `+` at the end of each strip opens a new tab in that group (same folder as the group's active tab, no worktree, last agent kind); `▾` next to it:
-  New tab…, New worktree tab, New terminal in this task, and Claude / Codex / Shell.
+- Double-click, F2, and Rename in the menus or palette edit only the tab's session name.
+  There is one input, labelled "Tab name". Rename channels in the sidebar. Enter commits,
+  Esc cancels, and clicking away commits; blank or unchanged names are left alone. After
+  Enter or Esc the keyboard returns to the tab, or to the terminal when renaming started
+  from its menu or the palette. In a narrow strip the editor takes the whole strip. Middle-click
+  closes. `+` at the end of each strip opens a new tab in that group (selected channel, last agent kind); `▾` next to it:
+  New channel…, New worktree channel, New terminal in this channel, and Claude / Codex / Shell.
 - The **top-right group's** strip ends with the window controls: Split right `◫`, Split down
   `⊟` (acting on the focused group), a chip naming the window (only with 2+ windows; click
   renames), Jump `🔍 Ctrl Space`, and `⋯` (Rename window…, Theme ▸, Status line, Terminal gets
@@ -91,7 +104,7 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
   `N ▾` overflow list. Roving tabindex: ←/→/Home/End, Enter focuses the terminal, F2 renames.
 - Context menu: Rename (same as double-click), Permissions… (task), Copy path, Copy branch, New
   terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
-  Shell in this task there), Move to window ▸ (existing windows plus
+  Shell in this task there), Move to channel ▸, Move to window ▸ (existing windows plus
   "New window"), Restart, Interrupt, Close tab (a named agent's tab only hides: see "Agents panel"), and when it is the task's last session with a
   worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
   the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
@@ -124,7 +137,7 @@ for terminals. The menu includes Reload panel and Close panel. Closing sends `cl
 opening agent; archiving the task removes all its panels. The phone UI ignores panels.
 
 Panel input updates retain the frame; changed HTML and Reload panel replace it. A panel's app
-lives in one layer per window, drawn over its tab's place in the layout, so switching tabs,
+lives in one layer per window, drawn over its tab's place in the layout, so switching channels or tabs,
 zooming, splitting and dragging the tab to another group keep the app and anything typed in it.
 Moving a panel to another window, reloading the window or a backend restart load the app again
 from its last input: state the app kept only in the page (an unsent comment) is lost there.
@@ -166,7 +179,7 @@ open in the host browser.
 
 While a panel has focus, Muster's navigation shortcuts still work: Jump (Ctrl+Space, Ctrl+K),
 the palette (Ctrl+Shift+P), Alt+J, tab switching (Alt+1..9, Ctrl+Tab, Alt+[ / ]), Alt+Shift+[ / ],
-Alt+arrows between groups, Alt+Z, Alt+Shift+Z (fullscreen), Alt+G, Alt+/ and F1, and Alt+W,
+Alt+arrows between groups, Alt+Z, Alt+Shift+Z (fullscreen), Alt+G, Alt+Shift+G, Alt+/ and F1, and Alt+W,
 which closes that panel. Esc reaches the app first; one it leaves alone (see "Fullscreen")
 leaves a fullscreen panel.
 In the app's text fields, Alt+letters and Alt+arrows stay with the field, as in Muster's own.
@@ -180,7 +193,7 @@ app's last error and Reload panel. A load cut off by a dropped connection retrie
 Jump lists every panel by title (pulling one from another window), and the status line counts
 panel tabs with terminals.
 Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`, note tab IDs `-(2^40 + note_id)`;
-`-1` remains the internal empty-pane sentinel. Old session-only layouts need no migration.
+`-1` remains the internal empty-pane sentinel. Legacy window trees migrate as described below.
 
 ### Notes
 
@@ -305,16 +318,18 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   An app's own `ui/request-display-mode` "fullscreen" still zooms its group (it reports
   `displayMode: "fullscreen"` in both cases); asking for "inline" also ends a fullscreen
   showing it. The phone UI has no panels or groups and is unchanged.
-- A window with no tabs shows the empty launcher (folder input with `fs.complete`, then
-  Claude / Codex / Shell, keys 1 2 3), with Jump and `⋯` in its top-right corner. An empty group
-  (only possible transiently) closes.
-- The window layout is saved with `window.set_layout` (debounced 400ms) and reconciled on load
-  and on every session change: sessions of this window that aren't in the layout join the
-  focused group; unknown or foreign sessions are dropped; empty groups collapse (a focused group
-  that empties hands focus to its nearest neighbour). A window whose `layout` is null (first
-  run after v1, or a daemon without it) starts as one group holding its sessions in task order;
-  v1's per-channel layouts are not migrated. Sessions this client creates (new tab, new
-  terminal, split) are held out of the layout until their call returns and places them.
+- A window with no channels shows a project launcher. An empty channel shows launch controls
+  for that channel. Empty groups collapse to their nearest neighbour.
+- `window.set_layout` saves a version 2 envelope (debounced 400ms):
+  `{v:2, active, layouts:{channelId:LayoutState}, sidebar, previous?}`. Each layout retains the
+  existing tree format. Arriving tabs join their own channel, including when it is in the
+  background. Newly created tabs use the destination captured when their RPC started.
+- Legacy window trees are partitioned by channel membership, preserving order and splits
+  where possible. The original JSON is retained as `previous`. Notes inherit their opener's
+  channel, then a neighbour in their tile, then the focused channel; unassigned notes without
+  any channels use a Notes workspace. Real channel assignments are persisted with version
+  guards. Existing channels sharing a project folder are never merged. UI protocol 2 prevents
+  an older client from overwriting this layout format.
 
 ### Cold cache bar
 An agent that has sat idle longer than its provider keeps the conversation cached re-reads the
@@ -444,9 +459,9 @@ of the same kind arrives; the next waiting update shows meanwhile.
   stored in localStorage) makes it call `window.raise` instead, falling back to pulling when
   that returns `raised: false`. Raising doesn't select the tab over there (there is no RPC for
   that).
-- **New tab…** (Alt+Shift+N): opens in the focused group. Folder (path input with `fs.complete`, defaults to the focused
-  tab's folder; recent folders as chips), agent segmented control (Claude · Codex · Shell ·
-  remembers last; no "None": a tab is a session), worktree toggle (default **off**; disabled for a known non-git
+- **New channel…** (Alt+Shift+N): opens a separate workspace. Folder (path input with `fs.complete`, defaults to the focused
+  tab's folder; recent folders as chips), launch choices (Claude · Codex · Shell · Empty;
+  remembers the last agent kind), worktree toggle (default **off**; disabled for a known non-git
   folder), base branch (only when worktree is on), optional name (blank = auto), optional first
   prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
   Ctrl+Enter creates. Ctrl+Shift+N skips the dialog (see Worktrees). It has no model choice, so
@@ -464,7 +479,7 @@ renames their labels, and enables/disables them. Saved workspaces are not listed
 happen in the official Claude CLI, never in Muster. The dialog does not inspect authentication
 or settings files. Directory bindings are fixed; disabling does not stop running sessions.
 
-New Tab shows a Claude profile selector for Claude only. Its initial choice is explicit
+New channel shows a Claude profile selector for Claude only. Its initial choice is explicit
 **Default**, which preserves the ordinary inherited Claude environment, regardless of saved
 CLI workspace defaults. Choose a registered profile for that new session. New tabs
 and splits opened directly from a Claude tab inherit that tab's selection, including Default.
@@ -478,9 +493,9 @@ profile support do not show these controls.
 
 ## Agents panel
 
-Named agents (PLAN.md §10) get a left dock, about 220px wide, in any window. **Alt+G** (or
-"Toggle agents panel" in Jump and the palette) shows and hides it; each window remembers its own
-state in its layout (`Window.layout.agents`, saved like zoom). You talk to an agent in its own
+Named agents (PLAN.md §10) appear below Channels in the shared sidebar. **Alt+Shift+G** (or
+"Toggle agents panel" in Jump and the palette) expands or collapses the section; each window
+remembers it in `Window.layout.sidebar.agents`. You talk to an agent in its own
 terminal tab; there is no chat view.
 
 | Part | What |
@@ -489,7 +504,7 @@ terminal tab; there is no chat view.
 | Proposal | An agent's proposed schedule (Phase 3) is an amber card under the agent it would run on, above its other schedules: **Proposed by reviewer · today 10:02**, the name, WHEN (the reading with its time zone, always: "At 08:30, Monday to Friday (America/Los Angeles time)", and for a one-off in another zone when that is here: "; 16:30 your time"), AGENT, ALSO (fresh conversation, quiet hours, a daily cap, a reply note, when set), the PROMPT (monospace, scrolls past 9 lines; the box takes the keyboard focus, so arrow keys scroll it, and a prompt over 8 lines or 600 characters has **Show all (N lines)** / **Show less** under it), THEN (every "Then…" step, nested ones indented under the step they follow: "When it replies: ask **deployer**", "When that step replies: …", "If it fails: notify you", each with its prompt in the same monospace box; **Show all** unfolds these too), WHY (the agent's reason, in italics: its words), and USE (the estimate, one sentence each: runs in the coming week and at most per day; what pays, amber with a shield for a Claude subscription agent, with its 7-day expiry and quiet hours; the agent's unattended cap and its last 7 days). Buttons **Approve** (`schedule.approve`; a toast with its next run), **Edit…** (the schedule dialog, its head saying it stays waiting until approved) and **Dismiss** (`schedule.remove`, no confirm: it never ran). Right-click, Shift+F10 or the menu key: the same three. It never shows a next run or a history: it hasn't run. A schedule made or widened outside Muster's window (the command line, a script: `held`) gets the same card, headed **Made from the command line or a script** (or **Resumed …**, **Changed and resumed …**, **Renewed for 7 days …**) with when, and WHY reading "Waits for your approval: it came from the command line or a script, not from a click in Muster's window. Until you approve it, it doesn't run."; a held change of one of yours has **Remove…** (with the usual question) instead of Dismiss. Approve sends the `updated_at` the card showed, so a schedule changed since is refused. If a change made in the window itself comes back held (Muster couldn't tell its program), a toast says so and points at the card. |
 | Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents, a `sleeps` marker for one that sleeps when idle, and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An asleep agent reads `asleep · 2h` with a half-filled dot, and `cold` when waking it would re-read the whole conversation at full cost. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token), followed by an estimate of what it spent today once read (`· ~$0.42 today (est.)`, OpenRouter's UTC day; see Scheduling settings). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). Hover: the persona's first line. |
 | Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), except an asleep one, whose tab is only shown (looking never wakes it), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
-| Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
+| Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+Shift+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
 | Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, New schedule… (preselects this agent), Start / Show (asleep: Show, and Wake with a `re-reads it all` hint when its cache has likely expired), Start fresh (a new conversation, restarting a running one), Sleep (`agent.sleep`; disabled until it runs and has a saved conversation; a toast says why the daemon refused), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
 | Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name (its tooltip and spoken label give the reading, with the time zone when it isn't this browser's), then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git, GitHub or files watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`) and, under the row, a line saying what to do (also in the row's accessible name). A schedule an agent made has a violet chip: `reminder` (a one-off it set for itself) or `from reviewer` (its proposal you approved); the tooltip says which and when. |
 | Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). A trigger has no Skip next; Run now runs it without an event. A URL trigger adds **Copy trigger command** (a `curl` line with its URL and secret, `trigger.secret`; the toast says to keep it private) and **New secret…** (confirm; the old secret stops working). A note trigger whose note has triggers off adds **Allow triggers on <note>**. |
@@ -676,16 +691,16 @@ Renaming (double-click, menu, `muster rename`) sets `auto_named: false` for good
 
 ## Worktrees
 
-Off by default. **Ctrl+Shift+N** creates a worktree tab directly in the focused group: same
-folder and agent as the focused tab, no dialog. **Alt+Shift+N** opens the New tab dialog, where worktree is a toggle. The
-worktree folder is keyed by the tab's id, so it never moves. The branch starts as
+Off by default. **Ctrl+Shift+N** creates a separate worktree channel: same
+project and agent as the focused tab, no dialog. **Alt+Shift+N** opens New channel, where worktree is a toggle. The
+worktree folder is keyed by the channel's id, so it never moves. The branch starts as
 `muster/<id>`. The daemon renames it once, to `muster/<slug of the first real name>`, and again
 on each explicit rename, as long as muster created the branch and it has no upstream.
 
 ## Windows
 
 - `muster` (no arguments) opens a new window every time. It **claims** the lowest-numbered
-  window that has tabs but no client connected (so reopening after closing restores your
+  window that has tabs or saved channels but no client connected (so reopening after closing restores your
   tabs), else a new empty window. `muster open [path] [--window N]` opens a window on a folder
   (a new tab there) or reclaims window N.
 - The window keeps its number in `sessionStorage`, so a reload reclaims the same window.
@@ -693,10 +708,10 @@ on each explicit rename, as long as muster created the branch and it has no upst
   need you. The native window mirrors the document title, and the WM helpers find windows by
   this title.
 - Closing a window leaves its tabs (sessions) and layout attached to it. A released window with
-  no sessions is deleted by the daemon.
+  no sessions or non-archived channels is deleted by the daemon.
 - Sessions created outside a window (CLI `muster new`, MCP `spawn_session`) go to the spawning
   session's window, else the task's window, else the most recently focused window, and join
-  that window's focused group.
+  that channel's focused group in the destination window.
 
 ## Keyboard map
 
@@ -710,9 +725,10 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 |---|---|
 | Ctrl+Space or Ctrl+Shift+K (Ctrl+K outside terminals) | Jump (Ctrl+Space again closes it) |
 | Ctrl+Shift+P | Command palette |
-| Alt+T or Ctrl+Shift+T | New tab in the focused group (new task: same folder, last agent, no worktree) |
-| Ctrl+Shift+N | New worktree tab in the focused group |
-| Alt+Shift+N | New tab… dialog |
+| Alt+T or Ctrl+Shift+T | New tab in the selected channel (last agent kind) |
+| Ctrl+Shift+N | New worktree channel |
+| Alt+Shift+N | New channel… dialog |
+| Alt+G | Hide or show the entire sidebar |
 | Alt+N | New terminal in the focused tab's task, as a tab in the focused group (picker menu 1/2/3) |
 | Alt+1…9 | Go to tab N of the focused group (hold Alt to see numbers) |
 | Ctrl+Tab / Ctrl+Shift+Tab, Alt+] / Alt+[ | Next / previous tab in the focused group |
@@ -725,7 +741,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
 | Alt+Shift+Z | Fullscreen: the focused tab fills the window (again, or Esc outside terminals and text fields, goes back) |
-| Alt+G | Show / hide the agents panel (per window) |
+| Alt+Shift+G | Show / hide the agents panel (per window) |
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
@@ -755,8 +771,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
   task's window. Without `session.set_window` ("unknown method"), moving a tab to another window
   or pulling it here falls back to `channel.move`, which works only for a task's lone session
   (else an error toast). Without `window.set_layout` the layout isn't saved (a reload rebuilds
-  one group). Closing a task's last tab also calls `channel.close_if_empty`, for daemons that
-  don't close emptied tasks themselves.
+  one group per channel). Durable empty channels require the matching protocol 2 backend.
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
   folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other

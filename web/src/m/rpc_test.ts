@@ -31,7 +31,7 @@ async function harness(path: string) {
       this.readyState = Socket.CLOSED;
       this.onclose();
     }
-    async open(hello: unknown = {}) {
+    async open(hello: unknown = { ui_protocol: 2 }) {
       this.readyState = Socket.OPEN;
       this.onopen();
       this.reply(this.sent.at(-1)!.id, hello);

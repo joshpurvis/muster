@@ -4,10 +4,14 @@
 import { signal } from "@preact/signals";
 import { connStatus, rpc } from "./rpc.ts";
 import {
+  activeChannelId,
+  channelLayout,
+  channelsPanelOpen,
   agentBySession,
   agentMessages,
   agents,
   agentsPanelOpen,
+  sidebarHidden,
   knowRun,
   knowSchedule,
   loadScheduleRuns,
@@ -44,6 +48,10 @@ import {
   sessionMark,
   sessions,
   sessionsByChannel,
+  selectChannel,
+  tabChannel,
+  updateSidebar,
+  windowChannels,
   setPref,
   lastBackend,
   daemonRestarting,
@@ -122,7 +130,6 @@ import * as terms from "./terms.ts";
 import { copyText } from "./util.ts";
 import {
   basename,
-  mainSession,
   midTurn,
   moveChannelLocally,
   newerPrefs,
@@ -259,11 +266,11 @@ async function pullHere(sid: SessionId): Promise<boolean> {
   const s = sessions.value.get(sid);
   const here = windowId.value;
   if (!s || here === null) return hereIds.value.has(sid);
-  const group = layout.value?.focus;
+  const group = channelLayout.value?.layouts[s.channel_id]?.focus;
   holdNewSessions();
   try {
     await setSessionWindow(s, here, windowOfSession(s));
-    updateLayout((l) => addTab(l, sid, group), [sid]);
+    updateLayout((l) => addTab(l, sid, group), [sid], s.channel_id);
     return hereIds.value.has(sid);
   } catch (e) {
     toast("error", `Couldn't bring the tab here: ${errText(e)}`);
@@ -381,10 +388,14 @@ export async function newNote(group?: string, title?: string) {
   const here = windowId.value;
   if (here === null) return toast("error", "Notes need a window: reconnect first");
   if (group) focusGroup(group);
+  const channel = activeChannelId.value;
   try {
-    const n = await rpc.call<Note>("note.create", { window_id: here, ...(title ? { title } : {}) });
+    const n = await rpc.call<Note>("note.create", {
+      window_id: here, channel_id: channel && channel > 0 ? channel : undefined, ...(title ? { title } : {}),
+    });
     knowNote(n);
-    revealSession(noteTab(n.id));
+    if (channel !== null) updateLayout((l) => addTab(l, noteTab(n.id), group), [], channel);
+    if (activeChannelId.peek() === channel) revealSession(noteTab(n.id));
   } catch (e) {
     toast("error", `Couldn't create a note: ${errText(e)}`);
   }
@@ -472,6 +483,8 @@ export function focusActiveTerminalSoon() {
 /** Make tab `sid` of this window the active one of its group, and focus that group. */
 export function revealSession(sid: SessionId, focus = true) {
   if (!hereIds.value.has(sid)) return;
+  const channel = tabChannel(sid);
+  if (channel !== null && channel !== activeChannelId.value) selectChannel(channel);
   pushRecent("s:" + sid);
   updateLayout((l) => activateTabTree(l, sid));
   if (focus) focusActiveTerminalSoon();
@@ -618,15 +631,16 @@ function gridFor(placement: Placement): { cols: number; rows: number } | undefin
 }
 
 /** Put a session this client created on screen where `placement` says. */
-function place(sid: SessionId, placement: Placement) {
+function place(sid: SessionId, placement: Placement, channel = tabChannel(sid)) {
   updateLayout(
     (l) =>
       placement.type === "split"
         ? splitPane(l, placement.side, sid, placement.group)
         : addTab(l, sid, placement.group),
     [sid],
+    channel,
   );
-  focusActiveTerminalSoon();
+  if (activeChannelId.peek() === channel) focusActiveTerminalSoon();
 }
 
 /** A new session in task `ch` (a tab of this window). */
@@ -637,22 +651,25 @@ export async function spawn(
   prompt?: string,
 ): Promise<SessionInfo | undefined> {
   if (placement.type === "split" && !canSplit(placement.side, placement.group)) return undefined;
-  const at = { ...placement, group: placement.group ?? layout.value?.focus };
+  const at = { ...placement, group: placement.group ?? channelLayout.value?.layouts[ch]?.focus };
   const grid = gridFor(at);
+  const opener = sessionOfGroup(at.group);
+  const cwd = opener?.channel_id === ch ? opener.live_cwd ?? opener.cwd : undefined;
   holdNewSessions();
   try {
     const mark = sessionMark();
     const s = await rpc.call<SessionInfo>("session.spawn", {
       channel_id: ch,
       kind,
-      account_profile: inheritedProfile(kind, sessionOfGroup(at.group)),
+      cwd,
+      account_profile: inheritedProfile(kind, opener),
       prompt: prompt || undefined,
       window_id: windowId.value ?? undefined,
       ...grid,
     });
     knowSession(s, mark);
     if (kind !== "shell") setPref("lastAgent", kind);
-    place(s.id, at);
+    place(s.id, at, ch);
     return s;
   } catch (e) {
     toast("error", `Couldn't start ${kind}: ${errText(e)}`);
@@ -751,7 +768,6 @@ export function closeTab(sid: SessionId, force = false) {
 
 function removeTab(s: SessionInfo) {
   const sid = s.id;
-  const last = (sessionsByChannel.value.get(s.channel_id) ?? []).every((x) => x.id === sid);
   const mark = sessionMark();
   rpc.call<{ hidden?: boolean; session?: SessionInfo }>("session.remove", { id: sid })
     .then((r) => {
@@ -760,18 +776,17 @@ function removeTab(s: SessionInfo) {
         knowSession(r.session, mark);
         return agentHidden(r.session);
       }
-      if (last) rpc.call("channel.close_if_empty", { id: s.channel_id }).catch(() => {});
     })
     .catch(fail("Close failed")).catch(() => {});
 }
 
 /** An agent's tab was closed (hidden): say it keeps running, with a Show that brings it back
- * (works whatever "Terminal gets Alt keys" says; Alt+G is named only when it reaches the app). */
+ * (works whatever "Terminal gets Alt keys" says; Alt+Shift+G is named only when it reaches the app). */
 function agentHidden(s: SessionInfo) {
   focusActiveTerminalSoon();
   if (s.state === "exited") return;
   const name = agentBySession.value.get(s.id)?.name ?? s.name;
-  const where = prefs.value.altToTerminal ? "the agents panel" : "the agents panel (Alt+G)";
+  const where = prefs.value.altToTerminal ? "the agents panel" : "the agents panel (Alt+Shift+G)";
   toast("info", `${name} keeps running in the background. Show it again from ${where}.`, 7000, undefined, {
     label: "Show",
     run: () => openAgent(name),
@@ -867,7 +882,7 @@ export function renameSession(sid: SessionId, name: string) {
     .catch(fail("Rename failed")).catch(() => {});
 }
 
-/** Rename (double-click, F2, menus, palette): edit exactly the names tab `sid` shows, inline in that
+/** Rename (double-click, F2, menus, palette): edit the session name, inline in that
  * tab. `from`: where the keyboard goes back to when it closes (the tab, or its terminal). */
 export function startRename(sid: SessionId, from: "tab" | "terminal" = "tab") {
   const s = sessions.value.get(sid);
@@ -875,22 +890,19 @@ export function startRename(sid: SessionId, from: "tab" | "terminal" = "tab") {
   // The rename fields live in the tab strip, which fullscreen hides.
   exitFullscreen(false);
   const c = channelById.value.get(s.channel_id);
-  const list = sessionsByChannel.value.get(s.channel_id) ?? [];
-  const ws = c ? workspaceById.value.get(c.workspace_id) : undefined;
-  const fields = renameFields(s, c, ws, list.length, mainSession(list)?.id === sid);
+  const fields = renameFields(s);
   renaming.value = { sid, channel: c ? c.id : null, fields, from };
 }
 
 type Renaming = NonNullable<typeof renaming.value>;
 
-/** Inline rename `r` was committed: rename the task and/or the session, whichever changed.
+/** Inline rename `r` was committed: rename only this session.
  * `byKey`: closed with Enter (see `endRename`). */
-export function commitRename(r: Renaming, v: { task?: string; session?: string }, byKey: boolean) {
+export function commitRename(r: Renaming, v: { session?: string }, byKey: boolean) {
   // An editor whose rename already ended (its tab left, a newer one started) renames nothing.
   if (renaming.value !== r) return;
   endRename(r, byKey);
   const ch = renameChanges(r.fields, v);
-  if (ch.task !== undefined && r.channel !== null) renameChannel(r.channel, ch.task);
   if (ch.session !== undefined) renameSession(r.sid, ch.session);
 }
 
@@ -940,10 +952,10 @@ export interface NewTabReq {
   /** Folder: an existing workspace, or a path (added as a workspace when new). */
   workspace_id?: number;
   path?: string;
-  agent: SessionKind;
+  agent: SessionKind | "none";
   worktree: boolean;
   base?: string;
-  /** Blank: the daemon names the task. */
+  /** Blank: use the project folder's name. */
   name?: string;
   prompt?: string;
   /** Omitted: the daemon's defaults. */
@@ -956,10 +968,11 @@ export interface NewTabReq {
 const FIRST_SESSION_MS = 8000;
 
 /**
- * A new tab: a new task (`channel.create`) whose first session joins group `req.group`. Fails
- * when that session never shows up (its start failed): the empty task is closed again.
+ * Create a channel, optionally with its first terminal. Fails when that terminal never shows
+ * up (its start failed): explicit cleanup closes the failed empty channel.
  */
 export async function createTab(req: NewTabReq): Promise<Channel> {
+  const startedIn = activeChannelId.value;
   const ws = req.workspace_id !== undefined
     ? workspaceById.value.get(req.workspace_id) ?? await ensureWorkspace(req.path ?? "")
     : await ensureWorkspace(req.path ?? "");
@@ -969,11 +982,11 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
   try {
     const c = await rpc.call<Channel>("channel.create", {
       workspace_id: ws.id,
-      // Daemons without auto naming need a name: the folder's.
-      name: req.name?.trim() || (windowsSupported.value ? undefined : basename(ws.path)),
+      // A workspace's name remains stable while individual agents change tasks.
+      name: req.name?.trim() || basename(ws.path),
       worktree: req.worktree,
       base: req.base?.trim() || undefined,
-      agent: req.agent,
+      agent: req.agent === "none" ? undefined : req.agent,
       account_profile: req.account_profile,
       prompt: req.prompt?.trim() || undefined,
       permissions: req.permissions,
@@ -985,12 +998,14 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
     knowChannel(here !== null ? { ...c, window_id: c.window_id ?? here } : c);
     // Optimistic: the window_upserted that lists the new task may lag the reply.
     if (here !== null) windows.value = moveChannelLocally(windows.value, c.id, here);
+    if (activeChannelId.peek() === startedIn || activeChannelId.peek() === c.id) selectChannel(c.id);
+    if (req.agent === "none") return c;
     const first = await firstSessionOf(c.id, FIRST_SESSION_MS);
     if (!first) {
       rpc.call("channel.close_if_empty", { id: c.id }).catch(() => {});
       throw new Error(`${req.agent} didn't start`);
     }
-    place(first.id, at);
+    place(first.id, at, c.id);
     return c;
   } finally {
     releaseNewSessions();
@@ -1006,7 +1021,7 @@ function agentOf(ch: ChannelId): SessionKind | null {
 /** The task of group `group`'s active tab (default: the focused tab's). */
 function taskOfGroup(group?: string): Channel | null {
   const s = sessionOfGroup(group);
-  return s ? channelById.value.get(s.channel_id) ?? null : null;
+  return s ? channelById.value.get(s.channel_id) ?? null : focusedTask.value;
 }
 
 function sessionOfGroup(group?: string): SessionInfo | undefined {
@@ -1017,10 +1032,8 @@ function sessionOfGroup(group?: string): SessionInfo | undefined {
 }
 
 /**
- * `+` / Alt+T: a new tab in `group` (default focused), in the folder of that group's active tab
- * (its project, or where it has `cd`'d to outside it), with the last agent kind and no
- * worktree. Ctrl+Shift+N (`worktree`): a worktree tab with the focused tab's agent. No tab to
- * take a folder from: the New tab dialog.
+ * `+` / Alt+T: a terminal in the selected channel, with the last agent kind. Ctrl+Shift+N
+ * creates a separate worktree channel. With no channel selected, open New channel.
  */
 export function newTabHere(opts: { worktree?: boolean; agent?: SessionKind; group?: string } = {}) {
   const c = taskOfGroup(opts.group);
@@ -1034,12 +1047,14 @@ export function newTabHere(opts: { worktree?: boolean; agent?: SessionKind; grou
     return;
   }
   const agent = opts.agent ?? (opts.worktree ? agentOf(c.id) ?? lastKind() : lastKind());
+  if (!opts.worktree) {
+    spawn(c.id, agent, { type: "tab", group: opts.group });
+    return;
+  }
   const s = sessionOfGroup(opts.group);
-  // The tab has left its project (`cd` in a shell, `/cd` in Claude): open where it is now.
-  const moved = opts.worktree ? null : movedFolder(s, c, ws);
   createTab({
-    workspace_id: moved ? undefined : c.workspace_id,
-    path: moved ?? ws?.path,
+    workspace_id: c.workspace_id,
+    path: ws?.path,
     agent,
     account_profile: inheritedProfile(agent, s),
     worktree: !!opts.worktree,
@@ -1056,8 +1071,8 @@ export function movedFolder(s: SessionInfo | undefined, c: Channel, ws: Workspac
   return inside(c.cwd) || inside(ws?.path) ? null : live;
 }
 
-export function newTabDialog(worktree?: boolean) {
-  overlay.value = { kind: "new_tab", worktree };
+export function newTabDialog(worktree?: boolean, cwd?: string) {
+  overlay.value = { kind: "new_tab", worktree, cwd };
 }
 
 /** Default folder for new tabs: the focused tab's (where it has moved to, as for `+`), else
@@ -1350,14 +1365,77 @@ export function restartTimedOut() {
 
 // ---------- named agents (docs/UI.md "Agents panel") ----------
 
-/** Alt+G: show or hide this window's agents panel (kept in the window's layout). */
+/** Alt+G: hide the whole dock while preserving its sections and divider. */
+export function toggleSidebar() {
+  const hidden = !sidebarHidden.value;
+  updateSidebar({ hidden });
+  if (hidden) focusActiveTerminalSoon();
+}
+
+/** Alt+Shift+G: expand or collapse Agents; reveal the sidebar if it was hidden. */
 export function toggleAgentsPanel() {
-  const open = !agentsPanelOpen.value;
-  updateLayout((l) => {
-    const { agents: _was, ...rest } = l;
-    return open ? { ...rest, agents: true } : rest;
-  });
+  const open = sidebarHidden.value || !agentsPanelOpen.value;
+  updateSidebar({ agents: open, hidden: false });
   if (!open) focusActiveTerminalSoon();
+}
+
+export function toggleChannelsPanel() {
+  updateSidebar({ channels: sidebarHidden.value || !channelsPanelOpen.value, hidden: false });
+}
+
+export function openChannel(id: number, focus = true) {
+  selectChannel(id);
+  if (focus) focusActiveTerminalSoon();
+}
+
+/** A session and its owned panels move together. Notes move independently. Running terminal
+ * directories and permission flags stay as they were; restart applies the new channel profile. */
+export async function moveTabToChannel(tab: number, channel: number) {
+  if (tabChannel(tab) === channel) return;
+  const target = windowChannels.peek().find((c) => c.id === channel);
+  if (!target) return toast("error", "That channel is no longer in this window");
+  const nid = noteId(tab);
+  const pid = panelId(tab);
+  const session = sessions.peek().get(pid === null ? tab : panels.peek().get(pid)?.session_id ?? -1);
+  if (session && agentBySession.peek().has(session.id)) {
+    return toast("info", "Named agents keep their own channel. Open them from Agents.");
+  }
+  try {
+    if (nid !== null) {
+      await flushDraft(nid);
+      const note = notes.peek().get(nid);
+      if (!note) return;
+      knowNote(await rpc.call<Note>("note.set_channel", { id: nid, channel_id: channel, version: note.version }));
+    } else if (session) {
+      const mark = sessionMark();
+      const moved = await rpc.call<SessionInfo>("session.move", {
+        id: session.id, channel_id: channel, from_channel_id: session.channel_id, move_panels: true,
+      });
+      knowSession(moved, mark);
+      // An RPC reply may beat the panel events on the event stream. Reflect the same bundle
+      // locally before revealSession chooses the panel's destination channel.
+      if (sessions.peek().get(session.id)?.channel_id === channel) {
+        for (const p of panels.peek().values()) {
+          if (p.session_id === session.id && p.channel_id === session.channel_id) knowPanel({ ...p, channel_id: channel });
+        }
+      }
+    } else return;
+    selectChannel(channel);
+    revealSession(tab);
+    toast("success", `Moved to ${target.name}`, 2200);
+  } catch (e) {
+    toast("error", `Couldn't move the tab: ${errText(e)}`);
+  }
+}
+
+export function archiveChannelAsk(c: Channel) {
+  const count = (sessionsByChannel.peek().get(c.id) ?? []).length;
+  overlay.value = {
+    kind: "confirm", title: `Archive ${c.name}?`,
+    body: `Stops ${count} ${count === 1 ? "session" : "sessions"} and removes this channel's panels. Notes remain in Notes. Files and worktrees are kept.`,
+    confirmLabel: "Archive channel", danger: true,
+    run: () => rpc.call("channel.archive", { id: c.id, remove_worktree: false }).catch(fail("Archive failed")),
+  };
 }
 
 /** An agent's session is running (not exited). */

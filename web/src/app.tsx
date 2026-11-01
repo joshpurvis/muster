@@ -7,6 +7,9 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { connStatus, rpc } from "./rpc.ts";
 import {
   agentMessages,
+  activeChannel,
+  activeChannelId,
+  channelLayout,
   agents,
   openRouter,
   agentsPanelOpen,
@@ -36,6 +39,7 @@ import {
   windowLostListeners,
   windowPrefs,
   windowSessions,
+  visibleIds,
   windowsSupported,
   workspaces,
 } from "./state.ts";
@@ -48,7 +52,7 @@ import { WindowControls } from "./components/WindowControls.tsx";
 import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
-import { AgentsPanel } from "./components/Agents.tsx";
+import { Sidebar } from "./components/Sidebar.tsx";
 import { Kbd, TooltipHost } from "./components/common.tsx";
 import { FolderInput } from "./components/FolderInput.tsx";
 import { SplitView } from "./layout/SplitView.tsx";
@@ -174,6 +178,8 @@ rpc.start();
   openRouter,
   agentMessages,
   agentsPanelOpen,
+  activeChannelId,
+  channelLayout,
   schedules,
   scheduleRuns,
   scheduleSettings,
@@ -239,11 +245,11 @@ function EmptyWindow() {
       </div>
       <div class="welcome-card empty-window">
         <div class="welcome-mark">m</div>
-        <h1>{first ? "Welcome to muster" : "No tabs in this window"}</h1>
+        <h1>{first ? "Welcome to muster" : "No channels in this window"}</h1>
         <p>
           {first
-            ? "Run coding agents and shells in tabs and split groups. Pick a folder and what to start there."
-            : "Pick a folder and what to start there."}
+            ? "Keep each project's agents, terminals and notes in its own tiled workspace."
+            : "Pick a project folder and what to start in its first channel."}
         </p>
         <label class="field empty-folder">
           <span class="field-label">Folder</span>
@@ -264,6 +270,25 @@ function EmptyWindow() {
       </div>
     </div>
   );
+}
+
+function EmptyChannel() {
+  const c = activeChannel.value;
+  return <div class="welcome empty">
+    <div class="empty-controls"><WindowControls empty /></div>
+    <div class="welcome-card empty-channel">
+      <h1>{c?.name ?? "Notes"}</h1>
+      <p>{c ? "Open a terminal or note to start working in this channel." : "Open a note or create a channel for your project."}</p>
+      {c && <>
+        <div class="empty-channel-path">{tildify(c.cwd, meta.value.home)}</div>
+        <LaunchButtons pick={(kind) => A.spawn(c.id, kind)} last={prefs.value.lastAgent} />
+      </>}
+      <div class="empty-channel-actions">
+        <button type="button" class="btn" onClick={() => A.newNote()}>New note</button>
+        <button type="button" class="btn" onClick={() => A.newTabDialog()}>New channel…</button>
+      </div>
+    </div>
+  </div>;
 }
 
 /** After `daemon_stopping`: replaces whatever had focus (maybe a terminal), so it takes the
@@ -415,16 +440,13 @@ function App() {
   return (
     <div class={fullscreen.value === null ? "app" : "app fullscreen"}>
       <div class="app-body">
-        {agentsPanelOpen.value && <AgentsPanel />}
+        <Sidebar />
         <main class="content">
-          {l && hereIds.value.size
-            ? (
-              <div class="panes">
-                <SplitView layout={l} />
-                <PanelLayer />
-              </div>
-            )
-            : <EmptyWindow />}
+          <div class="panes">
+            {l && visibleIds.value.size ? <SplitView key={activeChannelId.value ?? "empty"} layout={l} />
+              : activeChannelId.value !== null ? <EmptyChannel /> : <EmptyWindow />}
+            <PanelLayer />
+          </div>
         </main>
       </div>
       {prefs.value.statusLine && <StatusLine />}

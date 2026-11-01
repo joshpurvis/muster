@@ -955,7 +955,7 @@ exec cat > /dev/null
   ok(JSON.parse(dec.decode(lsJson.stdout)).find((x: Json) => x.id === t2.id)?.window_id === side.id, "muster ls --json shows the session's window");
   const t3 = await c.call("session.spawn", { channel_id: task.id, kind: "shell", window_id: 1 });
   ok(t3.window_id === 1, "session.spawn with window_id");
-  // A task closes with its last session; one created without an agent stays until then.
+  // Channels remain usable after their last session closes; cleanup is explicit.
   const empty = await c.call("channel.create", { workspace_id: ws.id, window_id: 1 });
   c.events = [];
   for (const x of [t1, t2]) await c.call("session.remove", { id: x.id });
@@ -963,13 +963,17 @@ exec cat > /dev/null
   await c.waitFor(`window ${side.id} removed with its last tab`, () => c.events.some((e) => e.event === "window_removed" && e.data.id === side.id));
   ok(true, "an unheld window loses its last tab: deleted");
   await c.call("session.remove", { id: t3.id });
-  await c.waitFor("task closed", () => c.events.some((e) => e.event === "channel_removed" && e.data.id === task.id));
-  ok(true, "removing a task's last session closes the task");
+  ok((await c.call("hello")).channels.some((x: Json) => x.id === task.id), "removing a channel's last session keeps its workspace");
   ok((await c.call("hello")).channels.some((x: Json) => x.id === empty.id), "a task without sessions isn't closed by that");
   const es = await c.call("session.spawn", { channel_id: empty.id, kind: "shell" });
   await c.call("session.remove", { id: es.id });
-  await c.waitFor("empty task closed", () => c.events.some((e) => e.event === "channel_removed" && e.data.id === empty.id));
-  ok(true, "...only once a session of it is removed");
+  ok((await c.call("hello")).channels.some((x: Json) => x.id === empty.id), "an empty channel remains after launch and close");
+  const reopened = await c.call("session.spawn", { channel_id: empty.id, kind: "shell" });
+  ok(reopened.channel_id === empty.id, "an emptied channel can launch another tab");
+  await c.call("session.remove", { id: reopened.id });
+  await c.call("channel.close_if_empty", { id: empty.id });
+  await c.waitFor("empty channel explicitly closed", () => c.events.some((e) => e.event === "channel_removed" && e.data.id === empty.id));
+  ok(true, "explicit empty-channel cleanup still works");
 
   // flood: 20 MB of output must not wedge the daemon or lose the tail
   c.input(sid, "head -c 20000000 /dev/zero | tr '\\0' x; echo; echo FLOOD$((40+2))\r");

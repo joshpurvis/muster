@@ -41,6 +41,10 @@ export const IconPlus = (p: P) => (
     <path d="M12 5v14M5 12h14" />
   </Svg>
 );
+
+export const IconChannels = (p: P) => (
+  <Svg {...p}><path d="M9 3 7 21M17 3l-2 18M4 8h17M3 16h17" /></Svg>
+);
 export const IconChevron = (p: P) => (
   <Svg {...p}>
     <path d="m9 6 6 6-6 6" />

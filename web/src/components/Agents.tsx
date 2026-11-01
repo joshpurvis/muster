@@ -4,7 +4,7 @@
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
-import { AgentSchedules, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
+import { AgentSchedules, agentsHeaderItems, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   schedulesSupported,
   scheduleSettings,
@@ -69,7 +69,7 @@ import type {
 } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
-import { openMenu } from "./Menu.tsx";
+import { contextMenu, openMenu } from "./Menu.tsx";
 import { PermissionsSection } from "./Permissions.tsx";
 import { ProfileSelect } from "./AccountProfiles.tsx";
 import {
@@ -104,10 +104,11 @@ export function AgentsPanel() {
   const sel = agentFilter.value;
   return (
     <aside class="agents-panel" aria-label="Agents">
-      <div class="ap-head">
-        <IconAgents size={14} />
-        <span class="ap-title">Agents</span>
-        {list.length > 0 && <span class="ap-count">{list.length}</span>}
+      <div class="ap-head" {...contextMenu(agentsHeaderItems)}>
+        <button type="button" class="sidebar-heading" aria-expanded="true" onClick={A.toggleAgentsPanel}>
+          <IconChevron size={12} class="open" /><IconAgents size={14} />
+          <span>Agents</span><span class="ap-count">{list.length}</span>
+        </button>
         {agentsSupported.value && (
           <button
             type="button"
@@ -120,16 +121,6 @@ export function AgentsPanel() {
             <IconMore size={13} />
           </button>
         )}
-        <button
-          type="button"
-          class="ap-icon-btn ap-head-x"
-          aria-label="Hide the agents panel"
-          data-tip="Hide"
-          data-keys="Alt+G"
-          onClick={() => A.toggleAgentsPanel()}
-        >
-          <IconX size={13} />
-        </button>
       </div>
       {agentsSupported.value && <SchedulesPausedNotice />}
       {agentsSupported.value && <ProposalsNotice />}
@@ -320,7 +311,12 @@ function Feed({ now }: { now: number }) {
   };
   return (
     <section class={cx("ap-feed", open && "open")} aria-label="Messages">
-      <div class="ap-feed-head">
+      <div class="ap-feed-head" {...contextMenu(() => [
+        { label: open ? "Hide messages" : "Show messages", run: () => setPref("agentFeed", !open) },
+        { label: "Show all agents' messages", disabled: sel === null, run: () => { agentFilter.value = null; setPref("agentFeed", true); } },
+        "sep",
+        { label: "Hide sidebar", keys: "Alt+G", run: A.toggleSidebar },
+      ])}>
         <button
           type="button"
           class="ap-feed-toggle"

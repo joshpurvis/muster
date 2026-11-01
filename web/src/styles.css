@@ -876,23 +876,6 @@ button.sl-item:hover {
   text-overflow: ellipsis;
 }
 
-/* Auto-named task before anything was derived: the folder name, muted. */
-.tab-task.placeholder {
-  font-style: italic;
-  color: var(--text-faint);
-}
-
-/* The session's own name, when its task has several: "fix auth · shell". */
-.tab-sub {
-  flex: none;
-  max-width: 60%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-left: 4px;
-  color: var(--text-faint);
-  font-weight: 400;
-}
-
 .tab.unread .tab-task {
   font-weight: 650;
   color: var(--text);
@@ -951,10 +934,6 @@ button.sl-item:hover {
   max-width: none;
 }
 
-.tab.renaming-two {
-  width: clamp(150px, 100cqw - 96px, 400px);
-}
-
 .tab.renaming > .icon,
 .tab.renaming .tab-wt,
 .tab.renaming .tab-perm,
@@ -969,14 +948,12 @@ button.sl-item:hover {
     display: none;
   }
 
-  .tab.renaming,
-  .tab.renaming-two {
+  .tab.renaming {
     width: calc(100cqw - 8px);
   }
 }
 
-/* A very narrow strip: the labels stay (which field renames the task and which only this tab
-   matters most here), just smaller and closer. */
+/* Keep the field label in narrow strips, just smaller and closer. */
 @container (max-width: 300px) {
   .tab.renaming .inline-edit-tag {
     font-size: 9.5px;
@@ -1857,7 +1834,7 @@ textarea {
   color: var(--text-faint);
 }
 
-/* "Task" / "Tab" before each rename field. */
+/* A small label before an inline rename field. */
 .inline-edit-tag {
   flex: none;
   font-size: 10.5px;
@@ -3030,16 +3007,75 @@ textarea {
   min-width: 0;
 }
 
+.sidebar {
+  width: 240px;
+  flex: none;
+  display: grid;
+  min-height: 0;
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
+  user-select: none;
+}
+
+.channels-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.channels-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 5px 6px 12px; }
+.channel-session-label { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
+.channel-session-context { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-faint); }
+.sidebar-heading, .sidebar-collapsed {
+  display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--text);
+  font-size: 12px; font-weight: 650; text-align: left;
+}
+.sidebar-heading { flex: 1; height: 100%; }
+.sidebar-collapsed { padding: 0 10px; border-bottom: 1px solid var(--border); }
+.sidebar-heading:hover, .sidebar-collapsed:hover { color: var(--accent-strong); }
+.sidebar-heading .open, .channel-project-toggle .open { transform: rotate(90deg); }
+.sidebar .ap-head { padding-left: 10px; }
+.sidebar-divider { background: var(--border); position: relative; }
+.sidebar-divider.resizable { cursor: row-resize; background: var(--bg-1); border-block: 1px solid var(--border); }
+.sidebar-divider.resizable:hover, .sidebar-divider:focus-visible { background: var(--accent); }
+.sidebar-divider:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
+.channel-project + .channel-project { margin-top: 9px; }
+.channel-project-head { display: flex; align-items: center; min-height: 28px; padding: 0 3px; }
+.channel-project-toggle {
+  min-width: 0; flex: 1; display: flex; align-items: center; gap: 5px;
+  padding: 4px 2px; color: var(--text-faint); text-align: left; font-size: 11px; font-weight: 550;
+}
+.channel-project-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-project-toggle:hover { color: var(--text); }
+.channel-row { display: flex; align-items: center; border-radius: var(--r); margin: 1px 0; }
+.channel-row:hover { background: var(--hover); }
+.channel-row.active, .channel-fallback.active { background: var(--accent-soft); color: var(--text); }
+.channel-row.channel-drop { background: var(--accent-soft); outline: 1px solid var(--accent); outline-offset: -1px; }
+.channel-select {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; min-height: 30px;
+  padding: 5px 4px 5px 10px; color: var(--text-muted); text-align: left; font-size: 12px;
+}
+.channel-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-row.active .channel-select, .channel-row.unread .channel-select { color: var(--text); }
+.channel-row.unread .channel-name { font-weight: 650; }
+.channel-count, .channel-attention { margin-left: auto; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.channel-count { color: var(--text-faint); }
+.channel-attention { color: var(--warn-text); background: var(--attn-bg); border-radius: 8px; min-width: 18px; text-align: center; padding: 1px 4px; }
+.channel-more { flex: none; margin: 0 3px 0 0; }
+.channel-rename { flex: 1; min-width: 0; padding: 2px 4px; }
+.channel-rename input { width: 100%; }
+.channel-fallback { width: 100%; border-radius: var(--r); padding-right: 10px; }
+.side-create { display: flex; align-items: center; gap: 6px; margin-top: 12px; color: var(--text); }
+.side-create:hover { color: var(--accent-strong); }
+.empty-channel-path { color: var(--text-faint); font-size: 12px; overflow-wrap: anywhere; margin-bottom: 20px; }
+.empty-channel-actions { display: flex; justify-content: center; gap: 8px; margin-top: 18px; }
+@media (max-width: 760px) { .sidebar { width: 190px; } }
+@media (max-height: 440px) { .sidebar .ap-feed { max-height: 35%; } }
+
 .agents-panel {
-  width: 220px;
+  width: auto;
   flex: none;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--bg-1);
-  border-right: 1px solid var(--border);
+  overflow: hidden;
   user-select: none;
-  animation: ap-in 140ms var(--ease);
 }
 
 @keyframes ap-in {
@@ -4181,7 +4217,7 @@ textarea {
 .ps-full:hover { background: var(--hover-strong); color: var(--text); }
 .ps-full.on { color: var(--accent-strong); }
 .ps-full:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.app.fullscreen .agents-panel, .app.fullscreen .statusline { display: none; }
+.app.fullscreen .sidebar, .app.fullscreen .statusline { display: none; }
 .fs-exit {
   position: absolute; top: 6px; right: 6px; z-index: 5; display: inline-flex; align-items: center; justify-content: center;
   width: 26px; height: 24px; padding: 0; border: 0; border-radius: 6px; cursor: pointer;

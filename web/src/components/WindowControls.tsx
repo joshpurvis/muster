@@ -8,6 +8,7 @@ import {
   overlay,
   prefs,
   setPref,
+  sidebarHidden,
   windowId,
   windowPrefs,
   windows,
@@ -40,6 +41,7 @@ function moreMenu(): MenuItem[] {
         run: () => setPref("theme", t),
       })),
     },
+    { label: sidebarHidden.value ? "Show sidebar" : "Hide sidebar", keys: "Alt+G", run: () => A.toggleSidebar() },
     { label: "Status line", checked: p.statusLine, run: () => A.toggleStatusLine() },
     ...(accountProfilesSupported.value
       ? [{ label: "Claude profiles…", run: () => (overlay.value = { kind: "account_profiles" }) }]

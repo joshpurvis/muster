@@ -735,6 +735,8 @@ export interface Note {
   updated_by: NoteAuthor;
   /** The window showing its tab; null while closed. */
   window_id: WindowId | null;
+  /** Channel whose workspace holds this note. Missing on pre-channel backends. */
+  channel_id?: ChannelId | null;
   /** Shown beside this session when it first appears (`note_open`). */
   beside: SessionId | null;
   /** Raised by every change (text, title, window): the newer record wins. */

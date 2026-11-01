@@ -539,6 +539,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agent_messages ADD COLUMN answer TEXT;
     CREATE INDEX agent_messages_answered ON agent_messages(id) WHERE answer IS NOT NULL;
     "#,
+    // v26: notes belong to channel workspaces. The UI migrates legacy notes from their tile
+    // placement; notes made by agents can already inherit the opener's channel.
+    r#"
+    ALTER TABLE notes ADD COLUMN channel_id INTEGER;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -786,7 +791,8 @@ impl Store {
         let by: String = r.get(6)?;
         Ok(Note { id: r.get(0)?, title: r.get(1)?, body: r.get(2)?, rev: r.get(3)?, created_at: r.get(4)?,
             updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
-            window_id: r.get(7)?, beside: r.get(8)?, version: r.get(9)?, triggers: r.get::<_, i64>(10)? != 0 })
+            window_id: r.get(7)?, beside: r.get(8)?, version: r.get(9)?, triggers: r.get::<_, i64>(10)? != 0,
+            channel_id: r.get(11)? })
     }
 
     /// Every note without its text: sizes and a preview are worked out by SQLite, so only the
@@ -796,7 +802,7 @@ impl Store {
         let mut q = conn.prepare("SELECT id,title,rev,version,created_at,updated_at,updated_by,window_id,beside,
             length(CAST(body AS BLOB)),
             CASE WHEN body = '' THEN 0 ELSE length(body) - length(replace(body, char(10), '')) + (substr(body, -1) != char(10)) END,
-            substr(body, 1, 240), triggers
+            substr(body, 1, 240), triggers, channel_id
             FROM notes ORDER BY id")?;
         let rows = q.query_map([], |r| {
             let by: String = r.get(6)?;
@@ -805,7 +811,7 @@ impl Store {
             Ok(NoteSummary { id: r.get(0)?, title: r.get(1)?, rev: r.get(2)?, version: r.get(3)?, created_at: r.get(4)?,
                 updated_at: r.get(5)?, updated_by: serde_json::from_str(&by).unwrap_or_else(|_| NoteAuthor::human()),
                 window_id, beside: r.get(8)?, open: window_id.is_some(), bytes: r.get(9)?, lines: r.get(10)?,
-                preview: preview(&head), triggers: r.get::<_, i64>(12)? != 0 })
+                preview: preview(&head), triggers: r.get::<_, i64>(12)? != 0, channel_id: r.get(13)? })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -822,7 +828,7 @@ impl Store {
 
     pub fn load_note(&self, id: NoteId) -> anyhow::Result<Option<Note>> {
         Ok(self.conn.lock().query_row(
-            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside,version,triggers FROM notes WHERE id=?1",
+            "SELECT id,title,body,rev,created_at,updated_at,updated_by,window_id,beside,version,triggers,channel_id FROM notes WHERE id=?1",
             [id], Self::note_row).optional()?)
     }
 
@@ -833,18 +839,18 @@ impl Store {
     /// Insert `note`; its id is assigned here.
     pub fn create_note(&self, note: &mut Note) -> anyhow::Result<()> {
         let conn = self.conn.lock();
-        conn.execute("INSERT INTO notes(title,body,rev,created_at,updated_at,updated_by,window_id,beside,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        conn.execute("INSERT INTO notes(title,body,rev,created_at,updated_at,updated_by,window_id,beside,version,channel_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![note.title, note.body, note.rev, note.created_at, note.updated_at,
-                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version])?;
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version, note.channel_id])?;
         note.id = conn.last_insert_rowid();
         Ok(())
     }
 
     pub fn save_note(&self, note: &Note) -> anyhow::Result<()> {
         let n = self.conn.lock().execute(
-            "UPDATE notes SET title=?2,body=?3,rev=?4,updated_at=?5,updated_by=?6,window_id=?7,beside=?8,version=?9 WHERE id=?1",
+            "UPDATE notes SET title=?2,body=?3,rev=?4,updated_at=?5,updated_by=?6,window_id=?7,beside=?8,version=?9,channel_id=?10 WHERE id=?1",
             params![note.id, note.title, note.body, note.rev, note.updated_at,
-                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version])?;
+                serde_json::to_string(&note.updated_by)?, note.window_id, note.beside, note.version, note.channel_id])?;
         anyhow::ensure!(n == 1, "note {} not found", note.id);
         Ok(())
     }
@@ -2339,6 +2345,21 @@ impl Store {
                 i.last_turn_at
             ],
         )?;
+        Ok(())
+    }
+
+    /// Channel membership and owned panel records commit together. Panel events keep their
+    /// panel ids and delivery state; no content, process settings or permission flags change.
+    pub fn move_session_channel(&self, id: SessionId, channel: ChannelId, panels: &[Panel]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        anyhow::ensure!(tx.execute("UPDATE sessions SET channel_id=?2 WHERE id=?1", params![id, channel])? == 1,
+            "no such session: {id}");
+        for p in panels {
+            anyhow::ensure!(tx.execute("UPDATE panels SET channel_id=?2,record=?3 WHERE id=?1",
+                params![p.id, channel, serde_json::to_string(p)?])? == 1, "panel {} disappeared", p.id);
+        }
+        tx.commit()?;
         Ok(())
     }
 

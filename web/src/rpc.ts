@@ -157,9 +157,9 @@ class Rpc {
       this.track(id, "hello").then((h) => {
         if (this.ws !== ws) return;
         const hello = h as HelloResult;
-        // Legacy backends speak v1. Explicit incompatible versions must not receive
+        // Channel workspaces need v2. Incompatible versions must not receive
         // queued actions or binary input from an already-open UI after an update.
-        if ((hello.ui_protocol ?? 1) !== 1) {
+        if ((hello.ui_protocol ?? 1) !== 2) {
           this.protocolMismatch = true;
           this.suspend();
           connStatus.value = "incompatible";

@@ -218,14 +218,18 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
         "note.create" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
             struct P { #[serde(default)] title: Option<String>, #[serde(default)] body: String,
-                #[serde(default)] window_id: Option<WindowId>, #[serde(default)] from_session: Option<SessionId> }
+                #[serde(default)] window_id: Option<WindowId>, #[serde(default)] from_session: Option<SessionId>,
+                #[serde(default)] channel_id: Option<ChannelId> }
             let p: P = parse(params)?;
             if let Some(s) = agent_session(hub, p.from_session)? {
                 let mut n = agent_note(hub, s, "note_write", json!({"title": p.title, "text": p.body})).await?;
                 if let Some(w) = p.window_id { n = crate::notes::open(hub, n.id, w, None)?; }
+                if let Some(c) = p.channel_id { n = crate::notes::set_channel(hub, n.id, c, None)?; }
                 return to_value(n);
             }
-            to_value(crate::notes::create(hub, p.title.as_deref(), &p.body, crate::notes::author(hub, p.from_session)?, p.window_id, None)?)
+            let channel = p.channel_id.or_else(|| p.from_session.and_then(|id| hub.session(id)).map(|s| s.channel_id));
+            to_value(crate::notes::create_in_channel(hub, p.title.as_deref(), &p.body,
+                crate::notes::author(hub, p.from_session)?, p.window_id, None, channel)?)
         }
         "note.write" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
@@ -267,6 +271,12 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
         "note.close" => {
             let p: IdParam<NoteId> = parse(params)?;
             to_value(crate::notes::close(hub, p.id)?)
+        }
+        "note.set_channel" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: NoteId, channel_id: ChannelId, #[serde(default)] version: Option<i64> }
+            let p: P = parse(params)?;
+            to_value(crate::notes::set_channel(hub, p.id, p.channel_id, p.version)?)
         }
         "note.delete" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
@@ -605,9 +615,15 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
                 /// Refuse unless the session is still in this channel (stale-view guard).
                 #[serde(default)]
                 from_channel_id: Option<ChannelId>,
+                #[serde(default)]
+                move_panels: bool,
             }
             let p: P = parse(params)?;
-            let (info, from) = hub.move_session_from(p.id, p.channel_id, p.from_channel_id)?;
+            let (info, from) = if p.move_panels {
+                hub.move_session_bundle(p.id, p.channel_id, p.from_channel_id, true)?
+            } else {
+                hub.move_session_from(p.id, p.channel_id, p.from_channel_id)?
+            };
             if p.close_empty_source && from != p.channel_id {
                 hub.archive_if_empty(from)?;
             }

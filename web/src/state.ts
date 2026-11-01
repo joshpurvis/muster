@@ -1,5 +1,5 @@
 // App state as signals. Server state is replaced/merged from hello + ServerEvents; this window's
-// layout (its split tree of groups) is owned here and saved with window.set_layout; UI prefs
+// channel layouts and sidebar are owned here and saved with window.set_layout; UI prefs
 // persist to localStorage.
 
 import { batch, computed, effect, signal } from "@preact/signals";
@@ -39,15 +39,15 @@ import {
   findPane,
   type LayoutState,
   type PaneNode,
-  parseLayout,
   noteId,
   noteTab,
   panelTab,
   panelId,
-  placeBeside,
-  placePanel,
-  reconcile,
 } from "./layout/tree.ts";
+import {
+  changeChannelLayout, loadChannelLayout, reconcileChannels, savedChannel,
+  type SidebarState, type TabHome, type WindowLayoutState,
+} from "./layout/channels.ts";
 import {
   confirmAfterFocus,
   confirmAfterUpsert,
@@ -525,8 +525,8 @@ export const BUSY_STATES = new Set<AgentState>(["working", "starting", "needs_ap
 /** Alt has been held on its own for a moment (the focused strip shows its Alt+1..9 numbers). */
 export const altHeld = signal(false);
 
-/** The inline rename in tab `sid`: the names it shows (`fields`, as they were when it opened), of
- * task `channel` (null when the task is unknown) and session `sid`. `from`: where it was opened
+/** The inline rename in tab `sid`: its session name when editing started. `channel` is retained
+ * only to cancel if the channel disappears. `from`: where it was opened
  * (its tab, or its terminal), where the keyboard goes back to when it closes. */
 export const renaming = signal<
   { sid: SessionId; channel: ChannelId | null; fields: RenameFields; from: "tab" | "terminal" } | null
@@ -534,8 +534,16 @@ export const renaming = signal<
 
 // ---------------- the window's layout (groups) ----------------
 
-/** This window's split tree of groups. Null until the window is known. */
-export const layout = signal<LayoutState | null>(null);
+/** Every channel's layout in this window. Only the active one is rendered. */
+export const channelLayout = signal<WindowLayoutState | null>(null);
+export const activeChannelId = computed(() => channelLayout.value?.active ?? null);
+export const activeChannel = computed(() => channelById.value.get(activeChannelId.value ?? -1) ?? null);
+const vacantLayout = emptyLayout();
+/** Existing tile controls operate on the selected channel. */
+export const layout = computed<LayoutState | null>(() => {
+  const s = channelLayout.value;
+  return s ? (s.active === null ? vacantLayout : s.layouts[s.active] ?? vacantLayout) : null;
+});
 /** The window `layout` belongs to (undefined: none built yet; null: no window support). */
 let layoutOwner: WindowId | null | undefined = undefined;
 
@@ -558,8 +566,53 @@ effect(() => {
   if (f !== null && (!l || l.focus !== f || !findPane(l.root, f))) fullscreen.value = null;
 });
 
-/** This window shows the agents panel (kept in its layout, like zoom). */
-export const agentsPanelOpen = computed(() => !!layout.value?.agents);
+export const agentsPanelOpen = computed(() => !!channelLayout.value?.sidebar.agents);
+export const sidebarHidden = computed(() => !!channelLayout.value?.sidebar.hidden);
+export const channelsPanelOpen = computed(() => !!channelLayout.value?.sidebar.channels);
+
+export function updateSidebar(change: Partial<SidebarState>) {
+  const s = channelLayout.peek();
+  if (s) channelLayout.value = { ...s, sidebar: { ...s.sidebar, ...change } };
+}
+
+/** Channels whose default window is here, or with a tab here (including panels and notes). */
+export const windowChannels = computed(() => {
+  const ids = new Set([
+    ...windowSessions.value.map((s) => s.channel_id),
+    ...windowPanels.value.map((p) => p.channel_id),
+    ...windowNotes.value.flatMap((n) => n.channel_id == null ? [] : [n.channel_id]),
+  ]);
+  return channels.value.filter((c) => !c.archived &&
+    (!windowsSupported.value || c.window_id === windowId.value || ids.has(c.id)))
+    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
+});
+
+export function tabChannel(tab: number): number | null {
+  const sid = sessions.peek().get(tab)?.channel_id;
+  const pid = panelId(tab);
+  const nid = noteId(tab);
+  const n = nid === null ? null : notes.peek().get(nid);
+  const direct = sid ?? (pid === null ? null : panels.peek().get(pid)?.channel_id) ?? n?.channel_id;
+  if (direct != null && channelById.peek().has(direct)) return direct;
+  const s = channelLayout.peek();
+  return s ? savedChannel(s, tab) : null;
+}
+
+export function selectChannel(id: number) {
+  const s = channelLayout.peek();
+  if (!s || (id !== 0 && !windowChannels.peek().some((c) => c.id === id))) return;
+  batch(() => {
+    fullscreen.value = null;
+    renaming.value = null;
+    confirmClose.value = null;
+    channelLayout.value = {
+      ...s, active: id, layouts: { ...s.layouts, [id]: s.layouts[id] ?? emptyLayout() },
+    };
+  });
+}
+
+/** All tabs still belong to the window; only these participate in its visible split tree. */
+export const visibleIds = computed(() => new Set(layout.value ? allSessions(layout.value.root) : []));
 
 export const focusedGroup = computed((): PaneNode | null => {
   const l = layout.value;
@@ -579,7 +632,7 @@ export const focusedTask = computed((): Channel | null => {
   const tab = focusedGroup.value?.active;
   const id = tab == null ? null : panelId(tab);
   const p = id === null ? null : panels.value.get(id);
-  return channelById.value.get(s?.channel_id ?? p?.channel_id ?? -1) ?? null;
+  return channelById.value.get(s?.channel_id ?? p?.channel_id ?? activeChannelId.value ?? -1) ?? null;
 });
 
 export const focusedTabId = computed(() => focusedGroup.value?.active ?? null);
@@ -612,27 +665,15 @@ export function releaseNewSessions() {
   if (holds === 0 && held.peek().size) held.value = new Set();
 }
 
-/** Session ids the layout shows: this window's, minus held ones, in joining order. */
-const liveIds = computed(() => [...hereIds.value].filter((id) => !held.value.has(id)));
-
-function reconcileTabs(s: LayoutState, ids: number[]): LayoutState {
-  // Panels, and notes an agent showed beside itself, go beside their opener; the rest join the
-  // focused group.
-  const beside = (id: number) => {
-    const n = noteId(id);
-    return n !== null && notes.peek().get(n)?.beside != null;
-  };
-  const terminalIds = ids.filter((id) => panelId(id) === null && !beside(id));
-  const existing = allSessions(s.root).filter((id) => ids.includes(id));
-  let next = reconcile(s, [...new Set([...terminalIds, ...existing])]);
-  for (const p of windowPanels.peek()) {
-    if (ids.includes(panelTab(p.id))) next = placePanel(next, p.id, p.session_id);
-  }
-  for (const n of windowNotes.peek()) {
-    if (n.beside != null && ids.includes(noteTab(n.id))) next = placeBeside(next, noteTab(n.id), n.beside);
-  }
-  return next;
-}
+const liveTabs = computed((): TabHome[] => {
+  const valid = (id: number | null | undefined) => id != null && channelById.value.has(id) ? id : null;
+  return [
+    ...windowSessions.value.map((s) => ({ id: s.id, channel: s.channel_id })),
+    ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
+    ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
+      channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
+  ].filter((t) => !held.value.has(t.id));
+});
 
 /** The session ids of the layout in on-screen order (groups, then their strips). */
 export const layoutOrder = computed(() => (layout.value ? allSessions(layout.value.root) : []));
@@ -648,24 +689,27 @@ effect(() => {
  * Change the layout. `fn` gets the current one; the result is reconciled with this window's
  * sessions. `place` names sessions the change puts on screen: they stop being held first.
  */
-export function updateLayout(fn: (l: LayoutState) => LayoutState, place: SessionId[] = []) {
-  const cur = layout.peek();
-  if (!cur) return;
+export function updateLayout(
+  fn: (l: LayoutState) => LayoutState,
+  place: SessionId[] = [],
+  channel: number | null = activeChannelId.peek(),
+) {
+  const cur = channelLayout.peek();
+  if (!cur || channel === null) return;
   batch(() => {
     if (place.some((id) => held.peek().has(id))) {
       const h = new Set(held.peek());
       for (const id of place) h.delete(id);
       held.value = h;
     }
-    const next = reconcileTabs(fn(cur), liveIds.peek());
-    if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
+    const next = reconcileChannels(changeChannelLayout(cur, channel, fn),
+      windowChannels.peek().map((c) => c.id), liveTabs.peek());
+    if (JSON.stringify(next) !== JSON.stringify(cur)) channelLayout.value = next;
   });
 }
 
 /**
- * Build this window's layout when the window becomes known (or changes): the one the daemon
- * stored (`Window.layout`), else, for a window that has none yet (first v2 run, or a daemon
- * without it), one group holding all its sessions.
+ * Load the window envelope, or migrate its legacy split tree into separate channel layouts.
  */
 effect(() => {
   if (!helloDone.value) return;
@@ -675,21 +719,21 @@ effect(() => {
   const owner = supported ? id : null;
   if (layoutOwner === owner) return;
   const w = supported ? myWindow.peek() : null;
-  const stored = w?.layout ? parseLayout(w.layout) : null;
+  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), liveTabs.peek());
   layoutOwner = owner;
-  lastSaved = stored ? JSON.stringify(w!.layout) : "";
+  lastSaved = w?.layout ? JSON.stringify(w.layout) : "";
   clearTimeout(saveTimer);
-  layout.value = reconcileTabs(stored ?? emptyLayout([]), liveIds.peek());
+  channelLayout.value = stored;
 });
 
-// Every change to this window's sessions reconciles the layout: new ones join the focused group,
-// gone ones leave (a focused group that empties hands focus to its neighbour), empty groups close.
+// Reconcile every channel, including background channels: arrivals join their own workspace.
 effect(() => {
-  const ids = liveIds.value;
-  const cur = layout.peek();
+  const tabs = liveTabs.value;
+  const ids = windowChannels.value.map((c) => c.id);
+  const cur = channelLayout.peek();
   if (!cur) return;
-  const next = reconcileTabs(cur, ids);
-  if (JSON.stringify(next) !== JSON.stringify(cur)) layout.value = next;
+  const next = reconcileChannels(cur, ids, tabs);
+  if (JSON.stringify(next) !== JSON.stringify(cur)) channelLayout.value = next;
 });
 
 // Save the layout (debounced). The daemon doesn't echo it back; daemons without
@@ -701,7 +745,7 @@ let setLayoutMissing = false;
 let saving: Promise<unknown> | null = null;
 
 function saveLayout(id: WindowId): Promise<unknown> {
-  const cur = layout.peek();
+  const cur = channelLayout.peek();
   if (!cur || windowId.peek() !== id || layoutOwner !== id) return saving ?? Promise.resolve();
   const json = JSON.stringify(cur);
   // Already sent: done once that call is.
@@ -718,7 +762,7 @@ function saveLayout(id: WindowId): Promise<unknown> {
 }
 
 effect(() => {
-  const l = layout.value;
+  const l = channelLayout.value;
   const id = windowId.value;
   if (!l || id === null || !windowsSupported.value || setLayoutMissing || layoutOwner !== id) return;
   clearTimeout(saveTimer);
@@ -732,6 +776,27 @@ export function saveLayoutNow(): Promise<unknown> {
   if (id === null || !windowsSupported.peek() || setLayoutMissing) return saving ?? Promise.resolve();
   return saveLayout(id);
 }
+
+// Persist migrated notes' inferred homes. The saved layout already protects their placement if
+// a reload interrupts this backfill. Version checks prevent it from undoing a concurrent move.
+const noteHomeAttempts = new Map<number, string>();
+effect(() => {
+  const s = channelLayout.value;
+  const epoch = helloEpoch.value;
+  if (!s) return;
+  for (const n of windowNotes.value) {
+    if (n.channel_id != null) continue;
+    const home = savedChannel(s, noteTab(n.id));
+    if (home === null || home === 0 || !channelById.value.has(home)) continue;
+    const attempt = `${epoch}:${n.version}:${home}`;
+    if (noteHomeAttempts.get(n.id) === attempt) continue;
+    noteHomeAttempts.set(n.id, attempt);
+    rpc.call<import("./types.ts").Note>("note.set_channel", { id: n.id, channel_id: home, version: n.version })
+      .then(applyNoteUpsert).catch((e) => {
+        if (!/changed/.test(String(e))) toast("error", `Couldn't save the channel for ${n.title}: ${String(e)}`);
+      });
+  }
+});
 
 // ---------------- server event handling ----------------
 

@@ -139,15 +139,23 @@ fn window_exists(hub: &Hub, window: WindowId) -> anyhow::Result<()> {
 /// A new note, shown in `window` (beside session `beside`) when given. No title: "Note <id>".
 pub fn create(hub: &Hub, title_in: Option<&str>, body: &str, by: NoteAuthor, window: Option<WindowId>,
     beside: Option<SessionId>) -> anyhow::Result<Note> {
+    let channel = beside.or(by.session_id).and_then(|id| hub.session(id)).map(|s| s.channel_id);
+    create_in_channel(hub, title_in, body, by, window, beside, channel)
+}
+
+pub fn create_in_channel(hub: &Hub, title_in: Option<&str>, body: &str, by: NoteAuthor,
+    window: Option<WindowId>, beside: Option<SessionId>, channel: Option<ChannelId>) -> anyhow::Result<Note> {
     let named = title_in.filter(|t| !t.trim().is_empty()).map(title).transpose()?;
     let body = clean(body);
     check_size(&body)?;
     if let Some(w) = window { window_exists(hub, w)?; }
+    if let Some(c) = channel { channel_exists(hub, c)?; }
     let _g = hub.notes.lock.lock();
     ensure!(hub.store().count_notes()? < MAX_NOTES, "Muster already has {MAX_NOTES} notes; delete some first");
     let now = now_ms();
     let mut n = Note { id: 0, title: named.clone().unwrap_or_else(|| "Note".into()), body, rev: 1, created_at: now,
-        updated_at: now, updated_by: by, window_id: window, beside: window.and(beside), version: 1, triggers: false };
+        updated_at: now, updated_by: by, window_id: window, channel_id: channel,
+        beside: window.and(beside), version: 1, triggers: false };
     hub.store().create_note(&mut n)?;
     if named.is_none() {
         n.title = format!("Note {}", n.id);
@@ -239,9 +247,28 @@ pub fn open(hub: &Hub, id: NoteId, window: WindowId, beside: Option<SessionId>) 
     window_exists(hub, window)?;
     let _g = hub.notes.lock.lock();
     let mut n = get(hub, id)?;
-    if n.window_id == Some(window) && (beside.is_none() || n.beside == beside) { return Ok(n) }
+    let channel = beside.and_then(|id| hub.session(id)).map(|s| s.channel_id).or(n.channel_id);
+    if n.window_id == Some(window) && (beside.is_none() || n.beside == beside) && n.channel_id == channel { return Ok(n) }
     n.window_id = Some(window);
     n.beside = beside;
+    n.channel_id = channel;
+    save(hub, n)
+}
+
+fn channel_exists(hub: &Hub, id: ChannelId) -> anyhow::Result<()> {
+    ensure!(hub.channel(id).is_some_and(|c| !c.archived), "channel {id} is archived or missing");
+    Ok(())
+}
+
+/// Move a note between workspaces without changing its text, window or trigger permission.
+pub fn set_channel(hub: &Hub, id: NoteId, channel: ChannelId, version: Option<i64>) -> anyhow::Result<Note> {
+    channel_exists(hub, channel)?;
+    let _g = hub.notes.lock.lock();
+    let mut n = get(hub, id)?;
+    if let Some(v) = version { ensure!(n.version == v, "note {id} changed; try moving it again"); }
+    if n.channel_id == Some(channel) { return Ok(n) }
+    n.channel_id = Some(channel);
+    n.beside = None;
     save(hub, n)
 }
 
@@ -344,6 +371,32 @@ mod tests {
         store.insert_session(&StoredSession { info, extra_args: vec![] }).unwrap();
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
             muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
+    }
+
+    #[test]
+    fn note_channel_membership_is_durable_and_moves_are_version_guarded() {
+        let hub = fixture();
+        let n = create(&hub, Some("Legacy"), "keep my draft", NoteAuthor::human(), Some(1), None).unwrap();
+        assert_eq!(n.channel_id, None);
+        assert!(set_channel(&hub, n.id, 99, Some(n.version)).is_err());
+        let moved = set_channel(&hub, n.id, 1, Some(n.version)).unwrap();
+        assert_eq!((moved.channel_id, moved.window_id, moved.rev), (Some(1), Some(1), n.rev));
+        assert_eq!(moved.body, "keep my draft");
+        assert_eq!(list(&hub).unwrap()[0].channel_id, Some(1));
+        assert_eq!(hub.store().load_note(n.id).unwrap().unwrap().channel_id, Some(1));
+        assert!(set_channel(&hub, n.id, 1, Some(n.version)).unwrap_err().to_string().contains("changed"));
+        assert_eq!(close(&hub, n.id).unwrap().channel_id, Some(1));
+        assert_eq!(open(&hub, n.id, 1, None).unwrap().channel_id, Some(1));
+        assert!(create_in_channel(&hub, None, "", NoteAuthor::human(), Some(1), None, Some(99)).is_err());
+    }
+
+    #[test]
+    fn notes_opened_by_agents_inherit_their_channel() {
+        let hub = fixture();
+        let n = create(&hub, None, "", author(&hub, Some(1)).unwrap(), None, None).unwrap();
+        assert_eq!(n.channel_id, Some(1));
+        let legacy = create(&hub, None, "", NoteAuthor::human(), None, None).unwrap();
+        assert_eq!(open(&hub, legacy.id, 1, Some(1)).unwrap().channel_id, Some(1));
     }
 
     #[test]

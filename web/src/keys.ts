@@ -197,14 +197,14 @@ export const commands: Command[] = [
   },
   {
     id: "new-worktree-tab",
-    title: "New worktree tab",
+    title: "New worktree channel",
     group: "Tab",
     keys: ["Ctrl+Shift+N"],
     run: () => A.newTabHere({ worktree: true }),
   },
   {
     id: "new-tab-dialog",
-    title: "New tab…",
+    title: "New channel…",
     group: "Tab",
     keys: ["Alt+Shift+N"],
     run: () => A.newTabDialog(),
@@ -416,12 +416,25 @@ export const commands: Command[] = [
     run: () => (overlay.value = { kind: "shutdown" }),
   },
 
-  // Agents
+  // Sidebar
+  {
+    id: "sidebar",
+    title: "Toggle sidebar",
+    group: "Window",
+    keys: ["Alt+G"],
+    run: () => A.toggleSidebar(),
+  },
+  {
+    id: "channels-panel",
+    title: "Toggle channels panel",
+    group: "Window",
+    run: () => A.toggleChannelsPanel(),
+  },
   {
     id: "agents-panel",
     title: "Toggle agents panel",
     group: "Agents",
-    keys: ["Alt+G"],
+    keys: ["Alt+Shift+G"],
     run: () => A.toggleAgentsPanel(),
   },
   {
@@ -659,7 +672,7 @@ function pendingHere(sid: number): boolean {
 // starts, approves, interrupts or types into anything. Close closes that panel itself.
 const PANEL_COMMANDS = new Set([
   "jump", "palette", "next-needs-you", "next-tab", "prev-tab", "move-tab-left", "move-tab-right",
-  "close-tab", "agents-panel", "zoom", "fullscreen", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
+  "close-tab", "sidebar", "agents-panel", "zoom", "fullscreen", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
   ...["left", "right", "up", "down"].map((d) => `focus-${d}`),
 ]);
 const panelBindings = () => bindings.filter((b) => PANEL_COMMANDS.has(b.cmd.id));

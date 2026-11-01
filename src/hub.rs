@@ -2469,7 +2469,7 @@ impl Hub {
     }
 
     /// `window.claim` for connection `conn`: with `id`, that window (created if missing);
-    /// else the lowest-id window with tabs (sessions) that nobody holds, else a new one.
+    /// else the lowest-id window with tabs or durable channels that nobody holds, else a new one.
     /// Releases the connection's previous window and adopts channels and sessions without a
     /// (live) window.
     pub fn claim_window(&self, conn: u64, id: Option<WindowId>) -> anyhow::Result<Window> {
@@ -2489,6 +2489,7 @@ impl Hub {
                         .windows
                         .iter()
                         .find(|(wid, w)| w.holder.is_none() && (has_sessions(&g, **wid)
+                            || g.channels.values().any(|c| !c.archived && c.window_id == Some(**wid))
                             || self.store.load_panels().is_ok_and(|ps| ps.iter().any(|p| !p.closed && p.window_id == Some(**wid)))))
                         .map(|(wid, _)| *wid);
                     match free {
@@ -3866,19 +3867,12 @@ impl Hub {
         self.agents.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;
-        // A task closes with its last session (worktree kept). Checked and closed under one
-        // lock, so a session spawned or moved into it meanwhile keeps it open. A task being
-        // archived is already marked, so this is a no-op there.
-        let closed = self.archive_if_empty(cid).unwrap_or_else(|e| {
-            tracing::warn!(channel = cid, "closing emptied task: {e}");
-            false
-        });
+        // A channel is a durable workspace: closing its last terminal leaves the channel,
+        // its panels and notes intact. Only an explicit archive/close_if_empty removes it.
         let mut events = Vec::new();
         {
             let mut g = self.inner.lock();
-            if !closed {
-                self.task_follows_locked(&mut g, cid, None, &mut events);
-            }
+            self.task_follows_locked(&mut g, cid, None, &mut events);
             if let Some(w) = entry.info.window_id {
                 self.drop_if_unused_locked(&mut g, w, &mut events);
             }
@@ -3886,7 +3880,7 @@ impl Hub {
                 self.emit(ev);
             }
         }
-        if !closed {
+        if self.sessions().iter().any(|s| s.channel_id == cid) {
             // A removed session's title no longer names the channel: rebuild from the rest.
             {
                 let mut g = self.inner.lock();
@@ -4077,6 +4071,21 @@ impl Hub {
         channel_id: ChannelId,
         expect_from: Option<ChannelId>,
     ) -> anyhow::Result<(SessionInfo, ChannelId)> {
+        self.move_session_bundle(id, channel_id, expect_from, false)
+    }
+
+    /// The desktop's Move to channel also moves the session's panel apps, atomically. The
+    /// ordinary API move retains its historic behavior (old panel waits become invalid).
+    pub fn move_session_bundle(
+        &self,
+        id: SessionId,
+        channel_id: ChannelId,
+        expect_from: Option<ChannelId>,
+        move_panels: bool,
+    ) -> anyhow::Result<(SessionInfo, ChannelId)> {
+        if move_panels {
+            anyhow::ensure!(self.agents().by_session(id).is_none(), "named agents keep their own channel");
+        }
         // Panel waits and panel prompts check their task under this lock: none can act for the
         // old task once the move is visible.
         let _panels = self.panels.operations.lock();
@@ -4113,7 +4122,19 @@ impl Hub {
             }
             let mut next = e.info.clone();
             next.channel_id = channel_id;
-            self.store.update_session(&next)?;
+            let moved_panels = if move_panels {
+                let all = self.store.load_panels()?;
+                let mut moved: Vec<_> = all.iter().filter(|p| p.session_id == id && p.channel_id == from).cloned().collect();
+                anyhow::ensure!(all.iter().filter(|p| !p.closed && p.channel_id == channel_id).count()
+                    + moved.iter().filter(|p| !p.closed).count() <= crate::panels::MAX_OPEN_PER_TASK,
+                    "the destination channel would have too many open panels; close a panel first");
+                for p in &mut moved { p.channel_id = channel_id; }
+                self.store.move_session_channel(id, channel_id, &moved)?;
+                moved
+            } else {
+                self.store.update_session(&next)?;
+                vec![]
+            };
             e.info = next.clone();
             for cid in [from, channel_id] {
                 let t = titles_of(&g, cid);
@@ -4121,6 +4142,7 @@ impl Hub {
             }
             // Both tasks' windows follow their sessions, as after `session.set_window`.
             let mut events = vec![ServerEvent::SessionUpserted(next.clone())];
+            events.extend(moved_panels.into_iter().map(ServerEvent::PanelUpserted));
             for cid in [from, channel_id] {
                 self.task_follows_locked(&mut g, cid, next.window_id, &mut events);
             }
@@ -4972,6 +4994,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interactive_terminal_does_not_inherit_reload_commands_color_overrides() {
+        let mut env: BTreeMap<String, String> = [
+            ("TERM", "dumb"), ("COLORTERM", ""), ("NO_COLOR", "1"),
+            ("FORCE_COLOR", "0"), ("CLICOLOR", "0"), ("CLICOLOR_FORCE", "0"),
+            ("CLAUDECODE", "1"), ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
+        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        prepare_terminal_env(&mut env);
+        assert_eq!(env, [
+            ("TERM", "xterm-256color"), ("COLORTERM", "truecolor"),
+            ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
+        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect());
+    }
+
+    #[test]
     fn titles_are_cleaned() {
         let c = SessionKind::Claude;
         assert_eq!(clean_title("✳ Fix the auth bug", c).as_deref(), Some("Fix the auth bug"));
@@ -4993,20 +5029,6 @@ mod tests {
         }
         // Mail-like words elsewhere are fine; long titles are capped.
         assert_eq!(clean_title("ask bob@example.com", c).as_deref(), Some("ask bob@example.com"));
-    #[test]
-    fn interactive_terminal_does_not_inherit_reload_commands_color_overrides() {
-        let mut env: BTreeMap<String, String> = [
-            ("TERM", "dumb"), ("COLORTERM", ""), ("NO_COLOR", "1"),
-            ("FORCE_COLOR", "0"), ("CLICOLOR", "0"), ("CLICOLOR_FORCE", "0"),
-            ("CLAUDECODE", "1"), ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
-        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
-        prepare_terminal_env(&mut env);
-        assert_eq!(env, [
-            ("TERM", "xterm-256color"), ("COLORTERM", "truecolor"),
-            ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
-        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect());
-    }
-
         let long = "word ".repeat(30);
         assert_eq!(clean_title(&long, c).unwrap().chars().count(), NAME_MAX - 1);
         assert!(clean_title("x\u{7}y", c).is_some_and(|t| t == "xy"));
@@ -6051,7 +6073,7 @@ mod tests {
     }
 
     #[test]
-    fn last_session_closes_the_task() {
+    fn last_session_leaves_a_durable_channel() {
         let hub = move_fixture();
         let mut rx = hub.subscribe();
         hub.remove_session(1).unwrap();
@@ -6059,13 +6081,17 @@ mod tests {
         // The removed shell's title no longer names the task.
         assert_eq!(drain(&mut rx), ["-s1", "c1@w1"]);
         hub.remove_session(2).unwrap();
-        assert!(hub.channel(1).unwrap().archived);
-        assert!(hub.store.load_channels().unwrap()[0].archived);
-        // Window 1 keeps task 2, which has no sessions and isn't closed by any of this.
-        assert_eq!(drain(&mut rx), ["-s2", "-c1", "w1"]);
+        assert!(!hub.channel(1).unwrap().archived);
+        assert!(!hub.store.load_channels().unwrap()[0].archived);
+        // Both empty workspaces stay in their window, including across a backend restart.
+        assert_eq!(drain(&mut rx), ["-s2"]);
         assert!(!hub.channel(2).unwrap().archived);
         let w = hub.window(1).unwrap();
-        assert_eq!(w.channel_ids, vec![2]);
+        assert_eq!(w.channel_ids, vec![1, 2]);
+        // Reopening without an explicit id must restore this window even with no terminals.
+        hub.claim_window(7, Some(1)).unwrap();
+        hub.release_windows(7);
+        assert_eq!(hub.claim_window(8, None).unwrap().id, 1);
     }
 
     #[test]
@@ -6080,7 +6106,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_emptied_by_a_move_waits_for_a_removal() {
+    fn a_channel_emptied_by_a_move_or_removal_stays_open() {
         let hub = move_fixture();
         // Moving both sessions into task 2 empties task 1 but doesn't close it (the client
         // does, with `close_empty_source`); removing one of them later leaves task 2 open.
@@ -6089,9 +6115,9 @@ mod tests {
         assert!(!hub.channel(1).unwrap().archived);
         hub.remove_session(1).unwrap();
         assert!(!hub.channel(2).unwrap().archived);
-        // Its last one: closed.
+        // Its last one: the workspace still remains.
         hub.remove_session(2).unwrap();
-        assert!(hub.channel(2).unwrap().archived);
+        assert!(!hub.channel(2).unwrap().archived);
         assert!(!hub.channel(1).unwrap().archived);
     }
 

@@ -344,7 +344,7 @@ function claim(ws: WebSocket, id?: number): Win {
   let w: Win | undefined;
   if (id !== undefined) w = windows.find((x) => x.id === id) ?? newWindow(id);
   else {
-    w = windows.find((x) => !x.open && hasTabs(x)) ?? newWindow();
+    w = windows.find((x) => !x.open && (hasTabs(x) || x.channel_ids.length > 0)) ?? newWindow();
   }
   w.open = true;
   holding.set(ws, w.id);
@@ -1015,9 +1015,11 @@ function noteMethod(method: string, p: any): unknown {
       const body = cleanNote(p.body ?? "");
       if (body.length > NOTE_MAX) throw new Error("note text would be too long; the limit is 1 MiB");
       if (p.window_id != null && !winById(p.window_id)) throw new Error(`no window with id ${p.window_id}`);
+      if (p.channel_id != null && !channels.some((c) => c.id === p.channel_id && !c.archived)) throw new Error("channel is archived or missing");
       const id = ++noteSeq;
       const n: Note = { id, title: String(p.title ?? "").trim() || `Note ${id}`, body, rev: 1, created_at: now(), updated_at: now(),
-        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null, beside: null, version: 0, triggers: false };
+        updated_by: noteAuthor(p.from_session), window_id: p.window_id ?? null,
+        channel_id: p.channel_id ?? sessions.get(p.from_session)?.channel_id ?? null, beside: null, version: 0, triggers: false };
       notes.set(id, n);
       return saveNote(n);
     }
@@ -1069,6 +1071,15 @@ function noteMethod(method: string, p: any): unknown {
       if (!winById(w)) throw new Error(`no window with id ${w}`);
       n.window_id = w;
       n.beside = p.window_id == null && p.from_session !== undefined ? p.from_session : (p.beside ?? null);
+      if (n.beside != null) n.channel_id = sessions.get(n.beside)?.channel_id ?? n.channel_id;
+      return saveNote(n);
+    }
+    case "note.set_channel": {
+      const n = getNote(p.id);
+      if (!channels.some((c) => c.id === p.channel_id && !c.archived)) throw new Error("channel is archived or missing");
+      if (p.version != null && p.version !== n.version) throw new Error(`note ${n.id} changed; try moving it again`);
+      n.channel_id = p.channel_id;
+      n.beside = null;
       return saveNote(n);
     }
     case "note.close": {
@@ -1419,6 +1430,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       return {};
     case "hello":
       return {
+        ui_protocol: 2,
         version: "0.0.0-mock",
         workspaces,
         channels: channels.filter((c) => !c.archived),
@@ -1765,10 +1777,9 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       kill(p.id);
       sessions.delete(p.id);
       broadcast("session_removed", { id: p.id });
-      // A task closes with its last session (worktree kept); else its window follows its tabs.
+      // Channels persist after their last terminal closes.
       const c = channels.find((x) => x.id === s.channel_id);
-      const closed = (await handle("channel.close_if_empty", { id: s.channel_id }) as any).closed;
-      if (!closed) taskFollows(c);
+      taskFollows(c);
       removeWindowIfEmpty(winById(s.window_id));
       return {};
     }
@@ -1799,8 +1810,17 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         throw new Error(`session ${s.id} is no longer in channel ${p.from_channel_id} (now in ${from})`);
       }
       if (from !== c.id) {
+        if (p.move_panels && agentList.some((a) => a.session_id === s.id)) throw new Error("named agents keep their own channel");
         s.channel_id = c.id;
         upsert(s);
+        if (p.move_panels) for (const r of panels.values()) {
+          if (r.panel.session_id === s.id && r.panel.channel_id === from) {
+            r.panel.channel_id = c.id;
+            broadcast("panel_upserted", r.panel);
+          }
+        }
+        taskFollows(channels.find((x) => x.id === from));
+        taskFollows(c, s.window_id ?? undefined);
         if (p.close_empty_source) await handle("channel.close_if_empty", { id: from });
       }
       return s;

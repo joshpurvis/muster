@@ -63,6 +63,25 @@ export function closeMenu() {
   m?.onClose?.();
 }
 
+/** The same context menu by mouse, Menu key or Shift+F10. Text fields retain editing menus. */
+export function contextMenu(items: () => MenuItem[]) {
+  const editing = (e: Event) => (e.target as Element)?.closest?.("input,textarea,[contenteditable=true]");
+  return {
+    onContextMenu: (e: MouseEvent) => {
+      if (editing(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openMenu({ x: e.clientX, y: e.clientY, items: items() });
+    },
+    onKeyDown: (e: KeyboardEvent) => {
+      if (editing(e) || !(e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey))) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openMenuAt(e.target as Element, items(), { alignRight: false, select: 0 });
+    },
+  };
+}
+
 function isAction(it: MenuItem): it is Exclude<MenuItem, "sep" | { header: string }> {
   return it !== "sep" && !("header" in it);
 }

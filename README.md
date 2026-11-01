@@ -14,10 +14,10 @@ key press away, and the terminals keep running when the window closes.
 
 ## What you get
 
-- **A tiling window for agents.** Split the window into groups, each with its own tabs, and drag
-  tabs between groups and windows. Each tab is one task in a folder you pick, optionally in its
-  own git worktree (Ctrl+Shift+N). A shell opened next to an agent (Alt+D) works in the same
-  folder. Tabs name themselves from what the agent is doing.
+- **Channels for projects.** Channels sit above Agents in a split sidebar. Each has its own
+  tiles and tabs, so switching projects restores your arrangement. New tabs join the selected
+  channel; Alt+Shift+N creates another channel, optionally in its own worktree. Drag tabs
+  between tiles, channels and windows. Empty channels stay ready for your next session.
 - **You see who needs you.** Every tab has a state dot: working, idle, needs approval, asking a
   question, stuck, exited. A banner above a waiting agent's terminal has Approve, Always and Deny
   (Alt+A approves). Alt+J jumps to the next agent that needs you in any window, the status line
@@ -42,7 +42,7 @@ key press away, and the terminals keep running when the window closes.
   ![An agent's terminal on the left; on the right a PR decision panel for "Rate-limit failed logins per IP" with the verdict "Safe to merge: it slows down people guessing passwords, and the tests pass", a note that an approving review is still required, cards for the risk, the passing checks and the reviews, a plain summary of what changed, and Merge, Request changes, Ask, Skip and Hold buttons](docs/screenshots/pr-decision.png)
 
 - **Named agents that remember.** Give an agent a name, a persona and a folder of memory files,
-  and it resumes its conversation each time you start it. The agents panel (Alt+G) starts them,
+  and it resumes its conversation each time you start it. The agents panel (Alt+Shift+G) starts them,
   edits their persona and memory, and shows the messages agents send each other.
 
   ![The agents panel on the left listing four named agents with their states and the messages between them, a Claude agent's terminal in the middle, and a panel on the right with a bar chart of CI minutes per day, master builds against PR builds, under the agent's one-line finding and three headline numbers](docs/screenshots/agents-chart.png)
@@ -121,13 +121,15 @@ From there:
 
 | Keys | What it does |
 |---|---|
-| Alt+T | New tab in the same folder |
+| Alt+T | New tab in the selected channel |
 | Alt+D | Shell beside the current agent, in a new group |
-| Ctrl+Shift+N | New tab in its own git worktree |
+| Alt+Shift+N | New channel dialog |
+| Ctrl+Shift+N | New channel in its own git worktree |
 | Alt+J | Go to the next agent that needs you |
 | Alt+A / Alt+Shift+A | Approve / deny the focused agent's prompt |
 | Ctrl+Space | Jump to any tab, agent or folder |
-| Alt+G | Agents panel |
+| Alt+Shift+G | Agents panel |
+| Alt+G | Hide or show the entire sidebar |
 | Alt+/ or F1 | Every shortcut |
 
 Run `muster skills install` once so your agents know how to open panels. The full UI spec,
@@ -174,7 +176,7 @@ tools agents get.
 Named agents are persistent agent sessions with their own folder, memory and resumed
 conversation (PLAN.md §10): `muster agent new reviewer --persona "Reviews diffs"`, then
 `muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_agent` MCP tool from an agent).
-In the UI, Alt+G opens the agents panel: start an agent with a click, create one from a
+In the UI, Alt+Shift+G opens the agents panel: start an agent with a click, create one from a
 template, edit its persona and memory, and watch the messages agents send each other.
 
 Agent panels are described in [docs/AGENT_PANELS.md](docs/AGENT_PANELS.md); the agent skills

@@ -6,7 +6,7 @@ import { signal } from "@preact/signals";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import { type DropZone, isNoopMove, splitFits } from "./tree.ts";
 import { layout } from "../state.ts";
-import { dropTab, moveTabToWindow, revealSession } from "../actions.ts";
+import { dropTab, moveTabToChannel, moveTabToWindow, revealSession } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
 import { IconNote, IconPanel, KindIcon } from "../icons.tsx";
 
@@ -29,6 +29,7 @@ interface DragState {
   target: Target | null;
   /** Over a "→ Window N" (id) or "→ New window" target. */
   win: number | "new" | null;
+  channel: number | null;
 }
 
 export const drag = signal<DragState | null>(null);
@@ -49,6 +50,8 @@ export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["
     }
     ev.preventDefault();
     const win = windowTarget(ev.clientX, ev.clientY);
+    const row = document.elementFromPoint(ev.clientX, ev.clientY)?.closest<HTMLElement>("[data-channel-id]");
+    const channel = row ? Number(row.dataset.channelId) : null;
     drag.value = {
       sid: s.id,
       label,
@@ -56,7 +59,8 @@ export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["
       x: ev.clientX,
       y: ev.clientY,
       win,
-      target: win !== null ? null : computeTarget(ev.clientX, ev.clientY, s.id),
+      channel,
+      target: win !== null || channel !== null ? null : computeTarget(ev.clientX, ev.clientY, s.id),
     };
   };
   const cleanup = () => {
@@ -75,7 +79,8 @@ export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["
       onClick();
       return;
     }
-    if (d?.win != null) moveTabToWindow(s.id, d.win);
+    if (d?.channel != null) moveTabToChannel(s.id, d.channel);
+    else if (d?.win != null) moveTabToWindow(s.id, d.win);
     else if (d?.target) {
       const t = d.target;
       dropTab(s.id, t.paneId, t.zone, t.index);

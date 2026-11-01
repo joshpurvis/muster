@@ -1370,6 +1370,41 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_last_terminal_keeps_its_workspace_and_panels() {
+        let hub = fixture();
+        let id = markdown(&hub);
+        event(&hub, id, "approve".into(), json!({})).unwrap();
+        hub.remove_session(1).unwrap();
+        assert!(!hub.channel(1).unwrap().archived);
+        assert_eq!(get(&hub, id).unwrap().channel_id, 1);
+        assert!(dir(&hub, id).exists());
+        assert_eq!(hub.store().panel_events(&get(&hub, id).unwrap()).unwrap().len(), 1);
+        // Explicit cleanup still removes them.
+        assert!(hub.archive_if_empty(1).unwrap());
+        assert!(list(&hub).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn desktop_channel_move_keeps_panel_ownership_and_queued_events() {
+        let hub = fixture();
+        let id = markdown(&hub);
+        event(&hub, id, "approve".into(), json!({"value": 7})).unwrap();
+        let before = get(&hub, id).unwrap();
+        let cwd = hub.session(1).unwrap().cwd;
+        hub.move_session_bundle(1, 2, Some(1), true).unwrap();
+        assert_eq!(hub.session(1).unwrap().cwd, cwd);
+        let panel = get(&hub, id).unwrap();
+        assert_eq!((panel.channel_id, panel.session_id, panel.revision), (2, 1, before.revision));
+        assert_eq!(hub.store().load_sessions().unwrap()[0].info.channel_id, 2);
+        assert!(hub.move_session_bundle(1, 1, Some(1), true).is_err(), "stale source refused");
+        assert!(hub.archive_if_empty(1).unwrap());
+        assert!(dir(&hub, id).exists(), "source cleanup cannot delete a moved panel");
+        let events = wait(&hub, 1, Some(id), 0).await.unwrap();
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        archive(&hub, 2).unwrap();
+    }
+
+    #[test]
     fn closing_an_emptied_task_removes_its_panels() {
         let hub = fixture();
         let id = markdown(&hub);

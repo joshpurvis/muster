@@ -70,7 +70,7 @@ Deno.test("closing a named agent's tab says it keeps running; any other tab says
   lacks(plain.body.join(" "), "task closes");
   equal(plain.danger, true);
   const last = closeConfirm(session({}), null, channel({ owns_worktree: true, branch: "muster/7" }), true);
-  has(last.body.join(" "), "task closes too");
+  has(last.body.join(" "), "stays open");
   has(last.body.join(" "), "muster/7");
   has(closeConfirm(session({ state: "exited" }), null, channel({}), false).body[0], "saved output");
 });

@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 
 /// Bump only for incompatible UI/application protocol changes, independently of host IPC.
-pub const UI_PROTOCOL: u32 = 1;
+pub const UI_PROTOCOL: u32 = 2;
 
 enum Source {
     Embedded,
@@ -403,7 +403,7 @@ mod tests {
                 if name == "bad" {
                     "{\"protocol\":999}"
                 } else {
-                    "{\"protocol\":1}"
+                    "{\"protocol\":2}"
                 },
             )
             .unwrap();

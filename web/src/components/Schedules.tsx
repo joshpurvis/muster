@@ -83,7 +83,7 @@ import {
 import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
-import { openMenu, openMenuAt } from "./Menu.tsx";
+import { openMenu, openMenuAt, type MenuItem } from "./Menu.tsx";
 import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
@@ -100,10 +100,10 @@ type ModalT = (
 // ---------------- the panel ----------------
 
 /** The panel header's ⋯: new agent or schedule, pause all, scheduling settings. */
-export function agentsHeaderMenu(el: Element) {
+export function agentsHeaderItems(): MenuItem[] {
   const sup = schedulesSupported.value;
   const paused = !!scheduleSettings.value?.paused;
-  openMenuAt(el, [
+  return [
     { label: "New agent…", run: () => A.newAgentDialog() },
     ...(sup
       ? [
@@ -113,7 +113,14 @@ export function agentsHeaderMenu(el: Element) {
         { label: "Scheduling settings…", run: () => A.scheduleSettingsDialog() },
       ]
       : []),
-  ], { minWidth: 200, alignRight: false });
+    "sep",
+    { label: agentsPanelOpen.value ? "Hide agents" : "Show agents", keys: "Alt+Shift+G", run: A.toggleAgentsPanel },
+    { label: "Hide sidebar", keys: "Alt+G", run: A.toggleSidebar },
+  ];
+}
+
+export function agentsHeaderMenu(el: Element) {
+  openMenuAt(el, agentsHeaderItems(), { minWidth: 200, alignRight: false });
 }
 
 /** "All schedules paused · Resume", under the panel header while Pause all is on. */

@@ -245,6 +245,18 @@ const INHERITED_SESSION_MARKERS: &[&str] = &[
     "MUSTER_JOB_SCOPE",
 ];
 
+/// A session has its own full-color PTY, independent of the terminal (or automation)
+/// that started/reloaded the daemon. In particular, an agent tool's NO_COLOR=1 is
+/// for that tool's captured output, not for every future interactive session.
+fn prepare_terminal_env(env: &mut BTreeMap<String, String>) {
+    for key in INHERITED_SESSION_MARKERS { env.remove(*key); }
+    for key in ["NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE"] {
+        env.remove(key);
+    }
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+}
+
 /// Result of `start_process`.
 struct Started {
     info: SessionInfo,
@@ -3298,12 +3310,10 @@ impl Hub {
         env.insert("MUSTER_BIN".into(), self.cfg.muster_bin.to_string_lossy().to_string());
         env.insert("PORT".into(), port_base.to_string());
         env.insert("MUSTER_PORT_BASE".into(), port_base.to_string());
-        env.insert("TERM".into(), "xterm-256color".into());
-        env.insert("COLORTERM".into(), "truecolor".into());
         env.extend(spec.env.clone());
         let host = self.cfg.terminal_host.as_ref().context("terminal host is not configured")?;
         let mut complete_env: BTreeMap<String, String> = std::env::vars().collect();
-        for key in INHERITED_SESSION_MARKERS { complete_env.remove(*key); }
+        prepare_terminal_env(&mut complete_env);
         // Never the OpenRouter key (nor a variable holding it, nor the gateway paired with it),
         // nor OpenRouter settings inherited from an OpenRouter session.
         crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
@@ -4983,6 +4993,20 @@ mod tests {
         }
         // Mail-like words elsewhere are fine; long titles are capped.
         assert_eq!(clean_title("ask bob@example.com", c).as_deref(), Some("ask bob@example.com"));
+    #[test]
+    fn interactive_terminal_does_not_inherit_reload_commands_color_overrides() {
+        let mut env: BTreeMap<String, String> = [
+            ("TERM", "dumb"), ("COLORTERM", ""), ("NO_COLOR", "1"),
+            ("FORCE_COLOR", "0"), ("CLICOLOR", "0"), ("CLICOLOR_FORCE", "0"),
+            ("CLAUDECODE", "1"), ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
+        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        prepare_terminal_env(&mut env);
+        assert_eq!(env, [
+            ("TERM", "xterm-256color"), ("COLORTERM", "truecolor"),
+            ("PATH", "/usr/bin"), ("CLAUDE_CONFIG_DIR", "/tmp/profile"),
+        ].into_iter().map(|(k, v)| (k.into(), v.into())).collect());
+    }
+
         let long = "word ".repeat(30);
         assert_eq!(clean_title(&long, c).unwrap().chars().count(), NAME_MAX - 1);
         assert!(clean_title("x\u{7}y", c).is_some_and(|t| t == "xy"));

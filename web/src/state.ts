@@ -537,6 +537,8 @@ export const renaming = signal<
 /** Every channel's layout in this window. Only the active one is rendered. */
 export const channelLayout = signal<WindowLayoutState | null>(null);
 export const activeChannelId = computed(() => channelLayout.value?.active ?? null);
+export const drawerFocused = signal(false);
+export const activeDrawer = computed(() => channelLayout.value?.drawers?.[activeChannelId.value ?? -1] ?? null);
 export const activeChannel = computed(() => channelById.value.get(activeChannelId.value ?? -1) ?? null);
 const vacantLayout = emptyLayout();
 /** Existing tile controls operate on the selected channel. */
@@ -603,6 +605,7 @@ export function selectChannel(id: number) {
   if (!s || (id !== 0 && !windowChannels.peek().some((c) => c.id === id))) return;
   batch(() => {
     fullscreen.value = null;
+    drawerFocused.value = false;
     renaming.value = null;
     confirmClose.value = null;
     channelLayout.value = {
@@ -621,6 +624,8 @@ export const focusedGroup = computed((): PaneNode | null => {
 
 /** The focused group's visible tab. */
 export const focusedSession = computed((): SessionInfo | null => {
+  const d = activeDrawer.value;
+  if (drawerFocused.value && d?.open && d.session !== null) return sessions.value.get(d.session) ?? null;
   const p = focusedGroup.value;
   if (!p || p.active === null || !hereIds.value.has(p.active)) return null;
   return sessions.value.get(p.active) ?? null;

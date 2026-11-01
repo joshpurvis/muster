@@ -1,6 +1,8 @@
 // Optional bottom line: the focused tab's task name, folder and branch (click copies), the number
 // of tabs in this window, a "needs you" chip (same as Alt+J) and the connection dot.
 import {
+  activeChannel,
+  activeDrawer,
   accountProfiles,
   focusedSession,
   focusedTask,
@@ -12,7 +14,7 @@ import {
 import { profileName } from "../account_profiles.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
-import { IconBranch, IconFolder } from "../icons.tsx";
+import { IconBranch, IconFolder, IconTerminal } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
 import { taskLabel } from "../model.ts";
 
@@ -86,6 +88,14 @@ export function StatusLine() {
         </span>
       )}
       <span class="sl-space" />
+      {activeChannel.value && (
+        <button type="button" class={cx("sl-item sl-terminal", activeDrawer.value?.open && "active")}
+          aria-label="Toggle channel terminal" aria-expanded={!!activeDrawer.value?.open}
+          aria-controls="channel-terminal-drawer" data-tip="Channel terminal" data-keys="Ctrl+`"
+          onClick={() => void A.toggleTerminalDrawer()}>
+          <IconTerminal size={14} />
+        </button>
+      )}
       {n > 0 && (
         <button
           type="button"

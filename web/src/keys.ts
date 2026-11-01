@@ -3,6 +3,7 @@
 
 import * as A from "./actions.ts";
 import {
+  activeChannel,
   agentsSupported,
   altHeld,
   confirmClose,
@@ -59,6 +60,7 @@ export interface KeyCtx {
 }
 
 const CODE_ALIASES: Record<string, string> = {
+  "`": "Backquote",
   "[": "BracketLeft",
   "]": "BracketRight",
   "/": "Slash",
@@ -521,6 +523,11 @@ export const commands: Command[] = [
   })),
 
   // View
+  {
+    id: "terminal-drawer", title: "Toggle channel terminal", group: "View",
+    keys: ["Ctrl+`"], run: () => { void A.toggleTerminalDrawer(); },
+    enabled: () => activeChannel.value !== null,
+  },
   { id: "find", title: "Find in terminal", group: "View", keys: ["Ctrl+Shift+F"], run: () => A.openFind() },
   {
     id: "font-up",

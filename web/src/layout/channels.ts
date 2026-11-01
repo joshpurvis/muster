@@ -40,11 +40,22 @@ export interface SidebarState {
   collapsedAccounts: string[];
 }
 
+export interface TerminalDrawerState {
+  session: number | null;
+  open: boolean;
+  height: number;
+}
+
+export function drawerHeight(value: number): number {
+  return Number.isFinite(value) ? Math.max(140, Math.min(700, value)) : 260;
+}
+
 export interface WindowLayoutState {
   v: 2;
   active: number | null;
   layouts: Record<string, LayoutState>;
   sidebar: SidebarState;
+  drawers?: Record<string, TerminalDrawerState>;
   /** The untouched pre-channel layout, retained for recovery. Never rendered or reconciled. */
   previous?: unknown;
 }
@@ -78,8 +89,18 @@ function reconcileChannel(s: LayoutState, tabs: TabHome[]): LayoutState {
 /** Add arrivals to their own channel, prune departed tabs, and retain empty real channels. */
 export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs: TabHome[]): WindowLayoutState {
   const ids = new Set(channels);
+  const drawers: Record<string, TerminalDrawerState> = {};
+  const drawerIds = new Set<number>();
+  for (const [key, drawer] of Object.entries(s.drawers ?? {})) {
+    if (!ids.has(Number(key))) continue;
+    const session = tabs.some((t) => t.id === drawer.session && t.channel === Number(key))
+      ? drawer.session : null;
+    drawers[key] = { ...drawer, session };
+    if (session !== null) drawerIds.add(session);
+  }
   const groups = new Map<number, TabHome[]>(channels.map((id) => [id, []]));
   for (const t of tabs) {
+    if (drawerIds.has(t.id)) continue;
     const saved = t.channel === null ? savedChannel(s, t.id) : null;
     const beside = t.beside == null ? null : tabs.find((x) => x.id === t.beside)?.channel;
     const channel = t.channel ?? beside ?? (saved !== null && ids.has(saved) ? saved : null) ??
@@ -93,7 +114,7 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   }
   const active = s.active !== null && Object.hasOwn(layouts, s.active) ? s.active :
     (groups.keys().next().value ?? null);
-  return { ...s, active, layouts };
+  return { ...s, active, layouts, ...(s.drawers ? { drawers } : {}) };
 }
 
 /** Read v2, or partition a legacy window tree without merging tasks with the same folder. */
@@ -108,11 +129,23 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
         if (l) layouts[key] = l;
       }
     }
+    const drawers: Record<string, TerminalDrawerState> = {};
+    if (obj.drawers && typeof obj.drawers === "object") {
+      for (const [key, value] of Object.entries(obj.drawers)) {
+        if (!/^\d+$/.test(key) || !value || typeof value !== "object") continue;
+        const d = value as Partial<TerminalDrawerState>;
+        drawers[key] = {
+          session: typeof d.session === "number" && Number.isSafeInteger(d.session) && d.session > 0 ? d.session : null,
+          open: d.open === true, height: drawerHeight(Number(d.height)),
+        };
+      }
+    }
     const side = obj.sidebar && typeof obj.sidebar === "object" ? obj.sidebar as Partial<SidebarState> : {};
     return reconcileChannels({
       v: 2,
       active: typeof obj.active === "number" && Number.isSafeInteger(obj.active) ? obj.active : null,
       layouts,
+      ...(obj.drawers ? { drawers } : {}),
       sidebar: {
         hidden: side.hidden === true,
         channels: side.channels !== false,

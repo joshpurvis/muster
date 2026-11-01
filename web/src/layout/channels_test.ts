@@ -147,3 +147,31 @@ Deno.test("account groups keep profiles distinct, include unavailable profiles a
   equal(groups.find((g) => g.key === "claude:openrouter")?.sessions.map((s) => s.id), [7]);
   equal(groups.flatMap((g) => g.sessions).map((s) => s.id).sort(), [1, 2, 3, 4, 5, 6, 7]);
 });
+
+Deno.test("drawer shells stay outside tiles across reconciliation and reload", () => {
+  const tabs = [{ id: 1, channel: 10 }, { id: 2, channel: 10 }, { id: 3, channel: 20 }];
+  const state = loadChannelLayout(null, [10, 20], tabs);
+  state.drawers = { 10: { session: 2, open: true, height: 300 } };
+  const next = reconcileChannels(state, [10, 20], tabs);
+  equal(allSessions(next.layouts[10].root), [1]);
+  equal(next.drawers, state.drawers);
+  const restored = loadChannelLayout(JSON.parse(JSON.stringify(next)), [10, 20], tabs);
+  equal(restored.layouts, next.layouts);
+  equal(restored.drawers, next.drawers);
+  const moved = reconcileChannels(next, [10, 20], tabs.map((t) => t.id === 2 ? { ...t, channel: 20 } : t));
+  equal(moved.drawers?.[10].session, null);
+  assert(allSessions(moved.layouts[20].root).includes(2), "moved shell returns to ordinary tabs");
+  equal(reconcileChannels(next, [20], [tabs[2]]).drawers, {});
+});
+
+Deno.test("drawer data rejects invalid session ids and clamps saved heights", () => {
+  const state = loadChannelLayout({ v: 2, drawers: {
+    10: { session: -1, open: "yes", height: 99999 },
+    20: { session: 2, open: true, height: "bad" },
+  } }, [10, 20], [{ id: 2, channel: 10 }]);
+  equal(state.drawers, {
+    10: { session: null, open: false, height: 700 },
+    20: { session: null, open: true, height: 260 },
+  });
+  equal(allSessions(state.layouts[10].root), [2]);
+});

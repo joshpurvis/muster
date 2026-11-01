@@ -8,6 +8,7 @@ import { connStatus, rpc } from "./rpc.ts";
 import {
   agentMessages,
   activeChannel,
+  drawerFocused,
   activeChannelId,
   channelLayout,
   agents,
@@ -49,6 +50,7 @@ import * as A from "./actions.ts";
 import { installKeys } from "./keys.ts";
 import { notes } from "./notes.ts";
 import { WindowControls } from "./components/WindowControls.tsx";
+import { TerminalDrawer } from "./components/TerminalDrawer.tsx";
 import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
@@ -159,6 +161,10 @@ effect(() => {
   void focusedTabId.value;
   const a = document.activeElement;
   if (!a || a === document.body) A.focusActiveTerminalSoon();
+});
+
+addEventListener("focusin", (e) => {
+  drawerFocused.value = !!(e.target as Element)?.closest?.(".terminal-drawer");
 });
 
 installKeys();
@@ -447,6 +453,7 @@ function App() {
               : activeChannelId.value !== null ? <EmptyChannel /> : <EmptyWindow />}
             <PanelLayer />
           </div>
+          <TerminalDrawer key={activeChannelId.value ?? "empty"} />
         </main>
       </div>
       {prefs.value.statusLine && <StatusLine />}

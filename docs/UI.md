@@ -72,6 +72,18 @@ error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, 
 └ status line (22px, optional): ~/p/muster · ⎇ muster/fix-auth · 4 tabs  needs you: 1  ● connected ┘
 ```
 
+### Channel terminal drawer
+
+The terminal icon at the right of the status line and **Ctrl+`** toggle a shell drawer below the
+selected channel’s tiles. The shell starts lazily in the channel’s main directory (not a tab’s
+current directory). Hiding the drawer keeps the process running. Each channel in the window keeps
+its own shell, open state and height across channel switches and window reloads; the shell is not
+added to the tiled tab layout. The shortcut also works when the status line is hidden.
+
+Drag the top edge to resize, or focus it and use Up/Down (20px), Home or End. Hiding returns focus
+to the active tab. Alt+W while the drawer has focus hides it. Exited shells offer Restart; a failed
+launch offers Try again. Archiving the channel stops its drawer shell along with its other sessions.
+
 ### Group tab strips
 - Every group has a tab strip (31px), always shown, even with one tab. Tabs show the state dot,
   the kind icon, the label, an optional `⎇` (worktree) and permissions icon (amber for network

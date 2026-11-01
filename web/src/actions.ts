@@ -1,10 +1,13 @@
 // User-facing actions. Components and the command table call these; they talk to the daemon and
 // update local state (the window's layout of groups, prefs, windows).
 
-import { signal } from "@preact/signals";
+import { batch, signal } from "@preact/signals";
 import { connStatus, rpc } from "./rpc.ts";
 import {
   activeChannelId,
+  activeChannel,
+  activeDrawer,
+  drawerFocused,
   channelLayout,
   channelsPanelOpen,
   agentBySession,
@@ -71,6 +74,7 @@ import {
   workspaceById,
   workspaces,
 } from "./state.ts";
+import { drawerHeight, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
@@ -485,6 +489,12 @@ export function revealSession(sid: SessionId, focus = true) {
   if (!hereIds.value.has(sid)) return;
   const channel = tabChannel(sid);
   if (channel !== null && channel !== activeChannelId.value) selectChannel(channel);
+  if (channel !== null && channelLayout.peek()?.drawers?.[channel]?.session === sid) {
+    setTerminalDrawer(channel, { open: true });
+    if (focus) requestAnimationFrame(() => terms.focusTerminal(sid));
+    return;
+  }
+  drawerFocused.value = false;
   pushRecent("s:" + sid);
   updateLayout((l) => activateTabTree(l, sid));
   if (focus) focusActiveTerminalSoon();
@@ -496,6 +506,7 @@ export function focusGroup(paneId: string) {
 }
 
 function withLayout(fn: (l: LayoutState) => LayoutState, focus = true) {
+  if (focus) drawerFocused.value = false;
   updateLayout(fn);
   if (focus) focusActiveTerminalSoon();
 }
@@ -640,7 +651,10 @@ function place(sid: SessionId, placement: Placement, channel = tabChannel(sid)) 
     [sid],
     channel,
   );
-  if (activeChannelId.peek() === channel) focusActiveTerminalSoon();
+  if (activeChannelId.peek() === channel) {
+    drawerFocused.value = false;
+    focusActiveTerminalSoon();
+  }
 }
 
 /** A new session in task `ch` (a tab of this window). */
@@ -675,6 +689,78 @@ export async function spawn(
     toast("error", `Couldn't start ${kind}: ${errText(e)}`);
   } finally {
     releaseNewSessions();
+  }
+}
+
+// A drawer is a shell session whose placement is saved outside the split tree.
+export const drawerStarting = signal<ReadonlySet<number>>(new Set());
+export const drawerErrors = signal<Record<number, string>>({});
+
+export function setTerminalDrawer(channel: number, change: Partial<TerminalDrawerState>) {
+  const cur = channelLayout.peek();
+  if (!cur || !channelById.peek().has(channel)) return;
+  const previous = cur.drawers?.[channel] ?? { session: null, open: false, height: 260 };
+  channelLayout.value = { ...cur, drawers: { ...cur.drawers,
+    [channel]: { ...previous, ...change, height: drawerHeight(change.height ?? previous.height) },
+  } };
+}
+
+export function hideTerminalDrawer() {
+  const id = activeChannelId.peek();
+  if (id === null) return;
+  drawerFocused.value = false;
+  setTerminalDrawer(id, { open: false });
+  focusActiveTerminalSoon();
+}
+
+export async function toggleTerminalDrawer() {
+  const channel = activeChannel.peek();
+  if (!channel) return;
+  if (activeDrawer.peek()?.open) return hideTerminalDrawer();
+  fullscreen.value = null;
+  setTerminalDrawer(channel.id, { open: true });
+  await startTerminalDrawer();
+}
+
+export async function startTerminalDrawer() {
+  const channel = activeChannel.peek();
+  if (!channel) return;
+  const drawer = activeDrawer.peek();
+  if (drawer?.session && sessions.peek().has(drawer.session)) {
+    requestAnimationFrame(() => terms.focusTerminal(drawer.session!));
+    return;
+  }
+  if (drawerStarting.peek().has(channel.id)) return;
+  const owner = windowId.peek();
+  drawerStarting.value = new Set([...drawerStarting.peek(), channel.id]);
+  drawerErrors.value = { ...drawerErrors.peek(), [channel.id]: "" };
+  holdNewSessions();
+  try {
+    const mark = sessionMark();
+    const session = await rpc.call<SessionInfo>("session.spawn", {
+      channel_id: channel.id, kind: "shell", cwd: channel.cwd,
+      name: "Channel terminal", window_id: owner ?? undefined,
+      ...terms.estimateGrid(document.querySelector(".content")?.clientWidth ?? 800, drawer?.height ?? 260),
+    });
+    batch(() => {
+      knowSession(session, mark);
+      if (windowId.peek() === owner) {
+        setTerminalDrawer(channel.id, { session: session.id });
+        // Release this arrival even while another channel's spawn is still pending.
+        updateLayout((l) => l, [session.id], channel.id);
+      }
+      releaseNewSessions();
+    });
+    if (activeChannelId.peek() === channel.id && activeDrawer.peek()?.open) {
+      requestAnimationFrame(() => terms.focusTerminal(session.id));
+    }
+  } catch (e) {
+    releaseNewSessions();
+    drawerErrors.value = { ...drawerErrors.peek(), [channel.id]: errText(e) };
+  } finally {
+    const next = new Set(drawerStarting.peek());
+    next.delete(channel.id);
+    drawerStarting.value = next;
   }
 }
 
@@ -809,6 +895,7 @@ function hideAgentTab(s: SessionInfo, name: string, force: boolean) {
 
 /** Alt+W: close the focused tab. */
 export function closeFocused() {
+  if (drawerFocused.peek() && activeDrawer.peek()?.open) return hideTerminalDrawer();
   const id = focusedTabId.value;
   if (id !== null) closeTab(id);
 }

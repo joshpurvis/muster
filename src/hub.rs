@@ -242,6 +242,7 @@ const INHERITED_SESSION_MARKERS: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
+    "MUSTER_JOB_SCOPE",
 ];
 
 /// Result of `start_process`.

@@ -1,10 +1,12 @@
 {
   "tasks": {
     "web": "cd web && deno task build",
-    "build": "deno task web && cargo build --workspace --release",
-    "build:all": "deno task web && cargo build --workspace --release --features gui",
+    "build": "bash scripts/job.sh build deno task build:inner",
+    "build:inner": "deno task web && cargo build --workspace --release",
+    "build:all": "bash scripts/job.sh build deno task build:all:inner",
+    "build:all:inner": "deno task web && cargo build --workspace --release --features gui",
     "dev": "deno task web && cargo build --workspace && ./target/debug/muster",
-    "test": "bash scripts/isolated.sh cargo test --workspace && cd web && deno task check && deno task test",
-    "smoke": "bash scripts/isolated.sh bash scripts/smoke.sh"
+    "test": "bash scripts/job.sh test bash scripts/isolated.sh cargo test --workspace && cd web && deno task check && deno task test",
+    "smoke": "bash scripts/job.sh test bash scripts/isolated.sh bash scripts/smoke.sh"
   }
 }

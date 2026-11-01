@@ -92,6 +92,12 @@ pub fn launch_owned_child(
                     "terminal ownership PID changed before launch"
                 );
                 anyhow::ensure!(same_parent(), "terminal host exited before launch");
+                // Before the target can fork: give this PTY and its descendants a distinct
+                // OOM boundary, outside both the terminal host and the launching terminal.
+                muster_terminal_core::isolation::enter_scope(
+                    &format!("session-{}-{}", owner.run.id, owner.run.generation), "muster-sessions.slice",
+                )?;
+                anyhow::ensure!(same_parent(), "terminal host exited while isolating the session");
                 // Exec keeps the same PID, session, terminal and ownership markers.
                 // Refuse a vanished cwd instead of falling back to the home directory.
                 let error = std::process::Command::new(program)

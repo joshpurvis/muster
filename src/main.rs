@@ -56,6 +56,7 @@ use clap::{Parser, Subcommand};
 use clap::CommandFactory;
 
 use crate::paths::Discovery;
+use muster_terminal_core::isolation;
 
 #[derive(Parser)]
 #[command(
@@ -586,6 +587,10 @@ fn read_persona(persona: Option<String>, file: Option<PathBuf>) -> anyhow::Resul
 const TARGET_HELP: &str = "Session: id, `.` (this session), session or tab name, unique prefix, or tab/name";
 
 fn main() -> ExitCode {
+    if let Some(result) = isolation::service_exec() {
+        if let Err(error) = result { eprintln!("muster: {error:#}"); }
+        return ExitCode::FAILURE;
+    }
     // Hook callbacks run inside agent CLIs on every event: dispatch before anything else
     // (no clap, no runtime) so they stay fast.
     let args: Vec<String> = std::env::args().collect();
@@ -902,7 +907,7 @@ fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>, _h
     cmd
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log);
+        .stderr(log.try_clone()?);
     // SAFETY: setsid is async-signal-safe; it detaches the daemon from our terminal.
     unsafe {
         cmd.pre_exec(|| {
@@ -910,7 +915,7 @@ fn start_daemon_from(exe: &std::path::Path, launch: Option<&std::path::Path>, _h
             Ok(())
         });
     }
-    let mut child = cmd.spawn().context("starting daemon")?;
+    let mut child = isolation::spawn_service(&mut cmd, &log, "backend").context("starting daemon")?;
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut exited: Option<(std::process::ExitStatus, Instant)> = None;
     loop {
@@ -1063,6 +1068,7 @@ fn take_restart_failure() -> Option<String> {
 }
 
 fn stop() -> anyhow::Result<()> {
+    isolation::enter_scope("lifecycle", "muster-control.slice")?;
     let _lock = lifecycle_lock("`muster stop`")?;
     stop_all(STOP_WAIT)
 }
@@ -1239,6 +1245,7 @@ struct RestartOpts {
 /// stops there and says so, and the windows' wait ends in "run muster". A failure after "go"
 /// is also recorded for the next `muster` to tell ([`record_restart_failure`]).
 fn restart_all(opts: RestartOpts) -> anyhow::Result<()> {
+    isolation::enter_scope("lifecycle", "muster-control.slice")?;
     use std::io::{BufRead, Write};
     use std::os::fd::FromRawFd;
     // SAFETY: the backend hands this process its end of a socket pair at this descriptor, which
@@ -1330,6 +1337,7 @@ const RESTART_MIN_FREE: u64 = 64 * 1024 * 1024;
 /// `--version` as this build, its host starts on scratch directories and answers this build's
 /// protocol ([`terminal::probe_host`]). There must also be room left to start.
 fn restart_checks(opts: &RestartOpts) -> anyhow::Result<RestartPlan> {
+    isolation::check_service_support(&std::env::current_exe()?)?;
     let d = paths::read_discovery().filter(backend_alive);
     if let Some(d) = &d {
         anyhow::ensure!(!backend_hidden(d),
@@ -1413,6 +1421,8 @@ fn check_restart_release(release: &executables::Release, app: Option<&str>, host
 /// Replacing a legacy monolithic daemon would kill its PTYs. Require a live,
 /// compatible host and the same backend identity immediately before signalling.
 fn reload() -> anyhow::Result<()> {
+    isolation::enter_scope("lifecycle", "muster-control.slice")?;
+    isolation::check_service_support(&std::env::current_exe()?)?;
     // Released before a handoff: the backend's own `reload` takes it then.
     let mut lock = Some(lifecycle_lock("`muster reload`")?);
     let discovery = paths::read_discovery().filter(backend_alive);

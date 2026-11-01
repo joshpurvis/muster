@@ -15,6 +15,8 @@ export MUSTER_DATA_DIR="$test_root/data"
 # Port 0 requests a fresh OS-assigned port for direct daemon invocations.
 # Suites using a fixed test port must override it explicitly in their child env.
 export MUSTER_PORT=0
+# General tests never create units in the user's manager. Isolation-specific smoke tests opt in.
+export MUSTER_ISOLATION="${MUSTER_ISOLATION:-off}"
 export CARGO_TARGET_DIR="$PWD/target"
 mkdir -m 700 "$MUSTER_RUNTIME_DIR" "$MUSTER_DATA_DIR"
 # Never the owner's real credentials (an OpenRouter key, the same key in OpenRouter's Claude Code

@@ -695,7 +695,7 @@ pub fn probe_host(executable: &Path, dir: &Path) -> anyhow::Result<()> {
         .env("MUSTER_TERMINAL_FENCE_LOCK", &fence)
         // A restart's command carries the OpenRouter key for the new daemon; this host gets none.
         .env_remove(crate::openrouter::ENV_KEY)
-        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
     let child = scratch.1.insert(command.spawn().with_context(|| format!("running the terminal host {}", executable.display()))?);
     let socket = runtime.join("terminal.sock");
     let end = Instant::now() + Duration::from_secs(10);
@@ -772,20 +772,21 @@ fn connect_or_start_host(executable: &Path) -> anyhow::Result<Arc<TerminalServic
     command.arg("--runtime-dir").arg(&runtime).arg("--data-dir").arg(&data)
         // Keeps the monolithic daemon of older builds from starting while this host lives.
         .env("MUSTER_TERMINAL_FENCE_LOCK", crate::paths::lock_path())
-        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        .stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
     // SAFETY: setsid is async-signal-safe and runs before exec, as in the daemon launcher.
     unsafe { command.pre_exec(|| {
         if libc::setsid() < 0 { return Err(std::io::Error::last_os_error()) }
         Ok(())
     }); }
-    let mut child = command.spawn().context("starting terminal host")?;
+    let mut child = muster_terminal_core::isolation::spawn_service(&mut command, &log, "terminal-host")
+        .context("starting terminal host")?;
     let end = Instant::now() + Duration::from_secs(15);
     let mut relaunch_at: Option<Instant> = None;
     loop {
         if let Ok(service) = TerminalService::connect(&socket, &data) {
             // Reap this child if it ever exits while the backend still runs. Dropping a
             // backend does not terminate the host, which is in its own process session.
-            std::thread::spawn(move || { let _ = child.wait(); });
+            child.reap_later();
             return Ok(service);
         }
         match child.try_wait()? {
@@ -798,7 +799,8 @@ fn connect_or_start_host(executable: &Path) -> anyhow::Result<Arc<TerminalServic
                 let at = *relaunch_at.get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
                 if Instant::now() >= at {
                     relaunch_at = None;
-                    child = command.spawn().context("starting terminal host")?;
+                    child = muster_terminal_core::isolation::spawn_service(&mut command, &log, "terminal-host")
+                        .context("starting terminal host")?;
                 }
             }
             Some(status) if status.code() == Some(muster_terminal_protocol::EXIT_FENCE_BUSY) => anyhow::bail!(LEGACY_DAEMON),

@@ -2,6 +2,7 @@
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
+    if let Some(result) = muster_terminal_core::isolation::service_exec() { return result }
     // Before creating a runtime or logger: the terminal bootstrap only waits
     // for its ownership checkpoint and execs the requested program.
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();

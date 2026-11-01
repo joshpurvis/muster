@@ -5,6 +5,7 @@ pub use muster_terminal_protocol::{ScreenSnapshot, SessionId, TerminalEvent};
 pub mod pty;
 pub mod replay;
 pub mod private_fs;
+pub mod isolation;
 pub type EventSink = Arc<dyn Fn(TerminalEvent) + Send + Sync>;
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)

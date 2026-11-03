@@ -1045,7 +1045,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     // 3. Verify. Submit once more only if our text demonstrably still sits in the input box
     //    (or the box is unreadable and nothing happened at all).
     match accepted(hub, id, generation, adapter, &item.text, seq_before, VERIFY_FOR).await {
-        Outcome::Accepted => return Ok(true),
+        Outcome::Accepted => { crate::mcp::communication::accepted(hub, id, &item.text); return Ok(true); },
         Outcome::Gone => anyhow::bail!("the session exited"),
         Outcome::Pending => {}
     }
@@ -1057,7 +1057,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     let seq_before = hub.output_seq(id);
     hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
     match accepted(hub, id, generation, adapter, &item.text, seq_before, VERIFY_RETRY_FOR).await {
-        Outcome::Accepted => return Ok(true),
+        Outcome::Accepted => { crate::mcp::communication::accepted(hub, id, &item.text); return Ok(true); },
         Outcome::Gone => anyhow::bail!("the session exited"),
         Outcome::Pending => {}
     }

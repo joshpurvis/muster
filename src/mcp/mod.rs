@@ -20,6 +20,7 @@ use axum::routing::post;
 use crate::hub::{Hub, ServerEvent};
 
 pub mod backend;
+pub mod communication;
 pub mod guard;
 pub mod protocol;
 pub mod tools;
@@ -124,7 +125,7 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     }
     if limits.cross_workspace {
         tracing::warn!(
-            "{}=1: agents may reach other workspaces through MCP",
+            "{} is retired: use directional sharing rules in the Agents panel",
             guard::ENV_CROSS_WORKSPACE
         );
     }

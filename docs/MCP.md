@@ -844,7 +844,7 @@ Reach: agents live in their own "agents" workspace (`<data>/agents`). `list_agen
 from every workspace: an agent is a shared service, asking runs no command anywhere, and the origin
 rule, hop limit, daily cap and permission check apply. Every other tool keeps the workspace rule,
 so agents can read each other's terminals but not reach the user's project workspaces (unless
-`MUSTER_MCP_CROSS_WORKSPACE=1`), and project agents don't drive an agent's terminal directly.
+the human adds a directional sharing rule), and project agents don't drive an agent's terminal directly.
 
 ### Schedules
 
@@ -988,8 +988,8 @@ server refuses:
 - any target outside the caller's workspace: `send_message`, `read_screen`,
   `get_recent_output`, `wait_for_state` (by session), `post_to_channel`, `get_diff`,
   `spawn_session` (by `channel_id`). `list_channels` and `list_sessions` only show the caller's
-  workspace. Error text: `… The human can allow it by starting the muster daemon with
-  MUSTER_MCP_CROSS_WORKSPACE=1.`
+  workspace plus explicitly shared targets. The human grants access in the Agents panel under
+  Session communication, with separate messaging and output-reading permissions.
 
 Text from agents (`send_message` text, `spawn_session` prompt) is typed into a terminal, so it
 is cleaned first: ESC and all other control characters except newline and tab are removed (CR
@@ -1021,3 +1021,40 @@ If the caller is not Claude, the target workspace default applies. This also hol
 tool creates a new channel. Disabled/missing profiles fail without falling back to another
 account. Named agents keep their own creation-time profile when started through `ask_agent`.
 Profile registration and manual selection are available through the desktop/CLI, not MCP.
+
+### Session conversations and explicit sharing
+
+Ordinary sessions support `request_session({session_id, text, timeout_seconds?})`.
+The default timeout is 0 (return immediately); up to 1800 seconds waits for an
+explicit answer. The recipient calls `reply_session({request_id, text})`, once.
+`session_messages({request_id?, after_id?})` returns only the caller's conversations,
+including request text, answer, timestamps and status: queued, delivered, answered,
+failed or timed_out. A wait timeout does not cancel delivery or prevent a late reply.
+These records persist across backend reloads. Up to 1000 requests are retained;
+answered or failed entries are evicted first, never unresolved entries. This API
+uses explicit replies rather than guessing which terminal output answered a request.
+Existing `send_message` remains a fire-and-forget prompt; named agents still use
+`ask_agent` and `reply`.
+
+`list_sessions` includes `reachability` with `can_message`, `can_read_output`,
+`message_reason` and `read_output_reason`. Discovering a session does not authorize
+reading its output. Same-workspace access remains the default. The old
+`MUSTER_MCP_CROSS_WORKSPACE` switch is retired; it no longer grants access. In the Agents panel,
+**Session communication** lets the human add directional workspace grants,
+optionally limited to one caller session, with separate messaging and reading
+permissions. Only a verified local window can change grants. Named agents remain
+global shared services under their existing origin and permission rules. Shared
+notes retain their existing global scope.
+
+`subscribe_channel({channel_id, enabled})` opts the caller into future posts.
+`channel_updates({after_id?})` returns subscribed updates and `next_cursor`; pass
+that cursor on the next poll. Reads recheck current sharing rules. Unsubscribing
+stops access through this feed. Subscriptions do not inject prompts or wake agents,
+so posts cannot automatically produce reply loops. Each session can subscribe to
+32 channels. The feed retains 1000 posts globally and exposes
+`oldest_available_id` so consumers can detect a retention gap. Own posts are omitted.
+
+The Agents panel shows session conversation threads and their progress. Human RPC:
+`communication.get` returns grants, messages and subscriptions; `communication.set`
+accepts `{grants, expected_grants}` and rejects stale edits. Each grant contains
+`from_workspace`, `to_workspace`, optional `from_session`, `message`, `read_output`.

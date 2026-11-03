@@ -21,7 +21,8 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 29] = [
+pub const TOOL_NAMES: [&str; 34] = [
+    "request_session", "reply_session", "session_messages", "subscribe_channel", "channel_updates",
     "whoami",
     "list_channels",
     "list_sessions",
@@ -51,7 +52,7 @@ const STATE_NAMES: [&str; 8] = [
     "exited",
 ];
 
-fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool) -> Value {
+pub(super) fn tool(name: &str, title: &str, description: &str, schema: Value, read_only: bool) -> Value {
     json!({
         "name": name,
         "title": title,
@@ -73,7 +74,8 @@ fn empty_schema() -> Value {
 
 pub fn tool_definitions() -> Vec<Value> {
     let session_id = json!({"type": "integer", "minimum": 1, "description": "Target session id (see list_sessions)."});
-    let mut tools = vec![
+    let mut tools = super::communication::definitions();
+    tools.extend(vec![
         tool(
             "whoami",
             "Who am I",
@@ -258,7 +260,7 @@ pub fn tool_definitions() -> Vec<Value> {
             }),
             false,
         ),
-    ];
+    ]);
     let csp = json!({"type":"object", "properties": {
         "resourceDomains":{"type":"array","items":{"type":"string"}},
         "connectDomains":{"type":"array","items":{"type":"string"}},
@@ -395,7 +397,7 @@ fn parse_state(s: &str) -> Option<AgentState> {
     serde_json::from_value(Value::String(s.to_string())).ok()
 }
 
-fn pretty(v: &Value) -> String {
+pub(super) fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
@@ -502,6 +504,7 @@ pub async fn call_tool<B: Backend>(
     };
     let a = Args(map);
     let res = match name {
+        "request_session" | "reply_session" | "session_messages" | "subscribe_channel" | "channel_updates" => super::communication::call(st, caller, name, args).await,
         "whoami" => whoami(st, caller),
         "list_channels" => list_channels(st, caller),
         "list_sessions" => list_sessions(st, caller, &a),
@@ -535,7 +538,7 @@ pub async fn call_tool<B: Backend>(
     })
 }
 
-fn caller_session<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<SessionInfo, String> {
+pub(super) fn caller_session<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<SessionInfo, String> {
     st.backend
         .session(caller)
         .ok_or_else(|| "calling session no longer exists".to_string())
@@ -604,7 +607,7 @@ fn open_channel<B: Backend>(st: &McpState<B>, id: ChannelId) -> Result<Channel, 
 const HOW_SHELL: &str =
     "The human can allow it by starting the muster daemon with MUSTER_MCP_ALLOW_SHELL=1.";
 const HOW_CROSS: &str =
-    "The human can allow it by starting the muster daemon with MUSTER_MCP_CROSS_WORKSPACE=1.";
+    "The human can add a sharing rule in the Agents panel under Session communication.";
 
 /// Text an agent sends to another session is typed into its terminal, so it must stay text:
 /// escape sequences could end the bracketed paste (`ESC [ 201 ~`) and turn the rest into raw
@@ -638,7 +641,7 @@ const HOW_PERMS: &str = "Only the human can grant that: ask them to change your 
 /// Agents can't reach an agent of `kind` that runs with more than they have: spawning into, or
 /// messaging a session in, a channel whose profile is more permissive (for that kind of agent)
 /// than the caller's channel is refused.
-fn check_not_more_permissive<B: Backend>(
+pub(super) fn check_not_more_permissive<B: Backend>(
     st: &McpState<B>,
     me: &SessionInfo,
     target: &Channel,
@@ -676,25 +679,25 @@ fn check_perms_not_wider<B: Backend>(
 }
 
 /// Origin and hop of a message the caller sends now (None inbound: human-rooted, hop 0).
-fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::agents::Origin, u32) {
+pub(super) fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> (crate::agents::Origin, u32) {
     let r = caller_route(st, caller);
     (r.origin, r.hop)
 }
 
 /// The route of anything the caller sends or spawns now: its provenance, one hop on.
-fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::agents::Route {
+pub(super) fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::agents::Route {
     crate::agents::outgoing(st.backend.prov(caller))
 }
 
 /// The caller's workspace (None if its channel is gone).
-fn caller_workspace<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<WorkspaceId> {
+pub(super) fn caller_workspace<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<WorkspaceId> {
     let me = st.backend.session(caller)?;
     st.backend.channel(me.channel_id).map(|c| c.workspace_id)
 }
 
 /// Is channel `ch` reachable for `caller`?
 fn in_reach<B: Backend>(st: &McpState<B>, caller: SessionId, ch: &Channel) -> bool {
-    st.limits.cross_workspace || caller_workspace(st, caller) == Some(ch.workspace_id)
+    super::communication::allowed(st, caller, ch, false) || super::communication::allowed(st, caller, ch, true)
 }
 
 fn check_channel_reach<B: Backend>(
@@ -702,7 +705,7 @@ fn check_channel_reach<B: Backend>(
     caller: SessionId,
     ch: &Channel,
 ) -> Result<(), String> {
-    if in_reach(st, caller, ch) {
+    if super::communication::allowed(st, caller, ch, false) {
         return Ok(());
     }
     Err(format!(
@@ -716,9 +719,6 @@ fn check_session_reach<B: Backend>(
     caller: SessionId,
     s: &SessionInfo,
 ) -> Result<(), String> {
-    if st.limits.cross_workspace {
-        return Ok(());
-    }
     match st.backend.channel(s.channel_id) {
         Some(ch) if in_reach(st, caller, &ch) => Ok(()),
         _ => Err(format!(
@@ -765,7 +765,7 @@ fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
         "origin": origin_json,
         "policy": {
             "shell_commands": st.limits.allow_shell,
-            "other_workspaces": st.limits.cross_workspace,
+            "sharing_rules": st.guard.lock().communication.grants.iter().filter(|g| Some(g.from_workspace) == caller_workspace(st, caller) && g.from_session.is_none_or(|s| s == caller)).collect::<Vec<_>>(),
         },
     })))
 }
@@ -800,7 +800,7 @@ fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
         .iter()
         .filter(|s| filter.is_none_or(|c| s.channel_id == c))
         .filter(|s| check_session_reach(st, caller, s).is_ok())
-        .map(|s| session_json(s, caller))
+        .map(|s| { let mut v = session_json(s, caller); v["reachability"] = super::communication::reachability(st, caller, s); v })
         .collect();
     Ok(pretty(&Value::Array(out)))
 }
@@ -1049,6 +1049,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let info = reachable_session(st, caller, target)?;
+    super::communication::check(st, caller, &info, false)?;
     // An agent only takes messages through ask_agent, which applies its origin rules.
     if let Some(b) = st.backend.agents().into_iter().find(|b| b.session_id == Some(target)) {
         return Err(format!(
@@ -1143,6 +1144,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
 fn read_screen<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let id = a.session_id("session_id")?;
     let info = reachable_session(st, caller, id)?;
+    super::communication::check(st, caller, &info, true)?;
     let text = st
         .backend
         .screen_text(id)
@@ -1157,7 +1159,8 @@ fn read_screen<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
 
 fn get_recent_output<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let id = a.session_id("session_id")?;
-    reachable_session(st, caller, id)?;
+    let info = reachable_session(st, caller, id)?;
+    super::communication::check(st, caller, &info, true)?;
     let lines = a
         .int("lines")?
         .unwrap_or(st.limits.recent_default_lines as i64)
@@ -1454,6 +1457,7 @@ fn post_to_channel<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         EventKind::AgentPost,
         json!({"session_id": caller, "text": text}),
     );
+    super::communication::publish(st, caller, ch.id, text)?;
     Ok(format!("Posted to channel {} (#{}).", ch.id, ch.name))
 }
 
@@ -1467,7 +1471,7 @@ async fn get_diff<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>)
         .unwrap_or(st.limits.diff_default_bytes as i64)
         .clamp(1000, st.limits.diff_max_bytes as i64) as usize;
     let ch = open_channel(st, ch_id)?;
-    check_channel_reach(st, caller, &ch)?;
+    if !super::communication::allowed(st, caller, &ch, true) { return Err(format!("channel {} is in another workspace; output reading requires a sharing rule. {HOW_CROSS}", ch.id)); }
     let diff = st
         .backend
         .diff(ch.cwd.clone(), ch.base_branch.clone())

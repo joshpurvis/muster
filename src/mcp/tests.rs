@@ -1491,7 +1491,7 @@ async fn other_workspaces_out_of_reach_by_default() {
     ] {
         let (t, err) = call(&st, tool, args).await;
         assert!(
-            err && t.contains("another workspace") && t.contains("MUSTER_MCP_CROSS_WORKSPACE=1"),
+            err && t.contains("another workspace") && t.contains("sharing rule"),
             "{tool}: {t}"
         );
     }
@@ -1508,8 +1508,8 @@ async fn other_workspaces_out_of_reach_by_default() {
 
 #[tokio::test]
 async fn other_workspaces_reachable_when_enabled() {
-    let (m, mut st) = state();
-    st.limits.cross_workspace = true;
+    let (m, st) = state();
+    st.edit_guard(|g| g.communication.grants.push(super::communication::Grant { from_workspace:1, to_workspace:2, from_session:None, message:true, read_output:true })).unwrap();
     add_shell_and_other_workspace(&m);
     let (t, err) = call(&st, "send_message", json!({"session_id": 5, "text": "hi"})).await;
     assert!(!err, "{t}");
@@ -1903,4 +1903,60 @@ async fn panel_update_offers_set_edits_beside_whole_data() {
     assert!(!call(&limited, "post_to_channel", json!({"text":"first"})).await.1);
     let (message, error) = call(&limited, "panel_update", json!({"panel_id": 1, "set": [{"path": "prs[number=226].status", "value": "merged"}]})).await;
     assert!(error && message.contains("rate limit"), "{message}");
+}
+
+#[tokio::test]
+async fn session_requests_correlate_replies_and_enforce_recipient() {
+    let (_, st) = state();
+    let (sent, err) = call(&st, "request_session", json!({"session_id":2,"text":"What changed?"})).await;
+    assert!(!err, "{sent}"); let id = parse(&sent)["id"].clone();
+    assert!(call(&st,"reply_session",json!({"request_id":id,"text":"forged"})).await.1);
+    let (reply, err) = call_as(&st,"tok2","reply_session",json!({"request_id":id,"text":"Fixed the parser."})).await;
+    assert!(!err,"{reply}"); assert_eq!(parse(&reply)["status"],"answered");
+    assert!(call_as(&st,"tok2","reply_session",json!({"request_id":id,"text":"again"})).await.1);
+    let (history, err) = call(&st,"session_messages",json!({"request_id":id})).await;
+    assert!(!err); assert_eq!(parse(&history)[0]["reply"],"Fixed the parser.");
+}
+
+#[tokio::test]
+async fn sharing_separates_messages_from_output_and_can_be_revoked() {
+    let (m, st) = state();
+    let mut foreign = channel(20,"foreign"); foreign.workspace_id = 2;
+    m.d.lock().channels.insert(20,foreign);
+    m.d.lock().sessions.get_mut(&2).unwrap().channel_id = 20;
+    assert!(call(&st,"send_message",json!({"session_id":2,"text":"hello"})).await.1);
+    st.edit_guard(|g| g.communication.grants.push(super::communication::Grant { from_workspace:1,to_workspace:2,from_session:Some(1),message:true,read_output:false })).unwrap();
+    let (sent,err) = call(&st,"send_message",json!({"session_id":2,"text":"hello"})).await; assert!(!err,"{sent}");
+    assert!(call(&st,"read_screen",json!({"session_id":2})).await.1);
+    let (sessions,_) = call(&st,"list_sessions",json!({})).await;
+    let sessions = parse(&sessions); let target = sessions.as_array().unwrap().iter().find(|v| v["id"] == 2).unwrap();
+    assert_eq!(target["reachability"]["can_message"],true);
+    assert_eq!(target["reachability"]["can_read_output"],false);
+    st.edit_guard(|g| g.communication.grants.clear()).unwrap();
+    assert!(call(&st,"send_message",json!({"session_id":2,"text":"hello"})).await.1);
+}
+
+#[tokio::test]
+async fn channel_subscriptions_only_return_future_posts_without_injection() {
+    let (m, st) = state();
+    call(&st,"post_to_channel",json!({"text":"old"})).await;
+    assert!(!call_as(&st,"tok2","subscribe_channel",json!({"channel_id":10,"enabled":true})).await.1);
+    call(&st,"post_to_channel",json!({"text":"new"})).await;
+    let (updates, err) = call_as(&st,"tok2","channel_updates",json!({})).await; assert!(!err,"{updates}");
+    let updates = parse(&updates); assert_eq!(updates["updates"].as_array().unwrap().len(),1);
+    assert_eq!(updates["updates"][0]["text"],"new"); assert!(m.d.lock().sends.is_empty());
+    let (next,_) = call_as(&st,"tok2","channel_updates",json!({"after_id":updates["next_cursor"]})).await;
+    assert_eq!(parse(&next)["updates"],json!([]));
+    call_as(&st,"tok2","subscribe_channel",json!({"channel_id":10,"enabled":false})).await;
+    let (next,_) = call_as(&st,"tok2","channel_updates",json!({})).await; assert_eq!(parse(&next)["updates"],json!([]));
+}
+
+#[tokio::test]
+async fn session_request_timeout_keeps_late_reply_and_survives_reload() {
+    let (m,st) = state();
+    let (out,err) = call(&st,"request_session",json!({"session_id":2,"text":"slow","timeout_seconds":1})).await;
+    assert!(!err,"{out}"); let out = parse(&out); assert_eq!(out["status"],"timed_out");
+    let st = McpState::new(m);
+    let (out,err) = call_as(&st,"tok2","reply_session",json!({"request_id":out["id"],"text":"late answer"})).await;
+    assert!(!err,"{out}"); assert_eq!(parse(&out)["status"],"answered");
 }

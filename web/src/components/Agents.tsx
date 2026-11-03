@@ -3,6 +3,7 @@
 // own terminal tab; the panel only starts, finds and configures agents.
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { Communication } from "./Communication.tsx";
 import { rpc } from "../rpc.ts";
 import { AgentSchedules, agentsHeaderItems, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
@@ -122,6 +123,7 @@ export function AgentsPanel() {
           </button>
         )}
       </div>
+      {agentsSupported.value && <Communication />}
       {agentsSupported.value && <SchedulesPausedNotice />}
       {agentsSupported.value && <ProposalsNotice />}
       {!agentsSupported.value

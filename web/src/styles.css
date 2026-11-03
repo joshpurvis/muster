@@ -5586,3 +5586,9 @@ fieldset.sch-then > legend {
 .drawer-resize:hover, .drawer-resize:focus-visible { background: var(--accent); opacity: 0.6; }
 .drawer-empty { flex: 1; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 16px; color: var(--text-muted); overflow: auto; }
 .drawer-notice { padding: 4px 12px; font-size: 11.5px; color: var(--text-muted); background: var(--bg-1); }
+
+.communication { padding: 8px 12px; font-size: 12px; overflow-wrap: anywhere; }
+.communication section { max-height: 65vh; overflow: auto; }
+.communication label { display: block; margin: 8px 0; }
+.communication select, .communication input[type=number] { display: block; width: 100%; }
+.communication details { margin: 8px 0; }

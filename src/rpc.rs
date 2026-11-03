@@ -187,6 +187,33 @@ pub enum Via {
 /// `dispatch`, told where the call came from.
 pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value, via: Via) -> RpcResult {
     match method {
+        "communication.get" | "communication.set" => {
+            if !matches!(who, Principal::Local) { return Err(RpcError("communication settings are local only".into())); }
+            let st = hub.mcp().ok_or_else(|| RpcError("MCP unavailable".into()))?;
+            if method == "communication.set" {
+                if via != Via::Window { return Err(RpcError("change sharing rules in Muster's window".into())); }
+                let grants: Vec<crate::mcp::communication::Grant> = serde_json::from_value(params["grants"].clone())?;
+                if grants.len() > 100 { return Err(RpcError("at most 100 sharing rules".into())); }
+                for g in &grants {
+                    if hub.workspace(g.from_workspace).is_none() || hub.workspace(g.to_workspace).is_none() {
+                        return Err(RpcError("sharing rule references a missing workspace".into()));
+                    }
+                    if let Some(id) = g.from_session {
+                        if !hub.session(id).and_then(|s| hub.channel(s.channel_id)).is_some_and(|c| c.workspace_id == g.from_workspace) {
+                            return Err(RpcError("sharing rule caller is outside its source workspace".into()));
+                        }
+                    }
+                }
+                let expected: Vec<crate::mcp::communication::Grant> = serde_json::from_value(params["expected_grants"].clone())?;
+                st.edit_guard(|g| -> Result<(), String> {
+                    if g.communication.grants != expected { return Err("sharing rules changed; refresh and try again".into()); }
+                    g.communication.grants = grants;
+                    Ok(())
+                })??;
+            }
+            let c = st.guard.lock().communication.clone();
+            Ok(json!({"grants":c.grants,"messages":c.messages.iter().map(|m| crate::mcp::communication::message_json(&st, m)).collect::<Vec<_>>(),"subscriptions":c.subscriptions}))
+        }
         // A liveness check: the phone calls it while visible to notice a dead socket.
         "ping" => Ok(json!({})),
         "hello" => {
@@ -1451,7 +1478,7 @@ fn widening(method: &str) -> bool {
     matches!(
         method,
         "schedule.create" | "schedule.update" | "schedule.pause" | "schedule.skip" | "schedule.renew"
-            | "schedule.settings.set" | "note.set_triggers" | "agent.update"
+            | "schedule.settings.set" | "note.set_triggers" | "agent.update" | "communication.set"
     )
 }
 
@@ -2469,6 +2496,19 @@ mod tests {
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));
         hub.set_mcp(Arc::downgrade(&st));
         (hub, st)
+    }
+
+    #[tokio::test]
+    async fn communication_settings_require_a_window_and_reject_stale_edits() {
+        let (hub, _st) = fixture();
+        let grant = json!({"from_workspace":1,"to_workspace":1,"from_session":null,"message":true,"read_output":false});
+        let params = json!({"grants":[grant],"expected_grants":[]});
+        assert!(call(&hub,"communication.set",params.clone()).await.unwrap_err().contains("window"));
+        let result = dispatch_via(&hub,&Principal::Local,"communication.set",params.clone(),Via::Window).await;
+        assert!(result.is_ok());
+        let result = dispatch_via(&hub,&Principal::Local,"communication.set",params,Via::Window).await;
+        assert!(matches!(result, Err(RpcError(s)) if s.contains("changed")));
+        assert_eq!(call(&hub,"communication.get",json!({})).await.unwrap()["grants"],json!([grant]));
     }
 
     fn agent(hub: &Hub, name: &str) {

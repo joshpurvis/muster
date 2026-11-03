@@ -295,6 +295,8 @@ impl RateLimiter {
 /// Mutable guard state shared by all MCP requests.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardState {
+    #[serde(default)]
+    pub communication: super::communication::State,
     pub sends: RateLimiter,
     pub posts: RateLimiter,
     pub spawns: RateLimiter,

@@ -278,6 +278,12 @@ pub trait Adapter: Send + Sync {
     fn clear_input_bytes(&self) -> Option<Vec<u8>> {
         None
     }
+
+    /// The name of another conversation the terminal shows instead of the agent's own (Claude
+    /// Code's subagent view), if any. Keys typed then reach that conversation, not the agent.
+    fn other_view(&self, _screen: &ScreenSnapshot) -> Option<String> {
+        None
+    }
 }
 
 pub fn adapter_for(kind: SessionKind) -> &'static dyn Adapter {

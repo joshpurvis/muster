@@ -171,6 +171,9 @@ pub struct Queues {
     store: crate::store::Store,
     /// In memory only: no delivery attempt before this time (see REQUEUE_BACKOFF).
     retry_at: Mutex<HashMap<SessionId, tokio::time::Instant>>,
+    /// In memory only: sessions whose human was told their queue waits while a subagent's
+    /// conversation is on screen. Cleared once the main conversation is back.
+    view_noticed: Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl Queues {
@@ -190,7 +193,7 @@ impl Queues {
             queue.busy = false;
         }
         store.save_runtime("prompt-queues", &queues)?;
-        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()) })
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default() })
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
@@ -655,6 +658,7 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
         if !hub.may_deliver(id) { drop_queue(&hub, id); }
         return;
     }
+    note_other_view(&hub, id);
     if !ready(&hub, id) || hub.injection.backing_off(id) { return }
     let generation = hub.pty_generation(id);
     let should_start = hub.injection.edit(id, |q| {
@@ -767,6 +771,7 @@ pub(crate) fn queued_panel_ids(hub: &Hub) -> std::collections::BTreeSet<crate::m
 }
 
 pub(crate) fn drop_queue(hub: &Hub, id: SessionId) {
+    hub.injection.view_noticed.lock().remove(&id);
     let queue = hub.injection.inner.lock().get(&id).cloned();
     if let Some(queue) = queue { note_lost_panel_batch(hub, id, &queue); }
     match hub.injection.remove(id) {
@@ -816,6 +821,22 @@ fn deferred(hub: &Hub, id: SessionId, generation: Option<u64>) -> bool {
     blocked
 }
 
+/// Tell the human once per spell that a queued prompt waits while a subagent's conversation
+/// is on screen. Checked on every kick, before readiness: the viewed subagent may be working,
+/// which keeps the session from looking ready, and the prompt waits all the same.
+fn note_other_view(hub: &Hub, id: SessionId) {
+    let Some(info) = hub.session(id) else { return };
+    let view = hub.screen(id).and_then(|s| adapter_for(info.kind).other_view(&s));
+    let queued = hub.injection.inner.lock().get(&id).is_some_and(|q| !q.items.is_empty());
+    match view.filter(|_| queued) {
+        Some(name) => if hub.injection.view_noticed.lock().insert(id) {
+            hub.notice("info", format!(
+                "Session {id} is showing subagent {name}; the queued prompt waits until you switch back to the main conversation."));
+        },
+        None => { hub.injection.view_noticed.lock().remove(&id); }
+    }
+}
+
 fn composer(hub: &Hub, id: SessionId, adapter: &dyn Adapter) -> Option<String> {
     hub.screen(id).and_then(|s| adapter.composer_text(&s))
 }
@@ -842,6 +863,9 @@ enum Unsafe {
     Gone(&'static str),
     /// A dialog (permission, question, folder trust) took over: keys would answer it.
     Dialog,
+    /// The terminal shows a subagent's conversation (Claude Code's subagent view): keys would
+    /// be sent to that subagent instead of the agent itself.
+    OtherView(String),
 }
 
 impl std::fmt::Display for Unsafe {
@@ -849,6 +873,7 @@ impl std::fmt::Display for Unsafe {
         match self {
             Unsafe::Gone(why) => f.write_str(why),
             Unsafe::Dialog => f.write_str("a dialog is open in the terminal"),
+            Unsafe::OtherView(name) => write!(f, "the terminal shows subagent {name}, not the main conversation"),
         }
     }
 }
@@ -870,12 +895,14 @@ fn unsafe_to_type(
     let Some(screen) = hub.screen(id) else {
         return Some(Unsafe::Gone("the terminal host is unavailable"));
     };
-    match adapter
-        .detect_from_screen(&screen, info.state)
-        .map(|u| u.state)
-    {
+    screen_unsafe(adapter, &screen, info.state)
+}
+
+/// What on the screen itself forbids typing: a dialog, or another conversation in view.
+fn screen_unsafe(adapter: &dyn Adapter, screen: &crate::adapters::ScreenSnapshot, state: AgentState) -> Option<Unsafe> {
+    match adapter.detect_from_screen(screen, state).map(|u| u.state) {
         Some(AgentState::NeedsApproval | AgentState::AskingQuestion) => Some(Unsafe::Dialog),
-        _ => None,
+        _ => adapter.other_view(screen).map(Unsafe::OtherView),
     }
 }
 
@@ -892,6 +919,10 @@ enum AfterTyping {
 fn after_typing(state: Option<Unsafe>, attempts: u8) -> AfterTyping {
     match state {
         None => AfterTyping::Submit,
+        // The human opened a subagent while it was typed: the text sits in the main box,
+        // which the next attempt clears (it matches `last_sent`) once main is back. Never
+        // counts against the attempts: waiting for the human is not a failed delivery.
+        Some(Unsafe::OtherView(_)) => AfterTyping::Requeue,
         Some(Unsafe::Dialog) if attempts < MAX_ATTEMPTS => AfterTyping::Requeue,
         Some(why) => AfterTyping::Fail(format!("prompt typed but not submitted: {why}")),
     }
@@ -992,7 +1023,9 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     let extra = Duration::from_millis((bytes.len() as u64 / 50).min(900));
     tokio::time::sleep(SUBMIT_DELAY_MIN + extra).await;
     // Something took over while we typed; don't press Enter into it.
-    match after_typing(unsafe_to_type(hub, id, adapter, generation), item.attempts) {
+    let why = unsafe_to_type(hub, id, adapter, generation);
+    if matches!(why, Some(Unsafe::OtherView(_))) { item.attempts = item.attempts.saturating_sub(1); }
+    match after_typing(why, item.attempts) {
         AfterTyping::Submit => {}
         AfterTyping::Requeue => {
             tracing::debug!(session = id, "dialog opened while typing; prompt requeued");
@@ -1002,6 +1035,14 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     }
     let seq_before = {
         let _op = item.panel.as_ref().map(|_| hub.panels.operations.lock());
+        // Checked last thing before any key below (Ctrl-C, Enter): one switch to a subagent
+        // after the check above would send it there (Ctrl-C would stop that subagent). The text
+        // stays in the main box and the next attempt clears it as ours. The human's own keys
+        // don't pass through Muster, so a switch inside this last instant can't be excluded.
+        if hub.screen(id).is_some_and(|s| adapter.other_view(&s).is_some()) {
+            item.attempts = item.attempts.saturating_sub(1);
+            return requeue(item);
+        }
         if let Some(batch) = &item.panel && !panel_bound(hub, id, batch) {
             // Typed but not submitted: take the text back out; the events return to the panel.
             if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
@@ -1259,6 +1300,24 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
 mod tests {
     use super::*;
 
+    /// The reported bug: the human viewed the lead's subagent and a queued message for the lead
+    /// was typed into it. Real Claude Code screens: subagent on screen (idle or working) blocks
+    /// typing; the main conversation, with the same agent list, does not.
+    #[test]
+    fn a_subagent_on_screen_blocks_typing() {
+        use crate::adapters::tui::testutil::snap;
+        let claude = adapter_for(crate::model::SessionKind::Claude);
+        for (fixture, state) in [
+            (include_str!("adapters/fixtures/claude_subagent_view.txt"), AgentState::Idle),
+            (include_str!("adapters/fixtures/claude_subagent_view.txt"), AgentState::Working),
+            (include_str!("adapters/fixtures/claude_subagent_typed.txt"), AgentState::Idle),
+        ] {
+            assert_eq!(screen_unsafe(claude, &snap(fixture), state), Some(Unsafe::OtherView("sleeper".into())));
+        }
+        let main = snap(include_str!("adapters/fixtures/claude_main_with_agents.txt"));
+        assert_eq!(screen_unsafe(claude, &main, AgentState::Idle), None);
+    }
+
     #[test]
     fn dialog_while_typing_requeues_at_front() {
         // Decision: a dialog means "requeue" (until attempts run out), a dead process fails.
@@ -1269,6 +1328,9 @@ mod tests {
             after_typing(Some(Unsafe::Dialog), MAX_ATTEMPTS),
             AfterTyping::Fail(_)
         ));
+        // The human opened a subagent's view mid-typing: don't press Enter into it.
+        assert_eq!(after_typing(Some(Unsafe::OtherView("sleeper".into())), 1), AfterTyping::Requeue);
+        assert_eq!(after_typing(Some(Unsafe::OtherView("sleeper".into())), MAX_ATTEMPTS), AfterTyping::Requeue);
         assert!(matches!(
             after_typing(Some(Unsafe::Gone("the session was removed")), 1),
             AfterTyping::Fail(m) if m.contains("removed")

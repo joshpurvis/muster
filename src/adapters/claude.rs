@@ -185,6 +185,52 @@ fn prompt_marker(line: &str) -> Option<bool> {
     }
 }
 
+/// The background-agent list under the input box marks the conversation on screen with `●`
+/// and the others with `◯`; the human's own is always `main`. (A `❯` in front is the list's
+/// selection cursor, not the view; a long list adds `↑ N more` after the name.) Only the
+/// footer below the input box is read, so transcript text can't pass for the list.
+/// `Some(true)` = main is on screen, `None` = no list.
+fn main_row_viewed(footer: &[String]) -> Option<bool> {
+    footer.iter().rev().find_map(|l| {
+        let t = l.trim_start();
+        let t = t.strip_prefix('❯').map(str::trim_start).unwrap_or(t);
+        let (viewed, rest) = match (t.strip_prefix("● main"), t.strip_prefix("◯ main")) {
+            (Some(rest), _) => (true, rest),
+            (_, Some(rest)) => (false, rest),
+            _ => return None,
+        };
+        rest.chars().next().is_none_or(char::is_whitespace).then_some(viewed)
+    })
+}
+
+/// A rule carrying a name at its right end (`──── sleeper ─`): Claude draws it above the input
+/// box while a subagent's conversation is on screen. Returns the name.
+fn labelled_rule(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let inner = t.trim_end_matches('─').trim_start_matches('─');
+    let ruled = t.starts_with("────") && t.ends_with('─');
+    (ruled && inner.len() < t.len() && !inner.trim().is_empty()).then(|| inner.trim())
+}
+
+/// The subagent whose conversation is on screen instead of the main one, if any. Anything
+/// typed then goes to that subagent, so Muster must not type a queued message.
+fn subagent_view(lines: &[String]) -> Option<String> {
+    let is_any_rule = |l: &str| tui::is_rule(l) || labelled_rule(l).is_some();
+    // The input box: the last `❯` row with a rule above and below it (multi-line drafts sit
+    // between). The agent list's cursor is a `❯` too, but has no rule above it.
+    let row = (1..lines.len()).rev().find(|&i| prompt_marker(&lines[i]) == Some(false) && is_any_rule(&lines[i - 1]))?;
+    let bottom = (row + 1..lines.len()).find(|&i| is_any_rule(&lines[i]))?;
+    let label = labelled_rule(&lines[row - 1]);
+    match main_row_viewed(&lines[bottom + 1..]) {
+        Some(true) => None,
+        Some(false) => Some(label.unwrap_or("a subagent").to_string()),
+        // No agent list drawn: trust the labelled rule only with the subagent placeholder.
+        None => label
+            .filter(|_| lines[row].trim_start_matches('❯').trim().starts_with("Message @"))
+            .map(str::to_string),
+    }
+}
+
 fn is_spinner_row(line: &str) -> bool {
     let t = line.trim_start();
     let mut chars = t.chars();
@@ -519,6 +565,10 @@ impl Adapter for ClaudeAdapter {
     fn clear_input_bytes(&self) -> Option<Vec<u8>> {
         Some(vec![0x03])
     }
+
+    fn other_view(&self, screen: &ScreenSnapshot) -> Option<String> {
+        subagent_view(&screen.lines)
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +710,56 @@ mod tests {
         assert_eq!(ClaudeAdapter.composer_text(&typed).as_deref(), Some("!ls -la"));
         // Back out of shell mode: an empty ordinary box is not a draft.
         assert_eq!(ClaudeAdapter.composer_text(&fx!("claude_idle_done")).as_deref(), Some(""));
+    }
+
+    /// Screens captured from Claude Code 2.1.316 with a background subagent running. While the
+    /// human views the subagent (Enter on its row in the agent list), the input box sends to
+    /// that subagent, so Muster must not type a queued message for the lead into it.
+    #[test]
+    fn subagent_view_is_detected() {
+        let a = ClaudeAdapter;
+        assert_eq!(a.other_view(&fx!("claude_subagent_view")).as_deref(), Some("sleeper"));
+        assert_eq!(a.other_view(&fx!("claude_subagent_typed")).as_deref(), Some("sleeper"));
+        // The list's cursor on `main` is only a selection; the subagent is still on screen.
+        assert_eq!(a.other_view(&fx!("claude_subagent_list_focused")).as_deref(), Some("sleeper"));
+        // Main conversation, with and without the agent list.
+        assert_eq!(a.other_view(&fx!("claude_main_with_agents")), None);
+        for s in [fx!("claude_idle_done"), fx!("claude_typed_multiline"), fx!("claude_shell_mode_empty")] {
+            assert_eq!(a.other_view(&s), None);
+        }
+    }
+
+    #[test]
+    fn subagent_view_without_agent_list_needs_label_and_placeholder() {
+        let lines = |rows: &[&str]| rows.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let rule = "─".repeat(40);
+        let labelled = format!("{} sleeper ─", "─".repeat(30));
+        assert_eq!(subagent_view(&lines(&[&labelled, "❯\u{a0}Message @general-purpose…", &rule])).as_deref(), Some("sleeper"));
+        // A labelled rule alone is not enough (the human's own draft could start differently).
+        assert_eq!(subagent_view(&lines(&[&labelled, "❯\u{a0}fix the tests", &rule])), None);
+        assert_eq!(subagent_view(&lines(&[&rule, "❯\u{a0}Message @x…", &rule])), None);
+        assert_eq!(labelled_rule(&rule), None);
+    }
+
+    /// Only the agent list under the input box counts: the same words in the conversation
+    /// never block (or unblock) delivery. A long list adds `↑ N more` to the `main` row.
+    #[test]
+    fn agent_list_is_read_from_the_footer_only() {
+        let main = fx!("claude_main_with_agents").lines;
+        let sub = fx!("claude_subagent_typed").lines;
+        let with_transcript = |lines: &[String], text: &str| {
+            let mut l = lines.to_vec();
+            l[5] = text.to_string();
+            l
+        };
+        assert_eq!(subagent_view(&with_transcript(&main, "◯ main")), None);
+        assert_eq!(subagent_view(&with_transcript(&main, "❯ ◯ main")), None);
+        assert_eq!(subagent_view(&with_transcript(&sub, "● main")).as_deref(), Some("sleeper"));
+        let paged = |lines: &[String], from: &str, to: &str| lines.iter().map(|l| l.replace(from, to)).collect::<Vec<_>>();
+        assert_eq!(subagent_view(&paged(&sub, "◯ main", "◯ main   ↑ 1 more")).as_deref(), Some("sleeper"));
+        assert_eq!(subagent_view(&paged(&main, "● main", "● main   ↑ 1 more")), None);
+        // A different first row name is not the main row.
+        assert_eq!(main_row_viewed(&["◯ mainframe".to_string()]), None);
     }
 
     #[test]

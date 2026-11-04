@@ -166,10 +166,23 @@ fn first_line(v: Option<&Value>, max: usize) -> Option<String> {
 // ----- screen parsing -----
 
 /// Index of the input-box row (`❯ …` directly below a rule), searching from the bottom.
+/// Typing `!` as the first character switches Claude to shell mode: the box then starts with
+/// `!` instead of `❯` (what follows is run as a shell command when sent).
 fn input_row(lines: &[String]) -> Option<usize> {
     (1..lines.len())
         .rev()
-        .find(|&i| lines[i].starts_with('❯') && tui::is_rule(&lines[i - 1]))
+        .find(|&i| prompt_marker(&lines[i]).is_some() && tui::is_rule(&lines[i - 1]))
+}
+
+/// The marker that starts the input row and whether it is shell mode.
+fn prompt_marker(line: &str) -> Option<bool> {
+    if line.starts_with('❯') {
+        Some(false)
+    } else if line.strip_prefix('!').is_some_and(|rest| rest.chars().next().is_none_or(char::is_whitespace)) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn is_spinner_row(line: &str) -> bool {
@@ -486,7 +499,9 @@ impl Adapter for ClaudeAdapter {
         }
         let lines = &screen.lines;
         let row = input_row(lines)?;
-        let mut text = vec![lines[row].trim_start_matches('❯').trim().to_string()];
+        let shell_mode = prompt_marker(&lines[row]) == Some(true);
+        let first = lines[row].trim_start_matches(['❯', '!']).trim();
+        let mut text = vec![first.to_string()];
         for l in &lines[row + 1..] {
             if tui::is_rule(l) {
                 break;
@@ -495,10 +510,10 @@ impl Adapter for ClaudeAdapter {
         }
         let t = text.join("\n").trim().to_string();
         // Dim placeholder suggestions look like `Try "…"`.
-        if t.starts_with("Try \"") {
-            return Some(String::new());
-        }
-        Some(t)
+        let t = if t.starts_with("Try \"") { String::new() } else { t };
+        // Shell mode counts as a draft even with nothing after the `!`: whatever is typed
+        // next would run as a command, not go to the model.
+        Some(if shell_mode { format!("!{t}") } else { t })
     }
 
     fn clear_input_bytes(&self) -> Option<Vec<u8>> {
@@ -631,6 +646,20 @@ mod tests {
             detect(&restored, AgentState::Working).unwrap().state,
             AgentState::Idle
         );
+    }
+
+    /// A lone `!` (or `!` plus text) puts Claude in shell mode: the input row starts with `!`,
+    /// not `❯`. Muster must see that as the human's draft, or a queued message typed now would
+    /// run as a shell command.
+    #[test]
+    fn shell_mode_is_a_draft_even_when_empty() {
+        let empty = fx!("claude_shell_mode_empty");
+        assert_eq!(ClaudeAdapter.composer_text(&empty).as_deref(), Some("!"));
+        assert_eq!(detect(&empty, AgentState::Idle).unwrap().state, AgentState::Idle);
+        let typed = fx!("claude_shell_mode_typed");
+        assert_eq!(ClaudeAdapter.composer_text(&typed).as_deref(), Some("!ls -la"));
+        // Back out of shell mode: an empty ordinary box is not a draft.
+        assert_eq!(ClaudeAdapter.composer_text(&fx!("claude_idle_done")).as_deref(), Some(""));
     }
 
     #[test]

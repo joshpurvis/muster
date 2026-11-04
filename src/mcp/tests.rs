@@ -1663,6 +1663,7 @@ fn with_agents(m: &Mock) {
             effort: None,
             persona: String::new(),
             home_dir: format!("/data/agents/{name}"),
+            working_location: Default::default(), reset_on_next_start: false,
             permissions: Permissions::default(),
             accepts_origins: default_accepts(kind),
             channel_id: Some(20),

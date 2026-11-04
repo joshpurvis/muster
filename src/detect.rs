@@ -77,6 +77,7 @@ pub fn spawn(hub: Arc<Hub>) {
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             iv.tick().await;
+            let cycle_started = std::time::Instant::now();
             let ids = hub.live_session_ids();
             let previous_len = tracks.len();
             tracks.retain(|id, _| ids.contains(id));
@@ -123,6 +124,7 @@ pub fn spawn(hub: Arc<Hub>) {
                     Err(error) => tracing::warn!("saving detector progress: {error:#}"),
                 }
             }
+            hub.metrics.record("detector.cycle_ms", "", cycle_started.elapsed().as_secs_f64()*1000.0);
         }
     });
 }

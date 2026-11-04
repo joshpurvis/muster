@@ -5,6 +5,7 @@ import {
   focusedTabId, meta, sessionsByChannel, toast, unread, updateSidebar, windowChannels, windowSessions, workspaceById,
 } from "../state.ts";
 import { needsHuman, type Channel, type SessionInfo } from "../types.ts";
+import { aggregateState } from "../model.ts";
 import { rpc } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { accountSessionGroups, sidebarRatio } from "../layout/channels.ts";
@@ -212,8 +213,7 @@ function ChannelRow({ channel: c }: { channel: Channel }) {
   const [editing, setEditing] = useState(false);
   const items = sessionsByChannel.value.get(c.id) ?? [];
   const attention = items.filter((s) => needsHuman(s.state)).length;
-  const state = items.find((s) => needsHuman(s.state))?.state ??
-    items.find((s) => s.state === "working" || s.state === "starting")?.state ?? "idle";
+  const state = aggregateState(items);
   const active = activeChannelId.value === c.id;
   const count = channelLayout.value?.layouts[c.id] ? allSessions(channelLayout.value.layouts[c.id].root).length : 0;
   const d = drag.value;

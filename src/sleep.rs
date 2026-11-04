@@ -1377,7 +1377,7 @@ mod tests {
             model: None,
             effort: None,
             persona: String::new(),
-            home_dir: "/tmp/dozy".into(),
+            home_dir: "/tmp/dozy".into(), working_location: Default::default(), reset_on_next_start: false,
             permissions: Permissions::default(),
             accepts_origins: vec![crate::agents::Origin::Human],
             channel_id: Some(1),

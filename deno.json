@@ -7,6 +7,8 @@
     "build:all:inner": "deno task web && cargo build --workspace --release --features gui",
     "dev": "deno task web && cargo build --workspace && ./target/debug/muster",
     "test": "bash scripts/job.sh test bash scripts/isolated.sh cargo test --workspace && cd web && deno task check && deno task test",
-    "smoke": "bash scripts/job.sh test bash scripts/isolated.sh bash scripts/smoke.sh"
+    "smoke": "bash scripts/job.sh test bash scripts/isolated.sh bash scripts/smoke.sh",
+    "eval": "deno task build && python3 scripts/eval.py",
+    "eval:compare": "python3 scripts/eval.py compare"
   }
 }

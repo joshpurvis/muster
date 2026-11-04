@@ -213,6 +213,12 @@ serve `web/dist` from disk.
 
 Log verbosity: `MUSTER_LOG=debug`.
 
+Local performance history is enabled by default: `muster metrics status` shows collection
+health, `muster metrics export` exports JSON, and `muster metrics disable` turns collection
+off. It stores numeric summaries locally with bounded retention and no terminal contents.
+Run `deno task eval --output /tmp/muster-baseline.json` for isolated typing, recovery and
+resource evals. See [metrics and evals](docs/METRICS.md) for definitions, controls and comparisons.
+
 ## Test
 
 ```sh

@@ -881,8 +881,43 @@ button.sl-item:hover {
   color: var(--text);
 }
 
-.tab-num {
+/* Reserve the bold label's width even while read; status updates must not move sibling tabs.
+   The hidden generated copy is excluded from textContent and the accessibility tree. */
+.tab-task[data-tab-label] {
+  display: grid;
+}
+
+.tab-task[data-tab-label]::before {
+  content: attr(data-tab-label);
+  grid-area: 1 / 1;
+  visibility: hidden;
+  font-weight: 650;
+}
+
+.tab-task[data-tab-label] > span {
+  grid-area: 1 / 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab-icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
+}
+
+.tab-icon.show-shortcut > .icon {
+  visibility: hidden;
+}
+
+.tab-num {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
   min-width: 15px;
   height: 15px;
   padding: 0 3px;
@@ -935,6 +970,7 @@ button.sl-item:hover {
 }
 
 .tab.renaming > .icon,
+.tab.renaming > .tab-icon,
 .tab.renaming .tab-wt,
 .tab.renaming .tab-perm,
 .tab.renaming .tab-queued,

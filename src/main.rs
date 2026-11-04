@@ -16,6 +16,7 @@ mod hub;
 mod inject;
 mod mcp;
 mod model;
+mod metrics;
 mod notes;
 mod panels;
 mod panel_apps;
@@ -74,6 +75,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Local performance history: status, export, enable, disable, clear.
+    Metrics {
+        #[command(subcommand)]
+        action: metrics::Cli,
+    },
     /// Open and manage agent panels in this session's task.
     Panel {
         #[command(subcommand)]
@@ -625,6 +631,7 @@ fn main() -> ExitCode {
         Some(Cmd::Daemon { foreground: false, .. }) => start_daemon_detached().map(|d| println!("{}", d.ui_url())),
         Some(Cmd::Hook { .. } | Cmd::Statusline { .. }) => unreachable!("handled above"),
         Some(Cmd::Status) => status(),
+        Some(Cmd::Metrics { action }) => running().and_then(|d| metrics::cli(&d, action)),
         Some(Cmd::Stop) => stop(),
         Some(Cmd::Reload) => reload(),
         Some(Cmd::RestartAll { report_fd, launch, app, host }) => restart_all(RestartOpts { report_fd, launch, app, host }),
@@ -1838,6 +1845,14 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         app_hash: release.app_hash().to_string(),
         host_pid: Some(host_pid),
     });
+    metrics::start(&hub, paths::data_dir().join("metrics.db"), serde_json::json!({
+        "backend": release.app_hash(),
+        "host": executables::hash_file(&PathBuf::from(format!("/proc/{host_pid}/exe"))).ok(),
+        "version": env!("CARGO_PKG_VERSION"), "debug": cfg!(debug_assertions),
+        "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+        "logical_cpus": std::thread::available_parallelism().ok().map(|n| n.get()),
+        "started": model::now_ms(),
+    }), host_pid);
     hook_inbox::spawn(&hub, hook_inbox)?;
     hub::spawn_input_attribution(&hub)?;
     hub.panels.port.store(panel_port, std::sync::atomic::Ordering::Relaxed);
@@ -1960,6 +1975,7 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
 
 async fn shutdown(hub: &Arc<hub::Hub>) {
     hub.shutdown().await;
+    let _ = hub.metrics.command("metrics.status", serde_json::json!({})).await;
     tracing::info!("muster daemon stopped");
 }
 

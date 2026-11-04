@@ -145,6 +145,8 @@ export function formatReport(env: string, samples: KeySample[], last = 50): stri
  * (latency_monitor.ts feeds it from the live hooks). Each stage takes the first event after the
  * previous one; keys older than STALE_MS are dropped at every stage, never counted. */
 export class KeyTracker {
+  expired = 0;
+  overflow = 0;
   /** Bumped by reset() and clear(): callbacks scheduled before then are ignored. */
   gen = 0;
   done: KeySample[] = [];
@@ -155,7 +157,9 @@ export class KeyTracker {
 
   /** This session's keys still in flight at t; stale ones are dropped. */
   private live(sid: number, t: number): KeySample[] {
-    const q = (this.pending.get(sid) ?? []).filter((s) => t - s.t0 <= STALE_MS);
+    const before = this.pending.get(sid) ?? [];
+    const q = before.filter((s) => t - s.t0 <= STALE_MS);
+    this.expired += before.filter((s) => t - s.t0 > STALE_MS && Number.isFinite(s.t1)).length;
     if (q.length) this.pending.set(sid, q);
     else this.pending.delete(sid);
     return q;
@@ -168,6 +172,11 @@ export class KeyTracker {
   keydown(sid: number, t0: number, k: { queue: number | null; frameGap: number | null; webgl: boolean }) {
     // A key that never sent bytes was a shortcut (Ctrl+Shift+C…): drop it.
     const q = this.live(sid, t0).filter((s) => !Number.isNaN(s.t1));
+    // Passive collection must stay bounded even if keys arrive much faster than output.
+    if (q.length >= 256) {
+      this.overflow += q.length - 255;
+      q.splice(0, q.length - 255);
+    }
     const prev = this.lastKey.get(sid);
     this.lastKey.set(sid, t0);
     q.push({
@@ -238,6 +247,12 @@ export class KeyTracker {
     this.gen++;
     this.pending.clear();
     this.lastKey.clear();
+    this.expired = 0;
+    this.overflow = 0;
+  }
+
+  expire(t: number) {
+    for (const sid of this.pending.keys()) this.live(sid, t);
   }
 
   /** reset(), and forget the finished keys too. */

@@ -95,6 +95,29 @@ pub fn parse_accepts(s: &str) -> anyhow::Result<Vec<Origin>> {
     Ok(out)
 }
 
+/// Identity stays in the agent home; this selects the project it works in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkingLocation {
+    #[default]
+    Home,
+    Main { workspace_id: WorkspaceId },
+    Worktree { workspace_id: WorkspaceId },
+}
+impl WorkingLocation {
+    pub fn workspace_id(&self) -> Option<WorkspaceId> {
+        match self { Self::Home => None, Self::Main { workspace_id } | Self::Worktree { workspace_id } => Some(*workspace_id) }
+    }
+}
+fn check_location(hub: &Hub, location: &WorkingLocation) -> anyhow::Result<()> {
+    if let Some(id) = location.workspace_id() {
+        let ws = hub.workspace(id).ok_or_else(|| anyhow::anyhow!("workspace {id} no longer exists"))?;
+        anyhow::ensure!(ws.is_git, "select a Git repository workspace");
+        anyhow::ensure!(Path::new(&ws.path).is_dir(), "repository directory is missing: {}", ws.path);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
     /// Pinned for the agent's lifetime, so its resume ID never crosses configuration dirs.
@@ -109,6 +132,8 @@ pub struct Agent {
     pub effort: Option<String>,
     pub persona: String,
     pub home_dir: String,
+    pub working_location: WorkingLocation,
+    pub reset_on_next_start: bool,
     /// Permission profile of the agent's tab when muster creates it (the human may change the
     /// tab's profile later, like any tab's; checks read the tab's actual profile).
     pub permissions: Permissions,
@@ -240,8 +265,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     let persona = persona.trim();
     format!(
         "# {name}\n\n\
-         You are {name}, a persistent muster agent ({kind}). This folder is your home: muster starts you \
-         here{resume}.\n\n\
+         You are {name}, a persistent muster agent ({kind}). This folder is your persistent home; your working directory may be a repository. Muster{resume}.\n\n\
          ## Persona\n\n{persona}\n\n\
          ## Memory\n\n\
          Keep durable notes (facts, decisions, open threads) in `memory/` in this folder, one topic per \
@@ -260,7 +284,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
-        resume = " and resumes your conversation when you restart",
+        resume = " resumes your conversation when you restart",
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -932,6 +956,16 @@ impl Registry {
         self.inner.lock().agents.get(&id).cloned()
     }
 
+    fn reset_for_start(&self, store: &Store, id: i64, expected: &WorkingLocation) -> anyhow::Result<Agent> {
+        let mut g = self.inner.lock();
+        let a = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent was removed"))?;
+        anyhow::ensure!(&a.working_location == expected, "working location changed while starting; try again");
+        store.reset_agent_conversation(id)?;
+        a.resume_id = None;
+        a.reset_on_next_start = false;
+        Ok(a.clone())
+    }
+
     /// `agent.update`: the configuration fields of `next` (model, effort, persona, profile,
     /// accepted origins, autostart); the runtime fields stay as they are now.
     fn set_config(&self, store: &Store, next: &Agent) -> anyhow::Result<Agent> {
@@ -946,6 +980,8 @@ impl Registry {
         a.autostart = next.autostart;
         a.provider = next.provider;
         a.sleep_after_min = next.sleep_after_min;
+        a.working_location = next.working_location.clone();
+        a.reset_on_next_start = next.reset_on_next_start;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -1279,6 +1315,8 @@ pub fn check_provider(hub: &Hub, kind: SessionKind, provider: Provider, model: O
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewAgent {
     #[serde(default)]
+    pub working_location: Option<WorkingLocation>,
+    #[serde(default)]
     pub account_profile: Option<crate::account_profiles::ProfileChoice>,
     pub name: String,
     #[serde(default)]
@@ -1324,6 +1362,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     if hub.agents().get(&name).is_some() {
         anyhow::bail!("an agent named {name} already exists");
     }
+    let working_location = req.working_location.unwrap_or_default();
+    check_location(hub, &working_location)?;
     let sleep_after_min = crate::sleep::check_after(req.sleep_after_min)?;
     let persona = req.persona.unwrap_or_default();
     let home = home_dir_for(&name);
@@ -1342,6 +1382,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             effort,
             persona,
             home_dir: home.to_string_lossy().into_owned(),
+            working_location,
+            reset_on_next_start: false,
             permissions: req.permissions.map(Into::into).unwrap_or_default(),
             accepts_origins: accepts,
             channel_id: None,
@@ -1362,6 +1404,11 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUpdate {
+    #[serde(default)]
+    pub working_location: Option<WorkingLocation>,
+    /// Required when changing location: true resets at the next start, false keeps the thread.
+    #[serde(default)]
+    pub reset_conversation: Option<bool>,
     pub name: String,
     #[serde(default)]
     pub provider: Option<Provider>,
@@ -1391,6 +1438,15 @@ pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agen
     let _one = hub.agents().config_lock.lock();
     let cur = hub.agents().get(&req.name).ok_or_else(|| no_agent(hub, &req.name))?;
     let mut next = cur.clone();
+    if let Some(location) = req.working_location {
+        check_location(hub, &location)?;
+        if location != cur.working_location {
+            anyhow::ensure!(!outside, "changing an agent's repository takes a click in Muster's window");
+            next.reset_on_next_start = req.reset_conversation.ok_or_else(|| anyhow::anyhow!("choose whether to keep or reset the conversation"))?;
+            next.working_location = location;
+        }
+    }
+
     if let Some(m) = req.model {
         next.model = clean_opt(Some(m));
     }
@@ -1605,14 +1661,14 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
     check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
-    if fresh {
+    check_location(hub, &agent.working_location)?;
+    if fresh || agent.reset_on_next_start {
         // First stop the old run's hooks from saving a conversation again (a turn-complete
         // still queued would otherwise undo the fresh start before the restart replaces it).
         if let Some(sid) = agent.session_id {
             hub.fence_conversation(sid);
         }
-        hub.agents().update(hub.store(), agent.id, |b| b.resume_id = None)?;
-        agent.resume_id = None;
+        agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
     let args = agent_args(agent.kind, agent.model.as_deref(), agent.effort.as_deref(), agent.resume_id.as_deref())?;
     let home = PathBuf::from(&agent.home_dir);
@@ -1642,6 +1698,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
 /// The run part of `start_locked`: restart the agent's exited session, else a new one in its tab.
 async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option<WindowId>, args: Vec<String>,
     woke: Option<i64>) -> anyhow::Result<AgentSession> {
+    let (channel, cwd) = prepare_channel(hub, &agent, window).await?;
     if let Some(sid) = agent.session_id
         && let Some(info) = hub.session(sid)
         && hub.channel(info.channel_id).is_some_and(|c| !c.archived)
@@ -1651,48 +1708,20 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
             return Ok(AgentSession { agent, session: info, started: false, woke });
         }
         hub.set_session_extra_args(sid, args)?;
-        let session = hub.restart_session(sid).await?;
+        let session = hub.restart_session_at(sid, Some((channel.id, cwd))).await?;
+        hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
+        agent.channel_id = Some(channel.id);
         return Ok(AgentSession { agent, session, started: true, woke });
     }
-    let window = window.filter(|w| hub.window(*w).is_some());
-    // The agent's own tab, never one found by name (it could have wider permissions).
-    let own = agent.channel_id.and_then(|c| hub.channel(c)).filter(|c| !c.archived);
-    let channel = match own {
-        Some(c) => c,
-        None => {
-            let dir = paths::agents_dir();
-            let ws = hub.add_workspace(dir.to_string_lossy().into_owned(), Some("agents".into())).await?;
-            let c = hub
-                .create_channel(CreateChannel {
-                    account_profile: None,
-                    workspace_id: ws.id,
-                    name: Some(agent.name.clone()),
-                    worktree: false,
-                    base: None,
-                    agent: None,
-                    prompt: None,
-                    extra_args: Vec::new(),
-                    permissions: Some(agent.permissions),
-                    window_id: window,
-                    prefer_window: None,
-                    cols: crate::hub::default_cols(),
-                    rows: crate::hub::default_rows(),
-                    from_session: None,
-                    prov: None,
-                })
-                .await?;
-            hub.agents().update(hub.store(), agent.id, |b| b.channel_id = Some(c.id))?;
-            agent.channel_id = Some(c.id);
-            c
-        }
-    };
+    hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
+    agent.channel_id = Some(channel.id);
     let session = hub
         .spawn_session(SpawnSession {
             account_profile: (agent.kind == SessionKind::Claude).then(|| crate::account_profiles::ProfileChoice::pinned(agent.account_profile_id)),
             channel_id: channel.id,
             kind: agent.kind,
             name: Some(agent.name.clone()),
-            cwd: Some(agent.home_dir.clone()),
+            cwd: Some(cwd),
             prompt: None,
             extra_args: args,
             cols: crate::hub::default_cols(),
@@ -1707,6 +1736,62 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         .await?;
     agent.session_id = Some(session.id);
     Ok(AgentSession { agent, session, started: true, woke })
+}
+
+/// Select a dedicated channel without changing or stopping the current run.
+async fn prepare_channel(hub: &Arc<Hub>, agent: &Agent, window: Option<WindowId>) -> anyhow::Result<(Channel, String)> {
+    check_location(hub, &agent.working_location)?;
+    let workspace_id = match agent.working_location.workspace_id() {
+        Some(id) => id,
+        None => hub.add_workspace(paths::agents_dir().to_string_lossy().into_owned(), Some("agents".into())).await?.id,
+    };
+    let worktree = matches!(agent.working_location, WorkingLocation::Worktree { .. });
+    let own = agent.channel_id.and_then(|id| hub.channel(id)).filter(|c|
+        !c.archived && c.workspace_id == workspace_id && c.owns_worktree == worktree);
+    let channel = match own {
+        Some(c) => c,
+        None => hub.create_channel(CreateChannel {
+            account_profile: None, workspace_id, name: Some(agent.name.clone()), worktree,
+            base: None, agent: None, prompt: None, extra_args: Vec::new(),
+            permissions: Some(agent.permissions), window_id: window.filter(|w| hub.window(*w).is_some()),
+            prefer_window: None, cols: crate::hub::default_cols(), rows: crate::hub::default_rows(),
+            from_session: None, prov: None,
+        }).await?,
+    };
+    let cwd = if agent.working_location == WorkingLocation::Home { agent.home_dir.clone() } else { channel.cwd.clone() };
+    anyhow::ensure!(Path::new(&cwd).is_dir(), "working directory is missing: {cwd}");
+    Ok((channel, cwd))
+}
+
+/// Supply the home persona without writing project instructions into the repository.
+/// Only the memory directory is added to the project's writable scope.
+pub fn configure_project_command(agent: &Agent, cwd: &str, permissions: Permissions, spec: &mut crate::adapters::CommandSpec) -> anyhow::Result<()> {
+    // A resumed Codex thread must use the selected checkout, not a remembered working root.
+    if agent.kind == SessionKind::Codex {
+        let at = spec.args.iter().position(|a| a == "--").unwrap_or(spec.args.len());
+        spec.args.splice(at..at, ["--cd".into(), cwd.into()]);
+    }
+    if agent.working_location == WorkingLocation::Home || cwd == agent.home_dir { return Ok(()) }
+    let home = Path::new(&agent.home_dir);
+    let persona = home.join(persona_file(agent.kind));
+    refuse_symlink(&persona)?;
+    let text = std::fs::read_to_string(&persona)?;
+    let instructions = format!("Your persistent agent home is {}. Your working directory is {}. The home instructions below refer to that home, including its memory/ directory. Follow the working repository's instructions as well.\n\n{}", home.display(), cwd, text);
+    let memory = home.join("memory").to_string_lossy().into_owned();
+    let args = match agent.kind {
+        SessionKind::Claude => vec!["--append-system-prompt".into(), instructions, "--add-dir".into(), memory],
+        SessionKind::Codex => {
+            let mut args = vec!["-c".into(), format!("developer_instructions={}", serde_json::to_string(&instructions)?)];
+            if matches!(permissions.codex_sandbox, CodexSandbox::WorkspaceWrite | CodexSandbox::WorkspaceWriteNetwork) {
+                args.extend(["--add-dir".into(), memory]);
+            }
+            args
+        },
+        SessionKind::Shell => vec![],
+    };
+    let at = spec.args.iter().position(|a| a == "--").unwrap_or(spec.args.len());
+    spec.args.splice(at..at, args);
+    Ok(())
 }
 
 /// The CLI arguments a restart of session `sid` must use when it is a named agent's: rebuilt
@@ -1751,12 +1836,16 @@ pub async fn restart_session(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<Se
         return hub.restart_session(id).await;
     }
     let _one = hub.agents().start_lock.lock().await;
-    let asleep = hub.agents().by_session(id).filter(|a| a.asleep_at.is_some()).map(|a| a.id);
-    let r = hub.restart_session(id).await;
-    if let (Err(e), Some(agent)) = (&r, asleep) {
-        crate::sleep::wake_failed(hub, agent, e);
+    let mut agent = hub.agents().by_session(id).ok_or_else(|| anyhow::anyhow!("agent was removed"))?;
+    let (channel, cwd) = prepare_channel(hub, &agent, None).await?;
+    if agent.reset_on_next_start {
+        hub.fence_conversation(id);
+        agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
-    r
+    let session = hub.restart_session_at(id, Some((channel.id, cwd))).await?;
+    hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
+    if let Some(a) = hub.agents().by_id(agent.id) { publish(hub, &a); }
+    Ok(session)
 }
 
 /// At daemon start (after `relocate_homes`): start every agent with autostart on.
@@ -2153,6 +2242,9 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "accepts_origins": b.accepts_origins,
         "autostart": b.autostart,
         "home_dir": b.home_dir,
+        "working_location": b.working_location,
+        "reset_on_next_start": b.reset_on_next_start,
+        "working_directory": session.map(|s| &s.cwd),
         "channel_id": b.channel_id,
         "session_id": b.session_id,
         "state": session.map(|s| s.state),
@@ -2827,7 +2919,7 @@ mod tests {
             model: None,
             effort: None,
             persona: String::new(),
-            home_dir: "/x".into(),
+            home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false,
             permissions: Permissions::default(),
             accepts_origins: default_accepts(kind),
             channel_id: None,
@@ -3169,6 +3261,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[tokio::test]
+    async fn repository_locations_keep_home_memory_and_old_worktrees() {
+        let repo = scratch("working-repo");
+        for args in [vec!["init", "-q"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"]] {
+            assert!(std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap().success());
+        }
+        let store = Store::open_memory().unwrap();
+        let hub = Hub::new(crate::hub::HubConfig { port: 0, client_token: "test".into(), muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap();
+        let ws = hub.add_workspace(repo.to_string_lossy().into_owned(), None).await.unwrap();
+        let mut a = create(&hub, serde_json::from_value(json!({"name":"location-worker","working_location":{"mode":"worktree","workspace_id":ws.id}})).unwrap()).unwrap();
+        let home = a.home_dir.clone();
+        memory_write(&a,"keep.md","remember this").unwrap();
+        let (ch, cwd) = prepare_channel(&hub,&a,None).await.unwrap();
+        assert!(ch.owns_worktree);
+        assert_eq!(ch.workspace_id,ws.id);
+        assert_ne!(cwd,ws.path);
+        assert!(Path::new(&cwd).join(".git").exists());
+        std::fs::write(Path::new(&cwd).join("unfinished.txt"),"in progress").unwrap();
+        hub.agents().update(hub.store(),a.id,|a| { a.channel_id=Some(ch.id); a.resume_id=Some("existing-thread".into()); }).unwrap();
+        a = hub.agents().by_id(a.id).unwrap();
+        assert_eq!(prepare_channel(&hub,&a,None).await.unwrap().0.id,ch.id);
+        let change = json!({"name":a.name,"working_location":{"mode":"main","workspace_id":ws.id}});
+        assert!(update(&hub,serde_json::from_value(change.clone()).unwrap(),false).unwrap_err().to_string().contains("keep or reset"));
+        let mut change = change; change["reset_conversation"] = json!(true);
+        assert!(update(&hub,serde_json::from_value(change.clone()).unwrap(),true).unwrap_err().to_string().contains("window"));
+        a = update(&hub,serde_json::from_value(change).unwrap(),false).unwrap();
+        assert_eq!(a.channel_id,Some(ch.id),"saving must not move the running channel");
+        assert_eq!(a.resume_id.as_deref(),Some("existing-thread"),"reset is deferred until start");
+        assert!(a.reset_on_next_start);
+        assert_eq!(a.home_dir,home);
+        assert_eq!(hub.store().load_agents().unwrap()[0].working_location,a.working_location);
+        let (main, dir) = prepare_channel(&hub,&a,None).await.unwrap();
+        assert!(!main.owns_worktree); assert_eq!(dir,ws.path);
+        assert_eq!(std::fs::read_to_string(Path::new(&cwd).join("unfinished.txt")).unwrap(),"in progress");
+        assert_eq!(memory_read(&a,"keep.md").unwrap()["text"],"remember this");
+        let bad = json!({"name":a.name,"working_location":{"mode":"main","workspace_id":99999},"reset_conversation":false});
+        assert!(update(&hub,serde_json::from_value(bad).unwrap(),false).is_err());
+        assert_eq!(hub.agents().by_id(a.id).unwrap().working_location,a.working_location);
+        let restarted = hub.agents().reset_for_start(hub.store(),a.id,&a.working_location).unwrap();
+        assert_eq!(restarted.resume_id,None);
+        assert!(!restarted.reset_on_next_start);
+        let stored = &hub.store().load_agents().unwrap()[0];
+        assert_eq!(stored.resume_id,None); assert!(!stored.reset_on_next_start);
+        assert_eq!(stored.working_location,a.working_location);
+    }
+
+    #[test]
+    fn project_persona_keeps_memory_absolute_and_preserves_read_only_permissions() {
+        let home = scratch("project-persona");
+        for kind in [SessionKind::Claude,SessionKind::Codex] {
+            let mut a = agent(kind); a.home_dir = home.to_string_lossy().into_owned();
+            a.working_location = WorkingLocation::Main { workspace_id:1 };
+            ensure_home(&home).unwrap();
+            write_persona(&home.join(persona_file(kind)),"A persistent identity.").unwrap();
+            let mut spec = crate::adapters::CommandSpec { program: "unused".into(), args: vec!["--".into(),"original-prompt".into()], env: Default::default(), consumed_initial_prompt:true };
+            let perms = Permissions { codex_sandbox: CodexSandbox::ReadOnly, ..Default::default() };
+            configure_project_command(&a,"/repo",perms,&mut spec).unwrap();
+            assert_eq!(&spec.args[spec.args.len()-2..], &["--","original-prompt"]);
+            assert!(spec.args.iter().any(|s| s.contains("A persistent identity.") && s.contains(&a.home_dir)));
+            if kind == SessionKind::Codex { assert!(!spec.args.iter().any(|a| a == "--add-dir")); }
+            else { assert!(spec.args.contains(&home.join("memory").to_string_lossy().into_owned())); }
+        }
     }
 
     /// A store with agents ada (session 1 running in its home) and cody, homes under

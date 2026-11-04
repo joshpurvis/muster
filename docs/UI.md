@@ -792,3 +792,22 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - `window.focused` is called on window focus and right after a claim when the page has focus.
 - Performance: batch output per animation frame per terminal. Never re-render the Preact tree on
   output bytes.
+
+### Named agent working repositories
+
+New/Edit agent offers **Working repository**: an existing Git workspace, or the
+agent home for a general-purpose agent. Selecting a repository defaults to a
+**Dedicated worktree**; **Repository's main checkout** explicitly shares that
+checkout's branch and uncommitted files. The agent gets its own channel in the
+selected workspace, so normal workspace communication rules apply to its session.
+The dedicated worktree is reused on subsequent starts. Changing location leaves
+old channels and worktrees intact, including unfinished changes.
+
+The agent home, persona and `memory/` remain independent of its working directory.
+Repo launches receive the home persona in addition to project instructions and
+access to the home memory directory; a read-only Codex profile stays read-only.
+Changing location requires choosing **Keep the existing conversation** or **Start
+a new conversation**. Saving affects the next start only: a currently running
+agent continues in its existing directory. Restarting that agent applies the new
+location, without restarting other sessions. The dialog displays its current
+working directory; resetting a conversation never deletes memory.

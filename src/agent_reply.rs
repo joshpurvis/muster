@@ -541,6 +541,7 @@ mod tests {
 
     fn agent_accepting(hub: &Hub, name: &str, kind: SessionKind, sid: SessionId, accepts: Option<Vec<Origin>>) -> Agent {
         let a = agents::create(hub, agents::NewAgent {
+            working_location: None,
             account_profile: None,
             provider: None,
             name: name.into(),

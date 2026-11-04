@@ -468,6 +468,7 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 }
 
 pub struct Hub {
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub panels: crate::panels::Panels,
     pub notes: crate::notes::Notes,
     /// Schedules and their runs (src/schedules/).
@@ -927,6 +928,7 @@ impl Hub {
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let spend = crate::spend::Spend::load(&store, cfg.openrouter_key.as_ref());
         let hub = Arc::new_cyclic(|weak| Hub {
+            metrics: Arc::default(),
             panels: crate::panels::Panels::default(),
             notes: crate::notes::Notes::default(),
             schedules,
@@ -3279,6 +3281,9 @@ impl Hub {
             resume,
         };
         let mut spec = adapter_for(info.kind).command(&ctx)?;
+        if let Some(agent) = self.agents.by_session(id) {
+            crate::agents::configure_project_command(&agent, &info.cwd, permissions, &mut spec)?;
+        }
         let continues = crate::cache::continues_conversation(info.kind, &ctx.extra_args) || ctx.resume.is_some();
         // A named agent resuming a conversation whose session row is gone (its task was
         // closed) takes the clock that conversation had.
@@ -3603,6 +3608,10 @@ impl Hub {
     /// Re-spawn a session's process (same id, kind, cwd, name). Kills it first if running.
     /// The replay buffer is cleared.
     pub async fn restart_session(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
+        self.restart_session_at(id, None).await
+    }
+
+    pub(crate) async fn restart_session_at(self: &Arc<Self>, id: SessionId, location: Option<(ChannelId, String)>) -> anyhow::Result<SessionInfo> {
         self.ensure_not_shutting_down()?;
         // Fail before interrupting a live process if its selected profile cannot start.
         let info = self.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
@@ -3640,7 +3649,7 @@ impl Hub {
         // An asleep agent restarted from its tab is awake from here on (src/sleep.rs), and asleep
         // again if this restart fails.
         let woke = crate::sleep::on_session_start(self, id)?;
-        let r = self.restart_inner(id).await;
+        let r = self.restart_inner(id, location).await;
         if let Some((agent, at)) = woke {
             match &r {
                 Ok(_) => crate::sleep::launched(self, agent),
@@ -3650,7 +3659,7 @@ impl Hub {
         r
     }
 
-    async fn restart_inner(self: &Arc<Self>, id: SessionId) -> anyhow::Result<SessionInfo> {
+    async fn restart_inner(self: &Arc<Self>, id: SessionId, location: Option<(ChannelId, String)>) -> anyhow::Result<SessionInfo> {
         if let Some(p) = self.pty(id) {
             if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
                 e.killed_generation = Some(p.generation);
@@ -3703,6 +3712,26 @@ impl Hub {
             let mut g = self.inner.lock();
             if let Some(e) = g.sessions.get_mut(&id) {
                 if e.generation == p.generation { self.set_pty(id, e, None); }
+            }
+        }
+        // The old process has exited before its workspace membership or cwd changes.
+        if let Some((channel_id, cwd)) = location {
+            let mut g = self.inner.lock();
+            anyhow::ensure!(g.channels.get(&channel_id).is_some_and(|c| !c.archived), "destination channel is missing or archived");
+            let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("session disappeared"))?;
+            let old_channel = e.info.channel_id;
+            let mut next = e.info.clone();
+            next.channel_id = channel_id;
+            next.cwd = cwd;
+            next.live_cwd = None;
+            self.store.update_session(&next)?;
+            e.info = next.clone();
+            for cid in [old_channel, channel_id] { let titles = titles_of(&g, cid); g.titles.insert(cid, titles); }
+            self.publish_session(&next);
+            drop(g);
+            // Keep the agent's channel binding aligned even if launching the new process fails.
+            if let Some(agent) = self.agents.by_session(id) {
+                self.agents.update(&self.store, agent.id, |a| a.channel_id = Some(channel_id))?;
             }
         }
         match self.start_process(id, None, None) {
@@ -5109,7 +5138,7 @@ mod tests {
                     model: None,
                     effort: None,
                     persona: String::new(),
-                    home_dir: "/x".into(),
+                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false,
                     permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
                     channel_id: Some(1),
@@ -5646,7 +5675,7 @@ mod tests {
         let with_agent = |store: &Store, record: &StoredTerminal| {
             store.insert_agent(&crate::agents::Agent {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
-                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(),
+                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
                 channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
             }).unwrap();
@@ -6480,7 +6509,7 @@ mod tests {
                 store.insert_agent(&crate::agents::Agent {
                     account_profile_id: None, provider: Default::default(), id: 0, name: "cody".into(),
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
-                    home_dir: "/x".into(), permissions: Permissions::default(),
+                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
                     channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
                 }).unwrap();
@@ -6772,7 +6801,7 @@ mod tests {
         let agent =|name: &str, resume: Option<&str>| crate::agents::Agent {
             account_profile_id: None, provider: Default::default(), id: 0, name: name.into(),
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
-            home_dir: "/x".into(), permissions: Permissions::default(),
+            home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
             channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
         };

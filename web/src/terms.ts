@@ -15,6 +15,7 @@ import { connStatus, FRAME_OUTPUT, FRAME_REPLAY, rpc } from "./rpc.ts";
 import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
+import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
 
 const MAX_WEBGL = 10;
 
@@ -63,16 +64,18 @@ interface Entry {
   sizeOwner?: string | null;
   /** Removes the latency probe's listeners from this terminal. */
   probeOff?: () => void;
+  attachStarted?: number;
 }
 
 const entries = new Map<number, Entry>();
+onMetricsFlush(() => measure("ui.visible_terminals", [...entries.values()].filter((e) => !!e.host).length));
 let park: HTMLDivElement | null = null;
 let fontSize = 13;
 let shortcutMatcher: (e: KeyboardEvent) => boolean = () => false;
 let focusListener: (sid: number) => void = () => {};
 
-/** The typing latency monitor's hooks (latency_monitor.ts). Null while it is off: then no
- * listener is installed and each hook point costs one null check. */
+/** The typing latency hooks (latency_monitor.ts). Null while both local metrics and the
+ * overlay are off: no listener is installed and each hook point costs one null check. */
 export interface LatencyProbe {
   keydown(sid: number, ev: KeyboardEvent, webgl: boolean): void;
   /** A user's input bytes were handed to the WebSocket. */
@@ -429,12 +432,20 @@ function installQueryHandlers(term: Terminal, inReplay: () => boolean, setReplay
 }
 
 function writeReplay(e: Entry, payload: Uint8Array) {
+  const started = e.attachStarted;
+  e.attachStarted = undefined;
+  measure("ui.replay_bytes", payload.length);
+  const parsed = () => {
+    if (started !== undefined && document.visibilityState === "visible") {
+      measure("ui.attach_parse_ms", performance.now() - started);
+    }
+  };
   // RIS in the stream (not term.reset()) so output already handed to xterm is parsed first.
-  e.term.write("\x1bc");
+  e.term.write("\x1bc", payload.length ? undefined : parsed);
   if (payload.length) {
     e.term.write(REPLAY_START);
     e.term.write(payload);
-    e.term.write(REPLAY_END);
+    e.term.write(REPLAY_END, parsed);
   }
 }
 
@@ -563,6 +574,7 @@ export function unmount(sid: number, host: HTMLElement) {
 }
 
 function attach(e: Entry) {
+  e.attachStarted = metricsEnabled() ? performance.now() : undefined;
   e.attached = true;
   const go = () =>
     rpc.call("session.resize", { id: e.sid, cols: e.term.cols, rows: e.term.rows })
@@ -572,6 +584,8 @@ function attach(e: Entry) {
         e.attached && entries.get(e.sid) === e ? rpc.call("session.attach", { id: e.sid }) : undefined
       )
       .catch(() => {
+        measure("ui.attach_failures", 1);
+        e.attachStarted = undefined;
         // Keep `attached` (= wanted): a reconnect's reattachAll retries it. If the session is
         // gone, session_removed disposes the entry.
       });
@@ -617,7 +631,11 @@ export function reattachAll() {
       e.sentRows = e.term.rows;
       rpc.call("session.resize", { id: e.sid, cols: e.term.cols, rows: e.term.rows }).catch(() => {});
     }
-    rpc.call("session.attach", { id: e.sid }).catch(() => {});
+    e.attachStarted = metricsEnabled() ? performance.now() : undefined;
+    rpc.call("session.attach", { id: e.sid }).catch(() => {
+      measure("ui.attach_failures", 1);
+      e.attachStarted = undefined;
+    });
   }
 }
 

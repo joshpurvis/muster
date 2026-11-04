@@ -1,14 +1,14 @@
 // Typing latency monitor (palette: "Typing latency monitor"): times each key typed into a
 // terminal, from keydown to the next animation frame after the first output that follows it
 // (see KeyTracker in latency.ts), and shows the last few in a small overlay.
-// Off by default and not kept across reloads. While off nothing is installed: no listeners, no
-// animation frame loop (terms.ts only checks for a null probe).
+// The overlay is off by default. Local metrics use the hooks without a permanent rAF loop.
 
 import { formatReport, formatSummary, formatTable, KeyTracker, uaFamily } from "./latency.ts";
 import { type LatencyProbe, setLatencyProbe } from "./terms.ts";
 import { isNative } from "./native.ts";
 import { toast } from "./state.ts";
 import { copyText } from "./util.ts";
+import { measure, metricsEnabled, onMetricsEnabled, onMetricsFlush } from "./metrics.ts";
 
 const SHOWN = 10;
 const KEPT = 200;
@@ -63,6 +63,7 @@ const paintReqs = new Set<number>();
 const probe: LatencyProbe = {
   keydown(sid, ev, webgl) {
     if (MODIFIERS.has(ev.key) || ev.isComposing) return;
+    if (!on && document.visibilityState !== "visible") return;
     const t0 = performance.now();
     // timeStamp is on performance.now()'s clock; a platform that fills it otherwise is ignored.
     const lag = t0 - ev.timeStamp;
@@ -85,7 +86,19 @@ const probe: LatencyProbe = {
     const gen = tracker.gen;
     const req = requestAnimationFrame(() => {
       paintReqs.delete(req);
-      if (tracker.painted(gen, sid, rendered, performance.now())) draw();
+      if (tracker.painted(gen, sid, rendered, performance.now())) {
+        if (on) draw();
+        // Never mix the intrusive overlay/frame-gap probe with passive history.
+        if (!on && document.visibilityState === "visible") {
+          for (const s of rendered) {
+            if (!Number.isFinite(s.t5)) continue;
+            measure(s.idle >= 1000 ? "ui.typing_idle_ms" : "ui.typing_ms", s.t5 - s.t0);
+            measure("ui.input_send_ms", s.t1 - s.t0);
+            measure("ui.echo_wait_ms", s.t2 - s.t1);
+            measure("ui.parse_ms", s.t3 - s.t2);
+          }
+        }
+      }
     });
     paintReqs.add(req);
   },
@@ -185,7 +198,7 @@ export function setLatencyMonitor(v: boolean) {
     setLatencyProbe(probe);
     return;
   }
-  setLatencyProbe(null);
+  setLatencyProbe(metricsEnabled() ? probe : null);
   stopFrames();
   for (const req of paintReqs) cancelAnimationFrame(req);
   paintReqs.clear();
@@ -193,3 +206,17 @@ export function setLatencyMonitor(v: boolean) {
   overlay?.remove();
   overlay = body = framesBtn = null;
 }
+
+onMetricsEnabled((enabled) => {
+  if (!on) {
+    tracker.reset();
+    setLatencyProbe(enabled ? probe : null);
+  }
+});
+onMetricsFlush(() => {
+  tracker.expire(performance.now());
+  if (!on && tracker.expired) measure("ui.typing_expired", tracker.expired);
+  if (!on && tracker.overflow) measure("ui.typing_overflow", tracker.overflow);
+  tracker.expired = 0;
+  tracker.overflow = 0;
+});

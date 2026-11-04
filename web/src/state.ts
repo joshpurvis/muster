@@ -338,6 +338,8 @@ export const needsYouHere = computed(() => needsYou.value.filter((s) => hereIds.
 
 /** Latest "notable" event per task (what makes its tabs bold/unread). */
 export const latestNotable = signal<Map<ChannelId, number>>(new Map());
+/** What this window already saw; the debounced server acknowledgement must not flash unread. */
+const locallyRead = signal<Map<ChannelId, number>>(new Map());
 
 export function isNotable(e: TimelineEvent): boolean {
   switch (e.kind) {
@@ -373,7 +375,7 @@ export const unread = computed(() => {
   const out = new Set<ChannelId>();
   for (const c of channels.value) {
     const t = latestNotable.value.get(c.id) ?? 0;
-    if (t > c.last_read_at) out.add(c.id);
+    if (t > Math.max(c.last_read_at, locallyRead.value.get(c.id) ?? 0)) out.add(c.id);
   }
   return out;
 });
@@ -977,8 +979,10 @@ export function applyEvent(ev: ServerEvent) {
     }
     case "event": {
       const e = ev.data;
-      noteNotable(e);
-      if (e.channel_id !== null) maybeMarkRead(e.channel_id);
+      batch(() => {
+        noteNotable(e);
+        if (e.channel_id !== null) maybeMarkRead(e.channel_id);
+      });
       break;
     }
     case "notice":
@@ -1081,6 +1085,11 @@ export function firstSessionOf(ch: ChannelId, ms: number): Promise<SessionInfo |
 
 function removeChannel(id: ChannelId) {
   batch(() => {
+    if (locallyRead.peek().has(id)) {
+      const read = new Map(locallyRead.peek());
+      read.delete(id);
+      locallyRead.value = read;
+    }
     channels.value = channels.value.filter((c) => c.id !== id);
     panels.value = new Map([...panels.value].filter(([, p]) => p.channel_id !== id));
   });
@@ -1092,12 +1101,16 @@ function removeChannel(id: ChannelId) {
 // one is pending moves its `seenAt` forward (what was on screen at the latest look).
 const readTimers = new Map<ChannelId, { timer: number; seenAt: number }>();
 function markReadSoon(ch: ChannelId) {
+  const seenAt = Date.now();
+  if (seenAt > (locallyRead.peek().get(ch) ?? 0)) {
+    locallyRead.value = new Map(locallyRead.peek()).set(ch, seenAt);
+  }
   const pending = readTimers.get(ch);
   if (pending) {
-    pending.seenAt = Date.now();
+    pending.seenAt = seenAt;
     return;
   }
-  const entry = { timer: 0, seenAt: Date.now() };
+  const entry = { timer: 0, seenAt };
   entry.timer = setTimeout(() => {
     readTimers.delete(ch);
     const seenAt = entry.seenAt;

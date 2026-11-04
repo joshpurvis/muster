@@ -7,6 +7,7 @@ import { Communication } from "./Communication.tsx";
 import { rpc } from "../rpc.ts";
 import { AgentSchedules, agentsHeaderItems, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
+  workspaces,
   schedulesSupported,
   scheduleSettings,
   agentFilter,
@@ -57,6 +58,7 @@ import {
 } from "../agents.ts";
 import type {
   Agent,
+  AgentWorkingLocation,
   AgentMessage,
   AgentTemplate,
   LateAnswer,
@@ -664,6 +666,7 @@ function OpenRouterModelField(
 }
 
 interface Draft {
+  working_location: AgentWorkingLocation;
   account_profile: ProfileChoice;
   provider: Provider;
   name: string;
@@ -681,6 +684,7 @@ interface Draft {
 
 function fromTemplate(t: AgentTemplate): Draft {
   return {
+    working_location: { mode: "home" },
     account_profile: "default",
     provider: "subscription",
     name: t.name,
@@ -698,6 +702,7 @@ function fromTemplate(t: AgentTemplate): Draft {
 
 function fromAgent(a: Agent): Draft {
   return {
+    working_location: a.working_location ?? { mode: "home" },
     account_profile: a.account_profile_id ?? "default",
     provider: a.provider ?? "subscription",
     name: a.name,
@@ -714,6 +719,7 @@ function fromAgent(a: Agent): Draft {
 }
 
 const BLANK: Draft = {
+  working_location: { mode: "home" },
   account_profile: "default",
   provider: "subscription",
   name: "",
@@ -754,6 +760,7 @@ export function AgentDialog(
   /** Model / Effort show Custom… until another entry is picked (`choiceOf`). */
   const [custom, setCustom] = useState({ model: false, effort: false });
   const [nameTouched, setNameTouched] = useState(false);
+  const [conversation, setConversation] = useState<"" | "keep" | "reset">("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const memDirty = useRef(false);
@@ -842,7 +849,9 @@ export function AgentDialog(
   const warn = unattendedWarning(d.kind, d.accepts);
   const orBlocked = needsModel(d.provider, d.kind, d.model);
   const sleepMin = d.sleep ? parseSleepAfter(d.sleepAfter) : 0;
-  const canSave = !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
+  const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
+  const locationValid = d.working_location.mode === "home" || workspaces.value.some(w => w.is_git && w.id === (d.working_location as { workspace_id: number }).workspace_id);
+  const canSave = locationValid && (!locationChanged || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
   const toggleOrigin = (o: Origin, on: boolean) =>
     set({ accepts: ORIGINS.map((x) => x.o).filter((x) => (x === o ? on : d.accepts.includes(x))) });
 
@@ -853,6 +862,7 @@ export function AgentDialog(
     try {
       if (!agent) {
         const a = await rpc.call<Agent>("agent.create", {
+          working_location: d.working_location,
           name: d.name.trim(),
           kind: d.kind,
           account_profile: d.kind === "claude" ? d.account_profile : undefined,
@@ -876,6 +886,10 @@ export function AgentDialog(
       }
       const before = fromAgent(agent);
       const patch: Record<string, unknown> = {};
+      if (locationChanged) {
+        patch.working_location = d.working_location;
+        patch.reset_conversation = conversation === "reset";
+      }
       if (d.provider !== before.provider) patch.provider = d.provider;
       if (d.model.trim() !== before.model) patch.model = d.model.trim();
       if (d.effort.trim() !== before.effort) patch.effort = d.effort.trim();
@@ -889,10 +903,10 @@ export function AgentDialog(
       if (Object.keys(patch).length) {
         const a = await rpc.call<Agent>("agent.update", { name: agent.name, ...patch });
         knowAgent(a);
-        const later = ["provider", "model", "effort", "permissions"].some((k) => k in patch) && A.agentLive(agent);
+        const later = ["provider", "model", "effort", "permissions", "working_location"].some((k) => k in patch) && A.agentLive(agent);
         toast(
           "success",
-          later ? "Saved. Provider, model, effort and permissions apply from its next start." : "Saved.",
+          later ? "Saved. Run settings and working location apply from its next start." : "Saved.",
         );
       }
       overlay.value = null;
@@ -969,6 +983,35 @@ export function AgentDialog(
         {agent && memSeen && <MemoryTab agent={agent} dirty={memDirty} hidden={tab !== "memory"} />}
         {
           <div class="dlg-body" hidden={tab !== "settings"}>
+            <div class="field">
+              <label class="field-label" for="agent-repository">Working repository</label>
+              <select id="agent-repository" value={d.working_location.mode === "home" ? "" : String(d.working_location.workspace_id)}
+                onChange={(e) => { set({ working_location: e.currentTarget.value ? { mode: "worktree", workspace_id: Number(e.currentTarget.value) } : { mode: "home" } }); setConversation(""); }}>
+                <option value="">Agent home (no repository)</option>
+                {workspaces.value.filter(w => w.is_git).map(w => <option key={w.id} value={w.id}>{w.name} — {w.path}</option>)}
+              </select>
+              <span class="field-hint">Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.</span>
+            </div>
+            {d.working_location.mode !== "home" && <div class="field">
+              <label class="field-label" for="agent-checkout">Working checkout</label>
+              <select id="agent-checkout" value={d.working_location.mode}
+                onChange={(e) => { if (d.working_location.mode !== "home") { set({ working_location: { ...d.working_location, mode: e.currentTarget.value as "worktree" | "main" } }); setConversation(""); } }}>
+                <option value="worktree">Dedicated worktree (recommended)</option>
+                <option value="main">Repository's main checkout</option>
+              </select>
+              <span class="field-hint">{d.working_location.mode === "worktree" ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts." : "Shares files, branch and uncommitted changes with anyone using this checkout."}</span>
+            </div>}
+            {locationChanged && <div class="field">
+              <label class="field-label" for="agent-location-conversation">Conversation at next start</label>
+              <select id="agent-location-conversation" required value={conversation} onChange={(e) => setConversation(e.currentTarget.value as "" | "keep" | "reset")}>
+                <option value="">Choose how to continue</option>
+                <option value="keep">Keep the existing conversation</option>
+                <option value="reset">Start a new conversation</option>
+              </select>
+              <span class="field-hint">Saving does not interrupt the running agent. Its next start uses this location; persistent memory is kept either way.</span>
+            </div>}
+            {agent?.working_directory && <p class="field-hint">Current working directory: <code>{agent.working_directory}</code>{agent.reset_on_next_start ? " · New conversation at next start" : ""}</p>}
+
             {!agent && templates.length > 0 && (
               <div class="field">
                 <span class="field-label">Start from</span>

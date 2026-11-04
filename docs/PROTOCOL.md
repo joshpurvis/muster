@@ -1,5 +1,13 @@
 # Muster client protocol (v1)
 
+Local metrics: `hello.metrics_enabled` advertises collection. Client-token callers may use
+`metrics.status`, `metrics.export` (`since`: Unix ms, `period`: 60 or 3600 seconds),
+`metrics.enable`, `metrics.disable` and `metrics.clear`. Paired devices cannot access these
+methods. Desktop `metrics.report` accepts `{build, renderer, samples:[{name,value}]}` with a
+16-character hexadecimal UI build, fixed browser-family/metric names and at most 256 finite,
+nonnegative numeric observations. It returns `{enabled}`. No arbitrary labels or text fields
+are accepted. See [metrics definitions and storage](METRICS.md).
+
 The daemon serves its UI and API on one localhost port (default 7433, else a free port).
 Panels use a second, ephemeral `127.0.0.1` listener serving only `GET /proxy` and `GET /preview`.
 Discovery file: `$XDG_RUNTIME_DIR/muster/daemon.json` (fallback `~/.local/state/muster/daemon.json`),
@@ -1591,3 +1599,19 @@ The inbox limits pending payloads to 64 MiB and 100,000 events. Overflow is reco
 and reported, and the helper remains bounded by its two-second write deadline. Full
 payloads stay in the private inbox only until acknowledged; the timeline still records
 hook summaries. These are application features, outside terminal-host IPC.
+
+### Agent working location
+
+`agent.create` accepts optional `working_location`, default `{"mode":"home"}`.
+Other values are `{"mode":"worktree","workspace_id":N}` and
+`{"mode":"main","workspace_id":N}`. The workspace must exist, be a Git repo,
+and have an existing directory. These select a working checkout; `home_dir` stays
+unchanged. Worktree mode creates a dedicated channel/worktree on the first start
+and reuses it thereafter. Main mode uses the workspace path in its own channel.
+
+`agent.update` accepts `working_location`. When it differs, `reset_conversation`
+(boolean) is required: false keeps the thread; true clears it at the next start.
+Changing location requires a verified local window. Saving does not move or stop
+a live session. Agent records expose `working_location`, `reset_on_next_start`,
+and `working_directory` (the current session's cwd, or null). Location and pending
+reset survive backend reloads. Old worktrees are retained when changing location.

@@ -544,6 +544,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE notes ADD COLUMN channel_id INTEGER;
     "#,
+    // v27: an agent's persistent home and working repository are independent.
+    r#"
+    ALTER TABLE agents ADD COLUMN working_location TEXT NOT NULL DEFAULT '{"mode":"home"}';
+    ALTER TABLE agents ADD COLUMN reset_on_next_start INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1017,7 +1022,7 @@ impl Store {
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
                     resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
-                    asleep_autostart
+                    asleep_autostart, working_location, reset_on_next_start
              FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -1032,6 +1037,8 @@ impl Store {
                 effort: r.get(4)?,
                 persona: r.get(5)?,
                 home_dir: r.get(6)?,
+                working_location: serde_json::from_str(&r.get::<_, String>(19)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(19, rusqlite::types::Type::Text, Box::new(e)))?,
+                reset_on_next_start: r.get::<_, i64>(20)? != 0,
                 permissions: serde_json::from_str(&perms).unwrap_or_default(),
                 // Unreadable: the strictest set (human only).
                 accepts_origins: serde_json::from_str(&accepts).unwrap_or_else(|_| vec![crate::agents::Origin::Human]),
@@ -1060,8 +1067,8 @@ impl Store {
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
                                session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
-                               sleep_after_min, asleep_at, asleep_autostart)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                               sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1080,7 +1087,9 @@ impl Store {
                 b.provider.as_str(),
                 b.sleep_after_min,
                 b.asleep_at,
-                b.asleep_at.map(|_| b.autostart as i64)
+                b.asleep_at.map(|_| b.autostart as i64),
+                serde_json::to_string(&b.working_location)?,
+                b.reset_on_next_start as i64
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1122,7 +1131,7 @@ impl Store {
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
                     autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
-                    provider = ?8, sleep_after_min = ?9 WHERE id = ?1",
+                    provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1132,9 +1141,21 @@ impl Store {
                 serde_json::to_string(&b.accepts_origins)?,
                 b.autostart as i64,
                 b.provider.as_str(),
-                b.sleep_after_min
+                b.sleep_after_min,
+                serde_json::to_string(&b.working_location)?,
+                b.reset_on_next_start as i64
             ],
         )?;
+        Ok(())
+    }
+
+    /// Clear the thread and pending reset together before the next run.
+    pub fn reset_agent_conversation(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE agents SET resume_id=NULL, reset_on_next_start=0 WHERE id=?1", [id])?;
+        confirm_codex_agent_thread(&tx, id, None)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2876,6 +2897,7 @@ mod tests {
             effort: None,
             persona: "Finds things.".into(),
             home_dir: "/data/agents/scout".into(),
+            working_location: Default::default(), reset_on_next_start: false,
             permissions: Permissions::default(),
             accepts_origins: vec![Origin::Human, Origin::Schedule],
             channel_id: None,

@@ -121,6 +121,7 @@ pub fn hello(hub: &Hub) -> Value {
         "updates": hub.updates().status(),
         // The running build's content id, so a restart can tell the build it started answers.
         "build": hub.updates().build(),
+        "metrics_enabled": hub.metrics.enabled(),
         "prefs": hub.ui_prefs(),
         // The backend's own pid, so a CLI that can't see it (a sandboxed command in its own PID
         // namespace) can still tell the discovery file names this backend.
@@ -186,6 +187,23 @@ pub enum Via {
 
 /// `dispatch`, told where the call came from.
 pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value, via: Via) -> RpcResult {
+    let started = std::time::Instant::now();
+    let result = dispatch_inner(hub, who, method, params, via).await;
+    if !method.starts_with("metrics.") {
+        // Fixed families only: never persist user-controlled method names or request data.
+        let family = match method.split('.').next().unwrap_or("") {
+            "session" => "session", "channel" => "channel", "agent" => "agent",
+            "panel" => "panel", "note" => "note", "schedule" => "schedule",
+            "hello" => "hello", "ping" => "ping", _ => "other",
+        };
+        hub.metrics.record("rpc.duration_ms", family, started.elapsed().as_secs_f64()*1000.0);
+        hub.metrics.record("rpc.calls", family, 1.0);
+        if result.is_err() { hub.metrics.record("rpc.errors", family, 1.0); }
+    }
+    result
+}
+
+async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: Value, via: Via) -> RpcResult {
     match method {
         "communication.get" | "communication.set" => {
             if !matches!(who, Principal::Local) { return Err(RpcError("communication settings are local only".into())); }
@@ -213,6 +231,15 @@ pub async fn dispatch_via(hub: &Arc<Hub>, who: &Principal, method: &str, params:
             }
             let c = st.guard.lock().communication.clone();
             Ok(json!({"grants":c.grants,"messages":c.messages.iter().map(|m| crate::mcp::communication::message_json(&st, m)).collect::<Vec<_>>(),"subscriptions":c.subscriptions}))
+        }
+        "metrics.report" => {
+            if !matches!(who, Principal::Local) { return Err(RpcError("metrics are local only".into())); }
+            hub.metrics.report(params)?;
+            Ok(json!({"enabled":hub.metrics.enabled()}))
+        }
+        "metrics.status" | "metrics.export" | "metrics.enable" | "metrics.disable" | "metrics.clear" => {
+            if !matches!(who, Principal::Local) { return Err(RpcError("metrics are local only".into())); }
+            Ok(hub.metrics.command(method, params).await?)
         }
         // A liveness check: the phone calls it while visible to notice a dead socket.
         "ping" => Ok(json!({})),
@@ -1881,6 +1908,7 @@ type Outbox = mpsc::Sender<Message>;
 
 /// One WebSocket client connection, authenticated as `who`.
 pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: WsLink) {
+    hub.metrics.record("ws.connections", "", 1.0);
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOX_CAP);
@@ -1920,6 +1948,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
         Principal::Local => None,
     };
     let events = {
+        let metrics = hub.metrics.clone();
         let out = out_tx.clone();
         let mut rx = hub.subscribe();
         tokio::spawn(async move {
@@ -1940,6 +1969,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                            metrics.record("ws.lagged_events", "", n as f64);
                             tracing::warn!("client lagged {n} events behind; closing so it resyncs");
                             let _ = out.send(Message::Close(None)).await;
                             break;
@@ -1957,6 +1987,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
                                     }
                                 }
                                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                                    metrics.record("ws.resyncs", "", 1.0);
                                     let _ = out.send(Message::Close(None)).await;
                                     return;
                                 }
@@ -2067,6 +2098,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
                         crate::sleep::Keys::Pass(admitted) => admitted,
                     };
                     if let Err(e) = hub.send_keys_admitted(id, &data[5..], admitted) {
+                        hub.metrics.record("input.failures", "", 1.0);
                         // Lost or refused keystrokes interrupt their run, which the user sees
                         // on the session (`input_interrupted`) and in a notice.
                         tracing::debug!("input for session {id}: {e:#}");
@@ -2156,8 +2188,10 @@ async fn handle_request(
             // Read before the replay is taken: a resize bumps it only once the host has the new
             // size, so the replay is drawn at this revision's size or a later one.
             let mut size_rev = hub.size_rev(id);
+            let attach_started = std::time::Instant::now();
             match hub.attach(id, limit).await {
                 Ok(att) => {
+                    hub.metrics.record("terminal.attach_ms", "", attach_started.elapsed().as_secs_f64()*1000.0);
                     let (kind, replay, rx, generation, offset) = match att {
                         Attach::Live { replay, rx, generation, offset } => {
                             tail.take_if(|t| t.generation() != generation);
@@ -2201,6 +2235,7 @@ async fn handle_request(
                     }
                     let _ = out.send(Message::Binary(frame(FRAME_REPLAY, id, &replay))).await;
                     let mut state = Forward { limit, mode, generation, offset, tail };
+                    hub.metrics.record("terminal.replay_bytes", "", replay.len() as f64);
                     state.sent(offset);
                     let task = tokio::spawn(forward_output(hub.clone(), id, state, rx, bus, out.clone()));
                     if let Some(other) = attachments.lock().insert(id, task) {
@@ -2208,6 +2243,7 @@ async fn handle_request(
                     }
                 }
                 Err(e) => {
+                    hub.metrics.record("terminal.attach_failures", "", 1.0);
                     let _ = out
                         .send(Message::Text(response(&req.id, Err(e.into())).to_string().into()))
                         .await;
@@ -2515,6 +2551,7 @@ mod tests {
         crate::agents::create(
             hub,
             NewAgent {
+            working_location: None,
                 account_profile: None,
                 provider: None,
                 name: name.into(),
@@ -2953,6 +2990,7 @@ mod tests {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {
+            working_location: None,
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
             effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();
@@ -3006,6 +3044,7 @@ mod tests {
     async fn approving_takes_a_click_in_a_window_never_a_script_or_an_agent() {
         let (hub, _st) = fixture();
         crate::agents::create(&hub, NewAgent {
+            working_location: None,
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
             effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();
@@ -3078,6 +3117,7 @@ mod tests {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {
+            working_location: None,
             account_profile: None, provider: None, name: "rpc-wk".into(), kind: Some(SessionKind::Codex), model: None,
             effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
         }).unwrap();

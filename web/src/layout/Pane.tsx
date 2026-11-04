@@ -1,6 +1,7 @@
 // One group: its tab strip (always shown; a tab is one session) + the active tab's terminal
 // (+ approval banner, exited bar, find bar). The top-right group's strip also carries the
 // window controls.
+import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { noteId, noteTab, panelId, panelTab, type PaneNode } from "./tree.ts";
 import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
@@ -375,6 +376,17 @@ function newTabMenu(paneId: string): MenuItem[] {
   ];
 }
 
+/** Shortcut hints occupy the existing icon slot, never the status dot or extra tab width. */
+function TabIcon({ children, index, focused, size = 14 }: {
+  children: ComponentChildren; index: number; focused: boolean; size?: number;
+}) {
+  const hint = altHeld.value && focused && index < 9;
+  return <span class={cx("tab-icon", hint && "show-shortcut")} style={{ width: size, height: size }}>
+    {children}
+    {hint && <span class="tab-num" aria-hidden="true">{index + 1}</span>}
+  </span>;
+}
+
 function TabStrip(
   { pane, tabs, focused, zoomed, controls }: {
     pane: PaneNode;
@@ -600,8 +612,7 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
       onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); A.closeTab(id); } }}
       onMouseDown={(e) => e.button === 1 && e.preventDefault()}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
-      {altHeld.value && focused && index < 9 && <span class="tab-num">{index + 1}</span>}
-      <IconPanel size={14} />
+      <TabIcon index={index} focused={focused}><IconPanel size={14} /></TabIcon>
       <span class="tab-name"><span class="tab-task">{panel.title}</span></span>
       <button type="button" class="tab-close" aria-label={`Close ${panel.title}`} data-tip="Close panel"
         onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>
@@ -644,8 +655,7 @@ function NoteTab({ note, paneId, index, tabsInGroup, active, focused }: {
       onMouseDown={(e) => e.button === 1 && e.preventDefault()}
       onDblClick={(e) => { if (!(e.target as HTMLElement).closest("button")) A.startNoteRename(note.id); }}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
-      {altHeld.value && focused && index < 9 && <span class="tab-num">{index + 1}</span>}
-      <IconNote size={14} />
+      <TabIcon index={index} focused={focused}><IconNote size={14} /></TabIcon>
       {renamingThis
         ? (
           <InlineEdit
@@ -754,10 +764,8 @@ function GroupTab(
         openMenu({ x: e.clientX, y: e.clientY, items: tabMenu(s, c, paneId, tabsInGroup) });
       }}
     >
-      {altHeld.value && groupFocused && index < 9
-        ? <span class="tab-num">{index + 1}</span>
-        : <StateDot state={s.state} />}
-      <KindIcon kind={s.kind} size={13} />
+      <StateDot state={s.state} />
+      <TabIcon index={index} focused={groupFocused} size={13}><KindIcon kind={s.kind} size={13} /></TabIcon>
       {edit
         ? (
           <InlineEdit
@@ -769,7 +777,7 @@ function GroupTab(
         )
         : (
           <span class="tab-name">
-            <span class="tab-task">{label.text}</span>
+            <span class="tab-task" data-tab-label={label.text}><span>{label.text}</span></span>
             {!!s.subagents && (
               <span class="tab-subagents" title={`${s.subagents} subagent${s.subagents === 1 ? "" : "s"} running`}>
                 +{s.subagents}

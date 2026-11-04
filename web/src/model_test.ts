@@ -288,6 +288,14 @@ Deno.test("aggregateState picks the most urgent", () => {
   assertEquals(aggregateState([]), null);
 });
 
+Deno.test("channel status distinguishes live idle sessions from empty or exited channels", () => {
+  assertEquals(aggregateState([sess(1, 1, "idle")]), "idle");
+  assertEquals(aggregateState([sess(1, 1, "exited"), sess(2, 1, "idle")]), "idle");
+  assertEquals(aggregateState([sess(1, 1, "idle"), sess(2, 1, "exited")]), "idle");
+  assertEquals(aggregateState([sess(1, 1, "exited"), sess(2, 1, "exited")]), "exited");
+  assertEquals(aggregateState([]), null);
+});
+
 Deno.test("needsYouOrder: urgent states first, then longest waiting; live channels only", () => {
   const list = [
     sess(1, 1, "error", 10),

@@ -4,6 +4,7 @@
 
 import { signal } from "@preact/signals";
 import type { HelloResult, ServerEvent } from "./types.ts";
+import { configureMetrics, measure } from "./metrics.ts";
 
 export const FRAME_OUTPUT = 0x01;
 export const FRAME_INPUT = 0x02;
@@ -87,6 +88,7 @@ class Rpc {
   private queue: { id: number; frame: string }[] = [];
   private ready = false;
   private everOpened = false;
+  private disconnectedAt: number | null = null;
   private backoff = 250;
   private token: string | null = null;
   private retryTimer = 0;
@@ -166,6 +168,14 @@ class Rpc {
           return;
         }
         this.ready = true;
+        if (!this.cookie) {
+          configureMetrics(hello.metrics_enabled ?? false, (body) =>
+            this.isOpen ? this.call("metrics.report", body) : null);
+          if (this.disconnectedAt !== null && document.visibilityState === "visible") {
+            measure("ui.reconnect_ms", performance.now() - this.disconnectedAt);
+          }
+          this.disconnectedAt = null;
+        }
         connStatus.value = "open";
         this.onHello(hello, reconnect);
         const q = this.queue;
@@ -181,6 +191,10 @@ class Rpc {
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
+      if (this.ready && !this.cookie) {
+        this.disconnectedAt ??= performance.now();
+        measure("ui.disconnects", 1);
+      }
       this.ws = null;
       this.ready = false;
       // In-flight calls can't complete on this socket.

@@ -220,6 +220,8 @@ export type Origin = "human" | "schedule" | "webhook";
  * token). Missing from backends without OpenRouter support. */
 export type Provider = "subscription" | "openrouter";
 
+export type AgentWorkingLocation = { mode: "home" } | { mode: "main" | "worktree"; workspace_id: number };
+
 export interface Agent {
   account_profile_id?: number | null;
   provider?: Provider;
@@ -233,6 +235,9 @@ export interface Agent {
   accepts_origins: Origin[];
   autostart: boolean;
   home_dir: string;
+  working_location?: AgentWorkingLocation;
+  reset_on_next_start?: boolean;
+  working_directory?: string | null;
   /** Its own tab (task). */
   channel_id: ChannelId | null;
   /** Its current session (live or exited). */
@@ -654,6 +659,7 @@ export interface WindowPrefs {
 }
 
 export interface HelloResult {
+  metrics_enabled?: boolean;
   panels?: Panel[];
   panel_origin?: string;
   /** Missing from backends without notes. */

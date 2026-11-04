@@ -174,6 +174,15 @@ fn input_row(lines: &[String]) -> Option<usize> {
         .find(|&i| prompt_marker(&lines[i]).is_some() && tui::is_rule(&lines[i - 1]))
 }
 
+/// The cursor sits on the input row right after the `❯ ` marker, where typing would start.
+/// A human who moved the cursor back to the start of a one-line draft looks the same, so the
+/// injector also asks whether the human typed since the turn ended (`inject::composer`).
+fn cursor_at_box_start(screen: &ScreenSnapshot, row: usize) -> bool {
+    let after = screen.lines[row].trim_start_matches('❯');
+    let start = 1 + after.chars().take_while(|c| c.is_whitespace()).count();
+    screen.cursor_row as usize == row && screen.cursor_col as usize == start
+}
+
 /// The marker that starts the input row and whether it is shell mode.
 fn prompt_marker(line: &str) -> Option<bool> {
     if line.starts_with('❯') {
@@ -569,6 +578,21 @@ impl Adapter for ClaudeAdapter {
     fn other_view(&self, screen: &ScreenSnapshot) -> Option<String> {
         subagent_view(&screen.lines)
     }
+
+    /// Claude's dim suggestions (a predicted next prompt such as "send q-12 to a worker now",
+    /// "Press up to edit queued messages") sit in an otherwise empty one-line box with the
+    /// cursor parked at its start; typing moves the cursor past the last character.
+    fn composer_may_be_suggestion(&self, screen: &ScreenSnapshot) -> bool {
+        if trust_dialog(screen) || permission_dialog(screen).is_some() {
+            return false;
+        }
+        let lines = &screen.lines;
+        let Some(row) = input_row(lines) else { return false };
+        prompt_marker(&lines[row]) == Some(false)
+            && !lines[row].trim_start_matches('❯').trim().is_empty()
+            && lines.get(row + 1).is_some_and(|l| tui::is_rule(l))
+            && cursor_at_box_start(screen, row)
+    }
 }
 
 #[cfg(test)]
@@ -710,6 +734,45 @@ mod tests {
         assert_eq!(ClaudeAdapter.composer_text(&typed).as_deref(), Some("!ls -la"));
         // Back out of shell mode: an empty ordinary box is not a draft.
         assert_eq!(ClaudeAdapter.composer_text(&fx!("claude_idle_done")).as_deref(), Some(""));
+    }
+
+    /// The reported bug (4 Nov, Claude Code 2.1.316): after a turn Claude drew the dim
+    /// suggestion `❯ send q-9473 to a worker now` with the cursor parked at column 2, Muster
+    /// read it as the human's draft, and two queued messages waited ~45 minutes until the
+    /// human sent something. Typing moves the cursor past the text (`❯ what are` → col 10).
+    /// The adapter only flags a possible suggestion; `inject::composer` decides.
+    #[test]
+    fn parked_cursor_flags_a_possible_suggestion() {
+        let at = |text: &str, cursor_col: u16| {
+            let mut s = fx!("claude_idle_done");
+            s.lines[16] = format!("❯\u{a0}{text}");
+            s.cursor_row = 16;
+            s.cursor_col = cursor_col;
+            s
+        };
+        let a = ClaudeAdapter;
+        let ghost = at("send q-9473 to a worker now", 2);
+        assert!(a.composer_may_be_suggestion(&ghost));
+        // The text itself is still reported as read.
+        assert_eq!(a.composer_text(&ghost).as_deref(), Some("send q-9473 to a worker now"));
+        assert!(a.composer_may_be_suggestion(&at("Press up to edit queued messages", 2)));
+        // Real typing: cursor after the text, or anywhere but the box start.
+        assert!(!a.composer_may_be_suggestion(&at("what are", 10)));
+        assert!(!a.composer_may_be_suggestion(&at("what are", 5)));
+        // An empty box, or the cursor elsewhere on screen (Claude still drawing).
+        assert!(!a.composer_may_be_suggestion(&at("", 2)));
+        let mut elsewhere = at("send q-9473 to a worker now", 2);
+        elsewhere.cursor_row = 3;
+        assert!(!a.composer_may_be_suggestion(&elsewhere));
+        // Multi-line drafts and shell mode are never suggestions, whatever the cursor does.
+        let mut multi = fx!("claude_typed_multiline");
+        let row = multi.lines.iter().rposition(|l| l.starts_with('❯')).unwrap();
+        (multi.cursor_row, multi.cursor_col) = (row as u16, 2);
+        assert!(!a.composer_may_be_suggestion(&multi));
+        let mut shell = fx!("claude_shell_mode_typed");
+        let row = shell.lines.iter().position(|l| l.starts_with('!')).unwrap();
+        (shell.cursor_row, shell.cursor_col) = (row as u16, 2);
+        assert!(!a.composer_may_be_suggestion(&shell));
     }
 
     /// Screens captured from Claude Code 2.1.316 with a background subagent running. While the

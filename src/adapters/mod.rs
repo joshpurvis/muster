@@ -284,6 +284,13 @@ pub trait Adapter: Send + Sync {
     fn other_view(&self, _screen: &ScreenSnapshot) -> Option<String> {
         None
     }
+
+    /// The text `composer_text` read could be the agent's own dim suggestion rather than
+    /// typed input (the screen carries no colours). Only a hint: the injector treats it as
+    /// empty only if the human hasn't typed into the session since it went idle.
+    fn composer_may_be_suggestion(&self, _screen: &ScreenSnapshot) -> bool {
+        false
+    }
 }
 
 pub fn adapter_for(kind: SessionKind) -> &'static dyn Adapter {

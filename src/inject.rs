@@ -837,8 +837,29 @@ fn note_other_view(hub: &Hub, id: SessionId) {
     }
 }
 
+/// The input box's text, with the agent's own dim suggestion read as empty. Claude draws a
+/// suggested next prompt in the empty box after a turn; read as the human's draft, it held
+/// queued messages until the human happened to send something (4 Nov: ~45 min). It counts
+/// as a suggestion only while the session is idle and the human hasn't typed into it since
+/// it went idle: a real draft (even with the cursor moved back to its start) follows keys.
 fn composer(hub: &Hub, id: SessionId, adapter: &dyn Adapter) -> Option<String> {
-    hub.screen(id).and_then(|s| adapter.composer_text(&s))
+    let screen = hub.screen(id)?;
+    let text = adapter.composer_text(&screen)?;
+    let untouched = || hub.session(id).is_some_and(|info| {
+        let now = crate::model::now_ms();
+        let typed_at = hub.human_input_of(id).map(|(_, at)| now - at.elapsed().as_millis() as i64);
+        untouched_since_idle(info.state, info.state_since, typed_at)
+    });
+    if !text.trim().is_empty() && adapter.composer_may_be_suggestion(&screen) && untouched() {
+        return Some(String::new());
+    }
+    Some(text)
+}
+
+/// Idle, with no keystroke from the human since it went idle (`typed_at`, Unix ms). Key
+/// times live in memory only, so a backend restart forgets keys typed before it.
+fn untouched_since_idle(state: AgentState, state_since: i64, typed_at: Option<i64>) -> bool {
+    state == AgentState::Idle && typed_at.is_none_or(|t| t < state_since)
 }
 
 /// First non-empty line of `text`, shortened, for spotting it in the input box.
@@ -1316,6 +1337,20 @@ mod tests {
         }
         let main = snap(include_str!("adapters/fixtures/claude_main_with_agents.txt"));
         assert_eq!(screen_unsafe(claude, &main, AgentState::Idle), None);
+    }
+
+    /// A possible suggestion counts as an empty box only while idle and untouched since: a
+    /// draft the human typed after the turn ended (cursor moved back to its start with Home)
+    /// stays a draft. 4 Nov: the lead went idle at 15:01:38 with no keys after, so the queued
+    /// messages should have gone; the human's 15:24 question came after the 15:22 idle.
+    #[test]
+    fn suggestion_only_when_untouched_since_idle() {
+        let idle_at = 1_000_000;
+        assert!(untouched_since_idle(AgentState::Idle, idle_at, None));
+        assert!(untouched_since_idle(AgentState::Idle, idle_at, Some(idle_at - 60_000)));
+        assert!(!untouched_since_idle(AgentState::Idle, idle_at, Some(idle_at + 5_000)));
+        assert!(!untouched_since_idle(AgentState::Idle, idle_at, Some(idle_at)));
+        assert!(!untouched_since_idle(AgentState::Working, idle_at, None));
     }
 
     #[test]

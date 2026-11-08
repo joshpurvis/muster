@@ -127,7 +127,7 @@ function ChannelsPanel() {
 function qualifier(c: Channel, list: Channel[]): string | null {
   const same = list.filter((x) => x.name === c.name);
   if (same.length < 2) return null;
-  if (c.branch && same.some((x) => x.branch !== c.branch)) return c.branch;
+  if (c.branch && same.filter((x) => x.branch === c.branch).length === 1) return c.branch;
   if (same.some((x) => x.cwd !== c.cwd)) return tildify(c.cwd, meta.value.home);
   return null;
 }

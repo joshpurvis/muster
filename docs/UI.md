@@ -51,7 +51,8 @@ its running process and cwd; restarting applies the destination channel's permis
 
 Unchanged from v0. Dark by default with a light theme (`prefers-color-scheme` plus a manual
 toggle). All colors are CSS custom properties on `:root`. State colors: starting gray
-(pulsing), working `#4ea1ff`, needs_approval / asking_question `#f0a020`, idle `#3fb950`,
+(pulsing), working `#4ea1ff`, needs_approval / asking_question `#f0a020`, idle `#6a6a76`
+(a dim filled dot, so working and needs-you stand out; the phone UI still shows idle green),
 error `#f85149`, stuck `#e0823d`, exited `#6a6a76` (hollow dot). Inter 13px UI, JetBrains Mono
 13px terminal, no web font downloads. Radii 6/10px, hairline borders, 120–160ms motion,
 `prefers-reduced-motion` respected, inline SVG icons.

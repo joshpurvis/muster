@@ -584,8 +584,10 @@ button.sl-item:hover {
   box-shadow: 0 0 0 2.5px rgba(240, 160, 32, 0.22);
 }
 
+/* Idle is the resting state: a dim filled dot, so working (blue) and needs-you (orange) stand
+   out. Exited is the same grey as a hollow ring. */
 .dot.st-idle {
-  background: var(--st-idle);
+  background: var(--st-exited);
 }
 
 .dot.st-error {

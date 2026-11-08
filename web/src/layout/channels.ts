@@ -5,23 +5,40 @@ import {
   allPanes, allSessions, emptyLayout, findPane, type LayoutState, parseLayout,
   placeBeside, reconcile,
 } from "./tree.ts";
-import type { AccountProfile, SessionInfo } from "../types.ts";
+import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
 
-export type ChannelGrouping = "directory" | "account";
+const trimSlash = (p: string) => p.replace(/\/+$/, "") || "/";
+const samePermissions = (a: Permissions, b: Permissions) =>
+  a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode;
 
-/** Group the current window's sessions by the account their running process uses. */
-export function accountSessionGroups(sessions: SessionInfo[], profiles: AccountProfile[]) {
-  const groups = new Map<string, { key: string; label: string; sessions: SessionInfo[] }>();
-  for (const session of sessions) {
-    const profile = session.kind === "claude" ? session.account_profile_id : null;
-    const routed = session.kind !== "shell" && session.provider === "openrouter";
-    const key = routed ? `${session.kind}:openrouter` : profile == null ? session.kind : `claude:${profile}`;
-    const label = routed ? `${session.kind} · OpenRouter` : profile == null ? session.kind :
-      profiles.find((p) => p.id === profile)?.name ?? `claude · Unavailable profile #${profile}`;
-    if (!groups.has(key)) groups.set(key, { key, label, sessions: [] });
-    groups.get(key)!.sessions.push(session);
-  }
-  return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label) || a.key.localeCompare(b.key));
+export interface FolderJoin {
+  /** The dialog's name; blank matches any channel in the folder. */
+  name?: string;
+  /** The permissions the new session would get; omitted means the defaults. */
+  permissions?: Permissions;
+  /** Skip the permission check (to explain why no channel was joined). */
+  anyPermissions?: boolean;
+  /** Preferred among several matches (the selected channel). */
+  prefer?: number | null;
+  /** Whether a channel has sessions: a failed start in a channel without any archives it. */
+  live?: (id: number) => boolean;
+}
+
+/**
+ * The window's channel in folder `path` that a New channel request without a new worktree joins
+ * as a tab, instead of becoming a second channel for the same folder. Sessions on different
+ * Claude accounts then share one channel's tabs and layout. A different explicit name, or
+ * permissions other than the channel's own (they belong to the channel, so joining would
+ * silently change them), still make a separate channel.
+ */
+export function folderChannel(list: Channel[], path: string, o: FolderJoin = {}): Channel | undefined {
+  const want = trimSlash(path);
+  const named = o.name?.trim();
+  const perms = o.permissions ?? DEFAULT_PERMISSIONS;
+  const matches = list.filter((c) => !c.archived && trimSlash(c.cwd) === want &&
+    (!named || named === c.name) && (o.live?.(c.id) ?? true) &&
+    (o.anyPermissions || samePermissions(perms, { ...DEFAULT_PERMISSIONS, ...c.permissions })));
+  return matches.find((c) => c.id === o.prefer) ?? matches[0];
 }
 
 export interface TabHome {
@@ -35,9 +52,6 @@ export interface SidebarState {
   channels: boolean;
   agents: boolean;
   split: number;
-  collapsedProjects: number[];
-  groupBy: ChannelGrouping;
-  collapsedAccounts: string[];
 }
 
 export interface TerminalDrawerState {
@@ -61,8 +75,7 @@ export interface WindowLayoutState {
 }
 
 export function defaultSidebar(): SidebarState {
-  return { hidden: false, channels: true, agents: true, split: 0.45, collapsedProjects: [],
-    groupBy: "directory", collapsedAccounts: [] };
+  return { hidden: false, channels: true, agents: true, split: 0.45 };
 }
 
 export function sidebarRatio(value: number): number {
@@ -151,11 +164,6 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
         channels: side.channels !== false,
         agents: side.agents !== false,
         split: sidebarRatio(Number(side.split)),
-        collapsedProjects: Array.isArray(side.collapsedProjects)
-          ? side.collapsedProjects.filter((id) => Number.isSafeInteger(id)) : [],
-        groupBy: side.groupBy === "account" ? "account" : "directory",
-        collapsedAccounts: Array.isArray(side.collapsedAccounts)
-          ? side.collapsedAccounts.filter((id) => typeof id === "string") : [],
       },
       ...(obj.previous !== undefined ? { previous: obj.previous } : {}),
     }, channels, tabs);

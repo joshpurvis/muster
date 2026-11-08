@@ -3,6 +3,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  activeChannelId,
   agentBySession,
   agents,
   channelById,
@@ -17,13 +18,16 @@ import {
   panels,
   prefs,
   sessions,
+  sessionsByChannel,
   toasts,
   windowById,
   windowOfSession,
   windowPrefs,
+  windowChannels,
   windows,
   workspaces,
 } from "../state.ts";
+import { folderChannel } from "../layout/channels.ts";
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
@@ -572,6 +576,17 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const notGit = !!known && !known.is_git;
   const recents = prefs.value.recentFolders.filter((f) => f !== expand(folder)).slice(0, 5);
   const canCreate = !!folder.trim() && !busy;
+  // Mirrors A.createTab: a channel already in this folder gets the new tab instead.
+  const join = {
+    name, permissions, prefer: activeChannelId.value,
+    live: (id: number) => !!sessionsByChannel.value.get(id)?.length,
+  };
+  const inFolder = !(worktree && !notGit) && known;
+  const joins = inFolder ? folderChannel(windowChannels.value, known.path, join) : undefined;
+  const differs = inFolder && !joins
+    ? folderChannel(windowChannels.value, known.path, { ...join, anyPermissions: true }) : undefined;
+  const separately = notGit ? "Give it a different name for a separate channel."
+    : "Give it a different name, or turn on Git worktree, for a separate channel.";
 
   const create = async () => {
     if (!canCreate) return;
@@ -660,6 +675,19 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
             </div>
           </div>
           {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} />}
+          {joins && (
+            <div class="field-hint" role="status">
+              {agent === "none" ? `Opens the “${joins.name}” channel, which already uses this folder.`
+                : `Opens as a new tab in the “${joins.name}” channel, which already uses this folder.`}{" "}
+              {separately}
+            </div>
+          )}
+          {differs && (
+            <div class="field-hint" role="status">
+              Creates a separate channel: the “{differs.name}” channel in this folder has different
+              permissions. Match them below to add a tab there instead.
+            </div>
+          )}
           <label class={cx("toggle", notGit && "disabled")}>
             <input
               type="checkbox"
@@ -723,7 +751,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
           </span>
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!canCreate}>
-            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} Create channel
+            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} {!joins ? "Create channel" : agent === "none" ? "Open channel" : "Add tab"}
           </button>
         </div>
       </form>

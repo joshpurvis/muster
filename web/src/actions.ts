@@ -74,7 +74,7 @@ import {
   workspaceById,
   workspaces,
 } from "./state.ts";
-import { drawerHeight, type TerminalDrawerState } from "./layout/channels.ts";
+import { drawerHeight, folderChannel, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
@@ -665,9 +665,28 @@ export async function spawn(
   prompt?: string,
 ): Promise<SessionInfo | undefined> {
   if (placement.type === "split" && !canSplit(placement.side, placement.group)) return undefined;
+  try {
+    return await spawnIn(ch, kind, placement, prompt);
+  } catch (e) {
+    toast("error", `Couldn't start ${kind}: ${errText(e)}`);
+  }
+}
+
+/**
+ * `spawn` without the toast. A tab follows the focused tab's folder and Claude profile, unless
+ * it is a New channel request joining an existing channel (`join`): then it starts in the
+ * channel's own folder with the profile chosen there (none: the project's default).
+ */
+async function spawnIn(
+  ch: ChannelId,
+  kind: SessionKind,
+  placement: Placement,
+  prompt?: string,
+  join?: { profile?: ProfileChoice },
+): Promise<SessionInfo> {
   const at = { ...placement, group: placement.group ?? channelLayout.value?.layouts[ch]?.focus };
   const grid = gridFor(at);
-  const opener = sessionOfGroup(at.group);
+  const opener = join ? undefined : sessionOfGroup(at.group);
   const cwd = opener?.channel_id === ch ? opener.live_cwd ?? opener.cwd : undefined;
   holdNewSessions();
   try {
@@ -676,7 +695,7 @@ export async function spawn(
       channel_id: ch,
       kind,
       cwd,
-      account_profile: inheritedProfile(kind, opener),
+      account_profile: join ? join.profile : inheritedProfile(kind, opener),
       prompt: prompt || undefined,
       window_id: windowId.value ?? undefined,
       ...grid,
@@ -685,8 +704,6 @@ export async function spawn(
     if (kind !== "shell") setPref("lastAgent", kind);
     place(s.id, at, ch);
     return s;
-  } catch (e) {
-    toast("error", `Couldn't start ${kind}: ${errText(e)}`);
   } finally {
     releaseNewSessions();
   }
@@ -1063,6 +1080,21 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
   const ws = req.workspace_id !== undefined
     ? workspaceById.value.get(req.workspace_id) ?? await ensureWorkspace(req.path ?? "")
     : await ensureWorkspace(req.path ?? "");
+  // Same folder, no worktree: join the channel already open there, so sessions on different
+  // Claude accounts share one channel's tabs and layout instead of splitting into siblings.
+  const joined = req.worktree ? undefined
+    : folderChannel(windowChannels.peek(), ws.path, { name: req.name, permissions: req.permissions,
+      prefer: startedIn, live: (id) => !!sessionsByChannel.peek().get(id)?.length });
+  if (joined) {
+    if (activeChannelId.peek() === startedIn) selectChannel(joined.id);
+    if (req.agent !== "none") {
+      await spawnIn(joined.id, req.agent, { type: "tab" }, req.prompt?.trim() || undefined,
+        { profile: req.agent === "claude" ? req.account_profile : undefined });
+    }
+    setPref("lastAgent", req.agent);
+    pushRecentFolder(ws.path);
+    return joined;
+  }
   const at: Placement = { type: "tab", group: req.group ?? layout.value?.focus };
   const here = windowId.value;
   holdNewSessions();

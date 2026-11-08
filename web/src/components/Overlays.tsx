@@ -21,9 +21,11 @@ import {
   windowById,
   windowOfSession,
   windowPrefs,
+  windowChannels,
   windows,
   workspaces,
 } from "../state.ts";
+import { folderChannel } from "../layout/channels.ts";
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, Spinner, StateDot } from "./common.tsx";
@@ -572,6 +574,9 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const notGit = !!known && !known.is_git;
   const recents = prefs.value.recentFolders.filter((f) => f !== expand(folder)).slice(0, 5);
   const canCreate = !!folder.trim() && !busy;
+  // Mirrors A.createTab: a plain channel in this folder gets the new tab instead.
+  const joins = !(worktree && !notGit) && known
+    ? folderChannel(windowChannels.value, known.path, name, permissions) : undefined;
 
   const create = async () => {
     if (!canCreate) return;
@@ -660,6 +665,12 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
             </div>
           </div>
           {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} />}
+          {joins && (
+            <div class="field-hint" role="status">
+              Opens as a new tab in the “{joins.name}” channel, which already uses this folder. Turn on
+              Git worktree for a separate channel.
+            </div>
+          )}
           <label class={cx("toggle", notGit && "disabled")}>
             <input
               type="checkbox"
@@ -723,7 +734,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
           </span>
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!canCreate}>
-            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} Create channel
+            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} {joins ? "Add tab" : "Create channel"}
           </button>
         </div>
       </form>

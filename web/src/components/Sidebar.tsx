@@ -1,14 +1,13 @@
-import type { ComponentChildren } from "preact";
 import { useRef, useState } from "preact/hooks";
 import {
-  accountProfiles, activeChannelId, agents, agentsPanelOpen, channelLayout, channels, channelsPanelOpen,
-  focusedTabId, meta, sessionsByChannel, toast, unread, updateSidebar, windowChannels, windowSessions, workspaceById,
+  activeChannelId, agents, agentsPanelOpen, channelLayout, channels, channelsPanelOpen,
+  meta, sessionsByChannel, toast, unread, updateSidebar, windowChannels, workspaceById,
 } from "../state.ts";
-import { needsHuman, type Channel, type SessionInfo } from "../types.ts";
+import { needsHuman, type Channel } from "../types.ts";
 import { aggregateState } from "../model.ts";
 import { rpc } from "../rpc.ts";
 import * as A from "../actions.ts";
-import { accountSessionGroups, sidebarRatio } from "../layout/channels.ts";
+import { sidebarRatio } from "../layout/channels.ts";
 import { allSessions } from "../layout/tree.ts";
 import { drag } from "../layout/dnd.tsx";
 import { IconAgents, IconChannels, IconChevron, IconMore, IconPlus } from "../icons.tsx";
@@ -21,9 +20,6 @@ import { agentsHeaderItems } from "./Schedules.tsx";
 function channelViewItems(): MenuItem[] {
   const side = channelLayout.peek()!.sidebar;
   return [
-    { label: "Group by directory", checked: side.groupBy === "directory", run: () => updateSidebar({ groupBy: "directory" }) },
-    { label: "Group by account", checked: side.groupBy === "account", run: () => updateSidebar({ groupBy: "account" }) },
-    "sep",
     { label: side.channels ? "Hide channels" : "Show channels", run: A.toggleChannelsPanel },
     { label: "Hide sidebar", keys: "Alt+G", run: A.toggleSidebar },
   ];
@@ -80,24 +76,13 @@ export function Sidebar() {
   );
 }
 
+/** One flat list of the window's channels, in their saved order. */
 function ChannelsPanel() {
   const open = channelsPanelOpen.value;
   const list = windowChannels.value;
-  const groups = [...new Set(list.map((c) => c.workspace_id))];
-  const side = channelLayout.value!.sidebar;
   const fallback = channelLayout.value?.layouts[0];
-  const accounts = accountSessionGroups(windowSessions.value, accountProfiles.value);
-  const sessionChannels = new Set(windowSessions.value.map((s) => s.channel_id));
-  const withoutSessions = list.filter((c) => !sessionChannels.has(c.id));
-  const accountKeys = [...accounts.map((g) => g.key), ...(withoutSessions.length ? ["no-sessions"] : [])];
-  const byAccount = side.groupBy === "account";
-  const collapsed = byAccount ? side.collapsedAccounts : side.collapsedProjects;
   const headerItems = (): MenuItem[] => [
     { label: "New channel…", keys: "Alt+Shift+N", run: () => A.newTabDialog() },
-    { label: "Expand all groups", disabled: !collapsed.length, run: () => updateSidebar(byAccount
-      ? { collapsedAccounts: [] } : { collapsedProjects: [] }) },
-    { label: "Collapse all groups", disabled: !(byAccount ? accountKeys : groups).length,
-      run: () => updateSidebar(byAccount ? { collapsedAccounts: accountKeys } : { collapsedProjects: groups }) },
     "sep", ...channelViewItems(),
   ];
   return (
@@ -110,7 +95,7 @@ function ChannelsPanel() {
         <button type="button" class="ap-icon-btn" aria-label="New channel" data-tip="New channel" data-keys="Alt+Shift+N"
           onClick={() => A.newTabDialog()}><IconPlus size={13} /></button>
       </div>
-      {open && <nav class="channels-scroll" aria-label={byAccount ? "Sessions by account" : "Channel workspaces"} onKeyDown={(e) => {
+      {open && <nav class="channels-scroll" aria-label="Channels" onKeyDown={(e) => {
         if (!(e.target as HTMLElement).matches(".channel-select") || !["ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
         e.preventDefault();
         const rows = [...e.currentTarget.querySelectorAll<HTMLButtonElement>(".channel-select")];
@@ -118,41 +103,7 @@ function ChannelsPanel() {
         rows[e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 :
           Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))]?.focus();
       }}>
-        {!byAccount && groups.map((id) => {
-          const ws = workspaceById.value.get(id);
-          const collapsed = side.collapsedProjects.includes(id);
-          const inProject = list.filter((c) => c.workspace_id === id);
-          const toggleProject = () => updateSidebar({ collapsedProjects: collapsed
-            ? side.collapsedProjects.filter((x) => x !== id) : [...side.collapsedProjects, id] });
-          return <section class="channel-project" key={id}>
-            <div class="channel-project-head" {...contextMenu(() => [
-              { label: "New channel in this project…", run: () => A.newTabDialog(false, ws?.path) },
-              { label: "Copy folder path", disabled: !ws, run: () => ws && A.copy(ws.path, "Path copied") },
-              "sep",
-              { label: collapsed ? "Expand project" : "Collapse project", run: toggleProject },
-              "sep", ...channelViewItems(),
-            ])}>
-              <button type="button" class="channel-project-toggle" aria-expanded={!collapsed} data-tip={ws?.path}
-                onClick={toggleProject}>
-                <IconChevron size={11} class={!collapsed ? "open" : ""} />
-                <span>{ws?.name ?? "Project"}</span>
-              </button>
-              <button type="button" class="ap-icon-btn" aria-label={`New channel in ${ws?.name ?? "project"}`}
-                data-tip="New channel in this project" onClick={() => A.newTabDialog(false, ws?.path)}><IconPlus size={12} /></button>
-            </div>
-            {inProject.filter((c) => !collapsed || c.id === activeChannelId.value ||
-              sessionsByChannel.value.get(c.id)?.some((s) => needsHuman(s.state)))
-              .map((c) => <ChannelRow key={c.id} channel={c} />)}
-          </section>;
-        })}
-        {byAccount && accounts.map((g) => <AccountGroup key={g.key} id={g.key} label={g.label}>
-          {g.sessions.filter((s) => !side.collapsedAccounts.includes(g.key) || s.id === focusedTabId.value || needsHuman(s.state))
-            .map((s) => <AccountSessionRow key={s.id} session={s} channel={list.find((c) => c.id === s.channel_id)} />)}
-        </AccountGroup>)}
-        {byAccount && withoutSessions.length > 0 && <AccountGroup id="no-sessions" label="No sessions">
-          {withoutSessions.filter((c) => !side.collapsedAccounts.includes("no-sessions") || c.id === activeChannelId.value)
-            .map((c) => <ChannelRow key={c.id} channel={c} />)}
-        </AccountGroup>}
+        {list.map((c) => <ChannelRow key={c.id} channel={c} />)}
         {fallback && <button type="button" class={cx("channel-select channel-fallback", activeChannelId.value === 0 && "active")}
           {...contextMenu(() => [
             { label: "New note", run: () => { A.openChannel(0, false); A.newNote(); } },
@@ -172,43 +123,6 @@ function ChannelsPanel() {
   );
 }
 
-function AccountGroup({ id, label, children }: { id: string; label: string; children: ComponentChildren }) {
-  const side = channelLayout.value!.sidebar;
-  const collapsed = side.collapsedAccounts.includes(id);
-  const toggle = () => updateSidebar({ collapsedAccounts: collapsed
-    ? side.collapsedAccounts.filter((key) => key !== id) : [...side.collapsedAccounts, id] });
-  return <section class="channel-project" data-account-group={id}>
-    <div class="channel-project-head" {...contextMenu(() => [
-      { label: collapsed ? "Expand group" : "Collapse group", run: toggle },
-      "sep", ...channelViewItems(),
-    ])}>
-      <button type="button" class="channel-project-toggle" aria-expanded={!collapsed} onClick={toggle}>
-        <IconChevron size={11} class={!collapsed ? "open" : ""} /><span>{label}</span>
-      </button>
-    </div>
-    {children}
-  </section>;
-}
-
-function AccountSessionRow({ session: s, channel: c }: { session: SessionInfo; channel?: Channel }) {
-  const active = focusedTabId.value === s.id;
-  const menu = (): MenuItem[] => [
-    { label: "Open session", run: () => A.revealSession(s.id) },
-    { label: "Copy folder path", run: () => A.copy(s.live_cwd ?? s.cwd, "Path copied") },
-    "sep", ...channelViewItems(),
-  ];
-  return <div class={cx("channel-row", active && "active")} data-account-session={s.id} {...contextMenu(menu)}>
-    <button type="button" class="channel-select" aria-current={active ? "page" : undefined}
-      data-tip={`${s.name} · ${c?.name ?? ""} · ${tildify(s.live_cwd ?? s.cwd, meta.value.home)}`}
-      onClick={() => A.revealSession(s.id)}>
-      <StateDot state={s.state} />
-      <span class="channel-session-label"><span class="channel-name">{s.name}</span><span class="channel-session-context">{c?.name}</span></span>
-    </button>
-    <button type="button" class="ap-icon-btn channel-more" aria-label={`Menu for ${s.name}`} aria-haspopup="menu"
-      onClick={(e) => openMenuAt(e.currentTarget, menu(), { alignRight: false })}><IconMore size={12} /></button>
-  </div>;
-}
-
 function ChannelRow({ channel: c }: { channel: Channel }) {
   const [editing, setEditing] = useState(false);
   const items = sessionsByChannel.value.get(c.id) ?? [];
@@ -223,6 +137,8 @@ function ChannelRow({ channel: c }: { channel: Channel }) {
     { label: "New note", run: () => { A.openChannel(c.id, false); A.newNote(); } },
     { label: "Permissions…", run: () => A.openPermissions(c.id) },
     { label: "Copy folder path", run: () => A.copy(c.cwd, "Path copied") },
+    { label: "New channel in this project…",
+      run: () => A.newTabDialog(false, workspaceById.peek().get(c.workspace_id)?.path ?? c.cwd) },
     "sep",
     { label: "Move up", disabled: !canReorder(c, -1), run: () => reorder(c, -1) },
     { label: "Move down", disabled: !canReorder(c, 1), run: () => reorder(c, 1) },
@@ -248,7 +164,7 @@ function ChannelRow({ channel: c }: { channel: Channel }) {
 }
 
 function canReorder(c: Channel, delta: number) {
-  const list = windowChannels.peek().filter((x) => x.workspace_id === c.workspace_id);
+  const list = windowChannels.peek();
   const i = list.findIndex((x) => x.id === c.id);
   return i + delta >= 0 && i + delta < list.length;
 }
@@ -256,8 +172,8 @@ function canReorder(c: Channel, delta: number) {
 async function reorder(c: Channel, delta: number) {
   if (!canReorder(c, delta)) return;
   const all = [...channels.peek()].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id);
-  const project = windowChannels.peek().filter((x) => x.workspace_id === c.workspace_id);
-  const neighbour = project[project.findIndex((x) => x.id === c.id) + delta];
+  const shown = windowChannels.peek();
+  const neighbour = shown[shown.findIndex((x) => x.id === c.id) + delta];
   const a = all.findIndex((x) => x.id === c.id), b = all.findIndex((x) => x.id === neighbour.id);
   [all[a], all[b]] = [all[b], all[a]];
   try {

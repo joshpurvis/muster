@@ -177,8 +177,13 @@ try {
   check(await a.eval(`${M}.windowSessions.value.every(s => s.id !== ${split})`), "source membership independent");
   ok("One channel in two windows has independent tabs and layouts");
 
-  // Context menus on the heading, directory, channel, account and session all expose the view controls.
-  await a.click('.channel-project-head', { button: "right" });
+  // The channel list is flat: no project or account headers, and the view controls are on
+  // the heading and on every channel.
+  check(await a.eval(`document.querySelectorAll('.channel-project, [data-account-group]').length`) === 0, "no channel tree");
+  check(await a.eval(`JSON.stringify([...document.querySelectorAll('.channels-scroll [data-channel-id]')].map(e => +e.dataset.channelId))
+    === JSON.stringify(${M}.windowChannels.value.map(c => c.id))`), "rows follow the window order");
+  await a.click('.channels-panel .ap-head', { button: "right" });
+  check(!await a.eval(`Array.from(document.querySelectorAll('[role="menuitem"]')).some(el => /Group by|Collapse all/.test(el.textContent))`), "no grouping items");
   await menuItem(a, "Hide channels");
   await a.wait(`!document.querySelector('.channels-scroll')`);
   await a.click('.sidebar-heading');
@@ -187,32 +192,31 @@ try {
   await a.wait(`getComputedStyle(document.querySelector('.sidebar')).display === 'none'`);
   await a.key("Alt+G");
   await a.wait(`getComputedStyle(document.querySelector('.sidebar')).display !== 'none'`);
-  const claude = await r(a, "session.spawn", { channel_id: alpha, kind: "claude", window_id: await a.eval(`${M}.windowId.value`) });
-  const codex = await r(a, "session.spawn", { channel_id: beta, kind: "codex", window_id: await a.eval(`${M}.windowId.value`) });
-  await a.click('.channels-panel .ap-head', { button: "right" });
-  await menuItem(a, "Group by account");
-  await a.wait(`!!document.querySelector('[data-account-group="claude"]') && !!document.querySelector('[data-account-group="codex"]')`);
-  await a.click(`[data-account-session="${codex.id}"] .channel-select`);
-  await a.wait(`${M}.focusedSession.value?.id === ${codex.id} && ${M}.activeChannelId.value === ${beta}`);
-  await a.click('[data-account-group="shell"] .channel-project-toggle');
-  await a.wait(`document.querySelector('[data-account-group="shell"] .channel-project-toggle').getAttribute('aria-expanded') === 'false'`);
-  await a.sleep(650);
-  await a.goto(url);
-  await a.wait(`!!document.querySelector('[data-account-group="shell"]')`, 10000);
-  check(await a.eval(`${M}.channelLayout.value.sidebar.groupBy`) === "account", "account view persisted");
-  check(await a.eval(`${M}.channelLayout.value.sidebar.collapsedAccounts.includes('shell')`), "account accordion persisted");
-  check(!await a.eval(`!!document.querySelector('[data-account-session="${split}"]')`), "other window's session excluded from accounts");
-  await a.click(`[data-account-session="${claude.id}"] .channel-select`);
-  await a.wait(`${M}.focusedSession.value?.id === ${claude.id} && ${M}.activeChannelId.value === ${alpha}`);
-  await a.click(`[data-account-session="${claude.id}"]`, { button: "right" });
-  await menuItem(a, "Hide channels");
-  await a.wait(`!document.querySelector('.channels-scroll')`);
-  await a.click('.sidebar-heading');
-  await a.shot(`${shots}/channels-accounts.png`);
-  await a.click('[data-account-group="claude"] .channel-project-head', { button: "right" });
-  await menuItem(a, "Group by directory");
-  await a.wait(`!document.querySelector('[data-account-group]')`);
-  ok("Context-menu hiding and account grouping, exact session selection and saved accordions");
+  ok("Flat channel list with view controls on the heading and channels");
+
+  // A second plain channel in a folder that already has one (another Claude account, say)
+  // joins it as a tab, so both share one channel's tabs and layout.
+  const plain = (await r(a, "hello")).channels.find((c: any) => c.id === alpha);
+  const before = (await r(a, "hello")).channels.filter((c: any) => !c.archived).length;
+  const tabsBefore = await a.eval(`${M}.windowSessions.value.filter(s => s.channel_id === ${alpha}).length`);
+  await select(a, beta);
+  await a.click('button[aria-label="New channel"]');
+  await a.wait(`document.querySelector('.dialog h2')?.textContent === 'New channel'`);
+  await a.eval(`(() => {
+    const folder = document.querySelectorAll('.dialog input')[0];
+    folder.value = ${JSON.stringify(plain.cwd)}; folder.dispatchEvent(new Event('input', {bubbles:true}));
+    const name = document.querySelector('.dialog input[placeholder="Project folder name"]');
+    name.value = ${JSON.stringify(plain.name)}; name.dispatchEvent(new Event('input', {bubbles:true}));
+    [...document.querySelectorAll('.dialog [role="radio"]')].find(b => b.textContent.trim() === 'Shell').click();
+  })()`);
+  await a.wait(`document.querySelector('.dialog button[type="submit"]')?.textContent.includes('Add tab')`);
+  await a.shot(`${shots}/channels-join-dialog.png`);
+  await a.click('.dialog button[type="submit"]');
+  await a.wait(`!document.querySelector('.dialog')`, 10000);
+  await selected(a, alpha);
+  await a.wait(`${M}.windowSessions.value.filter(s => s.channel_id === ${alpha}).length === ${tabsBefore + 1}`, 8000);
+  check((await r(a, "hello")).channels.filter((c: any) => !c.archived).length === before, "no sibling channel");
+  ok("New channel in an open folder joins that channel");
 
   // Exercise the built result in both themes and a smaller desktop window in one QA batch.
   await select(a, beta);

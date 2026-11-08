@@ -3055,8 +3055,6 @@ textarea {
 
 .channels-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .channels-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 5px 6px 12px; }
-.channel-session-label { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 2px; }
-.channel-session-context { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-faint); }
 .sidebar-heading, .sidebar-collapsed {
   display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--text);
   font-size: 12px; font-weight: 650; text-align: left;
@@ -3064,20 +3062,12 @@ textarea {
 .sidebar-heading { flex: 1; height: 100%; }
 .sidebar-collapsed { padding: 0 10px; border-bottom: 1px solid var(--border); }
 .sidebar-heading:hover, .sidebar-collapsed:hover { color: var(--accent-strong); }
-.sidebar-heading .open, .channel-project-toggle .open { transform: rotate(90deg); }
+.sidebar-heading .open { transform: rotate(90deg); }
 .sidebar .ap-head { padding-left: 10px; }
 .sidebar-divider { background: var(--border); position: relative; }
 .sidebar-divider.resizable { cursor: row-resize; background: var(--bg-1); border-block: 1px solid var(--border); }
 .sidebar-divider.resizable:hover, .sidebar-divider:focus-visible { background: var(--accent); }
 .sidebar-divider:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
-.channel-project + .channel-project { margin-top: 9px; }
-.channel-project-head { display: flex; align-items: center; min-height: 28px; padding: 0 3px; }
-.channel-project-toggle {
-  min-width: 0; flex: 1; display: flex; align-items: center; gap: 5px;
-  padding: 4px 2px; color: var(--text-faint); text-align: left; font-size: 11px; font-weight: 550;
-}
-.channel-project-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.channel-project-toggle:hover { color: var(--text); }
 .channel-row { display: flex; align-items: center; border-radius: var(--r); margin: 1px 0; }
 .channel-row:hover { background: var(--hover); }
 .channel-row.active, .channel-fallback.active { background: var(--accent-soft); color: var(--text); }

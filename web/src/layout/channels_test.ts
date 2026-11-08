@@ -1,12 +1,12 @@
 import {
-  accountSessionGroups, changeChannelLayout, loadChannelLayout, reconcileChannels, savedChannel, sidebarRatio,
+  changeChannelLayout, folderChannel, loadChannelLayout, reconcileChannels, savedChannel, sidebarRatio,
   type TabHome,
 } from "./channels.ts";
 import {
   addTab, allPanes, allSessions, emptyLayout, findPane, noteTab, panelTab,
   setSizes, sig, splitPane, toggleZoom,
 } from "./tree.ts";
-import type { AccountProfile, SessionInfo } from "../types.ts";
+import type { Channel } from "../types.ts";
 
 function equal(a: unknown, b: unknown) {
   if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
@@ -116,36 +116,35 @@ Deno.test("a notes-only legacy window has a stable fallback, with no invented pr
 });
 
 Deno.test("sidebar preferences are window-wide, validated and survive channel reloads", () => {
+  // Older saves carry the removed grouping fields; they are dropped, not kept.
   const s = loadChannelLayout({ v: 2, layouts: {}, active: 999,
     sidebar: { split: 4, agents: false, channels: true, collapsedProjects: [1, "bad"],
       groupBy: "account", collapsedAccounts: ["claude:7", 42] } }, [10], []);
   equal(s.active, 10);
-  equal(s.sidebar, { hidden: false, channels: true, agents: false, split: 0.8, collapsedProjects: [1],
-    groupBy: "account", collapsedAccounts: ["claude:7"] });
+  equal(s.sidebar, { hidden: false, channels: true, agents: false, split: 0.8 });
   equal(loadChannelLayout(s, [10], []).sidebar, s.sidebar);
-  equal(loadChannelLayout({ v: 2, sidebar: { groupBy: "invalid" } }, [], []).sidebar.groupBy, "directory");
   equal(sidebarRatio(NaN), 0.45);
   equal(sidebarRatio(-1), 0.2);
 });
 
-Deno.test("account groups keep profiles distinct, include unavailable profiles and honor running providers", () => {
-  const sessions = [
-    { id: 1, kind: "claude", account_profile_id: null },
-    { id: 2, kind: "claude", account_profile_id: 7 },
-    { id: 3, kind: "codex" },
-    { id: 4, kind: "claude", account_profile_id: 7 },
-    { id: 5, kind: "claude", account_profile_id: 99 },
-    { id: 6, kind: "shell" },
-    { id: 7, kind: "claude", account_profile_id: 7, provider: "openrouter" },
-  ] as SessionInfo[];
-  const profiles = [{ id: 7, name: "claude-personal", enabled: false }] as AccountProfile[];
-  const groups = accountSessionGroups(sessions, profiles);
-  equal(groups.find((g) => g.key === "claude:7")?.sessions.map((s) => s.id), [2, 4]);
-  equal(groups.find((g) => g.key === "claude:7")?.label, "claude-personal");
-  equal(groups.find((g) => g.key === "claude")?.sessions.map((s) => s.id), [1]);
-  equal(groups.find((g) => g.key === "claude:99")?.label, "claude · Unavailable profile #99");
-  equal(groups.find((g) => g.key === "claude:openrouter")?.sessions.map((s) => s.id), [7]);
-  equal(groups.flatMap((g) => g.sessions).map((s) => s.id).sort(), [1, 2, 3, 4, 5, 6, 7]);
+Deno.test("a new plain channel in an open folder joins it, across accounts", () => {
+  const ch = (id: number, cwd: string, extra: Partial<Channel> = {}) =>
+    ({ id, name: "muster", cwd, owns_worktree: false, archived: false, ...extra }) as Channel;
+  const list = [
+    ch(1, "/p/muster/.wt/feature", { owns_worktree: true }),
+    ch(2, "/p/other"),
+    ch(3, "/p/muster", { permissions: { codex_sandbox: "read_only", claude_mode: "plan" } }),
+  ];
+  equal(folderChannel(list, "/p/muster/")?.id, 3);
+  equal(folderChannel(list, "/p/muster", "muster")?.id, 3);
+  equal(folderChannel(list, "/p/muster", "  ")?.id, 3);
+  equal(folderChannel(list, "/p/muster", "scratch"), undefined);
+  equal(folderChannel(list, "/p/muster/.wt"), undefined);
+  equal(folderChannel([ch(4, "/p/muster", { archived: true })], "/p/muster"), undefined);
+  // Untouched dialog defaults join; the channel's own permissions join; others stay separate.
+  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "workspace_write", claude_mode: "default" })?.id, 3);
+  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "read_only", claude_mode: "plan" })?.id, 3);
+  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "full_access", claude_mode: "default" }), undefined);
 });
 
 Deno.test("drawer shells stay outside tiles across reconciliation and reload", () => {

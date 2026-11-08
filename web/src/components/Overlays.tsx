@@ -1019,7 +1019,9 @@ function CacheSettingsDialog() {
     const change: { cache_warn?: boolean; cache_ttl?: Partial<CacheTtl> } = {};
     if (on !== opened.warn) change.cache_warn = on;
     const t: Partial<CacheTtl> = {};
-    for (const [k, v] of parsed) if (v !== ttl[k]) t[k] = v!;
+    // Compared with what the field showed when opened, so a field an older backend didn't send
+    // (shown as its default) is only sent when edited here.
+    for (const [k, v] of parsed) if (v !== (ttl[k] ?? DEFAULT_CACHE_TTL[k])) t[k] = v!;
     if (Object.keys(t).length) change.cache_ttl = t;
     if (!Object.keys(change).length) return close();
     setBusy(true);

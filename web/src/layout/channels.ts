@@ -11,22 +11,34 @@ const trimSlash = (p: string) => p.replace(/\/+$/, "") || "/";
 const samePermissions = (a: Permissions, b: Permissions) =>
   a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode;
 
+export interface FolderJoin {
+  /** The dialog's name; blank matches any channel in the folder. */
+  name?: string;
+  /** The permissions the new session would get; omitted means the defaults. */
+  permissions?: Permissions;
+  /** Skip the permission check (to explain why no channel was joined). */
+  anyPermissions?: boolean;
+  /** Preferred among several matches (the selected channel). */
+  prefer?: number | null;
+  /** Whether a channel has sessions: a failed start in a channel without any archives it. */
+  live?: (id: number) => boolean;
+}
+
 /**
- * The window's plain channel (not a worktree) in folder `path`, which a new non-worktree
- * channel there joins as a tab instead of becoming a second channel with the same folder.
- * Sessions on different accounts then share one layout. A different explicit name, or
- * permissions changed from the defaults to something else than the channel's, still make a
- * separate channel (permissions belong to the channel).
+ * The window's channel in folder `path` that a New channel request without a new worktree joins
+ * as a tab, instead of becoming a second channel for the same folder. Sessions on different
+ * Claude accounts then share one channel's tabs and layout. A different explicit name, or
+ * permissions other than the channel's own (they belong to the channel, so joining would
+ * silently change them), still make a separate channel.
  */
-export function folderChannel(
-  list: Channel[], path: string, name?: string, permissions?: Permissions,
-): Channel | undefined {
+export function folderChannel(list: Channel[], path: string, o: FolderJoin = {}): Channel | undefined {
   const want = trimSlash(path);
-  const named = name?.trim();
-  return list.find((c) => !c.archived && !c.owns_worktree && trimSlash(c.cwd) === want &&
-    (!named || named === c.name) &&
-    (!permissions || samePermissions(permissions, DEFAULT_PERMISSIONS) ||
-      samePermissions(permissions, { ...DEFAULT_PERMISSIONS, ...c.permissions })));
+  const named = o.name?.trim();
+  const perms = o.permissions ?? DEFAULT_PERMISSIONS;
+  const matches = list.filter((c) => !c.archived && trimSlash(c.cwd) === want &&
+    (!named || named === c.name) && (o.live?.(c.id) ?? true) &&
+    (o.anyPermissions || samePermissions(perms, { ...DEFAULT_PERMISSIONS, ...c.permissions })));
+  return matches.find((c) => c.id === o.prefer) ?? matches[0];
 }
 
 export interface TabHome {

@@ -14,8 +14,8 @@ kills it, and reopening restores the window's channel selection, layouts and sid
   channel, a split tree for each channel, and the sidebar's collapse state and divider position.
 - **Channel**: a durable workspace holding a folder, optional worktree and branch, permissions,
   port block and name. New tab adds a terminal to the selected channel; New channel creates a
-  separate workspace, except that a plain (non-worktree) New channel in a folder this window
-  already has a plain channel for joins that channel as a new tab (see New channel). New terminals and splits inherit the active terminal’s current directory,
+  separate workspace, except that a New channel without a new worktree, in a folder where this
+  window already has a channel with sessions, joins that channel as a new tab (see New channel). New terminals and splits inherit the active terminal’s current directory,
   falling back to its launch directory; an empty channel uses its own folder. Changing directory
   does not automatically change channel membership. Closing the last terminal leaves the channel
   available to launch again.
@@ -35,6 +35,7 @@ show a tab count, unread activity and an attention count when a session needs yo
 channels form one flat list in their saved order, with no project or account headings (older
 saved grouping and collapse settings are ignored). Right-click the Channels heading, a row, or
 empty space for Hide channels (collapse this section) or Hide sidebar (hide the entire dock).
+Channels that share a name show their branch, or else their folder, under it.
 
 Select a channel to restore its tiles, tab order, active tabs, focused group and zoom. Double-click
 its name to rename it. Its menu also offers New tab, New note, Permissions, Copy folder path,
@@ -472,12 +473,14 @@ of the same kind arrives; the next waiting update shows meanwhile.
   remembers the last agent kind), worktree toggle (default **off**; disabled for a known non-git
   folder), base branch (only when worktree is on), optional name (blank = auto), optional first
   prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
-  Ctrl+Enter creates. With worktree off, a folder that already has a plain channel in this
-  window joins it instead: the dialog says so, the button reads **Add tab**, and the new
-  session (with the Claude profile chosen here) opens as a tab in that channel's layout, so
+  Ctrl+Enter creates. With worktree off, a folder where this window already has a channel with
+  sessions joins it instead (the selected channel first, if several match): the dialog says so,
+  the button reads **Add tab** (**Open channel** for Empty), and the new session, with the
+  Claude profile chosen here, opens as a tab in that channel's own folder and layout, so
   sessions on different accounts share one channel. A different name, or permissions other
-  than the defaults and the channel's own, still create a separate channel. Picking a folder
-  from the switcher follows the same rule. Ctrl+Shift+N skips the dialog (see Worktrees). It has no model choice, so
+  than that channel's (it says so), still create a separate channel; joining never changes a
+  session's permissions. Channels with no sessions are not joined, because a failed start
+  there would close them. Picking a folder from the switcher follows the same rule. Ctrl+Shift+N skips the dialog (see Worktrees). It has no model choice, so
   no provider choice either: running on OpenRouter is a named agent's setting (below).
 - **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
 - **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).

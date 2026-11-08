@@ -103,7 +103,7 @@ function ChannelsPanel() {
         rows[e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 :
           Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))]?.focus();
       }}>
-        {list.map((c) => <ChannelRow key={c.id} channel={c} />)}
+        {list.map((c) => <ChannelRow key={c.id} channel={c} context={qualifier(c, list)} />)}
         {fallback && <button type="button" class={cx("channel-select channel-fallback", activeChannelId.value === 0 && "active")}
           {...contextMenu(() => [
             { label: "New note", run: () => { A.openChannel(0, false); A.newNote(); } },
@@ -123,7 +123,16 @@ function ChannelsPanel() {
   );
 }
 
-function ChannelRow({ channel: c }: { channel: Channel }) {
+/** Without project headings, channels sharing a name show what tells them apart. */
+function qualifier(c: Channel, list: Channel[]): string | null {
+  const same = list.filter((x) => x.name === c.name);
+  if (same.length < 2) return null;
+  if (c.branch && same.some((x) => x.branch !== c.branch)) return c.branch;
+  if (same.some((x) => x.cwd !== c.cwd)) return tildify(c.cwd, meta.value.home);
+  return null;
+}
+
+function ChannelRow({ channel: c, context }: { channel: Channel; context: string | null }) {
   const [editing, setEditing] = useState(false);
   const items = sessionsByChannel.value.get(c.id) ?? [];
   const attention = items.filter((s) => needsHuman(s.state)).length;
@@ -154,7 +163,9 @@ function ChannelRow({ channel: c }: { channel: Channel }) {
       <button type="button" class="channel-select" aria-current={active ? "page" : undefined}
         data-tip={`${c.name} · ${tildify(c.cwd, meta.value.home)}${c.branch ? ` · ${c.branch}` : ""}${attention ? ` · ${attention} need you` : ""}`}
         onClick={() => A.openChannel(c.id)} onDblClick={() => setEditing(true)}>
-        <StateDot state={state} /><span class="channel-name">{c.name}</span>
+        <StateDot state={state} />
+        {context ? <span class="channel-label"><span class="channel-name">{c.name}</span>
+          <span class="channel-context">{context}</span></span> : <span class="channel-name">{c.name}</span>}
         {attention > 0 ? <span class="channel-attention" aria-label={`${attention} need you`}>{attention}</span> :
           <span class="channel-count" aria-label={`${count} tabs`}>{count}</span>}
       </button>}

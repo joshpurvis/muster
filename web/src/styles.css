@@ -3069,6 +3069,8 @@ textarea {
 .sidebar-divider.resizable:hover, .sidebar-divider:focus-visible { background: var(--accent); }
 .sidebar-divider:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
 .channel-row { display: flex; align-items: center; border-radius: var(--r); margin: 1px 0; }
+.channel-label { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 1px; }
+.channel-context { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-faint); }
 .channel-row:hover { background: var(--hover); }
 .channel-row.active, .channel-fallback.active { background: var(--accent-soft); color: var(--text); }
 .channel-row.channel-drop { background: var(--accent-soft); outline: 1px solid var(--accent); outline-offset: -1px; }

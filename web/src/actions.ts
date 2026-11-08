@@ -1083,7 +1083,8 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
   // Same folder, no worktree: join the channel already open there, so sessions on different
   // Claude accounts share one channel's tabs and layout instead of splitting into siblings.
   const joined = req.worktree ? undefined
-    : folderChannel(windowChannels.peek(), ws.path, req.name, req.permissions);
+    : folderChannel(windowChannels.peek(), ws.path, { name: req.name, permissions: req.permissions,
+      prefer: startedIn, live: (id) => !!sessionsByChannel.peek().get(id)?.length });
   if (joined) {
     if (activeChannelId.peek() === startedIn) selectChannel(joined.id);
     if (req.agent !== "none") {

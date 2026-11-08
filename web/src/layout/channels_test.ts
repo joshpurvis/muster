@@ -127,24 +127,35 @@ Deno.test("sidebar preferences are window-wide, validated and survive channel re
   equal(sidebarRatio(-1), 0.2);
 });
 
-Deno.test("a new plain channel in an open folder joins it, across accounts", () => {
+Deno.test("a new channel in an open folder joins it, across accounts", () => {
   const ch = (id: number, cwd: string, extra: Partial<Channel> = {}) =>
     ({ id, name: "muster", cwd, owns_worktree: false, archived: false, ...extra }) as Channel;
+  const elevated = { codex_sandbox: "full_access", claude_mode: "bypass" } as const;
   const list = [
     ch(1, "/p/muster/.wt/feature", { owns_worktree: true }),
     ch(2, "/p/other"),
-    ch(3, "/p/muster", { permissions: { codex_sandbox: "read_only", claude_mode: "plan" } }),
+    ch(3, "/p/muster"),
+    ch(4, "/p/muster"),
+    ch(5, "/p/muster", { permissions: elevated }),
   ];
   equal(folderChannel(list, "/p/muster/")?.id, 3);
-  equal(folderChannel(list, "/p/muster", "muster")?.id, 3);
-  equal(folderChannel(list, "/p/muster", "  ")?.id, 3);
-  equal(folderChannel(list, "/p/muster", "scratch"), undefined);
+  equal(folderChannel(list, "/p/muster", { name: "muster" })?.id, 3);
+  equal(folderChannel(list, "/p/muster", { name: "  " })?.id, 3);
+  equal(folderChannel(list, "/p/muster", { name: "scratch" }), undefined);
   equal(folderChannel(list, "/p/muster/.wt"), undefined);
-  equal(folderChannel([ch(4, "/p/muster", { archived: true })], "/p/muster"), undefined);
-  // Untouched dialog defaults join; the channel's own permissions join; others stay separate.
-  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "workspace_write", claude_mode: "default" })?.id, 3);
-  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "read_only", claude_mode: "plan" })?.id, 3);
-  equal(folderChannel(list, "/p/muster", undefined, { codex_sandbox: "full_access", claude_mode: "default" }), undefined);
+  equal(folderChannel([ch(6, "/p/muster", { archived: true })], "/p/muster"), undefined);
+  // The selected channel wins among matches; a channel with no sessions is never joined.
+  equal(folderChannel(list, "/p/muster", { prefer: 4 })?.id, 4);
+  equal(folderChannel(list, "/p/muster", { prefer: 2 })?.id, 3);
+  equal(folderChannel(list, "/p/muster", { live: (id) => id !== 3 })?.id, 4);
+  // An existing worktree channel's own folder joins it too.
+  equal(folderChannel(list, "/p/muster/.wt/feature")?.id, 1);
+  // Permissions must equal the channel's: defaults never join an elevated channel.
+  equal(folderChannel(list, "/p/muster", { prefer: 5 })?.id, 3);
+  equal(folderChannel([list[4]], "/p/muster"), undefined);
+  equal(folderChannel([list[4]], "/p/muster", { permissions: elevated })?.id, 5);
+  equal(folderChannel([list[4]], "/p/muster", { anyPermissions: true })?.id, 5);
+  equal(folderChannel(list, "/p/muster", { permissions: { codex_sandbox: "read_only", claude_mode: "plan" } }), undefined);
 });
 
 Deno.test("drawer shells stay outside tiles across reconciliation and reload", () => {

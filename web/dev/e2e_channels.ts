@@ -194,8 +194,8 @@ try {
   await a.wait(`getComputedStyle(document.querySelector('.sidebar')).display !== 'none'`);
   ok("Flat channel list with view controls on the heading and channels");
 
-  // A second plain channel in a folder that already has one (another Claude account, say)
-  // joins it as a tab, so both share one channel's tabs and layout.
+  // A New channel in a folder that already has one (another Claude account, say) joins it as
+  // a tab, so both share one channel's tabs and layout, and the dialog's account is used.
   const plain = (await r(a, "hello")).channels.find((c: any) => c.id === alpha);
   const before = (await r(a, "hello")).channels.filter((c: any) => !c.archived).length;
   const tabsBefore = await a.eval(`${M}.windowSessions.value.filter(s => s.channel_id === ${alpha}).length`);
@@ -207,15 +207,20 @@ try {
     folder.value = ${JSON.stringify(plain.cwd)}; folder.dispatchEvent(new Event('input', {bubbles:true}));
     const name = document.querySelector('.dialog input[placeholder="Project folder name"]');
     name.value = ${JSON.stringify(plain.name)}; name.dispatchEvent(new Event('input', {bubbles:true}));
-    [...document.querySelectorAll('.dialog [role="radio"]')].find(b => b.textContent.trim() === 'Shell').click();
+    [...document.querySelectorAll('.dialog [role="radio"]')].find(b => b.textContent.trim() === 'Claude').click();
   })()`);
   await a.wait(`document.querySelector('.dialog button[type="submit"]')?.textContent.includes('Add tab')`);
+  await a.eval(`(() => { const rpc = ${M}.rpc, call = rpc.call;
+    globalThis.spawns = []; rpc.call = (m,p) => (m === 'session.spawn' && spawns.push(p), call(m,p)); })()`);
   await a.shot(`${shots}/channels-join-dialog.png`);
   await a.click('.dialog button[type="submit"]');
   await a.wait(`!document.querySelector('.dialog')`, 10000);
   await selected(a, alpha);
   await a.wait(`${M}.windowSessions.value.filter(s => s.channel_id === ${alpha}).length === ${tabsBefore + 1}`, 8000);
   check((await r(a, "hello")).channels.filter((c: any) => !c.archived).length === before, "no sibling channel");
+  const spawned = await a.eval(`JSON.stringify(globalThis.spawns)`).then(JSON.parse);
+  check(spawned.length === 1 && spawned[0].channel_id === alpha && spawned[0].kind === "claude" &&
+    spawned[0].account_profile === "default" && spawned[0].cwd === undefined, "dialog's account, channel's folder");
   ok("New channel in an open folder joins that channel");
 
   // Exercise the built result in both themes and a smaller desktop window in one QA batch.

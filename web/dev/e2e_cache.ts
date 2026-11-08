@@ -116,23 +116,23 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   await a.wait(`!!document.querySelector('.cache-dlg')`, 2000);
   check((await a.eval(`document.querySelector('.cache-ttl-claude').value`)) === "60", "Claude: 60 minutes");
   // Another window changes a lifetime while this dialog is open: saving here keeps it.
-  await R("prefs.set", { cache_ttl: { codex: 45 } });
-  check((await a.eval(`document.querySelector('.cache-ttl-codex_openrouter').value`)) === "10", "Codex on OpenRouter: 10");
+  await R("prefs.set", { cache_ttl: { codex_chatgpt: 45 } });
+  check((await a.eval(`document.querySelector('.cache-ttl-codex_openrouter').value`)) === "30", "Codex on OpenRouter: 30");
   await shot("settings", `.cache-dlg`, 8);
   const setValue = (sel: string, v: string) =>
     a.eval(`(() => { const i = document.querySelector(${JSON.stringify(sel)});
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(i, ${JSON.stringify(v)});
       i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
-  await setValue(".cache-ttl-claude", "0");
-  check(await a.eval(`document.querySelector('.cache-dlg button[type=submit]').disabled`), "0 minutes can't be saved");
+  await setValue(".cache-ttl-claude", "-5");
+  check(await a.eval(`document.querySelector('.cache-dlg button[type=submit]').disabled`), "a negative lifetime can't be saved");
   await setValue(".cache-ttl-claude", "120");
   await a.click(`.cache-dlg button[type=submit]`);
   await a.wait(`!document.querySelector('.cache-dlg')`, 3000);
   await a.wait(`!${bar} && !document.querySelector('[data-tab-sid="${sid}"] .tab-cold')`, 3000);
   const saved = (await R("prefs.get", {})).cache_ttl;
   check(saved.claude === 120, "saved on the backend");
-  check(saved.codex === 45, "a field left alone keeps the other window's change");
-  await R("prefs.set", { cache_ttl: { codex: 30 } });
+  check(saved.codex_chatgpt === 45, "a field left alone keeps the other window's change");
+  await R("prefs.set", { cache_ttl: { codex_chatgpt: 0 } });
   ok("a longer Claude cache lifetime (2 h) makes an agent idle 1 h 20 m warm again");
 
   // A short window: the dialog's body scrolls, Save stays on screen.

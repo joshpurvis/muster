@@ -1,14 +1,25 @@
 // Shared bits: state dots, kbd, delegated tooltips, inline edit, spinner.
 import { Fragment } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import type { AgentState } from "../types.ts";
+import type { AgentState, SessionInfo } from "../types.ts";
 import { STATE_LABEL } from "../types.ts";
+import { CACHE_DOT_LABEL, type CacheDot, cacheDot } from "../cache.ts";
+import { cacheNow, windowPrefs } from "../state.ts";
 import { keyLabel } from "../keys.ts";
 import { cx } from "../util.ts";
 
-export function StateDot({ state, class: c }: { state: AgentState | null; class?: string }) {
+/** `cache`: an idle dot's colour (green warm, dim green cooling, grey cold; src/cache.ts). */
+export function StateDot({ state, cache, class: c }: { state: AgentState | null; cache?: CacheDot | null; class?: string }) {
   if (!state) return <span class={cx("dot dot-none", c)} />;
-  return <span class={cx("dot", "st-" + state, c)} title={STATE_LABEL[state]} />;
+  const label = STATE_LABEL[state];
+  return <span class={cx("dot", "st-" + state, cache && `cache-${cache}`, c)}
+    title={cache ? `${label} · ${CACHE_DOT_LABEL[cache]}` : label} />;
+}
+
+/** A session's dot, with its idle cache colour (ticks with the cache clock). */
+export function SessionDot({ s, class: c }: { s: SessionInfo; class?: string }) {
+  const cache = s.kind === "shell" ? null : cacheDot(s, cacheNow(), windowPrefs.value?.cache_warn !== false);
+  return <StateDot state={s.state} cache={cache} class={c} />;
 }
 
 export function Kbd({ k }: { k: string }) {

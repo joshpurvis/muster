@@ -29,7 +29,10 @@ import {
   windowChannels,
   tabChannel,
 } from "../state.ts";
-import { addDismissal, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText, wakeCold } from "../cache.ts";
+import {
+  addDismissal, CACHE_DOT_LABEL, cacheDot, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText,
+  wakeCold,
+} from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
 import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter, wakeFailedText } from "../agents.ts";
@@ -38,7 +41,7 @@ import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import * as terms from "../terms.ts";
 import { drag, startTabDrag } from "./dnd.tsx";
-import { InlineEdit, StateDot } from "../components/common.tsx";
+import { InlineEdit, SessionDot } from "../components/common.tsx";
 import { type MenuItem, openMenu, openMenuAt } from "../components/Menu.tsx";
 import { PermBadge } from "../components/Permissions.tsx";
 import { moveMenu, MoveTargets, WindowControls } from "../components/WindowControls.tsx";
@@ -449,7 +452,7 @@ function TabStrip(
             ? <IconPanel size={13} />
             : noteId(id) !== null
             ? <IconNote size={13} />
-            : <StateDot state={sessions.value.get(id)!.state} />,
+            : <SessionDot s={sessions.value.get(id)!} />,
           keys: focused && i < 9 ? `Alt+${i + 1}` : undefined,
           checked: id === pane.active,
           run: () => A.revealSession(id),
@@ -717,11 +720,13 @@ function GroupTab(
   const onOpenRouter = sessionOnOpenRouter(s);
   const asleep = isAsleep(agentBySession.value.get(s.id), s);
   const cold = isCold(s, cacheNow());
+  const dot = s.kind === "shell" ? null : cacheDot(s, cacheNow(), windowPrefs.value?.cache_warn !== false);
   const tip = [
     tabText(label),
     c?.name,
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
-    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation` : null,
+    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation`
+      : dot ? `Idle, ${CACHE_DOT_LABEL[dot]}` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
@@ -741,7 +746,8 @@ function GroupTab(
       )}
       role="tab"
       aria-selected={active}
-      aria-label={cold ? `${tabText(label)}, prompt cache likely expired` : tabText(label)}
+      aria-label={cold ? `${tabText(label)}, prompt cache likely expired`
+        : dot ? `${tabText(label)}, ${CACHE_DOT_LABEL[dot]}` : tabText(label)}
       tabIndex={active ? 0 : -1}
       data-tab-sid={s.id}
       data-tip={tip}
@@ -764,7 +770,7 @@ function GroupTab(
         openMenu({ x: e.clientX, y: e.clientY, items: tabMenu(s, c, paneId, tabsInGroup) });
       }}
     >
-      <StateDot state={s.state} />
+      <SessionDot s={s} />
       <TabIcon index={index} focused={groupFocused} size={13}><KindIcon kind={s.kind} size={13} /></TabIcon>
       {edit
         ? (

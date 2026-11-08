@@ -985,8 +985,10 @@ async fn permissions_are_shown_and_inherited_never_raised() {
 
 #[tokio::test]
 async fn spawn_children_limit() {
-    let (_, st) = state();
-    for _ in 0..8 {
+    let (_, mut st) = state();
+    // Only the children cap is under test here, not the spawn rate.
+    st.limits.spawn_per_window = 1000;
+    for _ in 0..st.limits.max_children_per_caller {
         let (t, err) = call(&st, "spawn_session", json!({"kind": "shell"})).await;
         assert!(!err, "{t}");
     }

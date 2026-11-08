@@ -176,15 +176,16 @@ let restartDelay = 0;
 const windowPrefs = {
   decorations: true,
   cache_warn: true,
-  cache_ttl: { claude: 60, claude_openrouter: 5, codex: 30, codex_openrouter: 10 } as Record<string, number>,
+  cache_ttl: { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 30 } as Record<string, number>,
   revision: 0,
 };
 
 /** src/cache.rs `CacheRules::cold_at` (and `refresh`'s `cache_ttl_min`). */
 function coldAt(s: Session): number | null {
-  const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : "");
+  const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : s.kind === "codex" ? "_chatgpt" : "");
+  // 0 never goes cold (Codex logged in with ChatGPT, by default).
   s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] : null;
-  if (s.cache_ttl_min == null || s.last_turn_at == null) return null;
+  if (!s.cache_ttl_min || s.last_turn_at == null) return null;
   return s.last_turn_at + s.cache_ttl_min * 60_000;
 }
 const workspaces: any[] = [];
@@ -1453,8 +1454,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     case "prefs.set":
       for (const [k, v] of Object.entries(p.cache_ttl ?? {})) {
         if (!(k in windowPrefs.cache_ttl)) throw new Error(`unknown field \`${k}\``);
-        if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 1440) {
-          throw new Error(`cache_ttl.${k}: 1 to 1440 minutes`);
+        if (!Number.isInteger(v) || (v as number) < 0 || (v as number) > 1440) {
+          throw new Error(`cache_ttl.${k}: 0 (never) to 1440 minutes`);
         }
       }
       if (typeof p.decorations === "boolean") windowPrefs.decorations = p.decorations;

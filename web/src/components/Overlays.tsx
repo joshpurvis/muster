@@ -30,7 +30,7 @@ import {
 import { folderChannel } from "../layout/channels.ts";
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
-import { Kbd, Spinner, StateDot } from "./common.tsx";
+import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
 import { IconBranch, IconCheck, IconCodex, IconFolder, IconNote, IconPanel, IconPlus, IconSpark, IconTerminal, IconTrash, IconX } from "../icons.tsx";
 import { noteTab, panelTab } from "../layout/tree.ts";
 import { authorName, notes, searchNotes } from "../notes.ts";
@@ -331,7 +331,7 @@ function jumpEntries(hits: ReadonlyMap<number, string> = new Map()): Entry[] {
       here: isHere,
       boost: 2,
       sub: isHere ? `${c.name} · ${folder}` : `${winName(windowOfSession(s))} · ${c.name} · ${folder}`,
-      icon: <StateDot state={s.state} />,
+      icon: <SessionDot s={s} />,
       right: <span class="sw-detail">{s.state_detail || STATE_LABEL[s.state]}</span>,
       run: () => {
         overlay.value = null;
@@ -379,7 +379,7 @@ function jumpEntries(hits: ReadonlyMap<number, string> = new Map()): Entry[] {
       sub: `agent · ${KIND_LABEL[a.kind]}${
         s && !isHere && st.live ? ` · ${winName(windowOfSession(s))}` : ""
       }`,
-      icon: <StateDot state={st.state} />,
+      icon: s && st.live ? <SessionDot s={s} /> : <StateDot state={st.state} />,
       right: <span class="sw-detail">{st.live ? s?.state_detail || st.label : "start"}</span>,
       run: () => {
         overlay.value = null;
@@ -1006,7 +1006,8 @@ function CacheSettingsDialog() {
   const ttl = opened.ttl;
   const [on, setOn] = useState(opened.warn);
   const [texts, setTexts] = useState<Record<keyof CacheTtl, string>>(
-    Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key])])) as Record<keyof CacheTtl, string>,
+    // A backend from before a field was renamed doesn't send it: show its default.
+    Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key] ?? DEFAULT_CACHE_TTL[r.key])])) as Record<keyof CacheTtl, string>,
   );
   const [busy, setBusy] = useState(false);
   const first = useRef<HTMLInputElement>(null);
@@ -1018,7 +1019,9 @@ function CacheSettingsDialog() {
     const change: { cache_warn?: boolean; cache_ttl?: Partial<CacheTtl> } = {};
     if (on !== opened.warn) change.cache_warn = on;
     const t: Partial<CacheTtl> = {};
-    for (const [k, v] of parsed) if (v !== ttl[k]) t[k] = v!;
+    // Compared with what the field showed when opened, so a field an older backend didn't send
+    // (shown as its default) is only sent when edited here.
+    for (const [k, v] of parsed) if (v !== (ttl[k] ?? DEFAULT_CACHE_TTL[k])) t[k] = v!;
     if (Object.keys(t).length) change.cache_ttl = t;
     if (!Object.keys(change).length) return close();
     setBusy(true);
@@ -1055,7 +1058,7 @@ function CacheSettingsDialog() {
             </span>
             <span>Warn when an agent's cache has likely expired</span>
           </label>
-          <div class={cx("cache-ttls", !on && "off")} role="group" aria-label="Cache lifetime, in minutes">
+          <div class={cx("cache-ttls", !on && "off")} role="group" aria-label="Cache lifetime, in minutes (0 never goes cold)">
             {CACHE_TTL_ROWS.map((r) => {
               const bad = parseTtl(texts[r.key]) === null;
               return (
@@ -1073,7 +1076,7 @@ function CacheSettingsDialog() {
                     <span class="muted">min</span>
                   </span>
                   <span id={`cache-hint-${r.key}`} class={cx("field-hint", bad && "field-bad")}>
-                    {bad ? `A whole number of minutes, 1 to ${CACHE_TTL_MAX}.` : `Default ${ttlText(DEFAULT_CACHE_TTL[r.key])}: ${r.hint}.`}
+                    {bad ? `A whole number of minutes, 0 (never cold) to ${CACHE_TTL_MAX}.` : `Default ${ttlText(DEFAULT_CACHE_TTL[r.key])}: ${r.hint}.`}
                   </span>
                 </label>
               );

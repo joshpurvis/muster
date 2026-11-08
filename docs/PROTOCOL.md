@@ -960,7 +960,8 @@ with its resume id) and given back to the session that resumes that same convers
 
 `SessionInfo.cache_ttl_min` is the lifetime that applies to the run, and
 `SessionInfo.cache_cold_at` = `last_turn_at` + it; both null for shells, before the first turn
-(`cache_cold_at` only), or with `cache_warn` off. Claude's lifetime also follows its launch
+(`cache_cold_at` only), with `cache_warn` off, or for a lifetime of 0 (never cold: Codex logged
+in with ChatGPT, by default). Claude's lifetime also follows its launch
 environment (read at each start, and from the saved launch after a backend restart; credentials
 are only tested for being set, never read or stored):
 
@@ -981,18 +982,18 @@ itself treats the cache as warm "for one cache TTL after Claude Code last sent a
 conversation or Claude last responded" (https://code.claude.com/docs/en/prompt-caching). The
 end of the last turn is the newest request the daemon can observe.
 
-Default lifetimes (`prefs.cache_ttl`, minutes; researched 2026-10):
+Default lifetimes (`prefs.cache_ttl`, minutes, 0 = never cold; researched 2026-10, Codex 2026-11-08):
 
 | Key | Default | Source |
 |---|---|---|
 | `claude` (Claude Code, subscription) | 60 | Claude Code asks for a 1-hour cache for the main conversation while within the plan's usage (5 min on usage credits); `promptCacheTtl` / `CLAUDE_CODE_PROMPT_CACHE_TTL` change it. code.claude.com/docs/en/prompt-caching |
 | `claude_openrouter` (OpenRouter, or an API key) | 5 | Anthropic's API default is 5 min; 1 h only when Claude Code is set to ask for it (`ENABLE_PROMPT_CACHING_1H`, `promptCacheTtl: "1h"`). platform.claude.com/docs/en/build-with-claude/prompt-caching, openrouter.ai/docs/features/prompt-caching |
-| `codex` (ChatGPT plan) | 30 | guess: not documented for ChatGPT plans; OpenAI's API default for GPT-5.6 and later is 30 min (a 12 h option exists but Codex doesn't ask for it). developers.openai.com/api/docs/guides/prompt-caching |
-| `codex_openrouter` | 10 | guess: OpenRouter's sticky routing ends after 10 idle minutes, after which a request may reach another provider's (cold) cache. openrouter.ai/docs/features/prompt-caching |
+| `codex_chatgpt` (Codex logged in with ChatGPT) | 0 (never) | OpenAI's Codex lead, 8 Nov 2026: "for logged in users across Codex & Work we keep cache forever and you don't have any penalty for coming back to an old conversation or resuming after a few hours" (x.com/thsottiaux). The CLI requests no lifetime (openai/codex `prompt_cache_ttl: None`). Codex on an API key can't be told apart without reading its credentials; it would get the API default of 30 min (a 12 h option exists; Codex doesn't ask for it). developers.openai.com/api/docs/guides/prompt-caching. Replaced `codex` (30, a guess) on 8 Nov 2026: a saved `codex` is ignored. |
+| `codex_openrouter` | 30 | OpenAI's minimum cache lifetime for GPT-5.6 and later ("a minimum 30-minute TTL by default"); OpenRouter keeps routing a conversation to the same endpoint for 60 idle minutes ("Sticky sessions expire after 60 minutes of inactivity"; read 2026-11-08, it said 10 before). A saved 10 stays until changed in Cache warning settings. openrouter.ai/docs/guides/best-practices/prompt-caching |
 
 Settings: `prefs.get`/`prefs.set` (see "Updates and window preferences") carry `cache_warn`
-(bool, default true) and `cache_ttl` (`{claude, claude_openrouter, codex, codex_openrouter}`,
-each 1 to 1440 minutes). `prefs.set {cache_ttl: {codex: 720}}` changes only the fields given;
+(bool, default true) and `cache_ttl` (`{claude, claude_openrouter, codex_chatgpt, codex_openrouter}`,
+each 0 (never cold) to 1440 minutes). `prefs.set {cache_ttl: {codex_chatgpt: 720}}` changes only the fields given;
 an out-of-range value or unknown key refuses the whole call.
 
 **Cold sends.** When the injector submits a prompt Muster delivers (an agent message, a

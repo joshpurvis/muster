@@ -1,8 +1,9 @@
 import { useRef, useState } from "preact/hooks";
 import {
   activeChannelId, agents, agentsPanelOpen, channelLayout, channels, channelsPanelOpen,
-  meta, sessionsByChannel, toast, unread, updateSidebar, windowChannels, workspaceById,
+  cacheNow, meta, sessionsByChannel, toast, unread, updateSidebar, windowChannels, windowPrefs, workspaceById,
 } from "../state.ts";
+import { CACHE_DOT_LABEL, channelCacheDot } from "../cache.ts";
 import { needsHuman, type Channel } from "../types.ts";
 import { aggregateState } from "../model.ts";
 import { rpc } from "../rpc.ts";
@@ -137,6 +138,8 @@ function ChannelRow({ channel: c, context }: { channel: Channel; context: string
   const items = sessionsByChannel.value.get(c.id) ?? [];
   const attention = items.filter((s) => needsHuman(s.state)).length;
   const state = aggregateState(items);
+  const cache = state === "idle"
+    ? channelCacheDot(items, cacheNow(), windowPrefs.value?.cache_warn !== false) : null;
   const active = activeChannelId.value === c.id;
   const count = channelLayout.value?.layouts[c.id] ? allSessions(channelLayout.value.layouts[c.id].root).length : 0;
   const d = drag.value;
@@ -161,9 +164,9 @@ function ChannelRow({ channel: c, context }: { channel: Channel; context: string
     {editing ? <div class="channel-rename"><InlineEdit fields={[{ value: c.name, label: "Channel name" }]}
       onCommit={([name]) => { setEditing(false); A.renameChannel(c.id, name); }} onCancel={() => setEditing(false)} /></div> :
       <button type="button" class="channel-select" aria-current={active ? "page" : undefined}
-        data-tip={`${c.name} · ${tildify(c.cwd, meta.value.home)}${c.branch ? ` · ${c.branch}` : ""}${attention ? ` · ${attention} need you` : ""}`}
+        data-tip={`${c.name} · ${tildify(c.cwd, meta.value.home)}${c.branch ? ` · ${c.branch}` : ""}${attention ? ` · ${attention} need you` : ""}${cache ? ` · ${CACHE_DOT_LABEL[cache]}` : ""}`}
         onClick={() => A.openChannel(c.id)} onDblClick={() => setEditing(true)}>
-        <StateDot state={state} />
+        <StateDot state={state} cache={cache} />
         {context ? <span class="channel-label"><span class="channel-name">{c.name}</span>
           <span class="channel-context">{context}</span></span> : <span class="channel-name">{c.name}</span>}
         {attention > 0 ? <span class="channel-attention" aria-label={`${attention} need you`}>{attention}</span> :

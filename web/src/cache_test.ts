@@ -1,4 +1,6 @@
-import { addDismissal, coldKey, coldText, idleText, isCold, parseTtl, ttlFor, ttlText, wakeCold } from "./cache.ts";
+import {
+  addDismissal, cacheDot, channelCacheDot, coldKey, coldText, idleText, isCold, parseTtl, ttlFor, ttlText, wakeCold,
+} from "./cache.ts";
 import { DEFAULT_CACHE_TTL } from "./cache.ts";
 import type { SessionInfo } from "./types.ts";
 
@@ -53,10 +55,37 @@ Deno.test("copy and lifetimes", () => {
   );
   assertEquals(ttlFor(sess(), DEFAULT_CACHE_TTL), 60);
   assertEquals(ttlFor(sess({ provider: "openrouter" }), DEFAULT_CACHE_TTL), 5);
-  assertEquals(ttlFor(sess({ kind: "codex" }), DEFAULT_CACHE_TTL), 30);
-  assertEquals(ttlFor(sess({ kind: "codex", provider: "openrouter" }), DEFAULT_CACHE_TTL), 10);
+  assertEquals(ttlFor(sess({ kind: "codex" }), DEFAULT_CACHE_TTL), 0);
+  assertEquals(ttlFor(sess({ kind: "codex", provider: "openrouter" }), DEFAULT_CACHE_TTL), 30);
   assertEquals(ttlFor(sess({ kind: "shell" }), DEFAULT_CACHE_TTL), null);
-  assertEquals([parseTtl(" 30 "), parseTtl("0"), parseTtl("1441"), parseTtl("1.5"), parseTtl("")], [30, null, null, null, null]);
+  assertEquals([parseTtl(" 30 "), parseTtl("0"), parseTtl("1441"), parseTtl("1.5"), parseTtl(""), parseTtl("-1")],
+    [30, 0, null, null, null, null]);
+  assertEquals(ttlText(0), "0, never cold");
+});
+
+Deno.test("an idle dot follows the cache: warm, cooling in its last 5 minutes, then cold", () => {
+  const cold = 60 * MIN;
+  const idle = (over: Partial<SessionInfo> = {}) => sess({ state: "idle", cache_cold_at: cold, ...over });
+  assertEquals(cacheDot(idle(), 0), "warm");
+  assertEquals(cacheDot(idle(), cold - 5 * MIN - 1), "warm");
+  assertEquals(cacheDot(idle(), cold - 5 * MIN), "cooling");
+  assertEquals(cacheDot(idle(), cold), "cold");
+  // Never cold (Codex on ChatGPT), no turn yet, or the warning off: warm. Shells: grey.
+  assertEquals(cacheDot(idle({ kind: "codex", cache_cold_at: null }), cold * 99), "warm");
+  assertEquals(cacheDot(idle(), cold, false), "warm");
+  assertEquals(cacheDot(idle({ kind: "shell", cache_cold_at: null }), 0), "cold");
+  // Lifetime 0 never goes cold; no lifetime at all means the launch switched caching off.
+  assertEquals(cacheDot(idle({ kind: "codex", cache_cold_at: null, cache_ttl_min: 0 }), cold * 99), "warm");
+  assertEquals(cacheDot(idle({ cache_cold_at: null, cache_ttl_min: null }), 0), "off");
+  assertEquals(channelCacheDot([idle({ cache_cold_at: null, cache_ttl_min: null })], 0), "off");
+  // Only idle sessions get one.
+  assertEquals(cacheDot(idle({ state: "working" }), cold), null);
+  // A channel: green if any agent is warm, else faded if one is cooling, else grey.
+  const shell = idle({ kind: "shell", cache_cold_at: null });
+  assertEquals(channelCacheDot([shell, idle({ cache_cold_at: 0 }), idle()], 0), "warm");
+  assertEquals(channelCacheDot([shell, idle({ cache_cold_at: 3 * MIN })], 0), "cooling");
+  assertEquals(channelCacheDot([shell, idle({ cache_cold_at: 0 })], 0), "cold");
+  assertEquals(channelCacheDot([shell], 0), null);
 });
 
 Deno.test("a dismissal lasts one idle period", () => {

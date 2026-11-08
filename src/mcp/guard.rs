@@ -69,8 +69,9 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_depth: 3,
-            max_children_per_caller: 8,
-            max_mcp_live_total: 24,
+            // Also stated in the spawn_session description (src/mcp/tools.rs) and docs/MCP.md.
+            max_children_per_caller: 32,
+            max_mcp_live_total: 32,
             send_per_window: 20,
             send_window_ms: 60_000,
             post_per_window: 30,
@@ -461,9 +462,9 @@ mod tests {
         let err = check_spawn(&spawn_budget(&s4, &live4, &HashMap::new(), 4, &l)).unwrap_err();
         assert!(err.contains("depth"), "{err}");
 
-        // 8 live children blocks; exited children don't count.
+        // 32 live children blocks; exited children don't count.
         let mut kids = vec![test_session(1, None)];
-        kids.extend((10..18).map(|i| test_session(i, Some(1))));
+        kids.extend((10..42).map(|i| test_session(i, Some(1))));
         let mut live: HashSet<_> = kids.iter().map(|k| k.id).collect();
         assert!(
             check_spawn(&spawn_budget(&kids, &live, &HashMap::new(), 1, &l))
@@ -475,13 +476,13 @@ mod tests {
 
         // Global cap.
         let mut many = vec![test_session(1, None)];
-        for p in 0..6u32 {
+        for p in 0..8u32 {
             many.push(test_session(100 + p, None));
             many.extend((0..4).map(|i| test_session(200 + p * 10 + i, Some(100 + p))));
         }
         let live: HashSet<_> = many.iter().map(|k| k.id).collect();
         let b = spawn_budget(&many, &live, &HashMap::new(), 1, &l);
-        assert_eq!(b.mcp_live_total, 24);
+        assert_eq!(b.mcp_live_total, 32);
         assert!(check_spawn(&b).unwrap_err().contains("daemon-wide"));
     }
 

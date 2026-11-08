@@ -957,8 +957,8 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Rule | Value |
 |---|---|
 | Spawn depth | A human-started session is depth 0. Its children are depth 1, and so on. Max depth **3**: a depth-3 session can't spawn. Computed by walking `parent_id` (cycle-safe), and also remembered at spawn time, so removing an ancestor can't shorten a lineage. Remembered parent depths persist before spawn, so backend replacement can recover a child even when its acknowledgement was lost. |
-| Live children per caller | **8** (live sessions whose `parent_id` is the caller) |
-| Live MCP-spawned sessions, daemon-wide | **24** (live sessions with any `parent_id`) |
+| Live children per caller | **32** (live sessions whose `parent_id` is the caller; raised from 8 on 8 Nov 2026) |
+| Live MCP-spawned sessions, daemon-wide | **32** (live sessions with any `parent_id`; raised from 24 with it, so one caller can reach its 32) |
 | `send_message` rate | **20 per 60 s** sliding window, per caller. A refusal before durable queue acceptance doesn't use up a slot; retained or uncertain deliveries still count. |
 | `spawn_session` rate | **10 per 10 minutes** sliding window, per caller. Refused or failed spawns don't use up a slot. |
 | Agent-created channels | At most **10** non-archived channels created through `spawn_session`'s `new_channel`, daemon-wide. Spawning into existing channels is not affected. Channel origin is recorded in the same transaction as creation, so earlier open channels still count after backend replacement. |

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::{AgentState, SessionInfo, SessionKind};
 use crate::openrouter::Provider;
 
-/// Longest cache lifetime one can set, in minutes (a day).
+/// Longest cache lifetime one can set, in minutes (a day). 0 means it never goes cold.
 pub const TTL_MAX_MIN: u32 = 24 * 60;
 
 /// How long each CLI/provider pair keeps a conversation cached, in minutes.
@@ -28,22 +28,30 @@ pub const TTL_MAX_MIN: u32 = 24 * 60;
 ///   the plan is on usage credits).
 /// - Claude Code on OpenRouter (an Anthropic API endpoint): 5 minutes unless the CLI is told
 ///   to ask for the 1-hour cache.
-/// - Codex on a ChatGPT plan: not documented; 30 minutes is OpenAI's API default for current
-///   models (guess).
+/// - Codex logged in with ChatGPT: never (0). OpenAI's Codex lead, 8 Nov 2026 (x.com/thsottiaux):
+///   "for logged in users across Codex & Work we keep cache forever and you don't have any
+///   penalty for coming back to an old conversation or resuming after a few hours". The CLI
+///   itself requests no lifetime (openai/codex `prompt_cache_ttl: None`, checked 8 Nov 2026).
+///   Muster can't tell an API-key Codex login apart without reading its credentials; that one
+///   gets the API's 30-minute default (OpenAI prompt caching guide, GPT-5.6 and later).
 /// - Codex on OpenRouter: 10 minutes, OpenRouter's sticky routing ends after 10 idle minutes and
-///   the next request may land on another provider's cache (guess).
+///   the next request may land on another endpoint without the cache (OpenRouter prompt caching
+///   docs, checked 8 Nov 2026).
+///
+/// The ChatGPT field replaced `codex` (30 min, a guess) on 8 Nov 2026; a saved `codex` is ignored
+/// so stored preferences pick up the new default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheTtl {
     pub claude: u32,
     pub claude_openrouter: u32,
-    pub codex: u32,
+    pub codex_chatgpt: u32,
     pub codex_openrouter: u32,
 }
 
 impl Default for CacheTtl {
     fn default() -> Self {
-        Self { claude: 60, claude_openrouter: 5, codex: 30, codex_openrouter: 10 }
+        Self { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 10 }
     }
 }
 
@@ -53,22 +61,22 @@ impl Default for CacheTtl {
 pub struct CacheTtlChange {
     pub claude: Option<u32>,
     pub claude_openrouter: Option<u32>,
-    pub codex: Option<u32>,
+    pub codex_chatgpt: Option<u32>,
     pub codex_openrouter: Option<u32>,
 }
 
 impl CacheTtl {
-    /// Apply a change; each value must be 1..=TTL_MAX_MIN minutes.
+    /// Apply a change; each value must be 0 (never cold) or 1..=TTL_MAX_MIN minutes.
     pub fn apply(&mut self, change: CacheTtlChange) -> anyhow::Result<()> {
         let mut next = *self;
         for (name, v, slot) in [
             ("claude", change.claude, &mut next.claude),
             ("claude_openrouter", change.claude_openrouter, &mut next.claude_openrouter),
-            ("codex", change.codex, &mut next.codex),
+            ("codex_chatgpt", change.codex_chatgpt, &mut next.codex_chatgpt),
             ("codex_openrouter", change.codex_openrouter, &mut next.codex_openrouter),
         ] {
             if let Some(v) = v {
-                anyhow::ensure!((1..=TTL_MAX_MIN).contains(&v), "cache_ttl.{name}: 1 to {TTL_MAX_MIN} minutes");
+                anyhow::ensure!(v <= TTL_MAX_MIN, "cache_ttl.{name}: 0 (never) to {TTL_MAX_MIN} minutes");
                 *slot = v;
             }
         }
@@ -77,15 +85,20 @@ impl CacheTtl {
     }
 
     /// Minutes for a session of `kind` billed to `provider`, whose launch says `basis`; None
-    /// for shells and for a Claude launched with prompt caching off.
+    /// for shells, for a Claude launched with prompt caching off, and for a lifetime of 0
+    /// (never cold).
     pub fn minutes(&self, kind: SessionKind, provider: Provider, basis: CacheBasis) -> Option<u32> {
+        self.configured(kind, provider, basis).filter(|&m| m > 0)
+    }
+
+    fn configured(&self, kind: SessionKind, provider: Provider, basis: CacheBasis) -> Option<u32> {
         match (kind, provider) {
             (SessionKind::Claude, _) if basis.env.is_some() => basis.env.flatten(),
             (SessionKind::Claude, Provider::OpenRouter) => Some(self.claude_openrouter),
             // Claude Code on an API key (or a cloud provider) gets the API's 5-minute default.
             (SessionKind::Claude, Provider::Subscription) if basis.api_auth => Some(self.claude_openrouter),
             (SessionKind::Claude, Provider::Subscription) => Some(self.claude),
-            (SessionKind::Codex, Provider::Subscription) => Some(self.codex),
+            (SessionKind::Codex, Provider::Subscription) => Some(self.codex_chatgpt),
             (SessionKind::Codex, Provider::OpenRouter) => Some(self.codex_openrouter),
             (SessionKind::Shell, _) => None,
         }
@@ -296,7 +309,7 @@ mod tests {
         for (kind, provider, minutes) in [
             (SessionKind::Claude, Provider::Subscription, 60),
             (SessionKind::Claude, Provider::OpenRouter, 5),
-            (SessionKind::Codex, Provider::Subscription, 30),
+
             (SessionKind::Codex, Provider::OpenRouter, 10),
         ] {
             let mut s = sess(kind, provider);
@@ -306,6 +319,18 @@ mod tests {
             assert!(!is_cold(&s, 1_000 + minutes * MIN - 1));
             assert!(is_cold(&s, 1_000 + minutes * MIN));
         }
+        // Codex on a ChatGPT login keeps its cache: never cold, like a 0 set for anything else.
+        let mut s = sess(SessionKind::Codex, Provider::Subscription);
+        s.last_turn_at = Some(1_000);
+        rules.refresh(&mut s);
+        assert_eq!((s.cache_cold_at, s.cache_ttl_min), (None, None));
+        assert!(!is_cold(&s, i64::MAX));
+        let mut never = CacheTtl::default();
+        never.apply(CacheTtlChange { claude: Some(0), ..Default::default() }).unwrap();
+        assert_eq!(never.minutes(SessionKind::Claude, Provider::Subscription, CacheBasis::default()), None);
+        // A saved `codex` from before the ChatGPT field is ignored, so the new default applies.
+        let old: CacheTtl = serde_json::from_value(json!({"claude": 45, "codex": 30})).unwrap();
+        assert_eq!((old.claude, old.codex_chatgpt), (45, 0));
     }
 
     #[test]
@@ -413,11 +438,11 @@ mod tests {
     #[test]
     fn switched_off_and_changed() {
         let mut ttl = CacheTtl::default();
-        ttl.apply(CacheTtlChange { codex: Some(12 * 60), ..Default::default() }).unwrap();
-        assert_eq!(ttl.codex, 720);
+        ttl.apply(CacheTtlChange { codex_chatgpt: Some(12 * 60), ..Default::default() }).unwrap();
+        assert_eq!(ttl.codex_chatgpt, 720);
         assert_eq!(ttl.claude, 60);
-        assert!(ttl.apply(CacheTtlChange { claude: Some(0), codex: Some(5), ..Default::default() }).is_err());
-        assert_eq!(ttl.codex, 720, "a refused change changes nothing");
+        assert!(ttl.apply(CacheTtlChange { claude: Some(TTL_MAX_MIN + 1), codex_chatgpt: Some(5), ..Default::default() }).is_err());
+        assert_eq!(ttl.codex_chatgpt, 720, "a refused change changes nothing");
         assert!(ttl.apply(CacheTtlChange { claude: Some(TTL_MAX_MIN + 1), ..Default::default() }).is_err());
         let mut s = sess(SessionKind::Codex, Provider::Subscription);
         s.last_turn_at = Some(0);

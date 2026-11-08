@@ -71,7 +71,7 @@ import type {
   Provider,
 } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
-import { Kbd, Spinner, StateDot } from "./common.tsx";
+import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
 import { contextMenu, openMenu } from "./Menu.tsx";
 import { PermissionsSection } from "./Permissions.tsx";
 import { ProfileSelect } from "./AccountProfiles.tsx";
@@ -230,7 +230,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
         agentMenu(a, e.clientX, e.clientY);
       }}
     >
-      <StateDot state={st.state} class={st.asleep ? "dot-asleep" : undefined} />
+      {s && st.live ? <SessionDot s={s} /> : <StateDot state={st.state} class={st.asleep ? "dot-asleep" : undefined} />}
       <span class="ap-row-text">
         <span class="ap-row-top">
           <span class="ap-name">{a.name}</span>

@@ -38,7 +38,7 @@ import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import * as terms from "../terms.ts";
 import { drag, startTabDrag } from "./dnd.tsx";
-import { InlineEdit, StateDot } from "../components/common.tsx";
+import { InlineEdit, SessionDot } from "../components/common.tsx";
 import { type MenuItem, openMenu, openMenuAt } from "../components/Menu.tsx";
 import { PermBadge } from "../components/Permissions.tsx";
 import { moveMenu, MoveTargets, WindowControls } from "../components/WindowControls.tsx";
@@ -449,7 +449,7 @@ function TabStrip(
             ? <IconPanel size={13} />
             : noteId(id) !== null
             ? <IconNote size={13} />
-            : <StateDot state={sessions.value.get(id)!.state} />,
+            : <SessionDot s={sessions.value.get(id)!} />,
           keys: focused && i < 9 ? `Alt+${i + 1}` : undefined,
           checked: id === pane.active,
           run: () => A.revealSession(id),
@@ -764,7 +764,7 @@ function GroupTab(
         openMenu({ x: e.clientX, y: e.clientY, items: tabMenu(s, c, paneId, tabsInGroup) });
       }}
     >
-      <StateDot state={s.state} />
+      <SessionDot s={s} />
       <TabIcon index={index} focused={groupFocused} size={13}><KindIcon kind={s.kind} size={13} /></TabIcon>
       {edit
         ? (

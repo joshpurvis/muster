@@ -3,8 +3,8 @@
 // Pure helpers; the clock and the dismissals live in state.ts.
 import type { CacheTtl, SessionInfo } from "./types.ts";
 
-/** The backend's defaults (src/cache.rs `CacheTtl::default`), in minutes. */
-export const DEFAULT_CACHE_TTL: CacheTtl = { claude: 60, claude_openrouter: 5, codex: 30, codex_openrouter: 10 };
+/** The backend's defaults (src/cache.rs `CacheTtl::default`), in minutes; 0 never goes cold. */
+export const DEFAULT_CACHE_TTL: CacheTtl = { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 10 };
 export const CACHE_TTL_MAX = 24 * 60;
 
 /** The settings dialog's rows: which field, and what it covers. */
@@ -15,9 +15,38 @@ export const CACHE_TTL_ROWS: { key: keyof CacheTtl; label: string; hint: string 
     label: "Claude on OpenRouter or an API key",
     hint: "Anthropic's default, unless Claude Code asks for 1 hour",
   },
-  { key: "codex", label: "Codex on a ChatGPT plan", hint: "OpenAI's API default; ChatGPT plans don't say" },
+  { key: "codex_chatgpt", label: "Codex logged in with ChatGPT", hint: "OpenAI keeps these conversations cached" },
   { key: "codex_openrouter", label: "Codex on OpenRouter", hint: "OpenRouter may switch provider after 10 idle minutes" },
 ];
+
+/** An idle agent's dot: green while its cache is warm, dim green in its last `COOLING_MS`,
+ * grey once cold. Idle shells (no cache) are grey too. */
+export type CacheDot = "warm" | "cooling" | "cold";
+export const COOLING_MS = 5 * 60_000;
+
+/** `s`'s cache, for its dot; null unless it is idle. Without a cold time (it never goes cold,
+ * has had no turn yet, or the warning is off: `warn`) an idle agent counts as warm. */
+export function cacheDot(s: SessionInfo, now: number, warn = true): CacheDot | null {
+  if (s.state !== "idle") return null;
+  if (s.kind === "shell") return "cold";
+  if (!warn || s.cache_cold_at == null) return "warm";
+  if (now >= s.cache_cold_at) return "cold";
+  return now >= s.cache_cold_at - COOLING_MS ? "cooling" : "warm";
+}
+
+/** A channel's dot when it is idle: green if any agent in it is warm, else dim green if one is
+ * cooling, else grey. */
+export function channelCacheDot(list: SessionInfo[], now: number, warn = true): CacheDot {
+  const dots = list.map((s) => cacheDot(s, now, warn));
+  return dots.includes("warm") ? "warm" : dots.includes("cooling") ? "cooling" : "cold";
+}
+
+/** Words for the dot's tooltip and accessible name. */
+export const CACHE_DOT_LABEL: Record<CacheDot, string> = {
+  warm: "cache warm",
+  cooling: "cache going cold soon",
+  cold: "cache cold",
+};
 
 const WAITING_NOT = new Set(["working", "starting", "exited"]);
 
@@ -46,8 +75,9 @@ export function idleText(ms: number): string {
   return m ? `${h} h ${m} m` : `${h} h`;
 }
 
-/** A lifetime for people: "1 h", "5 min", "1 h 30 min". */
+/** A lifetime for people: "1 h", "5 min", "1 h 30 min", "0, never cold" for 0. */
 export function ttlText(min: number): string {
+  if (min === 0) return "0, never cold";
   const h = Math.floor(min / 60), m = min % 60;
   if (!h) return `${m} min`;
   return m ? `${h} h ${m} min` : `${h} h`;
@@ -68,16 +98,18 @@ export function coldText(s: SessionInfo, now: number): string {
 /** The lifetime that applies to `s` (minutes), for tooltips. */
 export function ttlFor(s: SessionInfo, ttl: CacheTtl): number | null {
   if (s.kind === "shell") return null;
-  const key = (s.kind + (s.provider === "openrouter" ? "_openrouter" : "")) as keyof CacheTtl;
+  const key: keyof CacheTtl = s.kind === "claude"
+    ? (s.provider === "openrouter" ? "claude_openrouter" : "claude")
+    : s.provider === "openrouter" ? "codex_openrouter" : "codex_chatgpt";
   return ttl[key];
 }
 
-/** Parse a minutes field: a whole number 1..CACHE_TTL_MAX, else null. */
+/** Parse a minutes field: a whole number 0 (never cold) to CACHE_TTL_MAX, else null. */
 export function parseTtl(v: string): number | null {
   const t = v.trim();
   if (!/^\d+$/.test(t)) return null;
   const n = Number(t);
-  return n >= 1 && n <= CACHE_TTL_MAX ? n : null;
+  return n <= CACHE_TTL_MAX ? n : null;
 }
 
 /** Keep the newest `max` dismissals (insertion order). */

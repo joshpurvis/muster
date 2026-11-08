@@ -641,7 +641,8 @@ export type ServerEvent =
 export interface CacheTtl {
   claude: number;
   claude_openrouter: number;
-  codex: number;
+  /** Codex logged in with ChatGPT; 0 (the default) means it never goes cold. */
+  codex_chatgpt: number;
   codex_openrouter: number;
 }
 

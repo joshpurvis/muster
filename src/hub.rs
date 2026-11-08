@@ -6870,7 +6870,7 @@ mod tests {
         hub.set_ui_prefs(UiPrefsChange { cache_warn: Some(false), ..Default::default() }).unwrap();
         assert_eq!(hub.cache_cold(2, i64::MAX), None);
         assert!(hub.set_ui_prefs(UiPrefsChange {
-            cache_ttl: Some(crate::cache::CacheTtlChange { codex: Some(0), ..Default::default() }),
+            cache_ttl: Some(crate::cache::CacheTtlChange { codex_chatgpt: Some(crate::cache::TTL_MAX_MIN + 1), ..Default::default() }),
             ..Default::default()
         }).is_err());
     }

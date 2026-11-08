@@ -43,6 +43,8 @@
   --danger-fill: #da3633;
   --st-stuck: #e0823d;
   --st-exited: #6a6a76;
+  /* Idle: dim but >= 3:1 on every surface up to --bg-4. */
+  --st-idle-dot: #72727e;
   /* A cold prompt cache (src/cache.ts): calm, cool, not an alarm. */
   --cold: #8ab4d8;
   --attn-bg: rgba(240, 160, 32, 0.11);
@@ -115,6 +117,7 @@
   --danger-fill: #d92d20;
   --st-stuck: #c8621a;
   --st-exited: #9a9aa6;
+  --st-idle-dot: #7f7f8b;
   --cold: #2f6f9f;
   --attn-bg: rgba(214, 138, 0, 0.1);
   --attn-border: rgba(214, 138, 0, 0.35);
@@ -584,10 +587,10 @@ button.sl-item:hover {
   box-shadow: 0 0 0 2.5px rgba(240, 160, 32, 0.22);
 }
 
-/* Idle is the resting state: a dim filled dot, so working (blue) and needs-you (orange) stand
-   out. Exited is the same grey as a hollow ring. */
+/* Idle is the resting state: a dim grey filled dot, so working (blue) and needs-you (orange)
+   stand out. Exited stays a hollow ring. */
 .dot.st-idle {
-  background: var(--st-exited);
+  background: var(--st-idle-dot);
 }
 
 .dot.st-error {

@@ -176,7 +176,7 @@ let restartDelay = 0;
 const windowPrefs = {
   decorations: true,
   cache_warn: true,
-  cache_ttl: { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 10 } as Record<string, number>,
+  cache_ttl: { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 30 } as Record<string, number>,
   revision: 0,
 };
 
@@ -184,8 +184,8 @@ const windowPrefs = {
 function coldAt(s: Session): number | null {
   const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : s.kind === "codex" ? "_chatgpt" : "");
   // 0 never goes cold (Codex logged in with ChatGPT, by default).
-  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] || null : null;
-  if (s.cache_ttl_min == null || s.last_turn_at == null) return null;
+  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] : null;
+  if (!s.cache_ttl_min || s.last_turn_at == null) return null;
   return s.last_turn_at + s.cache_ttl_min * 60_000;
 }
 const workspaces: any[] = [];

@@ -117,7 +117,7 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   check((await a.eval(`document.querySelector('.cache-ttl-claude').value`)) === "60", "Claude: 60 minutes");
   // Another window changes a lifetime while this dialog is open: saving here keeps it.
   await R("prefs.set", { cache_ttl: { codex_chatgpt: 45 } });
-  check((await a.eval(`document.querySelector('.cache-ttl-codex_openrouter').value`)) === "10", "Codex on OpenRouter: 10");
+  check((await a.eval(`document.querySelector('.cache-ttl-codex_openrouter').value`)) === "30", "Codex on OpenRouter: 30");
   await shot("settings", `.cache-dlg`, 8);
   const setValue = (sel: string, v: string) =>
     a.eval(`(() => { const i = document.querySelector(${JSON.stringify(sel)});

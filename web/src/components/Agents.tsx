@@ -23,6 +23,7 @@ import {
   sessions,
   setPref,
   toast,
+  windowPrefs,
 } from "../state.ts";
 import * as A from "../actions.ts";
 import {
@@ -87,7 +88,7 @@ import {
   IconX,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
-import { idleText, isCold, wakeCold } from "../cache.ts";
+import { CACHE_DOT_LABEL, cacheDot, idleText, isCold, wakeCold } from "../cache.ts";
 
 /** Re-render every `ms` (the "time in state" column). */
 function useNow(ms = 30_000): number {
@@ -197,6 +198,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
   // Asleep: its next message re-reads the conversation uncached once the cache has expired.
   const cold = !!s && (st.asleep ? wakeCold(s, cacheNow()) : isCold(s, cacheNow()));
+  const dot = s && st.live ? cacheDot(s, cacheNow(), windowPrefs.value?.cache_warn !== false) : null;
   const persona = firstLine(a.persona);
   const open = () => {
     agentFilter.value = a.id;
@@ -210,7 +212,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-tip={persona || undefined}
       tabIndex={0}
       aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${
-        cold ? ", prompt cache likely expired" : ""
+        cold ? ", prompt cache likely expired" : dot ? `, ${CACHE_DOT_LABEL[dot]}` : ""
       }`}
       onClick={open}
       onKeyDown={(e) => {

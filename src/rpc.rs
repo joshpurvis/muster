@@ -2942,7 +2942,7 @@ mod tests {
     async fn window_prefs_persist_and_broadcast() {
         let (hub, _st) = fixture();
         let mut rx = hub.subscribe();
-        let ttl = json!({"claude": 60, "claude_openrouter": 5, "codex_chatgpt": 0, "codex_openrouter": 10});
+        let ttl = json!({"claude": 60, "claude_openrouter": 5, "codex_chatgpt": 0, "codex_openrouter": 30});
         let prefs = |d: bool, r: u64| json!({"decorations": d, "cache_warn": true, "cache_ttl": ttl, "revision": r});
         assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap(), prefs(true, 0));
         let set = prefs(false, 1);
@@ -2957,7 +2957,7 @@ mod tests {
         let p = call(&hub, "prefs.set", json!({"cache_warn": false, "cache_ttl": {"codex_chatgpt": 720}})).await.unwrap();
         assert_eq!((p["cache_warn"].clone(), p["cache_ttl"]["codex_chatgpt"].clone(), p["cache_ttl"]["claude"].clone()),
             (json!(false), json!(720), json!(60)));
-        for bad in [json!({"codex": 30}), json!({"claude": 1441}), json!({"gemini": 5}), json!({"claude": -1})] {
+        for bad in [json!({"claude": 1441}), json!({"gemini": 5}), json!({"claude": -1})] {
             assert!(call(&hub, "prefs.set", json!({"cache_ttl": bad})).await.is_err(), "{bad}");
         }
     }

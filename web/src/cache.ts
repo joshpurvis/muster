@@ -4,7 +4,7 @@
 import type { CacheTtl, SessionInfo } from "./types.ts";
 
 /** The backend's defaults (src/cache.rs `CacheTtl::default`), in minutes; 0 never goes cold. */
-export const DEFAULT_CACHE_TTL: CacheTtl = { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 10 };
+export const DEFAULT_CACHE_TTL: CacheTtl = { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 30 };
 export const CACHE_TTL_MAX = 24 * 60;
 
 /** The settings dialog's rows: which field, and what it covers. */
@@ -16,29 +16,35 @@ export const CACHE_TTL_ROWS: { key: keyof CacheTtl; label: string; hint: string 
     hint: "Anthropic's default, unless Claude Code asks for 1 hour",
   },
   { key: "codex_chatgpt", label: "Codex logged in with ChatGPT", hint: "OpenAI keeps these conversations cached" },
-  { key: "codex_openrouter", label: "Codex on OpenRouter", hint: "OpenRouter may switch provider after 10 idle minutes" },
+  { key: "codex_openrouter", label: "Codex on OpenRouter", hint: "OpenAI's minimum; OpenRouter keeps the same endpoint for 60 idle minutes" },
 ];
 
 /** An idle agent's dot: green while its cache is warm, dim green in its last `COOLING_MS`,
- * grey once cold. Idle shells (no cache) are grey too. */
-export type CacheDot = "warm" | "cooling" | "cold";
+ * grey once cold or with prompt caching switched off ("off"). Idle shells are grey too. */
+export type CacheDot = "warm" | "cooling" | "cold" | "off";
 export const COOLING_MS = 5 * 60_000;
 
-/** `s`'s cache, for its dot; null unless it is idle. Without a cold time (it never goes cold,
- * has had no turn yet, or the warning is off: `warn`) an idle agent counts as warm. */
+/** `s`'s cache, for its dot; null unless it is idle. A lifetime of 0 never goes cold; no
+ * lifetime (`cache_ttl_min` null with the warning on) means its launch switched caching off.
+ * With the warning off (`warn`) or before its first turn an idle agent counts as warm. */
 export function cacheDot(s: SessionInfo, now: number, warn = true): CacheDot | null {
   if (s.state !== "idle") return null;
   if (s.kind === "shell") return "cold";
-  if (!warn || s.cache_cold_at == null) return "warm";
+  if (!warn) return "warm";
+  // undefined: a backend from before cache_ttl_min; go by the cold time alone.
+  if (s.cache_ttl_min === null) return "off";
+  if (s.cache_cold_at == null) return "warm";
   if (now >= s.cache_cold_at) return "cold";
   return now >= s.cache_cold_at - COOLING_MS ? "cooling" : "warm";
 }
 
 /** A channel's dot when it is idle: green if any agent in it is warm, else dim green if one is
- * cooling, else grey. */
-export function channelCacheDot(list: SessionInfo[], now: number, warn = true): CacheDot {
-  const dots = list.map((s) => cacheDot(s, now, warn));
-  return dots.includes("warm") ? "warm" : dots.includes("cooling") ? "cooling" : "cold";
+ * cooling, else grey ("cold", or "off" when caching is off for all of them). Null (plain grey)
+ * when no idle agent is in it, only shells. */
+export function channelCacheDot(list: SessionInfo[], now: number, warn = true): CacheDot | null {
+  const dots = list.filter((s) => s.kind !== "shell").map((s) => cacheDot(s, now, warn));
+  for (const d of ["warm", "cooling", "cold", "off"] as const) if (dots.includes(d)) return d;
+  return null;
 }
 
 /** Words for the dot's tooltip and accessible name. */
@@ -46,6 +52,7 @@ export const CACHE_DOT_LABEL: Record<CacheDot, string> = {
   warm: "cache warm",
   cooling: "cache going cold soon",
   cold: "cache cold",
+  off: "prompt caching off",
 };
 
 const WAITING_NOT = new Set(["working", "starting", "exited"]);

@@ -1006,7 +1006,8 @@ function CacheSettingsDialog() {
   const ttl = opened.ttl;
   const [on, setOn] = useState(opened.warn);
   const [texts, setTexts] = useState<Record<keyof CacheTtl, string>>(
-    Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key])])) as Record<keyof CacheTtl, string>,
+    // A backend from before a field was renamed doesn't send it: show its default.
+    Object.fromEntries(CACHE_TTL_ROWS.map((r) => [r.key, String(ttl[r.key] ?? DEFAULT_CACHE_TTL[r.key])])) as Record<keyof CacheTtl, string>,
   );
   const [busy, setBusy] = useState(false);
   const first = useRef<HTMLInputElement>(null);

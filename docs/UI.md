@@ -55,11 +55,12 @@ toggle). All colors are CSS custom properties on `:root`. State colors: starting
 stuck `#e0823d`, exited `#6a6a76` (hollow dot). Idle follows the agent's prompt cache
 (`web/src/cache.ts` `cacheDot`, on tabs, channel rows, the switcher and the Agents panel): green
 `#3fb950` while warm (the next message is cheap; also an agent that never goes cold or has had no
-turn yet, and every idle agent with the cache warning off), faded green `#55935e` (`#6aa275`
-light) in its last 5 minutes, grey `#72727e` (`#7f7f8b` light) once cold. Idle shells have no
-cache and are grey. A channel row's idle dot is green if any agent in it is warm, else faded if
-one is cooling, else grey; the tooltips add "cache warm", "cache going cold soon" or "cache
-cold". The phone UI still shows idle green. Inter 13px UI, JetBrains Mono
+turn yet, and every idle agent with the cache warning off), faded green `#55935e` (`#4a8656`
+light) in its last 5 minutes, grey `#72727e` (`#7f7f8b` light) once cold or when its launch
+switched prompt caching off (`cache_ttl_min` null). Idle shells have no cache and are grey. A channel row's idle dot is green if any agent in it is warm, else faded if
+one is cooling, else grey (plain grey when it holds only shells); tooltips, and the tab and
+agent-row accessible names, add "cache warm", "cache going cold soon", "cache cold" or "prompt
+caching off". The phone UI still shows idle green. Inter 13px UI, JetBrains Mono
 13px terminal, no web font downloads. Radii 6/10px, hairline borders, 120–160ms motion,
 `prefers-reduced-motion` respected, inline SVG icons.
 
@@ -377,7 +378,7 @@ a light blue tint):
 settings…"; backends with `prefs.cache_warn` only): a switch "Warn when an agent's cache has likely
 expired" and the lifetime in minutes (0 for never, up to 1440) for Claude on a subscription
 (default 1 h), Claude on OpenRouter or an API key (5 min), Codex logged in with ChatGPT (0: OpenAI
-keeps these cached) and Codex on OpenRouter (10 min), each with its default and why under it. A Claude whose launch sets its own
+keeps these cached) and Codex on OpenRouter (30 min), each with its default and why under it. A Claude whose launch sets its own
 cache switch follows that instead (docs/PROTOCOL.md "Cold prompt cache"); the bar's tooltip names
 the lifetime that applies. Save sends only the fields edited in this dialog (compared with what
 it opened with, so another window's change to a field left alone stays); every window follows at

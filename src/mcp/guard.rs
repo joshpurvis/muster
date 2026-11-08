@@ -69,6 +69,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_depth: 3,
+            // Also stated in the spawn_session description (src/mcp/tools.rs) and docs/MCP.md.
             max_children_per_caller: 32,
             max_mcp_live_total: 32,
             send_per_window: 20,

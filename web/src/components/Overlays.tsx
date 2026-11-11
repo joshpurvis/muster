@@ -918,7 +918,7 @@ function RenameWindow() {
   }, []);
   if (!w) return null;
   return (
-    <Modal class="dialog confirm-dlg" label="Rename window">
+    <Modal class="dialog dlg-calm confirm-dlg" label="Rename window">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -971,7 +971,7 @@ function ShellDialog() {
   };
   const login = meta.value.login_shell || "your login shell";
   return (
-    <Modal class="dialog confirm-dlg" label="Shell for new terminals">
+    <Modal class="dialog dlg-calm confirm-dlg" label="Shell for new terminals">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1043,7 +1043,7 @@ function CacheSettingsDialog() {
     } else setBusy(false);
   };
   return (
-    <Modal class="dialog dialog-scroll cache-dlg" label="Cache warning">
+    <Modal class="dialog dialog-scroll dlg-calm cache-dlg" label="Cache warning">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1215,7 +1215,7 @@ function Confirm(
   // A stray Enter must not destroy anything: destructive confirms start on Cancel.
   useLayoutEffect(() => (props.danger ? cancel : ok).current?.focus(), []);
   return (
-    <Modal class="dialog confirm-dlg" label={props.title} describedBy="confirm-body">
+    <Modal class="dialog dlg-calm confirm-dlg" label={props.title} describedBy="confirm-body">
       <div class="dlg-head">
         <h2>{props.title}</h2>
       </div>
@@ -1273,7 +1273,7 @@ function Lifecycle({ restart }: { restart: boolean }) {
   };
   return (
     <Modal
-      class="dialog confirm-dlg"
+      class="dialog dlg-calm confirm-dlg"
       label={label}
       describedBy="lifecycle-body"
       onClose={() => {

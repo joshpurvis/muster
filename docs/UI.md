@@ -467,6 +467,20 @@ of the same kind arrives; the next waiting update shows meanwhile.
   running yet" (a reload would show the browser's own "can't reach 127.0.0.1" page instead).
 
 ### Overlays
+
+**Dialogs** share one calm layout (`web/src/components/DialogKit.tsx`): a small title (what it
+is for is read to screen readers, not printed under it, where a dialog has nothing more specific
+to say), the field you came to fill in first and large (no box until hovered or focused), then
+secondary settings as small pills in one row, each showing its current value (a pill that is a
+choice is a native select drawn over by the pill, so its list, keys and screen-reader name are the
+platform's; one that is on or off is a toggle; Permissions, Usage and the like open their detail
+under the row). Settings few people change sit behind **More options**, whose closed line
+summarises them ("Subscription · No autostart · Never sleeps"). Help that used to be a line under
+every field is a hover tip and the field's screen-reader description; warnings about risk
+(unattended use of a Claude subscription, OpenRouter billing, bypass and full access, destructive
+confirms) stay in view. One footer under a hairline: the Ctrl+Enter hint on the left where the
+dialog has it, then Cancel and one primary button.
+
 - **Jump** (Ctrl+Space or Ctrl+Shift+K anywhere, Ctrl+K outside terminals; Ctrl+Space again closes it): fuzzy search over every tab and
   session in **all windows**, and folders for "new tab here" (recent folders and known
   workspaces; choosing one opens a tab there with the last agent kind), and every named agent,
@@ -480,11 +494,15 @@ of the same kind arrives; the next waiting update shows meanwhile.
   stored in localStorage) makes it call `window.raise` instead, falling back to pulling when
   that returns `raised: false`. Raising doesn't select the tab over there (there is no RPC for
   that).
-- **New channel…** (Alt+Shift+N): opens a separate workspace. Folder (path input with `fs.complete`, defaults to the focused
-  tab's folder; recent folders as chips), launch choices (Claude · Codex · Shell · Empty;
-  remembers the last agent kind), worktree toggle (default **off**; disabled for a known non-git
-  folder), base branch (only when worktree is on), optional name (blank = auto), optional first
-  prompt (Claude and Codex), and the collapsed Permissions section from v0. Enter or
+- **New channel…** (Alt+Shift+N): opens a separate workspace. Folder first and large (path
+  input with `fs.complete`, defaults to the focused tab's folder; recent folders as small chips
+  under it), launch choices (Claude · Codex · Shell · Empty; remembers the last agent kind) with
+  the optional name beside them (blank = auto), an optional first prompt (Claude and Codex), then
+  pills: **Worktree** (default **off**; disabled for a known non-git folder, the tip says why;
+  when on, a "from current HEAD" base branch field joins the row), the Claude profile and
+  **Usage** (Claude only, see Claude profiles), and **Permissions** (reads "Permissions" at the
+  defaults, otherwise what differs, e.g. "Claude: bypass"; amber when more permissive, red with a
+  warning shield for full access or bypass; opens the two controls under the row). Enter or
   Ctrl+Enter creates. With worktree off, a folder where this window already has a channel with
   sessions joins it instead (the selected channel first, if several match): the dialog says so,
   the button reads **Add tab** (**Open channel** for Empty), and the new session, with the
@@ -507,15 +525,18 @@ renames their labels, and enables/disables them. Saved workspaces are not listed
 happen in the official Claude CLI, never in Muster. The dialog does not inspect authentication
 or settings files. Directory bindings are fixed; disabling does not stop running sessions.
 
-New channel shows a Claude profile selector for Claude only. Its initial choice is explicit
-**Default**, which preserves the ordinary inherited Claude environment, regardless of saved
-CLI workspace defaults. Choose a registered profile for that new session. New tabs
+New channel shows a Claude profile pill for Claude only. Its initial choice is explicit
+**Default** (the pill reads "Default profile"), which preserves the ordinary inherited Claude
+environment, regardless of saved CLI workspace defaults. With profiles registered, a suggestion
+to switch to the one with the most known room shows under the pills (**Use <name>** picks it and
+leaves focus on the pill), and the **Usage** pill opens each profile's capacity table (with the
+"keep" or "no suggestion" reason). Choose a registered profile for that new session. New tabs
 and splits opened directly from a Claude tab inherit that tab's selection, including Default.
 The tab tooltip identifies the profile; a named profile also appears in the optional status
 line. These are user labels for directories, not verified account identities.
 
-New Agent can pin a Claude profile. Edit Agent shows the fixed selection without allowing
-it to change, so its saved conversation never accidentally resumes under another profile.
+New Agent can pin a Claude profile (the same pills). Edit Agent shows the fixed selection,
+disabled, without allowing it to change (its tip says why), so its saved conversation never accidentally resumes under another profile.
 The account itself is verified with `/status` in Claude Code. Backend versions without
 profile support do not show these controls.
 
@@ -565,9 +586,14 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 
 **New / Edit schedule dialog** (header `⋯`, an agent's menu, the palette, a schedule's Edit…):
 
-- Agent (New only; Edit shows it as fixed text): Codex and OpenRouter agents first ("Best for
+- Layout: the Agent pill with the optional Name beside it, the prompt, When, then pills for If
+  missed, Conversation and Notify me and check chips for "Save replies to a note" and "Skip quiet
+  hours"; each pill's hover tip (and screen-reader description) says what its current choice
+  does. **More options** holds Then…, the daily cap and the time zone, its closed line
+  summarising them ("No follow-up · No daily cap · Europe/London").
+- Agent (New only; Edit shows it as a fixed chip): Codex and OpenRouter agents first ("Best for
   scheduled work"), then Claude subscription agents that accept the Schedule origin, then the
-  rest, greyed out and never selectable, with a hint to tick Schedule in Edit agent. The agent
+  rest, greyed out and never selectable, with a hint (the pill's tip) to tick Schedule in Edit agent. The agent
   passed in (an agent's New schedule…) is preselected if it can take scheduled work, else the
   first Codex or OpenRouter agent; a Claude subscription agent is never preselected for you. A
   Claude subscription agent shows the amber unattended-use warning and one line: its recurring
@@ -575,7 +601,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   that takes scheduled work, the field says so and offers **New agent…** (opens the New agent
   dialog on the Background worker template).
 - Prompt (monospace), with a hint: `{date}`, `{last_run}` and `{last_reply}` are filled in each
-  run. Name (optional; blank: the prompt's first line).
+  run. Name (optional; blank: the prompt's first line), beside the Agent pill.
 - When: Every 15 minutes, Every 30 minutes, Every hour (at minute :MM), Every day at HH:MM,
   Weekdays at HH:MM (`MM HH * * 1-5`), Once a week on a day at HH:MM, Once at a date and time
   (`datetime-local`, named "in <zone>": a wall-clock time sent as `{kind:"once", local}` and
@@ -592,10 +618,11 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 - If missed (Automatic · Run once when Muster is back · Skip; Automatic says what it does for
   this timing from the preview's `missed_default`), Conversation (Continue · Fresh each run:
   a new conversation each run, never while you're in a turn with it), Notify me (On failure ·
-  Always · Never), Also put the reply in (Nothing · A note: an existing note's title from a list,
-  or a new title, which makes that note), and "Skip runs in quiet hours (23:00–07:00)" (follows
-  the agent's default until changed).
-- More options (open in Edit when either is set): at most N runs a day (empty: no cap; Run now
+  Always · Never), "Save replies to a note" (an existing note's title from a list, or a new
+  title, which makes that note), and "Skip quiet hours (23:00–07:00)" (follows the agent's
+  default until changed).
+- More options (open in Edit when a cap, another time zone or a Then… step is set; a bad cap or
+  step shows its error under it while closed): Then… (below), at most N runs a day (empty: no cap; Run now
   doesn't count) and the time zone (this browser's by default; 09:00 stays 09:00 across clock
   changes).
 - Ctrl+Enter creates or saves; Esc closes. Create (`schedule.create`) opens the panel if it was
@@ -626,7 +653,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   Escape all return to it with everything typed so far kept.
 - In that mode the Agent list is of agents that accept triggered work (the Webhook origin), with
   the same grouping and hints ("tick Webhook (triggered) in Edit agent").
-- **Then…** (after "Also put the reply in"): "When it replies, ask [nobody · an agent]" with a
+- **Then…** (under More options): "When it replies, ask [nobody · an agent]" with a
   prompt box when an agent is picked, and "When it fails (blocked, refused, no reply, an error)"
   as Nothing more · Notify me · Ask an agent (an agent and a prompt). The hint explains `{reply}`
   and `{outcome}` and that each step is one hop further (4 at most), or, for Notify me, that a
@@ -638,15 +665,23 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 
 **New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
 
+- Layout: New shows the template chips, then Name (large) beside the kind switch, then the
+  persona; Edit shows the kind badge, name and home folder over Settings · Memory tabs. Then
+  pills: Model, Effort, the Claude profile and Usage (Claude only), Working repository (and its
+  checkout once a repository is chosen) and Permissions; then "Takes messages started by" as
+  three check chips; then **More options** (Provider, Autostart, Sleep when idle), whose closed
+  line summarises them.
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
-  `agent.templates`) with the template's one-line description; picking one fills every field
-  (a name you typed is kept). Name and kind (Claude · Codex).
-- **Provider** (shown when the backend supports it): Subscription · OpenRouter. Subscription is
+  `agent.templates`) with the chosen template's one-line description under it (every template's
+  as its hover tip); picking one fills every field (a name you typed is kept). Name and kind
+  (Claude · Codex).
+- **Provider** (shown when the backend supports it; under More options): Subscription · OpenRouter. Subscription is
   the CLI's own login, as before. Without `OPENROUTER_API_KEY` on the backend, OpenRouter is
   disabled and a hint under it says how to set it (`env OPENROUTER_API_KEY=… muster reload` from a
   shell that has the key; the key is read only when the backend starts; see docs/PROTOCOL.md
   "OpenRouter"). An agent already on OpenRouter keeps the choice and the hint says it won't start.
-  With OpenRouter chosen, an amber note says it bills per token to the OpenRouter key, not the
+  With OpenRouter chosen, an amber note (outside More options, as is the won't-start hint for
+  an agent on OpenRouter without the key) says it bills per token to the OpenRouter key, not the
   subscription, and that Claude Code is built for Anthropic's models (Codex: OpenAI's work
   best). Switching provider keeps the model only when the other list has it.
 - Model on OpenRouter replaces the Model dropdown: a search box over OpenRouter's models
@@ -659,15 +694,15 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   skips elements with `tabindex="-1"`, so Tab never walks the rows. Under it: how many models and where from, or, with no list, why it
   couldn't load and that Custom… still works. A Codex agent on OpenRouter has no Default: Create
   stays off until a model is chosen.
-- Model and Effort dropdowns for the agent's kind (`agent.models`): Default (the CLI's
-  choice), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
-  Custom…, which shows a text field for any other value. A saved value the list doesn't have
+- Model and Effort pills for the agent's kind (`agent.models`): Default (the CLI's
+  choice; the pill reads "Default"), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
+  Custom…, which shows a text field under the pills for any other value. A saved value the list doesn't have
   shows as Custom with its text, and Custom stays chosen (also with its field cleared) until
   another entry is picked. Effort lists the chosen model's levels where they differ from the
   CLI's; changing the model puts a listed level it doesn't offer back to Default (a custom one
   stays). Switching kind puts a model or level the new kind doesn't list back to Default. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook (triggered) checkboxes,
-  at least one), the Permissions section showing only the control for the agent's kind, and an
-  Autostart toggle.
+  at least one), the Permissions pill opening only the control for the agent's kind, and an
+  Autostart toggle (under More options).
 - Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are
   unclear about unattended use; scheduled work is safer on a Codex agent."
 - Edit shows the kind badge, name and home folder, and a second tab, **Memory**: the files in
@@ -696,7 +731,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
     Edit dialog and lose its unsaved Settings.
   - Files are named exactly as listed (an agent's `notes.md ` is not `notes.md`); a new note's
     name can't have invisible characters or spaces around a folder name.
-- **Sleep when idle** (off by default; under Autostart): after N minutes idle (5 to 10080, 60
+- **Sleep when idle** (off by default; under Autostart, in More options): after N minutes idle (5 to 10080, 60
   suggested) its process stops; its tab, scrollback and conversation stay, and the next message,
   schedule run, panel click or typing into its tab wakes it. The hint says a wake re-reads the
   whole conversation, at full cost once the prompt cache has expired, so sleeping after about the

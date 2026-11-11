@@ -291,7 +291,7 @@ export function PermissionsDialog(
     }
   };
   return (
-    <Modal class="dialog perm-dlg" label="Tab permissions">
+    <Modal class="dialog dlg-calm perm-dlg" label="Tab permissions">
       <form
         onSubmit={(e) => {
           e.preventDefault();

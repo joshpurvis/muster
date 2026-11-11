@@ -10,6 +10,8 @@ export interface PillOption {
   label: string;
   short?: string;
   disabled?: boolean;
+  /** Options with the same group, side by side, go in one `<optgroup>`. */
+  group?: string;
 }
 
 /** A native select drawn as a small pill: optional icon and key ("Model"), the chosen option's
@@ -18,7 +20,21 @@ export interface PillOption {
  * list and screen readers are the platform's own. `label` is the accessible name; `tip` the
  * hover text (pass the same words in `describedBy` for keyboard users). */
 export function PillSelect(
-  { icon, k, label, value, options, onChange, disabled, tip, describedBy, selectRef, id, class: c }: {
+  {
+    icon,
+    k,
+    label,
+    value,
+    options,
+    onChange,
+    disabled,
+    tip,
+    describedBy,
+    selectRef,
+    id,
+    class: c,
+    selectClass,
+  }: {
     icon?: ComponentChildren;
     k?: string;
     label: string;
@@ -31,9 +47,19 @@ export function PillSelect(
     selectRef?: Ref<HTMLSelectElement>;
     id?: string;
     class?: string;
+    selectClass?: string;
   },
 ) {
   const cur = options.find((o) => o.value === value);
+  const groups: { label?: string; items: PillOption[] }[] = [];
+  for (const o of options) {
+    const last = groups[groups.length - 1];
+    if (last && last.label === o.group) last.items.push(o);
+    else groups.push({ label: o.group, items: [o] });
+  }
+  const item = (o: PillOption) => (
+    <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>
+  );
   return (
     <span class={cx("pill pill-select", disabled && "disabled", c)} data-tip={tip}>
       {icon}
@@ -43,14 +69,18 @@ export function PillSelect(
       <select
         ref={selectRef}
         id={id}
-        class="pill-native"
+        class={cx("pill-native", selectClass)}
         value={value}
         disabled={disabled}
         aria-label={label}
         aria-describedby={describedBy}
         onChange={(e) => onChange(e.currentTarget.value)}
       >
-        {options.map((o) => <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>)}
+        {groups.map((g) =>
+          g.label === undefined
+            ? g.items.map(item)
+            : <optgroup key={g.label} label={g.label}>{g.items.map(item)}</optgroup>
+        )}
       </select>
     </span>
   );

@@ -2946,72 +2946,6 @@ textarea {
   line-height: 1.45;
 }
 
-.perm-section {
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  background: var(--bg-1);
-}
-
-.perm-disclosure {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 36px;
-  padding: 0 10px;
-  text-align: left;
-  border-radius: var(--r);
-}
-
-.perm-disclosure:hover {
-  background: var(--hover);
-}
-
-.perm-disclosure:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.perm-disc-chev {
-  display: inline-flex;
-  color: var(--text-faint);
-  transition: transform var(--t) var(--ease);
-}
-
-.perm-section.open .perm-disc-chev {
-  transform: rotate(90deg);
-}
-
-.perm-summary {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--text-faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
-}
-
-.perm-summary.elevated {
-  color: var(--st-attn);
-}
-
-.perm-summary.danger {
-  color: var(--st-error);
-}
-
-.perm-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 4px 12px 12px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-
 .dlg-foot-left {
   margin-right: auto;
 }
@@ -3677,7 +3611,6 @@ textarea {
 }
 
 /* Claude usage (src/usage.rs): only a current figure reads as a plain number. */
-.profile-field,
 .usage-hint {
   display: flex;
   flex-direction: column;
@@ -4330,6 +4263,47 @@ textarea {
   flex-direction: column;
   gap: 12px;
   padding-left: 18px;
+}
+
+/* The other dialogs: the same quiet head, labels and footer. */
+.dlg-calm .dlg-head .muted {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+.dlg-calm .field-label {
+  font-weight: 500;
+}
+
+.dlg-calm .cache-ttl-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
+}
+
+.dlg-calm .cache-ttl-row .field-hint {
+  grid-column: 1 / -1;
+  font-size: 11px;
+}
+
+.dlg-calm .cache-ttls {
+  gap: 14px;
+}
+
+.dlg-calm.profiles-dialog h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sch-dlg .sch-agent-fixed {
+  gap: 6px;
+  color: var(--text);
+}
+
+.sch-dlg .sch-claude-warn {
+  margin-top: 0;
 }
 
 @media (max-width: 600px) {
@@ -5587,27 +5561,6 @@ body.dragging .panel-view { pointer-events: none; }
 .sch-seg {
   align-self: flex-start;
   flex-wrap: wrap;
-}
-
-.sch-more-toggle {
-  align-self: flex-start;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 6px 0 2px;
-  border-radius: var(--r);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-.sch-more-toggle:hover {
-  color: var(--text);
-}
-
-.sch-more-toggle[aria-expanded="true"] .ap-chev {
-  transform: rotate(90deg);
 }
 
 .sch-more {

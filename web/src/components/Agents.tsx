@@ -1882,7 +1882,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   // This message carried another one's late reply.
   const carried = carriesLateReply(m);
   return (
-    <Modal class="dialog dialog-scroll msg-dlg" label={`Message ${m.id}`}>
+    <Modal class="dialog dialog-scroll dlg-calm msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
         <h2>
           {m.from} <span class="ap-arrow">→</span> {m.to}

@@ -84,7 +84,8 @@ import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, W
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, openMenuAt, type MenuItem } from "./Menu.tsx";
-import { IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
+import { IconAgents, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
+import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
 
@@ -725,12 +726,18 @@ export function ScheduleDialog(
   const [pBusy, setPBusy] = useState(false);
   /** Asks the backend again (after "Allow triggers" on the watched note). */
   const [pAgain, setPAgain] = useState(0);
-  const [more, setMore] = useState(() => kept?.more ?? (!!sched && (sched.daily_cap !== null || sched.tz !== browserZone())));
+  // Opens by itself when something in it is set: a cap, another time zone, follow-up steps.
+  const [more, setMore] = useState(() =>
+    kept?.more ??
+      (!!sched &&
+        (sched.daily_cap !== null || sched.tz !== browserZone() || !!d.then.okAgent || d.then.failMode !== "none"))
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const agentRef = useRef<HTMLSelectElement>(null);
   const seq = useRef(0);
+  const uid = useId();
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }));
   const setWhen = (p: Partial<WhenDraft>) => setD((x) => ({ ...x, when: { ...x.when, ...p } }));
   const setTrig = (p: Partial<TriggerDraft>) => setD((x) => ({ ...x, trig: { ...x.trig, ...p } }));
@@ -884,15 +891,16 @@ export function ScheduleDialog(
   const work = event ? "triggered" : "scheduled";
   const tick = event ? "Webhook (triggered)" : "Schedule";
 
+  /** Why some agents are greyed out (hover text and screen-reader description of the picker). */
+  const offHint = !wantedOff && choices.some((c) => c.group === "off")
+    ? `Greyed-out agents don't take ${work} work; tick ${tick} in their Edit agent to use them.`
+    : null;
   const agentField = editing
     ? (
-      <div class="field">
-        <span class="field-label">Agent</span>
-        <span class="sch-agent-fixed">
-          {chosen && <span class={cx("ap-kind", "ap-kind-" + chosen.kind)}>{KIND_LABEL[chosen.kind]}</span>}
-          {sched!.agent ?? "(removed)"}
-        </span>
-      </div>
+      <span class="pill sch-agent-fixed" aria-label={`Agent: ${sched!.agent ?? "(removed)"}`}>
+        {chosen && <span class={cx("ap-kind", "ap-kind-" + chosen.kind)}>{KIND_LABEL[chosen.kind]}</span>}
+        {sched!.agent ?? "(removed)"}
+      </span>
     )
     : eligible.length === 0
     ? (
@@ -911,44 +919,32 @@ export function ScheduleDialog(
       </div>
     )
     : (
-      <label class="field">
-        <span class="field-label">Agent</span>
-        <span class="select-wrap">
-          <select
-            ref={agentRef}
-            class="sch-agent"
-            value={d.agent}
-            onChange={(e) => set({ agent: e.currentTarget.value, quiet: null })}
-          >
-            {!d.agent && <option value="">Pick an agent</option>}
-            {(["unattended", "claude", "off"] as const).map((g) => {
-              const items = choices.filter((c) => c.group === g);
-              if (!items.length) return null;
-              return (
-                <optgroup key={g} label={groupLabel(g, work)}>
-                  {items.map((c) => (
-                    <option key={c.agent.id} value={c.agent.name} disabled={g === "off"}>
-                      {c.agent.name} ({KIND_LABEL[c.agent.kind]}
-                      {c.agent.provider === "openrouter" ? " on OpenRouter, pay per use" : ""})
-                    </option>
-                  ))}
-                </optgroup>
-              );
-            })}
-          </select>
-          <IconChevronDown size={14} />
-        </span>
-        {wantedOff && (
-          <span class="field-hint field-bad">
-            {wanted} doesn't take {work} work: tick {tick} in its Edit agent first.
-          </span>
-        )}
-        {!wantedOff && choices.some((c) => c.group === "off") && (
-          <span class="field-hint">
-            Greyed-out agents don't take {work} work; tick {tick} in their Edit agent to use them.
-          </span>
-        )}
-      </label>
+      <PillSelect
+        icon={<IconAgents size={13} />}
+        k="Agent"
+        label="Agent"
+        value={d.agent}
+        selectRef={agentRef}
+        selectClass="sch-agent"
+        class={d.agent ? "set" : undefined}
+        tip={offHint ?? undefined}
+        describedBy={offHint ? `${uid}-agent` : undefined}
+        onChange={(agent) => set({ agent, quiet: null })}
+        options={[
+          ...(!d.agent ? [{ value: "", label: "Pick an agent" }] : []),
+          ...(["unattended", "claude", "off"] as const).flatMap((g) =>
+            choices.filter((c) => c.group === g).map((c) => ({
+              value: c.agent.name,
+              label: `${c.agent.name} (${KIND_LABEL[c.agent.kind]}${
+                c.agent.provider === "openrouter" ? " on OpenRouter, pay per use" : ""
+              })`,
+              short: c.agent.name,
+              disabled: g === "off",
+              group: groupLabel(g, work),
+            }))
+          ),
+        ]}
+      />
     );
 
   const whenInputs = (() => {
@@ -1201,13 +1197,37 @@ export function ScheduleDialog(
   );
 
   const missedOptions = [
-    { v: "auto" as const, label: "Automatic" },
-    { v: "run_once" as const, label: "Run once when Muster is back" },
-    { v: "skip" as const, label: "Skip" },
+    { v: "auto" as const, label: "Automatic", short: "Automatic" },
+    { v: "run_once" as const, label: "Run once when Muster is back", short: "Run once" },
+    { v: "skip" as const, label: "Skip", short: "Skip" },
   ];
+  const missedHint = d.missed === "auto"
+    ? `Automatic: ${missedAutoText(preview?.missed_default)}`
+    : d.missed === "run_once"
+    ? "The newest missed run happens once, shortly after Muster is back."
+    : "Missed runs are recorded as skipped; it waits for its next time.";
+  const conversationHint = d.conversation === "fresh"
+    ? "Starts a new conversation each run, never while you're in a turn with it."
+    : "Each run joins the agent's current conversation.";
+  const notifyHint = d.notify === "on_failure"
+    ? "A notice and a desktop notification when a run is blocked, refused or gets no reply."
+    : d.notify === "always"
+    ? "A notice and a desktop notification after every run."
+    : "No notices; the history still shows every run.";
+  const moreSummary = [
+    phase2 && (d.then.okAgent
+      ? `Then ask ${d.then.okAgent}`
+      : d.then.failMode === "ask"
+      ? "On failure, ask an agent"
+      : d.then.failMode === "notify"
+      ? "On failure, notify me"
+      : "No follow-up"),
+    "cap" in cap && cap.cap ? `At most ${cap.cap} a day` : "No daily cap",
+    zone,
+  ].filter(Boolean).join(" · ");
 
   return (
-    <Modal class="dialog dialog-scroll sch-dlg" label={sched ? `Edit schedule ${sched.name}` : "New schedule"}>
+    <Modal class="dialog dialog-scroll dlg-calm sch-dlg" label={sched ? `Edit schedule ${sched.name}` : "New schedule"}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1222,7 +1242,7 @@ export function ScheduleDialog(
       >
         <div class="dlg-head">
           <h2>{sched ? sched.name : "New schedule"}</h2>
-          <span class="muted">
+          <span class={sched ? "muted" : "sr-only"}>
             {proposal
               ? `${sched!.made_by && sched!.made_by.approved_at === null ? `Proposed by ${sched!.made_by.agent}` : heldHeadline(sched!)}: saving keeps it waiting; it runs only once you approve it.`
               : sched
@@ -1233,7 +1253,28 @@ export function ScheduleDialog(
           </span>
         </div>
         <div class="dlg-body">
-          {agentField}
+          {!editing && eligible.length === 0
+            ? agentField
+            : (
+              <div class="kind-row">
+                {agentField}
+                <input
+                  class="pill pill-input sch-name-input"
+                  value={d.name}
+                  placeholder="Name (optional)"
+                  aria-label="Name (optional)"
+                  data-tip="Blank: the prompt's first line"
+                  spellcheck={false}
+                  onInput={(e) => set({ name: (e.target as HTMLInputElement).value })}
+                />
+              </div>
+            )}
+          {offHint && <span class="sr-only" id={`${uid}-agent`}>{offHint}</span>}
+          {wantedOff && (
+            <span class="field-hint field-bad">
+              {wanted} doesn't take {work} work: tick {tick} in its Edit agent first.
+            </span>
+          )}
           {subClaude && (
             <div class="sch-claude-warn" role="note">
               <span class="perm-warn agent-warn">
@@ -1244,17 +1285,18 @@ export function ScheduleDialog(
               </span>
             </div>
           )}
-          <label class="field">
-            <span class="field-label">Prompt</span>
+          <div class="persona-field">
             <textarea
               ref={promptRef}
-              class="sch-prompt"
+              class="quiet-input sch-prompt"
               rows={4}
               value={d.prompt}
-              placeholder="e.g. Summarise the pull requests opened since {last_run} and post it to your channel."
+              aria-label="Prompt"
+              aria-describedby={`${uid}-prompt`}
+              placeholder="Prompt, e.g. Summarise the pull requests opened since {last_run} and post it to your channel."
               onInput={(e) => set({ prompt: (e.target as HTMLTextAreaElement).value })}
             />
-            <span class="field-hint sch-hint-wrap">
+            <span class="field-hint sch-hint-wrap persona-hint" id={`${uid}-prompt`}>
               <span>
                 Filled in each run: <code>{"{date}"}</code> the run's date, <code>{"{last_run}"}</code>{" "}
                 when it last ran, <code>{"{last_reply}"}</code> the newest reply.
@@ -1270,30 +1312,20 @@ export function ScheduleDialog(
                 )}
               </span>
             </span>
-          </label>
-          <label class="field">
-            <span class="field-label">
-              Name <span class="muted">(optional)</span>
-            </span>
-            <input
-              class="sch-name-input"
-              value={d.name}
-              placeholder="From the prompt's first line"
-              spellcheck={false}
-              onInput={(e) => set({ name: (e.target as HTMLInputElement).value })}
-            />
-          </label>
+          </div>
           <div class="field">
-            {phase2
-              ? (
-                <Seg
-                  label="When"
-                  value={d.mode}
-                  options={[{ v: "time", label: "At a time" }, { v: "event", label: "When something happens" }]}
-                  onChange={(mode) => set({ mode, quiet: null })}
-                />
-              )
-              : <span class="field-label" id="sch-when-label">When</span>}
+            <div class="inline-field">
+              {phase2
+                ? (
+                  <Seg
+                    label="When"
+                    value={d.mode}
+                    options={[{ v: "time", label: "At a time" }, { v: "event", label: "When something happens" }]}
+                    onChange={(mode) => set({ mode, quiet: null })}
+                  />
+                )
+                : <span class="field-label" id="sch-when-label">When</span>}
+            </div>
             {event
               ? (
                 <div class="sch-when sch-trig" role="group" aria-label="What happens">
@@ -1396,179 +1428,151 @@ export function ScheduleDialog(
               </div>
             )
             : event && <span class="field-hint sch-trig-hint">{triggerHint[d.trig.kind]}</span>}
-          {!event && (
-            <div class="field">
-              <Seg
+          <div class="pills" role="group" aria-label="Run settings">
+            {!event && (
+              <PillSelect
+                k="If missed"
                 label="If missed (Muster was off or asleep)"
                 value={d.missed}
-                options={missedOptions}
-                onChange={(missed) => set({ missed })}
+                tip={missedHint}
+                describedBy={`${uid}-missed`}
+                onChange={(v) => set({ missed: v as Schedule["missed"] })}
+                options={missedOptions.map((o) => ({ value: o.v, label: o.label, short: o.short }))}
               />
-              <span class="field-hint">
-                {d.missed === "auto"
-                  ? `Automatic: ${missedAutoText(preview?.missed_default)}`
-                  : d.missed === "run_once"
-                  ? "The newest missed run happens once, shortly after Muster is back."
-                  : "Missed runs are recorded as skipped; it waits for its next time."}
+            )}
+            <PillSelect
+              k="Conversation"
+              label="Conversation"
+              value={d.conversation}
+              tip={conversationHint}
+              describedBy={`${uid}-conv`}
+              onChange={(v) => set({ conversation: v as Schedule["conversation"] })}
+              options={[{ value: "continue", label: "Continue" }, { value: "fresh", label: "Fresh each run" }]}
+            />
+            <PillSelect
+              k="Notify me"
+              label="Notify me"
+              value={d.notify}
+              tip={notifyHint}
+              describedBy={`${uid}-notify`}
+              onChange={(v) => set({ notify: v as Schedule["notify"] })}
+              options={[{ value: "on_failure", label: "On failure" }, { value: "always", label: "Always" }, {
+                value: "never",
+                label: "Never",
+              }]}
+            />
+            <label class={cx("check chip", d.noteOn && "on")} data-tip="Add each reply to a note, under a heading with its date">
+              <input
+                type="checkbox"
+                class="sch-note-toggle"
+                checked={d.noteOn}
+                onChange={(e) => set({ noteOn: (e.target as HTMLInputElement).checked })}
+              />
+              Save replies to a note
+            </label>
+            <label
+              class={cx("check chip", quietOn && "on")}
+              data-tip={subClaude ? "On by default for Claude subscription agents" : "Set the hours in Scheduling settings"}
+            >
+              <input
+                type="checkbox"
+                class="sch-quiet-toggle"
+                checked={quietOn}
+                aria-describedby={subClaude ? `${uid}-quiet` : undefined}
+                onChange={(e) => set({ quiet: (e.target as HTMLInputElement).checked })}
+              />
+              Skip quiet hours{quietHours && ` (${quietHours})`}
+            </label>
+          </div>
+          {!event && <span class="sr-only" id={`${uid}-missed`}>{missedHint}</span>}
+          <span class="sr-only" id={`${uid}-conv`}>{conversationHint}</span>
+          <span class="sr-only" id={`${uid}-notify`}>{notifyHint}</span>
+          {subClaude && <span class="sr-only" id={`${uid}-quiet`}>On by default for Claude subscription agents.</span>}
+          {d.noteOn && (
+            <div class="field pill-panel">
+              <input
+                class="sch-note"
+                list="sch-note-titles"
+                value={d.noteTitle}
+                aria-label="Note title"
+                placeholder="A note's title: pick one, or type a new one"
+                spellcheck={false}
+                onInput={(e) => set({ noteTitle: (e.target as HTMLInputElement).value })}
+              />
+              <datalist id="sch-note-titles">
+                {[...notes.value.values()].map((n) => <option key={n.id} value={n.title} />)}
+              </datalist>
+              <span class={cx("field-hint", noteBad && "field-bad")}>
+                {noteBad
+                  ? "Name the note."
+                  : note && "title" in note
+                  ? `A new note named ${note.title} is made. Each reply is added under a heading with its date.`
+                  : "Each reply is added to the end of the note under a heading with its date."}
               </span>
             </div>
           )}
-          <div class="field-row">
-            <div class="field">
-              <Seg
-                label="Conversation"
-                value={d.conversation}
-                options={[{ v: "continue", label: "Continue" }, { v: "fresh", label: "Fresh each run" }]}
-                onChange={(conversation) => set({ conversation })}
-              />
-              <span class="field-hint sch-hint-wrap">
-                <span>
-                  {d.conversation === "fresh"
-                    ? "Starts a new conversation each run, never while you're in a turn with it."
-                    : "Each run joins the agent's current conversation."}
-                </span>
-              </span>
-            </div>
-            <div class="field">
-              <Seg
-                label="Notify me"
-                value={d.notify}
-                options={[{ v: "on_failure", label: "On failure" }, { v: "always", label: "Always" }, {
-                  v: "never",
-                  label: "Never",
-                }]}
-                onChange={(notify) => set({ notify })}
-              />
-              <span class="field-hint sch-hint-wrap">
-                <span>
-                  {d.notify === "on_failure"
-                    ? "A notice and a desktop notification when a run is blocked, refused or gets no reply."
-                    : d.notify === "always"
-                    ? "A notice and a desktop notification after every run."
-                    : "No notices; the history still shows every run."}
-                </span>
-              </span>
-            </div>
-          </div>
-          <div class="field">
-            <Seg
-              label="Also put the reply in"
-              value={d.noteOn ? "note" : "none"}
-              options={[{ v: "none", label: "Nothing" }, { v: "note", label: "A note" }]}
-              onChange={(v) => set({ noteOn: v === "note" })}
-            />
-            {d.noteOn && (
-              <>
-                <input
-                  class="sch-note"
-                  list="sch-note-titles"
-                  value={d.noteTitle}
-                  aria-label="Note title"
-                  placeholder="A note's title: pick one, or type a new one"
-                  spellcheck={false}
-                  onInput={(e) => set({ noteTitle: (e.target as HTMLInputElement).value })}
-                />
-                <datalist id="sch-note-titles">
-                  {[...notes.value.values()].map((n) => <option key={n.id} value={n.title} />)}
-                </datalist>
-                <span class={cx("field-hint", noteBad && "field-bad")}>
-                  {noteBad
-                    ? "Name the note."
-                    : note && "title" in note
-                    ? `A new note named ${note.title} is made. Each reply is added under a heading with its date.`
-                    : "Each reply is added to the end of the note under a heading with its date."}
-                </span>
-              </>
-            )}
-          </div>
-          {phase2 && (
-            <fieldset class="field sch-then">
-              <legend class="field-label">Then…</legend>
-              <div class="sch-then-row">
-                <span class="sch-at">When it replies, ask</span>
-                {stepAgentSelect(d.then.okAgent, "Agent to ask when it replies", (okAgent) => setThen({ okAgent }), "nobody")}
-              </div>
-              {d.then.okAgent && (
-                <textarea
-                  class="sch-then-ok"
-                  rows={2}
-                  aria-label={`What to ask ${d.then.okAgent} when it replies`}
-                  value={d.then.okPrompt}
-                  placeholder="e.g. Here are the results: {reply} File a note with the likely causes."
-                  onInput={(e) => setThen({ okPrompt: (e.target as HTMLTextAreaElement).value })}
-                />
-              )}
-              <Seg
-                label="When it fails (blocked, refused, no reply, an error)"
-                value={d.then.failMode}
-                options={[{ v: "none", label: "Nothing more" }, { v: "notify", label: "Notify me" }, {
-                  v: "ask",
-                  label: "Ask an agent",
-                }]}
-                onChange={(failMode) => setThen({ failMode })}
-              />
-              {d.then.failMode === "ask" && (
-                <>
-                  <div class="sch-then-row">
-                    <span class="sch-at">Ask</span>
-                    {stepAgentSelect(d.then.failAgent, "Agent to ask when it fails", (failAgent) => setThen({ failAgent }))}
-                  </div>
+          <MoreOptions open={more} onToggle={setMore} summary={moreSummary}>
+            {phase2 && (
+              <fieldset class="field sch-then">
+                <legend class="field-label">Then…</legend>
+                <div class="sch-then-row">
+                  <span class="sch-at">When it replies, ask</span>
+                  {stepAgentSelect(d.then.okAgent, "Agent to ask when it replies", (okAgent) => setThen({ okAgent }), "nobody")}
+                </div>
+                {d.then.okAgent && (
                   <textarea
-                    class="sch-then-fail"
+                    class="sch-then-ok"
                     rows={2}
-                    aria-label="What to ask when it fails"
-                    value={d.then.failPrompt}
-                    placeholder="e.g. The nightly check ended {outcome}. Look into why."
-                    onInput={(e) => setThen({ failPrompt: (e.target as HTMLTextAreaElement).value })}
+                    aria-label={`What to ask ${d.then.okAgent} when it replies`}
+                    value={d.then.okPrompt}
+                    placeholder="e.g. Here are the results: {reply} File a note with the likely causes."
+                    onInput={(e) => setThen({ okPrompt: (e.target as HTMLTextAreaElement).value })}
                   />
-                </>
-              )}
-              <span class={cx("field-hint", "sch-hint-wrap", "error" in steps && "field-bad")}>
-                <span>
-                  {"error" in steps
-                    ? steps.error
-                    : d.then.failMode === "notify"
-                    ? "A failure also sends you a notice and a desktop notification, whatever Notify me says."
-                    : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 4 hops).</>}
-                </span>
-              </span>
-              {nestedSteps(sched?.then) > 0 && (
-                <span class="field-hint sch-hint-wrap">
+                )}
+                <Seg
+                  label="When it fails (blocked, refused, no reply, an error)"
+                  value={d.then.failMode}
+                  options={[{ v: "none", label: "Nothing more" }, { v: "notify", label: "Notify me" }, {
+                    v: "ask",
+                    label: "Ask an agent",
+                  }]}
+                  onChange={(failMode) => setThen({ failMode })}
+                />
+                {d.then.failMode === "ask" && (
+                  <>
+                    <div class="sch-then-row">
+                      <span class="sch-at">Ask</span>
+                      {stepAgentSelect(d.then.failAgent, "Agent to ask when it fails", (failAgent) => setThen({ failAgent }))}
+                    </div>
+                    <textarea
+                      class="sch-then-fail"
+                      rows={2}
+                      aria-label="What to ask when it fails"
+                      value={d.then.failPrompt}
+                      placeholder="e.g. The nightly check ended {outcome}. Look into why."
+                      onInput={(e) => setThen({ failPrompt: (e.target as HTMLTextAreaElement).value })}
+                    />
+                  </>
+                )}
+                <span class={cx("field-hint", "sch-hint-wrap", "error" in steps && "field-bad")}>
                   <span>
-                    Its steps go {nestedSteps(sched?.then) + 1} levels deep (made with the API); the deeper ones stay as
-                    they are while the step above them still asks an agent.
+                    {"error" in steps
+                      ? steps.error
+                      : d.then.failMode === "notify"
+                      ? "A failure also sends you a notice and a desktop notification, whatever Notify me says."
+                      : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 4 hops).</>}
                   </span>
                 </span>
-              )}
-            </fieldset>
-          )}
-          <label class="toggle">
-            <input
-              type="checkbox"
-              class="sch-quiet-toggle"
-              checked={quietOn}
-              onChange={(e) => set({ quiet: (e.target as HTMLInputElement).checked })}
-            />
-            <span class="toggle-track">
-              <span class="toggle-thumb" />
-            </span>
-            <span>
-              Skip runs in quiet hours{quietHours && ` (${quietHours})`}{" "}
-              <span class="muted">{subClaude ? "(on by default for Claude subscription agents)" : ""}</span>
-            </span>
-          </label>
-          <button
-            type="button"
-            class="sch-more-toggle"
-            aria-expanded={more}
-            onClick={() => setMore(!more)}
-          >
-            <span class="ap-chev" aria-hidden="true">
-              <IconChevron size={11} />
-            </span>
-            More options
-          </button>
-          {more && (
+                {nestedSteps(sched?.then) > 0 && (
+                  <span class="field-hint sch-hint-wrap">
+                    <span>
+                      Its steps go {nestedSteps(sched?.then) + 1} levels deep (made with the API); the deeper ones stay as
+                      they are while the step above them still asks an agent.
+                    </span>
+                  </span>
+                )}
+              </fieldset>
+            )}
             <div class="field-row sch-more">
               <label class="field">
                 <span class="field-label">At most this many runs a day</span>
@@ -1596,7 +1600,9 @@ export function ScheduleDialog(
                 <span class="field-hint">Times are read here, so 09:00 stays 09:00 when the clocks change.</span>
               </label>
             </div>
-          )}
+          </MoreOptions>
+          {!more && "error" in steps && <span class="field-hint field-bad">{steps.error}</span>}
+          {!more && "error" in cap && <span class="field-hint field-bad">{cap.error}</span>}
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">
@@ -1701,7 +1707,7 @@ export function ScheduleSettingsDialog({ Modal, close, back = false }: { Modal: 
     }
   };
   return (
-    <Modal class="dialog dialog-scroll sch-settings-dlg" label="Scheduling settings" onClose={close}>
+    <Modal class="dialog dialog-scroll dlg-calm sch-settings-dlg" label="Scheduling settings" onClose={close}>
       <form
         onSubmit={(e) => {
           e.preventDefault();

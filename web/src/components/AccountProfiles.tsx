@@ -365,7 +365,7 @@ export function AccountProfilesDialog({ Modal, close }: { Modal: ModalT; close: 
     }
   };
   return (
-    <Modal class="dialog dialog-scroll profiles-dialog" label="Claude profiles">
+    <Modal class="dialog dialog-scroll dlg-calm profiles-dialog" label="Claude profiles">
       <div class="dlg-head">
         <h2>Claude profiles</h2>
         <span class="muted">

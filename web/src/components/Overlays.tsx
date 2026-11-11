@@ -706,6 +706,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
               describedBy={`${id}-wt`}
               onChange={setWorktree}
             />
+            {notGit && <span class="pill-note">Not a git repository</span>}
             {wt && (
               <input
                 class="pill pill-input"

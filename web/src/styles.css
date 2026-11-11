@@ -4073,6 +4073,16 @@ textarea {
   color: var(--text-faint);
 }
 
+/* A short visible note beside a pill (a disabled pill's reason, a billing cue). */
+.pill-note {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.sch-agent-fixed .pill-note {
+  color: var(--warn-text);
+}
+
 /* What a pill opens, under the row. */
 .pill-panel {
   padding: 12px;

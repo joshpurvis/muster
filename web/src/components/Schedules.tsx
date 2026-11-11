@@ -898,9 +898,13 @@ export function ScheduleDialog(
     : null;
   const agentField = editing
     ? (
-      <span class="pill sch-agent-fixed" aria-label={`Agent: ${sched!.agent ?? "(removed)"}`}>
+      <span
+        class="pill sch-agent-fixed"
+        aria-label={`Agent: ${sched!.agent ?? "(removed)"}${chosen?.provider === "openrouter" ? ", on OpenRouter, pay per use" : ""}`}
+      >
         {chosen && <span class={cx("ap-kind", "ap-kind-" + chosen.kind)}>{KIND_LABEL[chosen.kind]}</span>}
         {sched!.agent ?? "(removed)"}
+        {chosen?.provider === "openrouter" && <span class="pill-note">OpenRouter, pay per use</span>}
       </span>
     )
     : eligible.length === 0

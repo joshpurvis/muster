@@ -1189,6 +1189,11 @@ export function AgentDialog(
               controls={`${id}-perms`}
             />
           </div>
+          {editing && d.kind === "claude" && (
+            <span class="field-hint">
+              The profile stays fixed: it goes with this agent's conversation. Create a new agent to use another.
+            </span>
+          )}
           <span class="sr-only" id={`${id}-default`}>Default is the CLI's own choice.</span>
           <span class="sr-only" id={`${id}-repo`}>
             Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.

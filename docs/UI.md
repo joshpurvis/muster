@@ -499,7 +499,7 @@ dialog has it, then Cancel and one primary button.
   input with `fs.complete`, defaults to the focused tab's folder; recent folders as small chips
   under it), launch choices (Claude · Codex · Shell · Empty; remembers the last agent kind) with
   the optional name beside them (blank = auto), an optional first prompt (Claude and Codex), then
-  pills: **Worktree** (default **off**; disabled for a known non-git folder, the tip says why;
+  pills: **Worktree** (default **off**; disabled for a known non-git folder, with "Not a git repository" beside it;
   when on, a "from current HEAD" base branch field joins the row), the Claude profile and
   **Usage** (Claude only, see Claude profiles), and **Permissions** (reads "Permissions" at the
   defaults, otherwise what differs, e.g. "Claude: bypass"; amber when more permissive, red with a
@@ -537,7 +537,7 @@ The tab tooltip identifies the profile; a named profile also appears in the opti
 line. These are user labels for directories, not verified account identities.
 
 New Agent can pin a Claude profile (the same pills). Edit Agent shows the fixed selection,
-disabled, without allowing it to change (its tip says why), so its saved conversation never accidentally resumes under another profile.
+disabled, without allowing it to change (a line under the pills says why), so its saved conversation never accidentally resumes under another profile.
 The account itself is verified with `/status` in Claude Code. Backend versions without
 profile support do not show these controls.
 

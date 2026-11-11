@@ -766,6 +766,13 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
 /** "Notes…": every note, open or closed, newest first. Enter opens one here, Shift+Delete asks to
  * delete it, Ctrl+Enter makes a new note (named by the filter text, if any). */
 function NotesDialog() {
+  // Opened from the sidebar's Notes row: Esc goes back there, not to the terminal, so arrow keys
+  // keep moving through the sidebar. Opening a note still focuses its editor.
+  const [opener] = useState(() => {
+    const el = document.activeElement as HTMLElement | null;
+    return el?.closest(".channels-panel") ? el : null;
+  });
+  const cancel = opener ? () => { overlay.value = null; opener.focus(); } : undefined;
   const [q, setQ] = useState("");
   const [sel, setSel] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -819,7 +826,7 @@ function NotesDialog() {
   };
 
   return (
-    <Modal class="switcher notes-list" label="Notes">
+    <Modal class="switcher notes-list" label="Notes" onClose={cancel}>
       <div class="sw-input-row">
         <span class="sw-mode">Notes</span>
         <input

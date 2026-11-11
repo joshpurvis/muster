@@ -36,6 +36,10 @@ channels form one flat list in their saved order, with no project or account hea
 saved grouping and collapse settings are ignored). Right-click the Channels heading, a row, or
 empty space for Hide channels (collapse this section) or Hide sidebar (hide the entire dock).
 Channels that share a name show their branch, or else their folder, under it.
+Below the channels, a **Notes** row (with the number of notes) opens the notes list described
+under "Notes": every note, type to filter, Enter opens it. Its menu has New note and, when the
+window still has the old Notes workspace (tabs of notes that had no channel when channels came
+in), Show unfiled note tabs.
 
 Select a channel to restore its tiles, tab order, active tabs, focused group and zoom. Double-click
 its name to rename it. Its menu also offers New tab, New note, Permissions, Copy folder path,
@@ -221,7 +225,7 @@ Alt+[ / ] select it. Agents read and write it through MCP (`note_read`, `note_ap
 docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
 
 - **Opening**: "New note" in the palette or in a strip's `▾` menu (a tab in that group, the
-  keyboard in its editor). "Notes…" (palette, `▾`, a note tab's menu) lists every note, open or
+  keyboard in its editor). "Notes…" (the sidebar's Notes row, palette, `▾`, a note tab's menu) lists every note, open or
   closed, newest first, with where it is (open here / in window N / closed), its first line, who
   edited it last and when: type to find one by its name or text, Enter opens it here (from
   closed, or pulled from another window), Ctrl+Enter makes a new note named after what was typed,

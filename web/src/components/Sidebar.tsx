@@ -11,7 +11,8 @@ import * as A from "../actions.ts";
 import { sidebarRatio } from "../layout/channels.ts";
 import { allSessions } from "../layout/tree.ts";
 import { drag } from "../layout/dnd.tsx";
-import { IconAgents, IconChannels, IconChevron, IconMore, IconPlus } from "../icons.tsx";
+import { IconAgents, IconChannels, IconChevron, IconMore, IconNote, IconPlus } from "../icons.tsx";
+import { notes, notesSupported } from "../notes.ts";
 import { cx, tildify } from "../util.ts";
 import { InlineEdit, StateDot } from "./common.tsx";
 import { contextMenu, openMenuAt, type MenuItem } from "./Menu.tsx";
@@ -91,7 +92,7 @@ function ChannelsPanel() {
       <div class="ap-head">
         <button type="button" class="sidebar-heading" aria-expanded={open} onClick={A.toggleChannelsPanel}>
           <IconChevron size={12} class={open ? "open" : ""} /><IconChannels size={14} /><span>Channels</span>
-          <span class="ap-count">{list.length + (fallback ? 1 : 0)}</span>
+          <span class="ap-count">{list.length}</span>
         </button>
         <button type="button" class="ap-icon-btn" aria-label="New channel" data-tip="New channel" data-keys="Alt+Shift+N"
           onClick={() => A.newTabDialog()}><IconPlus size={13} /></button>
@@ -105,20 +106,22 @@ function ChannelsPanel() {
           Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))]?.focus();
       }}>
         {list.map((c) => <ChannelRow key={c.id} channel={c} context={qualifier(c, list)} />)}
-        {fallback && <button type="button" class={cx("channel-select channel-fallback", activeChannelId.value === 0 && "active")}
-          {...contextMenu(() => [
-            { label: "New note", run: () => { A.openChannel(0, false); A.newNote(); } },
-            { label: "All notes…", run: A.openNotesList },
-            "sep",
-            ...channelViewItems(),
-          ])}
-          aria-current={activeChannelId.value === 0 ? "page" : undefined} onClick={() => A.openChannel(0)}>
-          <IconChannels size={13} /><span>Notes</span><span class="channel-count">{allSessions(fallback.root).length}</span>
-        </button>}
-        {!list.length && !fallback && <div class="ap-empty">
+        {!list.length && <div class="ap-empty">
           Keep a project's terminals, notes and panels together.
           <button type="button" class="side-create" onClick={() => A.newTabDialog()}><IconPlus size={12} /> New channel</button>
         </div>}
+        {/* Opens the notes list (every note, newest first, type to filter), not the old Notes
+            workspace, whose tabs only held notes that had no channel when channels came in. */}
+        {notesSupported.value && <button type="button" class={cx("channel-select channel-fallback", activeChannelId.value === 0 && "active")}
+          {...contextMenu(() => [
+            { label: "New note", run: () => A.newNote() },
+            ...(fallback ? [{ label: "Show unfiled note tabs", run: () => A.openChannel(0) }] : []),
+            "sep",
+            ...channelViewItems(),
+          ])}
+          aria-haspopup="dialog" data-tip="Find and open any note" onClick={A.openNotesList}>
+          <IconNote size={13} /><span>Notes</span><span class="channel-count">{notes.value.size}</span>
+        </button>}
       </nav>}
     </section>
   );

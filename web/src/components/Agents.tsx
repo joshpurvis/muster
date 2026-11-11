@@ -987,29 +987,38 @@ export function AgentDialog(
           <div class="dlg-body" hidden={tab !== "settings"}>
             <div class="field">
               <label class="field-label" for="agent-repository">Working repository</label>
-              <select id="agent-repository" value={d.working_location.mode === "home" ? "" : String(d.working_location.workspace_id)}
-                onChange={(e) => { set({ working_location: e.currentTarget.value ? { mode: "worktree", workspace_id: Number(e.currentTarget.value) } : { mode: "home" } }); setConversation(""); }}>
-                <option value="">Agent home (no repository)</option>
-                {workspaces.value.filter(w => w.is_git).map(w => <option key={w.id} value={w.id}>{w.name} — {w.path}</option>)}
-              </select>
+              <span class="select-wrap">
+                <select id="agent-repository" value={d.working_location.mode === "home" ? "" : String(d.working_location.workspace_id)}
+                  onChange={(e) => { set({ working_location: e.currentTarget.value ? { mode: "worktree", workspace_id: Number(e.currentTarget.value) } : { mode: "home" } }); setConversation(""); }}>
+                  <option value="">Agent home (no repository)</option>
+                  {workspaces.value.filter(w => w.is_git).map(w => <option key={w.id} value={w.id}>{w.name} — {w.path}</option>)}
+                </select>
+                <IconChevronDown size={14} />
+              </span>
               <span class="field-hint">Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.</span>
             </div>
             {d.working_location.mode !== "home" && <div class="field">
               <label class="field-label" for="agent-checkout">Working checkout</label>
-              <select id="agent-checkout" value={d.working_location.mode}
-                onChange={(e) => { if (d.working_location.mode !== "home") { set({ working_location: { ...d.working_location, mode: e.currentTarget.value as "worktree" | "main" } }); setConversation(""); } }}>
-                <option value="worktree">Dedicated worktree (recommended)</option>
-                <option value="main">Repository's main checkout</option>
-              </select>
+              <span class="select-wrap">
+                <select id="agent-checkout" value={d.working_location.mode}
+                  onChange={(e) => { if (d.working_location.mode !== "home") { set({ working_location: { ...d.working_location, mode: e.currentTarget.value as "worktree" | "main" } }); setConversation(""); } }}>
+                  <option value="worktree">Dedicated worktree (recommended)</option>
+                  <option value="main">Repository's main checkout</option>
+                </select>
+                <IconChevronDown size={14} />
+              </span>
               <span class="field-hint">{d.working_location.mode === "worktree" ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts." : "Shares files, branch and uncommitted changes with anyone using this checkout."}</span>
             </div>}
             {locationChanged && <div class="field">
               <label class="field-label" for="agent-location-conversation">Conversation at next start</label>
-              <select id="agent-location-conversation" required value={conversation} onChange={(e) => setConversation(e.currentTarget.value as "" | "keep" | "reset")}>
-                <option value="">Choose how to continue</option>
-                <option value="keep">Keep the existing conversation</option>
-                <option value="reset">Start a new conversation</option>
-              </select>
+              <span class="select-wrap">
+                <select id="agent-location-conversation" required value={conversation} onChange={(e) => setConversation(e.currentTarget.value as "" | "keep" | "reset")}>
+                  <option value="">Choose how to continue</option>
+                  <option value="keep">Keep the existing conversation</option>
+                  <option value="reset">Start a new conversation</option>
+                </select>
+                <IconChevronDown size={14} />
+              </span>
               <span class="field-hint">Saving does not interrupt the running agent. Its next start uses this location; persistent memory is kept either way.</span>
             </div>}
             {agent?.working_directory && <p class="field-hint">Current working directory: <code>{agent.working_directory}</code>{agent.reset_on_next_start ? " · New conversation at next start" : ""}</p>}

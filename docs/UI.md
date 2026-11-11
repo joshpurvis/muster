@@ -476,7 +476,8 @@ choice is a native select drawn over by the pill, so its list, keys and screen-r
 platform's; one that is on or off is a toggle; Permissions, Usage and the like open their detail
 under the row). Settings few people change sit behind **More options**, whose closed line
 summarises them ("Subscription · No autostart · Never sleeps"). Help that used to be a line under
-every field is a hover tip and the field's screen-reader description; warnings about risk
+every field is a tip (on hover, and in a dialog also when the keyboard reaches the control, until
+the next key) and the field's screen-reader description; warnings about risk
 (unattended use of a Claude subscription, OpenRouter billing, bypass and full access, destructive
 confirms) stay in view. One footer under a hairline: the Ctrl+Enter hint on the left where the
 dialog has it, then Cancel and one primary button.

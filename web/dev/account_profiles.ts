@@ -114,6 +114,22 @@ try {
     await b.eval(`document.querySelector('[aria-label="New channel"] select').value === 'default'`),
     "A suggestion must never change the selection by itself",
   );
+  // The capacity table opens from the Usage pill (closed by default).
+  check(
+    await b.eval(`!document.querySelector('[aria-label="New channel"] .usage-table')`),
+    "The usage table starts closed",
+  );
+  await clickText('[aria-label="New channel"] button.pill-toggle', "Usage");
+  await b.wait(`!!document.querySelector('[aria-label="New channel"] .usage-table')`);
+  check(
+    await b.eval(`[...document.querySelectorAll('[aria-label="New channel"] button.pill-toggle')]
+      .find((e) => e.textContent.trim() === 'Usage')?.getAttribute('aria-pressed') === 'true'`),
+    "The Usage pill reads as pressed while the table shows",
+  );
+  check(
+    await b.eval(`/Work/.test(document.querySelector('[aria-label="New channel"] .usage-table').innerText)`),
+    "The usage table lists the profiles",
+  );
   await b.sleep(150);
   await b.shot(`${base}/usage-new-tab.png`);
   await clickText('[aria-label="New channel"] button', "Use Work");

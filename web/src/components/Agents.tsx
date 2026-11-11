@@ -1387,6 +1387,11 @@ export function AgentDialog(
               )}
             </div>
           </MoreOptions>
+          {!more && sleepMin === null && (
+            <span class="field-hint field-bad">
+              Sleep when idle: {SLEEP_AFTER_MIN} to {SLEEP_AFTER_MAX} minutes (under More options).
+            </span>
+          )}
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">

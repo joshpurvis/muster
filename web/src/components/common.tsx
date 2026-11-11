@@ -58,26 +58,49 @@ export function TooltipHost() {
       }
       timer = setTimeout(() => {
         if (!t.isConnected || current !== t || document.body.classList.contains("dragging")) return;
-        const r = t.getBoundingClientRect();
-        const below = r.top < 60;
-        setTip({
-          text: t.dataset.tip!,
-          keys: t.dataset.keys,
-          x: r.left + r.width / 2,
-          y: below ? r.bottom + 6 : r.top - 6,
-          below,
-        });
+        show(t);
       }, tipDelay(t));
+    };
+    const show = (t: HTMLElement) => {
+      const r = t.getBoundingClientRect();
+      const below = r.top < 60;
+      setTip({
+        text: t.dataset.tip!,
+        keys: t.dataset.keys,
+        x: r.left + r.width / 2,
+        y: below ? r.bottom + 6 : r.top - 6,
+        below,
+      });
+    };
+    // In dialogs, help that moved into a tip also shows when the keyboard reaches its control
+    // (the pills' hints): it goes with the next key, or when focus leaves.
+    const focus = (e: FocusEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (!el?.matches?.(":focus-visible") || !el.closest(".modal")) return;
+      const t = el.closest("[data-tip]") as HTMLElement | null;
+      if (!t) return;
+      clearTimeout(timer);
+      current = t;
+      timer = setTimeout(() => {
+        if (t.isConnected && current === t && t.contains(document.activeElement)) show(t);
+      }, 300);
+    };
+    const unfocus = (e: FocusEvent) => {
+      if (current && !current.contains(e.relatedTarget as Node | null)) hide();
     };
     addEventListener("pointerover", over);
     addEventListener("pointerdown", hide, true);
     addEventListener("keydown", hide, true);
     addEventListener("blur", hide);
+    addEventListener("focusin", focus);
+    addEventListener("focusout", unfocus);
     return () => {
       removeEventListener("pointerover", over);
       removeEventListener("pointerdown", hide, true);
       removeEventListener("keydown", hide, true);
       removeEventListener("blur", hide);
+      removeEventListener("focusin", focus);
+      removeEventListener("focusout", unfocus);
     };
   }, []);
 

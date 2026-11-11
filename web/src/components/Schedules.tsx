@@ -38,6 +38,7 @@ import {
   noteChoice,
   OUTCOME_LABEL,
   outcomeTone,
+  capSummary,
   parseCap,
   parseTime,
   PRESETS,
@@ -1222,11 +1223,7 @@ export function ScheduleDialog(
       : d.then.failMode === "notify"
       ? "On failure, notify me"
       : "No follow-up"),
-    "cap" in cap && cap.cap
-      ? `At most ${cap.cap} a day`
-      : event && !editing
-      ? "At most 10 a day (a trigger's default)"
-      : "No daily cap",
+    capSummary(cap, event, editing),
     zone,
   ].filter(Boolean).join(" · ");
 

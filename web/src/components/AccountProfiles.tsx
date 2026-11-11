@@ -139,7 +139,7 @@ export function ProfilePill({ value, onChange, disabled = false, tip, selectRef,
   value: ProfileChoice | undefined;
   onChange: (choice: ProfileChoice | undefined) => void;
   disabled?: boolean;
-  /** Hover text; also read to screen readers. */
+  /** More hover text after the verification hint; also read to screen readers. */
   tip?: string;
   selectRef?: { current: HTMLSelectElement | null };
   usage?: boolean;
@@ -149,7 +149,8 @@ export function ProfilePill({ value, onChange, disabled = false, tip, selectRef,
   if (!accountProfilesSupported.value) return null;
   const profiles = accountProfiles.value;
   const missing = typeof value === "number" && !profiles.some((p) => p.id === value);
-  const hint = tip ?? "Verify your account with /status inside Claude Code.";
+  // The fixed-profile note (Edit agent) comes after the verification hint, never instead of it.
+  const hint = ["Verify your account with /status inside Claude Code.", tip].filter(Boolean).join(" ");
   return (
     <>
       <PillSelect

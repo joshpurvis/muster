@@ -1,7 +1,7 @@
 // Modal overlays: Jump / command palette, New tab, Rename window, shortcuts sheet, confirm
 // dialog, and the agent dialogs (Agents.tsx). Plus toasts.
 import type { ComponentChildren } from "preact";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   activeChannelId,
   agentBySession,
@@ -39,10 +39,11 @@ import type { CacheTtl, NoteInfo } from "../types.ts";
 import { CACHE_TTL_MAX, CACHE_TTL_ROWS, DEFAULT_CACHE_TTL, parseTtl, ttlText } from "../cache.ts";
 import type { Permissions, ProfileChoice, SessionKind } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORITY } from "../types.ts";
-import { PermissionsDialog, PermissionsSection } from "./Permissions.tsx";
+import { PermissionsDialog, PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
+import { PillToggle } from "./DialogKit.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
-import { AccountProfilesDialog, ProfileSelect } from "./AccountProfiles.tsx";
+import { AccountProfilesDialog, ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
 import { runningText } from "../updates.ts";
 import { agentStatus } from "../agents.ts";
@@ -569,11 +570,16 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const [permissions, setPermissions] = useState<Permissions>({ ...DEFAULT_PERMISSIONS });
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [permsOpen, setPermsOpen] = useState(false);
+  const [usage, setUsage] = useState(false);
   const folderRef = useRef<HTMLInputElement>(null);
+  const profileRef = useRef<HTMLSelectElement>(null);
+  const id = useId();
 
   const expand = (p: string) => (home ? p.trim().replace(/^~(?=\/|$)/, home) : p.trim()).replace(/\/+$/, "");
   const known = workspaces.value.find((w) => w.path.replace(/\/+$/, "") === expand(folder));
   const notGit = !!known && !known.is_git;
+  const wt = worktree && !notGit;
   const recents = prefs.value.recentFolders.filter((f) => f !== expand(folder)).slice(0, 5);
   const canCreate = !!folder.trim() && !busy;
   // Mirrors A.createTab: a channel already in this folder gets the new tab instead.
@@ -586,7 +592,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   const differs = inFolder && !joins
     ? folderChannel(windowChannels.value, known.path, { ...join, anyPermissions: true }) : undefined;
   const separately = notGit ? "Give it a different name for a separate channel."
-    : "Give it a different name, or turn on Git worktree, for a separate channel.";
+    : "Give it a different name, or turn on Worktree, for a separate channel.";
 
   const create = async () => {
     if (!canCreate) return;
@@ -612,7 +618,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
   };
 
   return (
-    <Modal class="dialog dialog-scroll" label="New channel">
+    <Modal class="dialog dialog-scroll dlg-calm new-channel-dlg" label="New channel" describedBy={`${id}-about`}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -627,22 +633,20 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
       >
         <div class="dlg-head">
           <h2>New channel</h2>
-          <span class="muted">
-            A project folder with its own tabs and tiled workspace.
-          </span>
+          <span id={`${id}-about`} class="sr-only">A project folder with its own tabs and tiled workspace.</span>
         </div>
         <div class="dlg-body">
-          <label class="field">
-            <span class="field-label">Folder</span>
+          <div class="hero-field">
             <FolderInput value={folder} onChange={setFolder} autoFocus inputRef={folderRef} />
             {recents.length > 0 && (
-              <span class="recent-folders">
+              <span class="recent-folders" role="group" aria-label="Recent folders">
                 {recents.map((f) => (
                   <button
                     type="button"
                     key={f}
                     class="recent-folder"
                     data-tip={tildify(f, home)}
+                    aria-label={tildify(f, home)}
                     onClick={() => {
                       setFolder(tildify(f, home));
                       folderRef.current?.focus();
@@ -653,10 +657,9 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
                 ))}
               </span>
             )}
-          </label>
-          <div class="field">
-            <span class="field-label">Start with</span>
-            <div class="seg seg-lg" role="radiogroup" aria-label="Start with">
+          </div>
+          <div class="kind-row">
+            <div class="seg seg-kind" role="radiogroup" aria-label="Start with">
               {AGENTS.map((a) => (
                 <button
                   type="button"
@@ -673,76 +676,80 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
                 Empty
               </button>
             </div>
+            <input
+              class="pill pill-input"
+              value={name}
+              placeholder="Name (optional)"
+              aria-label="Name (optional)"
+              data-tip="Blank: the project folder's name"
+              spellcheck={false}
+              onInput={(e) => setName((e.target as HTMLInputElement).value)}
+            />
           </div>
-          {agent === "claude" && <ProfileSelect value={profile} onChange={setProfile} />}
+          {(agent === "claude" || agent === "codex") && (
+            <textarea
+              class="quiet-input prompt-input"
+              rows={3}
+              value={prompt}
+              aria-label="First prompt (optional)"
+              placeholder="What should the agent do? (optional)"
+              onInput={(e) => setPrompt((e.target as HTMLTextAreaElement).value)}
+            />
+          )}
+          <div class="pills" role="group" aria-label="Channel options">
+            <PillToggle
+              icon={<IconBranch size={13} />}
+              label="Worktree"
+              on={wt}
+              disabled={notGit}
+              tip={notGit ? "This folder isn't a git repository" : "An isolated checkout on its own branch"}
+              describedBy={`${id}-wt`}
+              onChange={setWorktree}
+            />
+            {notGit && <span class="pill-note">Not a git repository</span>}
+            {wt && (
+              <input
+                class="pill pill-input"
+                value={base}
+                placeholder="from current HEAD"
+                aria-label="Base branch (optional)"
+                spellcheck={false}
+                onInput={(e) => setBase((e.target as HTMLInputElement).value)}
+              />
+            )}
+            {agent === "claude" && (
+              <ProfilePill value={profile} onChange={setProfile} selectRef={profileRef} usage={usage} onUsage={setUsage} />
+            )}
+            <PermissionsPill value={permissions} open={permsOpen} onToggle={setPermsOpen} controls={`${id}-perms`} />
+          </div>
+          <span id={`${id}-wt`} class="sr-only">
+            {notGit ? "This folder isn't a git repository." : "An isolated checkout on its own branch."}
+          </span>
+          {agent === "claude" && (
+            <ProfileUsage
+              value={profile}
+              table={usage}
+              onUse={(choice) => {
+                setProfile(choice);
+                // The button is about to disappear; keep focus on the choice it made.
+                profileRef.current?.focus();
+              }}
+            />
+          )}
+          {permsOpen && <PermissionsPanel id={`${id}-perms`} value={permissions} onChange={setPermissions} />}
           {joins && (
-            <div class="field-hint" role="status">
+            <div class="dlg-note" role="status">
               {agent === "none" ? `Opens the “${joins.name}” channel, which already uses this folder.`
                 : `Opens as a new tab in the “${joins.name}” channel, which already uses this folder.`}{" "}
               {separately}
             </div>
           )}
           {differs && (
-            <div class="field-hint" role="status">
+            <div class="dlg-note" role="status">
               Creates a separate channel: the “{differs.name}” channel in this folder has different
-              permissions. Match them below to add a tab there instead.
+              permissions. Match them under Permissions to add a tab there instead.
             </div>
           )}
-          <label class={cx("toggle", notGit && "disabled")}>
-            <input
-              type="checkbox"
-              checked={worktree && !notGit}
-              disabled={notGit}
-              onChange={(e) => setWorktree((e.target as HTMLInputElement).checked)}
-            />
-            <span class="toggle-track">
-              <span class="toggle-thumb" />
-            </span>
-            <span>
-              Git worktree{" "}
-              <span class="muted">
-                {notGit ? "(this folder isn't a git repository)" : "(an isolated checkout on its own branch)"}
-              </span>
-            </span>
-          </label>
-          {worktree && !notGit && (
-            <label class="field">
-              <span class="field-label">
-                Base branch <span class="muted">(optional)</span>
-              </span>
-              <input
-                value={base}
-                placeholder="current HEAD"
-                spellcheck={false}
-                onInput={(e) => setBase((e.target as HTMLInputElement).value)}
-              />
-            </label>
-          )}
-          <label class="field">
-            <span class="field-label">
-              Name <span class="muted">(optional)</span>
-            </span>
-            <input
-              value={name}
-              placeholder="Project folder name"
-              spellcheck={false}
-              onInput={(e) => setName((e.target as HTMLInputElement).value)}
-            />
-          </label>
-          {(agent === "claude" || agent === "codex") && (
-            <label class="field">
-              <span class="field-label">
-                First prompt <span class="muted">(optional)</span>
-              </span>
-              <textarea
-                rows={3}
-                value={prompt}
-                placeholder="What should the agent do?"
-                onInput={(e) => setPrompt((e.target as HTMLTextAreaElement).value)}
-              />
-            </label>
-          )}
-          <PermissionsSection value={permissions} onChange={setPermissions} />
           {err && <div class="form-error">{err}</div>}
         </div>
         <div class="dlg-foot">
@@ -751,7 +758,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
           </span>
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!canCreate}>
-            {busy ? <Spinner size={12} /> : worktree && !notGit ? <IconBranch size={13} /> : null} {!joins ? "Create channel" : agent === "none" ? "Open channel" : "Add tab"}
+            {busy ? <Spinner size={12} /> : wt ? <IconBranch size={13} /> : null} {!joins ? "Create channel" : agent === "none" ? "Open channel" : "Add tab"}
           </button>
         </div>
       </form>
@@ -912,7 +919,7 @@ function RenameWindow() {
   }, []);
   if (!w) return null;
   return (
-    <Modal class="dialog confirm-dlg" label="Rename window">
+    <Modal class="dialog dlg-calm confirm-dlg" label="Rename window">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -965,7 +972,7 @@ function ShellDialog() {
   };
   const login = meta.value.login_shell || "your login shell";
   return (
-    <Modal class="dialog confirm-dlg" label="Shell for new terminals">
+    <Modal class="dialog dlg-calm confirm-dlg" label="Shell for new terminals">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1037,7 +1044,7 @@ function CacheSettingsDialog() {
     } else setBusy(false);
   };
   return (
-    <Modal class="dialog dialog-scroll cache-dlg" label="Cache warning">
+    <Modal class="dialog dialog-scroll dlg-calm cache-dlg" label="Cache warning">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1209,7 +1216,7 @@ function Confirm(
   // A stray Enter must not destroy anything: destructive confirms start on Cancel.
   useLayoutEffect(() => (props.danger ? cancel : ok).current?.focus(), []);
   return (
-    <Modal class="dialog confirm-dlg" label={props.title} describedBy="confirm-body">
+    <Modal class="dialog dlg-calm confirm-dlg" label={props.title} describedBy="confirm-body">
       <div class="dlg-head">
         <h2>{props.title}</h2>
       </div>
@@ -1267,7 +1274,7 @@ function Lifecycle({ restart }: { restart: boolean }) {
   };
   return (
     <Modal
-      class="dialog confirm-dlg"
+      class="dialog dlg-calm confirm-dlg"
       label={label}
       describedBy="lifecycle-body"
       onClose={() => {

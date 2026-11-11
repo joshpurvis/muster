@@ -774,6 +774,13 @@ export function parseCap(text: string): { cap: number | null } | { error: string
   return { cap: Number(t) };
 }
 
+/** The daily cap as "More options" summarises it while closed: an empty cap on a new trigger
+ * is the backend's default of 10, not "no cap". */
+export function capSummary(cap: ReturnType<typeof parseCap>, trigger: boolean, editing: boolean): string {
+  if ("cap" in cap && cap.cap) return `At most ${cap.cap} a day`;
+  return trigger && !editing ? "At most 10 a day (a trigger's default)" : "No daily cap";
+}
+
 export type NoteChoice = { id: number } | { title: string } | null;
 
 /** The note a reply goes into: an existing note by its title (any case), or a new one with that

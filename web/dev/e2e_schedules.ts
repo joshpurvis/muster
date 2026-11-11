@@ -157,8 +157,8 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   await shot("new-schedule-once", ".sch-dlg", 8);
   await setValue(".sch-preset select", "weekdays", "change");
   await a.wait(`document.querySelector('.sch-reading')?.textContent === 'At 09:00, Monday to Friday'`, 3000);
-  await a.eval(`document.querySelector('.sch-more-toggle').scrollIntoView({ block: 'center' })`);
-  await a.click(".sch-more-toggle");
+  await a.eval(`document.querySelector('.sch-dlg .dlg-more').scrollIntoView({ block: 'center' })`);
+  await a.click(".sch-dlg .dlg-more");
   await a.wait(`!!document.querySelector('.sch-tz')`, 1000);
   check((await a.eval(`document.querySelector('.sch-tz').value`)).length > 0, "the time zone defaults to this browser's");
   await a.eval(`document.querySelector('.sch-dlg .dlg-body').scrollTop = 1e6`);
@@ -265,11 +265,14 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
     await a.eval(`[...document.querySelectorAll('.sch-seg')].every((g) => g.querySelectorAll('[tabindex="0"]').length === 1)`),
     "each segmented control is one Tab stop",
   );
-  await a.eval(`document.querySelector('.sch-seg [data-value="continue"]').focus()`);
+  // "When it fails" is under More options (Then…).
+  await a.eval(`document.querySelector('.sch-then') || document.querySelector('.sch-dlg .dlg-more').click()`);
+  await a.wait(`!!document.querySelector('.sch-then .sch-seg')`, 1000);
+  await a.eval(`document.querySelector('.sch-then .sch-seg [data-value="none"]').focus()`);
   await a.key("Right");
-  await a.wait(`document.activeElement?.dataset.value === 'fresh' && document.activeElement.getAttribute('aria-checked') === 'true'`, 1000);
+  await a.wait(`document.activeElement?.dataset.value === 'notify' && document.activeElement.getAttribute('aria-checked') === 'true'`, 1000);
   await a.key("Home");
-  await a.wait(`document.activeElement?.dataset.value === 'continue'`, 1000);
+  await a.wait(`document.activeElement?.dataset.value === 'none'`, 1000);
   await a.click(".sch-dlg button[type=submit]");
   await a.wait(`!document.querySelector('.sch-dlg')`, 2000);
   const tidy = (await R("schedule.list", {})).schedules.find((s: any) => s.id === cli.id);

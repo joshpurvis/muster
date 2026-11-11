@@ -729,6 +729,34 @@ function newAgent(p: any): MockAgent {
 /** OpenRouter (src/openrouter.rs): whether the mock backend "has" OPENROUTER_API_KEY
  * (`mock.openrouter` sets it), and a short copy of the filtered model list. */
 let orKey = false;
+// Two Claude account profiles and their last reported usage, so the New tab and New agent
+// dialogs show the profile picker and the capacity table (src/account_profiles.rs, loosely).
+const accountProfiles = [
+  { id: 1, name: "Work", config_dir: HOME + "/.claude-work", enabled: true, created_at: now(), account_group: null },
+  { id: 2, name: "Personal", config_dir: HOME + "/.claude-personal", enabled: true, created_at: now(), account_group: null },
+];
+function accountUsage() {
+  const t = now();
+  const win = (pct: number | null, hours: number) => ({
+    status: pct === null ? "unknown" : "current",
+    used_percentage: pct,
+    resets_at: pct === null ? null : Math.floor(t / 1000) + hours * 3600,
+    observed_at: pct === null ? null : t - 4 * 60_000,
+    reported_at: pct === null ? null : t - 4 * 60_000,
+    reported_by: null,
+  });
+  const row = (choice: number | "default", name: string, five: number | null, week: number | null) => ({
+    choice, name, enabled: true, eligible: true, ineligible_reason: null, account: String(choice),
+    same_account_as: [], five_hour: win(five, 3), seven_day: win(week, 90),
+  });
+  return {
+    evaluated_at: t,
+    stale_after_ms: 15 * 60_000,
+    rows: [row("default", "Default", null, null), row(1, "Work", 82, 61), row(2, "Personal", 12, 30)],
+    suggestion: { choice: 2, name: "Personal", choices: [2], reason: "It has the most known room in both windows." },
+    no_suggestion: null,
+  };
+}
 const OR_MODELS = [
   ["anthropic/claude-opus-5.5", "Anthropic: Claude Opus 5.5", 1000000, 5, 25],
   ["anthropic/claude-sonnet-5.5", "Anthropic: Claude Sonnet 5.5", 1000000, 2, 10],
@@ -1320,6 +1348,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     orKey = !!p.key_present;
     return { key_present: orKey };
   }
+  if (method === "account_profile.list") return accountProfiles;
+  if (method === "account_usage.get") return accountUsage();
   if (method === "openrouter.models") {
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
@@ -1445,6 +1475,8 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         updates,
         prefs: windowPrefs,
         openrouter: { key_present: orKey },
+        account_profiles: accountProfiles,
+        account_usage: accountUsage(),
         pid: mockBackend.pid,
         build: mockBackend.build,
         terminal_host: { protocol: 1, instance: mockBackend.host, pid: mockBackend.hostPid },

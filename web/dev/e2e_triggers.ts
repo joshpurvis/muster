@@ -90,6 +90,9 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   await a.wait(`!document.querySelector('.sch-trig-off')`, 3000);
   check((await R("note.get", { id: noteId })).triggers === true, "the note now allows triggers");
   // Then…: ask triage on a reply; notify on failure.
+  // Then… is under More options.
+  await a.eval(`document.querySelector('.sch-then') || document.querySelector('.sch-dlg .dlg-more').click()`);
+  await a.wait(`!!document.querySelector('.sch-then')`, 1000);
   await a.eval(`document.querySelector('.sch-then').scrollIntoView({ block: 'center' })`);
   await setValue(`.sch-then select[aria-label="Agent to ask when it replies"]`, "triage", "change");
   await a.wait(`!!document.querySelector('.sch-then-ok')`, 1000);

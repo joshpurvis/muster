@@ -781,15 +781,14 @@ try {
     await a.key("Enter");
     await a.wait(`!!document.querySelector('.agent-dlg [data-tpl="researcher"]')`, 3000);
     await a.click(`.agent-dlg [data-tpl="researcher"]`);
-    await a.wait(`document.querySelector('.agent-dlg .field-row input').value === 'researcher'`, 2000);
+    await a.wait(`document.querySelector('.agent-dlg input[aria-label="Name"]').value === 'researcher'`, 2000);
     check(
       await a.eval(`document.querySelector('.agent-dlg .persona-input').value.includes('plan mode')`),
       "the template prefilled the persona",
     );
-    // Model and Effort are selects: the CLI's list, Default, and Custom… for anything else.
-    const selOf = (label: string) =>
-      `document.getElementById([...document.querySelectorAll('.agent-dlg label.field-label')]` +
-      `.find((l) => l.textContent === '${label}').htmlFor)`;
+    // Model and Effort are selects (drawn as pills): the CLI's list, Default, and Custom… for
+    // anything else.
+    const selOf = (label: string) => `document.querySelector('.agent-dlg select[aria-label="${label}"]')`;
     const [ms, es] = [selOf("Model"), selOf("Effort")];
     const choose = (sel: string, value: string) =>
       a.eval(`(() => { const s = ${sel}; s.value = ${JSON.stringify(value)};
@@ -897,6 +896,9 @@ try {
         await a.type("new agent");
         await a.sleep(150);
         await a.key("Enter");
+        // Provider is under More options (a scripted click: focus stays in the Name field).
+        await a.wait(`!!document.querySelector('.agent-dlg .dlg-more')`, 3000);
+        await a.eval(`document.querySelector('.agent-dlg .dlg-more').click()`);
         await a.wait(`!!document.querySelector('.agent-dlg [data-provider="openrouter"]')`, 3000);
       };
       await newAgentDialog();

@@ -9,6 +9,7 @@ import {
   nextWhen,
   noteChoice,
   outcomeTone,
+  capSummary,
   parseCap,
   parseTime,
   runDuration,
@@ -556,4 +557,12 @@ Deno.test("the approval card lists every \"Then…\" step, nested ones included"
   ]);
   eq(thenSteps(null), []);
   eq(thenSteps({ on_success: { ...step("x", "p"), agent: null }, on_failure: null })[0].agent, "(a removed agent)");
+});
+
+Deno.test("the closed More options line says a new trigger's default cap", () => {
+  eq(capSummary(parseCap(""), false, false), "No daily cap");
+  eq(capSummary(parseCap(""), true, false), "At most 10 a day (a trigger's default)");
+  eq(capSummary(parseCap(""), true, true), "No daily cap");
+  eq(capSummary(parseCap("3"), true, false), "At most 3 a day");
+  eq(capSummary(parseCap("x"), false, false), "No daily cap");
 });

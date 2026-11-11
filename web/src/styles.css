@@ -2946,72 +2946,6 @@ textarea {
   line-height: 1.45;
 }
 
-.perm-section {
-  border: 1px solid var(--border);
-  border-radius: var(--r);
-  background: var(--bg-1);
-}
-
-.perm-disclosure {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-height: 36px;
-  padding: 0 10px;
-  text-align: left;
-  border-radius: var(--r);
-}
-
-.perm-disclosure:hover {
-  background: var(--hover);
-}
-
-.perm-disclosure:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.perm-disc-chev {
-  display: inline-flex;
-  color: var(--text-faint);
-  transition: transform var(--t) var(--ease);
-}
-
-.perm-section.open .perm-disc-chev {
-  transform: rotate(90deg);
-}
-
-.perm-summary {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--text-faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  min-width: 0;
-}
-
-.perm-summary.elevated {
-  color: var(--st-attn);
-}
-
-.perm-summary.danger {
-  color: var(--st-error);
-}
-
-.perm-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 4px 12px 12px;
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-}
-
 .dlg-foot-left {
   margin-right: auto;
 }
@@ -3547,6 +3481,7 @@ textarea {
 }
 
 .agent-home {
+  align-self: flex-start;
   font-size: 11px;
   color: var(--text-faint);
 }
@@ -3604,12 +3539,6 @@ textarea {
   color: var(--text);
   border-color: var(--accent);
   background: var(--accent-softer);
-}
-
-.tpl-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .profile-select,
@@ -3682,7 +3611,6 @@ textarea {
 }
 
 /* Claude usage (src/usage.rs): only a current figure reads as a plain number. */
-.profile-field,
 .usage-hint {
   display: flex;
   flex-direction: column;
@@ -3863,6 +3791,540 @@ textarea {
 
 .agent-warn .icon {
   margin-top: 1px;
+}
+
+/* ---------------- calm dialogs (New channel, New / Edit agent) ----------------
+   The field you came to fill in first and large; secondary settings as small pills in one row
+   (each opens its detail under the row); rarely changed ones behind "More options"; help on
+   hover and for screen readers instead of a line under every field. */
+
+.dlg-calm .dlg-head {
+  padding: 14px 18px 0;
+}
+
+.dlg-calm .dlg-head h2 {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.dlg-calm .dlg-body {
+  gap: 12px;
+  padding: 12px 18px 16px;
+}
+
+.dlg-calm .dlg-foot {
+  padding: 10px 14px 10px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.new-channel-dlg {
+  width: 560px;
+}
+
+.hero-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Large and boxless until hovered or focused, like a document title. */
+.hero-field .path-box input,
+.dialog .hero-input {
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  font-size: 15px;
+  font-weight: 500;
+  background: transparent;
+  border-color: transparent;
+}
+
+.hero-field .path-box input:hover:not(:focus),
+.dialog .hero-input:hover:not(:focus) {
+  background: var(--hover);
+}
+
+.hero-field .path-box input::placeholder,
+.dialog .hero-input::placeholder {
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.hero-field .recent-folders {
+  gap: 2px;
+}
+
+.hero-field .recent-folder {
+  height: 22px;
+  padding: 0 7px;
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.hero-field .recent-folder:hover {
+  background: var(--hover-strong);
+  color: var(--text);
+}
+
+.recent-folder:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.hero-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.hero-row .hero-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.dialog .hero-row .hero-input {
+  width: auto;
+}
+
+.kind-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.seg-kind {
+  align-self: flex-start;
+  flex: none;
+}
+
+.seg-kind .seg-btn {
+  height: 26px;
+  padding: 0 11px;
+}
+
+.seg-kind .seg-btn:focus-visible,
+.dlg-calm .seg-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* A text area that reads as part of the page: a soft fill, a border only on focus. */
+.dialog .quiet-input {
+  width: 100%;
+  min-height: 0;
+  padding: 9px 10px;
+  border-color: transparent;
+  background: var(--bg-1);
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.dialog .quiet-input:hover:not(:focus) {
+  border-color: var(--border);
+}
+
+.dialog .quiet-input::placeholder {
+  color: var(--text-faint);
+}
+
+.persona-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.persona-hint {
+  font-size: 11px;
+}
+
+/* ---- pills ---- */
+
+.pills {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  max-width: 100%;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background var(--t) var(--ease), border-color var(--t) var(--ease), color var(--t) var(--ease);
+}
+
+.pill > .icon {
+  flex: none;
+  color: var(--text-faint);
+}
+
+.pill:hover:not(:disabled):not(.disabled) {
+  background: var(--hover-strong);
+  color: var(--text);
+}
+
+.pill:disabled,
+.pill.disabled {
+  opacity: 0.6;
+}
+
+.pill:focus-visible,
+.pill-select:has(.pill-native:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.pill-k {
+  color: var(--text-faint);
+}
+
+.pill-value,
+.pill-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pill-select {
+  padding-right: 7px;
+}
+
+.pill-select.set .pill-value {
+  color: var(--text);
+}
+
+.pill-select > .icon:last-of-type {
+  margin-left: 1px;
+}
+
+/* The real select, transparent over the pill: it takes the clicks and the keys. */
+.pill .pill-native {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+  font: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.pill .pill-native:disabled {
+  cursor: not-allowed;
+}
+
+.pill-toggle.on,
+.perm-pill.on {
+  color: var(--text);
+  background: var(--accent-softer);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.pill-toggle.on > .icon {
+  color: var(--accent-strong);
+}
+
+.perm-pill.elevated,
+.perm-pill.elevated > .icon {
+  color: var(--warn-text);
+}
+
+.perm-pill.elevated {
+  border-color: var(--attn-border);
+}
+
+.perm-pill.danger,
+.perm-pill.danger > .icon {
+  color: var(--error-text);
+}
+
+.perm-pill.danger {
+  border-color: color-mix(in srgb, var(--st-error) 45%, transparent);
+}
+
+.dialog input.pill-input {
+  width: 150px;
+  height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+  background: transparent;
+}
+
+.dialog input.pill-input::placeholder {
+  color: var(--text-faint);
+}
+
+/* A short visible note beside a pill (a disabled pill's reason, a billing cue). */
+.pill-note {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+.sch-agent-fixed .pill-note {
+  color: var(--warn-text);
+}
+
+/* What a pill opens, under the row. */
+.pill-panel {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+}
+
+.perm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pill-panel-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.pill-panel-row .field-label {
+  flex: none;
+  min-width: 92px;
+}
+
+.pill-panel-row input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+}
+
+.dlg-note {
+  padding: 8px 10px;
+  border-radius: var(--r);
+  background: var(--hover);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.dlg-calm .usage-suggestion.usage-none:empty {
+  display: none;
+}
+
+/* ---- New agent: templates, origins, More options ---- */
+
+.tpl-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dlg-calm .tpl-list {
+  gap: 2px;
+}
+
+.dlg-calm .tpl {
+  height: 24px;
+  padding: 0 8px;
+  border-color: transparent;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.dlg-calm .tpl:hover {
+  border-color: transparent;
+  background: var(--hover-strong);
+}
+
+.dlg-calm .tpl.on {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-softer);
+}
+
+.dlg-calm .tpl:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.tpl-about {
+  padding-left: 8px;
+  font-size: 11.5px;
+}
+
+.inline-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.inline-field > .field-label {
+  font-weight: 500;
+}
+
+.check-row.chips {
+  gap: 6px;
+}
+
+.check.chip {
+  height: 26px;
+  padding: 0 9px 0 8px;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.check.chip:hover {
+  background: var(--hover-strong);
+  color: var(--text);
+}
+
+.check.chip.on {
+  color: var(--text);
+  background: var(--accent-softer);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.check.chip:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.check.chip input {
+  width: 13px;
+  height: 13px;
+}
+
+.dlg-more-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.dlg-more {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 24px;
+  border-radius: var(--r);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 550;
+  text-align: left;
+}
+
+.dlg-more:hover {
+  color: var(--text);
+}
+
+.dlg-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.dlg-more-chev {
+  flex: none;
+  color: var(--text-faint);
+  transition: transform var(--t) var(--ease);
+}
+
+.dlg-more-section.open .dlg-more-chev {
+  transform: rotate(90deg);
+}
+
+.dlg-more-summary {
+  min-width: 0;
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.dlg-more-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 18px;
+}
+
+/* The other dialogs: the same quiet head, labels and footer. */
+.dlg-calm .dlg-head .muted {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+
+.dlg-calm .field-label {
+  font-weight: 500;
+}
+
+.dlg-calm .cache-ttl-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
+}
+
+.dlg-calm .cache-ttl-row .field-hint {
+  grid-column: 1 / -1;
+  font-size: 11px;
+}
+
+.dlg-calm .cache-ttls {
+  gap: 14px;
+}
+
+.dlg-calm.profiles-dialog h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sch-dlg .sch-agent-fixed {
+  gap: 6px;
+  color: var(--text);
+}
+
+.sch-dlg .sch-claude-warn {
+  margin-top: 0;
+}
+
+@media (max-width: 600px) {
+  .hero-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .hero-row .hero-input {
+    flex: none;
+  }
 }
 
 /* Memory tab: files on the left, a plain-text editor on the right. */
@@ -5109,27 +5571,6 @@ body.dragging .panel-view { pointer-events: none; }
 .sch-seg {
   align-self: flex-start;
   flex-wrap: wrap;
-}
-
-.sch-more-toggle {
-  align-self: flex-start;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 6px 0 2px;
-  border-radius: var(--r);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-.sch-more-toggle:hover {
-  color: var(--text);
-}
-
-.sch-more-toggle[aria-expanded="true"] .ap-chev {
-  transform: rotate(90deg);
 }
 
 .sch-more {

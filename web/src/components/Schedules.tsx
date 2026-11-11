@@ -938,7 +938,7 @@ export function ScheduleDialog(
               label: `${c.agent.name} (${KIND_LABEL[c.agent.kind]}${
                 c.agent.provider === "openrouter" ? " on OpenRouter, pay per use" : ""
               })`,
-              short: c.agent.name,
+              short: c.agent.provider === "openrouter" ? `${c.agent.name} · OpenRouter, pay per use` : c.agent.name,
               disabled: g === "off",
               group: groupLabel(g, work),
             }))
@@ -1222,7 +1222,11 @@ export function ScheduleDialog(
       : d.then.failMode === "notify"
       ? "On failure, notify me"
       : "No follow-up"),
-    "cap" in cap && cap.cap ? `At most ${cap.cap} a day` : "No daily cap",
+    "cap" in cap && cap.cap
+      ? `At most ${cap.cap} a day`
+      : event && !editing
+      ? "At most 10 a day (a trigger's default)"
+      : "No daily cap",
     zone,
   ].filter(Boolean).join(" · ");
 

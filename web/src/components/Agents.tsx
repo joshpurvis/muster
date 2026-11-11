@@ -1209,7 +1209,10 @@ export function AgentDialog(
               value={d.effort}
               placeholder="a level the CLI accepts"
               focusTyped={focusEffort}
-              onChange={(effort) => set({ effort })}
+              onChange={(effort) => {
+                set({ effort });
+                setCustom((c) => ({ ...c, effort: true }));
+              }}
             />
           )}
           {d.provider === "openrouter" && (

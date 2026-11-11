@@ -43,7 +43,7 @@ async function create(b: Browser, name: string, kind = "Shell") {
   await b.eval(`(() => {
     const inputs = document.querySelectorAll('.dialog input');
     const folder = inputs[0]; folder.value = '/tmp'; folder.dispatchEvent(new Event('input', {bubbles:true}));
-    const name = document.querySelector('.dialog input[placeholder="Project folder name"]');
+    const name = document.querySelector('.dialog input[aria-label="Name (optional)"]');
     name.value = ${JSON.stringify(name)}; name.dispatchEvent(new Event('input', {bubbles:true}));
     [...document.querySelectorAll('.dialog [role="radio"]')].find(b => b.textContent.trim() === ${JSON.stringify(kind)}).click();
   })()`);
@@ -205,7 +205,7 @@ try {
   await a.eval(`(() => {
     const folder = document.querySelectorAll('.dialog input')[0];
     folder.value = ${JSON.stringify(plain.cwd)}; folder.dispatchEvent(new Event('input', {bubbles:true}));
-    const name = document.querySelector('.dialog input[placeholder="Project folder name"]');
+    const name = document.querySelector('.dialog input[aria-label="Name (optional)"]');
     name.value = ${JSON.stringify(plain.name)}; name.dispatchEvent(new Event('input', {bubbles:true}));
     [...document.querySelectorAll('.dialog [role="radio"]')].find(b => b.textContent.trim() === 'Claude').click();
   })()`);

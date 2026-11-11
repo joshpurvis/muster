@@ -1,5 +1,5 @@
 import type { ComponentChildren } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useId, useState } from "preact/hooks";
 import { accountProfiles, accountProfilesSupported, accountUsage, toast } from "../state.ts";
 import { rpc } from "../rpc.ts";
 import type { AccountProfile, AccountUsage, ProfileChoice } from "../types.ts";
@@ -12,7 +12,8 @@ import {
   type WindowCell,
   windowCell,
 } from "../account_profiles.ts";
-import { IconChevronDown } from "../icons.tsx";
+import { IconChevronDown, IconUser } from "../icons.tsx";
+import { PillSelect, PillToggle } from "./DialogKit.tsx";
 import { cx } from "../util.ts";
 
 /** Keeps `accountUsage` current while mounted (statuses age on the backend's clock: a figure
@@ -93,21 +94,24 @@ export function UsageTable({ usage, now, selected }: {
   );
 }
 
-/** The new-session flow's capacity table and suggestion. Choosing stays with the human: "Use"
- * changes the picker and moves focus to it. The status region stays mounted, so screen readers
- * hear the new text instead of losing it with a removed node. */
-function UsageHint({ value, onUse }: {
+/** The new-session flow's suggestion and, on request (the Usage pill), the capacity table.
+ * Choosing stays with the human: "Use" changes the picker and moves focus to it. The status
+ * region stays mounted, so screen readers hear the new text instead of losing it with a removed
+ * node. Only a suggestion to switch shows unasked; "keep" and "none" show with the table. */
+export function ProfileUsage({ value, onUse, table }: {
   value: ProfileChoice | undefined;
   onUse: (choice: ProfileChoice) => void;
+  /** The Usage pill is on. */
+  table: boolean;
 }) {
   const now = useUsageClock();
-  if (!accountUsage.value) return null;
+  if (!accountProfilesSupported.value || !accountProfiles.value.length || !accountUsage.value) return null;
   const usage = asOf(accountUsage.value, now);
   const s = suggestionView(usage, value);
   return (
     <div class="usage-hint">
-      <UsageTable usage={usage} now={now} selected={value} />
-      <div class={cx("usage-suggestion", s.kind === "none" && "usage-none")} role="status">
+      {table && <UsageTable usage={usage} now={now} selected={value} />}
+      <div class={cx("usage-suggestion", s.kind !== "switch" && "usage-none")} role="status">
         {s.kind === "switch" && (
           <>
             <span>
@@ -118,62 +122,67 @@ function UsageHint({ value, onUse }: {
             </button>
           </>
         )}
-        {s.kind === "keep" && (
+        {table && s.kind === "keep" && (
           <span>
             <strong>{s.name} has the most known room.</strong> {s.reason}
           </span>
         )}
-        {s.kind === "none" && <span>{s.reason}</span>}
+        {table && s.kind === "none" && <span>{s.reason}</span>}
       </div>
     </div>
   );
 }
 
-export function ProfileSelect({ value, onChange, disabled = false }: {
+/** The Claude profile pill (`null` on a backend without profiles), and, while the choice is
+ * still open and profiles exist, a Usage pill that shows each account's capacity. */
+export function ProfilePill({ value, onChange, disabled = false, tip, selectRef, usage, onUsage }: {
   value: ProfileChoice | undefined;
   onChange: (choice: ProfileChoice | undefined) => void;
   disabled?: boolean;
+  /** Hover text; also read to screen readers. */
+  tip?: string;
+  selectRef?: { current: HTMLSelectElement | null };
+  usage?: boolean;
+  onUsage?: (on: boolean) => void;
 }) {
-  const picker = useRef<HTMLSelectElement>(null);
+  const id = useId();
   if (!accountProfilesSupported.value) return null;
   const profiles = accountProfiles.value;
   const missing = typeof value === "number" && !profiles.some((p) => p.id === value);
+  const hint = tip ?? "Verify your account with /status inside Claude Code.";
   return (
-    <div class="profile-field">
-      <label class="field">
-        <span class="field-label">Claude profile</span>
-        <span class="profile-select">
-          <select
-            ref={picker}
-            value={value ?? "default"}
-            disabled={disabled}
-            onChange={(e) => onChange(parseProfileChoice(e.currentTarget.value))}
-          >
-            <option value="default">Default · ordinary Claude environment</option>
-            {missing && <option value={value} disabled>Unavailable profile #{value}</option>}
-            {profiles.map((p) => (
-              <option key={p.id} value={p.id} disabled={!p.enabled}>
-                {p.name}
-                {p.enabled ? "" : " (disabled)"}
-              </option>
-            ))}
-          </select>
-          <IconChevronDown size={14} />
-        </span>
-        <span class="field-hint">Verify your account with /status inside Claude Code.</span>
-      </label>
-      {/* Only where the choice is still open: an existing agent's profile is fixed. */}
-      {profiles.length > 0 && !disabled && (
-        <UsageHint
-          value={value}
-          onUse={(choice) => {
-            onChange(choice);
-            // The button is about to disappear; keep focus on the choice it made.
-            picker.current?.focus();
-          }}
+    <>
+      <PillSelect
+        icon={<IconUser size={13} />}
+        label="Claude profile"
+        value={String(value ?? "default")}
+        disabled={disabled}
+        tip={hint}
+        describedBy={`${id}-hint`}
+        selectRef={selectRef}
+        onChange={(v) => onChange(parseProfileChoice(v))}
+        options={[
+          { value: "default", label: "Default · ordinary Claude environment", short: "Default profile" },
+          ...(missing ? [{ value: String(value), label: `Unavailable profile #${value}`, disabled: true }] : []),
+          ...profiles.map((p) => ({
+            value: String(p.id),
+            label: p.name + (p.enabled ? "" : " (disabled)"),
+            disabled: !p.enabled,
+          })),
+        ]}
+      />
+      <span id={`${id}-hint`} class="sr-only">
+        Default is the ordinary Claude environment. {hint}
+      </span>
+      {profiles.length > 0 && !disabled && onUsage && (
+        <PillToggle
+          label="Usage"
+          on={!!usage}
+          onChange={onUsage}
+          tip="Each profile's last reported 5-hour and weekly usage"
         />
       )}
-    </div>
+    </>
   );
 }
 type ModalT = (p: { children: ComponentChildren; class?: string; label: string }) => ComponentChildren;

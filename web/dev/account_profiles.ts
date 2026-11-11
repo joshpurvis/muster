@@ -82,16 +82,16 @@ try {
   await clickText('[role="dialog"] button', "Done");
   await b.size(1440, 1000);
   await b.key("Alt+Shift+N");
-  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
-  await fill('[aria-label="New tab"] input', `${base}/repo`);
-  await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
+  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New channel"]')`);
+  await fill('[aria-label="New channel"] input', `${base}/repo`);
+  await clickText('[aria-label="New channel"] button[role="radio"]', "Claude");
   check(
-    await b.eval(`document.querySelector('[aria-label="New tab"] select').value === 'default'`),
+    await b.eval(`document.querySelector('[aria-label="New channel"] select').value === 'default'`),
     "New Tab must explicitly select Default even when the folder has a saved profile",
   );
-  await clickText('[aria-label="New tab"] button[type="submit"]', "Open tab");
+  await b.click('[aria-label="New channel"] button[type="submit"]');
   await b.wait(
-    `${M}.focusedSession.value?.kind === 'claude' && !document.querySelector('[role="dialog"][aria-label="New tab"]')`,
+    `${M}.focusedSession.value?.kind === 'claude' && !document.querySelector('[role="dialog"][aria-label="New channel"]')`,
     15000,
   );
   check(
@@ -99,41 +99,40 @@ try {
     "New Tab silently inherited a hidden workspace profile instead of its visible Default choice",
   );
   await b.key("Alt+Shift+N");
-  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
-  await fill('[aria-label="New tab"] input', `${base}/repo`);
-  await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
+  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New channel"]')`);
+  await fill('[aria-label="New channel"] input', `${base}/repo`);
+  await clickText('[aria-label="New channel"] button[role="radio"]', "Claude");
   // The capacity table and a suggestion the human may take or ignore: Default stays selected.
-  await b.wait(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion')`);
+  await b.wait(`!!document.querySelector('[aria-label="New channel"] .usage-suggestion')`);
   check(
     await b.eval(
-      `document.querySelector('[aria-label="New tab"] .usage-suggestion').textContent.includes('Suggested: Work')`,
+      `document.querySelector('[aria-label="New channel"] .usage-suggestion').textContent.includes('Suggested: Work')`,
     ),
     "New Tab does not suggest the account with known room",
   );
   check(
-    await b.eval(`document.querySelector('[aria-label="New tab"] select').value === 'default'`),
+    await b.eval(`document.querySelector('[aria-label="New channel"] select').value === 'default'`),
     "A suggestion must never change the selection by itself",
   );
   await b.sleep(150);
   await b.shot(`${base}/usage-new-tab.png`);
-  await clickText('[aria-label="New tab"] button', "Use Work");
+  await clickText('[aria-label="New channel"] button', "Use Work");
   const workId = await b.eval(
     `${M}.rpc.call('account_profile.list', {}).then(profiles => profiles.find(p => p.name === 'Work').id)`,
   );
-  await b.wait(`document.querySelector('[aria-label="New tab"] select').value === ${JSON.stringify(String(workId))}`);
+  await b.wait(`document.querySelector('[aria-label="New channel"] select').value === ${JSON.stringify(String(workId))}`);
   check(
-    await b.eval(`document.activeElement === document.querySelector('[aria-label="New tab"] select')`),
+    await b.eval(`document.activeElement === document.querySelector('[aria-label="New channel"] select')`),
     "Taking the suggestion must leave focus on the profile picker",
   );
   check(
-    await b.eval(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion[role="status"]')`),
+    await b.eval(`!!document.querySelector('[aria-label="New channel"] .usage-suggestion[role="status"]')`),
     "The suggestion's status region must stay mounted",
   );
   await b.sleep(150);
   await b.shot(`${base}/usage-new-tab-chosen.png`);
   await b.eval(`(() => {
-    const label = [...document.querySelectorAll('[aria-label="New tab"] label')].find(e => e.querySelector('.field-label')?.textContent === 'Claude profile');
-    const select = label.querySelector('select');
+    const select = document.querySelector('[aria-label="New channel"] select[aria-label="Claude profile"]');
     select.value = ${JSON.stringify(String(profile.id))};
     select.dispatchEvent(new Event('change', {bubbles: true}));
   })()`);
@@ -145,7 +144,7 @@ try {
   await b.eval(`document.documentElement.dataset.theme = 'light'`);
   await b.shot(`${base}/profile-selection-light.png`);
   await b.eval(`document.documentElement.dataset.theme = 'dark'`);
-  await clickText('[aria-label="New tab"] button[type="submit"]', "Open tab");
+  await b.click('[aria-label="New channel"] button[type="submit"]');
   await b.wait(`${M}.focusedSession.value?.account_profile_id === ${profile.id}`, 15000);
   check(
     await b.eval(`${M}.focusedSession.value.kind === 'claude'`),
@@ -156,19 +155,19 @@ try {
   await b.eval(`${M}.rpc.call('account_profile.update', {id: ${workId}, name: ${JSON.stringify(longName)}})`);
   await b.size(400, 800);
   await b.key("Alt+Shift+N");
-  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New tab"]')`);
-  await fill('[aria-label="New tab"] input', `${base}/repo`);
-  await clickText('[aria-label="New tab"] button[role="radio"]', "Claude");
-  await b.wait(`!!document.querySelector('[aria-label="New tab"] .usage-suggestion button')`);
+  await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New channel"]')`);
+  await fill('[aria-label="New channel"] input', `${base}/repo`);
+  await clickText('[aria-label="New channel"] button[role="radio"]', "Claude");
+  await b.wait(`!!document.querySelector('[aria-label="New channel"] .usage-suggestion button')`);
   check(
     await b.eval(`(() => {
     const d = document.querySelector('[role="dialog"]').getBoundingClientRect();
-    const r = document.querySelector('[aria-label="New tab"] .usage-suggestion button').getBoundingClientRect();
+    const r = document.querySelector('[aria-label="New channel"] .usage-suggestion button').getBoundingClientRect();
     return r.left >= d.left && r.right <= d.right && document.documentElement.scrollWidth <= innerWidth;
   })()`),
     "The Use button must stay inside a narrow dialog with a long profile name",
   );
-  await b.eval(`document.querySelector('[aria-label="New tab"] .usage-suggestion').scrollIntoView()`);
+  await b.eval(`document.querySelector('[aria-label="New channel"] .usage-suggestion').scrollIntoView()`);
   await b.sleep(150);
   await b.shot(`${base}/usage-new-tab-narrow-long-name.png`);
   // Light theme, through the app's own preference.

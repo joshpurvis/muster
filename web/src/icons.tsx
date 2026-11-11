@@ -199,3 +199,25 @@ export function KindIcon({ kind, size = 14 }: { kind: SessionKind; size?: number
   if (kind === "codex") return <IconCodex size={size} class="kind-codex" />;
   return <IconTerminal size={size} class="kind-shell" />;
 }
+/** A person: a Claude account profile (Lucide "user"). */
+export const IconUser = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="8" r="4" />
+    <path d="M5 20.5c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5" />
+  </Svg>
+);
+/** A dial: reasoning effort (Lucide "gauge"). */
+export const IconGauge = (p: P) => (
+  <Svg {...p}>
+    <path d="m12 14 4-4" />
+    <path d="M3.34 19a10 10 0 1 1 17.32 0" />
+  </Svg>
+);
+/** A chip: the model (Lucide "cpu", simplified). */
+export const IconCpu = (p: P) => (
+  <Svg {...p}>
+    <rect x="5" y="5" width="14" height="14" rx="2" />
+    <rect x="9" y="9" width="6" height="6" rx="1" />
+    <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3" />
+  </Svg>
+);

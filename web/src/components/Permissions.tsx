@@ -8,7 +8,7 @@ import { taskLabel } from "../model.ts";
 import * as A from "../actions.ts";
 import type { Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
 import { DEFAULT_PERMISSIONS } from "../types.ts";
-import { IconChevron, IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
+import { IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
 import { Spinner } from "./common.tsx";
 import { cx } from "../util.ts";
 
@@ -191,47 +191,66 @@ export function kindSummary(p: Permissions, kind: "codex" | "claude"): string {
     : `Claude: ${claudeOpt(p.claude_mode).short}`;
 }
 
-/** Collapsible "Permissions" section for the New tab and New agent dialogs. */
-export function PermissionsSection(
-  { value, onChange, only, note }: {
+/** The Permissions pill of the New channel and New agent dialogs: shows the current choice
+ * ("Permissions" while it is the default), amber when more permissive than the defaults, red
+ * when dangerous. Opens `PermissionsPanel` under the pill row. */
+export function PermissionsPill(
+  { value, only, open, onToggle, controls }: {
+    value: Permissions;
+    only?: "codex" | "claude";
+    open: boolean;
+    onToggle: (open: boolean) => void;
+    /** Id of the panel it opens. */
+    controls: string;
+  },
+) {
+  const changed = only
+    ? (only === "codex"
+      ? value.codex_sandbox !== DEFAULT_PERMISSIONS.codex_sandbox
+      : value.claude_mode !== DEFAULT_PERMISSIONS.claude_mode)
+    : !isDefault(value);
+  const text = !changed ? "Permissions" : only ? kindSummary(value, only)
+    : value.codex_sandbox === DEFAULT_PERMISSIONS.codex_sandbox ? kindSummary(value, "claude")
+    : value.claude_mode === DEFAULT_PERMISSIONS.claude_mode ? kindSummary(value, "codex")
+    : summary(value);
+  return (
+    <button
+      type="button"
+      class={cx("pill perm-pill", open && "on", isElevated(value) && "elevated", isDangerous(value) && "danger")}
+      aria-expanded={open}
+      aria-controls={controls}
+      aria-label={`Permissions: ${only ? kindSummary(value, only) : summary(value)}`}
+      onClick={() => onToggle(!open)}
+    >
+      {isDangerous(value)
+        ? <IconShieldAlert size={13} />
+        : isElevated(value)
+        ? <IconGlobe size={13} />
+        : <IconShield size={13} />}
+      <span class="pill-text">{text}</span>
+    </button>
+  );
+}
+
+/** What `PermissionsPill` opens: the control(s) and a note on who they apply to. */
+export function PermissionsPanel(
+  { value, onChange, only, note, id }: {
     value: Permissions;
     onChange: (p: Permissions) => void;
     only?: "codex" | "claude";
     note?: string;
+    id: string;
   },
 ) {
-  const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    if (open) ref.current?.scrollIntoView({ block: "nearest" });
-  }, [open]);
+  useLayoutEffect(() => ref.current?.scrollIntoView({ block: "nearest" }), []);
   return (
-    <div class={cx("perm-section", open && "open")} ref={ref}>
-      <button
-        type="button"
-        class="perm-disclosure"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-      >
-        <span class="perm-disc-chev" aria-hidden="true">
-          <IconChevron size={12} />
-        </span>
-        <span class="field-label">Permissions</span>
-        <span class={cx("perm-summary", isDangerous(value) && "danger", isElevated(value) && "elevated")}>
-          {isElevated(value) &&
-            (isDangerous(value) ? <IconShieldAlert size={12} /> : <IconGlobe size={12} />)}
-          {only ? kindSummary(value, only) : summary(value)}
-        </span>
-      </button>
-      {open && (
-        <div class="perm-body">
-          <PermissionFields value={value} onChange={onChange} only={only} />
-          <span class="field-hint perm-note">
-            {note ??
-              "Applies to every agent in the tab, including ones other agents start. Agents can't change it through muster's tools."}
-          </span>
-        </div>
-      )}
+    <div class="pill-panel perm-panel" id={id} ref={ref} role="group" aria-label="Permissions">
+      <PermissionFields value={value} onChange={onChange} only={only} />
+      <span class="field-hint perm-note">
+        {note ??
+          "Applies to every agent in the tab, including ones other agents start. Agents can't change it through muster's tools."}
+      </span>
     </div>
   );
 }

@@ -74,13 +74,18 @@ import type {
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
 import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
 import { contextMenu, openMenu } from "./Menu.tsx";
-import { PermissionsSection } from "./Permissions.tsx";
-import { ProfileSelect } from "./AccountProfiles.tsx";
+import { PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
+import { ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
+import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import {
   IconAgents,
+  IconBranch,
   IconChevron,
   IconChevronDown,
   IconCodex,
+  IconCpu,
+  IconFolder,
+  IconGauge,
   IconMore,
   IconPlus,
   IconShieldAlert,
@@ -423,7 +428,7 @@ function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
 // ---------------- New / Edit agent ----------------
 
 type ModalT = (
-  p: { children: ComponentChildren; class?: string; label: string; onClose?: () => void },
+  p: { children: ComponentChildren; class?: string; label: string; onClose?: () => void; describedBy?: string },
 ) => ComponentChildren;
 
 const ORIGINS: { o: Origin; label: string; hint: string }[] = [
@@ -439,25 +444,57 @@ interface Pick {
 }
 
 /** Model and Effort: Default, the CLI's list (`agent.models`) and "Custom…", which shows a text
- * field for anything else (a full model id, a level the list doesn't have yet). A stored value
- * the list doesn't know shows as custom. `custom` is the dialog's latch (`choiceOf`): Custom
- * stays chosen until another entry is picked. */
+ * field (`CustomPick`, under the pills) for anything else (a full model id, a level the list
+ * doesn't have yet). A stored value the list doesn't know shows as custom. `custom` is the
+ * dialog's latch (`choiceOf`): Custom stays chosen until another entry is picked. */
 function PickField(
-  { label, value, picks, custom, customLabel, placeholder, onChange }: {
+  { label, icon, value, picks, custom, focusTyped, describedBy, onChange }: {
     label: string;
+    icon: ComponentChildren;
     value: string;
     picks: Pick[];
     custom: boolean;
-    customLabel: string;
-    placeholder: string;
+    /** Set when Custom… is picked, so its field takes focus. */
+    focusTyped: { current: boolean };
+    describedBy: string;
     onChange: (v: string, custom: boolean) => void;
   },
 ) {
-  const id = useId();
-  const typed = useRef<HTMLInputElement>(null);
-  /** Custom… was just picked: focus its field, the current value selected so typing replaces it. */
-  const focusTyped = useRef(false);
   const choice = choiceOf(value, picks.map((p) => p.value), custom);
+  return (
+    <PillSelect
+      icon={icon}
+      k={label}
+      label={label}
+      value={choice}
+      tip="Default is the CLI's own choice"
+      describedBy={describedBy}
+      class={choice ? "set" : undefined}
+      onChange={(v) => {
+        focusTyped.current = v === CUSTOM;
+        onChange(v === CUSTOM ? value : v, v === CUSTOM);
+      }}
+      options={[
+        { value: "", label: "Default (the CLI's choice)", short: "Default" },
+        ...picks.map((p) => ({ value: p.value, label: p.label, short: p.value })),
+        { value: CUSTOM, label: "Custom…", short: value.trim() || "Custom" },
+      ]}
+    />
+  );
+}
+
+/** The text field of a Model or Effort set to Custom…: focused, its text selected, right after
+ * Custom… is picked, so typing replaces it. */
+function CustomPick(
+  { label, value, placeholder, focusTyped, onChange }: {
+    label: string;
+    value: string;
+    placeholder: string;
+    focusTyped: { current: boolean };
+    onChange: (v: string) => void;
+  },
+) {
+  const typed = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (focusTyped.current && typed.current) {
       focusTyped.current = false;
@@ -466,35 +503,17 @@ function PickField(
     }
   });
   return (
-    <div class="field">
-      <label class="field-label" for={id}>{label}</label>
-      <span class="select-wrap">
-        <select
-          id={id}
-          value={choice}
-          onChange={(e) => {
-            const v = e.currentTarget.value;
-            focusTyped.current = v === CUSTOM;
-            onChange(v === CUSTOM ? value : v, v === CUSTOM);
-          }}
-        >
-          <option value="">Default (the CLI's choice)</option>
-          {picks.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
-          <option value={CUSTOM}>Custom…</option>
-        </select>
-        <IconChevronDown size={14} />
-      </span>
-      {choice === CUSTOM && (
-        <input
-          ref={typed}
-          value={value}
-          aria-label={customLabel}
-          placeholder={placeholder}
-          spellcheck={false}
-          onInput={(e) => onChange((e.target as HTMLInputElement).value, true)}
-        />
-      )}
-    </div>
+    <label class="pill-panel pill-panel-row">
+      <span class="field-label">{label}</span>
+      <input
+        ref={typed}
+        value={value}
+        aria-label={label}
+        placeholder={placeholder}
+        spellcheck={false}
+        onInput={(e) => onChange((e.target as HTMLInputElement).value)}
+      />
+    </label>
   );
 }
 
@@ -772,6 +791,13 @@ export function AgentDialog(
   /** Closing with unsaved memory edits asks first (a bar in the footer). */
   const [askDiscard, setAskDiscard] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
+  const profileRef = useRef<HTMLSelectElement>(null);
+  const focusModel = useRef(false);
+  const focusEffort = useRef(false);
+  const [permsOpen, setPermsOpen] = useState(false);
+  const [usage, setUsage] = useState(false);
+  const [more, setMore] = useState(false);
+  const id = useId();
 
   useEffect(() => {
     if (editing || templateCache) return;
@@ -854,6 +880,25 @@ export function AgentDialog(
   const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
   const locationValid = d.working_location.mode === "home" || workspaces.value.some(w => w.is_git && w.id === (d.working_location as { workspace_id: number }).workspace_id);
   const canSave = locationValid && (!locationChanged || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
+  const checkoutHint = d.working_location.mode === "worktree"
+    ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts."
+    : "Shares files, branch and uncommitted changes with anyone using this checkout.";
+  const moreSummary = [
+    or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
+    d.autostart ? "Autostart on" : "No autostart",
+    d.sleep ? (sleepMin ? `Sleeps after ${sleepMin} min idle` : "Sleep time needs fixing") : "Never sleeps",
+  ].filter(Boolean).join(" · ");
+  const keyHint = or && !or.key_present && (
+    <span class="field-hint or-key-hint" id="agent-provider-hint">
+      {d.provider === "openrouter"
+        ? "This agent won't start: the backend has no OpenRouter key. "
+        : "OpenRouter is off. "}
+      It needs <code>OPENROUTER_API_KEY</code>{" "}
+      in the environment of Muster's backend, read only when the backend starts. From a shell
+      that has the key, run <code>env OPENROUTER_API_KEY=… muster reload</code>{" "}
+      (terminals keep running).
+    </span>
+  );
   const toggleOrigin = (o: Origin, on: boolean) =>
     set({ accepts: ORIGINS.map((x) => x.o).filter((x) => (x === o ? on : d.accepts.includes(x))) });
 
@@ -934,8 +979,9 @@ export function AgentDialog(
   const title = agent ? agent.name : "New agent";
   return (
     <Modal
-      class="dialog dialog-scroll agent-dlg"
+      class="dialog dialog-scroll dlg-calm agent-dlg"
       label={agent ? `Edit ${agent.name}` : "New agent"}
+      describedBy={`${id}-about`}
       onClose={onClose}
     >
       <form
@@ -957,11 +1003,13 @@ export function AgentDialog(
             {title}
             {agent?.provider === "openrouter" && <span class="or-badge or-badge-head">{OPENROUTER_BADGE}</span>}
           </h2>
-          <span class="muted">
-            {agent
-              ? <code class="agent-home">{agent.home_dir}</code>
-              : "A persistent agent with its own folder, memory/ and tab. You talk to it in its tab."}
-          </span>
+          {agent
+            ? <code class="agent-home" id={`${id}-about`}>{agent.home_dir}</code>
+            : (
+              <span class="sr-only" id={`${id}-about`}>
+                A persistent agent with its own folder, memory/ and tab. You talk to it in its tab.
+              </span>
+            )}
           {agent && (
             <div class="dlg-tabs" role="tablist">
               {(["settings", "memory"] as const).map((t) => (
@@ -983,116 +1031,286 @@ export function AgentDialog(
           )}
         </div>
         {agent && memSeen && <MemoryTab agent={agent} dirty={memDirty} hidden={tab !== "memory"} />}
-        {
-          <div class="dlg-body" hidden={tab !== "settings"}>
-            <div class="field">
-              <label class="field-label" for="agent-repository">Working repository</label>
-              <span class="select-wrap">
-                <select id="agent-repository" value={d.working_location.mode === "home" ? "" : String(d.working_location.workspace_id)}
-                  onChange={(e) => { set({ working_location: e.currentTarget.value ? { mode: "worktree", workspace_id: Number(e.currentTarget.value) } : { mode: "home" } }); setConversation(""); }}>
-                  <option value="">Agent home (no repository)</option>
-                  {workspaces.value.filter(w => w.is_git).map(w => <option key={w.id} value={w.id}>{w.name} — {w.path}</option>)}
-                </select>
-                <IconChevronDown size={14} />
-              </span>
-              <span class="field-hint">Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.</span>
+        <div class="dlg-body" hidden={tab !== "settings"}>
+          {!agent && templates.length > 0 && (
+            <div class="tpl-block">
+              <div class="tpl-list" role="radiogroup" aria-label="Template" aria-describedby={`${id}-tpl`}>
+                {templates.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={tpl === t.id}
+                    class={cx("tpl", tpl === t.id && "on")}
+                    data-tpl={t.id}
+                    data-tip={`${KIND_LABEL[t.kind]}: ${t.about}`}
+                    onClick={() => pick(t)}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <span class="field-hint tpl-about" id={`${id}-tpl`}>{templates.find((t) => t.id === tpl)?.about}</span>
             </div>
-            {d.working_location.mode !== "home" && <div class="field">
-              <label class="field-label" for="agent-checkout">Working checkout</label>
-              <span class="select-wrap">
-                <select id="agent-checkout" value={d.working_location.mode}
-                  onChange={(e) => { if (d.working_location.mode !== "home") { set({ working_location: { ...d.working_location, mode: e.currentTarget.value as "worktree" | "main" } }); setConversation(""); } }}>
-                  <option value="worktree">Dedicated worktree (recommended)</option>
-                  <option value="main">Repository's main checkout</option>
-                </select>
-                <IconChevronDown size={14} />
-              </span>
-              <span class="field-hint">{d.working_location.mode === "worktree" ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts." : "Shares files, branch and uncommitted changes with anyone using this checkout."}</span>
-            </div>}
-            {locationChanged && <div class="field">
+          )}
+          {!agent && (
+            <div class="hero-row">
+              <input
+                ref={nameRef}
+                class="hero-input"
+                value={d.name}
+                placeholder="Agent name, e.g. reviewer"
+                aria-label="Name"
+                spellcheck={false}
+                aria-invalid={!!d.name && !!nErr}
+                aria-describedby={d.name && nErr ? `${id}-name-err` : undefined}
+                onInput={(e) => {
+                  setNameTouched(true);
+                  set({ name: (e.target as HTMLInputElement).value });
+                }}
+              />
+              <div class="seg seg-kind" role="radiogroup" aria-label="Agent CLI">
+                {(["claude", "codex"] as const).map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    role="radio"
+                    aria-checked={d.kind === k}
+                    class={cx("seg-btn", d.kind === k && "on")}
+                    onClick={() => setKind(k)}
+                  >
+                    {k === "claude" ? <IconSpark size={13} /> : <IconCodex size={13} />} {KIND_LABEL[k]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {!agent && d.name && nErr && <span class="field-hint field-bad" id={`${id}-name-err`}>{nErr}</span>}
+          <div class="persona-field">
+            <textarea
+              class="quiet-input persona-input"
+              rows={6}
+              value={d.persona}
+              aria-label="Persona"
+              aria-describedby={`${id}-persona`}
+              placeholder="Persona: who it is and how it works. Muster adds how memory/ and messages work."
+              onInput={(e) => set({ persona: (e.target as HTMLTextAreaElement).value })}
+            />
+            <span class="field-hint persona-hint" id={`${id}-persona`}>
+              Persona, written to {d.kind === "claude" ? "CLAUDE.md" : "AGENTS.md"}{" "}
+              in its folder; its CLI reads it when a conversation starts.
+            </span>
+          </div>
+          <div class="pills" role="group" aria-label="Agent settings">
+            {d.provider !== "openrouter" && (
+              <PickField
+                label="Model"
+                icon={<IconCpu size={13} />}
+                value={d.model}
+                picks={modelPicks(catalog, d.kind)}
+                custom={custom.model}
+                focusTyped={focusModel}
+                describedBy={`${id}-default`}
+                onChange={setModel}
+              />
+            )}
+            <PickField
+              label="Effort"
+              icon={<IconGauge size={13} />}
+              value={d.effort}
+              picks={effortPicks(catalog, d.kind, d.model)}
+              custom={custom.effort}
+              focusTyped={focusEffort}
+              describedBy={`${id}-default`}
+              onChange={(effort, on) => {
+                set({ effort });
+                setCustom((c) => ({ ...c, effort: on }));
+              }}
+            />
+            {d.kind === "claude" && (
+              <ProfilePill
+                value={d.account_profile}
+                onChange={(choice) => set({ account_profile: choice ?? "default" })}
+                disabled={editing}
+                tip={editing
+                  ? "This agent keeps its profile and conversation together. Create a new agent to use another profile."
+                  : undefined}
+                selectRef={profileRef}
+                usage={usage}
+                onUsage={setUsage}
+              />
+            )}
+            <PillSelect
+              id="agent-repository"
+              icon={<IconFolder size={13} />}
+              label="Working repository"
+              value={d.working_location.mode === "home" ? "" : String(d.working_location.workspace_id)}
+              tip="Where it works. Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home."
+              describedBy={`${id}-repo`}
+              class={d.working_location.mode !== "home" ? "set" : undefined}
+              onChange={(v) => {
+                set({ working_location: v ? { mode: "worktree", workspace_id: Number(v) } : { mode: "home" } });
+                setConversation("");
+              }}
+              options={[
+                { value: "", label: "Agent home (no repository)", short: "Agent home" },
+                ...workspaces.value.filter((w) => w.is_git).map((w) => ({
+                  value: String(w.id),
+                  label: `${w.name} — ${w.path}`,
+                  short: w.name,
+                })),
+              ]}
+            />
+            {d.working_location.mode !== "home" && (
+              <PillSelect
+                id="agent-checkout"
+                icon={<IconBranch size={13} />}
+                label="Working checkout"
+                value={d.working_location.mode}
+                tip={checkoutHint}
+                describedBy={`${id}-checkout`}
+                onChange={(v) => {
+                  if (d.working_location.mode !== "home") {
+                    set({ working_location: { ...d.working_location, mode: v as "worktree" | "main" } });
+                    setConversation("");
+                  }
+                }}
+                options={[
+                  { value: "worktree", label: "Dedicated worktree (recommended)", short: "Own worktree" },
+                  { value: "main", label: "Repository's main checkout", short: "Main checkout" },
+                ]}
+              />
+            )}
+            <PermissionsPill
+              value={d.permissions}
+              only={d.kind}
+              open={permsOpen}
+              onToggle={setPermsOpen}
+              controls={`${id}-perms`}
+            />
+          </div>
+          <span class="sr-only" id={`${id}-default`}>Default is the CLI's own choice.</span>
+          <span class="sr-only" id={`${id}-repo`}>
+            Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.
+          </span>
+          {d.working_location.mode !== "home" && <span class="sr-only" id={`${id}-checkout`}>{checkoutHint}</span>}
+          {d.provider !== "openrouter" && choiceOf(d.model, modelPicks(catalog, d.kind).map((p) => p.value), custom.model) === CUSTOM && (
+            <CustomPick
+              label="Custom model"
+              value={d.model}
+              placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
+              focusTyped={focusModel}
+              onChange={(v) => setModel(v, true)}
+            />
+          )}
+          {choiceOf(d.effort, effortPicks(catalog, d.kind, d.model).map((p) => p.value), custom.effort) === CUSTOM && (
+            <CustomPick
+              label="Custom effort"
+              value={d.effort}
+              placeholder="a level the CLI accepts"
+              focusTyped={focusEffort}
+              onChange={(effort) => set({ effort })}
+            />
+          )}
+          {d.provider === "openrouter" && (
+            <OpenRouterModelField
+              kind={d.kind}
+              value={d.model}
+              custom={custom.model}
+              list={orList}
+              loading={orLoading}
+              onChange={setModel}
+            />
+          )}
+          {orBlocked && (
+            <span class="field-hint field-bad">
+              Codex on OpenRouter needs a model with its vendor, e.g. openai/gpt-6.1-sol.
+            </span>
+          )}
+          {d.kind === "claude" && !editing && (
+            <ProfileUsage
+              value={d.account_profile}
+              table={usage}
+              onUse={(choice) => {
+                set({ account_profile: choice });
+                profileRef.current?.focus();
+              }}
+            />
+          )}
+          {permsOpen && (
+            <PermissionsPanel
+              id={`${id}-perms`}
+              value={d.permissions}
+              onChange={(p) => set({ permissions: p })}
+              only={d.kind}
+              note="The profile of the agent's own tab. Only you can change it; it applies from the agent's next start."
+            />
+          )}
+          {locationChanged && (
+            <div class="field pill-panel">
               <label class="field-label" for="agent-location-conversation">Conversation at next start</label>
               <span class="select-wrap">
-                <select id="agent-location-conversation" required value={conversation} onChange={(e) => setConversation(e.currentTarget.value as "" | "keep" | "reset")}>
+                <select
+                  id="agent-location-conversation"
+                  required
+                  value={conversation}
+                  aria-describedby={`${id}-conv`}
+                  onChange={(e) => setConversation(e.currentTarget.value as "" | "keep" | "reset")}
+                >
                   <option value="">Choose how to continue</option>
                   <option value="keep">Keep the existing conversation</option>
                   <option value="reset">Start a new conversation</option>
                 </select>
                 <IconChevronDown size={14} />
               </span>
-              <span class="field-hint">Saving does not interrupt the running agent. Its next start uses this location; persistent memory is kept either way.</span>
-            </div>}
-            {agent?.working_directory && <p class="field-hint">Current working directory: <code>{agent.working_directory}</code>{agent.reset_on_next_start ? " · New conversation at next start" : ""}</p>}
-
-            {!agent && templates.length > 0 && (
-              <div class="field">
-                <span class="field-label">Start from</span>
-                <div class="tpl-list" role="radiogroup" aria-label="Template">
-                  {templates.map((t) => (
-                    <button
-                      key={t.id}
-                      type="button"
-                      role="radio"
-                      aria-checked={tpl === t.id}
-                      class={cx("tpl", tpl === t.id && "on")}
-                      data-tpl={t.id}
-                      onClick={() => pick(t)}
-                    >
-                      <span class="tpl-label">
-                        {t.kind === "claude"
-                          ? <IconSpark size={12} class="kind-claude" />
-                          : <IconCodex size={12} class="kind-codex" />}
-                        {t.label}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-                <span class="field-hint">{templates.find((t) => t.id === tpl)?.about}</span>
-              </div>
-            )}
-            {!agent && (
-              <div class="field-row">
-                <label class="field">
-                  <span class="field-label">Name</span>
+              <span class="field-hint" id={`${id}-conv`}>
+                Saving does not interrupt the running agent. Its next start uses this location; persistent memory is kept either way.
+              </span>
+            </div>
+          )}
+          {agent?.working_directory && (
+            <p class="field-hint">
+              Current working directory: <code>{agent.working_directory}</code>
+              {agent.reset_on_next_start ? " · New conversation at next start" : ""}
+            </p>
+          )}
+          <div class="inline-field">
+            <span class="field-label" id={`${id}-origins`}>Takes messages started by</span>
+            <div class="check-row chips" role="group" aria-labelledby={`${id}-origins`}>
+              {ORIGINS.map((o) => (
+                <label key={o.o} class={cx("check chip", d.accepts.includes(o.o) && "on")} data-tip={o.hint}>
                   <input
-                    ref={nameRef}
-                    value={d.name}
-                    placeholder="e.g. reviewer"
-                    spellcheck={false}
-                    aria-invalid={!!d.name && !!nErr}
-                    onInput={(e) => {
-                      setNameTouched(true);
-                      set({ name: (e.target as HTMLInputElement).value });
-                    }}
+                    type="checkbox"
+                    checked={d.accepts.includes(o.o)}
+                    onChange={(e) => toggleOrigin(o.o, (e.target as HTMLInputElement).checked)}
                   />
-                  {d.name && nErr && <span class="field-hint field-bad">{nErr}</span>}
+                  {o.label}
                 </label>
-                <div class="field">
-                  <span class="field-label">Runs</span>
-                  <div class="seg seg-lg" role="radiogroup" aria-label="Agent CLI">
-                    {(["claude", "codex"] as const).map((k) => (
-                      <button
-                        key={k}
-                        type="button"
-                        role="radio"
-                        aria-checked={d.kind === k}
-                        class={cx("seg-btn", d.kind === k && "on")}
-                        onClick={() => setKind(k)}
-                      >
-                        {k === "claude" ? <IconSpark size={13} /> : <IconCodex size={13} />} {KIND_LABEL[k]}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-            {d.kind === "claude" && <>
-              <ProfileSelect value={d.account_profile} onChange={(choice) => set({ account_profile: choice ?? "default" })} disabled={editing} />
-              {editing && <span class="field-hint">This agent keeps its profile and conversation together. Create a new agent to use another profile.</span>}
-            </>}
+              ))}
+            </div>
+          </div>
+          {warn && (
+            <span class="perm-warn agent-warn" role="note">
+              <IconShieldAlert size={13} /> {UNATTENDED_WARNING}
+            </span>
+          )}
+          {d.accepts.length === 0 && <span class="field-hint field-bad">Pick at least one.</span>}
+          {d.provider === "openrouter" && or && (
+            <span class="perm-warn or-warn" role="note">
+              <IconShieldAlert size={13} />{" "}
+              {OPENROUTER_BADGE}: billed per token to your OpenRouter key, not your {KIND_LABEL[d.kind]}{" "}
+              subscription.{" "}
+              {d.kind === "claude"
+                ? "Claude Code is built for Anthropic's models; others may not work."
+                : "OpenAI's models work best with Codex."}
+            </span>
+          )}
+          {d.provider === "openrouter" && or && !or.key_present && keyHint}
+          <MoreOptions open={more} onToggle={setMore} summary={moreSummary}>
             {or && (
-              <div class="field">
+              <div class="inline-field">
                 <span class="field-label" id="agent-provider-label">Provider</span>
-                <div class="seg seg-lg" role="radiogroup" aria-labelledby="agent-provider-label">
+                <div class="seg" role="radiogroup" aria-labelledby="agent-provider-label">
                   {(["subscription", "openrouter"] as const).map((p) => {
                     const off = p === "openrouter" && !or.key_present && d.provider !== "openrouter";
                     return (
@@ -1112,111 +1330,9 @@ export function AgentDialog(
                     );
                   })}
                 </div>
-                {!or.key_present && (
-                  <span class="field-hint or-key-hint" id="agent-provider-hint">
-                    {d.provider === "openrouter"
-                      ? "This agent won't start: the backend has no OpenRouter key. "
-                      : "OpenRouter is off. "}
-                    It needs <code>OPENROUTER_API_KEY</code>{" "}
-                    in the environment of Muster's backend, read only when the backend starts. From a shell
-                    that has the key, run <code>env OPENROUTER_API_KEY=… muster reload</code>{" "}
-                    (terminals keep running).
-                  </span>
-                )}
-                {d.provider === "openrouter" && (
-                  <span class="perm-warn or-warn" role="note">
-                    <IconShieldAlert size={13} />{" "}
-                    {OPENROUTER_BADGE}: billed per token to your OpenRouter key, not your {KIND_LABEL[d.kind]}{" "}
-                    subscription.{" "}
-                    {d.kind === "claude"
-                      ? "Claude Code is built for Anthropic's models; others may not work."
-                      : "OpenAI's models work best with Codex."}
-                  </span>
-                )}
               </div>
             )}
-            <div class="field-row">
-              {d.provider === "openrouter"
-                ? (
-                  <OpenRouterModelField
-                    kind={d.kind}
-                    value={d.model}
-                    custom={custom.model}
-                    list={orList}
-                    loading={orLoading}
-                    onChange={setModel}
-                  />
-                )
-                : (
-                  <PickField
-                    label="Model"
-                    value={d.model}
-                    picks={modelPicks(catalog, d.kind)}
-                    custom={custom.model}
-                    customLabel="Custom model"
-                    placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
-                    onChange={setModel}
-                  />
-                )}
-              <PickField
-                label="Effort"
-                value={d.effort}
-                picks={effortPicks(catalog, d.kind, d.model)}
-                custom={custom.effort}
-                customLabel="Custom effort"
-                placeholder="a level the CLI accepts"
-                onChange={(effort, on) => {
-                  set({ effort });
-                  setCustom((c) => ({ ...c, effort: on }));
-                }}
-              />
-            </div>
-            {orBlocked && (
-              <span class="field-hint field-bad">
-                Codex on OpenRouter needs a model with its vendor, e.g. openai/gpt-6.1-sol.
-              </span>
-            )}
-            <label class="field">
-              <span class="field-label">Persona</span>
-              <textarea
-                class="persona-input"
-                rows={7}
-                value={d.persona}
-                placeholder="Who it is and how it works. Muster adds how memory/ and messages work."
-                onInput={(e) => set({ persona: (e.target as HTMLTextAreaElement).value })}
-              />
-              <span class="field-hint">
-                Written to {d.kind === "claude" ? "CLAUDE.md" : "AGENTS.md"}{" "}
-                in its folder; its CLI reads it when a conversation starts.
-              </span>
-            </label>
-            <div class="field">
-              <span class="field-label">Takes messages started by</span>
-              <div class="check-row">
-                {ORIGINS.map((o) => (
-                  <label key={o.o} class="check" data-tip={o.hint}>
-                    <input
-                      type="checkbox"
-                      checked={d.accepts.includes(o.o)}
-                      onChange={(e) => toggleOrigin(o.o, (e.target as HTMLInputElement).checked)}
-                    />
-                    {o.label}
-                  </label>
-                ))}
-              </div>
-              {warn && (
-                <span class="perm-warn agent-warn" role="note">
-                  <IconShieldAlert size={13} /> {UNATTENDED_WARNING}
-                </span>
-              )}
-              {d.accepts.length === 0 && <span class="field-hint field-bad">Pick at least one.</span>}
-            </div>
-            <PermissionsSection
-              value={d.permissions}
-              onChange={(p) => set({ permissions: p })}
-              only={d.kind}
-              note="The profile of the agent's own tab. Only you can change it; it applies from the agent's next start."
-            />
+            {or && d.provider !== "openrouter" && !or.key_present && keyHint}
             <label class="toggle">
               <input
                 type="checkbox"
@@ -1267,9 +1383,9 @@ export function AgentDialog(
                 </div>
               )}
             </div>
-            {err && <div class="form-error">{err}</div>}
-          </div>
-        }
+          </MoreOptions>
+          {err && <div class="form-error">{err}</div>}
+        </div>
         <div class="dlg-foot">
           {askDiscard
             ? (

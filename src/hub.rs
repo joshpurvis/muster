@@ -3282,7 +3282,8 @@ impl Hub {
         };
         let mut spec = adapter_for(info.kind).command(&ctx)?;
         if let Some(agent) = self.agents.by_session(id) {
-            crate::agents::configure_project_command(&agent, &info.cwd, permissions, &mut spec)?;
+            let handoff = crate::agents::handoff_for(self, &agent)?;
+            crate::agents::configure_project_command(&agent, &info.cwd, permissions, handoff.as_ref(), &mut spec)?;
         }
         let continues = crate::cache::continues_conversation(info.kind, &ctx.extra_args) || ctx.resume.is_some();
         // A named agent resuming a conversation whose session row is gone (its task was
@@ -3592,6 +3593,22 @@ impl Hub {
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) {
             e.fenced_generation = Some(e.generation);
         }
+    }
+
+    /// Session `id`'s next (re)start runs on Claude profile `profile` (None: Default): a named
+    /// agent's tab follows its agent's account (`agents::run_agent`). Its running process, if
+    /// any, keeps the account it started with.
+    pub fn set_session_account_profile(&self, id: SessionId, profile: Option<i64>) -> anyhow::Result<()> {
+        let mut g = self.inner.lock();
+        let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        if e.info.account_profile_id == profile {
+            return Ok(());
+        }
+        anyhow::ensure!(e.info.kind == SessionKind::Claude, "only Claude sessions have a Claude profile");
+        self.store.set_session_account_profile(id, profile)?;
+        e.info.account_profile_id = profile;
+        self.publish_session(&e.info);
+        Ok(())
     }
 
     /// Replace a session's agent arguments for its next (re)start (an agent's `--resume`). Checked
@@ -5138,7 +5155,7 @@ mod tests {
                     model: None,
                     effort: None,
                     persona: String::new(),
-                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false,
+                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                     permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
                     channel_id: Some(1),
@@ -5675,7 +5692,7 @@ mod tests {
         let with_agent = |store: &Store, record: &StoredTerminal| {
             store.insert_agent(&crate::agents::Agent {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
-                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false,
+                kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
                 channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
             }).unwrap();
@@ -6509,7 +6526,7 @@ mod tests {
                 store.insert_agent(&crate::agents::Agent {
                     account_profile_id: None, provider: Default::default(), id: 0, name: "cody".into(),
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
-                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, permissions: Permissions::default(),
+                    home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
                     channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
                 }).unwrap();
@@ -6801,7 +6818,7 @@ mod tests {
         let agent =|name: &str, resume: Option<&str>| crate::agents::Agent {
             account_profile_id: None, provider: Default::default(), id: 0, name: name.into(),
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
-            home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, permissions: Permissions::default(),
+            home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
             channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None,
         };

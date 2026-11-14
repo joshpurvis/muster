@@ -73,6 +73,8 @@ import {
   windowsSupported,
   workspaceById,
   workspaces,
+  accountProfiles,
+  accountProfilesSupported,
 } from "./state.ts";
 import { drawerHeight, folderChannel, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
@@ -1811,6 +1813,16 @@ export function setAllSchedulesPaused(paused: boolean) {
 
 export function editAgent(name: string, tab: "settings" | "memory" = "settings") {
   overlay.value = { kind: "agent", name, tab };
+}
+
+/** A Claude agent, with Claude profiles set up: it can move to another account. */
+export function canSwitchAccount(a: Agent | undefined): a is Agent {
+  return !!a && a.kind === "claude" && accountProfilesSupported.value && accountProfiles.value.length > 0;
+}
+
+/** "Switch account…": Edit agent, on its account picker (docs/ACCOUNT_PROFILES.md). */
+export function switchAgentAccount(name: string) {
+  overlay.value = { kind: "agent", name, tab: "settings", focus: "profile" };
 }
 
 

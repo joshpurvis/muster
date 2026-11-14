@@ -12,6 +12,7 @@ import {
   accountProfiles,
   agentBySession,
   altHeld,
+  agents,
   cacheNow,
   channelById,
   coldDismissed,
@@ -143,6 +144,10 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
     items.push({ label: "Move to window", submenu: moveMenu(s.id) });
   }
   items.push({ label: "Move to channel", submenu: channelMoveMenu(s.id) });
+  const owner = agents.value.find((a) => a.session_id === s.id);
+  if (A.canSwitchAccount(owner)) {
+    items.push({ label: "Switch account…", run: () => A.switchAgentAccount(owner.name) });
+  }
   items.push(
     "sep",
     {

@@ -467,7 +467,7 @@ export type Overlay =
   /** "Restart Muster…": the same, then start them again (a terminal host update). */
   | { kind: "restart" }
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
-  | { kind: "agent"; name?: string; tab?: "settings" | "memory"; template?: string }
+  | { kind: "agent"; name?: string; tab?: "settings" | "memory"; template?: string; focus?: "profile" }
   | { kind: "agent_message"; id: number }
   /** New schedule (no `id`; `agent` preselects one) or Edit schedule. `draft`: the fields as
    * typed before Scheduling settings opened over it (the dialog's own shape). */

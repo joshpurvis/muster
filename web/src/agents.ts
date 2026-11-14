@@ -4,6 +4,7 @@
 
 import type {
   Agent,
+  AgentSwitch,
   AgentMessage,
   AgentState,
   LateAnswer,
@@ -379,5 +380,56 @@ export function lateText(a: LateAnswer): string {
     case "refused":
     case "undelivered":
       return `Kept here, not delivered${a.note ? `: ${a.note.replace(/^not delivered:? ?/, "")}` : ""}.`;
+  }
+}
+
+// ---------------- moving to another account (docs/ACCOUNT_PROFILES.md) ----------------
+
+/** Busy as the backend counts it for Save notes and Now (src/agents.rs `session_busy`). */
+export function sessionBusy(s: SessionInfo | undefined): boolean {
+  return !!s && s.state !== "exited" &&
+    (s.queued > 0 || ["starting", "working", "needs_approval", "asking_question", "stuck"].includes(s.state));
+}
+
+/** Why Save notes first can't be asked (null: it can), as the backend decides it (src/agents.rs
+ * `notes_skipped`: only an idle run). `oldName`: the account its run is on. */
+export function saveNotesBlocked(s: SessionInfo | undefined, oldAtLimit: boolean, oldName: string): string | null {
+  if (!s || s.state === "exited") return "It isn't running, so there is nothing to save from.";
+  if (s.state !== "idle" || s.queued > 0) return "It isn't idle. Muster asks only an idle agent.";
+  if (oldAtLimit) return `${oldName} is at its limit, so it couldn't answer.`;
+  return null;
+}
+
+/** The message after saving a move (`agent.update`'s `switch`). */
+export function switchMessage(name: string, sw: AgentSwitch): { level: "success" | "warn"; text: string } {
+  const notes = sw.notes === "asked"
+    ? ""
+    : sw.notes_skipped === "at_limit"
+    ? " Save notes was skipped: its current account is at its limit."
+    : "";
+  switch (sw.outcome) {
+    case "restarted":
+      return { level: "success", text: `${name} moved to ${sw.to}: a new conversation started there.${notes}` };
+    case "busy":
+      return { level: "warn", text: `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}` };
+    case "replaced":
+      return { level: "warn", text: `A newer move of ${name} replaced this one.` };
+    case "after_notes":
+      return {
+        level: "success",
+        text: `Asked ${name} to save its notes. It moves to ${sw.to} once it replies (at most 10 minutes), then restarts if idle.`,
+      };
+    case "failed":
+      return {
+        level: "warn",
+        text: `${name} didn't restart: ${sw.error ?? "unknown error"}. It moves to ${sw.to} at its next start.`,
+      };
+    default:
+      return {
+        level: "success",
+        text: sw.notes === "asked"
+          ? `Asked ${name} to save its notes. It moves to ${sw.to} at its next start.`
+          : `Saved. ${name} moves to ${sw.to} at its next start.${notes}`,
+      };
   }
 }

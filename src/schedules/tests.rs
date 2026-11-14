@@ -306,7 +306,7 @@ fn agent(name: &str, kind: SessionKind, provider: Provider, accepts: Vec<Origin>
         effort: None,
         persona: String::new(),
         home_dir: format!("/tmp/muster-schedule-test/{name}"),
-            working_location: Default::default(), reset_on_next_start: false,
+            working_location: Default::default(), reset_on_next_start: false, handoff: None,
         permissions: Permissions::default(),
         accepts_origins: accepts,
         channel_id: None,

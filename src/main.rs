@@ -483,7 +483,8 @@ enum AgentCmd {
     New {
         /// Agent name: letters, digits, `-`, `_` (unique, case-insensitive).
         name: String,
-        /// Pin this Claude agent to a profile name/id, or "default". Fixed after creation.
+        /// Pin this Claude agent to a profile name/id, or "default" (`agent edit --profile`
+        /// moves it later).
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
         #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
@@ -518,9 +519,23 @@ enum AgentCmd {
         perms: AgentPerms,
     },
     /// Change an agent: persona, model, effort, accepted origins, autostart, permissions
-    /// (model, effort and permissions apply from its next start).
+    /// (model, effort and permissions apply from its next start), or its Claude account.
     Edit {
         name: String,
+        /// Move this Claude agent to another profile (name/id, or "default"): its next start is
+        /// a new conversation there, with HANDOFF.md from Muster's records; memory/ comes along.
+        /// An agent that takes scheduled or triggered work moves only from Muster's window.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// With --profile: restart it now if it is idle (otherwise at its next start).
+        #[arg(long, requires = "profile")]
+        now: bool,
+        /// With --profile: don't first ask a running, idle agent to save notes into memory/.
+        #[arg(long, requires = "profile")]
+        no_save_notes: bool,
+        /// With --profile: why, written into its HANDOFF.md.
+        #[arg(long, value_name = "TEXT", requires = "profile")]
+        reason: Option<String>,
         /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
         /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
         #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
@@ -763,6 +778,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 cli::AgentOpts {
                     name,
                     profile,
+                    switch: Default::default(),
                     kind: Some(kind),
                     provider,
                     model,
@@ -777,6 +793,10 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             ),
             AgentCmd::Edit {
                 name,
+                profile,
+                now,
+                no_save_notes,
+                reason,
                 provider,
                 model,
                 effort,
@@ -791,7 +811,8 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 cli::AgentOpts {
                     name,
                     kind: None,
-                    profile: None,
+                    profile,
+                    switch: cli::SwitchOpts { now, save_notes: !no_save_notes, reason },
                     provider,
                     model,
                     effort,

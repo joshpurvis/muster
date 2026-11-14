@@ -2435,8 +2435,24 @@ pub fn profile_login_changed(d: &Discovery, profile: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// `muster agent edit --profile`'s companions (docs/CLI.md).
+#[derive(Debug)]
+pub struct SwitchOpts {
+    pub now: bool,
+    pub save_notes: bool,
+    pub reason: Option<String>,
+}
+
+impl Default for SwitchOpts {
+    fn default() -> Self {
+        SwitchOpts { now: false, save_notes: true, reason: None }
+    }
+}
+
 pub struct AgentOpts {
+    /// `agent new`: the profile it is pinned to; `agent edit`: the profile it moves to.
     pub profile: Option<String>,
+    pub switch: SwitchOpts,
     pub provider: Option<String>,
     pub name: String,
     pub kind: Option<String>,
@@ -2551,9 +2567,43 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     } else {
         Value::Null
     };
-    let b = client::rpc(d, "agent.update", o.params(&base)?)?;
+    let mut params = o.params(&base)?;
+    if let Some(profile) = &o.profile {
+        params["account_profile"] = profile_choice(d, profile)?;
+        params["now"] = json!(o.switch.now);
+        params["save_notes"] = json!(o.switch.save_notes);
+        if let Some(r) = &o.switch.reason {
+            params["handoff_reason"] = json!(r);
+        }
+    }
+    let b = client::rpc(d, "agent.update", params)?;
     print_agent("updated", &b, &o.name);
+    if let Some(line) = switch_line(b["name"].as_str().unwrap_or(&o.name), &b["switch"]) {
+        println!("  {line}");
+    }
     Ok(())
+}
+
+/// What `agent.update`'s `switch` says happened to a move to another account, in a line.
+pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
+    let to = sw["to"].as_str()?;
+    let notes = match (sw["notes"].as_str(), sw["notes_skipped"].as_str()) {
+        (Some("asked"), _) => format!(" Asked it to save notes first (it has up to {} minutes).",
+            crate::agents::SAVE_NOTES_WAIT.as_secs() / 60),
+        (_, Some("at_limit")) => " Save notes skipped: its current account is at its limit.".into(),
+        (_, Some("busy")) if sw["now"] != true => " Save notes skipped: it isn't idle.".into(),
+        _ => String::new(),
+    };
+    let what = match sw["outcome"].as_str() {
+        Some("restarted") => format!("{name} moved to {to}: a new conversation started there."),
+        Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
+        Some("replaced") => format!("A newer move of {name} replaced this one."),
+        Some("after_notes") => format!("{name} moves to {to} once it has saved its notes, then restarts if idle."),
+        Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
+            sw["error"].as_str().unwrap_or("unknown error")),
+        _ => format!("{name} moves to {to} at its next start (a new conversation; memory/ comes along)."),
+    };
+    Some(format!("{what}{notes}"))
 }
 
 /// `muster agent ls`: `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`.

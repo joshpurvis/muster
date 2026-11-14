@@ -583,6 +583,9 @@ interface MockAgent {
   session_id: number | null;
   resumable: boolean;
   created_at: number;
+  account_profile_id?: number | null;
+  handoff?: { from: number | null; at: number; reason?: string } | null;
+  reset_on_next_start?: boolean;
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
@@ -720,6 +723,8 @@ function newAgent(p: any): MockAgent {
     session_id: null,
     resumable: false,
     created_at: now(),
+    account_profile_id: typeof p.account_profile === "number" ? p.account_profile : null,
+    handoff: null,
   };
   agentList.push(a);
   memory.set(a.name, new Map());
@@ -1159,8 +1164,27 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         }
         a.accepts_origins = p.accepts;
       }
+      // A move to another account (src/agents.rs `update_switch` / `switch_account`, loosely).
+      const to = p.account_profile === undefined ? undefined : typeof p.account_profile === "number" ? p.account_profile : null;
+      let sw: Record<string, unknown> | undefined;
+      if (to !== undefined && to !== (a.account_profile_id ?? null)) {
+        if (a.kind !== "claude") throw new Error("account_profile is only supported for Claude agents");
+        a.handoff = { from: a.handoff?.from ?? a.account_profile_id ?? null, at: now(), reason: p.handoff_reason };
+        a.account_profile_id = to;
+        a.reset_on_next_start = true;
+        const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
+        const live = !!s && s.state !== "exited";
+        const notes = p.save_notes !== false && live && s.state === "idle";
+        sw = {
+          to: accountProfiles.find((x) => x.id === to)?.name ?? "Default",
+          now: !!p.now,
+          notes: notes ? "asked" : "skipped",
+          notes_skipped: notes ? undefined : p.save_notes === false ? "off" : live ? "busy" : "not_running",
+          outcome: notes && p.now ? "after_notes" : p.now && live ? (s.state === "idle" ? "restarted" : "busy") : "next_start",
+        };
+      }
       broadcast("agent_upserted", agentJson(a));
-      return agentJson(a);
+      return sw ? { ...agentJson(a), switch: sw } : agentJson(a);
     }
     case "agent.remove": {
       const a = agentNamed(p.name);

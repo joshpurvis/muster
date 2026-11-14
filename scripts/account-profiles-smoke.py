@@ -30,6 +30,8 @@ ENV = {
     "MUSTER_RUNTIME_DIR": str(RUNTIME), "MUSTER_DATA_DIR": str(DATA), "MUSTER_PORT": str(PORT),
     "CLAUDE_CONFIG_DIR": str(BASE / "default"), "PROFILE_LAUNCH_LOG": str(BASE / "launches.jsonl"),
     "STATUSLINE_DIR": str(BASE / "statusline"),
+    # Save notes first waits this long for a reply (debug builds only), not 10 minutes.
+    "MUSTER_TEST_SAVE_NOTES_WAIT_MS": "6000",
 }
 (BASE / "statusline").mkdir(mode=0o700)
 if "--browser" in sys.argv:
@@ -251,6 +253,100 @@ try:
     replacement = rpc("agent.start", {"name": "reviewer"})["session"]
     check(replacement["account_profile_id"] == personal and "fixture-conversation" in launched(replacement["id"])["args"],
           "named-agent replacement session retains profile and resume ID")
+
+    # ----- moving a named agent to another account (docs/ACCOUNT_PROFILES.md, Phase A) -----
+    def hooks(sid, conversation, reply=None):
+        mcp = json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())
+        run = mcp["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
+        for event, payload in (("SessionStart", {"session_id": conversation}),
+                               ("Stop", {"session_id": conversation, **({"last_assistant_message": reply} if reply else {})})):
+            status, _ = http(f"/hook/{event}", payload, run)
+            assert status == 200, event
+
+    def reviewer():
+        return next(x for x in rpc("agent.list") if x["name"] == "reviewer")
+
+    def launches(sid):
+        rows = [json.loads(line) for line in (BASE / "launches.jsonl").read_text().splitlines()]
+        return [r for r in rows if r["id"] == sid]
+
+    sid = replacement["id"]
+    moved = cli("agent", "edit", "reviewer", "--profile", "Work", "--no-save-notes", "--reason", "smoke move")
+    check("reviewer moves to Work at its next start" in moved, "the CLI move says when it applies")
+    rec = reviewer()
+    check(rec["account_profile_id"] == work and rec["handoff"]["from"] == personal and rec["reset_on_next_start"]
+          and session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal,
+          "a move is recorded without touching the running process or its tab's profile")
+    home = Path(rec["home_dir"])
+    cli("profile", "disable", "Work")
+    rpc("session.restart", {"id": sid}, error="disabled")
+    rec = reviewer()
+    check(session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal
+          and rec["handoff"] and rec["reset_on_next_start"] and rec["resumable"],
+          "a tab restart onto a disabled profile changes nothing: same run, tab, conversation and pending move")
+    cli("profile", "enable", "Work")
+    first = rpc("session.restart", {"id": sid})
+    run = launched(sid, first["pid"])
+    prompt = run["args"][run["args"].index("--append-system-prompt") + 1] if "--append-system-prompt" in run["args"] else ""
+    check(run["config_dir"] == str(BASE / "work") and "--resume" not in run["args"]
+          and "moved you from Claude account Home to Work" in prompt and "HANDOFF.md" in prompt,
+          "the first start after a move runs on the new profile, a new conversation, told to read HANDOFF.md")
+    handoff = (home / "HANDOFF.md").read_text()
+    check(handoff.startswith("<!-- Written by Muster") and "Home to Work" in handoff and "smoke move" in handoff and (home / "HANDOFF.md").stat().st_mode & 0o777 == 0o600,
+          "HANDOFF.md holds the move and the reason, private to the owner")
+    check(session(sid)["account_profile_id"] == work and reviewer()["handoff"] is None and not reviewer()["reset_on_next_start"],
+          "the agent's tab follows its account, and the handoff is done once that run started")
+    hooks(sid, "moved-conversation")
+    stamp = (home / "HANDOFF.md").stat().st_mtime_ns
+    second = rpc("session.restart", {"id": sid})
+    run = launched(sid, second["pid"])
+    check(run["config_dir"] == str(BASE / "work") and "moved-conversation" in run["args"]
+          and "--append-system-prompt" not in run["args"] and (home / "HANDOFF.md").stat().st_mtime_ns == stamp,
+          "the second start resumes the new conversation with no handoff")
+    # Refused like a choice at creation.
+    def refused(*args):
+        p = subprocess.run([str(BIN), *args], env=ENV, cwd=REPO, text=True, capture_output=True, timeout=20)
+        return p.returncode != 0 and p.stderr
+    cli("agent", "new", "coder", "--kind", "codex")
+    cli("agent", "new", "nightly", "--accepts", "human,schedule")
+    cli("profile", "disable", "Home")
+    no_codex = refused("agent", "edit", "coder", "--profile", "Work")
+    no_disabled = refused("agent", "edit", "nightly", "--profile", "Home")
+    cli("profile", "enable", "Home")
+    no_outside = refused("agent", "edit", "nightly", "--profile", "Work")
+    check(no_codex and "only supported for Claude" in no_codex and no_disabled and "disabled" in no_disabled
+          and no_outside and "click" in no_outside and next(x for x in rpc("agent.list") if x["name"] == "nightly")["account_profile_id"] is None,
+          "Codex agents, disabled profiles and a scheduled agent moved from outside the window are refused")
+    # Now, without Save notes: an idle agent restarts on the new profile at once.
+    hooks(sid, "moved-conversation")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    sw = rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": False})["switch"]
+    now_pid = session(sid)["pid"]
+    check(sw["outcome"] == "restarted" and launched(sid, now_pid)["config_dir"] == str(BASE / "personal")
+          and "--resume" not in launched(sid, now_pid)["args"], "Now restarts an idle agent on the new profile")
+    # Save notes first: asked, the move waits for the reply, then Now restarts it.
+    hooks(sid, "home-again")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    asked_at = time.monotonic()
+    sw = rpc("agent.update", {"name": "reviewer", "account_profile": work, "now": True})["switch"]
+    check(sw["notes"] == "asked" and sw["outcome"] == "after_notes", "Save notes first is asked of a running, idle agent")
+    asked = until("the save-notes message", lambda: next((m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"]
+                                                        if "You are moving to account Work" in (m.get("text") or "")), None))
+    time.sleep(1.5)
+    check(session(sid)["pid"] == now_pid, "the move waits for the agent's reply")
+    hooks(sid, "home-again", reply="Saved my notes to memory/.")
+    replied_pid = until("the restart after the reply", lambda: session(sid)["pid"] != now_pid and session(sid)["pid"])
+    check(time.monotonic() - asked_at < 5.5 and launched(sid, replied_pid)["config_dir"] == str(BASE / "work")
+          and next(m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"] if m["id"] == asked["id"])["reply"]
+          == "Saved my notes to memory/.", "once it replies, the agent restarts on the new profile")
+    # No reply: the move goes ahead once the wait is over.
+    hooks(sid, "work-again")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    started = time.monotonic()
+    rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True})
+    timed_pid = until("the restart after the wait", lambda: session(sid)["pid"] != replied_pid and session(sid)["pid"])
+    check(time.monotonic() - started >= 5 and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
+          "without a reply, the move goes ahead after the wait")
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())

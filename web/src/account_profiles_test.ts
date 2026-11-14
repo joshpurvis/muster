@@ -1,6 +1,7 @@
 import {
   accountBars,
   asOf,
+  atLimit,
   codexBars,
   formatAge,
   inheritedProfile,
@@ -249,4 +250,23 @@ Deno.test("the collapsed Usage heading shows the fullest current figure, never a
   if (!peak.tip.includes("Default") || !peak.tip.includes("Weekly")) throw new Error(peak.tip);
   equal(peakUsage(accountBars({ ...usage, rows: [usage.rows[1]] }, NOW)), null);
   equal(peakUsage([]), null);
+});
+
+Deno.test("an account is at its limit only on a current figure of 100%", () => {
+  const usage = (r: Partial<UsageRow>): AccountUsage => ({
+    evaluated_at: NOW,
+    stale_after_ms: 600_000,
+    rows: [row({}), row({ choice: 2, name: "Work", ...r })],
+    suggestion: null,
+    no_suggestion: null,
+  });
+  const full = win({ status: "current", used_percentage: 100, resets_at: NOW / 1000 + 3600, observed_at: NOW });
+  equal(atLimit(null, 2, NOW), false);
+  equal(atLimit(usage({}), 2, NOW), false);
+  equal(atLimit(usage({ seven_day: full }), 2, NOW), true);
+  equal(atLimit(usage({ seven_day: full }), "default", NOW), false);
+  equal(atLimit(usage({ five_hour: { ...full, used_percentage: 99 } }), 2, NOW), false);
+  equal(atLimit(usage({ seven_day: { ...full, status: "stale" } }), 2, NOW), false);
+  // Its reset passed: the old figure no longer applies.
+  equal(atLimit(usage({ seven_day: full }), 2, NOW + 3601_000), false);
 });

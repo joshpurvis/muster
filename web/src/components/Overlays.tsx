@@ -180,6 +180,7 @@ export function Overlays() {
           name={o.name}
           tab={o.tab}
           template={o.template}
+          focus={o.focus}
           Modal={Modal}
           close={close}
         />

@@ -104,6 +104,14 @@ export function lastObserved(row: UsageRow, now: number): string {
   return "Never";
 }
 
+/** Is `choice`'s account at a limit now: a current 5-hour or weekly figure at 100% (src/usage.rs
+ * `UsageRow::at_limit`)? Unknown or stale usage is not. */
+export function atLimit(usage: AccountUsage | null, choice: ProfileChoice, now: number): boolean {
+  if (!usage) return false;
+  const row = asOf(usage, now).rows.find((r) => (r.choice ?? "default") === choice);
+  return !!row && [row.five_hour, row.seven_day].some((w) => w.status === "current" && (w.used_percentage ?? 0) >= 100);
+}
+
 export const sameChoice = (a: ProfileChoice | undefined, b: ProfileChoice | undefined) =>
   (a ?? "default") === (b ?? "default");
 

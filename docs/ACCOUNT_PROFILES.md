@@ -1,8 +1,9 @@
 # Claude account profiles and machine placement
 
 Status: local profiles implemented, 2026-10-18. Usage display and placement suggestions
-(manual choice plus a recommendation) implemented, 2026-10-26. Automatic placement and handoff
-remain deferred. This expands the account and
+(manual choice plus a recommendation) implemented, 2026-10-26. Moving a named agent to another
+account by hand (Phase A below) implemented, 2026-11-13. Automatic placement and the handoff of
+an ordinary task remain deferred. This expands the account and
 quota-aware scheduling ideas in [PLAN.md](../PLAN.md). The existing terminal backend remains
 the starting point.
 
@@ -37,9 +38,10 @@ directory, not a verified account identity.
   keep showing the user's own status line beside its usage reporter, never through a link (see
   "Usage display and suggestions" below). Nothing else in those files is kept.
 - Select a profile with `muster new --profile NAME`, the New Tab dialog, or
-  `muster agent new NAME --profile PROFILE`. Named-agent profile bindings are fixed at
-  creation, including for replacement sessions and `--fresh`. Create another named agent
-  to use another profile; switching an existing agent is part of the deferred handoff work.
+  `muster agent new NAME --profile PROFILE`. A named agent keeps its profile for replacement
+  sessions and `--fresh`; moving it to another profile (Edit agent, or `muster agent edit NAME
+  --profile PROFILE`) starts a new conversation there with a handoff note (see "Moving a named
+  agent to another account" below).
   The New Tab dialog starts with explicit **Default**; choose the profile for each new
   session. Profile settings do not show the backend's saved workspace history. Workspace
   defaults remain available through the CLI for launches that omit an explicit choice.
@@ -369,6 +371,125 @@ does not resolve that question. Revisit the current [authentication and credenti
 rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
 before expanding this behavior.
 
+## Moving a named agent to another account (plan 2026-11-13; Phase A built 2026-11-13)
+
+Before Phase A, a named agent's profile was fixed when it was created: Fresh start reused it and
+Edit agent greyed the picker out. An agent's notes already live outside every profile
+(`<data>/agents/<name>/memory/`, checked 2026-11-13: all agents' notes are there, none in a
+profile's `projects/*/memory/`). What stays behind is its conversation, which lives in the old
+profile's folder and can't be resumed from another. Moving an agent therefore means: same name,
+home and notes, a new conversation on the new account, and a handoff note so it picks up where
+it left off.
+
+### Phase A: switch account by hand (built 2026-11-13)
+
+What the owner sees:
+
+- **Edit agent:** the account picker becomes active for Claude agents. When the owner picks
+  another account, the dialog says: "Moving to Work starts a new conversation. Its memory/ notes
+  come along. The current conversation stays on Personal." Below it are two choices, **At its
+  next start** (the default) and **Now**. *Now* restarts the agent only if it is idle, using the
+  same check as `start_fresh_if`. If it is busy, the dialog says so and the switch waits for the
+  next start.
+- **Save notes first** (checkbox, on by default when the agent is running, idle and its current
+  account still has room): before switching, Muster sends one message, "You are moving to
+  account Work. Write anything you would need to continue into memory/ now." Muster switches
+  once the reply arrives, or after 10 minutes. It is skipped when the old account is at its
+  limit.
+- **Agents panel / tab menu:** "Switch account…" opens the same choice.
+- **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--no-save-notes]`.
+
+How it works:
+
+1. `AgentUpdate` gains `account_profile`. Changing it always sets `reset_on_next_start = true`,
+   because a conversation can't follow it to the new account (there is no "keep" option, unlike a
+   location change). It also records `handoff_from` (the old profile ID, new column, store
+   migration). `set_config` and `update_agent_config` write `account_profile_id`.
+2. The agent's own tab keeps its profile on its session record, and `restart_session_at` reuses
+   that record, so `run_agent` sets the session's profile to the agent's before restarting it.
+3. Same checks as at creation: Claude agents only, the target profile must be enabled and
+   present (`check_account_profile`), and picking the current profile again is not a change.
+   Moving an agent that takes scheduled or webhook work, or is named in a schedule, changes which
+   account pays for unattended runs. So, like a provider change (`widens_unattended`), it takes a
+   click in Muster's window and is refused from the CLI or MCP.
+4. Handoff, from Muster's own records only (the old profile folder is never opened): before the
+   first start after a switch, Muster writes `<home>/HANDOFF.md`, which it owns and overwrites on
+   each switch. It holds the old and new account names and the time, the agent's last 5 requests
+   and replies from `agent_messages` (each cut to about 2,000 characters), any message still
+   waiting for a reply, and an optional reason typed in the dialog. That run gets
+   `--append-system-prompt` "Muster moved you from Personal to Work; your previous conversation
+   is not available. Read HANDOFF.md and memory/ before your first task." This costs no extra
+   turn. `handoff_from` is cleared once that run has started.
+5. The old conversation stays in the old profile untouched. Switching back later starts a new
+   conversation again. Resuming the old one would bring back a stale context.
+
+Tests: switching a profile forces a reset and moves the tab's profile; the first start writes
+HANDOFF.md and passes the prompt, and the second start does neither; a Codex agent, a disabled
+profile and a scheduled agent switched from outside the window are refused; Save notes waits for
+the reply and gives up after its timeout. The smoke test (`scripts/account-profiles-smoke.py`)
+switches a fake-Claude agent between two synthetic profiles and checks each run's
+`CLAUDE_CONFIG_DIR`. `docs/PROTOCOL.md` and `docs/CLI.md` document the new field and flags.
+
+Review after building (owner, 2026-11-13): no Claude reviews; one Codex Terra review, and Astra
+only if Terra or the change itself gives a real reason.
+
+As built (2026-11-13), where it adds to the plan above:
+
+- The pending move is the `handoff_from` column (store migration v28), a JSON record
+  (`agents::Handoff`: the old profile, the time, the reason), because the old profile can be
+  Default (no ID). A second move before any start keeps the first move's old profile, where the
+  conversation still is. Choosing "keep the conversation" for a location change can't undo a
+  move's reset; a move together with a location change needs no keep-or-reset choice.
+- HANDOFF.md quotes the last 5 messages Muster delivered (refused ones left out), each text and
+  reply cut to 2,000 bytes, oldest first, marking one still waiting for a reply with how to answer
+  it (MCP `reply` with its `msg_id`); up to 10 older unanswered ones follow. Texts sit in fences
+  no line of them can close; messages still queued are left out (they reach the new
+  conversation themselves). While a move is pending, every start or tab restart begins a new
+  conversation, whatever conversation id was saved meanwhile (an old run's hook, an older
+  backend's run on the old profile), and a restart onto a profile that can't start changes
+  nothing. HANDOFF.md's first line says Muster wrote it; an agent's own HANDOFF.md is renamed
+  to `HANDOFF.agent.md` first, never overwritten.
+- An agent working in a repository has HANDOFF.md outside its folders, so the note's text goes
+  into its appended system prompt with the persona, instead of a file to read. An agent working
+  in its home reads the file.
+- Save notes first is skipped when the agent isn't running or isn't idle (an errored run is not
+  idle; the same test as Now), or the account its run is on is at its limit (a current 5-hour or weekly figure at 100%; unknown,
+  stale or reset usage never counts). The wait runs in the backend: a backend reload during it
+  drops the pending Now restart, and the move then applies at the next start. A turn stopped on
+  a permission prompt keeps the wait going. A refused or failed message switches at once. Now
+  checks, under the start lock, that the move is still the newest (`replaced` otherwise). Known
+  gaps, noted from the review and not handled: a restart by the owner during the wait moves the
+  agent at once (the notes request is abandoned); a second move saved while a start of the first
+  is launching gives that run the second move's prompt (its next start then hands off again);
+  a run that exits at once still counts as the handoff's start.
+- The Now restart and its outcome after Save notes are notices, since the dialog has closed:
+  "saved its notes and moved to Work", or busy (moves at its next start).
+- `agent.update` replies with `switch` (docs/PROTOCOL.md). The CLI also takes `--reason TEXT`.
+- Also from a Claude agent's tab menu ("Switch account…"), not only the Agents panel row.
+
+### Phase B: an agent that can use either account
+
+- The account setting becomes **Fixed: Personal** (as today) or **Either: Personal, Work** (an
+  ordered list of allowed accounts, first is preferred).
+- A restart that resumes a conversation always stays on the account that conversation lives on
+  (a new `conversation_profile_id`). Only a **new** conversation picks an account: a fresh
+  start, a reset, the owner's context resets (`muster agent start --fresh`), or a wake that
+  resets. That choice uses the existing suggestion rule (`src/usage.rs`: current figures only,
+  lowest fuller window, never at 90% or more). With no current figures it uses the first
+  preference. Then Phase A's handoff runs.
+- When the conversation's account is at its limit and a message arrives, Muster shows "Personal
+  is at its limit until 3:40. Move to Work?" with a button. It does not move by itself.
+- **Gate before any automatic move:** moving a running agent to another account without a click
+  is the "automatic quota rollover" this document defers above. Before building it, do a dated
+  check of Anthropic's current
+  [authentication and credential rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+  and record the answer here. Picking an account at the start of a new conversation from the
+  owner's own allowed list is the same as the manual suggestion that already exists.
+
+Also worth a small follow-up: a **setup check** in Settings → Claude profiles that lists the
+skills, plugins and MCP servers one profile has and another lacks (names only, from the files
+Muster may read), so a moved agent doesn't silently lose a tool.
+
 ## Multiple backend machines
 
 Keep one logical Muster coordinator and one client view. Each backend runs a local worker
@@ -402,6 +523,8 @@ has stopped. Cross-machine handoff is deferred until these mechanics are impleme
    selection is not built.*
 4. **Local handoff.** Add a human-selected continuation under another profile, using the
    existing worktree and recorded task context. Ensure there is only one active writer.
+   *Named agents done 2026-11-13 ("Moving a named agent to another account", Phase A); ordinary
+   tasks are not.*
 5. **Remote workers.** Add machine ownership, authenticated transport, reconciliation, and
    worker-local profiles. Extend the same placement model to remote machines.
 6. **Remote handoff.** Add explicit transfer of working files and task context after remote

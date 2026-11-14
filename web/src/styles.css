@@ -4168,6 +4168,28 @@ textarea {
   gap: 12px;
 }
 
+/* Edit agent: moving it to another account. */
+.move-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.move-panel .field-hint {
+  margin: 0;
+}
+
+.move-panel .check.muted {
+  cursor: default;
+}
+
+.dialog .quiet-input.move-reason {
+  padding: 6px 10px;
+  border-color: var(--border);
+  background: var(--bg-overlay);
+}
+
 .pill-panel-row {
   display: flex;
   align-items: center;

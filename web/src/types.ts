@@ -59,6 +59,14 @@ export interface UsageSuggestion {
   reason: string;
 }
 
+/** `codex_usage.get`: Codex's plan limits as its newest session log on this machine saw them. */
+export interface CodexUsage {
+  /** Unix ms of the event that carried the figures. */
+  observed_at: number;
+  windows: { window_minutes: number; used_percentage: number; resets_at: number | null }[];
+  plan: string | null;
+}
+
 /** `account_usage.get` / `hello.account_usage`. */
 export interface AccountUsage {
   evaluated_at: number;

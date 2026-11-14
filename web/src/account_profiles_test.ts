@@ -1,9 +1,12 @@
 import {
+  accountBars,
   asOf,
+  codexBars,
   formatAge,
   inheritedProfile,
   lastObserved,
   parseProfileChoice,
+  peakUsage,
   profileName,
   suggestionView,
   windowCell,
@@ -176,4 +179,74 @@ Deno.test("a snapshot that can't be refreshed expires its own figures and sugges
     null,
     "Usage could not be refreshed from Muster, so nothing is suggested.",
   ]);
+});
+
+Deno.test("the sidebar shows one entry per account and only colours current figures", () => {
+  const resets = NOW / 1000 + 3600;
+  const usage: AccountUsage = {
+    evaluated_at: NOW,
+    stale_after_ms: 600_000,
+    suggestion: null,
+    no_suggestion: null,
+    rows: [
+      row({ five_hour: win({ status: "current", used_percentage: 93, resets_at: resets, observed_at: NOW }) }),
+      row({ choice: 1, name: "Main", account: "account-0" }),
+      row({
+        choice: 2,
+        name: "Work",
+        account: "account-2",
+        five_hour: win({ status: "stale", used_percentage: 80, observed_at: NOW - 3_600_000 }),
+      }),
+    ],
+  };
+  const bars = accountBars(usage, NOW);
+  equal(bars.map((b) => b.name), ["Default · Main", "Work"]);
+  const [five0, week0] = bars[0].bars.map((b) => b.bar);
+  const five1 = bars[1].bars[0].bar;
+  equal([five0.label, five0.level, five0.current], ["93%", "high", true]);
+  equal([week0.label, week0.fill], ["–", null]);
+  equal([five1.label, five1.level, five1.current], ["80%", "ok", false]);
+  if (!five1.tip.includes("stale")) throw new Error(five1.tip);
+});
+
+Deno.test("Codex shows its own windows, labelled by length, and ages like Claude's", () => {
+  const u = {
+    observed_at: NOW - 60_000,
+    plan: "pro",
+    windows: [
+      { window_minutes: 10080, used_percentage: 76, resets_at: NOW / 1000 + 86_400 },
+      { window_minutes: 300, used_percentage: 20, resets_at: NOW / 1000 - 1 },
+    ],
+  };
+  const c = codexBars(u, NOW, 600_000)!;
+  equal(c.bars.map((b) => [b.label, b.bar.label, b.bar.level]), [["5h", "–", "ok"], ["Wk", "76%", "warn"]]);
+  equal(codexBars(u, NOW + 700_000, 600_000)!.bars[1].bar.current, false);
+  equal(codexBars(null, NOW, 600_000), null);
+});
+
+Deno.test("the collapsed Usage heading shows the fullest current figure, never a stale one", () => {
+  const resets = NOW / 1000 + 3600;
+  const usage: AccountUsage = {
+    evaluated_at: NOW,
+    stale_after_ms: 600_000,
+    suggestion: null,
+    no_suggestion: null,
+    rows: [
+      row({
+        five_hour: win({ status: "current", used_percentage: 40, resets_at: resets, observed_at: NOW }),
+        seven_day: win({ status: "current", used_percentage: 78, resets_at: resets, observed_at: NOW }),
+      }),
+      row({
+        choice: 2,
+        name: "Work",
+        account: "account-2",
+        five_hour: win({ status: "stale", used_percentage: 95, observed_at: NOW - 3_600_000 }),
+      }),
+    ],
+  };
+  const peak = peakUsage(accountBars(usage, NOW))!;
+  equal([peak.name, peak.label, peak.level], ["Default", "78%", "warn"]);
+  if (!peak.tip.includes("Default") || !peak.tip.includes("Weekly")) throw new Error(peak.tip);
+  equal(peakUsage(accountBars({ ...usage, rows: [usage.rows[1]] }, NOW)), null);
+  equal(peakUsage([]), null);
 });

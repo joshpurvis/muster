@@ -150,7 +150,7 @@ export function Overlays() {
   if (!o) return null;
   switch (o.kind) {
     case "account_profiles":
-      return <AccountProfilesDialog Modal={Modal} close={close} />;
+      return <AccountProfilesDialog Modal={Modal} close={close} account={o.account} />;
     case "jump":
       return <Jump key={o.initial} initial={o.initial} />;
     case "new_tab":

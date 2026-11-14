@@ -1158,6 +1158,7 @@ may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nul
 | `account_profile.update` | `{id, name?, enabled?}` | `AccountProfile`; the directory is immutable; disabling leaves running processes alone |
 | `workspace.set_account_profile` | `{id, account_profile}` | `Workspace`; profile ID or `"default"`; affects only future selection |
 | `account_usage.get` | `{}` | `UsageSnapshot` (below) |
+| `codex_usage.get` | `{}` | `CodexUsage \| null` (below); null when no recent Codex session log has plan limits |
 | `account_profile.same_account` | `{id, with: number \| null}` | `AccountProfile`; `with`: the profile it signs in to the same account as, `null`: its own account |
 | `account_profile.login_changed` | `{account_profile: number \| "default"}` | `UsageSnapshot`; forgets that profile's (or Default's) usage and its same-account declaration |
 
@@ -1176,6 +1177,12 @@ reason}` or null with `no_suggestion` saying why; it is advice only (docs/ACCOUN
 and `account_usage_changed` sends a new one when an observation, a profile or a declaration
 changes. Statuses age with time, so a client showing them re-reads `account_usage.get`
 periodically.
+
+`CodexUsage` is `{observed_at (Unix ms), windows[], plan}`, each window `{window_minutes,
+used_percentage, resets_at (Unix s or null)}`. Muster reads it from the newest `token_count`
+event in Codex's own session logs (`$CODEX_HOME/sessions`, else `~/.codex/sessions`; the six most recently
+modified logs), so it is only as fresh as the last Codex turn on this machine; clients age it
+with the same `stale_after_ms` as Claude's figures. It sends no request to OpenAI.
 
 These management methods are local-client-only (not available to paired devices or MCP).
 There is no login, token, configuration-file copy, or directory deletion API.

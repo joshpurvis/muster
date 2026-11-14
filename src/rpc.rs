@@ -485,6 +485,10 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             require_local(who, method)?;
             to_value(hub.account_usage()?)
         }
+        "codex_usage.get" => {
+            require_local(who, method)?;
+            to_value(crate::codex_usage::read(&crate::codex_usage::codex_home()))
+        }
         "account_profile.same_account" => {
             require_local(who, method)?;
             #[derive(Deserialize)]

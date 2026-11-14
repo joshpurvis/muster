@@ -17,6 +17,7 @@ import { cx, tildify } from "../util.ts";
 import { InlineEdit, StateDot } from "./common.tsx";
 import { contextMenu, openMenuAt, type MenuItem } from "./Menu.tsx";
 import { AgentsPanel } from "./Agents.tsx";
+import { UsageCard } from "./AccountProfiles.tsx";
 import { agentsHeaderItems } from "./Schedules.tsx";
 
 function channelViewItems(): MenuItem[] {
@@ -36,8 +37,10 @@ export function Sidebar() {
   const resize = (e: PointerEvent) => {
     if (e.button !== 0 || !ref.current) return;
     e.preventDefault();
-    const rect = ref.current.getBoundingClientRect();
-    const move = (ev: PointerEvent) => updateSidebar({ split: sidebarRatio((ev.clientY - rect.top) / rect.height) });
+    // The split shares only Channels and Agents: the divider and the Usage row below them don't count.
+    const [top, , bottom] = [...ref.current.children].map((c) => c.getBoundingClientRect());
+    const span = top.height + bottom.height;
+    const move = (ev: PointerEvent) => updateSidebar({ split: sidebarRatio((ev.clientY - top.top) / span) });
     const done = () => {
       removeEventListener("pointermove", move);
       removeEventListener("pointerup", done);
@@ -54,8 +57,9 @@ export function Sidebar() {
   return (
     <aside ref={ref} class="sidebar" aria-label="Channels and agents"
       style={{ display: side.hidden ? "none" : undefined,
-        gridTemplateRows: both ? `minmax(80px, ${side.split}fr) 5px minmax(100px, ${1 - side.split}fr)`
-        : `${side.channels ? "minmax(0, 1fr)" : "var(--tab-h)"} 1px ${side.agents ? "minmax(0, 1fr)" : "var(--tab-h)"}` }}>
+        gridTemplateRows: (both ? `minmax(80px, ${side.split}fr) 5px minmax(100px, ${1 - side.split}fr)`
+        : `${side.channels ? "minmax(0, 1fr)" : "var(--tab-h)"} 1px ${side.agents ? "minmax(0, 1fr)" : "var(--tab-h)"}`) +
+        " auto" }}>
       <ChannelsPanel />
       <div class={cx("sidebar-divider", both && "resizable")}
         role="separator" aria-label="Resize channels and agents" aria-orientation="horizontal"
@@ -74,6 +78,7 @@ export function Sidebar() {
           <span class="ap-count">{agents.value.length}</span>
         </button>
       )}
+      <UsageCard />
     </aside>
   );
 }

@@ -6,6 +6,7 @@ mod assets;
 mod cache;
 mod cli;
 mod client;
+mod codex_usage;
 mod detect;
 mod devices;
 mod executables;

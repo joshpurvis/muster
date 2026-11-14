@@ -206,6 +206,15 @@ export const IconUser = (p: P) => (
     <path d="M5 20.5c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5" />
   </Svg>
 );
+/** Horizontal bars on axes: the sidebar's Usage section (Lucide "chart-bar"). */
+export const IconChart = (p: P) => (
+  <Svg {...p}>
+    <path d="M3 3v16a2 2 0 0 0 2 2h16" />
+    <path d="M7 16h8" />
+    <path d="M7 11h12" />
+    <path d="M7 6h3" />
+  </Svg>
+);
 /** A dial: reasoning effort (Lucide "gauge"). */
 export const IconGauge = (p: P) => (
   <Svg {...p}>

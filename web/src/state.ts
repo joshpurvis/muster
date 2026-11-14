@@ -6,6 +6,7 @@ import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AccountProfile,
   AccountUsage,
+  CodexUsage,
   Agent,
   AgentMessage,
   AgentState,
@@ -72,6 +73,8 @@ export const accountProfiles = signal<AccountProfile[]>([]);
 export const accountProfilesSupported = signal(false);
 /** `hello.account_usage`, then `account_usage_changed` (and refreshes while it is on screen). */
 export const accountUsage = signal<AccountUsage | null>(null);
+/** Codex's plan usage (`codex_usage.get`); null when unknown or the backend can't say. */
+export const codexUsage = signal<CodexUsage | null>(null);
 /** `hello.openrouter`: null when the backend has no OpenRouter support. */
 export const openRouter = signal<{ key_present: boolean } | null>(null);
 export const channels = signal<Channel[]>([]);
@@ -397,6 +400,8 @@ export interface Prefs {
   jumpRaises: boolean;
   /** The agents panel's message log is expanded. */
   agentFeed: boolean;
+  /** The sidebar's Usage card shows each account's bars. */
+  usageCard: boolean;
 }
 
 const defaultPrefs: Prefs = {
@@ -409,6 +414,7 @@ const defaultPrefs: Prefs = {
   altToTerminal: false,
   jumpRaises: false,
   agentFeed: true,
+  usageCard: true,
 };
 
 function loadPrefs(): Prefs {
@@ -450,7 +456,8 @@ export function pushRecentFolder(path: string) {
 export type ScheduleOverlay = { kind: "schedule"; id?: number; agent?: string; draft?: unknown };
 
 export type Overlay =
-  | { kind: "account_profiles" }
+  /** `account`: the usage account to highlight (a sidebar Usage row was clicked). */
+  | { kind: "account_profiles"; account?: string }
   | { kind: "jump"; initial: string }
   | { kind: "new_tab"; worktree?: boolean; cwd?: string }
   | { kind: "shortcuts" }

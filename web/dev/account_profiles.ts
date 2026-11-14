@@ -59,8 +59,52 @@ try {
     table.includes("not confirmed fresh") && table.includes("Unknown") && /Work\s+25%/.test(table),
     `Usage table does not show the fixture's states honestly: ${table}`,
   );
-  await b.eval(`document.querySelector('[aria-label="Claude profiles"] .usage-section').scrollIntoView()`);
   await b.shot(`${base}/usage-profiles.png`);
+  // The dialog's tabs: it opens on Usage with that tab focused; arrow keys move between tabs and
+  // show only the chosen panel.
+  const D = `document.querySelector('[aria-label="Claude profiles"]')`;
+  const tabState = () =>
+    b.eval(`(() => {
+    const sel = ${D}.querySelector('[role="tab"][aria-selected="true"]');
+    const shown = [...${D}.querySelectorAll('[role="tabpanel"]')].filter((p) => !p.hidden).map((p) => p.id);
+    return { selected: sel?.textContent, focused: document.activeElement === sel, shown, controls: sel?.getAttribute('aria-controls') };
+  })()`);
+  let t = await tabState();
+  check(t.selected === "Usage" && t.focused, `The dialog must open on a focused Usage tab: ${JSON.stringify(t)}`);
+  await b.eval(
+    `document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }))`,
+  );
+  await b.sleep(100);
+  t = await tabState();
+  check(
+    t.selected === "Profiles" && t.focused && t.shown.length === 1 && t.shown[0] === t.controls,
+    `ArrowRight must select and focus Profiles and show only its panel: ${JSON.stringify(t)}`,
+  );
+  // Profile rows start collapsed and open one at a time.
+  const heads = `${D}.querySelectorAll('.pf-head')`;
+  const expanded = () => b.eval(`[...${heads}].filter((h) => h.getAttribute('aria-expanded') === 'true').length`);
+  check((await expanded()) === 0, "Profile rows must start collapsed");
+  await b.eval(`${heads}[1].click()`);
+  await b.eval(`${heads}[2].click()`);
+  await b.sleep(100);
+  check(
+    (await expanded()) === 1 && await b.eval(`${heads}[2].getAttribute('aria-expanded') === 'true'`),
+    "Only one profile row may be open at a time",
+  );
+  await b.shot(`${base}/profiles-list.png`);
+  await clickText('[aria-label="Claude profiles"] [role="tab"]', "Add profile");
+  // The narrow window must fit the Add tab with its disclosure open too.
+  await clickText('[aria-label="Claude profiles"] .dlg-more', "Registering ~/.claude itself?");
+  await b.size(720, 900);
+  await b.sleep(200);
+  check(
+    await b.eval(`(() => {
+    const d = document.querySelector('[role="dialog"]'), r = d.getBoundingClientRect();
+    return r.left >= 0 && r.right <= innerWidth && r.bottom <= innerHeight && d.scrollWidth <= d.clientWidth;
+  })()`),
+    "The Add profile tab overflows a narrow viewport",
+  );
+  await b.size(1440, 1000);
   await fill('input[placeholder="Personal or Work"]', "UI profile");
   await fill('input[placeholder="~/.claude-work"]', `${base}/ui`);
   await clickText('button[type="submit"]', "Register profile");
@@ -69,6 +113,14 @@ try {
     `${M}.rpc.call('account_profile.list', {}).then(profiles => profiles.find(p => p.name === 'UI profile'))`,
   );
   check(profile?.config_dir === `${base}/ui`, "Registration form did not save the directory reference");
+  check(
+    await b.eval(`(() => {
+    const tab = document.querySelector('[aria-label="Claude profiles"] [role="tab"][aria-selected="true"]');
+    const open = document.querySelector('[aria-label="Claude profiles"] .pf-head[aria-expanded="true"]');
+    return tab?.textContent === 'Profiles' && open?.textContent.includes('UI profile');
+  })()`),
+    "After registering, the dialog should show Profiles with the new profile open",
+  );
   await b.size(720, 900);
   await b.sleep(200);
   await b.shot(`${base}/profiles-narrow.png`);
@@ -81,6 +133,15 @@ try {
   );
   await clickText('[role="dialog"] button', "Done");
   await b.size(1440, 1000);
+  // A Claude account in the sidebar's Usage section opens the dialog on Usage, that account marked.
+  await b.wait(`[...document.querySelectorAll('.us-opens')].some((r) => r.textContent.includes('Work'))`);
+  await b.eval(`[...document.querySelectorAll('.us-opens')].find((r) => r.textContent.includes('Work')).click()`);
+  await b.wait(`!!document.querySelector('[aria-label="Claude profiles"] .usage-table')`);
+  const marked = await b.eval(
+    `[...document.querySelectorAll('[aria-label="Claude profiles"] .usage-table tr.on .usage-name')].map((e) => e.textContent)`,
+  );
+  check(marked.includes("Work"), `The sidebar's Work row must open the dialog with Work marked: ${marked}`);
+  await clickText('[role="dialog"] button', "Done");
   await b.key("Alt+Shift+N");
   await b.wait(`!!document.querySelector('[role="dialog"][aria-label="New channel"]')`);
   await fill('[aria-label="New channel"] input', `${base}/repo`);

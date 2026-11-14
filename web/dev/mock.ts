@@ -1350,6 +1350,15 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   }
   if (method === "account_profile.list") return accountProfiles;
   if (method === "account_usage.get") return accountUsage();
+  // Codex's plan limits as its newest session log saw them (src/codex_usage.rs).
+  if (method === "codex_usage.get") {
+    const t = now();
+    return {
+      observed_at: t - 6 * 60_000,
+      plan: "pro",
+      windows: [{ window_minutes: 10080, used_percentage: 47, resets_at: Math.floor(t / 1000) + 4 * 86_400 }],
+    };
+  }
   if (method === "openrouter.models") {
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }

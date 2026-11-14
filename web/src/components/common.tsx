@@ -74,9 +74,11 @@ export function TooltipHost() {
     };
     // In dialogs, help that moved into a tip also shows when the keyboard reaches its control
     // (the pills' hints): it goes with the next key, or when focus leaves.
+    // Outside dialogs only where the tip is the one way to read something (`data-tip-focus`:
+    // the sidebar's usage rows).
     const focus = (e: FocusEvent) => {
       const el = e.target as HTMLElement | null;
-      if (!el?.matches?.(":focus-visible") || !el.closest(".modal")) return;
+      if (!el?.matches?.(":focus-visible") || !el.closest(".modal, [data-tip-focus]")) return;
       const t = el.closest("[data-tip]") as HTMLElement | null;
       if (!t) return;
       clearTimeout(timer);

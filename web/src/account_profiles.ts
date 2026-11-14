@@ -1,6 +1,7 @@
 import type {
   AccountProfile,
   AccountUsage,
+  CodexUsage,
   ProfileChoice,
   SessionInfo,
   UsageRow,
@@ -114,15 +115,18 @@ export const SUGGESTION_TTL_MS = 150_000;
  * passed reads as reset, a current one past the stale age as stale, and a suggestion that is
  * too old, or whose account is no longer current, is dropped. So a window that can't refresh
  * never keeps showing an expired figure as current, or a suggestion built on one. */
+/** A window as it stands at `now`: a passed reset reads as reset, an old current figure as stale. */
+export function ageWindow(w: UsageWindow, now: number, staleAfterMs: number): UsageWindow {
+  if (w.status === "unknown" || w.status === "reset") return w;
+  if (w.resets_at != null && w.resets_at * 1000 <= now) return { ...w, status: "reset" };
+  if (w.status === "current" && w.observed_at != null && now - w.observed_at > staleAfterMs) {
+    return { ...w, status: "stale" };
+  }
+  return w;
+}
+
 export function asOf(usage: AccountUsage, now: number): AccountUsage {
-  const age = (w: UsageWindow): UsageWindow => {
-    if (w.status === "unknown" || w.status === "reset") return w;
-    if (w.resets_at != null && w.resets_at * 1000 <= now) return { ...w, status: "reset" };
-    if (w.status === "current" && w.observed_at != null && now - w.observed_at > usage.stale_after_ms) {
-      return { ...w, status: "stale" };
-    }
-    return w;
-  };
+  const age = (w: UsageWindow) => ageWindow(w, now, usage.stale_after_ms);
   const rows = usage.rows.map((r) => ({ ...r, five_hour: age(r.five_hour), seven_day: age(r.seven_day) }));
   const s = usage.suggestion;
   if (!s) return { ...usage, rows };
@@ -155,4 +159,112 @@ export function suggestionView(usage: AccountUsage, selected: ProfileChoice | un
     return { kind: "keep", name, reason: s.reason };
   }
   return { kind: "switch", name: s.name, reason: s.reason, choice: s.choice };
+}
+
+export interface UsageBar {
+  /** 0–100 for the bar's fill; null when nothing is known. */
+  fill: number | null;
+  /** The figure beside the bar: "42%", "42%?" or "–". */
+  label: string;
+  /** The full story, for the tooltip and screen readers. */
+  tip: string;
+  /** Only a current figure is drawn in colour. */
+  current: boolean;
+  level: "ok" | "warn" | "high";
+}
+
+export interface AccountBars {
+  key: string;
+  tool: "claude" | "codex";
+  /** Every profile on this account, Default first; "Codex" for Codex. */
+  name: string;
+  /** Shortest window first: "5h", "Wk". */
+  bars: { label: string; bar: UsageBar }[];
+}
+
+function bar(title: string, w: UsageWindow, now: number): UsageBar {
+  const cell = windowCell(w, now);
+  const known = w.used_percentage != null && w.status !== "unknown" && w.status !== "reset";
+  const v = known ? Math.max(0, Math.min(100, w.used_percentage!)) : null;
+  return {
+    fill: v,
+    label: known ? cell.main : "–",
+    tip: `${title}: ${cell.main}${cell.detail ? ` · ${cell.detail}` : ""}`,
+    current: cell.current,
+    level: v == null || !cell.current ? "ok" : v >= 90 ? "high" : v >= 75 ? "warn" : "ok",
+  };
+}
+
+/** One entry per account (profiles on one login share its limits), in the snapshot's order. */
+export function accountBars(usage: AccountUsage, now: number): AccountBars[] {
+  const out = new Map<string, { rows: UsageRow[] }>();
+  for (const r of usage.rows) {
+    const g = out.get(r.account);
+    if (g) g.rows.push(r);
+    else out.set(r.account, { rows: [r] });
+  }
+  return [...out.entries()].map(([key, { rows }]) => {
+    // Rows of one account carry the same observation; prefer one a usable profile shows.
+    const r = rows.find((x) => x.eligible) ?? rows[0];
+    return {
+      key,
+      tool: "claude" as const,
+      name: rows.map((x) => x.name).join(" · "),
+      bars: [
+        { label: "5h", bar: bar("5-hour", r.five_hour, now) },
+        { label: "Wk", bar: bar("Weekly", r.seven_day, now) },
+      ],
+    };
+  });
+}
+
+/** A window length as a bar label and a tooltip title: 300 → "5h"/"5-hour", 10080 → "Wk"/"Weekly". */
+export function windowName(minutes: number): { label: string; title: string } {
+  if (minutes === 10080) return { label: "Wk", title: "Weekly" };
+  if (minutes % 1440 === 0) return { label: `${minutes / 1440}d`, title: `${minutes / 1440}-day` };
+  const h = Math.round(minutes / 6) / 10;
+  return { label: `${h}h`, title: `${h}-hour` };
+}
+
+/** Codex's single account, aged like Claude's figures. Null when nothing is known. */
+export function codexBars(u: CodexUsage | null, now: number, staleAfterMs: number): AccountBars | null {
+  if (!u?.windows.length) return null;
+  const bars = [...u.windows].sort((a, b) => a.window_minutes - b.window_minutes).map((w) => {
+    const n = windowName(w.window_minutes);
+    const win = ageWindow({
+      status: "current",
+      used_percentage: w.used_percentage,
+      resets_at: w.resets_at,
+      observed_at: u.observed_at,
+      reported_at: u.observed_at,
+      reported_by: null,
+    }, now, staleAfterMs);
+    return { label: n.label, bar: bar(n.title, win, now) };
+  });
+  return { key: "codex", tool: "codex", name: "Codex", bars };
+}
+
+export interface UsagePeak {
+  /** The account it belongs to. */
+  name: string;
+  /** "82%". */
+  label: string;
+  level: UsageBar["level"];
+  /** Account and the figure's full story, for the tooltip and screen readers. */
+  tip: string;
+}
+
+/** The fullest current figure across all accounts: what a collapsed Usage heading shows. A
+ * figure that is not current never counts; null when there is none. */
+export function peakUsage(accounts: AccountBars[]): UsagePeak | null {
+  let best: UsagePeak | null = null;
+  let max = -1;
+  for (const a of accounts) {
+    for (const { bar: b } of a.bars) {
+      if (!b.current || b.fill == null || b.fill <= max) continue;
+      max = b.fill;
+      best = { name: a.name, label: b.label, level: b.level, tip: `Highest now: ${a.name} · ${b.tip}` };
+    }
+  }
+  return best;
 }

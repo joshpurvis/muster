@@ -3045,6 +3045,73 @@ textarea {
 .empty-channel-actions { display: flex; justify-content: center; gap: 8px; margin-top: 18px; }
 @media (max-width: 760px) { .sidebar { width: 190px; } }
 @media (max-height: 440px) { .sidebar .ap-feed { max-height: 35%; } }
+/* The Messages heading never shrinks away: in a short sidebar the agents list gives way first
+   (it was clipped once the Usage section took its share of the height). */
+.sidebar .ap-feed { min-height: 31px; }
+/* With Agents dragged small, its list gives way before the Messages heading does. */
+.sidebar .ap-list { min-height: 0; }
+
+/* Usage: the sidebar's bottom-left section, a small table of every account's usage windows. */
+/* Content-height and pinned to the bottom (with Channels and Agents both collapsed its grid row
+   is the one that stretches); min-width lets long names ellipsize instead of widening it. */
+.us { --us-col: 62px; display: flex; flex-direction: column; min-height: 0; min-width: 0; align-self: end; }
+/* One hairline above it; collapsed Agents brings its own, so the two overlap there. */
+.sidebar > .us { border-top: 1px solid var(--border); }
+.sidebar > .sidebar-collapsed + .us { margin-top: -1px; }
+.us.open .ap-chev { transform: rotate(90deg); }
+.us-list {
+  display: flex; flex-direction: column; gap: 1px; padding: 0 6px 8px;
+  /* Yields in a short window, down to about one row that scrolls, so Agents and Messages keep
+     their headings. */
+  max-height: clamp(30px, calc(100vh - 445px), 38vh); overflow-y: auto;
+}
+.us-row { border-radius: var(--r); padding: 0 8px; outline: none; }
+.us-row:focus-visible { box-shadow: inset 0 0 0 1.5px var(--pane-focus-ring); }
+.us-row-in { display: flex; align-items: center; gap: 10px; height: 22px; min-width: 0; }
+.us-name {
+  flex: 1; min-width: 0; font-size: 12px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The collapsed heading's one figure: the fullest current window. */
+.us-peak {
+  margin-left: auto; padding-right: 8px; min-width: 0; font-size: 11px; color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.us-peak b { font-weight: 600; color: var(--text-muted); }
+.us-peak.um-warn b { color: var(--warn-text); }
+.us-peak.um-high b { color: var(--error-text); }
+
+/* One meter: track, then figure. */
+.um { display: flex; align-items: center; gap: 5px; min-width: 0; height: 12px; line-height: 12px; }
+.um-track { flex: 1; min-width: 12px; height: 4px; border-radius: 2px; background: var(--bg-4); overflow: hidden; }
+.um-fill {
+  display: block; height: 100%; border-radius: 2px; background: var(--accent);
+  transition: width 400ms var(--ease);
+}
+.um-warn .um-fill { background: var(--st-attn); }
+.um-high .um-fill { background: var(--st-error); }
+.um-pct {
+  flex: none; width: 27px; text-align: right; font-size: 10.5px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.um-warn .um-pct { color: var(--warn-text); }
+.um-high .um-pct { color: var(--error-text); }
+/* Not current (stale, unconfirmed): grey and hatched, never a solid coloured bar. */
+.um-stale .um-fill {
+  border-radius: 0;
+  background: repeating-linear-gradient(90deg, var(--text-faint) 0 2px, transparent 2px 4px);
+}
+.um-stale .um-pct { color: var(--text-faint); font-style: italic; }
+
+/* The windows are columns, named once in the heading. */
+.us .um { flex: none; width: var(--us-col); }
+.us-opens { cursor: pointer; }
+.us-opens:hover { background: var(--hover); }
+.us-cols { margin-left: auto; display: flex; gap: 10px; padding-right: 8px; font-size: 10.5px; color: var(--text-faint); }
+.us-cols span { width: var(--us-col); }
+@media (max-width: 760px) { .us { --us-col: 50px; } }
+
+.us.open .us-peak { display: none; }
 
 .agents-panel {
   width: auto;
@@ -3577,31 +3644,40 @@ textarea {
   cursor: not-allowed;
 }
 
-.profile-row {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--border);
-}
-
-.profile-row .field-row {
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: end;
-}
-
-.profiles-dialog h3 {
-  margin: 0;
-  font-size: 14px;
-}
-
 .profiles-dialog p.field-hint {
   display: block;
 }
 
-.dialog-scroll .profile-row {
-  flex: 0 0 auto;
+/* Claude profiles dialog: three tabs (Usage, Profiles, Add profile). A fixed minimum height
+   keeps the dialog from jumping between tabs. */
+.dialog-scroll .dlg-body.pf-panels { min-height: clamp(0px, calc(100vh - 340px), 280px); }
+.pf-panel { display: flex; flex-direction: column; gap: 12px; }
+.pf-panel[hidden] { display: none; }
+.pf-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.pf-item + .pf-item { border-top: 1px solid var(--border); }
+.pf-head {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 0 12px;
+  text-align: left; font-size: 12.5px; color: var(--text);
 }
+.pf-head:hover { background: var(--hover); }
+.pf-name { flex: 0 1 auto; min-width: 3em; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.pf-path {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint);
+}
+.pf-note { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-muted); }
+.pf-path-plain { font-family: inherit; font-size: 12px; }
+.pf-chev { flex: none; color: var(--text-faint); transition: transform var(--t) var(--ease); }
+.pf-item.open .pf-chev { transform: rotate(90deg); }
+.pf-item.open > .pf-head { background: var(--accent-softer); }
+.pf-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 12px 14px; border-top: 1px solid var(--border); }
+.field-row.pf-rename { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+.pf-action { display: flex; align-items: center; gap: 12px; }
+.pf-action .btn { flex: none; }
+.pf-action .field-hint { display: block; }
+.pf-empty { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pf-steps { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--text-muted); }
+.pf-steps code { overflow-wrap: anywhere; }
 
 .profile-directory {
   display: block;
@@ -3616,11 +3692,6 @@ textarea {
   flex-direction: column;
   gap: 10px;
   min-width: 0;
-}
-
-.profile-row .profile-account-row.field-row {
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
 }
 
 .usage-table-wrap {
@@ -4300,11 +4371,6 @@ textarea {
 
 .dlg-calm .cache-ttls {
   gap: 14px;
-}
-
-.dlg-calm.profiles-dialog h3 {
-  font-size: 13px;
-  font-weight: 600;
 }
 
 .sch-dlg .sch-agent-fixed {

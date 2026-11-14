@@ -443,17 +443,25 @@ As built (2026-11-13), where it adds to the plan above:
 - HANDOFF.md quotes the last 5 messages Muster delivered (refused ones left out), each text and
   reply cut to 2,000 bytes, oldest first, marking one still waiting for a reply with how to answer
   it (MCP `reply` with its `msg_id`); up to 10 older unanswered ones follow. Texts sit in fences
-  no line of them can close. Only a run that starts a new conversation gets the note: once the
-  agent has a conversation again (a start recorded but its handoff not cleared), the handoff is
-  dropped.
+  no line of them can close; messages still queued are left out (they reach the new
+  conversation themselves). While a move is pending, every start or tab restart begins a new
+  conversation, whatever conversation id was saved meanwhile (an old run's hook, an older
+  backend's run on the old profile), and a restart onto a profile that can't start changes
+  nothing. HANDOFF.md's first line says Muster wrote it; an agent's own HANDOFF.md is renamed
+  to `HANDOFF.agent.md` first, never overwritten.
 - An agent working in a repository has HANDOFF.md outside its folders, so the note's text goes
   into its appended system prompt with the persona, instead of a file to read. An agent working
   in its home reads the file.
-- Save notes first is skipped when the agent isn't running, is busy (the same test as Now), or
-  its current account is at its limit (a current 5-hour or weekly figure at 100%; unknown,
+- Save notes first is skipped when the agent isn't running or isn't idle (an errored run is not
+  idle; the same test as Now), or the account its run is on is at its limit (a current 5-hour or weekly figure at 100%; unknown,
   stale or reset usage never counts). The wait runs in the backend: a backend reload during it
-  drops the pending Now restart, and the move then applies at the next start. A refused or
-  failed message switches at once and shows a notice.
+  drops the pending Now restart, and the move then applies at the next start. A turn stopped on
+  a permission prompt keeps the wait going. A refused or failed message switches at once. Now
+  checks, under the start lock, that the move is still the newest (`replaced` otherwise). Known
+  gaps, noted from the review and not handled: a restart by the owner during the wait moves the
+  agent at once (the notes request is abandoned); a second move saved while a start of the first
+  is launching gives that run the second move's prompt (its next start then hands off again);
+  a run that exits at once still counts as the handoff's start.
 - The Now restart and its outcome after Save notes are notices, since the dialog has closed:
   "saved its notes and moved to Work", or busy (moves at its next start).
 - `agent.update` replies with `switch` (docs/PROTOCOL.md). The CLI also takes `--reason TEXT`.

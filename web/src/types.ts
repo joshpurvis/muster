@@ -235,7 +235,7 @@ export interface AgentSwitch {
   /** The new profile's name. */
   to: string;
   now: boolean;
-  outcome: "next_start" | "restarted" | "busy" | "after_notes" | "failed";
+  outcome: "next_start" | "restarted" | "busy" | "replaced" | "after_notes" | "failed";
   notes: "asked" | "skipped";
   notes_skipped?: "off" | "not_running" | "busy" | "at_limit";
   error?: string;

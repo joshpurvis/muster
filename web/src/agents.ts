@@ -391,10 +391,11 @@ export function sessionBusy(s: SessionInfo | undefined): boolean {
     (s.queued > 0 || ["starting", "working", "needs_approval", "asking_question", "stuck"].includes(s.state));
 }
 
-/** Why Save notes first can't be asked (null: it can), as the backend decides it. */
+/** Why Save notes first can't be asked (null: it can), as the backend decides it (src/agents.rs
+ * `notes_skipped`: only an idle run). `oldName`: the account its run is on. */
 export function saveNotesBlocked(s: SessionInfo | undefined, oldAtLimit: boolean, oldName: string): string | null {
   if (!s || s.state === "exited") return "It isn't running, so there is nothing to save from.";
-  if (sessionBusy(s)) return "It is busy. Muster asks only an idle agent.";
+  if (s.state !== "idle" || s.queued > 0) return "It isn't idle. Muster asks only an idle agent.";
   if (oldAtLimit) return `${oldName} is at its limit, so it couldn't answer.`;
   return null;
 }
@@ -410,7 +411,9 @@ export function switchMessage(name: string, sw: AgentSwitch): { level: "success"
     case "restarted":
       return { level: "success", text: `${name} moved to ${sw.to}: a new conversation started there.${notes}` };
     case "busy":
-      return { level: "warn", text: `${name} is busy, so it moves to ${sw.to} at its next start.${notes}` };
+      return { level: "warn", text: `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}` };
+    case "replaced":
+      return { level: "warn", text: `A newer move of ${name} replaced this one.` };
     case "after_notes":
       return {
         level: "success",

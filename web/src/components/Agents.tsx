@@ -895,10 +895,20 @@ export function AgentDialog(
   /** Moving a Claude agent to another account (docs/ACCOUNT_PROFILES.md). */
   const moving = !!agent && agent.kind === "claude" && !sameChoice(d.account_profile, agent.account_profile_id ?? "default");
   const agentSession = agent?.session_id != null ? sessions.value.get(agent.session_id) : undefined;
-  const fromName = profileName(accountProfiles.value, agent?.account_profile_id);
+  // Where its conversation is: with an earlier move still pending, the account it moves from.
+  const fromName = profileName(
+    accountProfiles.value,
+    agent?.handoff ? agent.handoff.from : agent?.account_profile_id,
+  );
   const toName = profileName(accountProfiles.value, d.account_profile === "default" ? null : d.account_profile);
+  // Save notes asks the running process, on the account it started with.
+  const runProfile = agentSession?.account_profile_id ?? null;
   const notesBlocked = moving
-    ? saveNotesBlocked(agentSession, atLimit(accountUsage.value, agent?.account_profile_id ?? "default", Date.now()), fromName)
+    ? saveNotesBlocked(
+      agentSession,
+      atLimit(accountUsage.value, runProfile ?? "default", Date.now()),
+      profileName(accountProfiles.value, runProfile),
+    )
     : null;
   const locationValid = d.working_location.mode === "home" || workspaces.value.some(w => w.is_git && w.id === (d.working_location as { workspace_id: number }).workspace_id);
   const canSave = locationValid && (!locationChanged || moving || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;

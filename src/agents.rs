@@ -1525,9 +1525,10 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
     let mut next = cur.clone();
     // Another account: same name, home and memory/, a new conversation (the old one stays in
     // the old profile's folder, which Muster never opens).
+    anyhow::ensure!(req.account_profile.is_none() || cur.kind == SessionKind::Claude,
+        "account_profile is only supported for Claude agents");
     let moving = match req.account_profile.map(|p| p.id()) {
         Some(to) if to != cur.account_profile_id => {
-            anyhow::ensure!(cur.kind == SessionKind::Claude, "account_profile is only supported for Claude agents");
             hub.check_account_profile(to)?;
             Some(to)
         }
@@ -1546,10 +1547,9 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             next.working_location = location;
         }
     }
-    // A conversation can't follow an agent to another account: there is no "keep".
-    if cur.handoff.is_some() {
-        next.reset_on_next_start = true;
-    }
+    // A conversation can't follow an agent to another account: there is no "keep". A pending
+    // move resets at its start whatever this flag says (`start_once`); the flag is for older
+    // backends.
     if let Some(to) = moving {
         next.account_profile_id = to;
         next.reset_on_next_start = true;
@@ -1795,7 +1795,9 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     hub.check_account_profile(agent.account_profile_id)?;
     check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     check_location(hub, &agent.working_location)?;
-    if fresh || agent.reset_on_next_start {
+    // A pending move always starts a new conversation, whatever conversation id was saved since
+    // it was recorded (an older backend's run on the old profile, a hook of the old run).
+    if fresh || agent.reset_on_next_start || agent.handoff.is_some() {
         // First stop the old run's hooks from saving a conversation again (a turn-complete
         // still queued would otherwise undo the fresh start before the restart replaces it).
         if let Some(sid) = agent.session_id {
@@ -1996,8 +1998,12 @@ pub async fn restart_session(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<Se
     }
     let _one = hub.agents().start_lock.lock().await;
     let mut agent = hub.agents().by_session(id).ok_or_else(|| anyhow::anyhow!("agent was removed"))?;
+    // As `start_once`: before the conversation is reset or the tab moved, so a profile that can't
+    // start leaves both as they were.
+    hub.check_account_profile(agent.account_profile_id)?;
+    check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     let (channel, cwd) = prepare_channel(hub, &agent, None).await?;
-    if agent.reset_on_next_start {
+    if agent.reset_on_next_start || agent.handoff.is_some() {
         hub.fence_conversation(id);
         agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
@@ -2077,7 +2083,9 @@ pub fn handoff_note(h: &Handoff, from: &str, to: &str, msgs: &[AgentMessage], re
     if let Some(r) = &h.reason {
         t.push_str(&format!("\nThe owner's reason:\n\n{}\n", fenced(r)));
     }
-    let delivered: Vec<&AgentMessage> = msgs.iter().filter(|m| m.refused.is_none()).collect();
+    // Delivered ones only: a message still queued reaches the new conversation itself.
+    let delivered: Vec<&AgentMessage> = msgs.iter()
+        .filter(|m| m.refused.is_none() && (m.reply.is_some() || m.answer.is_some() || received(m.id))).collect();
     let waiting = |m: &AgentMessage| m.reply.is_none() && m.answer.is_none() && received(m.id);
     let recent: Vec<&AgentMessage> = delivered.iter().take(HANDOFF_RECENT).copied().collect();
     let cut = |s: &str| truncate_bytes(s.trim(), HANDOFF_TEXT_MAX);
@@ -2092,8 +2100,7 @@ pub fn handoff_note(h: &Handoff, from: &str, to: &str, msgs: &[AgentMessage], re
             match (&m.reply, &m.answer) {
                 (_, Some(a)) => t.push_str(&format!("\nYour reply:\n\n{}\n", fenced(&cut(&a.text)))),
                 (Some(r), None) => t.push_str(&format!("\nYour reply:\n\n{}\n", fenced(&cut(r)))),
-                (None, None) if waiting(m) => t.push_str(&format!("\nStill waiting for your reply: {reply_how} ({}).\n", m.id)),
-                (None, None) => t.push_str("\nNot yet delivered when the move happened.\n"),
+                (None, None) => t.push_str(&format!("\nStill waiting for your reply: {reply_how} ({}).\n", m.id)),
             }
         }
     }
@@ -2129,13 +2136,43 @@ fn prepare_handoff(hub: &Hub, agent: &Agent) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(note) = handoff_for(hub, agent)? {
-        write_persona(&Path::new(&agent.home_dir).join(HANDOFF_FILE), &note.text)?;
+        let home = Path::new(&agent.home_dir);
+        // Never through a linked home or agents folder (a tab restart reaches here too).
+        ensure_home(home)?;
+        let file = home.join(HANDOFF_FILE);
+        keep_foreign_handoff(&file)?;
+        write_persona(&file, &format!("{HANDOFF_MARK}\n{}", note.text))?;
     }
     Ok(())
 }
 
 /// Written in an agent's home before the first run after a move (overwritten at each move).
 pub const HANDOFF_FILE: &str = "HANDOFF.md";
+/// HANDOFF.md's first line when Muster wrote it: one without it is the agent's own.
+const HANDOFF_MARK: &str = "<!-- Written by Muster at a move to another account; replaced at the next move. -->";
+
+/// A HANDOFF.md that Muster didn't write (the agent's own, from before moves existed) is
+/// renamed aside, never overwritten.
+fn keep_foreign_handoff(file: &Path) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    refuse_symlink(file)?;
+    let mut f = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("reading {}: {e}", file.display()),
+    };
+    let mut head = vec![0; HANDOFF_MARK.len()];
+    let n = f.read(&mut head)?;
+    if head[..n] == *HANDOFF_MARK.as_bytes() {
+        return Ok(());
+    }
+    let aside = (0..).map(|i| file.with_file_name(if i == 0 { "HANDOFF.agent.md".into() } else { format!("HANDOFF.agent-{i}.md") }))
+        .find(|p| matches!(lstat(p), Ok(None))).expect("a free name");
+    std::fs::rename(file, &aside).map_err(|e| anyhow::anyhow!("moving the agent's own {} aside: {e}", file.display()))?;
+    tracing::info!("kept the agent's own {} as {}", file.display(), aside.display());
+    Ok(())
+}
 
 /// The run after move `at` started: the move is done.
 fn handed_off(hub: &Hub, id: i64, at: i64) {
@@ -2162,6 +2199,11 @@ pub fn session_busy(s: &SessionInfo) -> bool {
             || matches!(s.state, AgentState::Starting | AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck))
 }
 
+/// Idle and waiting for input: what Save notes first and Now need (an errored run is not).
+pub fn session_idle(s: &SessionInfo) -> bool {
+    s.state == AgentState::Idle && s.queued == 0
+}
+
 /// The agent's session when it is running (in a tab still open).
 fn live_session(hub: &Hub, a: &Agent) -> Option<SessionInfo> {
     let sid = a.session_id?;
@@ -2182,13 +2224,14 @@ fn at_limit(hub: &Hub, id: Option<crate::account_profiles::ProfileId>) -> bool {
 /// Carry out move `sw` that `update_switch` recorded: Save notes first (in the background, up to
 /// `SAVE_NOTES_WAIT`), and with `now` a restart if the agent is idle. What happened, for the
 /// `agent.update` reply (`switch`): `outcome` is `next_start`, `restarted`, `busy` (Now was
-/// asked, it moves at its next start), `after_notes` (restarts once it saved its notes) or
-/// `failed` (`error`); `notes` is `asked` or `skipped` (`notes_skipped`: `off`, `not_running`,
+/// asked, it moves at its next start), `replaced` (a newer move came first), `after_notes`
+/// (restarts once it saved its notes) or `failed` (`error`); `notes` is `asked` or `skipped` (`notes_skipped`: `off`, `not_running`,
 /// `busy` or `at_limit`).
 pub async fn switch_account(hub: &Arc<Hub>, sw: Switch) -> Value {
     let to = profile_name(hub, sw.to);
     let live = hub.agents().get(&sw.name).and_then(|a| live_session(hub, &a));
-    let skip = notes_skipped(sw.save_notes, live.as_ref(), || at_limit(hub, sw.from));
+    // The account the running process is on (with an earlier move still pending, not `sw.from`).
+    let skip = notes_skipped(sw.save_notes, live.as_ref(), || at_limit(hub, live.as_ref().and_then(|s| s.account_profile_id)));
     let mut out = json!({ "to": to, "now": sw.now });
     let Some(why) = skip else {
         out["notes"] = json!("asked");
@@ -2215,44 +2258,95 @@ pub fn notes_skipped(wanted: bool, live: Option<&SessionInfo>, at_limit: impl Fn
     match live {
         _ if !wanted => Some("off"),
         None => Some("not_running"),
-        Some(s) if session_busy(s) => Some("busy"),
+        Some(s) if !session_idle(s) => Some("busy"),
         Some(_) if at_limit() => Some("at_limit"),
         Some(_) => None,
     }
 }
 
-/// Restart a moved agent now if it is idle: `restarted`, or `busy` (it moves at its next start).
+/// Restart a moved agent now if it is idle and move `sw` is still the one waiting (both checked
+/// under the start lock): `restarted`, `busy` (it moves at its next start) or `replaced` (a newer
+/// move, or a start that already moved it).
 async fn restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<&'static str> {
-    match start_fresh_if(hub, &sw.name, &|s: &SessionInfo| !session_busy(s)).await {
+    let replaced = std::sync::atomic::AtomicBool::new(false);
+    let ok = |s: &SessionInfo| {
+        let current = hub.agents().get(&sw.name).and_then(|a| a.handoff).is_some_and(|h| h.at == sw.at);
+        replaced.store(!current, std::sync::atomic::Ordering::Relaxed);
+        current && session_idle(s)
+    };
+    match start_fresh_if(hub, &sw.name, &ok).await {
         Ok(_) => Ok("restarted"),
-        Err(e) if e.downcast_ref::<NotIdle>().is_some() => Ok("busy"),
+        Err(e) if e.downcast_ref::<NotIdle>().is_some() => {
+            Ok(if replaced.load(std::sync::atomic::Ordering::Relaxed) { "replaced" } else { "busy" })
+        }
         Err(e) => Err(e),
     }
 }
 
 /// Save notes first: ask the agent, still on its old account, to write what it needs into
-/// memory/; once it replies or `SAVE_NOTES_WAIT` passes, restart it with `now` (if it is idle and
-/// this move is still the one waiting). Outcomes the owner can't see in the dialog any more are
-/// notices.
+/// memory/, and wait for its reply up to `SAVE_NOTES_WAIT` (a turn stopped on a permission prompt
+/// keeps the wait going, so the owner can approve it). Then, with `now`, restart it if it is still
+/// running, idle and this move is still the one waiting. What happened, the dialog having closed,
+/// is a notice.
 async fn save_notes_then(hub: &Arc<Hub>, sw: Switch, to: String) {
-    let text = format!("You are moving to account {to}. Write anything you would need to continue into memory/ now.");
-    if let Err(e) = ask(hub, &sw.name, text, None, None, save_notes_wait()).await {
-        tracing::warn!(agent = sw.name, "asking it to save notes before its move: {e:#}");
-        hub.notice("warn", format!("{} couldn't be asked to save notes before moving to {to}: {e:#}", sw.name));
-    }
-    if !sw.now {
+    let name = sw.name.clone();
+    let deadline = tokio::time::Instant::now() + save_notes_wait();
+    // Only to the run that was checked: one that stopped or slept since would be started, on the
+    // new account, by the delivery.
+    let still = |hub: &Hub| hub.agents().get(&name).and_then(|a| live_session(hub, &a)).is_some_and(|s| session_idle(&s));
+    let replied = if !still(hub) {
+        Err("it was no longer running and idle".to_string())
+    } else {
+        ask_until(hub, &name, format!("You are moving to account {to}. Write anything you would need to continue into memory/ now."), deadline)
+            .await.map_err(|e| format!("{e:#}"))
+    };
+    let said = match &replied {
+        Ok(true) => format!("{name} saved its notes"),
+        Ok(false) => format!("{name} didn't reply within {} minutes", save_notes_wait().as_secs() / 60),
+        Err(e) => {
+            tracing::warn!(agent = name, "asking it to save notes before its move: {e}");
+            format!("{name} couldn't be asked to save notes ({e})")
+        }
+    };
+    let Some(a) = hub.agents().get(&name).filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at)) else {
         return;
-    }
-    // A newer move, or a start since (which already moved it), replaces this one.
-    let Some(a) = hub.agents().get(&sw.name).filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at)) else { return };
-    // Stopped or asleep meanwhile: it moves at its next start.
-    if live_session(hub, &a).is_none() {
+    };
+    if !sw.now || live_session(hub, &a).is_none() {
+        hub.notice("info", format!("{said}. It moves to {to} at its next start."));
         return;
     }
     match restart_moved(hub, &sw).await {
-        Ok("restarted") => hub.notice("info", format!("{} saved its notes and moved to {to}.", sw.name)),
-        Ok(_) => hub.notice("info", format!("{} is busy, so it moves to {to} at its next start.", sw.name)),
-        Err(e) => hub.notice("warn", format!("{} didn't restart on {to}: {e:#}. It moves there at its next start.", sw.name)),
+        Ok("restarted") => hub.notice("info", format!("{said} and moved to {to}.")),
+        Ok("replaced") => {}
+        Ok(_) => hub.notice("info", format!("{said}. It is busy, so it moves to {to} at its next start.")),
+        Err(e) => hub.notice("warn", format!("{said}, but didn't restart on {to}: {e:#}. It moves there at its next start.")),
+    }
+}
+
+/// `ask`, waiting until `deadline` for the agent's reply even through a turn that stopped on a
+/// prompt. Ok(true): it replied; Ok(false): no reply by then.
+async fn ask_until(hub: &Arc<Hub>, name: &str, text: String, deadline: tokio::time::Instant) -> anyhow::Result<bool> {
+    let agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
+    let asking = hub.replies.asking(agent.id, None);
+    let (d, _) = send_checked(hub, &agent, text, Origin::Human.as_str().to_string(), None, None, None).await?;
+    let mut rx = hub.subscribe();
+    let _waiting = hub.replies.wait(d.msg_id);
+    drop(asking);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let (_, verdict, _) = wait_for_reply(&mut rx, d.session_id, left, || hub.session(d.session_id),
+            || crate::agent_reply::status(hub, d.msg_id)).await.map_err(|e| anyhow::anyhow!(e))?;
+        match verdict {
+            // Its turn ended (a reply the hook didn't attribute counts: it did the work).
+            AskVerdict::Replied(_) | AskVerdict::Unattributed => return Ok(true),
+            AskVerdict::Wait => return Ok(false),
+            AskVerdict::Ended => anyhow::bail!("its run ended before replying"),
+            // Waiting on the owner (a permission prompt or a question).
+            AskVerdict::Blocked => tokio::time::sleep(Duration::from_secs(1).min(left)).await,
+        }
     }
 }
 
@@ -3763,13 +3857,13 @@ mod tests {
         let h2 = back.handoff.unwrap();
         assert_eq!((back.account_profile_id, h2.from, h2.reason), (None, Some(personal), None));
         assert!(h2.at > h.at);
-        // Choosing "keep" for a location change can't undo the move's reset.
+        // Choosing "keep" for a location change can't undo the move: its start resets anyway.
         let repo = scratch("move-repo");
         assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
         let ws = hub.add_workspace(repo.to_string_lossy().into_owned(), None).await.unwrap();
         let (kept, _) = edit(&hub, json!({"name": "mover", "working_location": {"mode": "main", "workspace_id": ws.id},
             "reset_conversation": false}), false).unwrap();
-        assert!(kept.reset_on_next_start);
+        assert!(kept.handoff.is_some());
         // Moving with a location change needs no keep-or-reset choice.
         let (both, _) = edit(&hub, json!({"name": "mover", "working_location": {"mode": "home"}, "account_profile": work}), false).unwrap();
         assert!(both.reset_on_next_start && both.working_location == WorkingLocation::Home);
@@ -3784,7 +3878,7 @@ mod tests {
         hub.update_account_profile(work, None, Some(true)).unwrap();
         create(&hub, serde_json::from_value(json!({"name": "coder", "kind": "codex"})).unwrap()).unwrap();
         assert!(edit(&hub, json!({"name": "coder", "account_profile": work}), false).unwrap_err().contains("only supported for Claude"));
-        assert!(edit(&hub, json!({"name": "coder", "account_profile": "default"}), false).unwrap().1.is_none());
+        assert!(edit(&hub, json!({"name": "coder", "account_profile": "default"}), false).unwrap_err().contains("only supported for Claude"));
         // An agent that takes unattended work moves only with a click in Muster's window.
         create(&hub, serde_json::from_value(json!({"name": "cron", "accepts": ["human", "schedule"]})).unwrap()).unwrap();
         assert!(edit(&hub, json!({"name": "cron", "account_profile": work}), true).unwrap_err().contains("which account pays"));
@@ -3861,7 +3955,7 @@ mod tests {
             m.reply = Some(format!("done {i}"));
             m
         }).collect();
-        // Newest first: 9..1. 9 is waiting, 8 not delivered yet, 7 refused, 2 waiting (older).
+        // Newest first: 9..1. 9 is waiting, 8 still queued (not delivered), 7 refused, 2 waiting (older).
         msgs[0].reply = None;
         msgs[1].reply = None;
         msgs[2].refused = Some("not accepted".into());
@@ -3870,15 +3964,34 @@ mod tests {
         let h = Handoff { from: None, at: 0, reason: None };
         let note = handoff_note(&h, "Default", "Work", &msgs, |id| id != 8);
         let t = &note.text;
-        assert!(!t.contains("task 7") && !t.contains("task 3"), "refused and older answered ones are left out: {t}");
-        let order: Vec<usize> = ["task 4", "task 5", "task 6", "task 8", "task 9"].iter().map(|k| t.find(k).unwrap()).collect();
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "oldest first: {t}");
-        assert!(t.contains("Still waiting for your reply") && t.contains("(9)") && t.contains("Not yet delivered"));
+        assert!(!t.contains("task 7") && !t.contains("task 8") && !t.contains("task 1\n"),
+            "refused, queued and older answered ones are left out: {t}");
+        let order: Vec<usize> = ["task 3", "task 4", "task 5", "task 6", "task 9"].iter().map(|k| t.find(k).unwrap()).collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "the last five delivered, oldest first: {t}");
+        assert!(t.contains("Still waiting for your reply") && t.contains("(9)"));
         assert!(t.contains("Older messages still waiting") && t.contains("task 2") && !t.contains("done 2"));
         assert!(!t.contains(&"x".repeat(2001)), "each text is cut");
         assert!(t.contains("~~~~~\n"), "a fence its text can't close");
         let same = handoff_note(&h, "Work", "Work", &[], |_| true);
         assert!(same.prompt.contains("new conversation for you on Claude account Work") && same.text.contains("No messages"));
+    }
+
+    #[test]
+    fn the_agents_own_handoff_file_is_kept_aside() {
+        let home = scratch("own-handoff");
+        let file = home.join(HANDOFF_FILE);
+        keep_foreign_handoff(&file).unwrap();
+        std::fs::write(&file, "my own plan").unwrap();
+        std::fs::write(home.join("HANDOFF.agent.md"), "taken").unwrap();
+        keep_foreign_handoff(&file).unwrap();
+        assert!(!file.exists());
+        assert_eq!(std::fs::read_to_string(home.join("HANDOFF.agent-1.md")).unwrap(), "my own plan");
+        std::fs::write(&file, format!("{HANDOFF_MARK}\nold handoff")).unwrap();
+        keep_foreign_handoff(&file).unwrap();
+        assert!(file.exists() && !home.join("HANDOFF.agent-2.md").exists(), "Muster's own file is replaced, not kept");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(home.join("HANDOFF.agent.md"), &file).unwrap();
+        assert!(keep_foreign_handoff(&file).is_err(), "never through a link");
     }
 
     #[test]
@@ -3891,6 +4004,8 @@ mod tests {
         assert_eq!(notes_skipped(true, Some(&s), || true), Some("at_limit"));
         s.state = AgentState::Working;
         assert_eq!(notes_skipped(true, Some(&s), || panic!("not asked")), Some("busy"));
+        s.state = AgentState::Error;
+        assert_eq!(notes_skipped(true, Some(&s), || false), Some("busy"), "an errored run is not idle");
         s.state = AgentState::Idle;
         s.queued = 1;
         assert_eq!(notes_skipped(true, Some(&s), || false), Some("busy"));

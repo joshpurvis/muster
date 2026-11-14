@@ -392,7 +392,8 @@ Deno.test("a message that carried a late reply is told by its own text", () => {
 Deno.test("Save notes first is offered only to a running, idle agent with room", () => {
   assertEquals(saveNotesBlocked(undefined, false, "Personal"), "It isn't running, so there is nothing to save from.");
   assertEquals(saveNotesBlocked(session("exited"), false, "Personal")?.startsWith("It isn't running"), true);
-  assertEquals(saveNotesBlocked(session("working"), false, "Personal"), "It is busy. Muster asks only an idle agent.");
+  assertEquals(saveNotesBlocked(session("working"), false, "Personal"), "It isn't idle. Muster asks only an idle agent.");
+  assertEquals(saveNotesBlocked(session("error"), false, "Personal")?.startsWith("It isn't idle"), true);
   assertEquals(sessionBusy({ ...session("idle"), queued: 1 }), true);
   assertEquals(saveNotesBlocked(session("idle"), true, "Personal"), "Personal is at its limit, so it couldn't answer.");
   assertEquals(saveNotesBlocked(session("idle"), false, "Personal"), null);

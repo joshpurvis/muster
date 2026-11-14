@@ -278,6 +278,13 @@ try:
           and session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal,
           "a move is recorded without touching the running process or its tab's profile")
     home = Path(rec["home_dir"])
+    cli("profile", "disable", "Work")
+    rpc("session.restart", {"id": sid}, error="disabled")
+    rec = reviewer()
+    check(session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal
+          and rec["handoff"] and rec["reset_on_next_start"] and rec["resumable"],
+          "a tab restart onto a disabled profile changes nothing: same run, tab, conversation and pending move")
+    cli("profile", "enable", "Work")
     first = rpc("session.restart", {"id": sid})
     run = launched(sid, first["pid"])
     prompt = run["args"][run["args"].index("--append-system-prompt") + 1] if "--append-system-prompt" in run["args"] else ""
@@ -285,7 +292,7 @@ try:
           and "moved you from Claude account Home to Work" in prompt and "HANDOFF.md" in prompt,
           "the first start after a move runs on the new profile, a new conversation, told to read HANDOFF.md")
     handoff = (home / "HANDOFF.md").read_text()
-    check("Home to Work" in handoff and "smoke move" in handoff and (home / "HANDOFF.md").stat().st_mode & 0o777 == 0o600,
+    check(handoff.startswith("<!-- Written by Muster") and "Home to Work" in handoff and "smoke move" in handoff and (home / "HANDOFF.md").stat().st_mode & 0o777 == 0o600,
           "HANDOFF.md holds the move and the reason, private to the owner")
     check(session(sid)["account_profile_id"] == work and reviewer()["handoff"] is None and not reviewer()["reset_on_next_start"],
           "the agent's tab follows its account, and the handoff is done once that run started")

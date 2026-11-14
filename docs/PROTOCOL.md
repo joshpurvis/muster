@@ -1189,30 +1189,38 @@ the agent record; `agent.update` moves it (below).
 #### Moving a named agent to another account
 
 `agent.update` with `account_profile` (an id or `"default"`) moves a Claude agent to that
-profile; its current one is no change, a Codex agent is refused, and the profile is checked as
-at creation (enabled, its folder present). Optional with it: `now` (default false),
+profile; its current one is no change, a Codex agent is refused (even with `"default"`), and
+the profile is checked as at creation (enabled, its folder present). Optional with it: `now` (default false),
 `save_notes` (default true) and `handoff_reason` (a string, kept to 2,000 bytes; refused
 without a move). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
 profile the old conversation lives on, null for Default; a second move before a start keeps it).
-Nothing stops or changes a running process. The first start that begins a new conversation
+Nothing stops or changes a running process. The next start (or tab restart) of the agent
+always begins a new conversation while a move is pending, whatever conversation id was saved
+meanwhile; it is checked first (the profile enabled), so a refused restart changes nothing. It
 writes `<home>/HANDOFF.md` from Muster's own records (the move, the reason, the agent's last 5
 delivered messages and replies, up to 10 older ones still waiting for a reply; never the old
 profile's folder), moves the agent's tab to the new profile, and appends to its system prompt
 that it moved and should read HANDOFF.md and memory/ (for an agent working in a repository, the
 note's text itself). `handoff` is cleared once that run has started; later starts get neither.
+HANDOFF.md starts with a line saying Muster wrote it; a HANDOFF.md without that line (the agent's
+own) is renamed to `HANDOFF.agent.md` (or `HANDOFF.agent-N.md`) first, never overwritten.
 
 The reply's `switch` says what happens: `{to, now, outcome, notes, notes_skipped?, error?}`.
-`to` is the new profile's name. `notes` is `asked` when the agent is running, idle and its
-current account isn't at its limit (a current 5-hour or weekly figure at 100%): Muster sends it
+`to` is the new profile's name. `notes` is `asked` when the agent is running, idle (state `idle`, nothing queued; an errored
+run is not) and the account its run is on isn't at its limit (a current 5-hour or weekly figure
+at 100%): Muster sends it
 "You are moving to account <to>. Write anything you would need to continue into memory/ now."
-(origin human) and waits for its reply, up to 10 minutes; otherwise `skipped`, with
+(origin human) and waits for its reply, up to 10 minutes, also through a turn stopped on a
+permission prompt (the owner can approve it), and only if that run is still live and idle when
+the message goes; otherwise `skipped`, with
 `notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `outcome`: `next_start`;
 `restarted` (`now`, and it was idle: `agent.start` fresh under the start lock, as
-`start_fresh_if`); `busy` (`now`, but it was in a turn: it moves at its next start);
+`start_fresh_if`); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
+(`now`, but by the time the start lock was free a newer move had replaced this one);
 `after_notes` (`now` after the notes reply, if it is still running and idle and no newer move
-replaced this one; the result is a `notice`); `failed` (`error`; it moves at its next start).
+replaced this one; what happened, saved or no reply within the wait, is a `notice`); `failed` (`error`; it moves at its next start).
 
 Selection is resolved before creation and saved on the session. Restarts never re-resolve
 workspace defaults. Named-agent replacement sessions use the agent's pinned selection and

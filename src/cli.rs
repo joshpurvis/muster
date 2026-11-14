@@ -2591,12 +2591,13 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
         (Some("asked"), _) => format!(" Asked it to save notes first (it has up to {} minutes).",
             crate::agents::SAVE_NOTES_WAIT.as_secs() / 60),
         (_, Some("at_limit")) => " Save notes skipped: its current account is at its limit.".into(),
-        (_, Some("busy")) if sw["now"] != true => " Save notes skipped: it is busy.".into(),
+        (_, Some("busy")) if sw["now"] != true => " Save notes skipped: it isn't idle.".into(),
         _ => String::new(),
     };
     let what = match sw["outcome"].as_str() {
         Some("restarted") => format!("{name} moved to {to}: a new conversation started there."),
-        Some("busy") => format!("{name} is busy, so it moves to {to} at its next start."),
+        Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
+        Some("replaced") => format!("A newer move of {name} replaced this one."),
         Some("after_notes") => format!("{name} moves to {to} once it has saved its notes, then restarts if idle."),
         Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
             sw["error"].as_str().unwrap_or("unknown error")),

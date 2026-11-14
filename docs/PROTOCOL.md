@@ -172,7 +172,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
 | `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?}` | `Agent`. `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?, account_profile?, now?, save_notes?, handoff_reason?}` | `Agent`, plus `switch` after a move to another account (see "Moving a named agent to another account" under Claude profiles). `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -812,7 +812,7 @@ outside the window, and there:
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
 | `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` or `account_profile` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them (for a profile, which account pays). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
 or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
@@ -1183,8 +1183,36 @@ There is no login, token, configuration-file copy, or directory deletion API.
 `channel.create`, `session.spawn`, and `agent.create` accept `account_profile?: number |
 "default"`. It is valid only for Claude. For new sessions, absent/null inherits from a Claude
 parent/caller, then the workspace default; explicit `"default"` bypasses inheritance.
-`agent.create` instead defaults to ordinary inherited Claude behavior and permanently pins
-its choice on the agent record. `agent.update` cannot change it.
+`agent.create` instead defaults to ordinary inherited Claude behavior and pins its choice on
+the agent record; `agent.update` moves it (below).
+
+#### Moving a named agent to another account
+
+`agent.update` with `account_profile` (an id or `"default"`) moves a Claude agent to that
+profile; its current one is no change, a Codex agent is refused, and the profile is checked as
+at creation (enabled, its folder present). Optional with it: `now` (default false),
+`save_notes` (default true) and `handoff_reason` (a string, kept to 2,000 bytes; refused
+without a move). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
+can't follow it to another account; a location change in the same call needs no
+`reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
+profile the old conversation lives on, null for Default; a second move before a start keeps it).
+Nothing stops or changes a running process. The first start that begins a new conversation
+writes `<home>/HANDOFF.md` from Muster's own records (the move, the reason, the agent's last 5
+delivered messages and replies, up to 10 older ones still waiting for a reply; never the old
+profile's folder), moves the agent's tab to the new profile, and appends to its system prompt
+that it moved and should read HANDOFF.md and memory/ (for an agent working in a repository, the
+note's text itself). `handoff` is cleared once that run has started; later starts get neither.
+
+The reply's `switch` says what happens: `{to, now, outcome, notes, notes_skipped?, error?}`.
+`to` is the new profile's name. `notes` is `asked` when the agent is running, idle and its
+current account isn't at its limit (a current 5-hour or weekly figure at 100%): Muster sends it
+"You are moving to account <to>. Write anything you would need to continue into memory/ now."
+(origin human) and waits for its reply, up to 10 minutes; otherwise `skipped`, with
+`notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `outcome`: `next_start`;
+`restarted` (`now`, and it was idle: `agent.start` fresh under the start lock, as
+`start_fresh_if`); `busy` (`now`, but it was in a turn: it moves at its next start);
+`after_notes` (`now` after the notes reply, if it is still running and idle and no newer move
+replaced this one; the result is a `notice`); `failed` (`error`; it moves at its next start).
 
 Selection is resolved before creation and saved on the session. Restarts never re-resolve
 workspace defaults. Named-agent replacement sessions use the agent's pinned selection and
@@ -1613,6 +1641,6 @@ and reuses it thereafter. Main mode uses the workspace path in its own channel.
 `agent.update` accepts `working_location`. When it differs, `reset_conversation`
 (boolean) is required: false keeps the thread; true clears it at the next start.
 Changing location requires a verified local window. Saving does not move or stop
-a live session. Agent records expose `working_location`, `reset_on_next_start`,
+a live session. Agent records expose `working_location`, `reset_on_next_start`, `handoff`,
 and `working_directory` (the current session's cwd, or null). Location and pending
 reset survive backend reloads. Old worktrees are retained when changing location.

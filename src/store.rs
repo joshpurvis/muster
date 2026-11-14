@@ -549,6 +549,14 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN working_location TEXT NOT NULL DEFAULT '{"mode":"home"}';
     ALTER TABLE agents ADD COLUMN reset_on_next_start INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v28: a named agent moved to another Claude account (docs/ACCOUNT_PROFILES.md "Moving a
+    // named agent to another account"): until its first start there, the move that start hands
+    // off from, as JSON (`agents::Handoff`: the profile the old conversation lives on, when, and
+    // the owner's reason). NULL: no move pending. An older backend ignores it; the move's
+    // `account_profile_id` and `reset_on_next_start` still apply there, without the handoff.
+    r#"
+    ALTER TABLE agents ADD COLUMN handoff_from TEXT;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1022,7 +1030,7 @@ impl Store {
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
                     resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
-                    asleep_autostart, working_location, reset_on_next_start
+                    asleep_autostart, working_location, reset_on_next_start, handoff_from
              FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -1039,6 +1047,8 @@ impl Store {
                 home_dir: r.get(6)?,
                 working_location: serde_json::from_str(&r.get::<_, String>(19)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(19, rusqlite::types::Type::Text, Box::new(e)))?,
                 reset_on_next_start: r.get::<_, i64>(20)? != 0,
+                // Unreadable (written by hand): no handoff note, the move itself still applies.
+                handoff: r.get::<_, Option<String>>(21)?.and_then(|h| serde_json::from_str(&h).ok()),
                 permissions: serde_json::from_str(&perms).unwrap_or_default(),
                 // Unreadable: the strictest set (human only).
                 accepts_origins: serde_json::from_str(&accepts).unwrap_or_else(|_| vec![crate::agents::Origin::Human]),
@@ -1067,8 +1077,9 @@ impl Store {
         conn.execute(
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
                                session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
-                               sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                               sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start,
+                               handoff_from)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1089,7 +1100,8 @@ impl Store {
                 b.asleep_at,
                 b.asleep_at.map(|_| b.autostart as i64),
                 serde_json::to_string(&b.working_location)?,
-                b.reset_on_next_start as i64
+                b.reset_on_next_start as i64,
+                b.handoff.as_ref().map(serde_json::to_string).transpose()?
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1131,7 +1143,8 @@ impl Store {
             "UPDATE agents SET model = ?2, effort = ?3, persona = ?4, permissions = ?5, accepts_origins = ?6,
                     autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
-                    provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11 WHERE id = ?1",
+                    provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11,
+                    account_profile_id = ?12, handoff_from = ?13 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1143,9 +1156,17 @@ impl Store {
                 b.provider.as_str(),
                 b.sleep_after_min,
                 serde_json::to_string(&b.working_location)?,
-                b.reset_on_next_start as i64
+                b.reset_on_next_start as i64,
+                b.account_profile_id,
+                b.handoff.as_ref().map(serde_json::to_string).transpose()?
             ],
         )?;
+        Ok(())
+    }
+
+    /// Agent `id`'s first run on its new account has started: its handoff is done.
+    pub fn clear_agent_handoff(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE agents SET handoff_from = NULL WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -2384,6 +2405,15 @@ impl Store {
         Ok(())
     }
 
+    /// The Claude profile session `id`'s next start uses (a named agent's tab follows its
+    /// agent's account: `agents::run_agent`).
+    pub fn set_session_account_profile(&self, id: SessionId, profile: Option<i64>) -> anyhow::Result<()> {
+        anyhow::ensure!(self.conn.lock().execute(
+            "UPDATE sessions SET account_profile_id = ?2 WHERE id = ?1", params![id, profile])? == 1,
+            "no such session: {id}");
+        Ok(())
+    }
+
     /// Replace a session's stored agent arguments (used on its next start and restarts).
     pub fn set_session_extra_args(&self, id: SessionId, args: &[String]) -> anyhow::Result<()> {
         self.conn.lock().execute(
@@ -2897,7 +2927,7 @@ mod tests {
             effort: None,
             persona: "Finds things.".into(),
             home_dir: "/data/agents/scout".into(),
-            working_location: Default::default(), reset_on_next_start: false,
+            working_location: Default::default(), reset_on_next_start: false, handoff: None,
             permissions: Permissions::default(),
             accepts_origins: vec![Origin::Human, Origin::Schedule],
             channel_id: None,

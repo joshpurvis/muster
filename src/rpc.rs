@@ -1111,8 +1111,18 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
-            let b = crate::agents::update(hub, p, via == Via::Outside)?;
-            Ok(crate::agents::agent_view(hub, &b))
+            let (b, switch) = crate::agents::update_switch(hub, p, via == Via::Outside)?;
+            // A move to another account: Save notes first and Now (`agents::switch_account`).
+            let switch = match switch {
+                Some(sw) => Some(crate::agents::switch_account(hub, sw).await),
+                None => None,
+            };
+            let b = hub.agents().get(&b.name).unwrap_or(b);
+            let mut v = crate::agents::agent_view(hub, &b);
+            if let Some(sw) = switch {
+                v["switch"] = sw;
+            }
+            Ok(v)
         }
         "agent.list" => {
             let out: Vec<Value> = hub
@@ -2711,6 +2721,30 @@ mod tests {
         assert!(m["claude"]["models"].as_array().unwrap().iter().any(|x| x["id"] == "opus"));
         call(&hub, "agent.remove", json!({"name": "rpc-eve"})).await.unwrap();
         assert_eq!(drain(&mut rx, "agent_removed")[0]["name"], "rpc-eve");
+    }
+
+    /// `agent.update` with `account_profile` moves an agent and says what happened (`switch`).
+    #[tokio::test]
+    async fn agent_update_moves_an_agent_to_another_account() {
+        let (hub, _st) = fixture();
+        let dir = std::env::temp_dir().join(format!("muster-rpc-move-{}", crate::paths::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let work = hub.add_account_profile("Work", dir.to_str().unwrap()).unwrap().id;
+        agent(&hub, "rpc-mover");
+        let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "now": true})).await.unwrap();
+        assert_eq!(r["account_profile_id"], json!(work));
+        assert_eq!(r["reset_on_next_start"], json!(true));
+        assert!(r["handoff"]["at"].is_i64() && r["handoff"]["from"].is_null());
+        // Not running: nothing to save notes from or restart; it moves at its next start.
+        assert_eq!(r["switch"], json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "not_running",
+            "outcome": "next_start"}));
+        let same = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work})).await.unwrap();
+        assert!(same.get("switch").is_none(), "its current profile again is no move");
+        call(&hub, "agent.update", json!({"name": "rpc-mover", "accepts": ["human", "schedule"]})).await.unwrap_err();
+        dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-mover", "accepts": ["human", "schedule"]}),
+            Via::Window).await.map_err(|e| e.0).unwrap();
+        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": "default"})).await.unwrap_err();
+        assert!(e.contains("which account pays"), "{e}");
     }
 
     #[tokio::test]

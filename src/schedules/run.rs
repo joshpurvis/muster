@@ -274,9 +274,7 @@ pub fn spawn_execute(hub: Arc<Hub>, run: Run) {
 
 /// A session in a turn, or with prompts waiting.
 fn session_busy(s: &SessionInfo) -> bool {
-    s.state != AgentState::Exited
-        && (s.queued > 0
-            || matches!(s.state, AgentState::Starting | AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck))
+    crate::agents::session_busy(s)
 }
 
 /// The agent's session when it is busy (not running: not busy; sending starts it).

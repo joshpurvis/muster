@@ -8,6 +8,8 @@ import { rpc } from "../rpc.ts";
 import { AgentSchedules, agentsHeaderItems, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   workspaces,
+  accountProfiles,
+  accountUsage,
   schedulesSupported,
   scheduleSettings,
   agentFilter,
@@ -49,6 +51,8 @@ import {
   priceLabel,
   parseSleepAfter,
   readMemoryFile,
+  saveNotesBlocked,
+  switchMessage,
   SLEEP_AFTER_DEFAULT,
   SLEEP_AFTER_MAX,
   SLEEP_AFTER_MIN,
@@ -61,6 +65,7 @@ import type {
   Agent,
   AgentWorkingLocation,
   AgentMessage,
+  AgentSwitch,
   AgentTemplate,
   LateAnswer,
   ModelCatalog,
@@ -76,6 +81,7 @@ import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
 import { contextMenu, openMenu } from "./Menu.tsx";
 import { PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
+import { atLimit, profileName, sameChoice } from "../account_profiles.ts";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import {
   IconAgents,
@@ -172,6 +178,7 @@ function agentMenu(a: Agent, x: number, y: number) {
       { header: a.name },
       { label: "Edit…", run: () => A.editAgent(a.name) },
       { label: "Memory…", run: () => A.editAgent(a.name, "memory") },
+      ...(A.canSwitchAccount(a) ? [{ label: "Switch account…", run: () => A.switchAgentAccount(a.name) }] : []),
       ...(schedulesSupported.value ? [{ label: "New schedule…", run: () => A.newScheduleDialog(a.name) }] : []),
       "sep",
       ...(asleep
@@ -759,9 +766,11 @@ let templateCache: AgentTemplate[] | null = null;
 let catalogCache: ModelCatalog | null = null;
 
 export function AgentDialog(
-  { name, tab: tabInit, template, Modal, close }: {
+  { name, tab: tabInit, template, focus, Modal, close }: {
     name?: string;
     tab?: "settings" | "memory";
+    /** Edit only: "profile" opens on the account picker (Switch account…). */
+    focus?: "profile";
     /** New only: start from this template (e.g. "worker" from the New schedule dialog). */
     template?: string;
     Modal: ModalT;
@@ -782,6 +791,10 @@ export function AgentDialog(
   const [custom, setCustom] = useState({ model: false, effort: false });
   const [nameTouched, setNameTouched] = useState(false);
   const [conversation, setConversation] = useState<"" | "keep" | "reset">("");
+  /** A move to another account: when it applies, Save notes first, and why. */
+  const [moveNow, setMoveNow] = useState(false);
+  const [saveNotes, setSaveNotes] = useState(true);
+  const [moveReason, setMoveReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const memDirty = useRef(false);
@@ -821,6 +834,7 @@ export function AgentDialog(
   }, []);
   useLayoutEffect(() => {
     if (!editing) nameRef.current?.focus();
+    else if (focus === "profile") profileRef.current?.focus();
   }, []);
   // OpenRouter's models, once OpenRouter is chosen (the daemon fetches and caches them).
   useEffect(() => {
@@ -878,8 +892,16 @@ export function AgentDialog(
   const orBlocked = needsModel(d.provider, d.kind, d.model);
   const sleepMin = d.sleep ? parseSleepAfter(d.sleepAfter) : 0;
   const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
+  /** Moving a Claude agent to another account (docs/ACCOUNT_PROFILES.md). */
+  const moving = !!agent && agent.kind === "claude" && !sameChoice(d.account_profile, agent.account_profile_id ?? "default");
+  const agentSession = agent?.session_id != null ? sessions.value.get(agent.session_id) : undefined;
+  const fromName = profileName(accountProfiles.value, agent?.account_profile_id);
+  const toName = profileName(accountProfiles.value, d.account_profile === "default" ? null : d.account_profile);
+  const notesBlocked = moving
+    ? saveNotesBlocked(agentSession, atLimit(accountUsage.value, agent?.account_profile_id ?? "default", Date.now()), fromName)
+    : null;
   const locationValid = d.working_location.mode === "home" || workspaces.value.some(w => w.is_git && w.id === (d.working_location as { workspace_id: number }).workspace_id);
-  const canSave = locationValid && (!locationChanged || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
+  const canSave = locationValid && (!locationChanged || moving || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
   const checkoutHint = d.working_location.mode === "worktree"
     ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts."
     : "Shares files, branch and uncommitted changes with anyone using this checkout.";
@@ -947,14 +969,27 @@ export function AgentDialog(
       if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
         patch.permissions = d.permissions;
       }
+      if (moving) {
+        patch.account_profile = d.account_profile;
+        patch.now = moveNow;
+        patch.save_notes = saveNotes && !notesBlocked;
+        if (moveReason.trim()) patch.handoff_reason = moveReason.trim();
+        // A new conversation anyway: nothing to keep.
+        if (locationChanged) patch.reset_conversation = true;
+      }
       if (Object.keys(patch).length) {
-        const a = await rpc.call<Agent>("agent.update", { name: agent.name, ...patch });
+        const a = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", { name: agent.name, ...patch });
         knowAgent(a);
-        const later = ["provider", "model", "effort", "permissions", "working_location"].some((k) => k in patch) && A.agentLive(agent);
-        toast(
-          "success",
-          later ? "Saved. Run settings and working location apply from its next start." : "Saved.",
-        );
+        if (a.switch) {
+          const m = switchMessage(a.name, a.switch);
+          toast(m.level, m.text, 8000);
+        } else {
+          const later = ["provider", "model", "effort", "permissions", "working_location"].some((k) => k in patch) && A.agentLive(agent);
+          toast(
+            "success",
+            later ? "Saved. Run settings and working location apply from its next start." : "Saved.",
+          );
+        }
       }
       overlay.value = null;
       A.focusActiveTerminalSoon();
@@ -1131,9 +1166,8 @@ export function AgentDialog(
               <ProfilePill
                 value={d.account_profile}
                 onChange={(choice) => set({ account_profile: choice ?? "default" })}
-                disabled={editing}
                 tip={editing
-                  ? "This agent keeps its profile and conversation together. Create a new agent to use another profile."
+                  ? "Another profile moves this agent to that account: a new conversation there, with its memory/ notes."
                   : undefined}
                 selectRef={profileRef}
                 usage={usage}
@@ -1189,11 +1223,6 @@ export function AgentDialog(
               controls={`${id}-perms`}
             />
           </div>
-          {editing && d.kind === "claude" && (
-            <span class="field-hint">
-              The profile stays fixed: it goes with this agent's conversation. Create a new agent to use another.
-            </span>
-          )}
           <span class="sr-only" id={`${id}-default`}>Default is the CLI's own choice.</span>
           <span class="sr-only" id={`${id}-repo`}>
             Add a repository as a Muster workspace to select it here. Identity and memory stay in the agent home.
@@ -1235,7 +1264,7 @@ export function AgentDialog(
               Codex on OpenRouter needs a model with its vendor, e.g. openai/gpt-6.1-sol.
             </span>
           )}
-          {d.kind === "claude" && !editing && (
+          {d.kind === "claude" && (!editing || usage) && (
             <ProfileUsage
               value={d.account_profile}
               table={usage}
@@ -1254,7 +1283,57 @@ export function AgentDialog(
               note="The profile of the agent's own tab. Only you can change it; it applies from the agent's next start."
             />
           )}
-          {locationChanged && (
+          {moving && agent && (
+            <div class="field pill-panel move-panel" role="group" aria-labelledby={`${id}-move`}>
+              <span class="field-label" id={`${id}-move`}>Move to {toName}</span>
+              <span class="field-hint move-explain">
+                Moving to {toName} starts a new conversation. Its memory/ notes come along. The current conversation
+                stays on {fromName}.
+              </span>
+              <div class="seg" role="radiogroup" aria-label="When it moves">
+                {([false, true] as const).map((now) => (
+                  <button
+                    key={String(now)}
+                    type="button"
+                    role="radio"
+                    aria-checked={moveNow === now}
+                    class={cx("seg-btn", moveNow === now && "on")}
+                    onClick={() => setMoveNow(now)}
+                  >
+                    {now ? "Now" : "At its next start"}
+                  </button>
+                ))}
+              </div>
+              {moveNow && (
+                <span class="field-hint">
+                  Restarts it only if it is idle. If it is busy, it moves at its next start.
+                </span>
+              )}
+              <label class={cx("check", notesBlocked && "muted")}>
+                <input
+                  type="checkbox"
+                  checked={saveNotes && !notesBlocked}
+                  disabled={!!notesBlocked}
+                  aria-describedby={`${id}-notes`}
+                  onChange={(e) => setSaveNotes((e.target as HTMLInputElement).checked)}
+                />
+                Save notes first
+              </label>
+              <span class="field-hint" id={`${id}-notes`}>
+                {notesBlocked ??
+                  `Muster first asks it to write what it needs into memory/, and moves it once it replies or after 10 minutes.`}
+              </span>
+              <input
+                class="quiet-input move-reason"
+                value={moveReason}
+                maxLength={2000}
+                placeholder="Reason (optional), for its handoff note"
+                aria-label="Reason for the move"
+                onInput={(e) => setMoveReason((e.target as HTMLInputElement).value)}
+              />
+            </div>
+          )}
+          {locationChanged && !moving && (
             <div class="field pill-panel">
               <label class="field-label" for="agent-location-conversation">Conversation at next start</label>
               <span class="select-wrap">
@@ -1279,7 +1358,11 @@ export function AgentDialog(
           {agent?.working_directory && (
             <p class="field-hint">
               Current working directory: <code>{agent.working_directory}</code>
-              {agent.reset_on_next_start ? " · New conversation at next start" : ""}
+              {agent.handoff
+                ? ` · Moves to ${profileName(accountProfiles.value, agent.account_profile_id)} at next start (new conversation)`
+                : agent.reset_on_next_start
+                ? " · New conversation at next start"
+                : ""}
             </p>
           )}
           <div class="inline-field">

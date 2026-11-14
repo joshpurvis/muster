@@ -1656,7 +1656,7 @@ fn with_agents(m: &Mock) {
         d.live.insert(id);
         d.tokens.insert(tok.into(), id);
         d.agents.push(Agent {
-            account_profile_id: None,
+            account_profile_id: None, handoff: None,
             provider: Default::default(),
             id: id as i64,
             name: name.into(),

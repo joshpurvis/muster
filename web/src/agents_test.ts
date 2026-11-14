@@ -1,4 +1,7 @@
 import {
+  saveNotesBlocked,
+  sessionBusy,
+  switchMessage,
   agentStatus,
   carriesLateReply,
   ago,
@@ -384,4 +387,23 @@ Deno.test("a message that carried a late reply is told by its own text", () => {
   check(carriesLateReply(msg(9, 1, { reply_to: 4, text: 'Late reply to your message 4 ("x"):\nok' })), "carrier");
   check(!carriesLateReply(msg(9, 1, { reply_to: 4, text: "while handling 4" })), "ordinary chained message");
   check(!carriesLateReply(msg(9, 1, { reply_to: 5, text: "Late reply to your message 4:\nok" })), "another message's");
+});
+
+Deno.test("Save notes first is offered only to a running, idle agent with room", () => {
+  assertEquals(saveNotesBlocked(undefined, false, "Personal"), "It isn't running, so there is nothing to save from.");
+  assertEquals(saveNotesBlocked(session("exited"), false, "Personal")?.startsWith("It isn't running"), true);
+  assertEquals(saveNotesBlocked(session("working"), false, "Personal"), "It is busy. Muster asks only an idle agent.");
+  assertEquals(sessionBusy({ ...session("idle"), queued: 1 }), true);
+  assertEquals(saveNotesBlocked(session("idle"), true, "Personal"), "Personal is at its limit, so it couldn't answer.");
+  assertEquals(saveNotesBlocked(session("idle"), false, "Personal"), null);
+});
+
+Deno.test("the message after a move says when it takes effect", () => {
+  const sw = { to: "Work", now: false, notes: "skipped" as const, notes_skipped: "not_running" as const };
+  assertEquals(switchMessage("ada", { ...sw, outcome: "next_start" }).text, "Saved. ada moves to Work at its next start.");
+  assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "restarted" }).text,
+    "ada moved to Work: a new conversation started there.");
+  assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", notes_skipped: "busy" }).level, "warn");
+  assertEquals(switchMessage("ada", { ...sw, outcome: "next_start", notes_skipped: "at_limit" }).text.includes("at its limit"), true);
+  assertEquals(switchMessage("ada", { ...sw, now: true, notes: "asked", outcome: "after_notes" }).text.includes("once it replies"), true);
 });

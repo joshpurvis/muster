@@ -284,6 +284,14 @@ pub struct UsageRow {
     pub seven_day: WindowView,
 }
 
+impl UsageRow {
+    /// A current 5-hour or weekly figure is at 100%: this account can't answer now. Unknown,
+    /// stale, unconfirmed or reset usage never says so.
+    pub fn at_limit(&self) -> bool {
+        [&self.five_hour, &self.seven_day].iter().any(|w| w.current().is_some_and(|p| p >= 100.0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Suggestion {
     pub choice: ProfileChoice,
@@ -1195,5 +1203,19 @@ mod tests {
             let out = run_line(&reporter_command(bin, None), input);
             assert!(out.status.success() && out.stdout.is_empty(), "{bin:?}");
         }
+    }
+
+    #[test]
+    fn at_limit_needs_a_current_full_window() {
+        let mut row = UsageRow { choice: ProfileChoice::pinned(None), name: "Default".into(), enabled: true, eligible: true,
+            ineligible_reason: None, account: "account-0".into(), same_account_as: vec![],
+            five_hour: WindowView::unknown(), seven_day: WindowView::unknown() };
+        assert!(!row.at_limit(), "unknown is never at a limit");
+        row.seven_day = WindowView { status: Status::Current, used_percentage: Some(100.0), ..WindowView::unknown() };
+        assert!(row.at_limit());
+        row.seven_day.status = Status::Stale;
+        assert!(!row.at_limit(), "only current figures count");
+        row.five_hour = WindowView { status: Status::Current, used_percentage: Some(99.0), ..WindowView::unknown() };
+        assert!(!row.at_limit());
     }
 }

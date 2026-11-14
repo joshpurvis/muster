@@ -222,8 +222,29 @@ export type Provider = "subscription" | "openrouter";
 
 export type AgentWorkingLocation = { mode: "home" } | { mode: "main" | "worktree"; workspace_id: number };
 
+/** A move to another Claude account waiting for the agent's next start (src/agents.rs `Handoff`). */
+export interface AgentHandoff {
+  /** The profile its previous conversation lives on (null: Default). */
+  from: number | null;
+  at: number;
+  reason?: string;
+}
+
+/** What `agent.update` did with a move to another account (src/agents.rs `switch_account`). */
+export interface AgentSwitch {
+  /** The new profile's name. */
+  to: string;
+  now: boolean;
+  outcome: "next_start" | "restarted" | "busy" | "after_notes" | "failed";
+  notes: "asked" | "skipped";
+  notes_skipped?: "off" | "not_running" | "busy" | "at_limit";
+  error?: string;
+}
+
 export interface Agent {
   account_profile_id?: number | null;
+  /** A move to another account its next start hands off from (older daemons: absent). */
+  handoff?: AgentHandoff | null;
   provider?: Provider;
   id: number;
   name: string;

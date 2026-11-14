@@ -1,5 +1,6 @@
 import {
   asOf,
+  atLimit,
   formatAge,
   inheritedProfile,
   lastObserved,
@@ -176,4 +177,23 @@ Deno.test("a snapshot that can't be refreshed expires its own figures and sugges
     null,
     "Usage could not be refreshed from Muster, so nothing is suggested.",
   ]);
+});
+
+Deno.test("an account is at its limit only on a current figure of 100%", () => {
+  const usage = (r: Partial<UsageRow>): AccountUsage => ({
+    evaluated_at: NOW,
+    stale_after_ms: 600_000,
+    rows: [row({}), row({ choice: 2, name: "Work", ...r })],
+    suggestion: null,
+    no_suggestion: null,
+  });
+  const full = win({ status: "current", used_percentage: 100, resets_at: NOW / 1000 + 3600, observed_at: NOW });
+  equal(atLimit(null, 2, NOW), false);
+  equal(atLimit(usage({}), 2, NOW), false);
+  equal(atLimit(usage({ seven_day: full }), 2, NOW), true);
+  equal(atLimit(usage({ seven_day: full }), "default", NOW), false);
+  equal(atLimit(usage({ five_hour: { ...full, used_percentage: 99 } }), 2, NOW), false);
+  equal(atLimit(usage({ seven_day: { ...full, status: "stale" } }), 2, NOW), false);
+  // Its reset passed: the old figure no longer applies.
+  equal(atLimit(usage({ seven_day: full }), 2, NOW + 3601_000), false);
 });

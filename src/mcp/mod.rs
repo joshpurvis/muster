@@ -164,12 +164,20 @@ pub fn extract_headers(h: &HeaderMap) -> ReqHeaders {
     }
 }
 
+tokio::task_local! {
+    /// The TCP peer of the `/mcp` request being handled, for tools that check which program
+    /// called them (`start_fresh`: only the caller session's own processes).
+    pub static PEER: Option<std::net::SocketAddr>;
+}
+
 async fn handle_post(
     State(st): State<Arc<McpState<HubBackend>>>,
+    peer: Option<axum::Extension<crate::server::Peer>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let reply = protocol::handle_post(&st, &extract_headers(&headers), &body).await;
+    let peer = peer.and_then(|p| p.0.addr);
+    let reply = PEER.scope(peer, protocol::handle_post(&st, &extract_headers(&headers), &body)).await;
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     match reply.body {
         Some(v) => (

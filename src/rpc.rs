@@ -1552,7 +1552,12 @@ pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLi
         return Err("Muster can't tell which program it comes from".into());
     };
     let roots: std::collections::HashSet<u32> = hub.sessions().iter().filter_map(|s| s.pid).collect();
-    let holder = tokio::task::spawn_blocking(move || crate::server::connection_holder(peer, server, &roots))
+    // A program an agent detached from its session (init adopted it) is still in the session's
+    // own control group.
+    let holder = tokio::task::spawn_blocking(move || {
+        let cgroups = crate::server::session_cgroups(roots.iter().copied());
+        crate::server::connection_holder_in(peer, server, &roots, &cgroups)
+    })
         .await
         .unwrap_or_else(|e| crate::server::Holder::Unknown(format!("the lookup failed: {e}")));
     match holder {
@@ -1937,9 +1942,13 @@ pub async fn owner_terminal(hub: &Arc<Hub>, who: &Principal, peer: Option<std::n
     let Some(peer) = peer else { return Err("Muster can't tell which program it comes from".into()) };
     let server = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), hub.port());
     let roots: std::collections::HashSet<u32> = hub.sessions().iter().filter_map(|s| s.pid).collect();
-    let holder = tokio::task::spawn_blocking(move || crate::server::connection_holder(peer, server, &roots))
-        .await
-        .unwrap_or_else(|e| crate::server::Holder::Unknown(format!("the lookup failed: {e}")));
+    let holder = tokio::task::spawn_blocking(move || {
+        // A session's own control group: a program an agent detached from its session is still in it.
+        let cgroups = crate::server::session_cgroups(roots.iter().copied());
+        crate::server::connection_holder_in(peer, server, &roots, &cgroups)
+    })
+    .await
+    .unwrap_or_else(|e| crate::server::Holder::Unknown(format!("the lookup failed: {e}")));
     match holder {
         crate::server::Holder::Outside => Ok(()),
         crate::server::Holder::Inside(pid) => Err(format!("its program (process {pid}) runs inside a Muster session")),

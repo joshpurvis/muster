@@ -26,9 +26,16 @@
 //!   agent's tab (`channel.timeline`, data `self_handoff`); a finished or failed one is a notice too.
 //! - Codex agents: not supported yet (granting and asking are refused).
 //!
+//! - Only the caller session's own processes may ask (`own_processes`): a session's token sits in
+//!   files other programs of the user can read.
+//! - `/clear` and the prompt are queued together, the prompt held at the head of the queue until
+//!   Claude's new conversation starts, so nothing queued meanwhile goes first
+//!   (`inject::enqueue_handoff`); the injector checks the right again before typing `/clear`.
+//!
 //! Known gaps: a request waits in this backend's memory, so a backend restart (`muster reload`)
-//! forgets it (the agent can ask again). A restart between `/clear` and the prompt leaves the
-//! agent in its new, empty conversation without the prompt (its timeline shows the `/clear`).
+//! forgets it (the agent can ask again); the queue it left is settled at the next start
+//! (`inject::settle_orphaned_handoff`). The file is checked when asked and again before `/clear`,
+//! not when the new conversation reads it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,8 +63,6 @@ const CLEAR_WAIT: Duration = Duration::from_secs(5 * 60);
 const POLL: Duration = Duration::from_millis(250);
 /// `from` on the prompts Muster types for a handoff (the timeline's `prompt` events).
 const FROM: &str = "self-handoff";
-/// Claude Code's command for a new conversation in the same process.
-const CLEAR: &str = "/clear";
 
 /// `MIN_GAP_MS`; a debug build can shorten it for the smoke test.
 fn min_gap_ms() -> i64 {
@@ -73,6 +78,35 @@ fn min_gap_ms() -> i64 {
 #[derive(Default)]
 pub struct State {
     pending: Mutex<HashMap<i64, i64>>,
+    /// Per session: which parts of its handoff the injector has submitted (`submitting`).
+    typed: Mutex<HashMap<SessionId, Typed>>,
+}
+
+/// The parts of a session's handoff that were typed and submitted.
+#[derive(Debug, Default, Clone, Copy)]
+struct Typed {
+    clear: bool,
+    prompt: bool,
+}
+
+/// The injector is about to press Enter on `part` of session `id`'s handoff (src/inject.rs).
+pub(crate) fn submitting(hub: &Hub, id: SessionId, part: crate::inject::HandoffPart) {
+    let mut typed = hub.agents().self_handoff.typed.lock();
+    let t = typed.entry(id).or_default();
+    match part {
+        crate::inject::HandoffPart::Clear => t.clear = true,
+        crate::inject::HandoffPart::Prompt { .. } => t.prompt = true,
+    }
+}
+
+fn typed(hub: &Hub, id: SessionId) -> Typed {
+    hub.agents().self_handoff.typed.lock().get(&id).copied().unwrap_or_default()
+}
+
+/// Does session `id` still belong to an agent allowed to start itself fresh? The injector asks
+/// right before it types a handoff's `/clear`.
+pub(crate) fn still_allowed(hub: &Hub, id: SessionId) -> bool {
+    hub.agents().by_session(id).is_some_and(|a| a.self_handoff)
 }
 
 /// Removes an agent's waiting request when its handoff ends, however it ends.
@@ -143,6 +177,12 @@ pub fn resolve_file(given: &str, home: &Path, cwd: &Path) -> Result<PathBuf, Str
         std::io::ErrorKind::NotFound => format!("{} doesn't exist: write your handoff file first", path.display()),
         _ => format!("can't read {}: {e}", path.display()),
     })?;
+    // The path is typed into the agent's terminal: never a control character (ESC could end the
+    // paste and turn the rest into keys), and only a path that reads as text.
+    match real.to_str() {
+        Some(p) if !p.chars().any(char::is_control) => {}
+        _ => return Err(format!("{} has control characters or isn't valid UTF-8: rename the handoff file", path.display())),
+    }
     let meta = std::fs::metadata(&real).map_err(|e| format!("can't read {}: {e}", real.display()))?;
     if !meta.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
@@ -168,15 +208,15 @@ pub fn check_request(agent: Option<&Agent>, session: &SessionInfo, file: &str, n
             the human allows it: this session isn't one. Ask the human to /clear it instead"
             .into());
     };
+    if a.kind != SessionKind::Claude {
+        return Err("self handoff isn't supported for Codex agents yet".into());
+    }
     if !a.self_handoff {
         return Err(format!(
             "{} isn't allowed to start itself fresh: {}. Until then, ask the human to clear your conversation, or carry on",
             a.name,
             grant_how(&a.name)
         ));
-    }
-    if a.kind != SessionKind::Claude {
-        return Err("self handoff isn't supported for Codex agents yet".into());
     }
     if session.state == AgentState::Exited {
         return Err("your session isn't running".into());
@@ -230,16 +270,36 @@ fn record(hub: &Hub, channel: Option<ChannelId>, session: Option<SessionId>, lev
     hub.log_event(channel, session, EventKind::System, json!({ "text": text, "level": level, "self_handoff": d }));
 }
 
+/// Is the `/mcp` request being handled made by session `s`'s own processes (`mcp::PEER`)? A
+/// session's token sits in a file other agents of the same user could read: this keeps one
+/// from resetting another with it. Ok when the call didn't come over HTTP (in-process).
+fn own_processes(hub: &Hub, s: &SessionInfo) -> Result<(), String> {
+    let Ok(peer) = crate::mcp::PEER.try_with(|p| *p) else { return Ok(()) };
+    let (Some(peer), Some(pid)) = (peer, s.pid) else {
+        return Err("Muster can't tell which program made this call, so it can't be sure it is your own".into());
+    };
+    let server = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), hub.port());
+    let roots = std::collections::HashSet::from([pid]);
+    let cgroups = crate::server::session_cgroups(std::iter::once(pid));
+    match crate::server::connection_holder_in(peer, server, &roots, &cgroups) {
+        crate::server::Holder::Inside(_) => Ok(()),
+        crate::server::Holder::Outside => Err("this call doesn't come from your own session's processes: only an agent \
+            itself can ask for its fresh start, from its own terminal".into()),
+        crate::server::Holder::Unknown(why) => Err(format!("Muster can't tell which program made this call ({why})")),
+    }
+}
+
 /// `start_fresh` from session `caller`: check it, and on success start the handoff in the
 /// background (it waits for the turn that asked to end). What the tool answers.
 pub fn request(hub: &Arc<Hub>, caller: SessionId, file: &str) -> anyhow::Result<Value> {
     let session = hub.session(caller).ok_or_else(|| anyhow::anyhow!("calling session no longer exists"))?;
     let agent = hub.agents().by_session(caller);
     let now = now_ms();
+    let own = own_processes(hub, &session);
     let checked = {
         let mut pending = hub.agents().self_handoff.pending.lock();
         let waiting = agent.as_ref().is_some_and(|a| pending.contains_key(&a.id));
-        let r = check_request(agent.as_ref(), &session, file, now, waiting);
+        let r = own.clone().and_then(|()| check_request(agent.as_ref(), &session, file, now, waiting));
         if let (Ok(_), Some(a)) = (&r, &agent) {
             pending.insert(a.id, now);
         }
@@ -408,7 +468,8 @@ async fn drive(hub: &Arc<Hub>, ask: &Ask) -> Result<(), Stop> {
     if let Some(why) = crate::spend::submit_gate(hub, ask.session, &ask.source) {
         return Err(Stop::Cancelled(why));
     }
-    // 3. /clear, counted for the rate limit before it is typed (a crash after it still counts).
+    // 3. `/clear` and the prompt, queued together, the prompt held at the head of the queue so
+    //    nothing queued meanwhile goes first. Counted for the rate limit before anything is typed.
     let mut rx = hub.subscribe();
     let typed_at = now_ms();
     hub.agents().set_self_handoff_at(hub.store(), ask.agent, typed_at)
@@ -416,26 +477,40 @@ async fn drive(hub: &Arc<Hub>, ask: &Ask) -> Result<(), Stop> {
     if let Some(a) = hub.agents().by_id(ask.agent) {
         crate::agents::publish(hub, &a);
     }
-    crate::inject::send(hub, ask.session, CLEAR.into(), crate::inject::SendMode::Queue, FROM.into(), ask.source)
-        .await
-        .map_err(|e| Stop::Failed(format!("typing /clear: {e:#}")))?;
+    hub.agents().self_handoff.typed.lock().remove(&ask.session);
+    let prompt = first_prompt(&ask.name, &ask.file, ask.asked_at, ask.prov);
+    crate::inject::enqueue_handoff(hub, ask.session, ask.generation, prompt, ask.source, FROM)
+        .map_err(|e| Stop::Failed(format!("queueing /clear: {e:#}")))?;
+    let live = |hub: &Hub| hub.live_session_ids().contains(&ask.session) && hub.pty_generation(ask.session) == ask.generation;
     // 4. Claude starts the new conversation (its SessionStart hook, source `clear`).
     let deadline = tokio::time::Instant::now() + CLEAR_WAIT;
     loop {
+        if !live(hub) {
+            return Err(Stop::Failed("its run ended or restarted while /clear was on its way".into()));
+        }
+        // Taken back before `/clear` was typed: nothing happens (the injector checks again
+        // right before typing it). Once typed, the prompt still follows.
+        if !still_allowed(hub, ask.session) && !typed(hub, ask.session).clear {
+            crate::inject::withdraw_handoff(hub, ask.session).ok();
+            if !typed(hub, ask.session).clear {
+                return Err(Stop::Cancelled("the human took back its right to start itself fresh before /clear was typed".into()));
+            }
+        }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
-            // Still waiting in the queue (behind a draft, a dialog): never typed later, out of turn.
-            if crate::inject::withdraw(hub, ask.session, CLEAR).unwrap_or(false) {
+            let (clear, _) = crate::inject::withdraw_handoff(hub, ask.session).unwrap_or((false, false));
+            if clear || !typed(hub, ask.session).clear {
                 return Err(Stop::Cancelled(format!(
                     "/clear couldn't be typed within {} minutes (something was in the way, such as text in its input \
-                     box), so it was taken back unsent",
+                     box), so the fresh start was taken back unsent",
                     CLEAR_WAIT.as_secs() / 60
                 )));
             }
             return Err(Stop::Failed(format!(
                 "Claude didn't start a new conversation within {} minutes of /clear (no SessionStart hook with source \
-                 clear): its conversation may be unchanged",
-                CLEAR_WAIT.as_secs() / 60
+                 clear), so the prompt naming {} was taken back: its conversation may be unchanged",
+                CLEAR_WAIT.as_secs() / 60,
+                ask.file.display()
             )));
         }
         match tokio::time::timeout(left.min(Duration::from_secs(1)), rx.recv()).await {
@@ -453,20 +528,35 @@ async fn drive(hub: &Arc<Hub>, ask: &Ask) -> Result<(), Stop> {
             }
             _ => {}
         }
-        let live = hub.live_session_ids().contains(&ask.session) && hub.pty_generation(ask.session) == ask.generation;
-        if !live {
-            return Err(Stop::Failed("its run ended or restarted right after /clear".into()));
-        }
     }
-    // 5. The one prompt of the new conversation.
-    let prompt = first_prompt(&ask.name, &ask.file, ask.asked_at, ask.prov);
-    crate::inject::send(hub, ask.session, prompt, crate::inject::SendMode::Queue, FROM.into(), ask.source)
-        .await
-        .map_err(|e| Stop::Failed(format!(
-            "its conversation was cleared, but the prompt naming {} couldn't be typed ({e:#}): tell it to read that file",
-            ask.file.display()
-        )))?;
-    Ok(())
+    // 5. The prompt goes (first, whatever was queued meanwhile); done once it is submitted.
+    if !live(hub) {
+        return Err(Stop::Failed("its run ended or restarted right after /clear".into()));
+    }
+    crate::inject::release_handoff(hub, ask.session)
+        .map_err(|e| Stop::Failed(format!("releasing the prompt: {e:#}")))?;
+    let deadline = tokio::time::Instant::now() + CLEAR_WAIT;
+    loop {
+        if typed(hub, ask.session).prompt {
+            return Ok(());
+        }
+        if !crate::inject::handoff_queued(hub, ask.session).1 {
+            return Err(Stop::Failed(format!(
+                "its conversation was cleared, but the prompt naming {} left the queue untyped (the queue was cleared, \
+                 or its run changed): tell it to read that file",
+                ask.file.display()
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Stop::Failed(format!(
+                "its conversation was cleared, but the prompt naming {} is still waiting to be typed after {} minutes \
+                 (text in its input box?); it goes once the way is clear",
+                ask.file.display(),
+                CLEAR_WAIT.as_secs() / 60
+            )));
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Record how a handoff ended, in the tab's timeline and as a notice.
@@ -553,7 +643,8 @@ mod tests {
         assert!(check_request(None, &s, "memory/handoff.md", 0, false).unwrap_err().contains("only named agents"));
         let no = ok(&Agent { self_handoff: false, ..a.clone() }, &s, "memory/handoff.md").unwrap_err();
         assert!(no.contains("isn't allowed") && no.contains("--self-handoff on") && no.contains("Edit agent"), "{no}");
-        let codex = ok(&Agent { kind: SessionKind::Codex, ..a.clone() }, &s, "memory/handoff.md").unwrap_err();
+        // A Codex agent (never promoted: it can't be) hears "not supported yet", not how to grant it.
+        let codex = ok(&Agent { kind: SessionKind::Codex, self_handoff: false, ..a.clone() }, &s, "memory/handoff.md").unwrap_err();
         assert!(codex.contains("isn't supported for Codex agents yet"), "{codex}");
         assert!(ok(&a, &session(&home, AgentState::Exited), "memory/handoff.md").is_err());
 
@@ -567,6 +658,9 @@ mod tests {
         std::os::unix::fs::symlink(root.join("elsewhere.md"), home.join("link.md")).unwrap();
         assert!(ok(&a, &s, "link.md").unwrap_err().contains("outside your home"), "a link is judged by its target");
         assert!(ok(&a, &s, "/etc/passwd").unwrap_err().contains("outside your home"));
+        // Its path is typed into the terminal: no control characters (ESC would end the paste).
+        std::fs::write(home.join("x\u{1b}[201~\u{15}.md"), "x").unwrap();
+        assert!(ok(&a, &s, "x\u{1b}[201~\u{15}.md").unwrap_err().contains("control characters"));
         // The working directory of a session in a repository doesn't let it reach its home's parent.
         assert!(ok(&a, &session(&work, AgentState::Working), "../elsewhere.md").is_err());
 

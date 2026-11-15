@@ -850,18 +850,22 @@ on from inside any Muster session (an agent's or a shell tab's, even one that dr
 `agent.update`), from a script's WebSocket or from a phone. Anyone may turn it off. A promoted
 agent's `CLAUDE.md` gets a "Starting fresh" section saying how and when to use it. The agent writes
 a handoff file in its home folder or working directory, calls `start_fresh` with its path (or runs
-`muster start-fresh <path>`), and ends its turn. Muster then:
+`muster start-fresh <path>`), and ends its turn. The call must come from the agent's own
+processes (its Claude, or a command it runs): its token used by another program is refused, so
+one agent can't reset another with a token read from its files. Muster then:
 
 1. waits for that turn to end: idle, nothing queued, no text in its input box (the human writing to
    it), for 2 s (a request still waiting after 2 hours
    is given up; one whose agent is restarted, stopped, put to sleep, removed or no longer promoted
    is cancelled);
 2. checks the file again, and the spend caps for unattended work on OpenRouter;
-3. types `/clear` (Claude Code's own new conversation: the process, its background tasks and its
-   tab stay) and records the time (the rate limit: one per 30 minutes);
-4. waits up to 5 minutes for Claude's `SessionStart` hook with `source: "clear"` (a `/clear` still
-   waiting in the queue by then, say behind a draft, is taken back unsent);
-5. types one prompt: `[muster self-handoff origin=<o> hop=<n>] You (<name>) asked Muster for this
+3. queues `/clear` and the prompt together, the prompt held at the head of the queue so a message
+   that arrives meanwhile waits behind it, records the time (the rate limit: one per 30 minutes)
+   and types `/clear` (Claude Code's own new conversation: the process, its background tasks and
+   its tab stay), unless the right was taken back meanwhile;
+4. waits up to 5 minutes for Claude's `SessionStart` hook with `source: "clear"` (else both are
+   taken back unsent where they still wait, say behind a draft);
+5. lets the prompt go, and records the handoff done once it is typed: `[muster self-handoff origin=<o> hop=<n>] You (<name>) asked Muster for this
    new conversation yourself at <time>, with the tool start_fresh; the human did not type this. …
    Read your handoff file <path> and your memory/ notes, then carry on from there.`
 
@@ -870,9 +874,11 @@ handling scheduled or triggered work stays that work (the prompt says it is not 
 the human), and never becomes human-started. Every request, refusal, cancellation, failure and
 finished handoff is a `system` event in the agent's tab (`self_handoff.stage`); a finished or
 failed one is also a notice. "You cannot send a message to yourself" still holds for
-`send_message`. Codex agents: not supported yet. Known gaps: a request waits in the backend's
-memory, so a backend restart forgets it (the agent can ask again), and a restart between the
-`/clear` and the prompt leaves the agent in its new conversation without the prompt.
+`send_message`. Codex agents: not supported yet. A request waits in the backend's memory: a
+backend restart forgets it (the agent can ask again), and settles what it left in the prompt
+queue (an untyped `/clear` is dropped with its prompt; after a typed one the prompt goes).
+Known gap: the file is checked when asked and again before `/clear`, not when the new
+conversation reads it.
 
 Reach: agents live in their own "agents" workspace (`<data>/agents`). `list_agents` and `ask_agent` work
 from every workspace: an agent is a shared service, asking runs no command anywhere, and the origin

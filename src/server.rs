@@ -335,7 +335,7 @@ async fn rpc_http(
             Err(r) => return r,
         }
     };
-    axum::Json(crate::rpc::http_call(&hub, &who, &body).await).into_response()
+    axum::Json(crate::rpc::http_call(&hub, &who, &body, peer.addr).await).into_response()
 }
 
 #[derive(Deserialize)]
@@ -671,6 +671,28 @@ pub enum Holder {
 /// window's connection look like an agent's. Inside when any holder descends from one of
 /// `roots` (the sessions' processes); Unknown when anything can't be read or nothing holds it.
 pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>) -> Holder {
+    connection_holder_in(peer, server, roots, &[])
+}
+
+/// `connection_holder`, also Inside when a holder runs in one of `cgroups` (or below it): the
+/// sessions' own control groups, which a program an agent started stays in after its parent
+/// exits and it is handed to init (so it no longer descends from the session). Empty: as
+/// `connection_holder`.
+pub fn connection_holder_in(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>,
+    cgroups: &[String]) -> Holder {
+    holder(peer, server, roots, cgroups, false)
+}
+
+/// `connection_holder_in`, judging only the processes seen holding the connection: one that
+/// hides its descriptors never counts (Unknown when none is seen). For proving a call is a
+/// session's own (`self_handoff::own_processes`), where "might hold it" isn't enough.
+pub fn connection_holder_seen(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>,
+    cgroups: &[String]) -> Holder {
+    holder(peer, server, roots, cgroups, true)
+}
+
+fn holder(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>, cgroups: &[String],
+    seen_only: bool) -> Holder {
     const ESTABLISHED: &str = "01";
     let unknown = |why: &str| Holder::Unknown(why.to_string());
     let mut inodes: Vec<String> = Vec::new();
@@ -739,11 +761,19 @@ pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::coll
     // The processes seen holding it decide. Only when none is seen do the ones that might hold
     // it (hidden) decide: one of them is the holder. An unrelated program that hides its
     // descriptors, in a session or not, never decides for a connection someone visibly holds.
-    let judged = if holders.is_empty() { &hidden } else { &holders };
+    let judged = if holders.is_empty() && !seen_only { &hidden } else { &holders };
     if judged.is_empty() {
         return unknown("no process holds the connection");
     }
     for pid in judged {
+        if !cgroups.is_empty() {
+            match cgroup_of(*pid) {
+                Some(cg) if cgroups.iter().any(|s| cg == *s || cg.starts_with(&format!("{s}/"))) => return Holder::Inside(*pid),
+                Some(_) => {}
+                None if !std::path::Path::new(&format!("/proc/{pid}")).exists() => {}
+                None => return Holder::Unknown(format!("the control group of process {pid} can't be read")),
+            }
+        }
         match descent(*pid, roots) {
             Some(true) => return Holder::Inside(*pid),
             Some(false) => {}
@@ -754,6 +784,25 @@ pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::coll
         }
     }
     Holder::Outside
+}
+
+/// The control groups of these sessions' processes that are their own: each one that differs
+/// from the backend's own group and doesn't contain it (sessions Muster isolates run in scopes
+/// of their own; otherwise they share the backend's or the terminal host's group, which tells
+/// nothing and would take in programs the backend starts, a window among them). Never the root.
+pub fn session_cgroups(pids: impl Iterator<Item = u32>) -> Vec<String> {
+    let own = cgroup_of(std::process::id());
+    pids.filter_map(cgroup_of)
+        .filter(|c| !c.is_empty() && c != "/")
+        .filter(|c| own.as_ref().is_none_or(|o| o != c && !o.starts_with(&format!("{c}/"))))
+        .collect()
+}
+
+/// A process's cgroup v2 path (`0::/user.slice/…`), from `/proc/<pid>/cgroup`. None: gone,
+/// unreadable, or no unified hierarchy.
+pub fn cgroup_of(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("0::")).map(|p| p.trim().to_string())
 }
 
 /// A process's user ids (real, effective, saved, filesystem), from `/proc/<pid>/status`, which
@@ -1109,6 +1158,27 @@ mod tests {
         drop(c);
     }
 
+    /// A program detached from its session (its parent exited, init adopted it) no longer
+    /// descends from it, but stays in the session's control group: inside, when the caller
+    /// gives the sessions' groups (`connection_holder_in`, granting self handoff).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_holder_in_a_sessions_control_group_is_inside() {
+        let Some(mine) = cgroup_of(std::process::id()) else { eprintln!("no cgroup v2: skipped"); return };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (_srv, peer) = l.accept().unwrap();
+        let (me, server, none) = (std::process::id(), l.local_addr().unwrap(), std::collections::HashSet::new());
+        assert_eq!(connection_holder_in(peer, server, &none, &[mine.clone()]), Holder::Inside(me));
+        if let Some((parent, _)) = mine.rsplit_once('/').filter(|(p, _)| !p.is_empty()) {
+            assert_eq!(connection_holder_in(peer, server, &none, &[parent.to_string()]), Holder::Inside(me), "below it");
+        }
+        assert_eq!(connection_holder_in(peer, server, &none, &[format!("{mine}-other")]), Holder::Outside, "a sibling");
+        assert_eq!(connection_holder_in(peer, server, &none, &[]), Holder::Outside);
+        assert_eq!(connection_holder_seen(peer, server, &[me].into_iter().collect(), &[]), Holder::Inside(me), "seen holding it");
+        drop(c);
+    }
+
     /// A program that hides its descriptors (`PR_SET_DUMPABLE` off) while it holds the
     /// connection: its parents still show, so one started in a session is still inside.
     #[cfg(target_os = "linux")]
@@ -1135,6 +1205,8 @@ mod tests {
         // descriptors can't be read.
         assert_eq!(connection_holder(peer, server, &[child.id()].into_iter().collect()), Holder::Inside(child.id()));
         assert_eq!(connection_holder(peer, server, &[me].into_iter().collect()), Holder::Inside(child.id()));
+        // Proving a call is a session's own takes a holder that is seen: a hidden one never is.
+        assert!(matches!(connection_holder_seen(peer, server, &[child.id()].into_iter().collect(), &[]), Holder::Unknown(_)));
         let _ = child.kill();
         let _ = child.wait();
     }

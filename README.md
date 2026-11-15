@@ -177,7 +177,9 @@ Named agents are persistent agent sessions with their own folder, memory and res
 conversation (PLAN.md §10): `muster agent new reviewer --persona "Reviews diffs"`, then
 `muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_agent` MCP tool from an agent).
 In the UI, Alt+Shift+G opens the agents panel: start an agent with a click, create one from a
-template, edit its persona and memory, and watch the messages agents send each other.
+template, edit its persona and memory, and watch the messages agents send each other. You can
+also let a Claude agent start itself fresh from a handoff file it writes once its conversation
+grows long (docs/MCP.md, "Self handoff").
 
 Agent panels are described in [docs/AGENT_PANELS.md](docs/AGENT_PANELS.md); the agent skills
 that use them in [docs/CLI.md](docs/CLI.md#agent-skills).

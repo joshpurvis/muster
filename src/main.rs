@@ -38,6 +38,7 @@ mod replay_tail;
 mod pty;
 mod rpc;
 mod schedules;
+mod self_handoff;
 mod server;
 mod store;
 mod terminal;
@@ -426,6 +427,20 @@ agent. The asker gets it as a new message, or the human in the agents panel (doc
         #[arg(long)]
         json: bool,
     },
+    /// Inside a named agent's session: start a new conversation once this turn ends, from a
+    /// handoff file it wrote (only for agents the human allowed: `agent edit --self-handoff on`).
+    #[command(after_help = "Example:\n  muster start-fresh memory/handoff.md\n\n\
+Runs the session's MCP `start_fresh` tool. Once the agent is idle, Muster types /clear (its process\n\
+and background tasks keep running) and then one prompt naming the file. The file must exist inside\n\
+the agent's home folder or working directory; at most one fresh start every 30 minutes; Claude\n\
+agents only (docs/MCP.md, \"Self handoff\").")]
+    StartFresh {
+        /// The handoff file: absolute, or relative to this directory.
+        file: PathBuf,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a native UI window in this process (started by `muster` / `muster open`).
     #[command(hide = true)]
     NativeWindow {
@@ -563,6 +578,11 @@ enum AgentCmd {
         /// wakes it into the same conversation.
         #[arg(long, value_name = "TIME")]
         sleep_after: Option<String>,
+        /// Let this Claude agent start itself fresh from a handoff file it wrote (`muster
+        /// start-fresh`). Only the human turns it on: from Muster's window, or this command in a
+        /// terminal outside Muster (refused inside any Muster tab). Anyone may turn it off.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        self_handoff: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -788,6 +808,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     accepts,
                     autostart: Some(autostart),
                     sleep_after,
+                    self_handoff: None,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -806,6 +827,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 accepts,
                 autostart,
                 sleep_after,
+                self_handoff,
                 perms,
             } => cli::agent_edit(
                 d,
@@ -821,6 +843,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     accepts,
                     autostart: autostart.map(|a| a == "on"),
                     sleep_after,
+                    self_handoff: self_handoff.map(|a| a == "on"),
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -848,6 +871,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             json,
         } => cli::ask(d, &agent, &text, timeout, json),
         Cmd::Reply { msg_id, text, json } => cli::reply(d, msg_id, &text, json),
+        Cmd::StartFresh { file, json } => cli::start_fresh(d, &file, json),
         _ => unreachable!("dispatched in main"),
     }
 }

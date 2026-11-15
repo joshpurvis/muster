@@ -586,6 +586,8 @@ interface MockAgent {
   account_profile_id?: number | null;
   handoff?: { from: number | null; at: number; reason?: string } | null;
   reset_on_next_start?: boolean;
+  self_handoff: boolean;
+  self_handoff_at: number | null;
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
@@ -725,6 +727,8 @@ function newAgent(p: any): MockAgent {
     created_at: now(),
     account_profile_id: typeof p.account_profile === "number" ? p.account_profile : null,
     handoff: null,
+    self_handoff: false,
+    self_handoff_at: null,
   };
   agentList.push(a);
   memory.set(a.name, new Map());
@@ -1157,6 +1161,10 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       for (const k of ["model", "effort"] as const) if (k in p) a[k] = String(p[k]).trim() || null;
       if ("persona" in p) a.persona = p.persona;
       if ("autostart" in p) a.autostart = !!p.autostart;
+      if ("self_handoff" in p) {
+        if (p.self_handoff && a.kind !== "claude") throw new Error("self handoff isn't supported for Codex agents yet");
+        a.self_handoff = !!p.self_handoff;
+      }
       if ("permissions" in p) a.permissions = p.permissions;
       if ("accepts" in p) {
         if (!p.accepts.length) {

@@ -94,6 +94,10 @@ pub trait Backend: Send + Sync + 'static {
     fn agent_reply(&self, _caller: SessionId, _msg_id: i64, _text: String) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
         async { anyhow::bail!("replies unavailable in this backend") }
     }
+    /// The caller (a promoted named agent) asks for its own fresh start (src/self_handoff.rs).
+    fn agent_start_fresh(&self, _caller: SessionId, _file: &str) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("fresh starts unavailable in this backend")
+    }
 }
 
 #[derive(Clone)]
@@ -205,6 +209,9 @@ impl Backend for HubBackend {
     }
     async fn agent_reply(&self, caller: SessionId, msg_id: i64, text: String) -> anyhow::Result<serde_json::Value> {
         crate::agent_reply::reply(&self.0, caller, msg_id, text).await
+    }
+    fn agent_start_fresh(&self, caller: SessionId, file: &str) -> anyhow::Result<serde_json::Value> {
+        crate::self_handoff::request(&self.0, caller, file)
     }
 }
 

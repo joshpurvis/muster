@@ -247,6 +247,16 @@ asleep bar, a `cold` marker, a timeline note, and the cold-start mark on the mes
 migration v24 (`agents.sleep_after_min`, `agents.asleep_at`, `agents.asleep_autostart`,
 `agents.asleep_generation`).
 
+**Self handoff (built; src/self_handoff.rs, docs/MCP.md "Self handoff").** A per-agent right,
+off by default, that only the human grants (Edit agent, or `muster agent edit --self-handoff on`
+from a terminal outside every Muster session): a promoted Claude agent writes a handoff file and
+calls `start_fresh` (or `muster start-fresh`); once its turn has ended Muster types `/clear` (its
+process and background tasks stay), waits for Claude's new conversation, and types one prompt
+naming the file and saying the agent asked, with the asking turn's origin. Only for itself, a file
+inside its home or working directory, one waiting at a time, one per 30 minutes; every step is in
+its tab's timeline. Codex: not yet. Store migration v29 (`agents.self_handoff`,
+`agents.self_handoff_at`).
+
 **Deferred** (don't design them out):
 
 - A chat view per agent (desktop or phone), and the agents roster on the phone (devices get no

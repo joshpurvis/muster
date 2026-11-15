@@ -230,11 +230,19 @@ printf '\\033[2J\\033[H› \\r\\n\\r\\n  fake idle agent\\r\\n'
 exec tee '${BASE}/fake-input-'"$MUSTER_SESSION_ID" > '${BASE}/fake-input'
 `);
   await Deno.chmod(`${BASE}/bin/codex`, 0o700);
-  // Stand-in Claude: records how it was launched, then idles (never starts a real agent).
+  // Stand-in Claude: records how it was launched and each line typed into it, then idles (never
+  // starts a real agent). A line SMOKE-START-FRESH <file> runs `muster start-fresh <file>` as
+  // a program of its own session would (the self handoff test), its output in start-fresh-<id>.
   await Deno.writeTextFile(`${BASE}/bin/claude`, `#!/bin/bash
 ${LAUNCH_DUMP("claude")}
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/claude-token-'"$MUSTER_SESSION_ID"
-exec cat > /dev/null
+while IFS= read -r line; do
+  printf '%s\\n' "$line" >> '${BASE}/claude-input-'"$MUSTER_SESSION_ID"
+  case "$line" in
+    SMOKE-START-FRESH\\ *) out='${BASE}/start-fresh-'"$MUSTER_SESSION_ID"
+      "$MUSTER_BIN" start-fresh "\${line#SMOKE-START-FRESH }" > "$out.tmp" 2>&1; echo "exit=$?" >> "$out.tmp"; mv "$out.tmp" "$out";;
+  esac
+done
 `);
   await Deno.chmod(`${BASE}/bin/claude`, 0o700);
   await Deno.mkdir(REPO, { recursive: true });
@@ -1263,6 +1271,7 @@ exec cat > /dev/null
   await c.call("agent.remove", { name: "bg" });
 
   await lateReplies(c, mcp);
+  await selfHandoff(c, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
   ({ c, d } = await schedules(c, d));
@@ -1271,6 +1280,136 @@ exec cat > /dev/null
   ({ c, d } = await phoneAlerts(c, d));
   await openRouter(c, d);
   console.log(`\nPASS (${passed} checks)`);
+}
+
+/** Self handoff (docs/MCP.md "Self handoff"): only the human promotes an agent (never a call from
+ * inside a session, even one that dropped its session id); the promoted agent's `start_fresh`
+ * waits for its turn to end, types /clear, and once Claude says the new conversation started,
+ * one prompt naming its handoff file. A fake Claude stands in: the test plays its hooks. */
+async function selfHandoff(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+  const run = async (args: string[], extra: Record<string, string> = {}) => {
+    const o = await cli(args, { ...ENV, ...extra });
+    return { ok: o.success, out: dec.decode(o.stdout), err: dec.decode(o.stderr) };
+  };
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
+      await sleep(100);
+    }
+  };
+  const refusedMcp = (p: Promise<unknown>, part: string, what: string) =>
+    p.then(() => ok(false, what), (e) => ok(String(e).includes(part), `${what}: ${String(e).slice(0, 300)}`));
+
+  const made = await c.call("agent.create", { name: "otto", kind: "claude" });
+  ok(made.self_handoff === false, "self handoff: off for a new agent");
+  const sid: number = (await c.call("agent.start", { name: "otto" })).session.id;
+  const agentCh: number = (await c.call("agent.list")).find((a: Json) => a.name === "otto").channel_id;
+  let token = "";
+  await until("otto's token", async () => (token = await Deno.readTextFile(`${BASE}/claude-token-${sid}`).catch(() => "")).length > 10);
+  const home = `${DATA}/agents/otto`;
+  const file = `${home}/memory/handoff.md`;
+  await Deno.mkdir(`${home}/memory`, { recursive: true });
+  await Deno.writeTextFile(file, "next: ship the release notes\n");
+  const input = () => Deno.readTextFile(`${BASE}/claude-input-${sid}`).catch(() => "");
+  const hook = async (event: string, body: Json) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/${event}`, {
+      method: "POST", headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(body),
+    });
+    await r.body?.cancel();
+    if (!r.ok) throw new Error(`hook ${event}: ${r.status}`);
+  };
+  const stages = async () => ((await c.call("channel.timeline", { id: agentCh, limit: 500 })) as Json[])
+    .filter((e) => e.kind === "system" && e.data.self_handoff).map((e) => e.data.self_handoff.stage);
+
+  /** `muster start-fresh FILE` run by the agent's own process (the fake Claude runs it). */
+  const fromSession = async (f: string) => {
+    const out = `${BASE}/start-fresh-${sid}`;
+    await Deno.remove(out).catch(() => {});
+    c.input(sid, `SMOKE-START-FRESH ${f}\r`);
+    let text = "";
+    await until("start-fresh in the session", async () => (text = await Deno.readTextFile(out).catch(() => "")).includes("exit="));
+    return { ok: text.includes("exit=0"), text };
+  };
+  const refusedHere = async (f: string, part: string, what: string) => {
+    const r = await fromSession(f);
+    ok(!r.ok && r.text.includes(part), `${what}: ${r.text.trim().slice(0, 300)}`);
+  };
+
+  // ---- Not promoted: refused, saying how the human grants it, and recorded
+  await refusedHere(file, "--self-handoff on", "self handoff: refused before the human allows it");
+  ok((await stages()).includes("refused"), "self handoff: the refusal is in the agent's timeline");
+
+  // ---- Granting: never from inside a Muster session, even with its session id dropped
+  const ws = (await c.call("hello")).workspaces[0];
+  const shCh = await c.call("channel.create", { workspace_id: ws.id, name: "grant from a tab", agent: "shell" });
+  const shell = (await c.call("hello")).sessions.find((x: Json) => x.channel_id === shCh.id);
+  await sleep(800);
+  c.input(shell.id, `env -u MUSTER_SESSION_ID -u MUSTER_TOKEN MUSTER_RUNTIME_DIR='${RUNTIME}' MUSTER_DATA_DIR='${DATA}' ` +
+    `MUSTER_PORT='${PORT}' '${BIN}' agent edit otto --self-handoff on > '${BASE}/grant-in-tab' 2>&1; echo "exit=$?" >> '${BASE}/grant-in-tab'\r`);
+  let inTab = "";
+  await until("the grant typed in a tab", async () => (inTab = await Deno.readTextFile(`${BASE}/grant-in-tab`).catch(() => "")).includes("exit="));
+  ok(inTab.includes("exit=1") && inTab.includes("only the human"), `self handoff: the CLI in a Muster tab can't grant it (${inTab.trim().slice(0, 200)})`);
+  // (A program detached from a tab is refused by its control group when sessions are isolated:
+  // src/server.rs `a_holder_in_a_sessions_control_group_is_inside`; this daemon runs without.)
+  const withId = await run(["agent", "edit", "otto", "--self-handoff", "on"], { MUSTER_SESSION_ID: String(sid) });
+  ok(!withId.ok && withId.err.includes("only the human"), "self handoff: nor on a session's behalf");
+  await c.call("agent.update", { name: "otto", self_handoff: true }).then(
+    () => ok(false, "self handoff: a script's WebSocket can't grant it"),
+    (e) => ok(String(e).includes("only the human"), "self handoff: a script's WebSocket can't grant it"),
+  );
+  const granted = await run(["agent", "edit", "otto", "--self-handoff", "on"]);
+  ok(granted.ok && granted.out.includes("may start itself fresh"), `self handoff: the owner's terminal grants it (${granted.out.trim()}${granted.err})`);
+  const ls = await run(["agent", "ls"]);
+  ok(/SELF-HANDOFF/.test(ls.out) && /otto\s.*\son\s/.test(ls.out), `self handoff: muster agent ls shows it (${ls.out.trim()})`);
+  ok((await Deno.readTextFile(`${home}/CLAUDE.md`)).includes("## Starting fresh"), "self handoff: its CLAUDE.md tells it how");
+
+  // ---- The guards on asking
+  await refusedMcp(mcp(token, "start_fresh", { file }), "your own session's processes",
+    "self handoff: its token used from another program is refused");
+  await refusedHere("/etc/passwd", "outside your home", "self handoff: a file outside its folders is refused");
+  await refusedHere(`${home}/memory/missing.md`, "doesn't exist", "self handoff: a missing file is refused");
+  await refusedHere(`${home}/memory`, "not a regular file", "self handoff: a folder is refused");
+
+  // ---- Asked mid-turn: nothing is typed until the turn ends
+  await hook("UserPromptSubmit", { prompt: "tidy up the notes" });
+  const asked = await fromSession(file);
+  ok(asked.ok && asked.text.includes("End your turn"), `self handoff: muster start-fresh in its session (${asked.text.trim()})`);
+  await refusedHere(file, "already asked", "self handoff: one request waits at a time");
+  await sleep(3500);
+  ok(!(await input()).includes("/clear"), "self handoff: nothing typed while it works");
+  await hook("Stop", { last_assistant_message: "notes tidied" });
+  await until("/clear typed", async () => (await input()).includes("/clear"));
+  ok(true, "self handoff: /clear typed once it is idle");
+  // A message that arrives meanwhile waits behind the handoff prompt.
+  await c.call("session.send", { id: sid, text: "queued during the clear" });
+  await sleep(1500);
+  const before = await input();
+  ok(!before.includes("[muster self-handoff") && !before.includes("queued during the clear"),
+    "self handoff: the prompt, and what came after it, wait for Claude's new conversation");
+  // Claude's SessionStart hook for the new conversation.
+  await hook("SessionStart", { session_id: "conv-fresh", source: "clear" });
+  await until("the handoff prompt", async () => (await input()).includes("[muster self-handoff origin=human hop=0]"));
+  const typed = await input();
+  ok(typed.includes(file) && typed.includes("the human did not type this"), "self handoff: one prompt names the file and says who asked");
+  await until("done recorded", async () => (await stages()).includes("done"));
+  await hook("Stop", { last_assistant_message: "read it" });
+  await until("the queued message", async () => (await input()).includes("queued during the clear"));
+  const order = await input();
+  ok(order.indexOf("[muster self-handoff") < order.indexOf("queued during the clear"), "self handoff: its prompt goes first");
+  const st = await stages();
+  ok(st.includes("requested") && st.includes("done"), `self handoff: requested and done are recorded (${st.join(",")})`);
+  ok(c.events.some((e) => e.event === "notice" && String(e.data.text).includes("otto started fresh")), "self handoff: a notice says it happened");
+  const after = (await c.call("agent.list")).find((a: Json) => a.name === "otto");
+  ok(after.self_handoff_at > 0 && after.session_id === sid, "self handoff: same session (its process kept), the time recorded");
+
+  // ---- The rate limit, and taking the right back (from anywhere)
+  await hook("UserPromptSubmit", { prompt: "carry on" });
+  await refusedHere(file, "at most one every 30 minutes", "self handoff: one per 30 minutes");
+  await c.call("agent.update", { name: "otto", self_handoff: false });
+  await refusedHere(file, "isn't allowed", "self handoff: taken back, refused again");
+  ok(!(await Deno.readTextFile(`${home}/CLAUDE.md`)).includes("## Starting fresh"), "self handoff: its CLAUDE.md drops the section");
+  await c.call("agent.remove", { name: "otto" });
 }
 
 /** Late replies (docs/MCP.md "Late replies"): two fake Codex agents stand in for an asker and a

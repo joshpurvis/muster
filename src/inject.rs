@@ -79,6 +79,41 @@ struct Item {
     /// format stays readable by a backend without panels (it ignores unknown fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     panel: Option<PanelBatch>,
+    /// Part of a self handoff (src/self_handoff.rs). Optional and skipped when absent, like
+    /// `panel`: an older backend after a rollback types it as an ordinary prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff: Option<HandoffPart>,
+}
+
+/// The two prompts of a self handoff, queued together (`enqueue_handoff`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffPart {
+    /// `/clear`.
+    Clear,
+    /// The prompt naming the handoff file. While `held` it stays at the head of the queue and
+    /// nothing behind it is typed: it waits for Claude's new conversation (`release_handoff`).
+    Prompt { held: bool },
+}
+
+fn held(item: &Item) -> bool {
+    matches!(item.handoff, Some(HandoffPart::Prompt { held: true }))
+}
+
+/// After a backend restart nothing drives a self handoff any more: one whose `/clear` was never
+/// typed is dropped whole (it never clears the conversation out of turn, without its prompt);
+/// one whose `/clear` was typed lets its prompt go. True when something changed.
+fn settle_orphaned_handoff(queue: &mut SessQ) -> bool {
+    if queue.items.iter().any(|item| item.handoff == Some(HandoffPart::Clear)) {
+        queue.items.retain(|item| item.handoff.is_none());
+        return true;
+    }
+    let mut changed = false;
+    for item in queue.items.iter_mut().filter(|item| held(item)) {
+        item.handoff = Some(HandoffPart::Prompt { held: false });
+        changed = true;
+    }
+    changed
 }
 
 /// Panel events admitted to a prompt. They live here, not in `panel_events`, until the
@@ -191,6 +226,9 @@ impl Queues {
                 }
             }
             queue.busy = false;
+            if settle_orphaned_handoff(queue) {
+                tracing::warn!("a self handoff was waiting when the backend stopped: its prompts were settled");
+            }
         }
         store.save_runtime("prompt-queues", &queues)?;
         Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default() })
@@ -303,6 +341,90 @@ pub fn drop_message(hub: &Hub, msg: i64) -> anyhow::Result<bool> {
     Ok(dropped)
 }
 
+/// Queue a self handoff for session `id` in run `generation`: `/clear`, then `prompt` held at
+/// the head of the queue until `release_handoff` (src/self_handoff.rs). Refused when the run
+/// changed or another handoff is queued.
+pub(crate) fn enqueue_handoff(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, prompt: String,
+    source: crate::agents::Source, from: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!hub.is_shutting_down(), "application backend is stopping");
+    anyhow::ensure!(is_live(hub, id), "session {id} is not running");
+    let item = |text: &str, part| Item { generation, text: text.into(), clear_first: false, attempts: 0,
+        draft_noticed: false, source, panel: None, handoff: Some(part) };
+    let current = hub.pty_generation(id);
+    hub.injection.edit(id, |q| {
+        anyhow::ensure!(current == generation, "the terminal run changed");
+        if q.generation != generation { *q = SessQ::default(); }
+        q.generation = generation;
+        let queued = q.items.iter().chain(q.active.as_ref().map(|a| &a.item)).any(|i| i.handoff.is_some());
+        anyhow::ensure!(!queued, "a fresh start is already queued");
+        q.items.push_back(item("/clear", HandoffPart::Clear));
+        q.items.push_back(item(&prompt, HandoffPart::Prompt { held: true }));
+        Ok(())
+    })??;
+    sync_queued(hub, id);
+    log_prompt(hub, id, "/clear", from, true);
+    kick(hub.clone(), id);
+    Ok(())
+}
+
+/// Let session `id`'s held handoff prompt go (Claude started the new conversation). True when
+/// one was held.
+pub(crate) fn release_handoff(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<bool> {
+    let released = hub.injection.edit(id, |q| {
+        let mut any = false;
+        for item in q.items.iter_mut().filter(|i| held(i)) {
+            item.handoff = Some(HandoffPart::Prompt { held: false });
+            any = true;
+        }
+        any
+    })?;
+    if let Some(text) = released.then(|| handoff_prompt_text(hub, id)).flatten() {
+        log_prompt(hub, id, &text, "self-handoff", true);
+    }
+    kick(hub.clone(), id);
+    Ok(released)
+}
+
+fn handoff_prompt_text(hub: &Hub, id: SessionId) -> Option<String> {
+    hub.injection.inner.lock().get(&id)?.items.iter()
+        .find(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. }))).map(|i| i.text.clone())
+}
+
+/// Where session `id`'s self handoff stands in its queue.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffQueued {
+    /// `/clear` waits in the queue.
+    pub clear_waiting: bool,
+    /// `/clear` is being typed (or paused for review).
+    pub clear_active: bool,
+    /// The prompt waits or is being typed.
+    pub prompt: bool,
+}
+
+pub(crate) fn handoff_queued(hub: &Hub, id: SessionId) -> HandoffQueued {
+    let guard = hub.injection.inner.lock();
+    let Some(q) = guard.get(&id) else { return HandoffQueued::default() };
+    let active = q.active.as_ref().map(|a| &a.item);
+    HandoffQueued {
+        clear_waiting: q.items.iter().any(|i| i.handoff == Some(HandoffPart::Clear)),
+        clear_active: active.is_some_and(|i| i.handoff == Some(HandoffPart::Clear)),
+        prompt: q.items.iter().chain(active).any(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. }))),
+    }
+}
+
+/// Take session `id`'s self handoff back out of its queue, as far as it still waits (a prompt
+/// being typed stays). (`/clear` was taken back, its prompt was taken back).
+pub(crate) fn withdraw_handoff(hub: &Hub, id: SessionId) -> anyhow::Result<(bool, bool)> {
+    let removed = hub.injection.edit_with(id, Unsent::Discard, |q| {
+        let clear = q.items.iter().any(|i| i.handoff == Some(HandoffPart::Clear));
+        let prompt = q.items.iter().any(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. })));
+        q.items.retain(|i| i.handoff.is_none());
+        (clear, prompt)
+    })?;
+    sync_queued(hub, id);
+    Ok(removed)
+}
+
 /// Is agent message `msg` still in a prompt queue (waiting, or being typed)?
 pub fn holds_message(hub: &Hub, msg: i64) -> bool {
     let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
@@ -399,6 +521,7 @@ pub async fn send(
         draft_noticed: false,
         source,
         panel: None,
+        handoff: None,
     };
 
     if mode == SendMode::Interrupt {
@@ -413,7 +536,9 @@ pub async fn send(
             anyhow::ensure!(current == generation, "the terminal run changed");
             if q.generation != generation { *q = SessQ::default(); }
             q.generation = generation;
-            q.items.push_front(item);
+            // Never ahead of a held self-handoff prompt: the new conversation reads it first.
+            let at = q.items.iter().take_while(|i| held(i)).count();
+            q.items.insert(at, item);
             Ok(q.items.len() as u32)
         })??;
         sync_queued(hub, id);
@@ -600,7 +725,7 @@ pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[(crate::model::Pa
     // Human-origin at hop 0, as a `Chain`: older backends can still read this queue.
     let source = crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None });
     let item = Item { generation, text: text.clone(), clear_first: false, attempts: 0, draft_noticed: false,
-        source, panel: Some(batch) };
+        source, panel: Some(batch), handoff: None };
     hub.injection.edit(id, |queue| {
         if queue.generation != generation { *queue = SessQ::default(); }
         queue.generation = generation;
@@ -638,7 +763,7 @@ fn finish(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, result: &anyho
 pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: String,
     source: crate::agents::Source) -> anyhow::Result<()> {
     let item = Item { generation: Some(generation), text, clear_first: false, attempts: 0,
-        draft_noticed: false, source, panel: None };
+        draft_noticed: false, source, panel: None, handoff: None };
     hub.injection.edit(id, |q| {
         if q.generation != Some(generation) { *q = SessQ { generation: Some(generation), ..SessQ::default() }; }
         q.items.push_back(item);
@@ -682,7 +807,8 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
                 if q.generation != generation { return None }
                 // A panel batch whose opener left its task returns to its panels (`panel_moves`).
                 q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)));
-                let item = if is_ready { q.items.pop_front() } else { None };
+                // A held handoff prompt keeps its place, and everything behind it waits.
+                let item = if is_ready && !q.items.front().is_some_and(held) { q.items.pop_front() } else { None };
                 if let Some(item) = &item {
                     q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
                 } else { q.busy = false; }
@@ -794,6 +920,7 @@ fn deferred(hub: &Hub, id: SessionId, generation: Option<u64>) -> bool {
         .filter(|q| q.generation == generation)
         .and_then(|q| q.items.front().map(|item| (item.clear_first, item.draft_noticed)));
     let Some((clear_first, noticed)) = head else { return false };
+    if hub.injection.inner.lock().get(&id).and_then(|q| q.items.front().map(held)).unwrap_or(false) { return true }
     let blocked = if unsafe_to_type(hub, id, adapter, generation).is_some() {
         true
     } else if let Some(current) = composer(hub, id, adapter).filter(|c| !c.trim().is_empty()) {
@@ -984,6 +1111,10 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         crate::schedules::not_submitted(hub, &item.source, no);
         return Ok(true);
     }
+    // A self handoff's /clear whose right was taken back meanwhile is never typed.
+    if item.handoff == Some(HandoffPart::Clear) && !crate::self_handoff::still_allowed(hub, id) {
+        return Ok(true);
+    }
     // Unattended work for an OpenRouter session past a spend cap (or with today's spend
     // unknown) is taken back too, whoever queued it (src/spend.rs).
     if let Some(why) = crate::spend::submit_gate_fresh(hub, id, &item.source).await {
@@ -1081,6 +1212,11 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             crate::spend::not_submitted(hub, &item.source, why);
             return Ok(true);
         }
+        // A self handoff's /clear whose right was taken back while it was typed: taken back out.
+        if item.handoff == Some(HandoffPart::Clear) && !crate::self_handoff::still_allowed(hub, id) {
+            if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
+            return Ok(true);
+        }
         // Its turn is OpenRouter spend from now on, even before the screen shows it working.
         if let Some(a) = hub.agents().by_session(id)
             && hub.session(id).is_some_and(|s| s.provider == crate::openrouter::Provider::OpenRouter)
@@ -1101,6 +1237,10 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         mark_stage(hub, id, generation, Stage::Submitting)?;
         let seq_before = hub.output_seq(id);
         hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+        // Enter reached the terminal: a self handoff's part counts as typed from here on.
+        if let Some(part) = item.handoff {
+            crate::self_handoff::submitting(hub, id, part);
+        }
         seq_before
     };
 
@@ -1378,7 +1518,7 @@ mod tests {
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None,
+            source: crate::agents::Source::Human, panel: None, handoff: None,
         };
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
@@ -1398,7 +1538,7 @@ mod tests {
             let store = crate::store::Store::open_memory().unwrap();
             let queues = Queues::load(&store).unwrap();
             let item = Item { generation: Some(7), text: "run-once".into(), clear_first: false, attempts: 1,
-                draft_noticed: false, source: crate::agents::Source::Human, panel: None };
+                draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None };
             queues.edit(1, |q| {
                 q.busy = true;
                 q.generation = Some(7);
@@ -1437,12 +1577,12 @@ mod tests {
         queues.edit(1, |q| q.generation = Some(2)).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "obsolete".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None }).unwrap();
+            source: crate::agents::Source::Human, panel: None, handoff: None }).unwrap();
         assert!(queues.inner.lock()[&1].items.is_empty());
         queues.remove(1).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "removed".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None }).unwrap();
+            source: crate::agents::Source::Human, panel: None, handoff: None }).unwrap();
         assert!(queues.inner.lock().is_empty(), "late tasks cannot recreate deleted queues");
     }
 
@@ -1451,7 +1591,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
         let item = Item { generation: Some(1), text: "later".into(), clear_first: false, attempts: 0,
-            draft_noticed: false, source: crate::agents::Source::Human, panel: None };
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None };
         queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(item.clone()); }).unwrap();
         let count = || waiting(&queues.inner.lock()[&1]);
         assert_eq!(count(), 1);
@@ -1501,7 +1641,7 @@ mod tests {
     fn panel_item(events: Vec<PanelEvent>, fetch: Vec<i64>) -> Item {
         Item { generation: Some(1), text: "[panel]".into(), clear_first: false, attempts: 0, draft_noticed: false,
             source: crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None }),
-            panel: Some(PanelBatch { id: rand::random(), channel_id: 1, events, fetch }) }
+            panel: Some(PanelBatch { id: rand::random(), channel_id: 1, events, fetch }), handoff: None }
     }
 
     fn ids(store: &crate::store::Store, panel: &Panel) -> Vec<i64> {
@@ -1628,6 +1768,49 @@ mod tests {
         }
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
             muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
+    }
+
+    /// A self handoff (src/self_handoff.rs): its held prompt keeps the head of the queue, so
+    /// nothing queued after it goes first; it can be taken back; a backend restart never leaves
+    /// a `/clear` to be typed out of turn.
+    #[test]
+    fn a_self_handoff_holds_the_queue_and_settles_after_a_restart() {
+        let hub = hub_fixture();
+        let item = |text: &str, handoff| Item { generation: None, text: text.into(), clear_first: false, attempts: 0,
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff };
+        let texts = |hub: &Hub| hub.injection.inner.lock()[&1].items.iter().map(|i| i.text.clone()).collect::<Vec<_>>();
+        hub.injection.edit(1, |q| {
+            q.active = Some(Active { item: item("/clear", Some(HandoffPart::Clear)), stage: Stage::Typing });
+            q.items.extend([item("read the file", Some(HandoffPart::Prompt { held: true })), item("later", None)]);
+        }).unwrap();
+        assert_eq!(handoff_queued(&hub, 1), HandoffQueued { clear_waiting: false, clear_active: true, prompt: true });
+        // Held at the head: nothing is popped (`kick`) and the queue counts as busy.
+        assert!(held(hub.injection.inner.lock()[&1].items.front().unwrap()));
+        assert!(!queue_idle(&hub, 1));
+        // Taken back: the waiting prompt goes; the /clear being typed stays.
+        assert_eq!(withdraw_handoff(&hub, 1).unwrap(), (false, true));
+        assert_eq!(texts(&hub), ["later"]);
+        assert_eq!(withdraw_handoff(&hub, 2).unwrap(), (false, false), "another session's queue");
+        // An interrupting send goes behind a held prompt, never ahead of it.
+        hub.injection.edit(1, |q| {
+            q.active = None;
+            q.items.push_front(item("read the file", Some(HandoffPart::Prompt { held: true })));
+            let at = q.items.iter().take_while(|i| held(i)).count();
+            q.items.insert(at, item("urgent", None));
+        }).unwrap();
+        assert_eq!(texts(&hub), ["read the file", "urgent", "later"]);
+
+        // A restart: an untyped /clear goes with its prompt; a typed one lets its prompt go.
+        let mut q = SessQ::default();
+        q.items.extend([item("/clear", Some(HandoffPart::Clear)), item("read", Some(HandoffPart::Prompt { held: true })),
+            item("later", None)]);
+        assert!(settle_orphaned_handoff(&mut q));
+        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["later"]);
+        let mut q = SessQ::default();
+        q.items.extend([item("read", Some(HandoffPart::Prompt { held: true })), item("later", None)]);
+        assert!(settle_orphaned_handoff(&mut q));
+        assert!(!held(&q.items[0]));
+        assert!(!settle_orphaned_handoff(&mut SessQ::default()));
     }
 
     #[test]

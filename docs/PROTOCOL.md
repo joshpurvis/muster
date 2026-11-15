@@ -172,7 +172,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
 | `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
-| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?, account_profile?, now?, save_notes?, handoff_reason?}` | `Agent`, plus `switch` after a move to another account (see "Moving a named agent to another account" under Claude profiles). `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
+| `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?, account_profile?, now?, save_notes?, handoff_reason?, self_handoff?, from_session?}` | `Agent`, plus `switch` after a move to another account (see "Moving a named agent to another account" under Claude profiles). `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). `self_handoff`: let a Claude agent start itself fresh from a handoff file (see "Self handoff"); `true` only from the human: a click in Muster's window, or `/api/rpc` with the client token, no `from_session` (`muster agent edit --self-handoff` passes `$MUSTER_SESSION_ID`), on a connection whose program descends from no session's process and runs in no session's own control group (`rpc::owner_terminal`; the check `schedule.approve` makes of a window, which now also looks at control groups); refused for Codex agents. `false` works from anywhere. The persona file is rewritten when it changes. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
 | `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
@@ -198,7 +198,9 @@ type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "su
              channel_id: number | null /* its own tab */; state: AgentState | null /* its session's */; detail: string | null;
              resumable: boolean; created_at: number;
              sleep_after_min: number | null /* sleeps after this many idle minutes; null: never */;
-             asleep: boolean; asleep_at: number | null /* unix ms */ };
+             asleep: boolean; asleep_at: number | null /* unix ms */;
+             self_handoff: boolean /* may start itself fresh ("Self handoff") */;
+             self_handoff_at: number | null /* unix ms: when it last did (the rate limit) */ };
 type AgentMessage = { id: number; from: string /* agent name, "session:<id>", "human" */; from_session: number | null;
              to: string /* recipient name, "#<id>" once removed */; to_agent: number; to_session: number | null;
              origin: Origin; hop: number; reply_to: number | null; created_at: number;
@@ -231,6 +233,31 @@ reply, or gets or delivers a late reply (the same id again). An agent's state ch
 A named agent's session always restarts (`session.restart`, the UI's Restart, `agent.start`)
 with arguments rebuilt from the agent's record: model, effort, and `--resume` only with its
 current conversation id.
+
+### Self handoff
+
+A named Claude agent the human promoted (`self_handoff: true`, off by default) may ask for its own
+fresh start from a handoff file it wrote: MCP `start_fresh` (docs/MCP.md "Self handoff"), or
+`muster start-fresh FILE` in its session, which calls that tool with the session's own token.
+`start_fresh` is refused unless the `/mcp` request comes from the caller session's own
+processes (one that descends from its process or runs in its own control group): a session's
+token, readable in its files by other programs of the same user, can't reset it from elsewhere.
+The handoff file's path must have no control characters. Muster waits until the turn that asked
+has ended (idle, nothing queued, no draft in its input box, for 2 s), queues `/clear` and the
+prompt together, the prompt held at the head of the queue so nothing queued meanwhile goes
+before it, types `/clear`
+into the agent's tab (Claude Code's own new conversation: the process and its background tasks
+keep running), waits up to 5 minutes for Claude's `SessionStart` hook with `source: "clear"` (else both are
+taken back), then lets go of the prompt that names the file and says the agent asked for it, when, and on what work
+(`[muster self-handoff origin=<o> hop=<n>] …`). Both prompts carry the asking turn's origin and
+hop. Each request, refusal, cancellation, failure and finished handoff is a `system` event in the
+agent's tab (`data.self_handoff.stage`: `requested`, `refused`, `cancelled`, `failed`, `done`); a
+finished or failed one is also a `notice`. Rate limit: one per agent per 30 minutes, counted from
+the `/clear` (`MIN_GAP_MS` in `src/self_handoff.rs`; `self_handoff_at` on the record). Turning the right off before `/clear`
+is typed cancels it (the injector checks again right before typing it). A request waits in the
+backend's memory: a backend restart forgets it, and the prompt queue it left is settled at the
+next start (an untyped `/clear` is dropped with its prompt; after a typed one the prompt goes).
+Codex agents: not supported yet.
 
 ### Sleep and wake
 
@@ -812,7 +839,7 @@ outside the window, and there:
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
 | `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` or `account_profile` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them (for a profile, which account pays). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` or `account_profile` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them (for a profile, which account pays). Also refused: `self_handoff: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
 or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is

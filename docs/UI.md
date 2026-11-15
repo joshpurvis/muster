@@ -671,7 +671,8 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   persona; Edit shows the kind badge, name and home folder over Settings · Memory tabs. Then
   pills: Model, Effort, the Claude profile and Usage (Claude only), Working repository (and its
   checkout once a repository is chosen) and Permissions; then "Takes messages started by" as
-  three check chips; then **More options** (Provider, Autostart, Sleep when idle), whose closed
+  three check chips; then **More options** (Provider, Autostart, Sleep when idle, and for an existing
+  Claude agent Can start itself fresh), whose closed
   line summarises them.
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the chosen template's one-line description under it (every template's
@@ -749,6 +750,12 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   schedule run, panel click or typing into its tab wakes it. The hint says a wake re-reads the
   whole conversation, at full cost once the prompt cache has expired, so sleeping after about the
   cache's lifetime costs nothing extra.
+- **Can start itself fresh** (Edit only, Claude agents, off by default; under Sleep when idle, in More
+  options): lets the agent clear its own conversation from a handoff file it wrote (MCP
+  `start_fresh`, docs/MCP.md "Self handoff"). The hint says how it works, that it happens at most
+  once every 30 minutes, and that only the owner can turn it on; the closed More options line says
+  "Can start itself fresh" when on. Saving it from the window is the owner's click; the backend
+  refuses to turn it on from anywhere an agent could reach.
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
   from the agent's next start, which the toast says when it runs. Edit's title shows the
   OpenRouter badge for an agent on it.

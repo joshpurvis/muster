@@ -390,14 +390,26 @@ fn handoff_prompt_text(hub: &Hub, id: SessionId) -> Option<String> {
         .find(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. }))).map(|i| i.text.clone())
 }
 
-/// Where session `id`'s self handoff stands in its queue: (`/clear` waits or is being typed,
-/// its prompt waits or is being typed).
-pub(crate) fn handoff_queued(hub: &Hub, id: SessionId) -> (bool, bool) {
+/// Where session `id`'s self handoff stands in its queue.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandoffQueued {
+    /// `/clear` waits in the queue.
+    pub clear_waiting: bool,
+    /// `/clear` is being typed (or paused for review).
+    pub clear_active: bool,
+    /// The prompt waits or is being typed.
+    pub prompt: bool,
+}
+
+pub(crate) fn handoff_queued(hub: &Hub, id: SessionId) -> HandoffQueued {
     let guard = hub.injection.inner.lock();
-    let Some(q) = guard.get(&id) else { return (false, false) };
-    let all = || q.items.iter().chain(q.active.as_ref().map(|a| &a.item));
-    (all().any(|i| i.handoff == Some(HandoffPart::Clear)),
-     all().any(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. }))))
+    let Some(q) = guard.get(&id) else { return HandoffQueued::default() };
+    let active = q.active.as_ref().map(|a| &a.item);
+    HandoffQueued {
+        clear_waiting: q.items.iter().any(|i| i.handoff == Some(HandoffPart::Clear)),
+        clear_active: active.is_some_and(|i| i.handoff == Some(HandoffPart::Clear)),
+        prompt: q.items.iter().chain(active).any(|i| matches!(i.handoff, Some(HandoffPart::Prompt { .. }))),
+    }
 }
 
 /// Take session `id`'s self handoff back out of its queue, as far as it still waits (a prompt
@@ -524,7 +536,9 @@ pub async fn send(
             anyhow::ensure!(current == generation, "the terminal run changed");
             if q.generation != generation { *q = SessQ::default(); }
             q.generation = generation;
-            q.items.push_front(item);
+            // Never ahead of a held self-handoff prompt: the new conversation reads it first.
+            let at = q.items.iter().take_while(|i| held(i)).count();
+            q.items.insert(at, item);
             Ok(q.items.len() as u32)
         })??;
         sync_queued(hub, id);
@@ -1198,6 +1212,11 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             crate::spend::not_submitted(hub, &item.source, why);
             return Ok(true);
         }
+        // A self handoff's /clear whose right was taken back while it was typed: taken back out.
+        if item.handoff == Some(HandoffPart::Clear) && !crate::self_handoff::still_allowed(hub, id) {
+            if let Some(clear) = adapter.clear_input_bytes() { hub.write_input_generation(id, generation, &clear)?; }
+            return Ok(true);
+        }
         // Its turn is OpenRouter spend from now on, even before the screen shows it working.
         if let Some(a) = hub.agents().by_session(id)
             && hub.session(id).is_some_and(|s| s.provider == crate::openrouter::Provider::OpenRouter)
@@ -1207,9 +1226,6 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         // The prompt runs from here on: the session now handles a message from `source`.
         let now = crate::model::now_ms();
         hub.note_prompt_delivery(id, generation, item.source, now)?;
-        if let Some(part) = item.handoff {
-            crate::self_handoff::submitting(hub, id, part);
-        }
         // Muster's own sends (not the human's) into an agent whose cache has likely expired are
         // recorded before Enter, so a crash after it can't leave one unmarked; never held back
         // (src/cache.rs). A retry of the same delivery is recorded once.
@@ -1221,6 +1237,10 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         mark_stage(hub, id, generation, Stage::Submitting)?;
         let seq_before = hub.output_seq(id);
         hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+        // Enter reached the terminal: a self handoff's part counts as typed from here on.
+        if let Some(part) = item.handoff {
+            crate::self_handoff::submitting(hub, id, part);
+        }
         seq_before
     };
 
@@ -1763,7 +1783,7 @@ mod tests {
             q.active = Some(Active { item: item("/clear", Some(HandoffPart::Clear)), stage: Stage::Typing });
             q.items.extend([item("read the file", Some(HandoffPart::Prompt { held: true })), item("later", None)]);
         }).unwrap();
-        assert_eq!(handoff_queued(&hub, 1), (true, true));
+        assert_eq!(handoff_queued(&hub, 1), HandoffQueued { clear_waiting: false, clear_active: true, prompt: true });
         // Held at the head: nothing is popped (`kick`) and the queue counts as busy.
         assert!(held(hub.injection.inner.lock()[&1].items.front().unwrap()));
         assert!(!queue_idle(&hub, 1));
@@ -1771,6 +1791,14 @@ mod tests {
         assert_eq!(withdraw_handoff(&hub, 1).unwrap(), (false, true));
         assert_eq!(texts(&hub), ["later"]);
         assert_eq!(withdraw_handoff(&hub, 2).unwrap(), (false, false), "another session's queue");
+        // An interrupting send goes behind a held prompt, never ahead of it.
+        hub.injection.edit(1, |q| {
+            q.active = None;
+            q.items.push_front(item("read the file", Some(HandoffPart::Prompt { held: true })));
+            let at = q.items.iter().take_while(|i| held(i)).count();
+            q.items.insert(at, item("urgent", None));
+        }).unwrap();
+        assert_eq!(texts(&hub), ["read the file", "urgent", "later"]);
 
         // A restart: an untyped /clear goes with its prompt; a typed one lets its prompt go.
         let mut q = SessQ::default();

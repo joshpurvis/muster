@@ -32,7 +32,9 @@
 //!   Claude's new conversation starts, so nothing queued meanwhile goes first
 //!   (`inject::enqueue_handoff`); the injector checks the right again before typing `/clear`.
 //!
-//! Known gaps: a request waits in this backend's memory, so a backend restart (`muster reload`)
+//! Known gaps: without session isolation (`MUSTER_ISOLATION=off`) a program an agent detached
+//! from its session can't be told from the owner's terminal or window (docs/MCP.md "Self
+//! handoff", Limit). A request waits in this backend's memory, so a backend restart (`muster reload`)
 //! forgets it (the agent can ask again); the queue it left is settled at the next start
 //! (`inject::settle_orphaned_handoff`). The file is checked when asked and again before `/clear`,
 //! not when the new conversation reads it.
@@ -281,7 +283,7 @@ fn own_processes(hub: &Hub, s: &SessionInfo) -> Result<(), String> {
     let server = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), hub.port());
     let roots = std::collections::HashSet::from([pid]);
     let cgroups = crate::server::session_cgroups(std::iter::once(pid));
-    match crate::server::connection_holder_in(peer, server, &roots, &cgroups) {
+    match crate::server::connection_holder_seen(peer, server, &roots, &cgroups) {
         crate::server::Holder::Inside(_) => Ok(()),
         crate::server::Holder::Outside => Err("this call doesn't come from your own session's processes: only an agent \
             itself can ask for its fresh start, from its own terminal".into()),
@@ -488,11 +490,19 @@ async fn drive(hub: &Arc<Hub>, ask: &Ask) -> Result<(), Stop> {
         if !live(hub) {
             return Err(Stop::Failed("its run ended or restarted while /clear was on its way".into()));
         }
-        // Taken back before `/clear` was typed: nothing happens (the injector checks again
-        // right before typing it). Once typed, the prompt still follows.
-        if !still_allowed(hub, ask.session) && !typed(hub, ask.session).clear {
+        // `/clear` left the queue untyped: taken back by the injector (the right was taken back
+        // while it was typed) or with the queue. Its prompt goes with it.
+        let q = crate::inject::handoff_queued(hub, ask.session);
+        if !q.clear_waiting && !q.clear_active && !typed(hub, ask.session).clear {
             crate::inject::withdraw_handoff(hub, ask.session).ok();
-            if !typed(hub, ask.session).clear {
+            return Err(Stop::Cancelled("/clear left the queue before it was typed (the right was taken back, or the \
+                queue was cleared), so the fresh start didn't happen".into()));
+        }
+        // Taken back while `/clear` still waits: both go. One being typed is the injector's to
+        // take back (it checks again before Enter); once typed, the prompt still follows.
+        if !still_allowed(hub, ask.session) && q.clear_waiting {
+            let (clear, _) = crate::inject::withdraw_handoff(hub, ask.session).unwrap_or((false, false));
+            if clear {
                 return Err(Stop::Cancelled("the human took back its right to start itself fresh before /clear was typed".into()));
             }
         }
@@ -540,7 +550,7 @@ async fn drive(hub: &Arc<Hub>, ask: &Ask) -> Result<(), Stop> {
         if typed(hub, ask.session).prompt {
             return Ok(());
         }
-        if !crate::inject::handoff_queued(hub, ask.session).1 {
+        if !crate::inject::handoff_queued(hub, ask.session).prompt {
             return Err(Stop::Failed(format!(
                 "its conversation was cleared, but the prompt naming {} left the queue untyped (the queue was cleared, \
                  or its run changed): tell it to read that file",

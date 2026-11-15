@@ -847,7 +847,12 @@ itself fresh" under More options in Edit agent, or `muster agent edit NAME --sel
 terminal outside Muster. Only the human: no tool changes it, and `agent.update` refuses to turn it
 on from inside any Muster session (an agent's or a shell tab's, even one that dropped
 `MUSTER_SESSION_ID`: the connection's program is checked like a window's, docs/PROTOCOL.md
-`agent.update`), from a script's WebSocket or from a phone. Anyone may turn it off. A promoted
+`agent.update`), from a script's WebSocket or from a phone. Anyone may turn it off. Limit: a
+program an agent detaches from its session (its parent exits, init adopts it) is caught by the
+session's own control group only when Muster isolates sessions (the default with a systemd user
+manager; not with `MUSTER_ISOLATION=off`). As for every agent rule (docs/PROTOCOL.md "Channel
+permissions", Limits), an agent whose permissions let it act as the user outside its sandbox can
+get round it, for example by editing Muster's database. A promoted
 agent's `CLAUDE.md` gets a "Starting fresh" section saying how and when to use it. The agent writes
 a handoff file in its home folder or working directory, calls `start_fresh` with its path (or runs
 `muster start-fresh <path>`), and ends its turn. The call must come from the agent's own

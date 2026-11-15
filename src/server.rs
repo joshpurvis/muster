@@ -680,6 +680,19 @@ pub fn connection_holder(peer: SocketAddr, server: SocketAddr, roots: &std::coll
 /// `connection_holder`.
 pub fn connection_holder_in(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>,
     cgroups: &[String]) -> Holder {
+    holder(peer, server, roots, cgroups, false)
+}
+
+/// `connection_holder_in`, judging only the processes seen holding the connection: one that
+/// hides its descriptors never counts (Unknown when none is seen). For proving a call is a
+/// session's own (`self_handoff::own_processes`), where "might hold it" isn't enough.
+pub fn connection_holder_seen(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>,
+    cgroups: &[String]) -> Holder {
+    holder(peer, server, roots, cgroups, true)
+}
+
+fn holder(peer: SocketAddr, server: SocketAddr, roots: &std::collections::HashSet<u32>, cgroups: &[String],
+    seen_only: bool) -> Holder {
     const ESTABLISHED: &str = "01";
     let unknown = |why: &str| Holder::Unknown(why.to_string());
     let mut inodes: Vec<String> = Vec::new();
@@ -748,7 +761,7 @@ pub fn connection_holder_in(peer: SocketAddr, server: SocketAddr, roots: &std::c
     // The processes seen holding it decide. Only when none is seen do the ones that might hold
     // it (hidden) decide: one of them is the holder. An unrelated program that hides its
     // descriptors, in a session or not, never decides for a connection someone visibly holds.
-    let judged = if holders.is_empty() { &hidden } else { &holders };
+    let judged = if holders.is_empty() && !seen_only { &hidden } else { &holders };
     if judged.is_empty() {
         return unknown("no process holds the connection");
     }
@@ -1162,6 +1175,7 @@ mod tests {
         }
         assert_eq!(connection_holder_in(peer, server, &none, &[format!("{mine}-other")]), Holder::Outside, "a sibling");
         assert_eq!(connection_holder_in(peer, server, &none, &[]), Holder::Outside);
+        assert_eq!(connection_holder_seen(peer, server, &[me].into_iter().collect(), &[]), Holder::Inside(me), "seen holding it");
         drop(c);
     }
 
@@ -1191,6 +1205,8 @@ mod tests {
         // descriptors can't be read.
         assert_eq!(connection_holder(peer, server, &[child.id()].into_iter().collect()), Holder::Inside(child.id()));
         assert_eq!(connection_holder(peer, server, &[me].into_iter().collect()), Holder::Inside(child.id()));
+        // Proving a call is a session's own takes a holder that is seen: a hidden one never is.
+        assert!(matches!(connection_holder_seen(peer, server, &[child.id()].into_iter().collect(), &[]), Holder::Unknown(_)));
         let _ = child.kill();
         let _ = child.wait();
     }

@@ -557,6 +557,13 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE agents ADD COLUMN handoff_from TEXT;
     "#,
+    // v29: self handoff (src/self_handoff.rs): whether the human let the agent ask for its own
+    // fresh start (0: no, the default; only the human turns it on), and when it last cleared its
+    // conversation that way (Unix ms; the rate limit). An older backend ignores both.
+    r#"
+    ALTER TABLE agents ADD COLUMN self_handoff INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE agents ADD COLUMN self_handoff_at INTEGER;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1030,7 +1037,7 @@ impl Store {
         let mut st = conn.prepare(
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
                     resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
-                    asleep_autostart, working_location, reset_on_next_start, handoff_from
+                    asleep_autostart, working_location, reset_on_next_start, handoff_from, self_handoff, self_handoff_at
              FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -1065,6 +1072,8 @@ impl Store {
                 // Out of range (written by hand): the nearest allowed value.
                 sleep_after_min: r.get::<_, Option<i64>>(16)?.map(crate::sleep::clamp_after),
                 asleep_at: r.get(17)?,
+                self_handoff: r.get::<_, i64>(22)? != 0,
+                self_handoff_at: r.get(23)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1078,8 +1087,9 @@ impl Store {
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
                                session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
                                sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start,
-                               handoff_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                               handoff_from, self_handoff, self_handoff_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                     ?22, ?23)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1101,7 +1111,9 @@ impl Store {
                 b.asleep_at.map(|_| b.autostart as i64),
                 serde_json::to_string(&b.working_location)?,
                 b.reset_on_next_start as i64,
-                b.handoff.as_ref().map(serde_json::to_string).transpose()?
+                b.handoff.as_ref().map(serde_json::to_string).transpose()?,
+                b.self_handoff as i64,
+                b.self_handoff_at
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1144,7 +1156,7 @@ impl Store {
                     autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
                     provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11,
-                    account_profile_id = ?12, handoff_from = ?13 WHERE id = ?1",
+                    account_profile_id = ?12, handoff_from = ?13, self_handoff = ?14 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1158,9 +1170,16 @@ impl Store {
                 serde_json::to_string(&b.working_location)?,
                 b.reset_on_next_start as i64,
                 b.account_profile_id,
-                b.handoff.as_ref().map(serde_json::to_string).transpose()?
+                b.handoff.as_ref().map(serde_json::to_string).transpose()?,
+                b.self_handoff as i64
             ],
         )?;
+        Ok(())
+    }
+
+    /// Agent `id` cleared its conversation itself at `at` (src/self_handoff.rs, the rate limit).
+    pub fn set_agent_self_handoff_at(&self, id: i64, at: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute("UPDATE agents SET self_handoff_at = ?2 WHERE id = ?1", params![id, at])?;
         Ok(())
     }
 
@@ -2934,7 +2953,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false, sleep_after_min: None, asleep_at: None,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.

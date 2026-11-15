@@ -1672,7 +1672,7 @@ fn with_agents(m: &Mock) {
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
         });
         d.replies.insert(id, format!("{name} says hi"));
     }

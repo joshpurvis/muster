@@ -335,7 +335,7 @@ async fn rpc_http(
             Err(r) => return r,
         }
     };
-    axum::Json(crate::rpc::http_call(&hub, &who, &body).await).into_response()
+    axum::Json(crate::rpc::http_call(&hub, &who, &body, peer.addr).await).into_response()
 }
 
 #[derive(Deserialize)]

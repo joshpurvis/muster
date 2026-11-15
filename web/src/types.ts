@@ -279,6 +279,11 @@ export interface Agent {
   asleep?: boolean;
   /** Asleep since (Unix ms). */
   asleep_at?: number | null;
+  /** The human lets it start itself fresh from a handoff file (MCP `start_fresh`; docs/MCP.md
+   * "Self handoff"). Older daemons: absent. */
+  self_handoff?: boolean;
+  /** When it last did (Unix ms). */
+  self_handoff_at?: number | null;
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */
   wake_error?: string;

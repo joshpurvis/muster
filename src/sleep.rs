@@ -1386,7 +1386,7 @@ mod tests {
             created_at: 0,
             autostart: false,
             sleep_after_min: Some(30),
-            asleep_at: None,
+            asleep_at: None, self_handoff: false, self_handoff_at: None,
         }
     }
 

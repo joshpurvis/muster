@@ -2463,6 +2463,8 @@ pub struct AgentOpts {
     pub autostart: Option<bool>,
     /// `--sleep-after`: minutes, a duration (`90m`, `2h`), or `off`.
     pub sleep_after: Option<String>,
+    /// `agent edit --self-handoff on|off`.
+    pub self_handoff: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2515,6 +2517,13 @@ impl AgentOpts {
         if let Some(a) = &self.sleep_after {
             set("sleep_after_min", json!(parse_sleep_after(a)?));
         }
+        if let Some(on) = self.self_handoff {
+            set("self_handoff", json!(on));
+            // Granting it inside a Muster session is refused: say whose call it is (`agent.update`).
+            if let Some(id) = env_session() {
+                set("from_session", json!(id));
+            }
+        }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(
                 "permissions",
@@ -2541,6 +2550,12 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         if b["autostart"] == true { ", autostart" } else { "" },
         b["home_dir"].as_str().unwrap_or("?")
     );
+    if b["self_handoff"] == true {
+        println!(
+            "  may start itself fresh from a handoff file (`muster start-fresh`, at most one every {} minutes)",
+            crate::self_handoff::MIN_GAP_MS / 60_000
+        );
+    }
     if let Some(m) = b["sleep_after_min"].as_u64() {
         println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
     }
@@ -2606,7 +2621,7 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
     Some(format!("{what}{notes}"))
 }
 
-/// `muster agent ls`: `NAME  KIND  MODEL  ACCEPTS  SESSION  STATE`.
+/// `muster agent ls`: `NAME  KIND  MODEL  ACCEPTS  SELF-HANDOFF  SESSION  STATE`.
 pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     let v = client::rpc(d, "agent.list", json!({}))?;
     if as_json {
@@ -2635,6 +2650,7 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
                 }),
                 Cell::plain(s(b, "model")),
                 Cell::plain(accepts),
+                Cell::plain(if b["self_handoff"] == true { "on" } else { "-" }.to_string()),
                 Cell::plain(b["session_id"].as_u64().map_or("-".into(), |i| i.to_string())),
                 Cell {
                     color: state_color(&state),
@@ -2646,7 +2662,7 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     print!(
         "{}",
         render_table(
-            Some(&["NAME", "KIND", "MODEL", "ACCEPTS", "SESSION", "STATE"]),
+            Some(&["NAME", "KIND", "MODEL", "ACCEPTS", "SELF-HANDOFF", "SESSION", "STATE"]),
             &rows,
             term_width(),
             use_color()
@@ -2760,23 +2776,7 @@ pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> any
         std::io::stdin().lock().read_to_string(&mut s)?;
         Ok(s)
     })?;
-    let body = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": "reply", "arguments": {"msg_id": msg_id, "text": text}},
-    }))?;
-    let (status, resp) = client::request(d.port, "POST", "/mcp", Some(&token), Some(&body), std::time::Duration::from_secs(120))?;
-    if status != 200 {
-        anyhow::bail!("Muster refused the session's token (HTTP {status}): run muster reply in the agent's own terminal");
-    }
-    let v: Value = serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("invalid reply from Muster: {e}"))?;
-    if let Some(e) = v.get("error") {
-        anyhow::bail!("{}", e["message"].as_str().unwrap_or("reply failed"));
-    }
-    let out = v["result"]["content"][0]["text"].as_str().unwrap_or("");
-    if v["result"]["isError"].as_bool().unwrap_or(false) {
-        anyhow::bail!("{out}");
-    }
-    let r: Value = serde_json::from_str(out).unwrap_or(Value::Null);
+    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text}))?;
     if as_json {
         print_json(&r)?;
     } else {
@@ -2784,6 +2784,48 @@ pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> any
     }
     if !r["delivered"].as_bool().unwrap_or(false) && r["status"] != "pending" {
         return Err(exit(1, format!("message {msg_id}: reply kept, not delivered ({})", r["status"].as_str().unwrap_or("?"))));
+    }
+    Ok(())
+}
+
+/// Call this session's MCP tool `name` with its own token (`muster reply`, `muster start-fresh`).
+/// The tool's JSON result; its error text as the error.
+fn session_tool(d: &Discovery, token: &str, name: &str, arguments: Value) -> anyhow::Result<Value> {
+    let body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    }))?;
+    let (status, resp) = client::request(d.port, "POST", "/mcp", Some(token), Some(&body), std::time::Duration::from_secs(120))?;
+    if status != 200 {
+        anyhow::bail!("Muster refused the session's token (HTTP {status}): run this in the agent's own terminal");
+    }
+    let v: Value = serde_json::from_slice(&resp).map_err(|e| anyhow::anyhow!("invalid reply from Muster: {e}"))?;
+    if let Some(e) = v.get("error") {
+        anyhow::bail!("{}", e["message"].as_str().unwrap_or("the call failed"));
+    }
+    let out = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+    if v["result"]["isError"].as_bool().unwrap_or(false) {
+        anyhow::bail!("{out}");
+    }
+    Ok(serde_json::from_str(out).unwrap_or(Value::Null))
+}
+
+/// `muster start-fresh FILE`: inside a named agent's session, its MCP `start_fresh` (src/self_handoff.rs),
+/// with the session's own token: only ever for that agent itself. Prints what happens next.
+pub fn start_fresh(d: &Discovery, file: &std::path::Path, as_json: bool) -> anyhow::Result<()> {
+    if env_session().is_none() {
+        anyhow::bail!("muster start-fresh runs inside a named agent's session (it starts that agent fresh)");
+    }
+    let Some(token) = crate::hookcmd::session_token() else {
+        anyhow::bail!("this shell can't see its session's token: use the muster MCP tool `start_fresh` instead");
+    };
+    // Relative to where it is run, which the daemon can't see.
+    let file = std::path::absolute(file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    let r = session_tool(d, &token, crate::self_handoff::TOOL, json!({"file": file}))?;
+    if as_json {
+        print_json(&r)?;
+    } else {
+        println!("{}", r["note"].as_str().unwrap_or("asked for a fresh start"));
     }
     Ok(())
 }

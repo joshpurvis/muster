@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 34] = [
+pub const TOOL_NAMES: [&str; 35] = [
     "request_session", "reply_session", "session_messages", "subscribe_channel", "channel_updates",
     "whoami",
     "list_channels",
@@ -36,6 +36,7 @@ pub const TOOL_NAMES: [&str; 34] = [
     "list_agents",
     "ask_agent",
     "reply",
+    "start_fresh",
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
     "note_list", "note_read", "note_write", "note_append", "note_open",
     "list_schedules", "propose_schedule", "set_reminder", "pause_schedule", "delete_schedule",
@@ -256,6 +257,20 @@ pub fn tool_definitions() -> Vec<Value> {
                     "text": {"type": "string", "description": "Your answer; multi-line is fine."}
                 },
                 "required": ["msg_id", "text"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            "start_fresh",
+            "Start a new conversation",
+            "Named agents the human allowed to start themselves fresh only (anyone else is refused, with how the human allows it). First write everything you need to carry on into a handoff file in your home folder or working directory (open threads, decisions, next steps); then call this with its path and end your turn. Once you are idle, Muster clears your conversation (/clear: your process and background tasks keep running) and sends you one prompt that names the file and says you asked for it. Use it between tasks when your conversation has grown long, never mid-task. At most once every 30 minutes; Claude agents only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Path of your handoff file: absolute, or relative to your working directory. It must exist and lie inside your home folder or working directory."}
+                },
+                "required": ["file"],
                 "additionalProperties": false
             }),
             false,
@@ -521,6 +536,7 @@ pub async fn call_tool<B: Backend>(
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
         "reply" => reply(st, caller, &a).await,
+        "start_fresh" => start_fresh(st, caller, &a),
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
         "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
         "list_schedules" | "propose_schedule" | "set_reminder" | "pause_schedule" | "delete_schedule" => schedule_tool(st, caller, name, map),
@@ -1419,6 +1435,22 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
             Err(format!("{e:#}"))
         }
     }
+}
+
+/// `start_fresh`: a promoted named agent asks for its own fresh start (src/self_handoff.rs). Only
+/// ever for the caller itself: the tool takes no target.
+fn start_fresh<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let file = a.req_str("file")?;
+    caller_session(st, caller)?;
+    if file.len() > 4096 {
+        return Err("file: a path of at most 4096 bytes".into());
+    }
+    if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+        caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+    ))? {
+        return Err(format!("rate limit: too many calls this minute; try again in {wait_s}s"));
+    }
+    st.backend.agent_start_fresh(caller, file).map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 
 /// ask_agent's default wait, and how much terminal output stands in for a reply no hook

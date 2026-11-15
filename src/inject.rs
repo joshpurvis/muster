@@ -303,6 +303,19 @@ pub fn drop_message(hub: &Hub, msg: i64) -> anyhow::Result<bool> {
     Ok(dropped)
 }
 
+/// Take a prompt with exactly `text` back out of session `id`'s queue while it still waits (not
+/// one being typed): src/self_handoff.rs, a `/clear` that never got its turn. True when removed.
+pub(crate) fn withdraw(hub: &Hub, id: SessionId, text: &str) -> anyhow::Result<bool> {
+    let removed = hub.injection.edit_with(id, Unsent::Discard, |q| {
+        match q.items.iter().position(|item| item.text == text) {
+            Some(at) => q.items.remove(at).is_some(),
+            None => false,
+        }
+    })?;
+    sync_queued(hub, id);
+    Ok(removed)
+}
+
 /// Is agent message `msg` still in a prompt queue (waiting, or being typed)?
 pub fn holds_message(hub: &Hub, msg: i64) -> bool {
     let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
@@ -1628,6 +1641,25 @@ mod tests {
         }
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
             muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
+    }
+
+    /// A self handoff's `/clear` that never got its turn is taken back (src/self_handoff.rs);
+    /// one being typed, and every other prompt, stay.
+    #[test]
+    fn withdraw_takes_back_only_that_waiting_prompt() {
+        let hub = hub_fixture();
+        let item = |text: &str| Item { generation: None, text: text.into(), clear_first: false, attempts: 0,
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None };
+        hub.injection.edit(1, |q| {
+            q.active = Some(Active { item: item("/clear"), stage: Stage::Typing });
+            q.items.extend([item("first"), item("/clear"), item("last")]);
+        }).unwrap();
+        assert!(withdraw(&hub, 1, "/clear").unwrap());
+        let texts = |hub: &Hub| hub.injection.inner.lock()[&1].items.iter().map(|i| i.text.clone()).collect::<Vec<_>>();
+        assert_eq!(texts(&hub), ["first", "last"]);
+        assert!(hub.injection.inner.lock()[&1].active.is_some(), "the one being typed stays");
+        assert!(!withdraw(&hub, 1, "/clear").unwrap());
+        assert!(!withdraw(&hub, 2, "/clear").unwrap(), "another session's queue");
     }
 
     #[test]

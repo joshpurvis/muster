@@ -185,6 +185,11 @@ pub struct Agent {
     /// Asleep since (Unix ms): its process was stopped while idle, its tab and conversation
     /// kept; the next message wakes it. None: awake (running or stopped).
     pub asleep_at: Option<i64>,
+    /// The human lets it ask for its own fresh start from a handoff file (src/self_handoff.rs).
+    /// Off by default; only the human turns it on (`AgentUpdate::by_owner`).
+    pub self_handoff: bool,
+    /// When it last cleared its own conversation that way (Unix ms): the rate limit.
+    pub self_handoff_at: Option<i64>,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -292,6 +297,16 @@ pub fn persona_file(kind: SessionKind) -> &'static str {
         SessionKind::Claude => "CLAUDE.md",
         _ => "AGENTS.md",
     }
+}
+
+/// `persona_text` for an agent's record: with the fresh-start section when the human let it
+/// start itself fresh (`Agent::self_handoff`).
+pub fn persona_text_for(a: &Agent) -> String {
+    let mut t = persona_text(&a.name, a.kind, &a.persona);
+    if a.self_handoff && a.kind == SessionKind::Claude {
+        t.push_str(&crate::self_handoff::persona_section());
+    }
+    t
 }
 
 pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
@@ -881,6 +896,8 @@ pub struct Registry {
     /// triggers read it on every session event (`Hub::emit`, sometimes with the hub's lock
     /// held), so each turn is marked when it is seen, not at a later look.
     unattended: Mutex<HashSet<SessionId>>,
+    /// Fresh starts agents asked for that haven't happened yet (src/self_handoff.rs).
+    pub(crate) self_handoff: crate::self_handoff::State,
 }
 
 /// The sessions `rt` says are doing unattended work.
@@ -931,6 +948,7 @@ impl Registry {
             config_lock: Default::default(),
             unattended,
             sleep,
+            self_handoff: Default::default(),
         })
     }
 
@@ -1017,9 +1035,19 @@ impl Registry {
         a.reset_on_next_start = next.reset_on_next_start;
         a.account_profile_id = next.account_profile_id;
         a.handoff = next.handoff.clone();
+        a.self_handoff = next.self_handoff;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
+    }
+
+    /// Agent `id` cleared its own conversation at `at` (src/self_handoff.rs): saved first.
+    pub(crate) fn set_self_handoff_at(&self, store: &Store, id: i64, at: i64) -> anyhow::Result<()> {
+        let mut g = self.inner.lock();
+        let a = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+        store.set_agent_self_handoff_at(id, at)?;
+        a.self_handoff_at = Some(at);
+        Ok(())
     }
 
     /// The run that agent `id`'s handoff `at` was for has started: the handoff is done. A newer
@@ -1441,6 +1469,8 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             autostart: req.autostart,
             sleep_after_min,
             asleep_at: None,
+            self_handoff: false,
+            self_handoff_at: None,
         },
     )?;
     publish(hub, &a);
@@ -1491,6 +1521,15 @@ pub struct AgentUpdate {
     /// With a move: why, for HANDOFF.md.
     #[serde(default)]
     pub handoff_reason: Option<String>,
+    /// Let the agent ask for its own fresh start from a handoff file (src/self_handoff.rs).
+    /// Turning it on needs `by_owner`; turning it off works from anywhere.
+    #[serde(default)]
+    pub self_handoff: Option<bool>,
+    /// The call is the human's own: a click in Muster's window, or the CLI from a terminal
+    /// outside every Muster session (`rpc::owner_terminal`). Set by the RPC layer, never by
+    /// the caller (not a request field).
+    #[serde(skip)]
+    pub by_owner: bool,
 }
 
 /// An account move `update` recorded, for `switch_account` to carry out.
@@ -1587,13 +1626,20 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
     if let Some(m) = req.sleep_after_min {
         next.sleep_after_min = crate::sleep::check_after(Some(m))?;
     }
+    if let Some(on) = req.self_handoff {
+        if on && !cur.self_handoff {
+            crate::self_handoff::check_grant(&cur, req.by_owner)?;
+        }
+        next.self_handoff = on;
+    }
     if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
         anyhow::bail!("{why}");
     }
-    if next.persona != cur.persona {
+    // The persona file tells a promoted agent about its fresh start, so it follows the right.
+    if next.persona != cur.persona || next.self_handoff != cur.self_handoff {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
-        write_persona(&home.join(persona_file(next.kind)), &persona_text(&next.name, next.kind, &next.persona))?;
+        write_persona(&home.join(persona_file(next.kind)), &persona_text_for(&next))?;
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
     let switch = moving.map(|to| Switch {
@@ -1812,7 +1858,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     let persona = home.join(persona_file(agent.kind));
     // Only a missing persona file is (re)written; one that can't be read is an error.
     match lstat(&persona) {
-        Ok(None) => write_persona(&persona, &persona_text(&agent.name, agent.kind, &agent.persona))?,
+        Ok(None) => write_persona(&persona, &persona_text_for(&agent))?,
         Ok(Some(_)) => refuse_symlink(&persona)?,
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
@@ -2044,7 +2090,7 @@ fn profile_name(hub: &Hub, id: Option<crate::account_profiles::ProfileId>) -> St
 }
 
 /// A Unix-ms time on the local clock, for the handoff.
-fn local_time(ms: i64) -> String {
+pub(crate) fn local_time(ms: i64) -> String {
     jiff::Timestamp::from_millisecond(ms)
         .map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M %Z").to_string())
         .unwrap_or_else(|_| ms.to_string())
@@ -2757,6 +2803,8 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "sleep_after_min": b.sleep_after_min,
         "asleep": b.asleep_at.is_some(),
         "asleep_at": b.asleep_at,
+        "self_handoff": b.self_handoff,
+        "self_handoff_at": b.self_handoff_at,
     })
 }
 
@@ -3429,7 +3477,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
         }
     }
 

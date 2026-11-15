@@ -1111,7 +1111,14 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         "agent.update" => {
             require_local(who, method)?;
-            let p: crate::agents::AgentUpdate = parse(params)?;
+            // `muster agent edit --self-handoff` inside a session names it (never a request field).
+            let mut params = params;
+            let from_session = params.as_object_mut().and_then(|o| o.remove("from_session")).filter(|v| !v.is_null());
+            let mut p: crate::agents::AgentUpdate = parse(params)?;
+            // Only the human grants self handoff: a click in the window, or the CLI from a terminal
+            // outside every session (`owner_terminal`, checked by `http_call`).
+            p.by_owner = from_session.is_none()
+                && (via == Via::Window || OWNER_TERMINAL.try_with(|ok| *ok).unwrap_or(false));
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
@@ -1904,11 +1911,55 @@ pub fn url_origin(url: &str) -> Option<String> {
     ok.then(|| format!("https://{host}"))
 }
 
+tokio::task_local! {
+    /// This `/api/rpc` call passed `owner_terminal`: the CLI run by the human from a terminal
+    /// outside every Muster session. Read only by `agent.update` (granting self handoff).
+    static OWNER_TERMINAL: bool;
+}
+
+/// Does this call turn on an agent's self handoff (src/self_handoff.rs)?
+fn grants_self_handoff(method: &str, params: &Value) -> bool {
+    method == "agent.update" && params.get("self_handoff") == Some(&Value::Bool(true))
+}
+
+/// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
+/// behalf, from a program that descends from no session's process (`server::connection_holder`,
+/// as `from_window` checks a window's connection)? Err: why not. A shell tab in Muster is a
+/// session too: the CLI typed there is refused, like an agent's.
+pub async fn owner_terminal(hub: &Arc<Hub>, who: &Principal, peer: Option<std::net::SocketAddr>, params: &Value)
+    -> Result<(), String> {
+    if !matches!(who, Principal::Local) {
+        return Err("it comes from a paired device".into());
+    }
+    if params.get("from_session").is_some_and(|v| !v.is_null()) {
+        return Err("it was made on a session's behalf".into());
+    }
+    let Some(peer) = peer else { return Err("Muster can't tell which program it comes from".into()) };
+    let server = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), hub.port());
+    let roots: std::collections::HashSet<u32> = hub.sessions().iter().filter_map(|s| s.pid).collect();
+    let holder = tokio::task::spawn_blocking(move || crate::server::connection_holder(peer, server, &roots))
+        .await
+        .unwrap_or_else(|e| crate::server::Holder::Unknown(format!("the lookup failed: {e}")));
+    match holder {
+        crate::server::Holder::Outside => Ok(()),
+        crate::server::Holder::Inside(pid) => Err(format!("its program (process {pid}) runs inside a Muster session")),
+        crate::server::Holder::Unknown(why) => Err(format!("Muster can't tell which program it comes from ({why})")),
+    }
+}
+
 /// `POST /api/rpc` body handler: `{method, params, id?}` -> `{id, result}` / `{id, error}`.
-pub async fn http_call(hub: &Arc<Hub>, who: &Principal, body: &[u8]) -> Value {
+/// `peer`: the TCP peer, for `owner_terminal`.
+pub async fn http_call(hub: &Arc<Hub>, who: &Principal, body: &[u8], peer: Option<std::net::SocketAddr>) -> Value {
     match serde_json::from_slice::<Request>(body) {
         Ok(req) => {
             let r = match authorize(hub, who, &req.method, &req.params) {
+                Ok(()) if grants_self_handoff(&req.method, &req.params) => {
+                    let owner = owner_terminal(hub, who, peer, &req.params).await;
+                    if let Err(why) = &owner {
+                        tracing::info!("agent.update: self handoff not granted from here: {why}");
+                    }
+                    OWNER_TERMINAL.scope(owner.is_ok(), dispatch(hub, who, &req.method, req.params)).await
+                }
                 Ok(()) => dispatch(hub, who, &req.method, req.params).await,
                 Err(e) => Err(e),
             };
@@ -3202,5 +3253,113 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap();
         assert!(r["accepts_origins"].as_array().unwrap().iter().any(|o| o == "schedule"));
+    }
+
+    /// Self handoff (src/self_handoff.rs): only the human grants it (the window, or the CLI from a
+    /// terminal outside every session); anyone takes it back; the persona file follows it.
+    #[tokio::test]
+    async fn only_the_human_lets_an_agent_start_itself_fresh() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-otto");
+        let on = json!({"name": "rpc-otto", "self_handoff": true});
+        let persona = || std::fs::read_to_string(crate::agents::home_dir_for("rpc-otto").join("CLAUDE.md")).unwrap();
+        // `/api/rpc` from anywhere that isn't the owner's terminal, a script's WebSocket: refused.
+        let e = call(&hub, "agent.update", on.clone()).await.unwrap_err();
+        assert!(e.contains("only the human") && e.contains("--self-handoff on"), "{e}");
+        // On a session's behalf (`muster agent edit` typed in a Muster tab), even from the window.
+        let mut from = on.clone();
+        from["from_session"] = json!(2);
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", from.clone(), Via::Window).await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let e = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", from)).await.unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        // `http_call` asks who holds the connection: with none known, it is refused.
+        let body = serde_json::to_vec(&json!({"id": 1, "method": "agent.update", "params": on})).unwrap();
+        let r = http_call(&hub, &Principal::Local, &body, None).await;
+        assert!(r["error"]["message"].as_str().unwrap_or_default().contains("only the human"), "{r}");
+        for (who, params, why) in [
+            (Principal::Device { id: 1 }, on.clone(), "paired device"),
+            (Principal::Local, json!({"self_handoff": true, "from_session": 2}), "session's behalf"),
+            (Principal::Local, on.clone(), "can't tell"),
+        ] {
+            let e = owner_terminal(&hub, &who, None, &params).await.unwrap_err();
+            assert!(e.contains(why), "{why}: {e}");
+        }
+        // A connection to another port than Muster's isn't one Muster can place.
+        let (link, _conn) = window_link();
+        assert!(owner_terminal(&hub, &Principal::Local, link.peer, &on).await.is_err());
+        assert!(!persona().contains("Starting fresh"));
+        // The owner's terminal (what `http_call` checked) and the window grant it.
+        let r = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on.clone())).await.unwrap();
+        assert_eq!(r["self_handoff"], true);
+        assert!(persona().contains("## Starting fresh") && persona().contains("start_fresh"), "the persona tells it how");
+        // Taking it back works from anywhere.
+        let r = call(&hub, "agent.update", json!({"name": "rpc-otto", "self_handoff": false})).await.unwrap();
+        assert_eq!(r["self_handoff"], false);
+        assert!(!persona().contains("Starting fresh"));
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", on.clone(), Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["self_handoff"], true);
+        assert_eq!(call(&hub, "agent.list", json!({})).await.unwrap()[0]["self_handoff"], true);
+        assert!(hub.store().load_agents().unwrap()[0].self_handoff, "saved");
+        // Codex agents: not supported yet.
+        crate::agents::create(&hub, NewAgent {
+            working_location: None,
+            account_profile: None, provider: None, name: "rpc-cody".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
+        }).unwrap();
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-cody", "self_handoff": true}), Via::Window)
+            .await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("Codex"), "{e}");
+    }
+
+    /// `start_fresh` (MCP; `muster start-fresh` calls it): refused, and recorded, unless the agent
+    /// was promoted; once asked, one waits at a time, and a run that can't come to rest cancels it.
+    #[tokio::test]
+    async fn an_agent_asks_for_its_own_fresh_start() {
+        let (hub, st) = fixture();
+        agent(&hub, "rpc-otto");
+        let otto = hub.agents().get("rpc-otto").unwrap();
+        hub.agents().link_session(hub.store(), otto.id, Some(2)).unwrap();
+        // In a turn (the fixture's session has no process; its state says it works).
+        hub.set_state_for_test(2, AgentState::Working);
+        let home = crate::agents::home_dir_for("rpc-otto");
+        std::fs::create_dir_all(home.join("memory")).unwrap();
+        std::fs::write(home.join("memory/handoff.md"), "next: ship it\n").unwrap();
+        let file = home.join("memory/handoff.md").to_string_lossy().into_owned();
+        let ask = |sid: SessionId, f: &str| {
+            let st = st.clone();
+            let f = f.to_string();
+            async move {
+                let out = crate::mcp::tools::call_tool(&st, sid, "start_fresh", &json!({"file": f})).await.unwrap();
+                if out.is_error { Err(out.text) } else { Ok(out.text) }
+            }
+        };
+        let events = |stage: &str| hub.timeline(1, None, 200).into_iter()
+            .filter(|e| e.kind == EventKind::System && e.data["self_handoff"]["stage"] == stage).count();
+        // A plain session (the shell), and an agent the human didn't promote.
+        assert!(ask(1, &file).await.unwrap_err().contains("only named agents"));
+        let e = ask(2, &file).await.unwrap_err();
+        assert!(e.contains("isn't allowed") && e.contains("--self-handoff on"), "{e}");
+        assert_eq!(events("refused"), 2, "refusals are recorded");
+        dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-otto", "self_handoff": true}), Via::Window)
+            .await.map_err(|e| e.0).unwrap();
+        // A file outside its home and working directory.
+        let e = ask(2, "/etc/passwd").await.unwrap_err();
+        assert!(e.contains("outside your home"), "{e}");
+        // Asked: it waits for the turn to end.
+        let r: Value = serde_json::from_str(&ask(2, &file).await.unwrap()).unwrap();
+        assert_eq!(r["status"], "waiting");
+        assert!(r["note"].as_str().unwrap().contains("End your turn"));
+        assert_eq!(events("requested"), 1);
+        assert!(ask(2, &file).await.unwrap_err().contains("already asked"));
+        // This fixture's session has no process: the request is given up, and recorded.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while events("cancelled") == 0 {
+            assert!(std::time::Instant::now() < end, "never cancelled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(hub.agents().get("rpc-otto").unwrap().self_handoff_at, None, "nothing was typed: no rate limit used");
+        // Nothing waits any more: it may ask again.
+        assert!(ask(2, &file).await.is_ok());
     }
 }

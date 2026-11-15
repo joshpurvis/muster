@@ -708,6 +708,8 @@ interface Draft {
   /** Minutes as typed; "" with `sleep` off. */
   sleepAfter: string;
   sleep: boolean;
+  /** May start itself fresh (Edit, Claude only; the human's to grant). */
+  selfHandoff: boolean;
 }
 
 function fromTemplate(t: AgentTemplate): Draft {
@@ -725,6 +727,7 @@ function fromTemplate(t: AgentTemplate): Draft {
     autostart: t.autostart,
     sleep: false,
     sleepAfter: String(SLEEP_AFTER_DEFAULT),
+    selfHandoff: false,
   };
 }
 
@@ -743,6 +746,7 @@ function fromAgent(a: Agent): Draft {
     autostart: a.autostart,
     sleep: a.sleep_after_min != null,
     sleepAfter: String(a.sleep_after_min ?? SLEEP_AFTER_DEFAULT),
+    selfHandoff: !!a.self_handoff,
   };
 }
 
@@ -760,6 +764,7 @@ const BLANK: Draft = {
   autostart: false,
   sleep: false,
   sleepAfter: String(SLEEP_AFTER_DEFAULT),
+  selfHandoff: false,
 };
 
 let templateCache: AgentTemplate[] | null = null;
@@ -915,10 +920,13 @@ export function AgentDialog(
   const checkoutHint = d.working_location.mode === "worktree"
     ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts."
     : "Shares files, branch and uncommitted changes with anyone using this checkout.";
+  /** Self handoff: an existing Claude agent on a backend that knows it. */
+  const canSelfHandoff = !!agent && agent.kind === "claude" && agent.self_handoff !== undefined;
   const moreSummary = [
     or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
     d.autostart ? "Autostart on" : "No autostart",
     d.sleep ? (sleepMin ? `Sleeps after ${sleepMin} min idle` : "Sleep time needs fixing") : "Never sleeps",
+    canSelfHandoff && d.selfHandoff && "Can start itself fresh",
   ].filter(Boolean).join(" · ");
   const keyHint = or && !or.key_present && (
     <span class="field-hint or-key-hint" id="agent-provider-hint">
@@ -975,6 +983,7 @@ export function AgentDialog(
       if (d.persona !== before.persona) patch.persona = d.persona;
       if (d.autostart !== before.autostart) patch.autostart = d.autostart;
       if ((agent.sleep_after_min ?? 0) !== sleepMin) patch.sleep_after_min = sleepMin;
+      if (canSelfHandoff && d.selfHandoff !== before.selfHandoff) patch.self_handoff = d.selfHandoff;
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
       if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
         patch.permissions = d.permissions;
@@ -1484,6 +1493,30 @@ export function AgentDialog(
                 </div>
               )}
             </div>
+            {canSelfHandoff && (
+              <div class="sleep-field">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    data-field="self-handoff"
+                    aria-describedby="self-handoff-hint"
+                    checked={d.selfHandoff}
+                    onChange={(e) => set({ selfHandoff: (e.target as HTMLInputElement).checked })}
+                  />
+                  <span class="toggle-track">
+                    <span class="toggle-thumb" />
+                  </span>
+                  <span>
+                    Can start itself fresh <span class="muted">(clear its own conversation from a handoff file)</span>
+                  </span>
+                </label>
+                <span id="self-handoff-hint" class="field-hint sleep-after">
+                  When its conversation has grown long, it writes a handoff file and asks. Once it is idle, Muster
+                  clears the conversation (its process and background tasks keep running) and points it at the
+                  file. At most once every 30 minutes. Only you can turn this on.
+                </span>
+              </div>
+            )}
           </MoreOptions>
           {!more && sleepMin === null && (
             <span class="field-hint field-bad">

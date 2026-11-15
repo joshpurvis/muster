@@ -95,9 +95,10 @@ and targets in them are refused.
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
-| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
+| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
 | `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message. See "Agents" below. |
 | `reply` | `msg_id`, `text` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, or starts with `!` (unless shell commands are allowed). |
+| `start_fresh` | `file` (absolute, or relative to the caller's working directory; at most 4096 bytes) | `{status: "waiting", file, note}`. A named Claude agent the human promoted asks for its own fresh start; see "Self handoff" below. Only ever for the caller itself (no target argument). Refused (and recorded in its tab's timeline) when the caller isn't a named agent, isn't promoted (the error says how the human grants it), is a Codex agent (not supported yet), already has a request waiting, started fresh less than 30 minutes ago, or the file doesn't exist, isn't a regular file, or lies outside its home folder and working directory once symlinks are resolved. Counts toward the per-minute post rate limit. |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
 
@@ -839,6 +840,39 @@ replacement. Surviving terminal processes retain their tokens and non-human orig
 callbacks from new runs use a durable inbox while the backend is unavailable. Codex sessions with hooks off (`MUSTER_CODEX_HOOKS=0`) send no UserPromptSubmit, so a
 prompt typed in their terminal never clears provenance (stricter, never looser). Replies need the
 Stop hook or Codex notify; without them `ask_agent` returns the unattributed terminal tail.
+
+**Self handoff.** Long-running agents grow large conversations; only the human could clear one.
+The human can promote a Claude agent to do it itself (`self_handoff`, off by default): "Can start
+itself fresh" under More options in Edit agent, or `muster agent edit NAME --self-handoff on` in a
+terminal outside Muster. Only the human: no tool changes it, and `agent.update` refuses to turn it
+on from inside any Muster session (an agent's or a shell tab's, even one that dropped
+`MUSTER_SESSION_ID`: the connection's program is checked like a window's, docs/PROTOCOL.md
+`agent.update`), from a script's WebSocket or from a phone. Anyone may turn it off. A promoted
+agent's `CLAUDE.md` gets a "Starting fresh" section saying how and when to use it. The agent writes
+a handoff file in its home folder or working directory, calls `start_fresh` with its path (or runs
+`muster start-fresh <path>`), and ends its turn. Muster then:
+
+1. waits for that turn to end: idle, nothing queued, no text in its input box (the human writing to
+   it), for 2 s (a request still waiting after 2 hours
+   is given up; one whose agent is restarted, stopped, put to sleep, removed or no longer promoted
+   is cancelled);
+2. checks the file again, and the spend caps for unattended work on OpenRouter;
+3. types `/clear` (Claude Code's own new conversation: the process, its background tasks and its
+   tab stay) and records the time (the rate limit: one per 30 minutes);
+4. waits up to 5 minutes for Claude's `SessionStart` hook with `source: "clear"` (a `/clear` still
+   waiting in the queue by then, say behind a draft, is taken back unsent);
+5. types one prompt: `[muster self-handoff origin=<o> hop=<n>] You (<name>) asked Muster for this
+   new conversation yourself at <time>, with the tool start_fresh; the human did not type this. …
+   Read your handoff file <path> and your memory/ notes, then carry on from there.`
+
+Both prompts carry the provenance of the turn that asked (no message id): a handoff asked while
+handling scheduled or triggered work stays that work (the prompt says it is not a new request from
+the human), and never becomes human-started. Every request, refusal, cancellation, failure and
+finished handoff is a `system` event in the agent's tab (`self_handoff.stage`); a finished or
+failed one is also a notice. "You cannot send a message to yourself" still holds for
+`send_message`. Codex agents: not supported yet. Known gaps: a request waits in the backend's
+memory, so a backend restart forgets it (the agent can ask again), and a restart between the
+`/clear` and the prompt leaves the agent in its new conversation without the prompt.
 
 Reach: agents live in their own "agents" workspace (`<data>/agents`). `list_agents` and `ask_agent` work
 from every workspace: an agent is a shared service, asking runs no command anywhere, and the origin

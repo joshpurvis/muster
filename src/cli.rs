@@ -162,6 +162,7 @@ impl Snapshot {
             o.insert("channel_name".into(), json!(ch.map(|c| c.name.clone())));
             o.insert("window_id".into(), json!(self.window_of(s)));
         }
+        crate::links::add(&mut v, crate::links::tab(s.id), &crate::links::tab_title(&s.name, &s.kind));
         v
     }
 }
@@ -560,7 +561,7 @@ pub fn panel(d: &Discovery, cmd: PanelCmd) -> anyhow::Result<()> {
 
 #[derive(clap::Subcommand)]
 pub enum NoteCmd {
-    /// List notes: ID  REV  BYTES  OPEN  UPDATED  BY  TITLE.
+    /// List notes: ID  REV  BYTES  OPEN  UPDATED  BY  TITLE  LINK.
     #[command(alias = "list")]
     Ls {
         #[arg(long)] json: bool,
@@ -662,21 +663,34 @@ fn note_by(v: &Value) -> String {
     }
 }
 
+/// `[title](muster://note/ID)` for a note as the daemon returned it (src/links.rs).
+fn note_mention(n: &Value, id: i64) -> String {
+    crate::links::mention(n["title"].as_str().unwrap_or(""), &crate::links::note(id))
+}
+
 pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
     let from = env_session();
     match cmd {
         NoteCmd::Ls { json } => {
-            let v = client::rpc(d, "note.list", json!({}))?;
-            if json { return print_json(&v) }
+            let mut v = client::rpc(d, "note.list", json!({}))?;
+            if json {
+                for n in v.as_array_mut().into_iter().flatten() {
+                    if let Some(id) = n["id"].as_i64() {
+                        let title = n["title"].as_str().unwrap_or("").to_string();
+                        crate::links::add(n, crate::links::note(id), &title);
+                    }
+                }
+                return print_json(&v);
+            }
             let rows: Vec<NoteRow> = serde_json::from_value(v)?;
             if rows.is_empty() {
                 println!("no notes");
                 return Ok(());
             }
-            println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} TITLE", "ID", "REV", "BYTES", "OPEN", "UPDATED", "BY");
+            println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} TITLE  LINK", "ID", "REV", "BYTES", "OPEN", "UPDATED", "BY");
             for r in rows {
-                println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} {}", r.id, r.rev, r.bytes, if r.open { "yes" } else { "-" },
-                    format_duration(now_ms() - r.updated_at), note_by(&r.updated_by), r.title);
+                println!("{:<4} {:<5} {:<8} {:<5} {:<8} {:<20} {}  {}", r.id, r.rev, r.bytes, if r.open { "yes" } else { "-" },
+                    format_duration(now_ms() - r.updated_at), note_by(&r.updated_by), r.title, crate::links::note(r.id));
             }
             Ok(())
         }
@@ -684,25 +698,35 @@ pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
             let body = if text.is_empty() { String::new() } else { note_text(&text)? };
             let n = client::rpc(d, "note.create", json!({"title": title, "body": body, "from_session": from}))?;
             println!("{}", n["id"]);
+            // The id alone on stdout, for scripts; the mention for whoever reads it.
+            if let Some(id) = n["id"].as_i64() {
+                eprintln!("link: {}", note_mention(&n, id));
+            }
             Ok(())
         }
         NoteCmd::Read { note, json } => {
-            let n = client::rpc(d, "note.get", json!({"id": note_target(d, &note)?}))?;
-            if json { return print_json(&n) }
+            let mut n = client::rpc(d, "note.get", json!({"id": note_target(d, &note)?}))?;
+            if json {
+                if let Some(id) = n["id"].as_i64() {
+                    let title = n["title"].as_str().unwrap_or("").to_string();
+                    crate::links::add(&mut n, crate::links::note(id), &title);
+                }
+                return print_json(&n);
+            }
             print!("{}", n["body"].as_str().unwrap_or(""));
             Ok(())
         }
         NoteCmd::Write { note, rev, text } => {
             let id = note_target(d, &note)?;
             let n = client::rpc(d, "note.write", json!({"id": id, "body": note_text(&text)?, "base_rev": rev, "from_session": from}))?;
-            println!("note {id}: rev {}", n["rev"]);
+            println!("note {id}: rev {}: {}", n["rev"], note_mention(&n, id));
             Ok(())
         }
         NoteCmd::Append { note, text } => {
             let id = note_target(d, &note)?;
             let t = send_text(&text, || note_text(&[]).map_err(std::io::Error::other))?;
             let n = client::rpc(d, "note.append", json!({"id": id, "text": t, "from_session": from}))?;
-            println!("note {id}: rev {}", n["rev"]);
+            println!("note {id}: rev {}: {}", n["rev"], note_mention(&n, id));
             Ok(())
         }
         NoteCmd::Rename { note, title } => {
@@ -714,7 +738,7 @@ pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
             let id = note_target(d, &note)?;
             anyhow::ensure!(window.is_some() || from.is_some(), "give --window N, or run inside a Muster session to show it beside that session");
             let n = client::rpc(d, "note.open", json!({"id": id, "window_id": window, "from_session": if window.is_none() { from } else { None }}))?;
-            println!("note {id}: window {}", n["window_id"]);
+            println!("note {id}: window {}: {}", n["window_id"], note_mention(&n, id));
             Ok(())
         }
         NoteCmd::Close { note } => {
@@ -737,6 +761,38 @@ pub fn note(d: &Discovery, cmd: NoteCmd) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// `muster link KIND TARGET`: the Markdown link that mentions a note, panel, tab or agent to the
+/// human (`[title](muster://note/91)`, src/links.rs); `--url`: the address alone. Read-only.
+pub fn link(d: &Discovery, kind: &str, t: &str, url_only: bool) -> anyhow::Result<()> {
+    let (link, title) = match kind {
+        "note" => {
+            let n = client::rpc(d, "note.get", json!({"id": note_target(d, t)?}))?;
+            let id = n["id"].as_i64().context("note.get returned no id")?;
+            (crate::links::note(id), n["title"].as_str().unwrap_or("").to_string())
+        }
+        "panel" => {
+            let id: i64 = t.trim().parse().map_err(|_| exit(2, format!("a panel is named by its id, not {t:?}")))?;
+            let h = client::rpc(d, "hello", json!({}))?;
+            let p = h["panels"].as_array().and_then(|a| a.iter().find(|p| p["id"].as_i64() == Some(id)))
+                .ok_or_else(|| exit(2, format!("no open panel with id {id}")))?;
+            (crate::links::panel(id), p["title"].as_str().unwrap_or("").to_string())
+        }
+        "tab" => {
+            let (_, s) = target(d, t)?;
+            (crate::links::tab(s.id), crate::links::tab_title(&s.name, &s.kind))
+        }
+        _ => {
+            let list = client::rpc(d, "agent.list", json!({}))?;
+            let a = list.as_array().and_then(|l| l.iter().find(|a| a["name"].as_str().is_some_and(|n| eq_ci(n, t))))
+                .ok_or_else(|| exit(2, format!("no agent named {t:?} (see muster agent ls)")))?;
+            let name = a["name"].as_str().unwrap_or(t);
+            (crate::links::agent(name), name.to_string())
+        }
+    };
+    println!("{}", if url_only { link } else { crate::links::mention(&title, &link) });
+    Ok(())
 }
 
 // ----- schedules (docs/CLI.md "Schedules") -----
@@ -2623,8 +2679,13 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
 
 /// `muster agent ls`: `NAME  KIND  MODEL  ACCEPTS  SELF-HANDOFF  SESSION  STATE`.
 pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
-    let v = client::rpc(d, "agent.list", json!({}))?;
+    let mut v = client::rpc(d, "agent.list", json!({}))?;
     if as_json {
+        for a in v.as_array_mut().into_iter().flatten() {
+            if let Some(name) = a["name"].as_str().map(str::to_string) {
+                crate::links::add(a, crate::links::agent(&name), &name);
+            }
+        }
         return print_json(&v);
     }
     let list = v.as_array().cloned().unwrap_or_default();

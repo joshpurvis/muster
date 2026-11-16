@@ -319,6 +319,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          Keep durable notes (facts, decisions, open threads) in `memory/` in this folder, one topic per \
          file, and read them when a conversation starts. Conversations get compacted or restarted; \
          `memory/` is what survives.\n\n\
+         ## Links\n\n{links}\n\n\
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
@@ -333,6 +334,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         resume = " resumes your conversation when you restart",
+        links = crate::links::INSTRUCTION,
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -397,6 +399,7 @@ fn write_persona(path: &Path, text: &str) -> anyhow::Result<()> {
         .open(path)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     f.write_all(text.as_bytes())?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -519,6 +522,27 @@ pub fn rename_old_tools(text: &str) -> Option<String> {
         out = res;
     }
     (out != text).then_some(out)
+}
+
+/// An agent made before links (src/links.rs) has a persona file without "## Links". At its next
+/// start Muster adds the section once, before "## Messages" (else at the end), to a file it
+/// generated (one that still calls the agent "a persistent muster agent"); a file replaced by hand
+/// is left alone. Best effort.
+fn add_links_section(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    if text.contains("\n## Links\n") || !text.contains("a persistent muster agent") {
+        return;
+    }
+    let section = format!("## Links\n\n{}\n\n", crate::links::INSTRUCTION);
+    let next = match text.find("\n## Messages\n") {
+        Some(i) => format!("{}{section}{}", &text[..i + 1], &text[i + 1..]),
+        None => format!("{}\n\n{}\n", text.trim_end(), section.trim_end()),
+    };
+    // A fresh temporary file renamed over it (`paths::write_private`), so a failed write never
+    // leaves it cut short and a planted file can't be truncated.
+    if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
+        tracing::warn!("adding the Links section to {}: {e:#}", path.display());
+    }
 }
 
 /// The persona files in `home` name the current tools (`rename_old_tools`). Best effort.
@@ -1859,7 +1883,10 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     // Only a missing persona file is (re)written; one that can't be read is an error.
     match lstat(&persona) {
         Ok(None) => write_persona(&persona, &persona_text_for(&agent))?,
-        Ok(Some(_)) => refuse_symlink(&persona)?,
+        Ok(Some(_)) => {
+            refuse_symlink(&persona)?;
+            add_links_section(&persona);
+        }
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
     // Awake from here on; a start below that fails puts an agent it was waking back to sleep
@@ -3800,10 +3827,31 @@ mod tests {
         assert!(check_name(&"x".repeat(41)).is_err());
         let t = persona_text("ada", SessionKind::Claude, "Reviews diffs.");
         assert!(t.contains("Reviews diffs.") && t.contains("memory/") && t.contains("resumes"));
+        // Every agent is told to mention things by title, as a link, with the form shown.
+        assert!(t.contains("## Links") && t.contains("[Pairs to review](muster://note/91)"), "{t}");
         assert_eq!(persona_file(SessionKind::Codex), "AGENTS.md");
         assert_eq!(parse_accepts("human, schedule,human").unwrap(), vec![Origin::Human, Origin::Schedule]);
         assert!(parse_accepts("cron").is_err());
         assert!(parse_accepts("").is_err());
+    }
+
+    #[test]
+    fn an_older_persona_file_gets_the_links_section_once() {
+        let dir = scratch("links-section");
+        let p = dir.join("CLAUDE.md");
+        let old = persona_text("ada", SessionKind::Claude, "Reviews diffs.").replace(
+            &format!("## Links\n\n{}\n\n", crate::links::INSTRUCTION), "");
+        assert!(!old.contains("## Links"));
+        std::fs::write(&p, &old).unwrap();
+        add_links_section(&p);
+        let once = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(once, persona_text("ada", SessionKind::Claude, "Reviews diffs."), "back to what Muster writes now");
+        add_links_section(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), once, "only once");
+        // A file the human wrote by hand is left as it is.
+        std::fs::write(&p, "# Mine\n\nMy own rules.\n").unwrap();
+        add_links_section(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# Mine\n\nMy own rules.\n");
     }
 
     /// A fresh scratch dir for one test (under the system temp dir).

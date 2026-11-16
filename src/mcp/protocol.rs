@@ -43,6 +43,12 @@ plain-text notes the human and every agent share: append to add without conflict
 from note_read. A named agent can set itself a one-off reminder up to 24 hours ahead (set_reminder) or propose a \
 schedule that the human approves (propose_schedule). You cannot approve permission prompts; the human does that.";
 
+/// What the server tells every agent about itself: INSTRUCTIONS, then how to mention things to
+/// the human (src/links.rs).
+fn instructions() -> String {
+    format!("{INSTRUCTIONS} {}", crate::links::INSTRUCTION)
+}
+
 /// The HTTP headers we look at, already extracted (case-insensitively) by the caller.
 #[derive(Debug, Default, Clone)]
 pub struct ReqHeaders {
@@ -360,7 +366,7 @@ async fn handle_modern<B: Backend>(
             "resultType": "complete",
             "supportedVersions": all_versions(),
             "capabilities": capabilities(),
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions(),
             "ttlMs": 300_000,
             "cacheScope": "private",
             "_meta": meta,
@@ -448,7 +454,7 @@ async fn handle_legacy<B: Backend>(
                 "protocolVersion": version,
                 "capabilities": capabilities(),
                 "serverInfo": server_info(),
-                "instructions": INSTRUCTIONS,
+                "instructions": instructions(),
             })
         }
         "ping" => json!({}),
@@ -457,7 +463,7 @@ async fn handle_legacy<B: Backend>(
             "supportedVersions": all_versions(),
             "capabilities": capabilities(),
             "serverInfo": server_info(),
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions(),
         }),
         "tools/call" => match call(st, caller, params).await {
             Ok(r) => r,

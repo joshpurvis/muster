@@ -16,6 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
+import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -119,6 +120,122 @@ export function onTerminalFocus(f: (sid: number) => void) {
   focusListener = f;
 }
 
+/** A click on a Muster link (links.ts) in session `sid`'s terminal. */
+let linkListener: (link: MusterLink, sid: number) => void = () => {};
+export function onMusterLink(f: (link: MusterLink, sid: number) => void) {
+  linkListener = f;
+}
+
+/** The hyperlinked (OSC 8) Muster link under the mouse in one terminal, and the link a press
+ * started on. Muster follows a link itself (`followClicks`), not through xterm, so the press
+ * never reaches the program as a mouse report. */
+interface LinkState {
+  hovered: string | null;
+  pressed: string | null;
+}
+
+/** Links a program marked up itself (OSC 8). A Muster link is followed on a left click
+ * (`followClicks`). A web link does what xterm does without a handler: it asks first, naming
+ * the address, since the text may say something else. Any other kind (file://, ssh://…) is
+ * left alone. */
+function oscLinks(state: LinkState) {
+  return {
+    allowNonHttpProtocols: true,
+    activate(_ev: MouseEvent, uri: string) {
+      if (parseMusterLink(uri) || !/^https?:\/\//i.test(uri)) return;
+      if (!confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) return;
+      const w = globalThis.open();
+      if (!w) return;
+      try {
+        w.opener = null;
+      } catch { /* some engines throw */ }
+      w.location.href = uri;
+    },
+    hover(_ev: MouseEvent, uri: string) {
+      if (parseMusterLink(uri)) state.hovered = uri;
+    },
+    leave() {
+      state.hovered = null;
+    },
+  };
+}
+
+/** A plain left click (no modifier) on a Muster link follows it. Its press and release are
+ * caught before xterm sees them, so a program with mouse reporting on gets no click, no
+ * selection starts, and other buttons (a middle-click paste) never follow a link. The link is
+ * found where the press is (a text link), or is the hyperlink under the pointer, so a link
+ * printed under a pointer that hasn't moved is caught too. */
+function followClicks(el: HTMLElement, term: Terminal, state: LinkState, sid: number) {
+  const linkAt = (ev: MouseEvent): string | null => {
+    const screen = el.querySelector(".xterm-screen")?.getBoundingClientRect();
+    if (!screen || !screen.width || !screen.height) return state.hovered;
+    const x = Math.floor((ev.clientX - screen.left) / (screen.width / term.cols));
+    const y = Math.floor((ev.clientY - screen.top) / (screen.height / term.rows));
+    if (x < 0 || y < 0 || x >= term.cols || y >= term.rows) return null;
+    const row = term.buffer.active.viewportY + y;
+    const hit = textLinks(term, row).find((l) => {
+      const at = row * term.cols + x, from = (l.start.y - 1) * term.cols + l.start.x - 1;
+      return at >= from && at <= (l.end.y - 1) * term.cols + l.end.x - 1;
+    });
+    return hit?.uri ?? state.hovered;
+  };
+  el.addEventListener("mousedown", (ev) => {
+    state.pressed = null;
+    if (ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return;
+    const uri = linkAt(ev);
+    if (!uri) return;
+    state.pressed = uri;
+    ev.preventDefault();
+    ev.stopPropagation();
+  }, true);
+  el.addEventListener("mouseup", (ev) => {
+    const pressed = state.pressed;
+    state.pressed = null;
+    if (!pressed) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const link = ev.button === 0 && linkAt(ev) === pressed ? parseMusterLink(pressed) : null;
+    if (link) linkListener(link, sid);
+  }, true);
+}
+
+/** Muster addresses written as text in the logical line around buffer row `row` (0-based): the
+ * row and the rows wrapped to and from it, only as far as an address can reach. Characters
+ * just outside what is read (the row before a wrapped one, or the next row's text after the last
+ * one's, since a replay redrawn at another width no longer marks wrapped rows) go in as `edges`,
+ * so a cut address is no link rather than a link to the wrong id. */
+function textLinks(term: Terminal, row: number) {
+  const b = term.buffer.active;
+  const cols = term.cols;
+  const reach = Math.ceil(MAX_LINK / cols) + 1;
+  let top = row;
+  while (top > 0 && row - top < reach && b.getLine(top)?.isWrapped) top--;
+  let bottom = row;
+  while (bottom - row < reach && b.getLine(bottom + 1)?.isWrapped) bottom++;
+  const cellsOf = (r: number) => {
+    const line = b.getLine(r);
+    const out: { chars: string; width: number }[] = [];
+    for (let x = 0; x < cols; x++) {
+      const c = line?.getCell(x);
+      out.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
+    }
+    return out;
+  };
+  let text = "";
+  for (let r = top; r <= bottom; r++) text += b.getLine(r)?.translateToString(false) ?? "";
+  if (!text.includes("muster://")) return [];
+  const cells: { chars: string; width: number }[] = [];
+  for (let r = top; r <= bottom; r++) cells.push(...cellsOf(r));
+  // The last row's trailing blanks go, so its last character meets the next row's text: an
+  // address ending there may have been cut by a wrap the terminal no longer knows of (a replay
+  // drawn at another width), and is then no link if that text would make it another one.
+  while (cells.length > (bottom - top) * cols && !cells.at(-1)?.chars) cells.pop();
+  const full = (r: number) => !!b.getLine(r)?.getCell(cols - 1)?.getChars();
+  const before = top > 0 && (b.getLine(top)?.isWrapped || full(top - 1)) ? cellsOf(top - 1).at(-1)?.chars || " " : "";
+  const next = b.getLine(bottom + 1)?.translateToString(false, 0, MAX_LINK) ?? "";
+  return linkRanges(cells, cols, top, { before, next });
+}
+
 function parkEl(): HTMLDivElement {
   if (!park) {
     park = document.createElement("div");
@@ -187,6 +304,7 @@ function create(sid: number): Entry {
   el.className = "term-el";
   el.dataset.sid = String(sid);
   parkEl().appendChild(el);
+  const linkState: LinkState = { hovered: null, pressed: null };
   const term = new Terminal({
     allowProposedApi: true,
     fontFamily: FONT_FAMILY,
@@ -203,6 +321,7 @@ function create(sid: number): Entry {
     disableStdin: connStatus.peek() !== "open",
     // App shortcuts use Alt; don't let xterm swallow Alt+letters on macOS.
     macOptionClickForcesSelection: true,
+    linkHandler: oscLinks(linkState),
   });
   const fit = new FitAddon();
   const search = new SearchAddon();
@@ -213,6 +332,21 @@ function create(sid: number): Entry {
       if (ev.ctrlKey || ev.metaKey) globalThis.open(uri, "_blank", "noopener");
     }),
   );
+  // Muster links written out as text (`title (muster://note/91)`, as Claude Code and Codex print
+  // Markdown links): underlined on hover like the marked-up ones; `followClicks` follows them. A
+  // row wrapped from the one above is read with it (`textLinks`), so a link split by the wrap is
+  // whole. Only links on row `y` are given (xterm keeps them per row).
+  term.registerLinkProvider({
+    provideLinks(y, callback) {
+      const found = textLinks(term, y - 1).filter((l) => l.start.y <= y && l.end.y >= y);
+      callback(
+        found.length
+          ? found.map((l) => ({ range: { start: l.start, end: l.end }, text: l.uri, activate: () => {} }))
+          : undefined,
+      );
+    },
+  });
+  followClicks(el, term, linkState, sid);
   try {
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";

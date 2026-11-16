@@ -319,14 +319,14 @@ export async function moveTabToWindow(sid: SessionId, target: WindowId | "new") 
 
 /** Show session `sid` wherever it is: a tab here is selected; one in another window is pulled
  * into the focused group, or with "Jump focuses the other window" that window is raised (pulling
- * when that fails). */
-export async function gotoSession(sid: SessionId) {
+ * when that fails). `raise: false` always pulls (a link: raising another window can't select). */
+export async function gotoSession(sid: SessionId, raise = true) {
   const s = sessions.value.get(sid);
   if (!s) return;
   pushRecent("s:" + sid);
   if (!hereIds.value.has(sid)) {
     const other = windowOfSession(s);
-    if (prefs.value.jumpRaises && other !== null && other !== windowId.value) {
+    if (raise && prefs.value.jumpRaises && other !== null && other !== windowId.value) {
       const raised = await rpc.call<{ raised: boolean }>("window.raise", { id: other })
         .then((r) => !!r?.raised).catch(() => false);
       if (raised) return;
@@ -337,8 +337,9 @@ export async function gotoSession(sid: SessionId) {
 }
 
 /** Show panel `id` wherever it is: selected here, or moved here from another window (with
- * "Jump focuses the other window", that window is raised instead when it can be). */
-export async function gotoPanel(id: number) {
+ * "Jump focuses the other window", that window is raised instead when it can be, unless `raise`
+ * is false). */
+export async function gotoPanel(id: number, raise = true) {
   const p = panels.value.get(id);
   if (!p) return;
   const tab = panelTab(id);
@@ -346,7 +347,7 @@ export async function gotoPanel(id: number) {
   if (!hereIds.value.has(tab)) {
     const here = windowId.value;
     if (here === null) return;
-    if (prefs.value.jumpRaises && p.window_id !== null && p.window_id !== here) {
+    if (raise && prefs.value.jumpRaises && p.window_id !== null && p.window_id !== here) {
       const raised = await rpc.call<{ raised: boolean }>("window.raise", { id: p.window_id })
         .then((r) => !!r?.raised).catch(() => false);
       if (raised) return;
@@ -363,8 +364,10 @@ export async function gotoPanel(id: number) {
 }
 
 /** Show note `id`: selected here, or opened here (from closed, or from another window; with
- * "Jump focuses the other window", that window is raised instead when it can be). */
-export async function gotoNote(id: number, group?: string) {
+ * "Jump focuses the other window", that window is raised instead when it can be). `beside`: open
+ * it beside that session's tab, as an agent's `note_open` does (a link clicked in its terminal);
+ * `raise` as for `gotoSession`. */
+export async function gotoNote(id: number, group?: string, beside?: SessionId, raise = true) {
   const n = notes.value.get(id);
   if (!n) return;
   const tab = noteTab(id);
@@ -373,14 +376,14 @@ export async function gotoNote(id: number, group?: string) {
     const here = windowId.value;
     if (here === null) return;
     const other = n.window_id !== null && windows.value.some((w) => w.id === n.window_id) ? n.window_id : null;
-    if (prefs.value.jumpRaises && other !== null && other !== here) {
+    if (raise && prefs.value.jumpRaises && other !== null && other !== here) {
       const raised = await rpc.call<{ raised: boolean }>("window.raise", { id: other })
         .then((r) => !!r?.raised).catch(() => false);
       if (raised) return;
     }
     if (group) focusGroup(group);
     try {
-      knowNote(await rpc.call<Note>("note.open", { id, window_id: here }));
+      knowNote(await rpc.call<Note>("note.open", { id, window_id: here, ...(beside ? { beside } : {}) }));
     } catch (e) {
       toast("error", `Couldn't open the note: ${errText(e)}`);
       return;

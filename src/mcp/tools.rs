@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 35] = [
+pub const TOOL_NAMES: [&str; 39] = [
     "request_session", "reply_session", "session_messages", "subscribe_channel", "channel_updates",
     "whoami",
     "list_channels",
@@ -40,6 +40,7 @@ pub const TOOL_NAMES: [&str; 35] = [
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
     "note_list", "note_read", "note_write", "note_append", "note_open",
     "list_schedules", "propose_schedule", "set_reminder", "pause_schedule", "delete_schedule",
+    "post_question", "list_questions", "withdraw_question", "record_answer",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -346,7 +347,53 @@ pub fn tool_definitions() -> Vec<Value> {
         tool("delete_schedule", "Delete schedule", "Delete a schedule you made (a proposal, a reminder, or a proposal the human approved) and its history. Schedules the human made can only be paused (pause_schedule).",
             json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
     ]);
+    tools.extend(question_definitions());
     tools
+}
+
+/// The question tools (src/questions.rs, docs/MCP.md "Questions for the human").
+fn question_definitions() -> Vec<Value> {
+    let number = json!({"type":"integer","minimum":1,"description":"The question's number: 3 for Q3."});
+    let line = |max: u32, d: &str| json!({"type":"string","maxLength":max,"description":d});
+    let letters = json!({"description":"A letter (\"a\") or, for pick_several, a list of letters.","anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"maxItems":6}]});
+    vec![
+        tool("post_question", "Post a question for the human",
+            "Ask the human something without waiting: Muster stores the question and this call returns at once, so your turn goes on and messages to you keep arriving. Use it instead of an interview box or a form. When the human answers, Muster sends you a message starting \"Answer to your question Q<n>\" that repeats the whole question and your note_to_self, addressed to you by name if you are a named agent (it reaches you after a restart or fresh start too), else to this session or, if it has ended, to the session that started it. Usually a lead passes questions on: if a lead started you or you work for one, ask the lead (request_session, ask_agent) unless the human has been talking to you directly. Write for someone who knows the product but not the code: no file names, PR numbers or internal labels in question, context, example or options (put them in details). Refused, with every problem listed, without: context, a concrete example of what changes, 2-6 options with your pick first (as a) and its why (except kind own_words), if_no_answer, note_to_self. Lettered a-f in the order given. At most 20 open per asker; the same open question is refused with its number.",
+            json!({"type":"object","properties":{
+                "question":line(300, "The question, one sentence on one line."),
+                "context":line(1000, "One or two sentences in plain words: what this is about."),
+                "example":line(800, "A concrete example of what changes for a customer or for the human with each answer."),
+                "kind":{"type":"string","enum":["pick_one","yes_no","pick_several","own_words"],"default":"pick_one","description":"pick_one (default); yes_no (exactly two options); pick_several (any number, pick lists those you recommend); own_words (a paste or a value: no options, no pick)."},
+                "options":{"type":"array","maxItems":6,"items":{"type":"object","properties":{"text":line(200, "The option, one line."),"why":line(300, "One line of why; required for your pick.")},"required":["text"],"additionalProperties":false},"description":"Lettered a, b, c... in this order; your pick first."},
+                "pick":letters,
+                "if_no_answer":line(500, "What you do if the human never answers, and when."),
+                "note_to_self":line(4000, "For you, sent back with the answer: what you will do with each answer and which files to reopen, so you can act on it after a restart."),
+                "holding_up":line(300, "What waits on this answer, if anything."),
+                "product":line(60, "The product or project it is about."),
+                "area":{"type":"string","enum":["merge","money","public","customer_dns","other"],"default":"other","description":"merge, money, public (anything published) or customer_dns questions never take a default answer."},
+                "details":line(2000, "File names, job and PR numbers: shown only when the human opens the details."),
+                "pictures":{"type":"array","maxItems":6,"items":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of a png, jpg, gif, webp or svg."},"caption":line(200, "What it shows.")},"required":["path","caption"],"additionalProperties":false}},
+                "links":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"label":line(80, "What it opens, e.g. Open the pull request."),"url":{"type":"string","description":"http(s) address."}},"required":["label","url"],"additionalProperties":false}}
+            },"required":["question"],"additionalProperties":false}), false),
+        tool("list_questions", "List questions for the human",
+            "List the questions agents posted for the human: number (Q<n>), asker, product, question, options with the asker's pick, what it holds up, and for open ones the asker's state now (running, asleep, cold: whether its next message re-reads its whole conversation). Answered ones carry the answer, who recorded it and how it was delivered. Oldest first. With number: that one question in full (its note_to_self included). With mine=true: only yours (as a named agent, also those you asked before a restart), e.g. to check an answer before asking again.",
+            json!({"type":"object","properties":{
+                "number":number,
+                "status":{"type":"string","enum":["open","answered","withdrawn","all"],"default":"open"},
+                "mine":{"type":"boolean","default":false},
+                "limit":{"type":"integer","minimum":1,"maximum":200,"default":200,"description":"At most this many (the newest)."}
+            },"additionalProperties":false}), true),
+        tool("withdraw_question", "Withdraw a question",
+            "Take back a question you posted that is still open (it no longer matters, or you found the answer). Only the asker can.",
+            json!({"type":"object","properties":{"number":number,"reason":line(500, "Why, in a few words.")},"required":["number","reason"],"additionalProperties":false}), false),
+        tool("record_answer", "Record the human's answer",
+            "Record the answer the human gave you in chat to an open question (\"Q3 a\"), for a lead relaying it. Only the human's own words, never your opinion: put them in words verbatim, and the letters they chose in pick. Muster stores it, then delivers it to the asker as a message from you (your envelope, origin and hop, the same guards and caps as ask_agent), repeating the whole question and the asker's note to itself; it never arrives as the human's own input. Allowed for the asker itself (then nothing is sent), any named agent, or the session that started the asker; refused while you handle scheduled or triggered work, and once the question was answered or withdrawn. The result says how it was delivered.",
+            json!({"type":"object","properties":{
+                "number":number,
+                "words":line(4000, "What the human typed, verbatim, e.g. \"Q3 a, but ask the lead first\"."),
+                "pick":letters
+            },"required":["number","words"],"additionalProperties":false}), false),
+    ]
 }
 
 // ----- argument helpers -----
@@ -540,6 +587,7 @@ pub async fn call_tool<B: Backend>(
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
         "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
         "list_schedules" | "propose_schedule" | "set_reminder" | "pause_schedule" | "delete_schedule" => schedule_tool(st, caller, name, map),
+        "post_question" | "list_questions" | "withdraw_question" | "record_answer" => question_tool(st, caller, name, map).await,
         _ => return Err(()),
     };
     Ok(match res {
@@ -601,6 +649,21 @@ fn schedule_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, ar
         }
     }
     st.backend.schedule_tool(caller, name, Value::Object(args.clone()))
+        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+}
+
+/// Questions for the human (src/questions.rs). Posting, withdrawing and recording share the post
+/// rate limit, so a loop can't flood the human with questions.
+async fn question_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: &Map<String, Value>) -> TResult {
+    caller_session(st, caller)?;
+    if name != "list_questions" {
+        if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+            caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+        ))? {
+            return Err(format!("rate limit: at most {} questions, answers, note writes or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
+        }
+    }
+    st.backend.question_tool(caller, name, Value::Object(args.clone())).await
         .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 

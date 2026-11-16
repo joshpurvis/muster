@@ -255,6 +255,23 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             Ok(result)
         }
 
+        // Questions for the human (docs/PROTOCOL.md "Questions"): read-only here, plus the first
+        // number before any exists. Posting, withdrawing and recording an answer are MCP tools
+        // only, so each carries its session's identity and guards.
+        "question.list" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { #[serde(default)] status: crate::questions::Filter, #[serde(default)] limit: Option<usize> }
+            let p: P = parse(params)?;
+            Ok(crate::questions::list(hub, p.status, None, p.limit)?)
+        }
+        "question.get" => {
+            let p: IdParam<i64> = parse(params)?;
+            Ok(crate::questions::get(hub, p.id)?)
+        }
+        "question.start_at" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { first: i64 }
+            Ok(crate::questions::start_at(hub, parse::<P>(params)?.first)?)
+        }
         // Notes (docs/PROTOCOL.md "Notes"). `from_session` (the CLI inside a session) only says
         // who wrote; without it the change is the human's.
         "note.list" => to_value(crate::notes::list(hub)?),

@@ -564,6 +564,22 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agents ADD COLUMN self_handoff INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE agents ADD COLUMN self_handoff_at INTEGER;
     "#,
+    // v30: questions for the human (src/questions.rs). The id is the question's number (Q<id>),
+    // never reused (AUTOINCREMENT); `record` is the whole question as JSON, its answer and that
+    // answer's delivery included; `status` and the asker's ids are copied out for queries. An
+    // older backend never reads the table.
+    r#"
+    CREATE TABLE questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL,
+        asker_agent INTEGER,
+        asker_session INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        record TEXT NOT NULL
+    );
+    CREATE INDEX questions_status ON questions(status, id);
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1028,6 +1044,121 @@ impl Store {
     pub fn delete_push_subscription(&self, device_id: i64) -> anyhow::Result<()> {
         self.conn.lock().execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [device_id])?;
         Ok(())
+    }
+
+    // ----- questions (src/questions.rs) -----
+
+    fn row_question(id: i64, record: &str) -> anyhow::Result<crate::questions::Question> {
+        let mut q: crate::questions::Question = serde_json::from_str(record).with_context(|| format!("question {id}"))?;
+        q.id = id;
+        Ok(q)
+    }
+
+    /// Store a new question and return its number, unless the asker has the same question open
+    /// already or too many open ones, or too many are open in all (checked in the same
+    /// transaction as the insert).
+    pub fn insert_question(&self, q: &crate::questions::Question, per_asker: usize, all: usize)
+        -> anyhow::Result<Result<i64, crate::questions::InsertRefusal>> {
+        use crate::questions::InsertRefusal;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        // The same asker: the same named agent, else the same session.
+        let mine = "status = 'open' AND ((?1 IS NOT NULL AND asker_agent = ?1) OR (?1 IS NULL AND asker_agent IS NULL AND asker_session = ?2))";
+        let dup: Option<i64> = tx.query_row(
+            &format!("SELECT id FROM questions WHERE {mine} AND json_extract(record, '$.question') = ?3 ORDER BY id LIMIT 1"),
+            params![q.asker.agent_id, q.asker.session_id, q.question], |r| r.get(0)).optional()?;
+        if let Some(n) = dup {
+            return Ok(Err(InsertRefusal::Duplicate(n)));
+        }
+        let n: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM questions WHERE {mine}"),
+            params![q.asker.agent_id, q.asker.session_id], |r| r.get(0))?;
+        if n as usize >= per_asker {
+            return Ok(Err(InsertRefusal::AskerFull(n as usize)));
+        }
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM questions WHERE status = 'open'", [], |r| r.get(0))?;
+        if n as usize >= all {
+            return Ok(Err(InsertRefusal::Full(n as usize)));
+        }
+        tx.execute("INSERT INTO questions(status, asker_agent, asker_session, created_at, updated_at, record)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![q.status.as_str(), q.asker.agent_id, q.asker.session_id, q.created_at, q.updated_at, serde_json::to_string(q)?])?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Ok(id))
+    }
+
+    pub fn question(&self, id: i64) -> anyhow::Result<Option<crate::questions::Question>> {
+        let raw: Option<String> = self.conn.lock()
+            .query_row("SELECT record FROM questions WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        raw.map(|r| Self::row_question(id, &r)).transpose()
+    }
+
+    /// Every question with `status` (None: all), oldest first.
+    pub fn questions(&self, status: Option<crate::questions::Status>) -> anyhow::Result<Vec<crate::questions::Question>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT id, record FROM questions WHERE ?1 IS NULL OR status = ?1 ORDER BY id")?;
+        let rows = st.query_map([status.map(|s| s.as_str())], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, record) = row?;
+            match Self::row_question(id, &record) {
+                Ok(q) => out.push(q),
+                Err(e) => tracing::warn!("skipping a question that doesn't read: {e:#}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Change question `id` with `edit`, read and written in one transaction (so two callers
+    /// can't both answer it). An error from `edit` changes nothing. Returns the question after.
+    pub fn update_question<T>(&self, id: i64, edit: impl FnOnce(&mut crate::questions::Question) -> anyhow::Result<T>)
+        -> anyhow::Result<(crate::questions::Question, T)> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx.query_row("SELECT record FROM questions WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        let raw = raw.with_context(|| format!("no question Q{id} (see list_questions)"))?;
+        let before = Self::row_question(id, &raw)?;
+        let mut after = before.clone();
+        let out = edit(&mut after)?;
+        if after != before {
+            after.updated_at = now_ms().max(before.updated_at);
+            tx.execute("UPDATE questions SET status = ?2, updated_at = ?3, record = ?4 WHERE id = ?1",
+                params![id, after.status.as_str(), after.updated_at, serde_json::to_string(&after)?])?;
+            tx.commit()?;
+        }
+        Ok((after, out))
+    }
+
+    /// Questions whose answer a previous backend stored but didn't finish delivering.
+    pub fn unfinished_question_deliveries(&self) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT id FROM questions WHERE status = 'answered'
+            AND json_extract(record, '$.answer.delivery.status') IN ('pending', 'delivering') ORDER BY id")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The message that carried an answer to `to_agent`: from `from`, with exactly `text` (which
+    /// names the question, and a question takes one answer).
+    pub fn find_question_delivery(&self, to_agent: i64, from: &str, text: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.lock().query_row(
+            "SELECT id FROM agent_messages WHERE to_agent = ?1 AND from_label = ?2 AND text = ?3 ORDER BY id DESC LIMIT 1",
+            params![to_agent, from, text], |r| r.get(0)).optional()?)
+    }
+
+    /// The first question gets number `first`: only while none was ever stored (questions are
+    /// never deleted, so an empty table means none was). False otherwise.
+    pub fn set_questions_start(&self, first: i64) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let rows: i64 = tx.query_row("SELECT COUNT(*) FROM questions", [], |r| r.get(0))?;
+        if rows > 0 {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM sqlite_sequence WHERE name = 'questions'", [])?;
+        tx.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('questions', ?1)", [first - 1])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     // ----- agents -----

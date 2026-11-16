@@ -1271,6 +1271,7 @@ done
   await c.call("agent.remove", { name: "bg" });
 
   await lateReplies(c, mcp);
+  await questionsForHuman(c, mcp);
   await selfHandoff(c, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
@@ -1530,6 +1531,86 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
   await c.call("session.remove", { id: plainS });
   await c.call("agent.remove", { name: "asker" });
   await c.call("agent.remove", { name: "helper" });
+}
+
+/** Questions for the human (docs/MCP.md "Questions for the human"): a fake Codex "writer" posts
+ * questions and carries on; a fake Codex "lead" records the human's chat answer; the answer reaches
+ * the writer by name, the second one after the writer started fresh. */
+async function questionsForHuman(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+  await c.call("agent.create", { name: "writer", kind: "codex" });
+  await c.call("agent.create", { name: "lead", kind: "codex" });
+  const writerS: number = (await c.call("agent.start", { name: "writer" })).session.id;
+  const leadS: number = (await c.call("agent.start", { name: "lead" })).session.id;
+  for (const id of [writerS, leadS]) {
+    await c.waitFor(`agent ${id} idle`, () => c.events.some((e) => e.event === "session_upserted" && e.data.id === id && e.data.state === "idle"));
+  }
+  const tokenOf = async (id: number) => {
+    const path = `${BASE}/fake-token-${id}`;
+    for (let n = 0; n < 100 && !(await exists(path)); n++) await sleep(100);
+    return await Deno.readTextFile(path);
+  };
+  const got = async (id: number, needle: string) => {
+    for (let n = 0; n < 100; n++) {
+      if ((await Deno.readTextFile(`${BASE}/fake-input-${id}`).catch(() => "")).includes(needle)) return true;
+      await sleep(100);
+    }
+    return false;
+  };
+  const refused = (p: Promise<unknown>, needle: string) => p.then(() => "", (e) => String(e)).then((e) => e.includes(needle) ? true : e);
+  const questions = (...args: string[]) => cli(["questions", ...args], ENV);
+  let writerT = await tokenOf(writerS);
+  const leadT = await tokenOf(leadS);
+  const ask = (question: string, note: string) => ({
+    question, product: "Smoke",
+    context: "The smoke test's error pages end with a sign-up card whose heading differs per page.",
+    example: "Someone reading the missing-mailbox page sees one heading or the other above the button.",
+    options: [{ text: "Heading one on every page", why: "Already approved on one page." }, { text: "Heading two on every page" }],
+    pick: "a", if_no_answer: "The build waits; nothing on the site changes.", note_to_self: note,
+  });
+
+  // Numbers can carry on from another list, only before the first question.
+  const start = await questions("start-at", "5");
+  ok(start.success && dec.decode(start.stdout).includes("Q5"), `questions: start-at sets the first number (${dec.decode(start.stderr)})`);
+  // Posting returns at once and holds nothing: the writer stays idle, its inbox open.
+  const t0 = Date.now();
+  const q1 = await mcp(writerT, "post_question", ask("Which heading goes on the sign-up card?", "smoke-note-one: on a edit cards.md, on b keep it"));
+  ok(q1.question === "Q5" && Date.now() - t0 < 3000 && String(q1.answer_goes_to).includes("writer, by name"),
+    `questions: posting returns at once with a stable number (${JSON.stringify(q1)})`);
+  ok((await c.call("hello")).sessions.find((x: Json) => x.id === writerS).state === "idle", "questions: the asker is not held in a question box");
+  ok(await refused(mcp(writerT, "post_question", { question: "Merge it now?" }), "Fix all of these") === true,
+    "questions: a question without context, example, options, pick or if_no_answer is refused");
+  ok(await refused(questions("start-at", "9").then((o) => o.success ? "" : Promise.reject(dec.decode(o.stderr))), "can't change") === true,
+    "questions: start-at is refused once a question exists");
+  // The human's terminal lists it.
+  let out = await questions();
+  ok(out.success && dec.decode(out.stdout).includes("Q5") && dec.decode(out.stdout).includes("Which heading goes on the sign-up card?") &&
+    dec.decode(out.stdout).includes("(asker's pick)"), `questions: muster questions lists the open one (${dec.decode(out.stdout).slice(0, 300)})`);
+
+  // The lead records what the human typed in chat; the writer gets the whole question back by name.
+  const r1 = await mcp(leadT, "record_answer", { number: 5, words: "Q5 a", pick: "a" });
+  ok(r1.status === "answered" && r1.delivered === true && r1.delivery.to === "writer", `questions: the lead records the answer (${JSON.stringify(r1)})`);
+  ok(await got(writerS, `from lead origin=human`) && await got(writerS, "Answer to your question Q5: a) Heading one on every page.") &&
+    await got(writerS, "smoke-note-one") && await got(writerS, `Their words, verbatim: "Q5 a"`),
+    "questions: the answer is typed into the writer with the question and its own note, from the lead");
+  ok(await refused(mcp(leadT, "record_answer", { number: 5, words: "Q5 b", pick: "b" }), "answered already") === true, "questions: one answer per question");
+
+  // A question asked, then the writer starts fresh: the answer still reaches it, in the new run.
+  const q2 = await mcp(writerT, "post_question", ask("Which footer goes on the error pages?", "smoke-note-two: on a edit footer.md"));
+  await Deno.remove(`${BASE}/fake-token-${writerS}`);
+  const mark = c.events.length;
+  await c.call("agent.start", { name: "writer", fresh: true });
+  await c.waitFor("writer fresh", () => c.events.slice(mark).some((e) => e.event === "session_upserted" && e.data.id === writerS && e.data.state === "idle"));
+  writerT = await tokenOf(writerS);
+  const r2 = await mcp(leadT, "record_answer", { number: q2.number, words: "Q6: b, the plain one", pick: "b" });
+  ok(r2.delivered === true && r2.delivery.to === "writer", `questions: an answer after a fresh start goes to the agent by name (${JSON.stringify(r2)})`);
+  ok(await got(writerS, "Answer to your question Q6: b) Heading two on every page.") && await got(writerS, "smoke-note-two"),
+    "questions: the fresh run gets the answer and its note");
+  const mine = await mcp(writerT, "list_questions", { mine: true, status: "answered" });
+  ok(mine.total === 2 && mine.questions[1].answer.words === "Q6: b, the plain one", `questions: the writer reads its answers back after the reset (${JSON.stringify(mine).slice(0, 200)})`);
+  out = await questions("--all");
+  ok(dec.decode(out.stdout).includes("recorded by lead"), "questions: muster questions --all shows who recorded each answer");
+  await c.call("agent.remove", { name: "writer" });
+  await c.call("agent.remove", { name: "lead" });
 }
 
 /** The fake CLI's launch record for session `id` (waits until it is written). */

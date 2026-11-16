@@ -102,8 +102,6 @@ terms.onClipboardFailed((text) => toast("error", text));
 // A click on a Muster link in a terminal shows what it names (links.ts): a closed note opens
 // beside the terminal that linked it.
 terms.onMusterLink((link, sid) => {
-  const l = layout.value;
-  const group = l ? paneOfSession(l.root, sid)?.id : undefined;
   followLink(link, {
     hasNote: (id) => notes.value.has(id),
     hasPanel: (id) => panels.value.get(id)?.closed === false,
@@ -112,7 +110,7 @@ terms.onMusterLink((link, sid) => {
       const a = agents.value.find((x) => x.name.toLowerCase() === name.toLowerCase());
       return a ? { name: a.name, session: a.session_id } : null;
     },
-    gotoNote: (id) => void A.gotoNote(id, group),
+    gotoNote: (id) => void A.gotoNote(id, undefined, sid),
     gotoPanel: (id) => void A.gotoPanel(id),
     gotoSession: (id) => void A.gotoSession(id),
     notify: (text) => toast("info", text, 5000),

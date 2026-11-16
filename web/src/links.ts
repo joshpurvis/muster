@@ -1,7 +1,7 @@
 // Links that bring a note, panel, tab or agent to the front (docs/UI.md "Links"). Agents write
-// them for the human as Markdown, `[Pairs to review](muster://note/91)`: Claude Code shows the
-// title as a terminal hyperlink (OSC 8), Codex and plain text show `title (muster://note/91)`.
-// Muster's terminal makes both clickable (terms.ts).
+// them for the human as Markdown, `[Pairs to review](muster://note/91)`, which Claude Code and
+// Codex print as `Pairs to review (muster://note/91)`. Muster's terminal makes the address
+// clickable, and a program's own hyperlink (OSC 8) to one too (terms.ts).
 //
 // A link names a kind and an id (an agent: its name), nothing else: no token, no query, no
 // fragment. Text in a terminal may come from anywhere (a web page an agent printed), so a link
@@ -45,8 +45,7 @@ export function findMusterLinks(text: string): { start: number; end: number; uri
 
 /** Links in one terminal row as 1-based, inclusive cell columns (xterm's `IBufferRange.x`).
  * `cells` are the row's cells left to right; a wide character takes two, the second with width 0
- * and no text, so columns after one differ from string offsets. Links wrapped onto the next row
- * aren't found (Muster's are short). */
+ * and no text, so columns after one differ from string offsets. */
 export function linkColumns(cells: { chars: string; width: number }[]): { start: number; end: number; uri: string }[] {
   let text = "";
   const col: number[] = [];
@@ -57,6 +56,14 @@ export function linkColumns(cells: { chars: string; width: number }[]): { start:
     text += s;
   });
   return findMusterLinks(text).map((l) => ({ start: col[l.start] + 1, end: col[l.end - 1] + 1, uri: l.uri }));
+}
+
+/** Links in a logical line (a row and the rows wrapped from it) as xterm buffer ranges, 1-based
+ * and inclusive: `cells` are the rows' cells in order, `cols` per row, the first row being buffer
+ * row `top` (0-based). A link split by the wrap is one range over both rows. */
+export function linkRanges(cells: { chars: string; width: number }[], cols: number, top: number) {
+  const at = (col: number) => ({ x: ((col - 1) % cols) + 1, y: top + 1 + Math.floor((col - 1) / cols) });
+  return linkColumns(cells).map((l) => ({ start: at(l.start), end: at(l.end), uri: l.uri }));
 }
 
 /** What following a link may use: lookups, the three "show it" actions and a short message. */

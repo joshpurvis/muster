@@ -16,7 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
-import { linkColumns, type MusterLink, parseMusterLink } from "./links.ts";
+import { linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -126,26 +126,60 @@ export function onMusterLink(f: (link: MusterLink, sid: number) => void) {
   linkListener = f;
 }
 
-/** Links a program marked up itself (OSC 8: Claude Code prints Markdown links this way when
- * Muster starts it, see src/adapters/claude.rs). A Muster link opens on a plain click; it only
- * shows something. A web link opens in a new browser tab on Ctrl/Cmd+click, as a bare address
- * does; its text may say something else than where it goes, so hovering shows the address. Any
- * other kind (file://, ssh://…) is left alone. */
-function oscLinks(sid: number, el: HTMLElement) {
+/** The Muster link under the mouse in one terminal, and the one a press started on. Muster
+ * follows a link itself (`followClicks`), not through xterm, so the press never reaches the
+ * program as a mouse report. */
+interface LinkState {
+  hovered: string | null;
+  pressed: string | null;
+}
+
+/** Links a program marked up itself (OSC 8). A Muster link is followed on a left click
+ * (`followClicks`). A web link does what xterm does without a handler: it asks first, naming
+ * the address, since the text may say something else. Any other kind (file://, ssh://…) is
+ * left alone. */
+function oscLinks(state: LinkState) {
   return {
     allowNonHttpProtocols: true,
-    activate(ev: MouseEvent, uri: string) {
-      const link = parseMusterLink(uri);
-      if (link) return linkListener(link, sid);
-      if (/^https?:\/\//i.test(uri) && (ev.ctrlKey || ev.metaKey)) globalThis.open(uri, "_blank", "noopener");
+    activate(_ev: MouseEvent, uri: string) {
+      if (parseMusterLink(uri) || !/^https?:\/\//i.test(uri)) return;
+      if (!confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) return;
+      const w = globalThis.open();
+      if (!w) return;
+      try {
+        w.opener = null;
+      } catch { /* some engines throw */ }
+      w.location.href = uri;
     },
     hover(_ev: MouseEvent, uri: string) {
-      if (parseMusterLink(uri) || /^https?:\/\//i.test(uri)) el.title = uri;
+      if (parseMusterLink(uri)) state.hovered = uri;
     },
     leave() {
-      el.removeAttribute("title");
+      state.hovered = null;
     },
   };
+}
+
+/** A plain left click (no modifier) on a Muster link follows it. Its press and release are
+ * caught before xterm sees them, so a program with mouse reporting on gets no click, no
+ * selection starts, and other buttons (a middle-click paste) never follow a link. */
+function followClicks(el: HTMLElement, state: LinkState, sid: number) {
+  el.addEventListener("mousedown", (ev) => {
+    state.pressed = null;
+    if (!state.hovered || ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return;
+    state.pressed = state.hovered;
+    ev.preventDefault();
+    ev.stopPropagation();
+  }, true);
+  el.addEventListener("mouseup", (ev) => {
+    const pressed = state.pressed;
+    state.pressed = null;
+    if (!pressed) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const link = ev.button === 0 && state.hovered === pressed ? parseMusterLink(pressed) : null;
+    if (link) linkListener(link, sid);
+  }, true);
 }
 
 function parkEl(): HTMLDivElement {
@@ -216,6 +250,8 @@ function create(sid: number): Entry {
   el.className = "term-el";
   el.dataset.sid = String(sid);
   parkEl().appendChild(el);
+  const linkState: LinkState = { hovered: null, pressed: null };
+  followClicks(el, linkState, sid);
   const term = new Terminal({
     allowProposedApi: true,
     fontFamily: FONT_FAMILY,
@@ -232,7 +268,7 @@ function create(sid: number): Entry {
     disableStdin: connStatus.peek() !== "open",
     // App shortcuts use Alt; don't let xterm swallow Alt+letters on macOS.
     macOptionClickForcesSelection: true,
-    linkHandler: oscLinks(sid, el),
+    linkHandler: oscLinks(linkState),
   });
   const fit = new FitAddon();
   const search = new SearchAddon();
@@ -243,27 +279,37 @@ function create(sid: number): Entry {
       if (ev.ctrlKey || ev.metaKey) globalThis.open(uri, "_blank", "noopener");
     }),
   );
-  // Muster links written out as text (`title (muster://note/91)`, as Codex prints Markdown
-  // links): clickable like the marked-up ones.
+  // Muster links written out as text (`title (muster://note/91)`, as Claude Code and Codex print
+  // Markdown links): clickable like the marked-up ones. A row wrapped from the one above is read
+  // with it, so a link split by the wrap is whole (never the wrong id from half of one).
   term.registerLinkProvider({
     provideLinks(y, callback) {
-      const line = term.buffer.active.getLine(y - 1);
-      if (!line || !line.translateToString(true).includes("muster://")) return callback(undefined);
+      const b = term.buffer.active;
+      let top = y - 1;
+      while (top > 0 && b.getLine(top)?.isWrapped) top--;
+      let bottom = y - 1;
+      while (b.getLine(bottom + 1)?.isWrapped) bottom++;
       const cells: { chars: string; width: number }[] = [];
-      for (let x = 0; x < line.length; x++) {
-        const c = line.getCell(x);
-        cells.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
+      let text = "";
+      for (let r = top; r <= bottom; r++) {
+        const line = b.getLine(r);
+        if (!line) break;
+        text += line.translateToString(false);
+        for (let x = 0; x < term.cols; x++) {
+          const c = line.getCell(x);
+          cells.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
+        }
       }
-      const found = linkColumns(cells);
+      if (!text.includes("muster://")) return callback(undefined);
+      const found = linkRanges(cells, term.cols, top);
       callback(
         found.length
           ? found.map((l) => ({
-            range: { start: { x: l.start, y }, end: { x: l.end, y } },
+            range: { start: l.start, end: l.end },
             text: l.uri,
-            activate: () => {
-              const link = parseMusterLink(l.uri);
-              if (link) linkListener(link, sid);
-            },
+            activate: () => {}, // followClicks does it
+            hover: () => (linkState.hovered = l.uri),
+            leave: () => (linkState.hovered = null),
           }))
           : undefined,
       );

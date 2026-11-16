@@ -1,4 +1,4 @@
-import { findMusterLinks, followLink, type LinkDeps, linkColumns, type MusterLink, parseMusterLink } from "./links.ts";
+import { findMusterLinks, followLink, type LinkDeps, linkColumns, linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -70,6 +70,18 @@ Deno.test("linkColumns: wide characters before a link shift its columns", () => 
   assertEquals(linkColumns(emoji), [{ start: 4, end: 17, uri: "muster://tab/2" }]);
   // Empty cells read as spaces.
   assertEquals(linkColumns([{ chars: "", width: 1 }, ...cells("muster://panel/1")]).map((l) => l.start), [2]);
+});
+
+Deno.test("linkRanges: a link split by a wrap is one range over both rows, never half of it", () => {
+  const cells = (s: string) => [...s].map((chars) => ({ chars, width: 1 }));
+  // 10 columns, buffer rows 6 and 7 (0-based; xterm's ranges are 1-based): "see muster" + "://note/91".
+  assertEquals(linkRanges(cells("see muster").concat(cells("://note/91")), 10, 6), [
+    { start: { x: 5, y: 7 }, end: { x: 10, y: 8 }, uri: "muster://note/91" },
+  ]);
+  // Split inside the id: note 91, not note 9.
+  assertEquals(linkRanges(cells("ab muster:").concat(cells("//note/9")).concat(cells("1 ")), 10, 0).map((l) => l.uri), [
+    "muster://note/91",
+  ]);
 });
 
 /** A fake world that records every call: following a link may only look things up, show one of

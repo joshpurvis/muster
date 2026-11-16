@@ -1,17 +1,21 @@
-// Links checks against the MOCK daemon (docs/UI.md "Links"): a shell prints a note's link the
-// way Claude Code does (OSC 8: the title only) and the way Codex does (`title (muster://…)`), a
-// click opens the closed note beside the terminal, a link to a deleted note says so, and the
-// clicks make no call but the ones that show something.
+// Links checks against the MOCK daemon (docs/UI.md "Links"): a shell prints a note's link as a
+// hyperlink (OSC 8: the title only) and as Claude Code and Codex print Markdown links
+// (`title (muster://…)`), then turns mouse reporting on. A click opens the closed note beside the
+// terminal, a link to a deleted note says so, no click reaches the program, and the clicks make
+// no call but the ones that show something.
 //
 //   deno task build:dev && MOCK_PORT=17761 deno task mock &
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots> --allow-write=<shots>,/tmp \
 //     dev/e2e_links.ts http://127.0.0.1:17761/#token=dev <shots-dir> <repo-path>
 import { type Browser, launch } from "./cdp.ts";
+import { noteTab } from "../src/layout/tree.ts";
 
 const M = "globalThis.__muster";
 
 export async function linkChecks(a: Browser, shots: string, ok: (m: string) => void, check: (c: unknown, m: string) => void) {
-  const R = (m: string, p: unknown): Promise<any> => a.eval(`${M}.rpc.call(${JSON.stringify(m)}, ${JSON.stringify(p)})`);
+  // The test's own calls go around the recorder installed below.
+  const R = (m: string, p: unknown): Promise<any> =>
+    a.eval(`(globalThis.__rawCall ?? ${M}.rpc.call.bind(${M}.rpc))(${JSON.stringify(m)}, ${JSON.stringify(p)})`);
   const shot = async (name: string) => {
     await a.sleep(400);
     await a.shot(`${shots}/${name}.png`);
@@ -19,17 +23,21 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
   const sid: number = await a.eval(`${M}.windowSessions.value.find((s) => s.kind === 'shell')?.id ?? null`);
   check(sid, "a shell tab to print the links");
   // Every call the page makes from here on is recorded.
-  await a.eval(`(() => { const r = ${M}.rpc; globalThis.__calls = []; const call = r.call.bind(r);
-    r.call = (m, p) => { globalThis.__calls.push(m); return call(m, p); }; })()`);
+  await a.eval(`(() => { const r = ${M}.rpc; globalThis.__calls = []; globalThis.__input = 0;
+    const call = r.call.bind(r); globalThis.__rawCall = call; r.call = (m, p) => { globalThis.__calls.push(m); return call(m, p); };
+    const send = r.sendInput.bind(r); r.sendInput = (sid, d) => { globalThis.__input++; return send(sid, d); }; })()`);
   const note = await R("note.create", { title: "Pairs to review", body: "1. login + signup\n2. billing + receipts\n3. docs + help\n" });
+  const tab = `.note-tab[data-tab-sid="${noteTab(note.id)}"]`;
   check(note.window_id === null, "the note starts closed");
-  // What Claude Code prints for `[Pairs to review](muster://note/N)` (FORCE_HYPERLINK=1), what
-  // Codex prints for it, and a link to a note that was deleted.
+  // A program's own hyperlink (OSC 8) to the note, what Claude Code and Codex print for
+  // `[Pairs to review](muster://note/N)`, and a link to a note that was deleted. Then mouse
+  // reporting goes on (as a TUI's would): a click on a link must not reach the program.
   const cmd = `clear; printf 'Your three pairs are in \\e]8;;muster://note/${note.id}\\e\\\\Pairs to review\\e]8;;\\e\\\\.\\n` +
-    `Codex: Pairs to review (muster://note/${note.id})\\nOld: muster://note/99999\\n'\r`;
+    `Codex: Pairs to review (muster://note/${note.id})\\nOld: muster://note/99999\\n\\e[?1000h\\e[?1006h'\r`;
   await R("session.input", { id: sid, data: cmd });
   await a.wait(`(${M}.termText(${sid}) ?? '').includes('Old: muster://note/99999')`, 6000);
-  await a.eval(`globalThis.__calls.length = 0`);
+  await a.wait(`${M}.term(${sid}).modes.mouseTrackingMode !== 'none'`, 3000);
+  await a.eval(`globalThis.__calls.length = 0; globalThis.__input = 0`);
 
   /** Viewport pixel centre of the first `text` after `marker` on the row that holds `marker`. */
   const at = async (marker: string, text: string): Promise<[number, number]> =>
@@ -55,23 +63,22 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
     await a.clickAt(x, y);
   };
 
-  // ---- Claude's hyperlink: the title alone, a plain click opens the closed note beside it
-  await clickLink("Your three pairs", "Pairs to review", "links-1-hover-claude-link");
-  await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('.note-tab.active')`, 5000);
+  // ---- a hyperlink (OSC 8): the title alone; a plain click opens the closed note beside it
+  await clickLink("Your three pairs", "Pairs to review", "links-1-hover-hyperlink");
+  await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('${tab}.active')`, 5000);
+  check((await R("note.get", { id: note.id })).beside === sid, "opened beside the terminal that showed the link");
   await a.wait(`document.querySelector('textarea.note-text')?.value.includes('billing + receipts')`, 4000);
   await shot("links-2-note-opened");
-  ok("a click on Claude's linked title opened the closed note as a tab beside the terminal");
+  ok("a click on a hyperlinked title (OSC 8) opened the closed note beside the terminal; mouse reporting was on");
 
-  // ---- Codex's text form: back on the terminal, the address in the text is a link too
-  await a.click(`.tab[data-tab-sid="${sid}"]`);
-  await a.wait(`!document.querySelector('.note-tab.active')`, 3000);
-  await clickLink("Codex:", "muster://note/");
-  await a.wait(`!!document.querySelector('.note-tab.active')`, 3000);
-  ok("a click on the address Codex prints selects the note's tab");
+  // ---- the text form Claude Code and Codex print: the address in the text is a link too
+  await R("note.close", { id: note.id });
+  await a.wait(`${M}.notes.value.get(${note.id})?.window_id == null && !document.querySelector('${tab}')`, 4000);
+  await clickLink("Codex:", "muster://note/", "links-1b-hover-text-link");
+  await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('${tab}.active')`, 4000);
+  ok("a click on the address in `Pairs to review (muster://note/N)` opens the closed note again");
 
   // ---- a link to a note that is gone: a short message, nothing else
-  await a.click(`.tab[data-tab-sid="${sid}"]`);
-  await a.wait(`!document.querySelector('.note-tab.active')`, 3000);
   await clickLink("Old:", "muster://note/");
   await a.wait(`[...document.querySelectorAll('.toast')].some((t) => t.textContent.includes('Note 99999 no longer exists'))`, 3000);
   await shot("links-3-gone");
@@ -79,10 +86,11 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
 
   // ---- the clicks made no call but showing the note
   const calls: string[] = await a.eval(`globalThis.__calls`);
-  // Showing a tab: open the note (in this window, in the terminal's task), save the layout, mark
+  check((await a.eval(`globalThis.__input`)) === 0, "no click reached the program, though it asked for mouse reports");
+  // Showing a note: open it (in this window, beside the terminal), save the layout, mark
   // the task read, fit the terminals. Nothing that types, approves, starts or stops.
   const showing = new Set([
-    "note.open", "note.set_channel", "window.raise", "panel.move", "session.set_window", "window.focused", "note.get",
+    "note.open", "note.set_channel", "window.raise", "window.focused", "note.get",
     "window.set_layout", "channel.mark_read", "session.resize",
   ]);
   check(calls.every((m) => showing.has(m)), `only calls that show something: ${calls.join(", ")}`);

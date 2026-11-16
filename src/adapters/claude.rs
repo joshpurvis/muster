@@ -389,14 +389,6 @@ impl Adapter for ClaudeAdapter {
                 MCP_TOOL_TIMEOUT_MS.to_string(),
             );
         }
-        // Claude Code prints a Markdown link as a terminal hyperlink (OSC 8: only the title shows,
-        // and Muster's terminal opens it on a click, src/links.rs) only when it believes the
-        // terminal supports them, which it can't tell for Muster's (checked with Claude Code
-        // 2.1.318: without this, `[Plan](muster://note/7)` prints as `Plan (muster://note/7)`).
-        // A FORCE_HYPERLINK of the daemon's own wins.
-        if std::env::var_os("FORCE_HYPERLINK").is_none() {
-            env.insert("FORCE_HYPERLINK".to_string(), "1".to_string());
-        }
         Ok(CommandSpec {
             program: "claude".to_string(),
             args,
@@ -928,9 +920,6 @@ mod tests {
                 spec.env.get("MCP_TOOL_TIMEOUT").map(String::as_str),
                 Some("1900000")
             );
-        }
-        if std::env::var_os("FORCE_HYPERLINK").is_none() {
-            assert_eq!(spec.env.get("FORCE_HYPERLINK").map(String::as_str), Some("1"), "links print as hyperlinks");
         }
         assert_eq!(spec.args[0], "--mcp-config");
         assert_eq!(spec.args[2], "--settings");

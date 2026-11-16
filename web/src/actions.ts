@@ -363,8 +363,9 @@ export async function gotoPanel(id: number) {
 }
 
 /** Show note `id`: selected here, or opened here (from closed, or from another window; with
- * "Jump focuses the other window", that window is raised instead when it can be). */
-export async function gotoNote(id: number, group?: string) {
+ * "Jump focuses the other window", that window is raised instead when it can be). `beside`: open
+ * it beside that session's tab, as an agent's `note_open` does (a link clicked in its terminal). */
+export async function gotoNote(id: number, group?: string, beside?: SessionId) {
   const n = notes.value.get(id);
   if (!n) return;
   const tab = noteTab(id);
@@ -380,7 +381,7 @@ export async function gotoNote(id: number, group?: string) {
     }
     if (group) focusGroup(group);
     try {
-      knowNote(await rpc.call<Note>("note.open", { id, window_id: here }));
+      knowNote(await rpc.call<Note>("note.open", { id, window_id: here, ...(beside ? { beside } : {}) }));
     } catch (e) {
       toast("error", `Couldn't open the note: ${errText(e)}`);
       return;

@@ -116,7 +116,8 @@ They come with every session in `whoami`, `list_sessions` and `spawn_session`, e
 `list_agents`, `panel_open` and every panel in `list_panels`, and every note result (`note_list`,
 `note_read`, `note_write`, `note_append`, `note_open`). `muster link note|panel|tab|agent
 <target>` prints one from the shell (docs/CLI.md). The server's `instructions` and every named
-agent's CLAUDE.md or AGENTS.md ("Links") tell agents to use them.
+agent's CLAUDE.md or AGENTS.md ("Links", added to an older agent's file at its next start) tell
+agents to use them. The link works in Muster's terminal, not inside panels or notes.
 
 ### Panels
 

@@ -1,8 +1,8 @@
 //! Links that bring a note, panel, tab or agent to the front of Muster's window (docs/UI.md
 //! "Links"). Agents mention things to the human by title, as a Markdown link:
-//! `[Pairs to review](muster://note/91)`. Claude Code shows the title as a terminal hyperlink
-//! (OSC 8, see `adapters::claude`); Codex shows `Pairs to review (muster://note/91)`; Muster's
-//! terminal makes both clickable (web/src/links.ts, which also parses them).
+//! `[Pairs to review](muster://note/91)`. Claude Code and Codex print it as
+//! `Pairs to review (muster://note/91)`, and Muster's terminal makes the address clickable
+//! (web/src/links.ts, which also parses them; a program's own OSC 8 hyperlinks work too).
 //!
 //! A link names a kind and an id (an agent: its name) and nothing else: no access token, no
 //! window, nothing private, since it ends up in transcripts and may be pasted elsewhere.
@@ -68,9 +68,9 @@ pub fn tab_title(name: &str, kind: &str) -> String {
 
 /// The sentence every agent's instructions carry (src/agents.rs persona, the MCP server's
 /// instructions): mention things by title, as a link.
-pub const INSTRUCTION: &str = "When you mention a note, panel, tab or agent to the human, write \
-its title as a Markdown link, never its bare number: [Pairs to review](muster://note/91). The \
-human clicks it to see that note. Muster's tool and command results give the ready link as \
+pub const INSTRUCTION: &str = "When you mention a note, panel, tab or agent to the human in your \
+replies, write its title as a Markdown link, never its bare number: [Pairs to review](muster://note/91). \
+The human clicks it in Muster's terminal to see that note. Muster's tool and command results give the ready link as \
 `mention` (the address alone as `link`); `muster link note 91` prints one.";
 
 #[cfg(test)]

@@ -301,13 +301,16 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
 | `muster://agent/reviewer` | the named agent's tab |
 
 - **How it arrives**: an agent writes Markdown, `[Pairs to review](muster://note/91)`. Claude
-  Code prints it as a terminal hyperlink (OSC 8: only the title shows, underlined on hover; Muster
-  starts Claude sessions with `FORCE_HYPERLINK=1`, since Claude Code can't tell that Muster's
-  terminal supports them). Codex prints `Pairs to review (muster://note/91)`, and any program may
-  print the bare address: Muster's terminal finds those in the text and makes them clickable too.
-- **Click**: a plain click follows a Muster link. Web links keep their Ctrl+click (⌘-click), also
-  as hyperlinks, whose address shows as a tooltip on hover since their text may say something
-  else. Other hyperlinks (`file://`, …) do nothing.
+  Code and Codex both print it as `Pairs to review (muster://note/91)`; Muster's terminal finds the
+  address in the text (also when the line wraps inside it) and underlines it on hover. A program
+  that prints a terminal hyperlink (OSC 8) to a Muster address gets the same. Claude Code is not
+  asked to print hyperlinks (`FORCE_HYPERLINK`): a terminal redrawn by the daemon (after a resize,
+  then a reload or reconnect) drops them, and the title alone would lose its address.
+- **Click**: a left click without a modifier follows a Muster link. Muster takes the press and
+  release itself, so a program with mouse reporting on gets no click, no selection starts, and a
+  middle-click (paste) or a click with a modifier does what it always did. Web links are as
+  before: Ctrl+click (⌘-click) on an address, and xterm's "Do you want to navigate…" question
+  for a hyperlink. Other hyperlinks (`file://`, …) do nothing.
 - **Gone**: a link to a deleted note, a closed panel or tab, or an agent that doesn't exist (or
   has never started) shows a short message saying so.
 - **Only shows**: following a link selects a tab, opens a note's tab or raises a window, nothing
@@ -315,10 +318,13 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   note's text, so a link in untrusted text (a web page an agent printed) is safe to click.
 - Agents get the link ready-made: tool and command results that return a note, panel, session or
   agent carry `link` and `mention` (docs/MCP.md "Links"), and `muster link` prints one
-  (docs/CLI.md). Every agent's instructions (its CLAUDE.md or AGENTS.md, the MCP server's
-  instructions) say to mention things this way.
+  (docs/CLI.md). Every agent's instructions say to mention things this way: the MCP server's
+  instructions, and a named agent's CLAUDE.md or AGENTS.md ("Links"; an agent made before this
+  gets the section at its next start, unless its file was replaced by hand). With "Jump focuses
+  the other window" on, a link to something in another window raises that window as Jump does,
+  without selecting the thing there.
 - Not yet: outside Muster's window (another terminal, a browser) the address isn't registered
-  with the system, so it does nothing there; the phone UI shows Claude's linked titles as plain
+  with the system, so it does nothing there; the phone UI and Markdown panels show it as plain
   text.
 
 ### Dragging tabs

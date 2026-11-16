@@ -1,5 +1,5 @@
 // Questions agents posted for the human (docs/UI.md "Questions", docs/PROTOCOL.md "Questions").
-// The pinned Questions tab lists the open ones and the recently answered ones; the human answers
+// The Questions tab lists the open ones and the recently answered ones; the human answers
 // with a click on an option or in their own words. `question.list {full}` after each hello, then
 // `question_upserted` events. Answering and taking an answer back go through `question.answer` and
 // `question.undo`, which the daemon accepts only from a click in this window.

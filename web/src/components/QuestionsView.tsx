@@ -1,4 +1,4 @@
-// The pinned Questions tab (docs/UI.md "Questions"): the open questions agents asked the human,
+// The Questions tab (docs/UI.md "Questions"): the open questions agents asked the human,
 // holding-up-work first, beside the question shown whole (context, example, pictures, lettered
 // options with the asker's pick, the human's own words, what happens if nobody answers). Send
 // gives the answer; it goes after a few seconds and can be taken back until the asker has read it.

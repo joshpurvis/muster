@@ -35,7 +35,7 @@ export function StatusLine() {
   // Sessions that need you, and open questions (the Questions tab).
   const n = waiting + asked;
   const status = connStatus.value;
-  // Terminal, panel and note tabs alike (not the pinned Questions tab).
+  // Terminal, panel and note tabs alike (not the Questions tab).
   const count = visibleIds.value.size - (visibleIds.value.has(QUESTIONS_TAB) ? 1 : 0);
   const s = focusedSession.value;
   // Where the focused tab is now: a shell's `cd` or Claude's `/cd` moves it off the task folder.

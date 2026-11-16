@@ -554,8 +554,8 @@ export const activeChannelId = computed(() => channelLayout.value?.active ?? nul
 export const drawerFocused = signal(false);
 export const activeDrawer = computed(() => channelLayout.value?.drawers?.[activeChannelId.value ?? -1] ?? null);
 export const activeChannel = computed(() => channelById.value.get(activeChannelId.value ?? -1) ?? null);
-/** The pinned Questions tab is in this window: the backend has questions and the human didn't
- * hide it. It sits first in the shown channel's first group (docs/UI.md "Questions"). */
+/** The Questions tab is in this window: the backend has questions and the human didn't hide it.
+ * It is in the shown channel, where the human last put it (docs/UI.md "Questions"). */
 export const questionsShown = computed(() =>
   questionsSupported.value && channelLayout.value !== null && channelLayout.value.questions !== false &&
   activeChannelId.value !== null
@@ -697,9 +697,9 @@ const liveTabs = computed((): TabHome[] => {
     ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
     ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
       channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
-    // In whichever channel is shown, first in its first group (never one archived meanwhile:
-    // then the channel that takes its place).
-    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), pinned: true }] : []),
+    // In whichever channel is shown (never one archived meanwhile: then the channel that takes
+    // its place), arriving where the human last put it.
+    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), questions: true }] : []),
   ].filter((t) => !held.value.has(t.id));
 });
 
@@ -747,7 +747,11 @@ effect(() => {
   const owner = supported ? id : null;
   if (layoutOwner === owner) return;
   const w = supported ? myWindow.peek() : null;
-  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), liveTabs.peek());
+  // The Questions tab isn't shown until this layout is loaded: keep its saved place meanwhile (its
+  // own group would close), and drop it again if the window then hides it.
+  const tabs = liveTabs.peek();
+  const keep = tabs.some((t) => t.questions) ? [] : [{ id: QUESTIONS_TAB, channel: null, questions: true, kept: true }];
+  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep]);
   layoutOwner = owner;
   lastSaved = w?.layout ? JSON.stringify(w.layout) : "";
   clearTimeout(saveTimer);

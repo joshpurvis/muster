@@ -77,7 +77,7 @@ import {
   accountProfilesSupported,
   questionsShown,
 } from "./state.ts";
-import { drawerHeight, folderChannel, type TerminalDrawerState } from "./layout/channels.ts";
+import { drawerHeight, folderChannel, rememberPlace, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab, QUESTIONS_TAB } from "./layout/tree.ts";
@@ -469,7 +469,7 @@ export function nextNeedsYou() {
   else gotoSession(next.id);
 }
 
-/** Show the pinned Questions tab (shown again if it was hidden), on the open questions, or on
+/** Show the Questions tab (shown again if it was hidden), on the open questions, or on
  * question `id`. */
 export function openQuestionsTab(id?: number) {
   if (!questionsSupported.value) return toast("info", "This Muster has no questions yet: restart it after updating");
@@ -489,7 +489,7 @@ export function openQuestionsTab(id?: number) {
   if (questionsShown.peek()) revealSession(QUESTIONS_TAB);
 }
 
-/** Hide the pinned Questions tab in this window (the palette's Questions, or "needs you", shows
+/** Hide the Questions tab in this window (the palette's Questions, or "needs you", shows
  * it again). */
 export function hideQuestionsTab() {
   const s = channelLayout.peek();
@@ -605,10 +605,19 @@ export function gotoTabIndex(n: number) {
   if (sid !== undefined) revealSession(sid);
 }
 
+/** After the human moved tab `sid`: the Questions tab remembers its new place for the channels it
+ * goes to next (docs/UI.md "Questions"). */
+function moved(sid: SessionId) {
+  const s = channelLayout.peek();
+  if (sid === QUESTIONS_TAB && s) channelLayout.value = rememberPlace(s, sid);
+}
+
 /** Alt+Shift+[ / ]: move the focused tab within its group. */
 export function shiftFocusedTab(delta: number) {
   const id = focusedTabId.value;
-  if (id !== null) updateLayout((l) => shiftTab(l, id, delta));
+  if (id === null) return;
+  updateLayout((l) => shiftTab(l, id, delta));
+  moved(id);
 }
 
 /** Ctrl+Alt+arrow: move the focused tab to the neighbouring group (a new split at the edge). */
@@ -622,11 +631,13 @@ export function moveFocusedTab(dir: Direction) {
     if (from.tabs.length < 2 || !canSplit(sideOf(dir), from.id)) return;
   }
   withLayout((x) => moveTabToNeighbour(x, id, dir));
+  moved(id);
 }
 
 /** A tab dropped on a group (its strip at `index`, its body's center, or an edge: a new split). */
 export function dropTab(sid: SessionId, paneId: string, zone: DropZone, index?: number) {
   withLayout((l) => moveTab(l, sid, paneId, zone, index));
+  moved(sid);
 }
 
 /** Context menu "Split right / down ▸ Move this tab": the tab goes into a new group beside its own. */
@@ -635,6 +646,7 @@ export function splitWithTab(sid: SessionId, side: Side) {
   const p = l ? paneOfSession(l.root, sid) : null;
   if (!p || p.tabs.length < 2 || !canSplit(side, p.id)) return;
   withLayout((x) => moveTab(x, sid, p.id, side));
+  moved(sid);
 }
 
 // ---------- sessions ----------
@@ -874,7 +886,7 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
  * agent's session), so closing before the agent list has loaded can't stop one.
  */
 export function closeTab(sid: SessionId, force = false) {
-  // The pinned Questions tab hides (questions stay; the palette shows it again).
+  // The Questions tab hides (questions stay; the palette shows it again).
   if (sid === QUESTIONS_TAB) return hideQuestionsTab();
   const nid = noteId(sid);
   if (nid !== null) {
@@ -1553,7 +1565,8 @@ export function openChannel(id: number, focus = true) {
 /** A session and its owned panels move together. Notes move independently. Running terminal
  * directories and permission flags stay as they were; restart applies the new channel profile. */
 export async function moveTabToChannel(tab: number, channel: number) {
-  if (tabChannel(tab) === channel) return;
+  // The Questions tab is in whichever channel is shown; it doesn't belong to one.
+  if (tab === QUESTIONS_TAB || tabChannel(tab) === channel) return;
   const target = windowChannels.peek().find((c) => c.id === channel);
   if (!target) return toast("error", "That channel is no longer in this window");
   const nid = noteId(tab);

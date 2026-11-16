@@ -1,6 +1,6 @@
 import {
-  changeChannelLayout, folderChannel, loadChannelLayout, reconcileChannels, savedChannel, sidebarRatio,
-  type TabHome,
+  changeChannelLayout, folderChannel, loadChannelLayout, reconcileChannels, rememberPlace, savedChannel,
+  sidebarRatio, type TabHome, type WindowLayoutState,
 } from "./channels.ts";
 import {
   addTab, allPanes, allSessions, emptyLayout, findPane, noteTab, panelTab,
@@ -186,7 +186,7 @@ Deno.test("drawer data rejects invalid session ids and clamps saved heights", ()
   equal(allSessions(state.layouts[10].root), [2]);
 });
 
-Deno.test("the pinned Questions tab sits first in the first group of whichever channel is shown", async () => {
+Deno.test("the Questions tab starts first in the first group of whichever channel is shown", async () => {
   const { QUESTIONS_TAB: Q, activateTab, noteId, panelId, pinFirst } = await import("./tree.ts");
   equal([noteId(Q), panelId(Q)], [null, null]);
   // Two groups; the tab arrives in the focused (right) one, not selected, and moves to the front
@@ -203,14 +203,14 @@ Deno.test("the pinned Questions tab sits first in the first group of whichever c
   equal(sig(moved.root), `row([${Q},1,2] [3])`);
   equal(allPanes(moved.root)[0].active, Q);
   equal(moved.focus, allPanes(moved.root)[0].id);
-  // A drag that put it elsewhere in its own group is undone.
+  // Moved elsewhere in its own group, pinFirst puts it back (only when it arrives, see below).
   const dragged = pinFirst(emptyLayout([1, Q, 2]), Q);
   equal(sig(dragged.root), `[${Q},1,2]`);
   equal(pinFirst(dragged, Q), dragged);
 
   // Reconciling: it follows the shown channel and leaves the others; hidden, it is nowhere.
   const tabs = (active: number): TabHome[] => [
-    { id: 1, channel: 10 }, { id: 2, channel: 20 }, { id: Q, channel: active, pinned: true },
+    { id: 1, channel: 10 }, { id: 2, channel: 20 }, { id: Q, channel: active, questions: true },
   ];
   let w = loadChannelLayout({ v: 2, active: 10, layouts: {}, sidebar: {} }, [10, 20], tabs(10));
   equal(sig(w.layouts[10].root), `[${Q},1]`);
@@ -226,3 +226,186 @@ Deno.test("the pinned Questions tab sits first in the first group of whichever c
   equal(sig(hidden.layouts[20].root), "[2]");
   equal(loadChannelLayout(JSON.parse(JSON.stringify(w)), [10, 20], tabs(20)).questions, undefined);
 });
+
+const QTAB = -(2 ** 52);
+const qTabs = (active: number, extra: TabHome[] = []): TabHome[] => [
+  { id: 1, channel: 10 }, { id: 2, channel: 10 }, { id: 3, channel: 20 }, { id: 4, channel: 20 }, ...extra,
+  { id: QTAB, channel: active, questions: true },
+];
+/** Channel 10 with groups [Questions,1] [2] (a two-group channel as it loads today). */
+function twoGroups(): WindowLayoutState {
+  const w = loadChannelLayout({ v: 2, active: 10, layouts: {}, sidebar: {} }, [10, 20], qTabs(10));
+  const ten = splitPane(w.layouts[10], "right", 2, allPanes(w.layouts[10].root)[0].id);
+  return reconcileChannels({ ...w, layouts: { ...w.layouts, 10: ten } }, [10, 20], qTabs(10));
+}
+
+Deno.test("a dragged Questions tab stays where it is dropped and the window remembers it", async () => {
+  const { moveTab } = await import("./tree.ts");
+  let w = twoGroups();
+  equal(sig(w.layouts[10].root), `row([${QTAB},1] [2])`);
+  // Dropped into the right group's strip, after its tab: no snapping back to the front.
+  const right = allPanes(w.layouts[10].root)[1].id;
+  w = changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, right, "center", 1));
+  w = rememberPlace(reconcileChannels(w, [10, 20], qTabs(10)), QTAB);
+  equal(sig(w.layouts[10].root), `row([1] [2,${QTAB}])`);
+  equal(w.questionsAt, { group: -1, index: -1 });
+  // Another change in the channel leaves it there (a new tab joins the focused group after it).
+  w = reconcileChannels(w, [10, 20], qTabs(10, [{ id: 5, channel: 10 }]));
+  equal(sig(w.layouts[10].root), `row([1] [2,${QTAB},5])`);
+
+  // In another channel it arrives at the same place: the right group of two, at the end.
+  const twenty = splitPane(w.layouts[20], "right", 4, allPanes(w.layouts[20].root)[0].id);
+  w = reconcileChannels({ ...w, active: 20, layouts: { ...w.layouts, 20: twenty } }, [10, 20], qTabs(20, [{ id: 5, channel: 10 }]));
+  equal(sig(w.layouts[20].root), `row([3] [4,${QTAB}])`);
+  equal(allSessions(w.layouts[10].root).includes(QTAB), false);
+  // In a one-group channel, second in that group, as it was when it left.
+  const one = loadChannelLayout(JSON.parse(JSON.stringify({ ...w, active: 10, layouts: { 10: w.layouts[10] } })),
+    [10, 20], qTabs(20));
+  equal(sig(one.layouts[20].root), `[3,${QTAB},4]`);
+});
+
+Deno.test("Questions dragged into a new split along the right edge gets that split in each channel", async () => {
+  const { moveTab, paneRects } = await import("./tree.ts");
+  let w = twoGroups();
+  // Onto the right edge of the right group: a third, full-height group with Questions alone.
+  const right = allPanes(w.layouts[10].root)[1].id;
+  w = changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, right, "right"));
+  w = rememberPlace(reconcileChannels(w, [10, 20], qTabs(10)), QTAB);
+  equal(sig(w.layouts[10].root), `row([1] [2] [${QTAB}])`);
+  equal(w.questionsAt?.alone, "right");
+  const size = w.questionsAt!.size!;
+  assert(Math.abs(size - 0.25) < 1e-9, `share ${size}`);
+
+  // Channel 20 (one group) gets Questions in a group of its own on the right, the same share,
+  // without moving focus or selection there.
+  const focus = w.layouts[20].focus;
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20], qTabs(20));
+  const l20 = w.layouts[20];
+  equal(sig(l20.root), `row([3,4] [${QTAB}])`);
+  equal(l20.focus, focus);
+  const q = allPanes(l20.root)[1];
+  assert(Math.abs(paneRects(l20.root).get(q.id)!.w - size) < 1e-9, "same share of the window");
+  // Channel 10, left behind, closes the group it had: no empty group, no copy of the tab.
+  equal(sig(w.layouts[10].root), "row([1] [2])");
+  // Back in channel 10, its own group on the right again.
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20], qTabs(10));
+  equal(sig(w.layouts[10].root), `row([1] [2] [${QTAB}])`);
+  equal(sig(w.layouts[20].root), "[3,4]");
+});
+
+Deno.test("the remembered Questions place survives a save and reload; old saves load as before", async () => {
+  const { moveTab } = await import("./tree.ts");
+  let w = twoGroups();
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, allPanes(l.root)[1].id, "center", 0)), QTAB);
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20], qTabs(20));
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20], qTabs(10));
+  equal(sig(w.layouts[10].root), `row([1] [${QTAB},2])`);
+  const saved = JSON.parse(JSON.stringify(w));
+  const back = loadChannelLayout(saved, [10, 20], qTabs(10));
+  equal(back.questionsAt, { group: -1, index: 0 });
+  equal(sig(back.layouts[10].root), `row([1] [${QTAB},2])`);
+
+  // A save from before Questions could move: no questionsAt, the tab first in the first group.
+  const old = twoGroups();
+  const { questionsAt: _none, ...oldSave } = JSON.parse(JSON.stringify(old));
+  const loaded = loadChannelLayout(oldSave, [10, 20], qTabs(10));
+  equal(loaded.questionsAt, undefined);
+  equal(sig(loaded.layouts[10].root), `row([${QTAB},1] [2])`);
+  // ...and switching channels there still puts it first in the first group.
+  const switched = reconcileChannels({ ...loaded, active: 20 }, [10, 20], qTabs(20));
+  equal(sig(switched.layouts[20].root), `[${QTAB},3,4]`);
+  // A broken saved place is ignored.
+  for (const bad of [{ group: "x", index: 0 }, { group: 0.5, index: 0 }, { group: -7, index: 0 }, 5, null]) {
+    equal(loadChannelLayout({ ...oldSave, questionsAt: bad }, [10, 20], qTabs(10)).questionsAt, undefined);
+  }
+  equal(loadChannelLayout({ ...oldSave, questionsAt: { group: 1, index: 0, alone: "middle", size: 3 } }, [10, 20],
+    qTabs(10)).questionsAt, { group: 1, index: 0 });
+});
+
+Deno.test("Questions never vanishes when its group goes: it comes back at its place, never twice", async () => {
+  const { removeSession } = await import("./tree.ts");
+  let w: WindowLayoutState = { ...twoGroups(), questionsAt: { group: -1, index: 0, alone: "right", size: 0.3 } };
+  // Its group taken away (any change that drops the tab): the next reconcile puts it back.
+  w = reconcileChannels(changeChannelLayout(w, 10, (l) => removeSession(l, QTAB)), [10, 20], qTabs(10));
+  equal(sig(w.layouts[10].root), `row([1] [2] [${QTAB}])`);
+  equal(allSessions(w.layouts[10].root).filter((t) => t === QTAB).length, 1);
+  // Hidden, then shown again: back in its own group on the right.
+  w = reconcileChannels({ ...w, questions: false }, [10, 20], qTabs(10).filter((t) => t.id !== QTAB));
+  equal(sig(w.layouts[10].root), "row([1] [2])");
+  const { questions: _shown, ...again } = w;
+  w = reconcileChannels(again, [10, 20], qTabs(10));
+  equal(sig(w.layouts[10].root), `row([1] [2] [${QTAB}])`);
+  // A remembered group that no longer exists falls back to the last one there is.
+  w = { ...w, questionsAt: { group: 5, index: 9 } };
+  w = reconcileChannels(changeChannelLayout(w, 10, (l) => removeSession(l, QTAB)), [10, 20], qTabs(10));
+  equal(sig(w.layouts[10].root), `row([1] [2,${QTAB}])`);
+  // An empty channel: Questions is its only tab.
+  const empty = reconcileChannels({ ...w, active: 30 }, [10, 20, 30], qTabs(30));
+  equal(sig(empty.layouts[30].root), `[${QTAB}]`);
+});
+
+Deno.test("reload keeps a Questions split inside a column, even before the window shows the tab", async () => {
+  const { moveTab } = await import("./tree.ts");
+  let w = twoGroups();
+  // Onto the bottom edge of the right group: a split inside the right column.
+  const right = allPanes(w.layouts[10].root)[1].id;
+  w = rememberPlace(reconcileChannels(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, right, "bottom")),
+    [10, 20], qTabs(10)), QTAB);
+  equal(sig(w.layouts[10].root), `row([1] col([2] [${QTAB}]))`);
+  // Loading: the window doesn't show the tab yet (its tab list has no Questions), only a kept one.
+  const saved = JSON.parse(JSON.stringify(w));
+  const kept: TabHome = { id: QTAB, channel: null, questions: true, kept: true };
+  const loaded = loadChannelLayout(saved, [10, 20], [...qTabs(10).filter((t) => t.id !== QTAB), kept]);
+  equal(sig(loaded.layouts[10].root), `row([1] col([2] [${QTAB}]))`);
+  // Then shown: it stays put. Or hidden by the window: gone, with no empty group.
+  equal(sig(reconcileChannels(loaded, [10, 20], qTabs(10)).layouts[10].root), `row([1] col([2] [${QTAB}]))`);
+  equal(sig(reconcileChannels(loaded, [10, 20], qTabs(10).filter((t) => t.id !== QTAB)).layouts[10].root), "row([1] [2])");
+  // A kept tab never lands anywhere it wasn't: not in a save without it, not in a legacy tree.
+  const { questionsAt: _q, ...plain } = saved;
+  const none = loadChannelLayout({ ...plain, layouts: { 10: { v: 1, root: { type: "pane", id: "a", tabs: [1, 2] }, focus: "a", zoom: null } } },
+    [10, 20], [...qTabs(10).filter((t) => t.id !== QTAB), kept]);
+  equal(allSessions(none.layouts[10].root).includes(QTAB), false);
+  const legacy = loadChannelLayout({ type: "pane", id: "a", tabs: [1, 2] }, [10, 20],
+    [...qTabs(10).filter((t) => t.id !== QTAB), kept]);
+  equal(Object.values(legacy.layouts).some((l) => allSessions(l.root).includes(QTAB)), false);
+});
+
+Deno.test("Questions remembers a resize or the tabs around it when it leaves a channel", async () => {
+  const { moveTab, paneRects, setSizes } = await import("./tree.ts");
+  let w = twoGroups();
+  const right = allPanes(w.layouts[10].root)[1].id;
+  w = rememberPlace(reconcileChannels(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, right, "right")),
+    [10, 20], qTabs(10)), QTAB);
+  // Widened to 40% with the gutter (no Questions move), then hidden and shown again: still 40%.
+  w = changeChannelLayout(w, 10, (l) => setSizes(l, [], [0.3, 0.3, 0.4]));
+  w = reconcileChannels({ ...w, questions: false }, [10, 20], qTabs(10).filter((t) => t.id !== QTAB));
+  assert(Math.abs(w.questionsAt!.size! - 0.4) < 1e-9, `remembered ${w.questionsAt!.size}`);
+  const { questions: _h, ...shown } = w;
+  w = reconcileChannels(shown, [10, 20], qTabs(10));
+  const q = allPanes(w.layouts[10].root).find((p) => p.tabs.includes(QTAB))!;
+  assert(Math.abs(paneRects(w.layouts[10].root).get(q.id)!.w - 0.4) < 1e-9, "back at 40%");
+
+  // In the right group's strip, then a tab dragged before it: after a channel switch and back,
+  // it is still second there, not first.
+  w = twoGroups();
+  const r = allPanes(w.layouts[10].root)[1].id;
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, r, "center", 0)), QTAB);
+  w = reconcileChannels(w, [10, 20], qTabs(10, [{ id: 5, channel: 10 }]));
+  w = changeChannelLayout(w, 10, (l) => moveTab(l, 5, r, "center", 0));
+  equal(sig(w.layouts[10].root), `row([1] [5,${QTAB},2])`);
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20], qTabs(20, [{ id: 5, channel: 10 }]));
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20], qTabs(10, [{ id: 5, channel: 10 }]));
+  equal(sig(w.layouts[10].root), `row([1] [5,${QTAB},2])`);
+
+  // Leaving a one-group channel keeps "the last group": the next two-group channel gets it on
+  // the right, not the left.
+  w = twoGroups();
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, allPanes(l.root)[1].id, "center")), QTAB);
+  equal(w.questionsAt, { group: -1, index: -1 });
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20], qTabs(20));
+  equal(sig(w.layouts[20].root), `[3,4,${QTAB}]`);
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20], qTabs(10));
+  equal(w.questionsAt, { group: -1, index: -1 });
+  equal(sig(w.layouts[10].root), `row([1] [2,${QTAB}])`);
+});
+

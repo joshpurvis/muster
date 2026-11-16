@@ -110,6 +110,14 @@ const QUESTIONS = [
   },
 ];
 
+// Only the mock: ask its health route before the window loads anything (a real daemon would hand
+// this browser a real window).
+const health = await fetch(new URL("/api/health", url)).then((r) => r.json()).catch(() => null);
+if (!String(health?.version ?? "").includes("mock")) {
+  await b.close();
+  throw new Error("Only the mock daemon is allowed: /api/health doesn't say mock");
+}
+
 try {
   await b.size(1100, 728);
   await b.send("Emulation.setTimezoneOverride", { timezoneId: "UTC" });

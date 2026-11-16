@@ -92,28 +92,29 @@ function parseCron(line: string): Cron {
 }
 
 function dayMatches(c: Cron, d: Date): boolean {
-  const dom = c.dom.includes(d.getDate()), dow = c.dow.includes(d.getDay());
+  const dom = c.dom.includes(d.getUTCDate()), dow = c.dow.includes(d.getUTCDay());
   if (c.domStar && c.dowStar) return true;
   if (c.domStar) return dow;
   if (c.dowStar) return dom;
   return dom || dow;
 }
 
-/** The first fire time strictly after `ms`, in this process's zone. */
+/** The first fire time strictly after `ms`, in the mock's zone (UTC). Plausible, not exact: the
+ *  mock reads every cron in UTC, also for a schedule saved with another zone. */
 function nextAfter(c: Cron, ms: number): number | null {
   const d = new Date(Math.floor(ms / MIN) * MIN + MIN);
   const limit = ms + 4 * 366 * DAY;
   while (d.getTime() < limit) {
-    if (!c.mon.includes(d.getMonth() + 1)) {
-      d.setMonth(d.getMonth() + 1, 1);
-      d.setHours(0, 0, 0, 0);
+    if (!c.mon.includes(d.getUTCMonth() + 1)) {
+      d.setUTCMonth(d.getUTCMonth() + 1, 1);
+      d.setUTCHours(0, 0, 0, 0);
     } else if (!dayMatches(c, d)) {
-      d.setDate(d.getDate() + 1);
-      d.setHours(0, 0, 0, 0);
-    } else if (!c.hour.includes(d.getHours())) {
-      d.setHours(d.getHours() + 1, 0, 0, 0);
-    } else if (!c.min.includes(d.getMinutes())) {
-      d.setMinutes(d.getMinutes() + 1, 0, 0);
+      d.setUTCDate(d.getUTCDate() + 1);
+      d.setUTCHours(0, 0, 0, 0);
+    } else if (!c.hour.includes(d.getUTCHours())) {
+      d.setUTCHours(d.getUTCHours() + 1, 0, 0, 0);
+    } else if (!c.min.includes(d.getUTCMinutes())) {
+      d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0);
     } else return d.getTime();
   }
   return null;
@@ -314,7 +315,7 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   function inQuiet(ms: number): boolean {
     const [sh, sm] = settings.quiet_start.split(":").map(Number), [eh, em] = settings.quiet_end.split(":").map(Number);
-    const d = new Date(ms), m = d.getHours() * 60 + d.getMinutes(), a = sh * 60 + sm, b = eh * 60 + em;
+    const d = new Date(ms), m = d.getUTCHours() * 60 + d.getUTCMinutes(), a = sh * 60 + sm, b = eh * 60 + em;
     return a <= b ? m >= a && m < b : m >= a || m < b;
   }
 
@@ -494,7 +495,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     record(s, sent);
     publish(s);
     setTimeout(() => {
-      deps.reply(m, `Done: ${s.name.toLowerCase()} for ${new Date(run.slot).toDateString()}. Nothing needs you.`);
+      deps.reply(m, `Done: ${s.name.toLowerCase()} for ${new Date(run.slot).toUTCString().slice(0, 16)}. Nothing needs you.`);
       const r = { ...sent, outcome: "replied", finished_at: now(), message: m };
       record(s, r);
       if (s.note_id !== null) {
@@ -846,18 +847,18 @@ export function scheduleMock(deps: ScheduleDeps) {
     return s;
   }
 
-  /** The `n`th weekday (Mon-Fri) at 09:00 before now, counting back from the latest. */
+  /** The `n`th weekday (Mon-Fri) at 09:00 (UTC, the mock's zone) before now, counting back from the latest. */
   function weekdayAt(n: number, h = 9, m = 0): number {
     const d = new Date(now());
-    d.setHours(h, m, 0, 0);
-    if (d.getTime() > now()) d.setDate(d.getDate() - 1);
+    d.setUTCHours(h, m, 0, 0);
+    if (d.getTime() > now()) d.setUTCDate(d.getUTCDate() - 1);
     let left = n;
     for (;;) {
-      if (d.getDay() !== 0 && d.getDay() !== 6) {
+      if (d.getUTCDay() !== 0 && d.getUTCDay() !== 6) {
         if (left === 0) return d.getTime();
         left--;
       }
-      d.setDate(d.getDate() - 1);
+      d.setUTCDate(d.getUTCDate() - 1);
     }
   }
 

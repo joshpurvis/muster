@@ -3415,3 +3415,147 @@ mod tests {
         assert!(s.session_json(sess)["window_id"].is_null());
     }
 }
+
+// ----- questions (src/questions.rs) -----
+
+#[derive(clap::Subcommand)]
+pub enum QuestionsCmd {
+    /// One question in full: context, example, details, the asker's note, the answer.
+    Show {
+        /// Its number: 3 or Q3.
+        number: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Before the first question is posted: make its number N, so Muster's numbers carry on from
+    /// a list you kept elsewhere. Refused once any question exists.
+    StartAt { first: i64 },
+}
+
+fn question_number(t: &str) -> anyhow::Result<i64> {
+    let digits = t.trim().trim_start_matches(['Q', 'q']);
+    digits.parse::<i64>().ok().filter(|n| *n > 0).ok_or_else(|| exit(2, format!("not a question number: {t:?} (3 or Q3)")))
+}
+
+fn option_lines(q: &Value, indent: &str) -> Vec<String> {
+    let picks: Vec<&str> = q["pick"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    q["options"].as_array().map(|opts| opts.iter().map(|o| {
+        let letter = o["letter"].as_str().unwrap_or("?");
+        let pick = if picks.contains(&letter) { "  (asker's pick)" } else { "" };
+        format!("{indent}{letter}) {}{pick}", o["text"].as_str().unwrap_or(""))
+    }).collect()).unwrap_or_default()
+}
+
+/// "idle 2h, cold" for an open question's asker.
+fn asker_line(q: &Value) -> Option<String> {
+    let now = &q["asker_now"];
+    if now.is_null() {
+        return None;
+    }
+    let mut parts = vec![match (now["running"].as_bool(), now["asleep"].as_bool(), now["state"].as_str()) {
+        (_, Some(true), _) => "asleep".to_string(),
+        (_, _, Some("gone")) => "gone".to_string(),
+        (Some(false), _, _) => "not running".to_string(),
+        (_, _, Some("idle")) => format!("idle {}", format_duration(now["idle_ms"].as_i64().unwrap_or(0))),
+        (_, _, Some(s)) => s.replace('_', " "),
+        _ => "?".to_string(),
+    }];
+    if now["cold"].as_bool() == Some(true) {
+        parts.push("cold (its next message re-reads its whole conversation)".into());
+    }
+    Some(format!("{} now: {}", q["asker"].as_str().unwrap_or("asker"), parts.join(", ")))
+}
+
+fn answer_line(a: &Value) -> String {
+    let picked: Vec<&str> = a["picked"].as_array().map(|p| p.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let picked = if picked.is_empty() { String::new() } else { format!(" (picked {})", picked.join(", ")) };
+    let by = a["recorded_by"].as_str().map(|b| format!(", recorded by {b}")).unwrap_or_default();
+    let d = &a["delivery"];
+    format!("answered \"{}\"{picked}{by}; {}: {}", a["words"].as_str().unwrap_or(""),
+        d["status"].as_str().unwrap_or("?").replace('_', " "), d["note"].as_str().unwrap_or(""))
+}
+
+/// `muster questions`: the questions agents posted for the human (docs/CLI.md "Questions").
+pub fn questions(d: &Discovery, action: Option<QuestionsCmd>, all: bool, as_json: bool) -> anyhow::Result<()> {
+    match action {
+        Some(QuestionsCmd::StartAt { first }) => {
+            client::rpc(d, "question.start_at", json!({"first": first, "from_session": env_session()}))?;
+            println!("the first question will be Q{first}");
+            Ok(())
+        }
+        Some(QuestionsCmd::Show { number, json }) => {
+            let q = client::rpc(d, "question.get", json!({"id": question_number(&number)?}))?;
+            if json || as_json {
+                return print_json(&q);
+            }
+            let s = |k: &str| q[k].as_str().unwrap_or("").to_string();
+            println!("{}  {}  asked {} ago by {}{}", s("number"), s("status"), format_duration(now_ms() - q["created_at"].as_i64().unwrap_or(0)),
+                q["asker"]["label"].as_str().unwrap_or("?"), q["product"].as_str().map(|p| format!(" ({p})")).unwrap_or_default());
+            println!("\n{}\n", s("question"));
+            println!("Context: {}\nExample: {}", s("context"), s("example"));
+            for l in option_lines(&q, "  ") {
+                println!("{l}");
+            }
+            for o in q["options"].as_array().into_iter().flatten().filter(|o| o["why"].is_string()) {
+                println!("  why {}: {}", o["letter"].as_str().unwrap_or("?"), o["why"].as_str().unwrap_or(""));
+            }
+            println!("If no answer: {}", s("if_no_answer"));
+            if let Some(h) = q["holding_up"].as_str() { println!("Holding up: {h}"); }
+            if let Some(h) = q["details"].as_str() { println!("Details: {h}"); }
+            for l in q["links"].as_array().into_iter().flatten() {
+                println!("Link: {} {}", l["label"].as_str().unwrap_or(""), l["url"].as_str().unwrap_or(""));
+            }
+            for p in q["pictures"].as_array().into_iter().flatten() {
+                println!("Picture: {} ({})", p["path"].as_str().unwrap_or(""), p["caption"].as_str().unwrap_or(""));
+            }
+            println!("\nThe asker's note to itself:\n{}", s("note_to_self"));
+            if let Some(line) = asker_line(&json!({"asker": q["asker"]["label"], "asker_now": q["asker_now"]})) {
+                println!("\n{line}");
+            }
+            if q["answer"].is_object() {
+                let a = &q["answer"];
+                let flat = json!({"picked": a["picked"], "words": a["words"], "recorded_by": a["recorded_by"]["label"], "delivery": a["delivery"]});
+                println!("\n{}", answer_line(&flat));
+            }
+            if let Some(r) = q["withdrawn"]["reason"].as_str() { println!("\nwithdrawn: {r}"); }
+            Ok(())
+        }
+        None => {
+            let v = client::rpc(d, "question.list", json!({"status": if all { "all" } else { "open" }}))?;
+            if as_json {
+                return print_json(&v);
+            }
+            let qs = v["questions"].as_array().cloned().unwrap_or_default();
+            if qs.is_empty() {
+                println!("{}", if all { "no questions" } else { "no open questions" });
+                return Ok(());
+            }
+            for (i, q) in qs.iter().enumerate() {
+                if i > 0 { println!(); }
+                let product = q["product"].as_str().map(|p| format!(" ({p})")).unwrap_or_default();
+                let passed = q["passed_on_by"].as_str().map(|p| format!(", passed on by {p}")).unwrap_or_default();
+                let holding = q["holding_up"].as_str().map(|h| format!("  holding up: {h}")).unwrap_or_default();
+                println!("{:<5} {:<9} {:>6}  {}{passed}{product}{holding}", q["number"].as_str().unwrap_or("?"),
+                    q["status"].as_str().unwrap_or("?"), format_duration(now_ms() - q["created_at"].as_i64().unwrap_or(0)),
+                    q["asker"].as_str().unwrap_or("?"));
+                println!("      {}", q["question"].as_str().unwrap_or(""));
+                for l in option_lines(q, "      ") {
+                    println!("{l}");
+                }
+                match q["status"].as_str() {
+                    Some("open") => {
+                        println!("      If no answer: {}", q["if_no_answer"].as_str().unwrap_or(""));
+                        if let Some(l) = asker_line(q) { println!("      {l}"); }
+                    }
+                    Some("answered") => println!("      {}", answer_line(&q["answer"])),
+                    Some("withdrawn") => println!("      withdrawn: {}", q["withdrawn"]["reason"].as_str().unwrap_or("")),
+                    _ => {}
+                }
+            }
+            if v["total"].as_u64().unwrap_or(0) as usize > qs.len() {
+                println!("\n(showing the newest {} of {})", qs.len(), v["total"]);
+            }
+            Ok(())
+        }
+    }
+}

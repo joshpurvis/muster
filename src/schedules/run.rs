@@ -456,7 +456,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
                 Err(e) => return finish(hub, &s, &mut run, Outcome::Failed, Some(format!("couldn't start a fresh conversation: {e:#}"))),
             }
         }
-        let out = crate::agents::Outgoing { agent: agent.name.clone(), text, from, from_session: None, route };
+        let out = crate::agents::Outgoing { agent: agent.name.clone(), agent_id: Some(agent.id), text, from, from_session: None, route };
         match crate::agents::deliver(hub, out).await {
             Ok(d) => break (s, d),
             Err(e) => {

@@ -494,6 +494,22 @@ Saving before a reload or Close window waits for any write on its way and then s
 typed meanwhile; if typing could be neither saved nor kept (storage blocked), the window asks
 before it goes.
 
+## Questions
+
+Questions agents posted for the human (`src/questions.rs`; the agents' side is docs/MCP.md
+"Questions for the human"). Stored in the `questions` table (migration v30), one JSON record per
+question; the row id is its number (Q<id>, never reused). Desktop client token only: devices
+have no `question.*` methods. There are no events yet (nothing on screen shows them).
+
+| Method | Params | Result |
+|---|---|---|
+| `question.list` | `{status?: "open" \| "answered" \| "withdrawn" \| "all" (default "open"), limit? (≤ 200)}` | `{questions: [...], shown, total}`, oldest first (the newest `limit`), as MCP `list_questions` returns them; every question, whatever its workspace. |
+| `question.get` | `{id}` | The whole question, as MCP `list_questions` with `number` returns it. |
+| `question.start_at` | `{first}` (1 to 1000000) | `{first}`. The first question posted gets number `first`. Refused once any question exists, from a paired device, and from a session (`from_session`: the CLI inside one). |
+
+Posting, withdrawing and recording an answer are MCP tools only (each runs as the calling
+session, with its guards): no client method writes a question or an answer.
+
 ## Schedules
 
 Recurring and one-off messages to a named agent (`src/schedules/`, docs/SCHEDULING_PLAN.md

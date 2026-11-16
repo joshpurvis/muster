@@ -962,6 +962,87 @@ The same from an agent's shell: `muster schedule propose …` and `muster schedu
 its session run `propose_schedule` and `set_reminder` as that agent, and `muster schedule pause`
 and `muster schedule rm` run `pause_schedule` and `delete_schedule` (docs/CLI.md "Schedules").
 
+### Questions for the human
+
+An agent that needs the human posts a question and carries on: nothing waits on it, its turn
+goes on and messages to it keep arriving (unlike an interview box, which holds every message to
+the agent until it is answered). Muster keeps the question; the answer reaches the agent later as
+a message. This is the first step of the Questions tab: there is no tab yet. Questions are listed
+with `list_questions` or `muster questions` (docs/CLI.md "Questions"), and a lead records an
+answer the human typed in chat with `record_answer`. Code: `src/questions.rs`.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `post_question` | `question`, `context`, `example`, `kind?` (`pick_one` default, `yes_no`, `pick_several`, `own_words`), `options?: [{text, why?}]`, `pick?` (a letter, or a list for `pick_several`), `if_no_answer`, `note_to_self`, `holding_up?`, `product?`, `area?` (`merge`, `money`, `public`, `customer_dns`, `other` default), `details?`, `pictures?: [{path, caption}]`, `links?: [{label, url}]` | `{number, question: "Q<n>", status: "open", answer_goes_to, note}`, at once. Refused, with every problem listed: no `context` (20 to 1000 characters), no concrete `example` (20 to 800, not the context again), no `if_no_answer` (15 to 500), no `note_to_self` (30 to 4000: what the asker will do with each answer and which files to reopen), a `question` that isn't one line of 10 to 300 characters; for every kind but `own_words`, fewer than 2 or more than 6 options (`yes_no`: exactly 2), no `pick`, a pick that isn't an option, a `pick_one` or `yes_no` pick that isn't option a (the pick goes first), or a picked option without a `why`. `own_words` (a paste, a value) takes no options and no pick. Options are lettered a to f in the order given. Pictures: up to 6, absolute paths (no control characters) of existing png, jpg, gif, webp or svg files, each with a caption; links: up to 4, http(s). The same question still open from the same asker is refused with its number; at most 20 open per asker and 200 in all. |
+| `list_questions` | `number?`, `status?` (`open` default, `answered`, `withdrawn`, `all`), `mine?`, `limit?` (newest 200 at most) | `{questions: [{number, id, status, asker, passed_on_by, product, question, kind, options, pick, holding_up, if_no_answer, area, answer, withdrawn, asker_now}], shown, total}`, oldest first: the newest `limit` that match (`total`: how many match in all), of those the caller may read (`shown`; see "Who reads" below). `asker_now` (open ones): the asker's `state`, `running`, `asleep`, `cold` (its next message would re-read its whole conversation uncached), `idle_ms`. `answer`: `{picked, words, how, recorded_by, at, delivery}`. With `number`: that question whole (the asker's `note_to_self` and its ids included). `mine`: only the caller's (a named agent's across its restarts and fresh starts). |
+| `withdraw_question` | `number`, `reason` | `{number, question, status: "withdrawn"}`. Only the asker, only while open. |
+| `record_answer` | `number`, `words` (the human's answer, verbatim, at most 4000 characters), `pick?` | `{number, question, status: "answered", picked, delivery: {status, note, to, msg_id, session_id, at}, delivered}`. See below. |
+
+`post_question`, `withdraw_question` and `record_answer` share the post rate limit (30 per minute
+with note writes, panel updates and posts); `record_answer` also counts toward the send limit (20
+messages a minute with `send_message` and `ask_agent`). Every call is audited (`mcp_call`).
+
+**Who reads.** A session sees the questions it asked, those of sessions it started, those asked
+in its own workspace and in one whose output a sharing rule lets it read; a named agent (a lead
+relays questions) sees all. The human's clients (`muster questions`) see all. So a question never
+asks for a password, key or token.
+
+**Numbers.** A question's number (Q1, Q2, …) is its row id and never changes or comes back, also
+for a withdrawn one. `muster questions start-at N`, before the first question is posted, makes the
+first one QN, so the numbers can carry on from a list kept elsewhere.
+
+**Recording an answer.** A lead that the human answered in chat ("Q3 a") calls `record_answer`
+with the human's words verbatim and the letters they chose. Allowed for any named agent, for the
+session that started the asker, and for the asker itself (then nothing is sent: it has the
+answer); and only while the caller handles what the human typed to it (no provenance: not
+another agent's message, nor scheduled or triggered work), unless it started the asker. Refused,
+with nothing stored, with letters that aren't the question's or more than one for
+`pick_one`/`yes_no`, and when the answer couldn't reach the asker under the rules the caller's
+own messages follow: for a named agent `ask_agent`'s (its accepted origins, the hop limit, the
+daily cap, a tab with more permissions than the caller's channel); for a session
+`send_message`'s (never a shell, never one that ended, another workspace only with a sharing
+rule, never a channel with more permissions). Once the question was answered or withdrawn it is
+refused; if the answer's delivery failed (`refused`, `undelivered`), the one who recorded it sends
+it again by calling `record_answer` with the same words and pick. Muster can't check that the
+human said it: the message says who recorded it and that Muster can't check it, and arrives as
+that recorder's message, never as the human's own input.
+
+**Delivery.** The answer is stored first, then delivered:
+- To the asking **named agent, by name**: through `ask_agent`'s path, as a message from the
+  recorder (`[muster msg <id> from <recorder> origin=<o> hop=<n>]`), so the asker's accepted
+  origins, the hop limit, the daily caps, the spend caps and the injection queue all apply. It
+  reaches the agent's current session whatever happened since it asked (a restart, a fresh
+  start); an asleep agent wakes and a stopped one starts, as for any message. A removed agent,
+  or a newer agent that took its name, doesn't get it.
+- Else to the **session that asked**, if it still runs, after a
+  `[muster answer to question Q<n> from <recorder> origin=<o> hop=<n>]` header (no agent
+  message row; a Claude session takes it only on a human-rooted chain).
+- Else to the **session that started it** (its lead: by name when that is a named agent),
+  saying the asker has ended. If the recorder is that lead, nothing is sent (`not_needed`).
+A message for a named agent that was removed, and another made with its name, in the moment
+before it is typed in is refused (as every agent message now is).
+
+The message starts `Answer to your question Q<n>: <letter>) <option>.`, says who recorded it and
+quotes the words it recorded, then repeats the whole question (context, example, options with the
+asker's pick, if no answer, holding up, details, links, pictures) and the asker's `note_to_self`
+(headed as the asker's note, not the reader's, when it goes to the asker's lead), so an agent
+whose conversation was restarted since can act on it. It is plain text: control characters are
+removed before it is typed anywhere. Each delivery checks the reach rules again, with the
+recorder's current session (a named recorder's, after its restarts); a recorder Muster can no
+longer find refuses it rather than sending unchecked. A delivery that a backend restart
+interrupted is finished at the next start: to a named agent, the message it was sent as is looked
+up (under the sender label kept when it was recorded) and never sent twice; to a session, it
+counts as delivered while still in that session's input queue and is sent again otherwise (if the
+restart came right after it was typed in, the session sees it twice rather than never). One that
+can't be delivered (`refused`, `undelivered`) is kept with its reason, `list_questions` shows it,
+and its recorder can send it again.
+
+Not yet (later steps of the Questions tab): the tab itself and answering there, a lead passing a
+session's question on in one call (`passed_on_by` is kept for it), defaults that answer a question
+at a set time (`area` is kept: merges, money, public and customer DNS will never take one),
+delivering into a fresh start for an asker gone cold (`asker_now.cold` is the signal), answers
+for one agent sent together, and a one-line copy to the lead.
+
 ### Permissions
 
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see

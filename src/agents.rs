@@ -2453,6 +2453,9 @@ pub async fn autostart(hub: &Arc<Hub>) {
 #[derive(Debug, Clone)]
 pub struct Outgoing {
     pub agent: String,
+    /// The agent's id when the sender checked it: refused if `agent` names another agent by the
+    /// time it is started and typed in (one removed and made again with its name meanwhile).
+    pub agent_id: Option<i64>,
     pub text: String,
     /// Sender label for the envelope.
     pub from: String,
@@ -2565,9 +2568,16 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
             return Err(Refused(why).into());
         }
     }
+    let replaced = |now: Option<i64>| out.agent_id.is_some_and(|id| now != Some(id));
+    if replaced(hub.agents().get(&out.agent).map(|a| a.id)) {
+        return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
+    }
     // A sleep waits for this delivery to reach the queue (src/sleep.rs).
     let _delivering = hub.agents().get(&out.agent).map(|a| crate::sleep::delivering(hub, a.id));
     let bs = start(hub, &out.agent, false, None).await?;
+    if replaced(Some(bs.agent.id)) {
+        return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
+    }
     if let Some(at) = bs.woke {
         crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, &format!("a message from {} arrived", out.from), false);
     }
@@ -2642,7 +2652,7 @@ pub async fn send_checked(
         hub.spend.ensure_fresh(hub).await;
     }
     let route = precheck(hub, agent, &text, &from, from_session, prov, forced)?;
-    let d = deliver(hub, Outgoing { agent: agent.name.clone(), text, from, from_session, route }).await?;
+    let d = deliver(hub, Outgoing { agent: agent.name.clone(), agent_id: Some(agent.id), text, from, from_session, route }).await?;
     Ok((d, route))
 }
 

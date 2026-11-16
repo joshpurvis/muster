@@ -37,6 +37,7 @@ mod push;
 mod renderer;
 mod replay_tail;
 mod pty;
+mod questions;
 mod rpc;
 mod schedules;
 mod self_handoff;
@@ -92,6 +93,19 @@ enum Cmd {
     Note {
         #[command(subcommand)]
         action: cli::NoteCmd,
+    },
+    /// Questions agents posted for you: the open ones, `--all`, or `show N` for one in full.
+    #[command(after_help = "Examples:\n  muster questions\n  muster questions --all\n  muster questions show Q3\n\n\
+Agents post them with the MCP tool `post_question` and get the answer back as a message; a lead\n\
+records an answer you typed in chat with `record_answer` (docs/MCP.md, \"Questions for the human\").")]
+    Questions {
+        #[command(subcommand)]
+        action: Option<cli::QuestionsCmd>,
+        /// Answered and withdrawn ones too.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Print the link to a note, panel, tab or agent, for mentioning it to the human:
     /// `[title](muster://note/91)`, which opens it when clicked in Muster (`--url`: the address).
@@ -706,6 +720,7 @@ fn main() -> ExitCode {
             None => cli::devices(&d, json),
             Some(DevicesCmd::Revoke { device, all }) => cli::revoke_device(&d, device.as_deref(), all),
         }),
+        Some(Cmd::Questions { action, all, json }) => running().and_then(|d| cli::questions(&d, action, all, json)),
         Some(Cmd::Events { json, session, tab }) => {
             running().and_then(|d| cli::events(&d, json, session.as_deref(), tab.as_deref()))
         }
@@ -1935,9 +1950,12 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         // Late replies a previous backend stored but didn't deliver (src/agent_reply.rs), read
         // now, before the server takes requests: this backend's own deliveries are never among them.
         let unfinished = agent_reply::unfinished(&hub);
+        // Answers to questions for the human likewise (src/questions.rs).
+        let answers = questions::unfinished(&hub);
         tokio::spawn(async move {
             agents::autostart(&hub).await;
             agent_reply::resume(&hub, unfinished).await;
+            questions::resume(&hub, answers).await;
         });
     }
     // Schedules: finish runs a previous backend left, then fire on time (src/schedules/); the

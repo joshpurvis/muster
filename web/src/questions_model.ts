@@ -28,11 +28,27 @@ export function draftFor(q: Question, all: Map<number, Draft>): Draft {
   return all.get(q.id) ?? { pick: q.kind === "own_words" ? [] : [...q.pick], words: "" };
 }
 
-/** A click on option `letter`: tick or untick it (pick several), else choose it. */
+/** A click on option `letter`: tick or untick it (pick several), else choose it (again: unchoose
+ * it, to answer in words alone). */
 export function choose(q: Question, d: Draft, letter: string): Draft {
-  if (q.kind !== "pick_several") return { ...d, pick: [letter] };
+  if (q.kind !== "pick_several") return { ...d, pick: d.pick.includes(letter) ? [] : [letter] };
   const pick = d.pick.includes(letter) ? d.pick.filter((l) => l !== letter) : [...d.pick, letter].sort();
   return { ...d, pick };
+}
+
+/** New words typed into the box. The first words typed replace the chosen options ("or answer in
+ * your own words"): typing "No, hold it" under a preselected "a) Yes, merge it" never sends a
+ * as well. An option clicked after that is sent with the words. */
+export function typeWords(d: Draft, words: string): Draft {
+  return { pick: d.words.trim() === "" && words.trim() !== "" ? [] : d.pick, words };
+}
+
+/** What Send would send, in words, under the box. */
+export function sendsText(q: Question, d: Draft): string {
+  const picked = pickedText(q, d.pick);
+  const words = d.words.trim();
+  if (!picked.length) return words ? "Sends your words only." : "";
+  return words ? `Sends ${picked.join(", ")}, with your words.` : `Sends ${picked.join(", ")}.`;
 }
 
 /** Is there something to send? Own words need words; the rest a pick or words. */
@@ -79,17 +95,22 @@ const PROMPT: ReadonlySet<AgentState> = new Set(["needs_approval", "asking_quest
  * asker's session as this window has it (live), `asleep` whether that named agent sleeps, `cold`
  * whether its prompt cache has gone cold (the next message re-reads its whole conversation).
  */
-export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boolean, cold: boolean):
-  { tone: "warm" | "busy" | "cold"; text: string } {
+export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boolean, cold: boolean, agentGone = false):
+  { tone: "warm" | "busy" | "cold" | "gone"; text: string } {
   const who = q.asker.label;
   const named = q.asker.agent_id != null;
+  if (named && agentGone) {
+    return { tone: "gone", text: `The agent ${who} was removed, so your answer would reach nobody. It is kept here.` };
+  }
   if (asleep) {
     return { tone: "cold", text: `${who} is asleep. Your answer wakes it${cold ? "; its memory of this has gone cold, so it re-reads its conversation first" : ""}.` };
   }
   if (!s || s.state === "exited") {
     return named
       ? { tone: "cold", text: `${who} isn't running. Your answer starts it and reaches it by name.` }
-      : { tone: "cold", text: "The session that asked has ended. Your answer goes to the session that started it." };
+      : q.asker.parent_id == null
+      ? { tone: "gone", text: "The session that asked has ended, and nothing started it, so your answer would reach nobody. It is kept here." }
+      : { tone: "cold", text: "The session that asked has ended. Your answer goes to the session that started it, if that still runs." };
   }
   if (BUSY.has(s.state)) return { tone: "busy", text: `${who} is working. Your answer reaches it when its current step ends.` };
   if (PROMPT.has(s.state)) {

@@ -1632,13 +1632,19 @@ pub async fn question_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, li
     #[serde(deny_unknown_fields)]
     struct U {
         id: i64,
+        // The answer the human means to take back (its `answer.at`): never a newer one.
+        #[serde(default)]
+        at: Option<i64>,
     }
     Ok(match method {
         "question.answer" => {
             let p: P = parse(params)?;
             crate::questions::answer_in_tab(hub, p.id, p.pick, &p.words, crate::questions::TAB_HOLD).await?
         }
-        _ => crate::questions::undo(hub, parse::<U>(params)?.id)?,
+        _ => {
+            let u: U = parse(params)?;
+            crate::questions::undo(hub, u.id, u.at)?
+        }
     })
 }
 

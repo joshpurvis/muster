@@ -312,15 +312,20 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   not running, and so how the answer reaches it), **Send answer**, the question's links and
   **Open <asker>'s tab**. **Details** (closed) has the asker's details, its note to itself (which
   comes back with the answer), the picture paths and what it is about (a merge, money, …).
-- **Answering**: click an option (pick several: tick any number) and/or type, then **Send
-  answer** (or Ctrl+Enter in the box). What was picked or typed is kept per question while you
+- **Answering**: click an option (pick several: tick any number; a chosen option clicked again is
+  unchosen) or type, then **Send answer** (or Ctrl+Enter in the box). The first words typed replace
+  the chosen options ("or answer in your own words": typing "No, hold it" under a preselected "Yes,
+  merge it" never sends the yes too); an option clicked after typing goes with the words. A line
+  under the box says what Send sends. What was picked or typed is kept per question while you
   look at others. The answer goes after 8 seconds; a toast says so with **Undo**, and the next
   open question is shown. Only a click in the window answers as the human (`question.answer`).
 - **Undo**: until the asker has read the answer (in those 8 seconds, or while it waits in the
-  asker's input queue because it is busy, or when it couldn't be delivered), the answered page and
-  the toast offer **Undo**: the question is open again with your answer kept to change. Once the
-  asker has it, it is gone from the page.
-- **Answered**: the newest 50; each page shows **Your answer** (or "The answer" when a lead
+  asker's input queue because it is busy and was never typed into its box, or when it couldn't be
+  delivered), the answered page and the toast offer **Undo**: the question is open again with your
+  answer kept to change. Each answer's toast takes back that answer only, never one given after it.
+  Once the asker has it, or it was typed into the asker's box (a dialog then put it back in the
+  queue), Undo is refused.
+- **Answered**: the 50 answered last; each page shows **Your answer** (or "The answer" when a lead
   recorded it from chat), what was not chosen, **How** (here, or told to a lead in chat) and
   **What happened** (on its way, waiting for the asker's current step, read at a time, or why it
   didn't arrive).

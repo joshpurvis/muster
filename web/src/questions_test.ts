@@ -1,5 +1,6 @@
 import {
-  afterAnswer, ageText, choose, draftFor, howText, pickedText, readyToSend, sortAnswered, sortOpen, whatHappened, whoText,
+  afterAnswer, ageText, choose, draftFor, howText, pickedText, readyToSend, sendsText, sortAnswered, sortOpen, typeWords,
+  whatHappened, whoText,
 } from "./questions_model.ts";
 import type { Question, SessionInfo } from "./types.ts";
 
@@ -47,6 +48,16 @@ Deno.test("the draft starts at the asker's pick; picking several ticks and untic
   equal(draftFor(own, new Map()), { pick: [], words: "" });
   assert(!readyToSend(own, { pick: ["a"], words: "" }), "own words need words");
   equal(pickedText(one, ["b"]), ["b) Heading two"]);
+  // Typing answers instead of the preselected pick ("or in your own words"); a click after that adds an option.
+  const typed = typeWords(d, "No, hold it");
+  equal(typed, { pick: [], words: "No, hold it" });
+  equal(sendsText(one, typed), "Sends your words only.");
+  const both = choose(one, typed, "b");
+  equal(sendsText(one, both), "Sends b) Heading two, with your words.");
+  equal(typeWords(both, "No, hold it for now").pick, ["b"]);
+  equal(sendsText(one, d), "Sends a) Heading one.");
+  // Clicking the chosen option again unchooses it.
+  equal(choose(one, d, "a").pick, []);
   equal(whoText(q(4, { passed_on_by: { label: "lead", session_id: 1, kind: "claude" } })), "writer, passed on by lead");
 });
 
@@ -59,7 +70,10 @@ Deno.test("after you answer: how the answer will reach the asker as it is now", 
   assert(afterAnswer(one, session("exited"), true, true).text.includes("asleep"), "asleep");
   assert(afterAnswer(one, undefined, false, false).text.includes("starts it and reaches it by name"), "a named agent not running");
   const plain = q(2, { asker: { label: "Claude (fix)", session_id: 9, kind: "claude" } });
-  assert(afterAnswer(plain, undefined, false, false).text.includes("session that started it"), "an ended plain session");
+  assert(afterAnswer(plain, undefined, false, false).text.includes("reach nobody"), "an ended top-level session");
+  const child = q(3, { asker: { label: "Claude (fix)", session_id: 9, kind: "claude", parent_id: 2 } });
+  assert(afterAnswer(child, undefined, false, false).text.includes("session that started it"), "an ended plain session");
+  equal(afterAnswer(one, session("idle"), false, false, true).tone, "gone");
 });
 
 Deno.test("an answer's how and what happened, in plain words", () => {

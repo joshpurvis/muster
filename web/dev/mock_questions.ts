@@ -53,7 +53,7 @@ export function questionMock(d: QuestionDeps) {
     const q: Question = {
       id, number: `Q${id}`, status: "open", created_at: at, updated_at: at,
       asker: { label: p.asker ?? s?.name ?? `session ${p.asker_session}`, session_id: p.asker_session, kind: (s?.kind ?? "codex") as never,
-        ...(p.named === false ? {} : { agent_id: 1000 + p.asker_session }) },
+        ...(p.named ? { agent_id: 1000 + p.asker_session } : {}) },
       product: p.product, question: p.question, context: p.context, example: p.example, kind: p.kind ?? "pick_one",
       options: (p.options ?? []).map((o: any, i: number) => ({ letter: "abcdef"[i], text: o.text, ...(o.why ? { why: o.why } : {}) })),
       pick: p.pick ?? [], if_no_answer: p.if_no_answer, holding_up: p.holding_up, area: p.area ?? "other",

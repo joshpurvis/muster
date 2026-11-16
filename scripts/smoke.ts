@@ -1647,7 +1647,12 @@ async function questionsForHuman(c: Client, d: Daemon, mcp: (token: string, name
   ok(!(await Deno.readTextFile(`${BASE}/fake-input-${writerS}`)).includes("the darker one"), "questions: the answer taken back never arrived");
   ok(c.events.slice(mark3).some((e) => e.event === "question_upserted" && e.data.id === q3.number && e.data.status === "open"),
     "questions: the window hears of each change (question_upserted)");
-  const read = await w.call("question.get", { id: q3.number });
+  // Typed in already; its delivery record follows a moment later.
+  let read = await w.call("question.get", { id: q3.number });
+  for (let n = 0; n < 50 && ["pending", "delivering"].includes(read.answer.delivery.status); n++) {
+    await sleep(100);
+    read = await w.call("question.get", { id: q3.number });
+  }
   ok(read.answer.delivery.status === "delivered" && read.answer.delivery.to === "writer", `questions: delivered to the writer by name (${JSON.stringify(read.answer.delivery)})`);
   ok(await refused(w.call("question.undo", { id: q3.number }), "has read your answer") === true, "questions: no taking back once the writer has it");
   w.close();

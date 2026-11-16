@@ -694,8 +694,9 @@ const liveTabs = computed((): TabHome[] => {
     ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
     ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
       channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
-    // In whichever channel is shown, first in its first group.
-    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: activeChannelId.value, pinned: true }] : []),
+    // In whichever channel is shown, first in its first group (never one archived meanwhile:
+    // then the channel that takes its place).
+    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), pinned: true }] : []),
   ].filter((t) => !held.value.has(t.id));
 });
 

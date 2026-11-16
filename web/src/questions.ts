@@ -31,23 +31,39 @@ export const answeredQuestions = computed(() => sortAnswered(questions.value.val
 /** The count on the tab and in "needs you". */
 export const openQuestionCount = computed(() => (questionsSupported.value ? openQuestions.value.length : 0));
 
+/** Questions that changed (events, replies) while a load was on its way: kept over the load. */
+let changedDuringLoad: Map<number, Question> | null = null;
+
+/** Record question `q` from an event or a reply, unless this window has a newer copy (an older
+ * reply arriving after an event). */
 export function applyQuestion(q: Question) {
+  const have = questions.value.get(q.id);
+  if (have && have.updated_at > q.updated_at) return;
+  changedDuringLoad?.set(q.id, q);
   const next = new Map(questions.value);
   next.set(q.id, q);
   questions.value = next;
 }
 
 export async function loadQuestions() {
+  const changed = changedDuringLoad = new Map();
   try {
     const [open, answered] = await Promise.all([
       rpc.call<{ questions: Question[] }>("question.list", { status: "open", full: true }),
       rpc.call<{ questions: Question[] }>("question.list", { status: "answered", full: true, limit: ANSWERED_LIMIT }),
     ]);
-    questions.value = new Map([...open.questions, ...answered.questions].map((q) => [q.id, q]));
+    const loaded = new Map([...open.questions, ...answered.questions].map((q) => [q.id, q]));
+    for (const [id, q] of changed) {
+      const l = loaded.get(id);
+      if (!l || l.updated_at <= q.updated_at) loaded.set(id, q);
+    }
+    questions.value = loaded;
     questionsSupported.value = true;
   } catch (e) {
     // An older backend: no questions, or no `full`.
     if (/unknown (method|field)/i.test(e instanceof Error ? e.message : String(e))) questionsSupported.value = false;
+  } finally {
+    if (changedDuringLoad === changed) changedDuringLoad = null;
   }
 }
 
@@ -90,10 +106,11 @@ export async function sendAnswer(q: Question, d: Draft): Promise<Question> {
   return sent;
 }
 
-/** Take the human's answer back: the question is open again, with that answer as its draft. */
+/** Take back the human's answer `q.answer` (never a newer one given since): the question is open
+ * again, with that answer as its draft. */
 export async function undoAnswer(q: Question): Promise<Question> {
   const was = q.answer;
-  const back = await rpc.call<Question>("question.undo", { id: q.id });
+  const back = await rpc.call<Question>("question.undo", { id: q.id, ...(was ? { at: was.at } : {}) });
   applyQuestion(back);
   if (was) setDraft(q.id, { pick: [...was.picked], words: was.words });
   return back;

@@ -81,7 +81,7 @@ import { drawerHeight, folderChannel, type TerminalDrawerState } from "./layout/
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
 import { noteId, noteTab, panelId, panelTab, QUESTIONS_TAB } from "./layout/tree.ts";
-import { openQuestionCount, questionsFilter, questionsSupported, selectedQuestion } from "./questions.ts";
+import { openQuestionCount, questions, questionsFilter, questionsSupported, selectedQuestion } from "./questions.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
@@ -480,7 +480,11 @@ export function openQuestionsTab(id?: number) {
     channelLayout.value = shown;
   }
   if (id !== undefined) selectedQuestion.value = id;
-  else if (openQuestionCount.value > 0) questionsFilter.value = "open";
+  else if (openQuestionCount.value > 0) {
+    // On the open questions: a question picked before that is answered by now isn't one.
+    questionsFilter.value = "open";
+    if (selectedQuestion.value !== null && questions.value.get(selectedQuestion.value)?.status !== "open") selectedQuestion.value = null;
+  }
   exitFullscreen(false);
   if (questionsShown.peek()) revealSession(QUESTIONS_TAB);
 }

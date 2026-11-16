@@ -798,10 +798,9 @@ pub async fn answer_in_tab(hub: &Arc<Hub>, number: i64, pick: Vec<String>, words
     let h = hub.clone();
     tokio::spawn(async move {
         tokio::time::sleep(hold).await;
-        // Not taken back (nor taken back and answered again) meanwhile.
-        let still = h.store().question(number).ok().flatten().is_some_and(|q| q.answer.as_ref()
-            .is_some_and(|a| a.how == How::Tab && a.at == at && a.delivery.status == DeliveryStatus::Pending));
-        if still && let Err(e) = finish(&h, number).await {
+        // Only this answer, if it wasn't taken back meanwhile (one given again waits for its own
+        // hold): checked in the transaction that claims it.
+        if let Err(e) = finish_answer(&h, number, Some(at)).await {
             tracing::warn!(question = number, "sending an answer from the Questions tab: {e:#}");
         }
     });
@@ -832,11 +831,15 @@ pub fn can_undo(hub: &Hub, q: &Question) -> bool {
 /// `question.undo`: the human takes back the answer they gave in the tab, until the asker has
 /// read it (`can_undo`). The question is open again. A message already in the asker's input
 /// queue is taken out of it and its log entry marked as taken back.
-pub fn undo(hub: &Arc<Hub>, number: i64) -> anyhow::Result<Value> {
+/// `answered_at`: the answer the human means (its `at`), when given: a newer one is never taken
+/// back in its place.
+pub fn undo(hub: &Arc<Hub>, number: i64, answered_at: Option<i64>) -> anyhow::Result<Value> {
     let current = hub.store().question(number)?.with_context(|| format!("no question Q{number}"))?;
     let Some(a) = current.answer.as_ref().filter(|_| current.status == Status::Answered) else {
         anyhow::bail!("Q{number} has no answer to take back")
     };
+    anyhow::ensure!(answered_at.is_none_or(|t| t == a.at),
+        "Q{number} was answered again since: open it to take back the newer answer");
     anyhow::ensure!(a.how == How::Tab, "Q{number} was answered{}, not in the Questions tab: only an answer given there is taken back here",
         answered_by(Some(a)));
     let to = a.delivery.to.clone().unwrap_or_else(|| current.asker.label.clone());
@@ -849,7 +852,7 @@ pub fn undo(hub: &Arc<Hub>, number: i64) -> anyhow::Result<Value> {
         // Out of the queue first: what is being typed can't be taken out.
         DeliveryStatus::Delivered => match (a.delivery.msg_id, a.delivery.session_id) {
             (Some(m), _) => {
-                anyhow::ensure!(crate::inject::drop_message(hub, m)?, read());
+                anyhow::ensure!(crate::inject::take_back_message(hub, m)?, read());
                 Some(m)
             }
             (None, Some(s)) => {
@@ -1079,10 +1082,18 @@ fn sender(hub: &Hub, a: &Answer) -> (String, Option<SessionId>) {
 /// Deliver question `id`'s pending answer, unless something took it already. Returns the
 /// question as it stands afterwards.
 pub async fn finish(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Question> {
+    finish_answer(hub, id, None).await
+}
+
+/// `finish`, only for the answer given at `at` when it is given (the tab's hold: an answer taken
+/// back and given again meanwhile waits for its own hold). Claimed in one transaction.
+async fn finish_answer(hub: &Arc<Hub>, id: i64, at: Option<i64>) -> anyhow::Result<Question> {
     let (q, claimed) = hub.store().update_question(id, |q| {
         Ok(match q.answer.as_mut() {
-            Some(a) if a.delivery.status == DeliveryStatus::Pending => {
+            Some(a) if a.delivery.status == DeliveryStatus::Pending && at.is_none_or(|t| t == a.at) => {
                 a.delivery.status = DeliveryStatus::Delivering;
+                // "Sent in 8 s unless you undo it" (the tab's hold) no longer holds.
+                a.delivery.note = None;
                 true
             }
             _ => false,
@@ -1371,11 +1382,17 @@ pub fn may_read(hub: &Hub, viewer: SessionId, q: &Question) -> bool {
 /// Questions (`filter`), oldest first, only `mine`'s when given, the newest `limit` (filtered in
 /// the database), and only those `viewer` may read (None: the human's client, all of them).
 /// `total` counts every match in Muster, `shown` those returned.
-/// `full`: each question whole, as `get` returns it (the Questions tab).
+/// `full`: each question whole, as `get` returns it (the Questions tab); answered ones are then
+/// the newest answers (by when they were answered, newest last), not the newest numbers.
 pub fn list(hub: &Hub, filter: Filter, mine: Option<&Who>, limit: Option<usize>, viewer: Option<SessionId>, full: bool)
     -> anyhow::Result<Value> {
     let limit = limit.unwrap_or(LIST_MAX).clamp(1, LIST_MAX);
-    let (mut qs, total) = hub.store().questions(filter.status(), mine.map(|m| (m.agent_id, m.session_id)), limit)?;
+    let (mut qs, total) = if full && filter == Filter::Answered && mine.is_none() {
+        // The tab's history: the newest answers, whatever their numbers.
+        hub.store().recently_answered(limit)?
+    } else {
+        hub.store().questions(filter.status(), mine.map(|m| (m.agent_id, m.session_id)), limit)?
+    };
     if let Some(me) = mine {
         qs.retain(|q| same(&q.asker, me));
     }
@@ -2044,17 +2061,20 @@ mod tests {
         post(&hub, 3, good()).unwrap();
         // Within the hold: taken back, open again, and the hold's end sends nothing.
         answer_in_tab(&hub, 1, vec!["a".into()], "", std::time::Duration::from_millis(80)).await.unwrap();
-        let v = undo(&hub, 1).unwrap();
+        let v = undo(&hub, 1, None).unwrap();
         assert_eq!((v["status"].as_str(), v["answer"].is_null()), (Some("open"), true), "{v}");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(hub.store().question(1).unwrap().unwrap().answer.is_none());
-        assert!(undo(&hub, 1).unwrap_err().to_string().contains("no answer to take back"));
+        assert!(undo(&hub, 1, None).unwrap_err().to_string().contains("no answer to take back"));
         // Answered again: sent. One that never reached the writer can be taken back too.
         answer_in_tab(&hub, 1, vec!["b".into()], "", std::time::Duration::ZERO).await.unwrap();
         let q = sent(&hub, 1).await;
         assert_eq!(q.answer.as_ref().unwrap().picked, vec!["b"]);
         assert!(can_undo(&hub, &q));
-        assert_eq!(undo(&hub, 1).unwrap()["status"], "open");
+        // A Undo meant for an earlier answer never takes this one back.
+        let e = undo(&hub, 1, Some(q.answer.as_ref().unwrap().at - 1)).unwrap_err().to_string();
+        assert!(e.contains("answered again since"), "{e}");
+        assert_eq!(undo(&hub, 1, Some(q.answer.as_ref().unwrap().at)).unwrap()["status"], "open");
         // Delivered and no longer waiting in a queue: the writer has read it.
         answer_in_tab(&hub, 1, vec!["a".into()], "", std::time::Duration::from_secs(60)).await.unwrap();
         hub.store().update_question(1, |q| {
@@ -2063,7 +2083,7 @@ mod tests {
             Ok(())
         }).unwrap();
         assert!(!can_undo(&hub, &hub.store().question(1).unwrap().unwrap()));
-        let e = undo(&hub, 1).unwrap_err().to_string();
+        let e = undo(&hub, 1, None).unwrap_err().to_string();
         assert!(e.contains("writer has read your answer to Q1 already"), "{e}");
         assert_eq!(hub.store().question(1).unwrap().unwrap().status, Status::Answered);
         // An answer a lead recorded from chat isn't taken back here.
@@ -2072,8 +2092,36 @@ mod tests {
         post(&hub, 3, other).unwrap();
         let rec: Record = serde_json::from_value(json!({"number": 2, "words": "no price", "pick": "a"})).unwrap();
         record(&hub, 2, rec).await.unwrap();
-        let e = undo(&hub, 2).unwrap_err().to_string();
+        let e = undo(&hub, 2, None).unwrap_err().to_string();
         assert!(e.contains("recorded by manager") && e.contains("not in the Questions tab"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_tabs_history_is_the_newest_answers_not_the_newest_numbers() {
+        let hub = fixture();
+        agent(&hub, "writer", SessionKind::Codex, 3);
+        for (i, text) in ["Which heading goes on the first card today?", "Which heading goes on the second card today?",
+            "Which heading goes on the third card today?"].iter().enumerate()
+        {
+            let mut v = good();
+            v["question"] = json!(text);
+            assert_eq!(post(&hub, 3, v).unwrap()["number"], i as i64 + 1);
+        }
+        // Q1 is answered last: it leads the history although its number is the lowest.
+        for (n, at) in [(2, 100), (3, 200), (1, 300)] {
+            hub.store().update_question(n, |q| {
+                q.status = Status::Answered;
+                q.answer = Some(Answer { picked: vec!["a".into()], words: String::new(), how: How::Tab, recorded_by: None, at,
+                    prov: None, from_label: Some("human".into()), into: Conversation::Current, delivery: interrupted() });
+                Ok(())
+            }).unwrap();
+        }
+        let v = list(&hub, Filter::Answered, None, Some(2), None, true).unwrap();
+        let ids: Vec<i64> = v["questions"].as_array().unwrap().iter().map(|q| q["id"].as_i64().unwrap()).collect();
+        assert_eq!((ids, v["total"].as_i64()), (vec![3, 1], Some(3)));
+        // Agents' listings keep the newest numbers.
+        let v = list(&hub, Filter::Answered, None, Some(2), None, false).unwrap();
+        assert_eq!(v["questions"][1]["number"], "Q3");
     }
 
     #[test]

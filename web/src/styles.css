@@ -6372,7 +6372,12 @@ fieldset.sch-then > legend {
 .qv-opts.many .qv-opt.on { background: var(--bg-2); border-color: var(--border-strong); box-shadow: none; }
 .qv-opts.many .qv-opt.on .qv-letter { background: var(--bg-3); border-color: var(--border-strong); color: var(--text-muted); }
 
-.qv-say { margin-bottom: 16px; display: flex; }
+.qv-say { margin-bottom: 8px; display: flex; }
+.qv-sends { margin: 0 0 12px; color: var(--text-faint); font-size: 12px; }
+.qv-q:focus { outline: none; }
+.qv-q:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.qv-lightbox-close { background: var(--bg-2); cursor: pointer; }
+.qv-dot.gone::before { background: var(--st-exited); }
 .qv-say textarea {
   flex: 1;
   min-height: 34px;
@@ -6384,6 +6389,7 @@ fieldset.sch-then > legend {
   border-radius: 8px;
   padding: 7px 10px;
 }
+.qv-say + .qv-fate { margin-top: 8px; }
 .qv-say textarea.big { min-height: 150px; font-family: var(--font-mono); font-size: 12.5px; }
 .qv-say textarea::placeholder { color: var(--text-faint); }
 .qv-say textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }

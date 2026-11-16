@@ -11,10 +11,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
   afterAnswer, ageText, answeredQuestions, choose, clockText, type Draft, draftFor, drafts, HOLD_SECONDS, howText,
   loadPicture, openQuestions, pickedText, pictures, questions, questionsFilter, readyToSend, refreshQuestion, selectedQuestion,
-  sendAnswer, setDraft, undoAnswer, whatHappened, whoText,
+  sendAnswer, sendsText, setDraft, typeWords, undoAnswer, whatHappened, whoText,
 } from "../questions.ts";
 import type { Question } from "../types.ts";
-import { agents, sessions, toast } from "../state.ts";
+import { agents, agentsSupported, dismissToastKey, sessions, toast } from "../state.ts";
 import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
@@ -34,11 +34,30 @@ function useNow(ms = 30_000): number {
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
+/** The "sent, Undo" toast of each question, one per answer given (a new answer gets its own). */
+const sentToasts = new Map<number, string>();
+function dismissSentToast(id: number) {
+  const key = sentToasts.get(id);
+  if (key) dismissToastKey(key);
+  sentToasts.delete(id);
+}
+
+/** After the page changed under the keyboard (Send, Undo): back to its top, focus on its question. */
+function showPageTop() {
+  requestAnimationFrame(() => {
+    const page = document.querySelector<HTMLElement>(".questions-view .qv-page");
+    page?.scrollTo(0, 0);
+    page?.querySelector<HTMLElement>(".qv-q")?.focus({ preventScroll: true });
+  });
+}
+
 /** The asker's session as this window has it now: a named agent's current one, else the one that asked. */
 function askerSession(q: Question) {
   const agent = q.asker.agent_id != null ? agents.value.find((a) => a.id === q.asker.agent_id) : undefined;
   const sid = agent?.session_id ?? q.asker_now?.session_id ?? q.asker.session_id;
-  return { agent, session: sid != null ? sessions.value.get(sid) : undefined };
+  // A named asker this window no longer lists (once the list is loaded) was removed.
+  const gone = q.asker.agent_id != null && agentsSupported.value && agents.value.length > 0 && !agent;
+  return { agent, gone, session: sid != null ? sessions.value.get(sid) : undefined };
 }
 
 export function QuestionsView() {
@@ -125,7 +144,8 @@ function QuestionList({ list, filter, current, now, onPick }: {
         <div key={title} role="group" aria-label={title || undefined}>
           {title && <div class="qv-grp">{title}</div>}
           {qs.map((q) => (
-            <button key={q.id} type="button" role="listitem" class={cx("qv-row", q.id === current?.id && "sel", q.status === "answered" && "done")}
+            <div key={q.id} role="listitem">
+            <button type="button" class={cx("qv-row", q.id === current?.id && "sel", q.status === "answered" && "done")}
               aria-current={q.id === current?.id ? "true" : undefined} onClick={() => onPick(q)}>
               <span class="qv-top"><span class="qv-qn">{q.number}</span><span class="qv-ttl">{q.question}</span></span>
               <span class="qv-sub">
@@ -139,6 +159,7 @@ function QuestionList({ list, filter, current, now, onPick }: {
                 )}
               </span>
             </button>
+            </div>
           ))}
         </div>
       ))}
@@ -173,14 +194,24 @@ function Pictures({ q, onZoom }: { q: Question; onZoom: (p: { src: string; capti
 }
 
 function Lightbox({ src, caption, onClose }: { src: string; caption: string; onClose: () => void }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => ref.current?.focus(), []);
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    // Back to the picture that opened it once it closes.
+    const opener = document.activeElement as HTMLElement | null;
+    close.current?.focus();
+    return () => opener?.isConnected && opener.focus();
+  }, []);
   return (
-    <div class="qv-lightbox" role="dialog" aria-modal="true" aria-label={caption} tabIndex={-1} ref={ref}
+    <div class="qv-lightbox" role="dialog" aria-modal="true" aria-label={caption}
       onClick={onClose}
-      onKeyDown={(e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); } }}>
+      onKeyDown={(e) => {
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); }
+        // The only control: the keyboard stays on it.
+        else if (e.key === "Tab") { e.preventDefault(); close.current?.focus(); }
+      }}>
       <img src={src} alt={caption} />
-      <div class="qv-lightbox-cap">{caption} · click or Esc to close</div>
+      <div class="qv-lightbox-cap">{caption}</div>
+      <button type="button" class="qv-btn qv-lightbox-close" ref={close} onClick={onClose}>Close (Esc)</button>
     </div>
   );
 }
@@ -197,7 +228,7 @@ function Head({ q, now, narrow, onBack }: { q: Question; now: number; narrow: bo
         {q.holding_up && q.status === "open" && <span class="qv-tag block">Holding up work</span>}
       </div>
       {/* Non-breaking hyphens: a balanced title never breaks "sign-up" across lines. */}
-      <h2 class="qv-q">{q.question.replaceAll("-", "\u2011")}</h2>
+      <h2 class="qv-q" tabIndex={-1}>{q.question.replaceAll("-", "\u2011")}</h2>
       <p class="qv-ctx">{q.context}</p>
       <p class="qv-ex"><b>Example</b>{q.example}</p>
     </>
@@ -250,8 +281,8 @@ function QuestionPage({ q, now, narrow, onBack, onZoom }: {
 function Answering({ q }: { q: Question }) {
   const d = draftFor(q, drafts.value);
   const [busy, setBusy] = useState(false);
-  const { agent, session } = askerSession(q);
-  const after = afterAnswer(q, session, isAsleep(agent, session), session ? wakeCold(session, Date.now()) : false);
+  const { agent, gone, session } = askerSession(q);
+  const after = afterAnswer(q, session, isAsleep(agent, session), session ? wakeCold(session, Date.now()) : false, gone);
   const ready = readyToSend(q, d);
   const many = q.kind === "pick_several";
   const update = (next: Draft) => setDraft(q.id, next);
@@ -265,8 +296,13 @@ function Answering({ q }: { q: Question }) {
       // On to the next open one; the last one stays, showing how its answer goes.
       const i = before.findIndex((x) => x.id === q.id);
       const next = before.filter((x) => x.id !== q.id)[Math.min(Math.max(i, 0), before.length - 2)];
-      if (next) selectedQuestion.value = next.id;
-      toast("success", `${q.number} goes to ${sent.asker.label} in ${HOLD_SECONDS} seconds`, 9000, `q-sent-${q.id}`,
+      selectedQuestion.value = next?.id ?? q.id;
+      showPageTop();
+      // Its own toast: its Undo takes back this answer, never one given after it.
+      dismissSentToast(q.id);
+      const key = `q-sent-${q.id}-${sent.answer?.at ?? Date.now()}`;
+      sentToasts.set(q.id, key);
+      toast("success", `${q.number} goes to ${sent.asker.label} in ${HOLD_SECONDS} seconds`, 9000, key,
         { label: "Undo", run: () => void undo(sent) });
     } catch (e) {
       toast("error", `Couldn't send the answer to ${q.number}: ${errText(e)}`);
@@ -280,13 +316,14 @@ function Answering({ q }: { q: Question }) {
       {q.options.length > 0 && (
         <>
           {many && <p class="qv-hint">Tick any number.</p>}
-          <div class={cx("qv-opts", many && "many")} role={many ? "group" : "radiogroup"} aria-label="Options">
+          <div class={cx("qv-opts", many && "many")} role="group" aria-label="Options">
             {q.options.map((o) => {
               const on = d.pick.includes(o.letter);
               const theirs = q.pick.includes(o.letter);
               return (
-                <button key={o.letter} type="button" class={cx("qv-opt", on && "on")} role={many ? "checkbox" : "radio"}
-                  aria-checked={on} onClick={() => update(choose(q, d, o.letter))}>
+                <button key={o.letter} type="button" class={cx("qv-opt", on && "on")} role={many ? "checkbox" : undefined}
+                  aria-checked={many ? on : undefined} aria-pressed={many ? undefined : on}
+                  onClick={() => update(choose(q, d, o.letter))}>
                   <span class="qv-letter" aria-hidden="true">{o.letter}</span>
                   {many && <span class="qv-box" aria-hidden="true">{on ? "✓" : ""}</span>}
                   <span class="qv-txt">
@@ -306,7 +343,7 @@ function Answering({ q }: { q: Question }) {
           aria-label={q.kind === "own_words" ? "Your answer" : "Or answer in your own words"}
           placeholder={q.kind === "own_words" ? "Type or paste your answer" : "Or answer in your own words"}
           value={d.words}
-          onInput={(e) => update({ ...d, words: (e.target as HTMLTextAreaElement).value })}
+          onInput={(e) => update(typeWords(d, (e.target as HTMLTextAreaElement).value))}
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
@@ -314,6 +351,7 @@ function Answering({ q }: { q: Question }) {
             }
           }} />
       </div>
+      {q.kind !== "own_words" && sendsText(q, d) && <p class="qv-sends" aria-live="polite">{sendsText(q, d)}</p>}
       <div class="qv-fate">
         <div><span>If you don't answer</span><span>{q.if_no_answer}</span></div>
         {q.holding_up && <div><span>Holding up</span><span>{q.holding_up}</span></div>}
@@ -334,9 +372,11 @@ function Answering({ q }: { q: Question }) {
 async function undo(q: Question) {
   try {
     await undoAnswer(q);
+    dismissSentToast(q.id);
     selectedQuestion.value = q.id;
     questionsFilter.value = "open";
-    toast("info", `${q.number} is open again, with your answer kept to change`, 4000, `q-sent-${q.id}`);
+    showPageTop();
+    toast("info", `${q.number} is open again, with your answer kept to change`, 4000);
   } catch (e) {
     toast("error", `Couldn't take back the answer to ${q.number}: ${errText(e)}`);
   }

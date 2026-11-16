@@ -439,33 +439,56 @@ pub fn holds_prompt(hub: &Hub, id: SessionId, prefix: &str) -> bool {
         q.items.iter().any(|i| i.text.starts_with(prefix)) || q.active.as_ref().is_some_and(|a| a.item.text.starts_with(prefix)))
 }
 
-/// Is agent message `msg` waiting in a prompt queue, not yet being typed (`drop_message` could
-/// still take it out)? (src/questions.rs: the human may take an answer back until then.)
+/// A waiting item that was never typed into its session: not being typed, and not one typed
+/// and then requeued (a dialog or a subagent's view came up before Enter), whose text may still
+/// sit in the input box (`last_sent`), where Enter would send it after all.
+fn untyped<'a>(q: &'a SessQ) -> impl Iterator<Item = &'a Item> + 'a {
+    q.items.iter().filter(move |i| q.last_sent.as_deref() != Some(i.text.as_str()))
+}
+
+/// Is agent message `msg` waiting in a prompt queue, never typed in yet (`take_back_message`
+/// could still take it out)? (src/questions.rs: the human may take an answer back until then.)
 pub fn waits_message(hub: &Hub, msg: i64) -> bool {
     let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
-    hub.injection.inner.lock().values().any(|q| q.items.iter().any(is))
+    hub.injection.inner.lock().values().any(|q| untyped(q).any(is))
 }
 
-/// Does session `id`'s queue hold a prompt starting with `prefix` that waits, not yet being
-/// typed (`drop_prompt` could still take it out)?
+/// Does session `id`'s queue hold a prompt starting with `prefix` that waits, never typed in yet
+/// (`drop_prompt` could still take it out)?
 pub fn waits_prompt(hub: &Hub, id: SessionId, prefix: &str) -> bool {
-    hub.injection.inner.lock().get(&id).is_some_and(|q| q.items.iter().any(|i| i.text.starts_with(prefix)))
+    hub.injection.inner.lock().get(&id).is_some_and(|q| untyped(q).any(|i| i.text.starts_with(prefix)))
 }
 
-/// Take the prompts of session `id` that start with `prefix` out of its queue where they still
-/// wait (not one being typed). True when one was removed. (src/questions.rs: the human takes
-/// back an answer typed into a session that isn't a named agent, which has no message id.)
+/// Take agent message `msg`'s prompt out of the queue where it waits, only while it was never
+/// typed in (`untyped`): one typed and requeued may still be in the input box. True when taken.
+pub fn take_back_message(hub: &Hub, msg: i64) -> anyhow::Result<bool> {
+    let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
+    take_back(hub, is)
+}
+
+/// Take the prompts that start with `prefix` out of session `id`'s queue, as `take_back_message`.
+/// (src/questions.rs: an answer typed into a session that isn't a named agent has no message id.)
 pub fn drop_prompt(hub: &Hub, id: SessionId, prefix: &str) -> anyhow::Result<bool> {
     if !waits_prompt(hub, id, prefix) {
         return Ok(false);
     }
-    let dropped = hub.injection.edit_with(id, Unsent::Discard, |q| {
-        let before = q.items.len();
-        q.items.retain(|item| !item.text.starts_with(prefix));
-        q.items.len() != before
-    })?;
-    sync_queued(hub, id);
-    Ok(dropped)
+    take_back(hub, |item: &Item| item.text.starts_with(prefix))
+}
+
+fn take_back(hub: &Hub, is: impl Fn(&Item) -> bool) -> anyhow::Result<bool> {
+    let sessions: Vec<SessionId> = hub.injection.inner.lock().iter()
+        .filter(|(_, q)| untyped(q).any(&is)).map(|(id, _)| *id).collect();
+    let mut taken = false;
+    for id in sessions {
+        taken |= hub.injection.edit_with(id, Unsent::Discard, |q| {
+            let before = q.items.len();
+            let typed = q.last_sent.clone();
+            q.items.retain(|item| !is(item) || typed.as_deref() == Some(item.text.as_str()));
+            q.items.len() != before
+        })?;
+        sync_queued(hub, id);
+    }
+    Ok(taken)
 }
 
 /// Session `id` has no prompt waiting, being typed, or paused for review (src/sleep.rs).
@@ -1804,6 +1827,32 @@ mod tests {
         }
         Hub::new(crate::hub::HubConfig { port: 0, client_token: "fixture".into(),
             muster_bin: "/bin/true".into(), terminal_host: None, openrouter_key: None }, store).unwrap()
+    }
+
+    /// The human takes back a queued answer (src/questions.rs `undo`) only while it was never
+    /// typed in: not while it is being typed, and not after it was typed and requeued (a dialog
+    /// or a subagent's view came up before Enter), when its text may still be in the input box.
+    #[test]
+    fn only_a_prompt_never_typed_in_is_taken_back() {
+        let hub = hub_fixture();
+        let chain = |msg| crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: Some(msg) });
+        let item = |text: &str, source| Item { generation: None, text: text.into(), clear_first: false, attempts: 0,
+            draft_noticed: false, source, panel: None, handoff: None };
+        hub.injection.edit(1, |q| {
+            q.active = Some(Active { item: item("[muster msg 7] typing", chain(7)), stage: Stage::Typing });
+            q.items.extend([item("[muster msg 8] waiting", chain(8)), item("[muster msg 9] typed, requeued", chain(9)),
+                item("[muster answer to question Q3 from human origin=human hop=0]\nAnswer", crate::agents::Source::Human)]);
+            q.last_sent = Some("[muster msg 9] typed, requeued".into());
+        }).unwrap();
+        assert!(waits_message(&hub, 8) && !waits_message(&hub, 7) && !waits_message(&hub, 9));
+        assert!(!take_back_message(&hub, 7).unwrap() && !take_back_message(&hub, 9).unwrap());
+        assert!(take_back_message(&hub, 8).unwrap());
+        assert!(!waits_message(&hub, 8));
+        let prefix = "[muster answer to question Q3 from ";
+        assert!(!drop_prompt(&hub, 2, prefix).unwrap(), "another session's queue");
+        assert!(drop_prompt(&hub, 1, prefix).unwrap());
+        let left: Vec<String> = hub.injection.inner.lock()[&1].items.iter().map(|i| i.text.clone()).collect();
+        assert_eq!(left, ["[muster msg 9] typed, requeued"]);
     }
 
     /// A self handoff (src/self_handoff.rs): its held prompt keeps the head of the queue, so

@@ -1065,9 +1065,10 @@ The UI's structure is window → channel → split groups → tabs. A session st
 window directly. A channel holds folder, worktree, permissions, port block and name; its
 `window_id` is its default window for new sessions and what `Window.channel_ids` lists. A
 channel with tabs in multiple windows has a separate split layout in each window. UI protocol
-2 stores `{v:2, active, layouts, sidebar, drawers?, questions?, questionsAt?, previous?}` in
-`Window.layout` (`questions: false` hides the Questions tab, `questionsAt` is where it was put,
-docs/UI.md "Questions"); `previous` preserves the old window tree during migration. Notes gain `channel_id` in store migration v26.
+2 stores `{v:2, active, layouts, sidebar, drawers?, questions?, questionsIn?, questionsAt?, previous?}`
+in `Window.layout` (`questions: false` hides the Questions tab, `questionsIn` is its place in each
+channel by channel id, `questionsAt` where it was last put, for channels without one; docs/UI.md
+"Questions"); `previous` preserves the old window tree during migration. Notes gain `channel_id` in store migration v26.
 
 - `SessionInfo.window_id: number | null`: the window the session is a tab in. Store migration
   v5: every existing session gets its channel's `window_id`; windows gain a `layout` column.

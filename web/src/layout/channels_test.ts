@@ -557,3 +557,18 @@ Deno.test("a channel Questions only passed through follows where it was last put
   const q = allPanes(w.layouts[20].root).find((p) => p.tabs.includes(QTAB))!;
   assert(Math.abs(paneRects(w.layouts[20].root).get(q.id)!.w - 0.4) < 1e-9, "still 40% wide");
 });
+
+Deno.test("passing through a one-group channel doesn't give it a place: it keeps following the default", async () => {
+  const { moveTab } = await import("./tree.ts");
+  // Put last in 10's last group; 20 has one group, so "last group" there is its first.
+  let w = twoGroups();
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, allPanes(l.root)[1].id, "center")), QTAB);
+  w = show(w, 20);
+  equal(sig(w.layouts[20].root), `[3,4,${QTAB}]`);
+  w = show(w, 10);
+  equal(Object.keys(w.questionsIn ?? {}), ["10"]);
+  // Now first in 10's first group: 20, never placed, follows.
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, allPanes(l.root)[0].id, "center", 0)), QTAB);
+  w = show(w, 20);
+  equal(sig(w.layouts[20].root), `[${QTAB},3,4]`);
+});

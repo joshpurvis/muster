@@ -406,56 +406,71 @@ export function sameGeneralPlace(a: TabPlace, b: TabPlace): boolean {
 }
 
 /**
- * New group `np` on `side` of the branch made of exactly the groups `ids`, taking `share` of the
- * split they then share (the inverse of closing it there). Null when no branch is made of those
- * groups any more. A branch whose split was folded into its parent's (closing a group can do
- * that) is found as a run of that parent's children and gathered back into its own split.
+ * New group `np` on `side` of the branch it sat beside, taking `share` of the split they then
+ * share (the inverse of closing it there). That branch is the smallest one (a node, or a run of a
+ * split's children) holding every group of `ids` still here: groups added inside it meanwhile (a
+ * panel split beside its opener) or closed there don't lose the place. A branch whose split was
+ * folded into its parent's (closing a group can do that) is a run of that parent's children,
+ * gathered back into its own split. Null when none of those groups is left.
  */
 function insertNear(root: Layout, ids: string[], np: PaneNode, side: Side, share: number): Layout | null {
+  const here = allPanes(root).map((p) => p.id);
+  const want = ids.filter((id) => here.includes(id));
+  if (!want.length) return null;
   const dir = sideDir(side);
   const before = side === "left" || side === "top";
-  const s = Math.max(0.05, Math.min(0.95, share));
-  const groups = (n: Layout) => allPanes(n).map((p) => p.id);
+  const s = share > 0 && share < 1 ? share : 0.5;
+  const held = (n: Layout) => allPanes(n).filter((p) => want.includes(p.id)).length;
   const wrap = (n: Layout): Layout =>
     ({ type: "split", dir, children: before ? [np, n] : [n, np], sizes: before ? [s, 1 - s] : [1 - s, s] });
-  if (sameIds(groups(root), ids)) return wrap(root);
-  const rec = (n: Layout): Layout | null => {
-    if (n.type === "pane") return null;
+  // The smallest run holding them all (a whole split is its parent's one-child run, or the root).
+  let best = { path: [] as number[], i: -1, j: -1, groups: here.length };
+  const walk = (n: Layout, path: number[]) => {
+    if (n.type === "pane") return;
     for (let i = 0; i < n.children.length; i++) {
-      const run: string[] = [];
+      if (!held(n.children[i])) continue;
+      let got = 0, groups = 0;
       for (let j = i; j < n.children.length; j++) {
-        const more = groups(n.children[j]);
-        if (!more.every((id) => ids.includes(id))) break;
-        run.push(...more);
-        if (!sameIds(run, ids)) continue;
-        if (n.dir === dir) {
-          // Beside them in the same split: its share back, the others' scaled down to make room.
-          const at = before ? i : j + 1;
-          const children = [...n.children];
-          const sizes = n.sizes.map((x) => x * (1 - s));
-          children.splice(at, 0, np);
-          sizes.splice(at, 0, s);
-          return { ...n, children, sizes };
-        }
-        const kids = n.children.slice(i, j + 1);
-        const total = n.sizes.slice(i, j + 1).reduce((a, b) => a + b, 0);
-        const branch: Layout = kids.length === 1
-          ? kids[0]
-          : { type: "split", dir: n.dir, children: kids, sizes: normSizes(n.sizes.slice(i, j + 1)) };
-        return {
-          ...n,
-          children: [...n.children.slice(0, i), wrap(branch), ...n.children.slice(j + 1)],
-          sizes: [...n.sizes.slice(0, i), total, ...n.sizes.slice(j + 1)],
-        };
+        got += held(n.children[j]);
+        groups += allPanes(n.children[j]).length;
+        if (got < want.length) continue;
+        const whole = i === 0 && j === n.children.length - 1;
+        if (!whole && groups < best.groups) best = { path, i, j, groups };
+        break;
       }
     }
-    for (let i = 0; i < n.children.length; i++) {
-      const r = rec(n.children[i]);
-      if (r) return { ...n, children: n.children.map((c, j) => (j === i ? r : c)) };
-    }
-    return null;
+    n.children.forEach((c, k) => walk(c, [...path, k]));
   };
-  return rec(root);
+  walk(root, []);
+  if (best.i < 0) return wrap(root);
+  const { i, j } = best;
+  const rebuild = (n: Layout, depth: number): Layout => {
+    if (n.type !== "split") return n;
+    if (depth < best.path.length) {
+      const k = best.path[depth];
+      return { ...n, children: n.children.map((c, x) => (x === k ? rebuild(c, depth + 1) : c)) };
+    }
+    if (n.dir === dir) {
+      // Beside them in the same split: its share back, the others' scaled down to make room.
+      const at = before ? i : j + 1;
+      const children = [...n.children];
+      const sizes = n.sizes.map((x) => x * (1 - s));
+      children.splice(at, 0, np);
+      sizes.splice(at, 0, s);
+      return { ...n, children, sizes };
+    }
+    const kids = n.children.slice(i, j + 1);
+    const total = n.sizes.slice(i, j + 1).reduce((a, b) => a + b, 0);
+    const branch: Layout = kids.length === 1
+      ? kids[0]
+      : { type: "split", dir: n.dir, children: kids, sizes: normSizes(n.sizes.slice(i, j + 1)) };
+    return {
+      ...n,
+      children: [...n.children.slice(0, i), wrap(branch), ...n.children.slice(j + 1)],
+      sizes: [...n.sizes.slice(0, i), total, ...n.sizes.slice(j + 1)],
+    };
+  };
+  return rebuild(root, 0);
 }
 
 /**

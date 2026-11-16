@@ -144,13 +144,14 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   // A channel where it was put keeps its own place (only channels still here). Leaving it (another
   // channel shown, or hidden) records where it was there: a resize or the tabs around it may have
   // changed since it was moved. So does leaving one where it is no longer where the window-wide
-  // place would put it (resized there, say), so it isn't moved back.
+  // place puts it in that channel's groups (resized there, say), so it isn't moved back.
   const questionsIn: Record<string, TabPlace> = {};
   for (const [id, at] of Object.entries(s.questionsIn ?? {})) if (groups.has(Number(id))) questionsIn[id] = at;
   for (const [id, l] of Object.entries(s.layouts)) {
     if (!groups.has(Number(id)) || groups.get(Number(id))!.some((t) => t.id === QUESTIONS_TAB)) continue;
     const at = placeOf(l, QUESTIONS_TAB);
-    if (at && (questionsIn[id] || !sameGeneralPlace(at, fallback))) questionsIn[id] = at;
+    const given = at && !questionsIn[id] ? placeOf(putAt(l, QUESTIONS_TAB, fallback), QUESTIONS_TAB) : null;
+    if (at && (questionsIn[id] || !given || !sameGeneralPlace(at, given))) questionsIn[id] = at;
   }
   const layouts: Record<string, LayoutState> = {};
   for (const [id, items] of groups) {

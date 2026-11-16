@@ -597,3 +597,33 @@ Deno.test("putAt puts a tab back exactly where it was in the same layout, by the
   assertEquals(generalPlace(at), { group: -1, index: 0 });
   assertEquals(generalPlace(placeOf(shared, T)!), { group: -1, index: 2 });
 });
+
+Deno.test("putAt keeps an exact place when groups were added or closed beside it, and any share", async () => {
+  const { placeOf, putAt, setSizes, placeBeside } = await import("./tree.ts");
+  const T = 99;
+  // col(row([1] col([2] [3])) [4]) with T beside the [2]/[3] column... built as: [2] over [3] at
+  // top right, T to their right, [4] across the bottom.
+  let l = splitPane(emptyLayout([1]), "bottom", 4);
+  l = splitPane(l, "right", 2, paneOfSession(l.root, 1)!.id);
+  l = splitPane(l, "bottom", 3, paneOfSession(l.root, 2)!.id);
+  l = splitPane(l, "right", T, paneOfSession(l.root, 2)!.id);
+  const at = JSON.parse(JSON.stringify(placeOf(l, T)));
+  const gone = removeSession(l, T);
+  // Away, a panel opens beside terminal 2 (a new group to its right): the place still holds.
+  const panel = placeBeside(gone, -5, 2);
+  assertEquals(allPanes(panel.root).length, allPanes(gone.root).length + 1);
+  const back = putAt(reconcile(panel, [1, 2, 3, 4, -5, T]), T, at);
+  assert(paneOfSession(back.root, T)!.tabs.length === 1, `its own group again: ${sig(back.root)}`);
+  // Away, terminal 3 closes: still its own group beside what is left of that branch.
+  const closed = removeSession(gone, 3);
+  const back2 = putAt(reconcile(closed, [1, 2, 4, T]), T, at);
+  assertEquals(paneOfSession(back2.root, T)!.tabs.length, 1);
+  assertEquals(sig(back2.root), `col(row([1] [2] [${T}]) [4])`);
+
+  // A narrow share (4% of a wide window) comes back at 4%, not at a minimum.
+  let narrow = splitPane(emptyLayout([1]), "right", T);
+  narrow = setSizes(narrow, [], [0.96, 0.04]);
+  const p = placeOf(narrow, T)!;
+  const again = putAt(reconcile(removeSession(narrow, T), [1, T]), T, p);
+  assertEquals(sized(again.root), sized(narrow.root));
+});

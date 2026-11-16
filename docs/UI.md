@@ -309,9 +309,11 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   counting from the first, or the last group when it was in the last one, at the same place in the
   strip (or its end); a group of its own along a whole window edge becomes one along that edge with
   the same share of the window. Before you have put it anywhere, that is first in the first group.
-  Saves from before per-channel places use their one window place this way. If the groups its place
-  names are gone (a terminal next to it closed meanwhile), it goes where that channel's place says
-  in those general terms. When it leaves a channel, the group it had alone there closes; when it
+  A channel it only passed through, without being moved or resized there, keeps following that
+  place. Saves from before per-channel places use their one window place this way. Groups added or
+  closed beside it while you were elsewhere (a panel opened next to a terminal) don't lose its
+  place; only when every group it was next to is gone does it go where that channel's place says in
+  those general terms. When it leaves a channel, the group it had alone there closes; when it
   comes back it is put at that channel's place again, so it is never lost or doubled. Pin icon,
   "Questions" and the number of open questions in an amber badge. It doesn't rename or close: its
   menu (and Alt+W) **Hide Questions tab**, which the window remembers; the palette's

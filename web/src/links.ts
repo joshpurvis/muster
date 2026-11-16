@@ -45,8 +45,15 @@ export function findMusterLinks(text: string): { start: number; end: number; uri
 
 /** Links in one terminal row as 1-based, inclusive cell columns (xterm's `IBufferRange.x`).
  * `cells` are the row's cells left to right; a wide character takes two, the second with width 0
- * and no text, so columns after one differ from string offsets. */
-export function linkColumns(cells: { chars: string; width: number }[]): { start: number; end: number; uri: string }[] {
+ * and no text, so columns after one differ from string offsets. `before` and `after` are the
+ * characters just outside `cells`, if any may belong to the same text (a row wrapped or drawn
+ * full to its edge): a link they would continue (`muster://note/9` then `1`) is none, never a link
+ * to the wrong id. */
+export function linkColumns(
+  cells: { chars: string; width: number }[],
+  edges: { before?: string; after?: string } = {},
+): { start: number; end: number; uri: string }[] {
+  const before = edges.before ?? "", after = edges.after ?? "";
   let text = "";
   const col: number[] = [];
   cells.forEach((c, x) => {
@@ -55,16 +62,28 @@ export function linkColumns(cells: { chars: string; width: number }[]): { start:
     for (let i = 0; i < s.length; i++) col.push(x);
     text += s;
   });
-  return findMusterLinks(text).map((l) => ({ start: col[l.start] + 1, end: col[l.end - 1] + 1, uri: l.uri }));
+  const n = before.length;
+  return findMusterLinks(before + text + after)
+    .filter((l) => l.start >= n && l.end <= n + text.length)
+    .map((l) => ({ start: col[l.start - n] + 1, end: col[l.end - n - 1] + 1, uri: l.uri }));
 }
 
 /** Links in a logical line (a row and the rows wrapped from it) as xterm buffer ranges, 1-based
  * and inclusive: `cells` are the rows' cells in order, `cols` per row, the first row being buffer
- * row `top` (0-based). A link split by the wrap is one range over both rows. */
-export function linkRanges(cells: { chars: string; width: number }[], cols: number, top: number) {
+ * row `top` (0-based). A link split by the wrap is one range over both rows. `edges` as for
+ * `linkColumns`. */
+export function linkRanges(
+  cells: { chars: string; width: number }[],
+  cols: number,
+  top: number,
+  edges: { before?: string; after?: string } = {},
+) {
   const at = (col: number) => ({ x: ((col - 1) % cols) + 1, y: top + 1 + Math.floor((col - 1) / cols) });
-  return linkColumns(cells).map((l) => ({ start: at(l.start), end: at(l.end), uri: l.uri }));
+  return linkColumns(cells, edges).map((l) => ({ start: at(l.start), end: at(l.end), uri: l.uri }));
 }
+
+/** The longest address, in characters (`muster://agent/` and a 40-character name). */
+export const MAX_LINK = 55;
 
 /** What following a link may use: lookups, the three "show it" actions and a short message. */
 export interface LinkDeps {

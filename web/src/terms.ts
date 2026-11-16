@@ -16,7 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
-import { linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
+import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -126,9 +126,9 @@ export function onMusterLink(f: (link: MusterLink, sid: number) => void) {
   linkListener = f;
 }
 
-/** The Muster link under the mouse in one terminal, and the one a press started on. Muster
- * follows a link itself (`followClicks`), not through xterm, so the press never reaches the
- * program as a mouse report. */
+/** The hyperlinked (OSC 8) Muster link under the mouse in one terminal, and the link a press
+ * started on. Muster follows a link itself (`followClicks`), not through xterm, so the press
+ * never reaches the program as a mouse report. */
 interface LinkState {
   hovered: string | null;
   pressed: string | null;
@@ -162,12 +162,29 @@ function oscLinks(state: LinkState) {
 
 /** A plain left click (no modifier) on a Muster link follows it. Its press and release are
  * caught before xterm sees them, so a program with mouse reporting on gets no click, no
- * selection starts, and other buttons (a middle-click paste) never follow a link. */
-function followClicks(el: HTMLElement, state: LinkState, sid: number) {
+ * selection starts, and other buttons (a middle-click paste) never follow a link. The link is
+ * found where the press is (a text link), or is the hyperlink under the pointer, so a link
+ * printed under a pointer that hasn't moved is caught too. */
+function followClicks(el: HTMLElement, term: Terminal, state: LinkState, sid: number) {
+  const linkAt = (ev: MouseEvent): string | null => {
+    const screen = el.querySelector(".xterm-screen")?.getBoundingClientRect();
+    if (!screen || !screen.width || !screen.height) return state.hovered;
+    const x = Math.floor((ev.clientX - screen.left) / (screen.width / term.cols));
+    const y = Math.floor((ev.clientY - screen.top) / (screen.height / term.rows));
+    if (x < 0 || y < 0 || x >= term.cols || y >= term.rows) return null;
+    const row = term.buffer.active.viewportY + y;
+    const hit = textLinks(term, row).find((l) => {
+      const at = row * term.cols + x, from = (l.start.y - 1) * term.cols + l.start.x - 1;
+      return at >= from && at <= (l.end.y - 1) * term.cols + l.end.x - 1;
+    });
+    return hit?.uri ?? state.hovered;
+  };
   el.addEventListener("mousedown", (ev) => {
     state.pressed = null;
-    if (!state.hovered || ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return;
-    state.pressed = state.hovered;
+    if (ev.button !== 0 || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.metaKey) return;
+    const uri = linkAt(ev);
+    if (!uri) return;
+    state.pressed = uri;
     ev.preventDefault();
     ev.stopPropagation();
   }, true);
@@ -177,9 +194,43 @@ function followClicks(el: HTMLElement, state: LinkState, sid: number) {
     if (!pressed) return;
     ev.preventDefault();
     ev.stopPropagation();
-    const link = ev.button === 0 && state.hovered === pressed ? parseMusterLink(pressed) : null;
+    const link = ev.button === 0 && linkAt(ev) === pressed ? parseMusterLink(pressed) : null;
     if (link) linkListener(link, sid);
   }, true);
+}
+
+/** Muster addresses written as text in the logical line around buffer row `row` (0-based): the
+ * row and the rows wrapped to and from it, only as far as an address can reach. Characters
+ * just outside what is read (a wrapped row cut off, or a row drawn full to its edge that a
+ * redrawn replay no longer marks as wrapped) go in as `edges`, so a cut address is no link
+ * rather than a link to the wrong id. */
+function textLinks(term: Terminal, row: number) {
+  const b = term.buffer.active;
+  const cols = term.cols;
+  const reach = Math.ceil(MAX_LINK / cols) + 1;
+  let top = row;
+  while (top > 0 && row - top < reach && b.getLine(top)?.isWrapped) top--;
+  let bottom = row;
+  while (bottom - row < reach && b.getLine(bottom + 1)?.isWrapped) bottom++;
+  const cellsOf = (r: number) => {
+    const line = b.getLine(r);
+    const out: { chars: string; width: number }[] = [];
+    for (let x = 0; x < cols; x++) {
+      const c = line?.getCell(x);
+      out.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
+    }
+    return out;
+  };
+  let text = "";
+  for (let r = top; r <= bottom; r++) text += b.getLine(r)?.translateToString(false) ?? "";
+  if (!text.includes("muster://")) return [];
+  const cells: { chars: string; width: number }[] = [];
+  for (let r = top; r <= bottom; r++) cells.push(...cellsOf(r));
+  const full = (r: number) => !!b.getLine(r)?.getCell(cols - 1)?.getChars();
+  const before = top > 0 && (b.getLine(top)?.isWrapped || full(top - 1)) ? cellsOf(top - 1).at(-1)?.chars || " " : "";
+  const next = b.getLine(bottom + 1);
+  const after = next && (next.isWrapped || full(bottom)) ? next.getCell(0)?.getChars() || " " : "";
+  return linkRanges(cells, cols, top, { before, after });
 }
 
 function parkEl(): HTMLDivElement {
@@ -251,7 +302,6 @@ function create(sid: number): Entry {
   el.dataset.sid = String(sid);
   parkEl().appendChild(el);
   const linkState: LinkState = { hovered: null, pressed: null };
-  followClicks(el, linkState, sid);
   const term = new Terminal({
     allowProposedApi: true,
     fontFamily: FONT_FAMILY,
@@ -280,41 +330,20 @@ function create(sid: number): Entry {
     }),
   );
   // Muster links written out as text (`title (muster://note/91)`, as Claude Code and Codex print
-  // Markdown links): clickable like the marked-up ones. A row wrapped from the one above is read
-  // with it, so a link split by the wrap is whole (never the wrong id from half of one).
+  // Markdown links): underlined on hover like the marked-up ones; `followClicks` follows them. A
+  // row wrapped from the one above is read with it (`textLinks`), so a link split by the wrap is
+  // whole. Only links on row `y` are given (xterm keeps them per row).
   term.registerLinkProvider({
     provideLinks(y, callback) {
-      const b = term.buffer.active;
-      let top = y - 1;
-      while (top > 0 && b.getLine(top)?.isWrapped) top--;
-      let bottom = y - 1;
-      while (b.getLine(bottom + 1)?.isWrapped) bottom++;
-      const cells: { chars: string; width: number }[] = [];
-      let text = "";
-      for (let r = top; r <= bottom; r++) {
-        const line = b.getLine(r);
-        if (!line) break;
-        text += line.translateToString(false);
-        for (let x = 0; x < term.cols; x++) {
-          const c = line.getCell(x);
-          cells.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
-        }
-      }
-      if (!text.includes("muster://")) return callback(undefined);
-      const found = linkRanges(cells, term.cols, top);
+      const found = textLinks(term, y - 1).filter((l) => l.start.y <= y && l.end.y >= y);
       callback(
         found.length
-          ? found.map((l) => ({
-            range: { start: l.start, end: l.end },
-            text: l.uri,
-            activate: () => {}, // followClicks does it
-            hover: () => (linkState.hovered = l.uri),
-            leave: () => (linkState.hovered = null),
-          }))
+          ? found.map((l) => ({ range: { start: l.start, end: l.end }, text: l.uri, activate: () => {} }))
           : undefined,
       );
     },
   });
+  followClicks(el, term, linkState, sid);
   try {
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";

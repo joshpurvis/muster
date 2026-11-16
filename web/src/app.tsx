@@ -99,8 +99,9 @@ mq.addEventListener("change", applyThemePref);
 terms.setFontSize(prefs.value.fontSize);
 terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 terms.onClipboardFailed((text) => toast("error", text));
-// A click on a Muster link in a terminal shows what it names (links.ts): a closed note opens
-// beside the terminal that linked it.
+// A click on a Muster link in a terminal shows what it names (links.ts), here: a closed note opens
+// beside the terminal that linked it, and a thing in another window comes to this one (raising
+// that window, as Jump may, would show whatever is selected there).
 terms.onMusterLink((link, sid) => {
   followLink(link, {
     hasNote: (id) => notes.value.has(id),
@@ -110,9 +111,9 @@ terms.onMusterLink((link, sid) => {
       const a = agents.value.find((x) => x.name.toLowerCase() === name.toLowerCase());
       return a ? { name: a.name, session: a.session_id } : null;
     },
-    gotoNote: (id) => void A.gotoNote(id, undefined, sid),
-    gotoPanel: (id) => void A.gotoPanel(id),
-    gotoSession: (id) => void A.gotoSession(id),
+    gotoNote: (id) => void A.gotoNote(id, undefined, sid, false),
+    gotoPanel: (id) => void A.gotoPanel(id, false),
+    gotoSession: (id) => void A.gotoSession(id, false),
     notify: (text) => toast("info", text, 5000),
   });
 });

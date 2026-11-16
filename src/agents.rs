@@ -399,6 +399,7 @@ fn write_persona(path: &Path, text: &str) -> anyhow::Result<()> {
         .open(path)
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     f.write_all(text.as_bytes())?;
+    f.sync_all()?;
     Ok(())
 }
 
@@ -537,7 +538,11 @@ fn add_links_section(path: &Path) {
         Some(i) => format!("{}{section}{}", &text[..i + 1], &text[i + 1..]),
         None => format!("{}\n\n{}\n", text.trim_end(), section.trim_end()),
     };
-    if let Err(e) = write_persona(path, &next) {
+    // Written beside it and renamed over it, so a failed write never leaves it cut short.
+    let tmp = path.with_extension("md.muster-links");
+    let done = write_persona(&tmp, &next).and_then(|()| Ok(std::fs::rename(&tmp, path)?));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&tmp);
         tracing::warn!("adding the Links section to {}: {e:#}", path.display());
     }
 }

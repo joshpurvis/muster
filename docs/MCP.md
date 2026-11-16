@@ -112,7 +112,7 @@ a click on it shows that note (docs/UI.md "Links"). Results that return one carr
   `muster://agent/<name>`. It holds nothing else (no token, nothing private).
 - `mention`: `[title](link)`, with the title on one line and its Markdown characters escaped.
 
-They come with every session in `whoami`, `list_sessions` and `spawn_session`, every agent in
+They come with every session in `whoami`, `list_sessions` and `spawn_session`, `wait_for_state`, every agent in
 `list_agents`, `panel_open` and every panel in `list_panels`, and every note result (`note_list`,
 `note_read`, `note_write`, `note_append`, `note_open`). `muster link note|panel|tab|agent
 <target>` prints one from the shell (docs/CLI.md). The server's `instructions` and every named

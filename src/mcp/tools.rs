@@ -1218,7 +1218,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
     let after_ms = a.int("after_ms")?;
     reachable_session(st, caller, id)?;
     let (info, verdict, waited_ms) = wait_loop(st, id, &states, timeout_s, after_ms).await?;
-    Ok(pretty(&json!({
+    let mut out = json!({
         "session_id": id,
         "state": info.state,
         "detail": info.state_detail,
@@ -1228,7 +1228,9 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
         "timed_out": verdict == Verdict::Wait,
         "ended": (verdict == Verdict::Ended).then_some("exited"),
         "waited_ms": waited_ms,
-    })))
+    });
+    crate::links::add(&mut out, crate::links::tab(id), &crate::links::tab_title(&info.name, info.kind.as_str()));
+    Ok(pretty(&out))
 }
 
 /// The wait_for_state loop: until `id` is in one of `states` (staleness rules in mcp::wait),

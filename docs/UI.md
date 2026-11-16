@@ -302,7 +302,9 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
 
 - **How it arrives**: an agent writes Markdown, `[Pairs to review](muster://note/91)`. Claude
   Code and Codex both print it as `Pairs to review (muster://note/91)`; Muster's terminal finds the
-  address in the text (also when the line wraps inside it) and underlines it on hover. A program
+  address in the text (also when the line wraps inside it) and underlines it on hover. An
+  address cut at a row's edge in a way Muster can't join again (a terminal redrawn after a resize)
+  is no link rather than a link to the wrong id. A program
   that prints a terminal hyperlink (OSC 8) to a Muster address gets the same. Claude Code is not
   asked to print hyperlinks (`FORCE_HYPERLINK`): a terminal redrawn by the daemon (after a resize,
   then a reload or reconnect) drops them, and the title alone would lose its address.
@@ -320,9 +322,10 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   agent carry `link` and `mention` (docs/MCP.md "Links"), and `muster link` prints one
   (docs/CLI.md). Every agent's instructions say to mention things this way: the MCP server's
   instructions, and a named agent's CLAUDE.md or AGENTS.md ("Links"; an agent made before this
-  gets the section at its next start, unless its file was replaced by hand). With "Jump focuses
-  the other window" on, a link to something in another window raises that window as Jump does,
-  without selecting the thing there.
+  gets the section at its next start, unless its file was replaced by hand).
+- **Where**: a link always shows the thing in the window it was clicked in (a note beside the
+  terminal that showed the link, a panel or tab moved here from another window), also with "Jump
+  focuses the other window" on: raising that window would show whatever is selected there.
 - Not yet: outside Muster's window (another terminal, a browser) the address isn't registered
   with the system, so it does nothing there; the phone UI and Markdown panels show it as plain
   text.

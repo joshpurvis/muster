@@ -78,8 +78,11 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
   await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('${tab}.active')`, 4000);
   ok("a click on the address in `Pairs to review (muster://note/N)` opens the closed note again");
 
-  // ---- a link to a note that is gone: a short message, nothing else
-  await clickLink("Old:", "muster://note/");
+  // ---- a link to a note that is gone: a short message, nothing else. Pressed where the pointer
+  // already is, with no move first (a link printed under a pointer that stays put).
+  const [ox, oy] = await at("Old:", "muster://note/");
+  await a.send("Input.dispatchMouseEvent", { type: "mousePressed", x: ox, y: oy, button: "left", clickCount: 1, buttons: 1 });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: ox, y: oy, button: "left", clickCount: 1 });
   await a.wait(`[...document.querySelectorAll('.toast')].some((t) => t.textContent.includes('Note 99999 no longer exists'))`, 3000);
   await shot("links-3-gone");
   ok("a link to a deleted note shows a short message");

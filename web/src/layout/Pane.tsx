@@ -519,7 +519,7 @@ function TabStrip(
       >
         {tabs.map((id, i) => {
           if (id === QUESTIONS_TAB) {
-            return <QuestionsTab key={id} index={i} paneId={pane.id} active={id === pane.active} focused={focused} />;
+            return <QuestionsTab key={id} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           }
           const panel = panels.value.get(panelId(id) ?? -1);
           if (panel) return <PanelTab key={id} panel={panel} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
@@ -580,7 +580,7 @@ function TabStrip(
         </button>
       </div>
       <div class="strip-spacer" />
-      {d && focused && <MoveTargets over={d.win} />}
+      {d && focused && d.kind !== "questions" && <MoveTargets over={d.win} />}
       {zoomed && (
         <button
           type="button"
@@ -640,24 +640,29 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
   );
 }
 
-/** The pinned Questions tab: first in the strip, with the number of open questions. It doesn't
- * drag, rename or close; its menu hides it (the palette's Questions shows it again). */
-function QuestionsTab({ paneId, index, active, focused }: {
-  paneId: string; index: number; active: boolean; focused: boolean;
+/** The Questions tab, with the number of open questions. It drags among the groups like any tab
+ * (the window remembers where), but doesn't rename or close: its menu hides it (the palette's
+ * Questions shows it again). */
+function QuestionsTab({ paneId, index, tabsInGroup, active, focused }: {
+  paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
 }) {
   const n = openQuestionCount.value;
   const label = n === 1 ? "Questions, 1 open" : `Questions, ${n} open`;
   const menu: MenuItem[] = [
+    { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(QUESTIONS_TAB, "right") },
+    { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(QUESTIONS_TAB, "bottom") },
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
     { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(QUESTIONS_TAB) },
     "sep",
     { label: "Hide Questions tab", keys: "Alt+W", run: () => A.hideQuestionsTab() },
   ];
   return (
-    <div class={cx("tab", "questions-tab", active && "active", active && focused && "focused")}
+    <div class={cx("tab", "questions-tab", active && "active", active && focused && "focused",
+      drag.value?.sid === QUESTIONS_TAB && "dragging")}
       role="tab" aria-selected={active} aria-label={label} tabIndex={active ? 0 : -1}
-      data-tab-sid={QUESTIONS_TAB} data-tip={`Questions agents asked you · pinned · ${n} open`}
-      onClick={() => A.revealSession(QUESTIONS_TAB)}
+      data-tab-sid={QUESTIONS_TAB} data-tip={`Questions agents asked you · ${n} open`}
+      onPointerDown={(e) => startTabDrag(e, { id: QUESTIONS_TAB, kind: "questions" }, "Questions",
+        () => A.revealSession(QUESTIONS_TAB))}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
       <TabIcon index={index} focused={focused}><IconPin size={13} /></TabIcon>
       <span class="tab-name"><span class="tab-task">Questions</span></span>

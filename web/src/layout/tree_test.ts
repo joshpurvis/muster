@@ -511,3 +511,25 @@ Deno.test("topRightPane: the group in the window's top-right corner carries the 
 function findActive(s: LayoutState): number | null {
   return allPanes(s.root).find((p) => p.id === s.focus)?.active ?? null;
 }
+
+Deno.test("placeOf names a tab's place so putAt can rebuild it in another layout", async () => {
+  const { findPane, placeOf, putAt, setSizes } = await import("./tree.ts");
+  const T = 99;
+  // A group of its own along the bottom edge, a third of the height.
+  let l = splitPane(emptyLayout([1, 2]), "bottom", T);
+  l = setSizes(l, [], [2 / 3, 1 / 3]);
+  const at = placeOf(l, T)!;
+  assertEquals([at.alone, Math.round(at.size! * 300)], ["bottom", 100]);
+  const other = putAt(addTab(splitPane(emptyLayout([5]), "right", 6), T), T, at);
+  assertEquals(sig(other.root), `col(row([5] [6]) [${T}])`);
+  // Along the left edge.
+  const left = placeOf(splitPane(emptyLayout([1, 2]), "left", T), T)!;
+  assertEquals(left.alone, "left");
+  assertEquals(sig(putAt(emptyLayout([5, T]), T, left).root), `row([${T}] [5])`);
+  // Alone in the middle column is not an edge: it is the middle group.
+  let mid = splitPane(emptyLayout([1]), "right", 2);
+  mid = splitPane(mid, "left", T, findPane(mid.root, mid.focus)!.id);
+  assertEquals(sig(mid.root), `row([1] [${T}] [2])`);
+  assertEquals(placeOf(mid, T), { group: 1, index: 0 });
+  assertEquals(placeOf(emptyLayout([1, 2]), T), null);
+});

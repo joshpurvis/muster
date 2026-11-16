@@ -21,7 +21,7 @@ kills it, and reopening restores the window's channel selection, layouts and sid
   available to launch again.
 - **Group**: one tile in a channel's split tree, with its own tab strip and one visible tab.
 - **Tab**: a terminal session, panel or note. Each belongs to a window and channel. The same
-  channel can have tabs in several windows, with an independent layout in each. The pinned
+  channel can have tabs in several windows, with an independent layout in each. The
   Questions tab is the exception: one per window, in whichever channel is shown (see "Questions").
 - **Project**: the API's `Workspace`, a known folder. The sidebar does not group by it.
 
@@ -293,12 +293,20 @@ Agents that need the human post a question and carry on (docs/MCP.md "Questions 
 human"); the **Questions** tab is where the human sees and answers them (`web/src/components/QuestionsView.tsx`,
 `web/src/questions.ts`).
 
-- **The tab**: pinned, one per window, first in the top-left group of whichever channel is shown
-  (it moves with the channel you select, and goes back to the front if a tab is dragged before
-  it). Pin icon, "Questions" and the number of open questions in an amber badge. It doesn't drag,
-  rename or close: its menu (and Alt+W) **Hide Questions tab**, which the window remembers; the
-  palette's **Questions**, Alt+J or the status line's "needs you" shows it again. Shown only when
-  the backend has questions.
+- **The tab**: one per window, in whichever channel is shown (it moves with the channel you
+  select). It starts first in the top-left group. It drags like any tab: to another place in its
+  strip, into another group, or onto a group's edge for a split of its own; its menu's **Split
+  right** / **Split down**, Alt+Shift+[ / ] and Ctrl+Alt+arrows move it too. It never goes to
+  another window or channel. The window remembers where it was put (`questionsAt` in the saved
+  layout) and each channel it moves to gets that place: the same group counting from the first, or
+  the last group when it was in the last one, at the same place in the strip (or its end); a group
+  of its own along a whole window edge becomes a group of its own along that edge, with the same
+  share of the window. When it leaves a channel, the group it had alone there closes; when it comes
+  back (another channel shown, or Hide then show), it is put at the remembered place again, so it
+  is never lost or doubled. Pin icon, "Questions" and the number of open questions in an amber
+  badge. It doesn't rename or close: its menu (and Alt+W) **Hide Questions tab**, which the window
+  remembers; the palette's **Questions**, Alt+J or the status line's "needs you" shows it again,
+  wherever it is. Shown only when the backend has questions.
 - **The count**: on the tab, in "needs you" in the status line (sessions that need you plus open
   questions; its tooltip says which), and in the window title.
 - **Layout**: a bar with **Open N** and **Answered N**; the list on the left (340px), "Holding up

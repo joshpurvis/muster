@@ -112,7 +112,7 @@ export const IconNote = (p: P) => (
     <path d="M14 3v6h6M8 13h8M8 17h5" />
   </Svg>
 );
-/** The pinned Questions tab (Lucide "pin"). */
+/** The Questions tab (Lucide "pin"). */
 export const IconPin = (p: P) => (
   <Svg {...p}>
     <path d="M12 17v5" />

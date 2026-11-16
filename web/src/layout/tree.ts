@@ -12,7 +12,7 @@ export type Dir = "row" | "col";
 // -2^52, below every note's. Keeping numeric tabs means existing saved layouts load without
 // migration.
 const NOTE_BASE = 2 ** 40;
-/** The pinned Questions tab (docs/UI.md "Questions"): one per window, in every channel. */
+/** The Questions tab (docs/UI.md "Questions"): one per window, in whichever channel is shown. */
 export const QUESTIONS_TAB = -(2 ** 52);
 export const panelTab = (id: number): number => -id - 1;
 export const panelId = (tab: number): number | null =>
@@ -288,24 +288,115 @@ export function reconcile(s: LayoutState, live: number[]): LayoutState {
 }
 
 /**
- * A pinned tab sits first in the first group (the top-left one): moved there if it is anywhere
- * else, keeping focus and every group's selection (it stays selected if it was).
+ * Where a tab sits in its channel's groups, in terms another channel's groups can follow (the
+ * Questions tab keeps one per window, docs/UI.md "Questions"). A group of its own along a whole
+ * window edge is remembered as that edge and its share of the window.
  */
-export function pinFirst(s: LayoutState, tab: number): LayoutState {
+export interface TabPlace {
+  /** Its group in reading order (top-left first); -1 is the last of two or more. */
+  group: number;
+  /** Its place in that group's strip; -1 is the end. */
+  index: number;
+  /** It had a group of its own along this edge of the window... */
+  alone?: Side;
+  /** ...taking this share of the window's width (left, right) or height (top, bottom). */
+  size?: number;
+}
+
+/** The first tab of the top-left group: the Questions tab's place before it could move. */
+export const FIRST_PLACE: TabPlace = { group: 0, index: 0 };
+
+const SIDES: readonly Side[] = ["left", "right", "top", "bottom"];
+const MAX_GROUPS = 64;
+
+/** A saved `TabPlace`, or null when it isn't one. */
+export function parseTabPlace(raw: unknown): TabPlace | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const int = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= -1 && v <= MAX_GROUPS * 64;
+  if (!int(o.group) || !int(o.index)) return null;
+  const place: TabPlace = { group: Math.min(o.group as number, MAX_GROUPS), index: o.index as number };
+  if (SIDES.includes(o.alone as Side)) {
+    place.alone = o.alone as Side;
+    if (typeof o.size === "number" && o.size > 0 && o.size < 1) place.size = o.size;
+  }
+  return place;
+}
+
+/** Where tab `tab` sits now (null: not in this layout). */
+export function placeOf(s: LayoutState, tab: number): TabPlace | null {
+  const panes = allPanes(s.root);
+  const i = panes.findIndex((p) => p.tabs.includes(tab));
+  if (i < 0) return null;
+  const p = panes[i];
+  if (p.tabs.length === 1 && panes.length > 1) {
+    const r = paneRects(s.root).get(p.id)!;
+    const e = 1e-6;
+    const tall = r.y <= e && r.y + r.h >= 1 - e;
+    const wide = r.x <= e && r.x + r.w >= 1 - e;
+    if (tall && r.x + r.w >= 1 - e) return { group: -1, index: 0, alone: "right", size: r.w };
+    if (tall && r.x <= e) return { group: 0, index: 0, alone: "left", size: r.w };
+    if (wide && r.y + r.h >= 1 - e) return { group: -1, index: 0, alone: "bottom", size: r.h };
+    if (wide && r.y <= e) return { group: 0, index: 0, alone: "top", size: r.h };
+  }
+  const at = p.tabs.indexOf(tab);
+  return {
+    group: panes.length > 1 && i === panes.length - 1 ? -1 : i,
+    index: at > 0 && at === p.tabs.length - 1 ? -1 : at,
+  };
+}
+
+const samePlace = (a: TabPlace | null, b: TabPlace) =>
+  !!a && a.alone === b.alone && (b.alone ? Math.abs((a.size ?? 0.5) - (b.size ?? 0.5)) < 1e-6
+    : a.group === b.group && a.index === b.index);
+
+/**
+ * Move tab `tab` (already in the layout) to `place`: into that group's strip, clamped to the
+ * groups and tabs there are, or, for a place along an edge, into a new group along that whole
+ * edge. Focus and every group's selection stay (the tab stays selected if it was).
+ */
+export function putAt(s: LayoutState, tab: number, place: TabPlace): LayoutState {
   const from = paneOfSession(s.root, tab);
-  const first = allPanes(s.root)[0];
-  if (!from || (from.id === first.id && first.tabs[0] === tab)) return s;
+  if (!from || samePlace(placeOf(s, tab), place)) return s;
   const selected = from.active === tab;
   const focused = s.focus === from.id;
+  if (place.alone) {
+    const base = removeSession(s, tab);
+    const np = pane([tab]);
+    const dir = sideDir(place.alone);
+    const before = place.alone === "left" || place.alone === "top";
+    const size = Math.max(0.1, Math.min(0.9, place.size ?? 0.5));
+    const r = base.root;
+    const root: Layout = r.type === "split" && r.dir === dir
+      ? {
+        ...r,
+        children: before ? [np, ...r.children] : [...r.children, np],
+        sizes: before ? [size, ...r.sizes.map((x) => x * (1 - size))] : [...r.sizes.map((x) => x * (1 - size)), size],
+      }
+      : { type: "split", dir, children: before ? [np, r] : [r, np], sizes: before ? [size, 1 - size] : [1 - size, size] };
+    return finish({ ...base, root, focus: selected && focused ? np.id : base.focus });
+  }
+  const panes = allPanes(s.root);
+  const target = panes[place.group < 0 ? panes.length - 1 : Math.min(place.group, panes.length - 1)];
+  const rest = target.tabs.filter((t) => t !== tab);
+  const at = place.index < 0 ? rest.length : Math.min(place.index, rest.length);
+  if (target.id === from.id && from.tabs.indexOf(tab) === at) return s;
   const root = mapPanes(s.root, (p) => {
-    const rest = p.tabs.filter((t) => t !== tab);
-    if (p.id === first.id) {
-      return { ...p, tabs: [tab, ...rest], active: selected ? tab : p.active ?? tab };
+    if (p.id === target.id) {
+      const tabs = [...rest];
+      tabs.splice(at, 0, tab);
+      return { ...p, tabs, active: selected ? tab : p.active ?? tab };
     }
     if (p.id !== from.id) return p;
-    return { ...p, tabs: rest, active: p.active === tab ? rest[0] ?? null : p.active };
+    const left = p.tabs.filter((t) => t !== tab);
+    return { ...p, tabs: left, active: p.active === tab ? left[0] ?? null : p.active };
   });
-  return finish({ ...s, root, focus: selected && focused ? first.id : s.focus });
+  return finish({ ...s, root, focus: selected && focused ? target.id : s.focus });
+}
+
+/** First in the first group (the top-left one), keeping focus and every group's selection. */
+export function pinFirst(s: LayoutState, tab: number): LayoutState {
+  return putAt(s, tab, FIRST_PLACE);
 }
 
 /** A new panel joins the group immediately to its opener's right, or splits there. */

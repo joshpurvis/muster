@@ -1,6 +1,7 @@
 // Pointer-based tab drag & drop. Dragging a tab over a group shows where it will land: the body's
 // edges split that group, its center joins the group's tabs, a strip inserts at the marker. The
-// "→ Window N / → New window" targets in the focused strip move it to another window.
+// "→ Window N / → New window" targets in the focused strip move it to another window (not the
+// Questions tab: every window and channel has its own, so it only moves among the groups).
 
 import { signal } from "@preact/signals";
 import { useLayoutEffect, useRef, useState } from "preact/hooks";
@@ -8,7 +9,7 @@ import { type DropZone, isNoopMove, splitFits } from "./tree.ts";
 import { layout } from "../state.ts";
 import { dropTab, moveTabToChannel, moveTabToWindow, revealSession } from "../actions.ts";
 import type { SessionInfo } from "../types.ts";
-import { IconNote, IconPanel, KindIcon } from "../icons.tsx";
+import { IconNote, IconPanel, IconPin, KindIcon } from "../icons.tsx";
 
 export interface Target {
   paneId: string;
@@ -23,7 +24,7 @@ export interface Target {
 interface DragState {
   sid: number;
   label: string;
-  kind: SessionInfo["kind"] | "panel" | "note";
+  kind: SessionInfo["kind"] | "panel" | "note" | "questions";
   x: number;
   y: number;
   target: Target | null;
@@ -49,8 +50,9 @@ export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["
       document.body.classList.add("dragging");
     }
     ev.preventDefault();
-    const win = windowTarget(ev.clientX, ev.clientY);
-    const row = document.elementFromPoint(ev.clientX, ev.clientY)?.closest<HTMLElement>("[data-channel-id]");
+    const groupsOnly = s.kind === "questions";
+    const win = groupsOnly ? null : windowTarget(ev.clientX, ev.clientY);
+    const row = groupsOnly ? null : document.elementFromPoint(ev.clientX, ev.clientY)?.closest<HTMLElement>("[data-channel-id]");
     const channel = row ? Number(row.dataset.channelId) : null;
     drag.value = {
       sid: s.id,
@@ -226,7 +228,8 @@ function Ghost({ x, y, kind, label }: { x: number; y: number; kind: DragState["k
   top = Math.max(4, Math.min(top, innerHeight - size.h - 4));
   return (
     <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
-      {kind === "panel" ? <IconPanel size={13} /> : kind === "note" ? <IconNote size={13} /> : <KindIcon kind={kind} size={13} />}
+      {kind === "panel" ? <IconPanel size={13} /> : kind === "note" ? <IconNote size={13} />
+        : kind === "questions" ? <IconPin size={13} /> : <KindIcon kind={kind} size={13} />}
       <span>{label}</span>
     </div>
   );

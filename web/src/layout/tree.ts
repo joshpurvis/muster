@@ -489,7 +489,9 @@ export function putAt(s: LayoutState, tab: number, place: TabPlace): LayoutState
     const base = removeSession(s, tab);
     const np = pane([tab]);
     const root = insertNear(base.root, place.near, np, place.side, place.share ?? 0.5);
-    if (root) return finish({ ...base, root, focus: selected && focused ? np.id : base.focus });
+    const next = root && finish({ ...base, root, focus: selected && focused ? np.id : base.focus });
+    // Along a whole window edge, it stays along that edge (groups beside it may have closed).
+    if (next && (!place.alone || placeOf(next, tab)?.alone === place.alone)) return next;
   }
   if (place.alone) {
     const base = removeSession(s, tab);

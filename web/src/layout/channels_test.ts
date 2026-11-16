@@ -572,3 +572,23 @@ Deno.test("passing through a one-group channel doesn't give it a place: it keeps
   w = show(w, 20);
   equal(sig(w.layouts[20].root), `[${QTAB},3,4]`);
 });
+
+Deno.test("a channel where Questions got its own group from the default and was resized there keeps it", async () => {
+  const { paneRects, moveTab } = await import("./tree.ts");
+  // The default is "first in the last group"; 20 has [3] and [Q,4].
+  let w = twoGroups();
+  w = rememberPlace(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, allPanes(l.root)[1].id, "center", 0)), QTAB);
+  w = changeChannelLayout(w, 20, (l) => splitPane(l, "right", 4, allPanes(l.root)[0].id));
+  w = show(w, 20);
+  equal(sig(w.layouts[20].root), `row([3] [${QTAB},4])`);
+  // Terminal 4 closes: Questions has that group to itself. Widened to 40%, then away and back.
+  const without4 = (c: number) => qTabs(c).filter((t) => t.id !== 4);
+  w = reconcileChannels(w, [10, 20, 30], without4(20));
+  equal(sig(w.layouts[20].root), `row([3] [${QTAB}])`);
+  w = changeChannelLayout(w, 20, (l) => setSizes(l, [], [0.6, 0.4]));
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20, 30], without4(10));
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20, 30], without4(20));
+  const q = allPanes(w.layouts[20].root).find((p) => p.tabs.includes(QTAB))!;
+  assert(q.tabs.length === 1 && Math.abs(paneRects(w.layouts[20].root).get(q.id)!.w - 0.4) < 1e-9,
+    `its own group at 40%: ${sig(w.layouts[20].root)}`);
+});

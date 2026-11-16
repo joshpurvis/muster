@@ -627,3 +627,20 @@ Deno.test("putAt keeps an exact place when groups were added or closed beside it
   const again = putAt(reconcile(removeSession(narrow, T), [1, T]), T, p);
   assertEquals(sized(again.root), sized(narrow.root));
 });
+
+Deno.test("a split along a whole window edge stays along it when the groups beside it closed", async () => {
+  const { placeOf, putAt, placeBeside } = await import("./tree.ts");
+  const T = 99;
+  // [1] over [2], Questions full height on the right.
+  let l = splitPane(emptyLayout([1]), "bottom", 2);
+  l = splitPane(l, "right", T, paneOfSession(l.root, 1)!.id);
+  l = { ...l, root: normalize(l.root) };
+  const edge = putAt(l, T, { group: -1, index: 0, alone: "right", size: 0.3 });
+  const at = JSON.parse(JSON.stringify(placeOf(edge, T)));
+  assertEquals(at.alone, "right");
+  // Away: a panel opens beside 2, then 2 closes.
+  let away = placeBeside(removeSession(edge, T), -5, 2);
+  away = removeSession(away, 2);
+  const back = putAt(reconcile(away, [1, -5, T]), T, at);
+  assertEquals(placeOf(back, T)!.alone, "right");
+});

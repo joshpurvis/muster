@@ -3,7 +3,8 @@
 // old, unassigned notes in a window with no channels (never a backend channel id).
 import {
   allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, generalPlace, type LayoutState, parseLayout,
-  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, sameGeneralPlace, type TabPlace,
+  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
+  type TabPlace,
 } from "./tree.ts";
 import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
 
@@ -150,7 +151,7 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   for (const [id, l] of Object.entries(s.layouts)) {
     if (!groups.has(Number(id)) || groups.get(Number(id))!.some((t) => t.id === QUESTIONS_TAB)) continue;
     const at = placeOf(l, QUESTIONS_TAB);
-    const given = at && !questionsIn[id] ? placeOf(putAt(l, QUESTIONS_TAB, fallback), QUESTIONS_TAB) : null;
+    const given = at && !questionsIn[id] ? arrivedAt(l, fallback) : null;
     if (at && (questionsIn[id] || !given || !sameGeneralPlace(at, given))) questionsIn[id] = at;
   }
   const layouts: Record<string, LayoutState> = {};
@@ -164,6 +165,14 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
     ...rest, active, layouts, ...(s.drawers ? { drawers } : {}),
     ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
   };
+}
+
+/** Where Questions would be in layout `l` if it arrived there now at `place` (its own group, if it
+ * has one there, closes first, as it does when it leaves). */
+function arrivedAt(l: LayoutState, place: TabPlace): TabPlace | null {
+  const away = removeSession(l, QUESTIONS_TAB);
+  const back = reconcile(away, [...allSessions(away.root), QUESTIONS_TAB]);
+  return placeOf(putAt(back, QUESTIONS_TAB, place), QUESTIONS_TAB);
 }
 
 /** Read v2, or partition a legacy window tree without merging tasks with the same folder. */

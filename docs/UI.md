@@ -297,13 +297,15 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   select). It starts first in the top-left group. It drags like any tab: to another place in its
   strip, into another group, or onto a group's edge for a split of its own; its menu's **Split
   right** / **Split down**, Alt+Shift+[ / ] and Ctrl+Alt+arrows move it too. It never goes to
-  another window or channel. The window remembers where it was put (`questionsAt` in the saved
-  layout) and each channel it moves to gets that place: the same group counting from the first, or
-  the last group when it was in the last one, at the same place in the strip (or its end); a group
-  of its own along a whole window edge becomes a group of its own along that edge, with the same
-  share of the window. When it leaves a channel, the group it had alone there closes; when it comes
-  back (another channel shown, or Hide then show), it is put at the remembered place again, so it
-  is never lost or doubled. Pin icon, "Questions" and the number of open questions in an amber
+  another window or channel. A reload keeps it exactly where it was. The window also remembers
+  its place (`questionsAt` in the saved layout, taken when it is moved and when it leaves a
+  channel), and each channel it moves to gets that place: the same group counting from the first,
+  or the last group when it was in the last one, at the same place in the strip (or its end); a
+  group of its own along a whole window edge becomes a group of its own along that edge, with the
+  same share of the window. A group of its own inside a column or row (not along a whole edge)
+  comes back as a tab of the group at that place. When it leaves a channel, the group it had alone
+  there closes; when it comes back (another channel shown, or Hide then show), it is put at the
+  remembered place again, so it is never lost or doubled. Pin icon, "Questions" and the number of open questions in an amber
   badge. It doesn't rename or close: its menu (and Alt+W) **Hide Questions tab**, which the window
   remembers; the palette's **Questions**, Alt+J or the status line's "needs you" shows it again,
   wherever it is. Shown only when the backend has questions.

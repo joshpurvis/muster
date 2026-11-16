@@ -661,8 +661,9 @@ function QuestionsTab({ paneId, index, tabsInGroup, active, focused }: {
       drag.value?.sid === QUESTIONS_TAB && "dragging")}
       role="tab" aria-selected={active} aria-label={label} tabIndex={active ? 0 : -1}
       data-tab-sid={QUESTIONS_TAB} data-tip={`Questions agents asked you · ${n} open`}
-      onPointerDown={(e) => startTabDrag(e, { id: QUESTIONS_TAB, kind: "questions" }, "Questions",
-        () => A.revealSession(QUESTIONS_TAB))}
+      // A press without a drag is a click; screen readers' Activate sends only the click.
+      onPointerDown={(e) => startTabDrag(e, { id: QUESTIONS_TAB, kind: "questions" }, "Questions", () => {})}
+      onClick={() => A.revealSession(QUESTIONS_TAB)}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
       <TabIcon index={index} focused={focused}><IconPin size={13} /></TabIcon>
       <span class="tab-name"><span class="tab-task">Questions</span></span>

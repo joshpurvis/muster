@@ -747,7 +747,11 @@ effect(() => {
   const owner = supported ? id : null;
   if (layoutOwner === owner) return;
   const w = supported ? myWindow.peek() : null;
-  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), liveTabs.peek());
+  // The Questions tab isn't shown until this layout is loaded: keep its saved place meanwhile (its
+  // own group would close), and drop it again if the window then hides it.
+  const tabs = liveTabs.peek();
+  const keep = tabs.some((t) => t.questions) ? [] : [{ id: QUESTIONS_TAB, channel: null, questions: true, kept: true }];
+  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep]);
   layoutOwner = owner;
   lastSaved = w?.layout ? JSON.stringify(w.layout) : "";
   clearTimeout(saveTimer);

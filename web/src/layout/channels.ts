@@ -3,7 +3,7 @@
 // old, unassigned notes in a window with no channels (never a backend channel id).
 import {
   allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, type LayoutState, parseLayout,
-  parseTabPlace, placeBeside, placeOf, putAt, reconcile, type TabPlace,
+  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, type TabPlace,
 } from "./tree.ts";
 import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
 
@@ -48,6 +48,9 @@ export interface TabHome {
   /** The window's Questions tab: it arrives in a channel at the window's `questionsAt`, then
    * stays wherever it is moved. */
   questions?: boolean;
+  /** Only keep it where the saved layout has it, never place it anew (loading, before the window
+   * knows whether to show it: its group survives the load). */
+  kept?: boolean;
 }
 
 export interface SidebarState {
@@ -125,19 +128,38 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   for (const t of tabs) {
     if (drawerIds.has(t.id)) continue;
     const saved = t.channel === null ? savedChannel(s, t.id) : null;
+    if (t.kept && (saved === null || !ids.has(saved))) continue;
     const beside = t.beside == null ? null : tabs.find((x) => x.id === t.beside)?.channel;
     const channel = t.channel ?? beside ?? (saved !== null && ids.has(saved) ? saved : null) ??
       (s.active !== null && ids.has(s.active) ? s.active : channels[0]) ?? 0;
     if (!groups.has(channel)) groups.set(channel, []);
     groups.get(channel)!.push(t);
   }
+  // Questions leaving a channel (another one shown, or hidden) remembers where it was there: a
+  // resize or the tabs around it may have changed since it was last moved.
+  let questionsAt = s.questionsAt;
+  for (const [id, l] of Object.entries(s.layouts)) {
+    if (!allSessions(l.root).includes(QUESTIONS_TAB)) continue;
+    if (groups.get(Number(id))?.some((t) => t.id === QUESTIONS_TAB)) continue;
+    questionsAt = leftFrom(l, questionsAt);
+  }
   const layouts: Record<string, LayoutState> = {};
   for (const [id, items] of groups) {
-    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items, s.questionsAt ?? FIRST_PLACE);
+    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items, questionsAt ?? FIRST_PLACE);
   }
   const active = s.active !== null && Object.hasOwn(layouts, s.active) ? s.active :
     (groups.keys().next().value ?? null);
-  return { ...s, active, layouts, ...(s.drawers ? { drawers } : {}) };
+  return { ...s, active, layouts, ...(s.drawers ? { drawers } : {}), ...(questionsAt ? { questionsAt } : {}) };
+}
+
+/** Where Questions was in layout `l` as it leaves. With one group there, "first" or "last" group
+ * can't be told apart, so the remembered one stays. */
+function leftFrom(l: LayoutState, before: TabPlace | undefined): TabPlace | undefined {
+  const at = placeOf(l, QUESTIONS_TAB);
+  if (!at) return before;
+  const one = allPanes(l.root).length === 1;
+  const kept = one && !at.alone && before && !before.alone ? { ...at, group: before.group } : at;
+  return one && !before && kept.group === 0 && kept.index === 0 ? before : kept;
 }
 
 /** Read v2, or partition a legacy window tree without merging tasks with the same folder. */
@@ -187,7 +209,8 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
   const active = focused == null ? channels[0] ?? null : owners.get(focused) ?? channels[0] ?? null;
   // Old notes have no channel. Prefer their opener, then a terminal/panel in the same tile,
   // then the focused channel. Save their chosen home in the migrated tree.
-  const assigned = tabs.map((t) => {
+  // A legacy tree predates the Questions tab: nothing of it to keep.
+  const assigned = tabs.filter((t) => !t.kept).map((t) => {
     if (t.channel !== null) return t;
     const p = legacy ? allPanes(legacy.root).find((p) => p.tabs.includes(t.id)) : null;
     const channel = (t.beside == null ? null : owners.get(t.beside)) ??
